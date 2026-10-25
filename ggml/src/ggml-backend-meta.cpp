@@ -2349,6 +2349,26 @@ struct ggml_backend_meta_context {
         // earlier partial before the layer-tail ADD.
         std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
 
+        // Complete Phone Region (L35-L45) pipeline storage. The stock gallocr
+        // intentionally reuses its compute arena according to SERIAL graph
+        // order, so an early Region graph cannot safely keep using those
+        // addresses while a future C2P chunk starts. Two scratch slots clone
+        // the exact transient buffer layout for bounded window=2 execution.
+        struct phone_region_scratch_arena {
+            ggml_backend_buffer_t   source_buffer = nullptr;
+            ggml_backend_buffer_ptr buffer;
+        };
+        struct phone_region_scratch_slot {
+            std::vector<phone_region_scratch_arena> arenas;
+            int owner_chunk = -1;
+        };
+        std::array<phone_region_scratch_slot, 2> phone_region_scratch_slots;
+
+        // Region outputs live longer than scratch: L46 consumes them only
+        // after the per-chunk Region submission. Keep one compact output
+        // allocation per chunk so a scratch slot can be safely reused.
+        std::vector<ggml_backend_buffer_ptr> phone_region_output_bufs;
+
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
@@ -12393,6 +12413,319 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         return reduce_copy_by_direction[src*n_backends + dst].total_us;
     };
 
+    struct phone_region_binding_backup {
+        ggml_tensor * tensor = nullptr;
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+    };
+    std::vector<phone_region_binding_backup> phone_region_output_backups;
+    struct phone_region_output_restore_guard {
+        std::vector<phone_region_binding_backup> & backups;
+        ~phone_region_output_restore_guard() {
+            for (auto it = backups.rbegin(); it != backups.rend(); ++it) {
+                it->tensor->buffer = it->buffer;
+                it->tensor->data = it->data;
+            }
+        }
+    } phone_region_output_guard { phone_region_output_backups };
+
+    auto phone_region_root = [](ggml_tensor * tensor) -> ggml_tensor * {
+        while (tensor != nullptr && tensor->view_src != nullptr) {
+            tensor = tensor->view_src;
+        }
+        return tensor;
+    };
+    auto backup_region_binding =
+        [](std::vector<phone_region_binding_backup> & backups,
+           ggml_tensor * tensor) {
+            for (const auto & backup : backups) {
+                if (backup.tensor == tensor) {
+                    return;
+                }
+            }
+            backups.push_back({ tensor, tensor->buffer, tensor->data });
+        };
+    auto restore_region_bindings =
+        [](std::vector<phone_region_binding_backup> & backups) {
+            for (auto it = backups.rbegin(); it != backups.rend(); ++it) {
+                it->tensor->buffer = it->buffer;
+                it->tensor->data = it->data;
+            }
+            backups.clear();
+        };
+
+    auto bind_phone_region_output =
+        [&](int chunk, ggml_tensor * output) -> bool {
+            if (n_backends != 2 || chunk < 0 || output == nullptr) {
+                return false;
+            }
+            ggml_tensor * root = phone_region_root(output);
+            if (root == nullptr || root->buffer == nullptr ||
+                    root->data == nullptr) {
+                return false;
+            }
+
+            auto & cfg = backend_ctx->backend_configs[1];
+            const size_t chunk_index = static_cast<size_t>(chunk);
+            if (cfg.phone_region_output_bufs.size() <= chunk_index) {
+                cfg.phone_region_output_bufs.resize(chunk_index + 1);
+            }
+            const size_t need =
+                ggml_backend_buffer_get_alloc_size(root->buffer, root);
+            auto & output_buf = cfg.phone_region_output_bufs[chunk_index];
+            if (!output_buf ||
+                    ggml_backend_buffer_get_size(output_buf.get()) < need) {
+                output_buf.reset(
+                    ggml_backend_alloc_buffer(cfg.backend, need));
+            }
+            if (!output_buf) {
+                return false;
+            }
+
+            const uintptr_t old_root =
+                reinterpret_cast<uintptr_t>(root->data);
+            const uintptr_t new_root = reinterpret_cast<uintptr_t>(
+                ggml_backend_buffer_get_base(output_buf.get()));
+            if (old_root == 0 || new_root == 0) {
+                return false;
+            }
+
+            // Find every descriptor (including later L46 views) that aliases
+            // this chunk output root before changing any pointer.
+            std::set<ggml_tensor *> visited;
+            std::set<ggml_tensor *> family;
+            std::function<void(ggml_tensor *)> visit =
+                [&](ggml_tensor * tensor) {
+                    if (tensor == nullptr ||
+                            !visited.insert(tensor).second) {
+                        return;
+                    }
+                    if (phone_region_root(tensor) == root) {
+                        family.insert(tensor);
+                    }
+                    if (tensor->view_src != nullptr) {
+                        visit(tensor->view_src);
+                    }
+                    for (ggml_tensor * src : tensor->src) {
+                        visit(src);
+                    }
+                };
+            for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+                ggml_cgraph * graph =
+                    cfg.cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    visit(graph->nodes[k]);
+                }
+                for (int k = 0; k < graph->n_leafs; ++k) {
+                    visit(graph->leafs[k]);
+                }
+            }
+
+            for (ggml_tensor * tensor : family) {
+                if (tensor->data == nullptr) {
+                    return false;
+                }
+                const uintptr_t old_data =
+                    reinterpret_cast<uintptr_t>(tensor->data);
+                if (old_data < old_root ||
+                        old_data - old_root > need ||
+                        ggml_nbytes(tensor) > need - (old_data - old_root)) {
+                    return false;
+                }
+            }
+            for (ggml_tensor * tensor : family) {
+                backup_region_binding(
+                    phone_region_output_backups, tensor);
+                const uintptr_t old_data =
+                    reinterpret_cast<uintptr_t>(tensor->data);
+                tensor->buffer = output_buf.get();
+                tensor->data = reinterpret_cast<void *>(
+                    new_root + (old_data - old_root));
+            }
+
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_OUTPUT_SLOT] chunk=%d bytes=%zu "
+                       "aliases=%zu status=BOUND\n",
+                       chunk, need, family.size());
+            }
+            return true;
+        };
+
+    auto bind_phone_region_scratch =
+        [&](ggml_cgraph * graph, int chunk, size_t slot_index,
+            ggml_tensor * output,
+            std::vector<phone_region_binding_backup> & backups) -> bool {
+            if (n_backends != 2 || graph == nullptr ||
+                    chunk < 0 || slot_index >= 2 || output == nullptr) {
+                return false;
+            }
+
+            auto & cfg = backend_ctx->backend_configs[1];
+            auto & slot = cfg.phone_region_scratch_slots[slot_index];
+            ggml_backend_t phone_backend = cfg.backend;
+
+            // Reusing a slot is the window=2 credit boundary. The graph RPC
+            // worker returns after submission, not GPU completion, so fence
+            // explicitly before overwriting a slot that previously belonged
+            // to another chunk.
+            int64_t reuse_wait_us = 0;
+            if (slot.owner_chunk >= 0 &&
+                    slot.owner_chunk != chunk) {
+                const int64_t wait_begin_us = ggml_time_us();
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(phone_backend);
+                if (rpc_fence != nullptr) {
+                    rpc_fence(phone_backend);
+                } else {
+                    ggml_backend_synchronize(phone_backend);
+                }
+                reuse_wait_us = ggml_time_us() - wait_begin_us;
+            }
+
+            ggml_tensor * output_root = phone_region_root(output);
+            std::set<ggml_tensor *> owned_roots;
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                ggml_tensor * node = graph->nodes[k];
+                if (node == nullptr ||
+                        !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                        node->view_src != nullptr ||
+                        node == output_root ||
+                        node->op == GGML_OP_NONE) {
+                    continue;
+                }
+                if (node->buffer == nullptr || node->data == nullptr) {
+                    return false;
+                }
+                owned_roots.insert(node);
+            }
+            if (owned_roots.empty()) {
+                return false;
+            }
+
+            // Allocate a private clone for each transient source arena used by
+            // this Region graph. Cloning the whole arena preserves gallocr's
+            // exact offsets and all nested VIEW relationships.
+            std::map<ggml_backend_buffer_t,
+                     ggml_backend_meta_context::backend_config::
+                         phone_region_scratch_arena *> arena_map;
+            size_t scratch_bytes = 0;
+            for (ggml_tensor * root : owned_roots) {
+                ggml_backend_buffer_t source = root->buffer;
+                if (arena_map.find(source) != arena_map.end()) {
+                    continue;
+                }
+                auto it = std::find_if(
+                    slot.arenas.begin(), slot.arenas.end(),
+                    [&](const auto & arena) {
+                        return arena.source_buffer == source;
+                    });
+                if (it == slot.arenas.end()) {
+                    slot.arenas.push_back({});
+                    it = std::prev(slot.arenas.end());
+                    it->source_buffer = source;
+                }
+                const size_t source_size =
+                    ggml_backend_buffer_get_size(source);
+                if (!it->buffer ||
+                        ggml_backend_buffer_get_size(it->buffer.get()) <
+                            source_size) {
+                    it->buffer.reset(
+                        ggml_backend_alloc_buffer(
+                            phone_backend, source_size));
+                }
+                if (!it->buffer) {
+                    return false;
+                }
+                arena_map[source] = &*it;
+                scratch_bytes +=
+                    ggml_backend_buffer_get_size(it->buffer.get());
+            }
+
+            // Visit the complete dependency closure because fused graphs do
+            // not carry a conventional leaf list. Only tensors rooted in an
+            // owned transient allocation are rebound; weights, C2P input and
+            // persistent KV-cache SET_ROWS views remain untouched.
+            std::set<ggml_tensor *> visited;
+            std::set<ggml_tensor *> family;
+            std::function<void(ggml_tensor *)> visit =
+                [&](ggml_tensor * tensor) {
+                    if (tensor == nullptr ||
+                            !visited.insert(tensor).second) {
+                        return;
+                    }
+                    ggml_tensor * root = phone_region_root(tensor);
+                    if (owned_roots.find(root) != owned_roots.end()) {
+                        family.insert(tensor);
+                    }
+                    if (tensor->view_src != nullptr) {
+                        visit(tensor->view_src);
+                    }
+                    for (ggml_tensor * src : tensor->src) {
+                        visit(src);
+                    }
+                };
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                visit(graph->nodes[k]);
+            }
+
+            for (ggml_tensor * tensor : family) {
+                if (tensor->buffer == nullptr || tensor->data == nullptr) {
+                    return false;
+                }
+                auto arena_it = arena_map.find(tensor->buffer);
+                if (arena_it == arena_map.end()) {
+                    return false;
+                }
+                ggml_backend_buffer_t source = tensor->buffer;
+                const uintptr_t source_base =
+                    reinterpret_cast<uintptr_t>(
+                        ggml_backend_buffer_get_base(source));
+                const uintptr_t old_data =
+                    reinterpret_cast<uintptr_t>(tensor->data);
+                const size_t source_size =
+                    ggml_backend_buffer_get_size(source);
+                if (source_base == 0 || old_data < source_base ||
+                        old_data - source_base > source_size ||
+                        ggml_nbytes(tensor) >
+                            source_size - (old_data - source_base)) {
+                    return false;
+                }
+            }
+
+            for (ggml_tensor * tensor : family) {
+                ggml_backend_buffer_t source = tensor->buffer;
+                const uintptr_t source_base =
+                    reinterpret_cast<uintptr_t>(
+                        ggml_backend_buffer_get_base(source));
+                const uintptr_t old_data =
+                    reinterpret_cast<uintptr_t>(tensor->data);
+                auto * arena = arena_map.at(source);
+                const uintptr_t private_base =
+                    reinterpret_cast<uintptr_t>(
+                        ggml_backend_buffer_get_base(
+                            arena->buffer.get()));
+                backup_region_binding(backups, tensor);
+                tensor->buffer = arena->buffer.get();
+                tensor->data = reinterpret_cast<void *>(
+                    private_base + (old_data - source_base));
+            }
+
+            slot.owner_chunk = chunk;
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_SCRATCH] chunk=%d slot=%zu "
+                       "arenas=%zu tensors=%zu bytes=%.3f MiB "
+                       "reuse_wait_ms=%.3f status=BOUND\n",
+                       chunk, slot_index, arena_map.size(),
+                       family.size(),
+                       scratch_bytes / (1024.0 * 1024.0),
+                       reuse_wait_us / 1000.0);
+            }
+            return true;
+        };
+
     // Opt-in V1: reorder only the already-built, already-allocated Meta
     // subgraphs. Each C2P chunk may be followed immediately by its complete
     // L35-L45 Phone Region graph. This gives PC work on chunk N+1 a chance
@@ -12491,13 +12824,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             eligible =
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
+        bool region_pipe_isolation_needed = false;
         if (eligible) {
-            // The stock gallocr packs buffers according to ORIGINAL graph
-            // order. Moving Region chunk N before the PC/Phone C2P work for
-            // chunk N+1 is only safe if its live output does not alias any
-            // later C2P Phone writer. Such an alias is legal in the original
-            // order (the future C2P temporary dies before Region N starts),
-            // but would corrupt the early output in this new schedule.
+            // The stock gallocr is intentionally allowed to alias Region
+            // outputs/intermediates with future C2P scratch in SERIAL order.
+            // The pipeline no longer rejects that layout: every Phone Region
+            // submission is rebound to one of two private scratch arenas and
+            // its final output gets a separate per-chunk buffer.
             auto ranges_overlap = [](const ggml_tensor * a,
                                      const ggml_tensor * b) -> bool {
                 const uintptr_t pa = reinterpret_cast<uintptr_t>(a->data);
@@ -12508,7 +12841,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     pa <= UINTPTR_MAX - na && pb <= UINTPTR_MAX - nb &&
                     pa < pb + nb && pb < pa + na;
             };
-            for (size_t c = 0; c < region_pipe_chunks.size() && eligible; ++c) {
+            for (size_t c = 0; c < region_pipe_chunks.size(); ++c) {
                 const auto & e = region_pipe_chunks.at((int) c);
                 char out_name[96];
                 std::snprintf(out_name, sizeof(out_name),
@@ -12522,7 +12855,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     break;
                 }
                 for (size_t future = c + 1;
-                        future < region_pipe_chunks.size() && eligible; ++future) {
+                        future < region_pipe_chunks.size(); ++future) {
                     const auto & next = region_pipe_chunks.at((int) future);
                     for (size_t sg : { next.norm_sg, next.down_sg }) {
                         ggml_cgraph * phone =
@@ -12539,30 +12872,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     layout_only) {
                                 continue;
                             }
-                            // Nodes without a materialized backing pointer
-                            // cannot be shown disjoint; reject to avoid
-                            // interpreting unknown memory as safe.
                             if (node->data == nullptr ||
                                     ranges_overlap(output, node)) {
+                                region_pipe_isolation_needed = true;
                                 if (pipeline_debug) {
                                     printf("[PHONE_REGION_PIPE_ALIAS] "
                                            "chunk=%zu future=%zu node=%s "
-                                           "reason=%s\n",
+                                           "reason=%s action=ISOLATE\n",
                                            c, future, node->name,
                                            node->data == nullptr ?
                                                "UNKNOWN_BUFFER" :
                                                "OUTPUT_OVERLAP");
                                 }
-                                region_pipe_reason =
-                                    node->data == nullptr ?
-                                        "UNKNOWN_FUTURE_BUFFER" :
-                                        "OUTPUT_BUFFER_ALIAS";
-                                eligible = false;
-                                break;
                             }
-                        }
-                        if (!eligible) {
-                            break;
                         }
                     }
                 }
@@ -12606,7 +12928,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
         region_pipeline_active = eligible;
         if (eligible) {
-            region_pipe_reason = "READY";
+            region_pipe_reason =
+                region_pipe_isolation_needed ?
+                    "READY_SCRATCH_POOL" : "READY";
         } else if (std::strcmp(region_pipe_reason, "TOPOLOGY") == 0) {
             region_pipe_reason = "UNSUPPORTED_GRAPH";
         }
@@ -12618,11 +12942,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             std::atoi(region_pipeline_env) != 0) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
-               "reason=%s\n",
+               "scratch_pool=%d reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
                backend_ctx->n_subgraphs,
+               region_pipeline_active ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             for (const auto & entry : region_pipe_chunks) {
@@ -14616,6 +14941,59 @@ auto prefill_norm_sg_has_prework =
                     direct_route_chunk);
         }
 
+        std::vector<phone_region_binding_backup>
+            phone_region_scratch_backups;
+        uint64_t phone_region_saved_uid = 0;
+        bool phone_region_uid_rebound = false;
+        if (region_pipeline_active && phone_region_fused) {
+            char output_name[96];
+            std::snprintf(
+                output_name, sizeof(output_name),
+                "phone_region_chunk_end_%d-45",
+                phone_region_chunk_id);
+            ggml_tensor * region_output =
+                find_sg_named_tensor(
+                    1, phone_block_end, output_name);
+            if (region_output == nullptr ||
+                    !bind_phone_region_output(
+                        phone_region_chunk_id, region_output)) {
+                printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
+                       "reason=OUTPUT_BIND_FAILED action=STOP\n",
+                       phone_region_chunk_id);
+                return GGML_STATUS_FAILED;
+            }
+            const size_t slot_index =
+                static_cast<size_t>(phone_region_chunk_id) % 2;
+            if (!bind_phone_region_scratch(
+                    phone_graph, phone_region_chunk_id,
+                    slot_index, region_output,
+                    phone_region_scratch_backups)) {
+                restore_region_bindings(
+                    phone_region_scratch_backups);
+                printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
+                       "slot=%zu reason=SCRATCH_BIND_FAILED "
+                       "action=STOP\n",
+                       phone_region_chunk_id, slot_index);
+                return GGML_STATUS_FAILED;
+            }
+
+            // RPC servers cache graphs by uid. Buffer addresses are now slot
+            // specific, so salt the uid with chunk/slot to make the cache key
+            // describe the rebound graph. Repeated runs reuse the same key
+            // and persistent slot buffers.
+            phone_region_saved_uid = phone_graph->uid;
+            phone_graph->uid ^=
+                0x5052475343524154ULL ^
+                (uint64_t) (phone_region_chunk_id + 1) *
+                    0x9e3779b97f4a7c15ULL ^
+                (uint64_t) (slot_index + 1) *
+                    0xbf58476d1ce4e5b9ULL;
+            if (phone_graph->uid == 0) {
+                phone_graph->uid = 1;
+            }
+            phone_region_uid_rebound = true;
+        }
+
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
@@ -14629,6 +15007,16 @@ auto prefill_norm_sg_has_prework =
         }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
+
+        // wait(1) means ggml_backend_graph_compute_async() has consumed and
+        // serialized the graph descriptors. The GPU may still be executing,
+        // but it now owns the private remote addresses, so host descriptors
+        // can return to their original gallocr bindings immediately.
+        if (phone_region_uid_rebound) {
+            phone_graph->uid = phone_region_saved_uid;
+            restore_region_bindings(
+                phone_region_scratch_backups);
+        }
 
         if (direct_route_bound) {
             if (direct_route_rebound) {
