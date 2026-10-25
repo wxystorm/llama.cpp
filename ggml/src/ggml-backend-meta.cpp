@@ -13651,6 +13651,224 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     std::vector<uint64_t> region_pipe_completion_seq(
         region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
+    std::vector<uint64_t> region_pipe_completion_wait_task(
+        region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
+    std::vector<int64_t> region_pipe_completion_wait_begin_us(
+        region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
+
+    if (region_pipeline_active &&
+            backend_ctx->region_completion_worker == nullptr) {
+        backend_ctx->region_completion_worker =
+            new ggml_backend_meta_transfer_worker();
+    }
+
+    auto run_region_c2p_pc_prework =
+        [&](int chunk) -> ggml_status {
+            if (!region_pipeline_active ||
+                    chunk <= 0 ||
+                    static_cast<size_t>(chunk) >=
+                        region_pipe_chunks.size() ||
+                    find_region_c2p_pc_prework(34, chunk) !=
+                        nullptr) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            const auto chunk_it =
+                region_pipe_chunks.find(chunk);
+            if (chunk_it == region_pipe_chunks.end()) {
+                return GGML_STATUS_SUCCESS;
+            }
+            const region_pipe_chunk & e = chunk_it->second;
+
+            char norm_name[96];
+            char topk_name[96];
+            char weights_name[96];
+            std::snprintf(
+                norm_name, sizeof(norm_name),
+                "prefill_ffn_norm_chunk_%d-34", chunk);
+            std::snprintf(
+                topk_name, sizeof(topk_name),
+                "c2p_prefill_route_topk_chunk_%d-34", chunk);
+            std::snprintf(
+                weights_name, sizeof(weights_name),
+                "c2p_prefill_route_weights_chunk_%d-34", chunk);
+
+            ggml_tensor * norm_src =
+                find_sg_named_tensor(0, e.norm_sg, norm_name);
+            ggml_tensor * src_topk =
+                find_sg_named_tensor(0, e.down_sg, topk_name);
+            ggml_tensor * src_weights =
+                find_sg_named_tensor(0, e.down_sg, weights_name);
+            ggml_tensor * pc_partial =
+                get_prefill_down_boundary_node(0, e.down_sg);
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[e.down_sg].cgraph_main;
+
+            if (norm_src == nullptr ||
+                    src_topk == nullptr ||
+                    src_weights == nullptr ||
+                    pc_partial == nullptr ||
+                    pc_graph == nullptr) {
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_PC_PREWORK_SKIP] "
+                        "chunk=%d reason=MISSING_GRAPH_VALUE\n",
+                        chunk);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
+            // Future C2P norm SGs are views of the full L34 ffn_norm that was
+            // already produced by chunk0. If a future norm SG contains a real
+            // arithmetic producer, do not speculate across the continuation.
+            ggml_cgraph * norm_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[e.norm_sg].cgraph_main;
+            bool norm_layout_only = norm_graph != nullptr;
+            for (int k = 0;
+                    norm_graph != nullptr &&
+                    k < norm_graph->n_nodes; ++k) {
+                ggml_tensor * node = norm_graph->nodes[k];
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+                const bool layout_only =
+                    node->op == GGML_OP_VIEW ||
+                    node->op == GGML_OP_RESHAPE ||
+                    node->op == GGML_OP_PERMUTE ||
+                    node->op == GGML_OP_TRANSPOSE ||
+                    node->op == GGML_OP_NONE;
+                if (!layout_only) {
+                    norm_layout_only = false;
+                    break;
+                }
+            }
+            if (!norm_layout_only) {
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_PC_PREWORK_SKIP] "
+                        "chunk=%d reason=NORM_HAS_COMPUTE\n",
+                        chunk);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
+            auto & pc_cfg = backend_ctx->backend_configs[0];
+            const size_t slot =
+                static_cast<size_t>(chunk);
+            if (pc_cfg.c2p_prefill_norm_stage_bufs.size() <=
+                    slot) {
+                pc_cfg.c2p_prefill_norm_stage_bufs.resize(
+                    slot + 1);
+            }
+            if (pc_cfg.c2p_prefill_partial_stage_bufs.size() <=
+                    slot) {
+                pc_cfg.c2p_prefill_partial_stage_bufs.resize(
+                    slot + 1);
+            }
+            if (pc_cfg.c2p_route_stage_bufs.size() <= slot) {
+                pc_cfg.c2p_route_stage_bufs.resize(slot + 1);
+            }
+
+            auto & norm_buf =
+                pc_cfg.c2p_prefill_norm_stage_bufs[slot];
+            const size_t norm_bytes =
+                ggml_nbytes(norm_src);
+            if (!norm_buf ||
+                    ggml_backend_buffer_get_size(
+                        norm_buf.get()) < norm_bytes) {
+                norm_buf.reset(
+                    ggml_backend_alloc_buffer(
+                        pc_cfg.backend,
+                        norm_bytes));
+            }
+            if (!norm_buf) {
+                return GGML_STATUS_ALLOC_FAILED;
+            }
+
+            ggml_tensor * norm_stage =
+                get_node_aux(norm_src);
+            norm_stage->buffer = norm_buf.get();
+            norm_stage->data =
+                ggml_backend_buffer_get_base(
+                    norm_buf.get());
+
+            const int64_t prework_begin_us =
+                ggml_time_us();
+            ggml_backend_synchronize(pc_cfg.backend);
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend,
+                pc_cfg.backend,
+                norm_src,
+                norm_stage);
+            ggml_backend_synchronize(pc_cfg.backend);
+
+            region_c2p_pc_prework_state state;
+            state.layer = 34;
+            state.chunk = chunk;
+            state.norm_sg = e.norm_sg;
+            state.down_sg = e.down_sg;
+            state.norm_stage = norm_stage;
+            state.src_topk = src_topk;
+            state.src_weights = src_weights;
+            state.pc_partial = pc_partial;
+
+            bind_c2p_route_storage(
+                src_topk,
+                pc_cfg.c2p_route_stage_bufs[slot][0],
+                state.bindings);
+            bind_c2p_route_storage(
+                src_weights,
+                pc_cfg.c2p_route_stage_bufs[slot][1],
+                state.bindings);
+            bind_c2p_route_storage(
+                pc_partial,
+                pc_cfg.c2p_prefill_partial_stage_bufs[slot],
+                state.bindings);
+
+            const uint64_t saved_uid =
+                pc_graph->uid;
+            pc_graph->uid = 0;
+            compute_workers.start(0, e.down_sg);
+            state.status =
+                compute_workers.wait(0);
+            pc_graph->uid = saved_uid;
+            state.wall_us =
+                ggml_time_us() - prework_begin_us;
+            state.ready =
+                state.status == GGML_STATUS_SUCCESS;
+
+            if (!state.ready) {
+                restore_c2p_route_bindings(
+                    state.bindings);
+                return state.status;
+            }
+
+            region_c2p_pc_prework[
+                { state.layer, state.chunk }] =
+                    std::move(state);
+
+            if (pipeline_debug) {
+                const auto * ready =
+                    find_region_c2p_pc_prework(34, chunk);
+                printf(
+                    "[REGION_C2P_PC_PREWORK] "
+                    "layer=34 chunk=%d norm_bytes=%zu "
+                    "partial_bytes=%zu wall_ms=%.3f "
+                    "state=PC_READY_PHONE_DEFERRED status=OK\n",
+                    chunk,
+                    norm_bytes,
+                    ready != nullptr &&
+                            ready->pc_partial != nullptr ?
+                        ggml_nbytes(
+                            ready->pc_partial) : 0,
+                    ready != nullptr ?
+                        ready->wall_us / 1000.0 : 0.0);
+            }
+
+            return GGML_STATUS_SUCCESS;
+        };
 
     bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
