@@ -14123,6 +14123,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                    region_pc_overlap_requested ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
+            printf("[PHONE_REGION_LOCAL_CONTINUATION_PLAN] "
+                   "active=1 dependency=PHONE_COMPUTE_FIFO "
+                   "pc_completion_wait=0 slot_credit=BUFFER_REUSE_ONLY\n");
             for (const auto & entry : region_pipe_chunks) {
                 printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
                        "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
@@ -14135,9 +14138,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
     }
-
-    std::vector<uint64_t> region_pipe_completion_seq(
-        region_pipeline_active ? region_pipe_chunks.size() : 0, 0);
 
     bool ab_next_entry_dumped = false;
     const int64_t meta_execute_begin_us = ggml_time_us();
@@ -14207,86 +14207,38 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             continue;
         }
 
-        // A continuation may run on a transfer/PC path rather than solely on
-        // the Phone compute socket, so do not rely on socket ordering alone.
-        // Wait for exactly this Region producer, then release its scratch
-        // slot. This is the dependency edge that turns the old phase barrier
-        // into per-chunk dataflow.
+        // Region -> L46 is a Phone-local dependency. Do not turn producer
+        // completion into a PC scheduling event: the Region graph and the
+        // L46 Phone graph are submitted on the same ordered COMPUTE socket,
+        // and the RPC server executes graph commands synchronously in FIFO
+        // order. Therefore L46 may be queued immediately after Region while
+        // the Phone is still computing Region; no wait_ready_seq(), completion
+        // worker, REGION_DONE notification, or START_L46 control round-trip
+        // belongs on this edge.
+        //
+        // Completion seqs are retained only by phone_region_scratch_slots for
+        // safe N%%2 scratch-buffer reuse. They are memory-lifetime credits,
+        // never compute-scheduling dependencies.
         if (region_pipeline_active &&
                 pipeline_stage != nullptr &&
                 std::strcmp(
                     pipeline_stage,
                     "P2C_CONTINUE") == 0) {
             if (pipeline_chunk < 0 ||
-                    static_cast<size_t>(pipeline_chunk) >=
-                        region_pipe_completion_seq.size()) {
-                printf("[PHONE_REGION_CONTINUATION_REJECT] "
+                    region_pipe_chunks.find(pipeline_chunk) ==
+                        region_pipe_chunks.end()) {
+                printf("[PHONE_REGION_LOCAL_CONTINUATION_REJECT] "
                        "chunk=%d reason=INVALID_CHUNK action=STOP\n",
                        pipeline_chunk);
                 return GGML_STATUS_FAILED;
             }
-
-            const uint64_t seq =
-                region_pipe_completion_seq[
-                    static_cast<size_t>(pipeline_chunk)];
-            const ggml_backend_rpc_wait_ready_seq_t
-                wait_ready =
-                    ggml_backend_meta_get_wait_ready_seq(
-                        backend_ctx->backend_configs[1].backend);
-            if (seq == 0 || wait_ready == nullptr) {
-                printf("[PHONE_REGION_CONTINUATION_REJECT] "
-                       "chunk=%d seq=%" PRIu64
-                       " reason=MISSING_COMPLETION_CREDIT "
-                       "action=STOP\n",
-                       pipeline_chunk, seq);
-                return GGML_STATUS_FAILED;
-            }
-
-            const int64_t wait_begin_us = ggml_time_us();
-            const bool ready = wait_ready(
-                backend_ctx->backend_configs[1].backend,
-                seq);
-            const int64_t wait_us =
-                ggml_time_us() - wait_begin_us;
-            if (!ready) {
-                printf("[PHONE_REGION_CONTINUATION_REJECT] "
-                       "chunk=%d seq=%" PRIu64
-                       " reason=WAIT_FAILED action=STOP\n",
-                       pipeline_chunk, seq);
-                return GGML_STATUS_FAILED;
-            }
-
-            auto & slot =
-                backend_ctx->backend_configs[1]
-                    .phone_region_scratch_slots[
-                        static_cast<size_t>(pipeline_chunk) % 2];
-            if (slot.owner_chunk != pipeline_chunk ||
-                    (slot.completion_seq != 0 &&
-                     slot.completion_seq != seq)) {
-                printf("[PHONE_REGION_CONTINUATION_REJECT] "
-                       "chunk=%d seq=%" PRIu64
-                       " slot_owner=%d slot_seq=%" PRIu64
-                       " reason=SLOT_CREDIT_MISMATCH "
-                       "action=STOP\n",
-                       pipeline_chunk, seq,
-                       slot.owner_chunk,
-                       slot.completion_seq);
-                return GGML_STATUS_FAILED;
-            }
-
-            slot.owner_chunk = -1;
-            slot.completion_seq = 0;
-            region_pipe_completion_seq[
-                static_cast<size_t>(pipeline_chunk)] = 0;
-
             if (pipeline_debug) {
-                printf("[PHONE_REGION_CONTINUATION_WAIT] "
-                       "chunk=%d seq=%" PRIu64
-                       " slot=%zu wait_ms=%.3f "
-                       "slot_released=1 status=READY\n",
-                       pipeline_chunk, seq,
-                       static_cast<size_t>(pipeline_chunk) % 2,
-                       wait_us / 1000.0);
+                printf("[PHONE_REGION_LOCAL_CONTINUATION] "
+                       "chunk=%d slot=%zu "
+                       "dependency=PHONE_COMPUTE_FIFO "
+                       "pc_completion_wait=0 status=QUEUED\n",
+                       pipeline_chunk,
+                       static_cast<size_t>(pipeline_chunk) % 2);
             }
         }
 
@@ -16561,26 +16513,18 @@ auto prefill_norm_sg_has_prework =
                 phone_cfg.phone_region_scratch_slots[
                     slot_index];
 
-            // Every Region chunk now publishes a producer-completion credit
-            // for its own L46 continuation. Chunks whose scratch slot will be
-            // reused also expose the same seq as a slot credit; the
-            // continuation consumes it first and releases the slot, so later
-            // reuse no longer needs a global/device fence.
+            // Region completion is NOT a continuation/scheduling event.
+            // Publish a seq only when this scratch slot will be reused by
+            // chunk N+2. The marker is ordered after Region on the same
+            // COMPUTE socket, so bind_phone_region_scratch() can wait for
+            // exactly the old slot owner without draining the Phone queue.
+            // L46 never reads or waits on this seq.
             const bool will_reuse_slot =
                 phone_region_chunk_id >= 0 &&
                 static_cast<size_t>(
                     phone_region_chunk_id + 2) <
                     region_pipe_chunks.size();
-            const auto continuation_it =
-                region_pipe_chunks.find(
-                    phone_region_chunk_id);
-            const bool has_continuation =
-                continuation_it !=
-                    region_pipe_chunks.end() &&
-                continuation_it->second
-                        .continuation_begin_sg <
-                    region_pipe_invalid_sg;
-            if (has_continuation || will_reuse_slot) {
+            if (will_reuse_slot) {
                 constexpr uint64_t REGION_SEQ_PREFIX =
                     0xA000000000000000ULL;
                 constexpr uint64_t REGION_SEQ_MASK =
@@ -16608,44 +16552,26 @@ auto prefill_norm_sg_has_prework =
                     mark_ready != nullptr &&
                     mark_ready(phone_cfg.backend, seq);
                 if (!marked) {
-                    printf("[PHONE_REGION_CONTINUATION_REJECT] "
-                           "chunk=%d seq=%" PRIu64
+                    printf("[PHONE_REGION_SLOT_CREDIT_REJECT] "
+                           "chunk=%d slot=%zu seq=%" PRIu64
                            " reason=MARK_FAILED action=STOP\n",
-                           phone_region_chunk_id, seq);
+                           phone_region_chunk_id,
+                           slot_index,
+                           seq);
                     return GGML_STATUS_FAILED;
                 }
 
-                if (has_continuation) {
-                    GGML_ASSERT(
-                        phone_region_chunk_id >= 0 &&
-                        static_cast<size_t>(
-                            phone_region_chunk_id) <
-                            region_pipe_completion_seq.size());
-                    region_pipe_completion_seq[
-                        static_cast<size_t>(
-                            phone_region_chunk_id)] = seq;
-                }
-                if (will_reuse_slot) {
-                    slot.completion_seq = seq;
-                }
+                slot.completion_seq = seq;
 
-                if (pipeline_debug && will_reuse_slot) {
+                if (pipeline_debug) {
                     printf("[PHONE_REGION_SLOT_CREDIT] "
                            "chunk=%d slot=%zu seq=%" PRIu64
-                           " marked=1 future_chunk=%d\n",
+                           " marked=1 future_chunk=%d "
+                           "purpose=BUFFER_REUSE_ONLY\n",
                            phone_region_chunk_id,
                            slot_index,
                            seq,
                            phone_region_chunk_id + 2);
-                }
-                if (pipeline_debug && has_continuation) {
-                    printf("[PHONE_REGION_CONTINUATION_CREDIT] "
-                           "chunk=%d seq=%" PRIu64
-                           " marked=1 p2c_sg=%zu\n",
-                           phone_region_chunk_id,
-                           seq,
-                           continuation_it->second
-                               .continuation_begin_sg);
                 }
             }
         }
