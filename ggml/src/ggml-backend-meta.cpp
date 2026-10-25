@@ -2326,6 +2326,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 
 struct ggml_backend_meta_compute_workers;
 struct ggml_backend_meta_transfer_worker;
+struct ggml_backend_meta_pc_ready_worker;
 
 struct ggml_backend_meta_context;
 static bool ggml_backend_meta_tensor_phone_primary_layer(
@@ -2445,6 +2446,9 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
+    // Two-level PC scheduler for PC-primary Tensor prefill.
+    // HIGH is reserved for Reduce; NORMAL contains Attention/PC-FFN work.
+    ggml_backend_meta_pc_ready_worker * pc_ready_worker = nullptr;
     // V1 endpoint separation: ordinary PC-primary Tensor FFN work destined
     // for Phone is submitted through its own FIFO instead of borrowing the
     // PC Meta compute-worker control path. Completion is consumed on a
@@ -2718,6 +2722,164 @@ struct ggml_backend_meta_transfer_worker {
         std::unique_lock<std::mutex> lock(mutex);
         stage_cv.wait(lock, [&]() { return stage_ready >= id || completed >= id; });
         return status;
+    }
+};
+
+struct ggml_backend_meta_pc_ready_worker {
+    enum class priority : uint8_t {
+        HIGH = 0,
+        NORMAL = 1,
+    };
+
+    struct task {
+        uint64_t id = 0;
+        priority prio = priority::NORMAL;
+        std::function<ggml_status(uint64_t)> run;
+        std::string kind;
+        int layer = -1;
+        int chunk = -1;
+        size_t sg = SIZE_MAX;
+        int64_t enqueue_us = 0;
+        bool debug = false;
+    };
+
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    std::deque<task> high_tasks;
+    std::deque<task> normal_tasks;
+    std::map<uint64_t, ggml_status> completed_status;
+    uint64_t submitted = 0;
+    bool stop = false;
+
+    ggml_backend_meta_pc_ready_worker() : worker([this]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            task_cv.wait(lock, [&]() {
+                return stop || !high_tasks.empty() || !normal_tasks.empty();
+            });
+            if (stop && high_tasks.empty() && normal_tasks.empty()) {
+                return;
+            }
+
+            task current;
+            if (!high_tasks.empty()) {
+                current = std::move(high_tasks.front());
+                high_tasks.pop_front();
+            } else {
+                current = std::move(normal_tasks.front());
+                normal_tasks.pop_front();
+            }
+            const size_t high_pending = high_tasks.size();
+            const size_t normal_pending = normal_tasks.size();
+            lock.unlock();
+
+            const int64_t begin_us = ggml_time_us();
+            if (current.debug) {
+                printf(
+                    "[PC_READY_QUEUE] event=BEGIN queue=%s kind=%s "
+                    "task=%" PRIu64 " layer=%d chunk=%d sg=%zu "
+                    "queue_ms=%.3f high_pending=%zu normal_pending=%zu\n",
+                    current.prio == priority::HIGH ? "HIGH" : "NORMAL",
+                    current.kind.c_str(),
+                    current.id,
+                    current.layer,
+                    current.chunk,
+                    current.sg,
+                    (begin_us - current.enqueue_us) / 1000.0,
+                    high_pending,
+                    normal_pending);
+            }
+
+            const ggml_status status = current.run(current.id);
+            const int64_t end_us = ggml_time_us();
+
+            lock.lock();
+            completed_status[current.id] = status;
+            if (current.debug) {
+                printf(
+                    "[PC_READY_QUEUE] event=END queue=%s kind=%s "
+                    "task=%" PRIu64 " layer=%d chunk=%d sg=%zu "
+                    "exec_ms=%.3f status=%d\n",
+                    current.prio == priority::HIGH ? "HIGH" : "NORMAL",
+                    current.kind.c_str(),
+                    current.id,
+                    current.layer,
+                    current.chunk,
+                    current.sg,
+                    (end_us - begin_us) / 1000.0,
+                    (int) status);
+            }
+            done_cv.notify_all();
+        }
+    }) {}
+
+    ~ggml_backend_meta_pc_ready_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        task_cv.notify_one();
+        worker.join();
+    }
+
+    uint64_t enqueue(
+            priority prio,
+            std::function<ggml_status(uint64_t)> run,
+            const char * kind,
+            int layer,
+            int chunk,
+            size_t sg,
+            bool debug) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint64_t id = ++submitted;
+        task queued;
+        queued.id = id;
+        queued.prio = prio;
+        queued.run = std::move(run);
+        queued.kind = kind != nullptr ? kind : "UNKNOWN";
+        queued.layer = layer;
+        queued.chunk = chunk;
+        queued.sg = sg;
+        queued.enqueue_us = ggml_time_us();
+        queued.debug = debug;
+        if (prio == priority::HIGH) {
+            high_tasks.push_back(std::move(queued));
+        } else {
+            normal_tasks.push_back(std::move(queued));
+        }
+        if (debug) {
+            printf(
+                "[PC_READY_QUEUE] event=ENQUEUE queue=%s kind=%s "
+                "task=%" PRIu64 " layer=%d chunk=%d sg=%zu "
+                "high_pending=%zu normal_pending=%zu\n",
+                prio == priority::HIGH ? "HIGH" : "NORMAL",
+                kind != nullptr ? kind : "UNKNOWN",
+                id,
+                layer,
+                chunk,
+                sg,
+                high_tasks.size(),
+                normal_tasks.size());
+        }
+        task_cv.notify_one();
+        return id;
+    }
+
+    ggml_status wait(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&]() {
+            return completed_status.find(id) != completed_status.end();
+        });
+        const ggml_status status = completed_status.at(id);
+        completed_status.erase(id);
+        return status;
+    }
+
+    bool is_completed(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completed_status.find(id) != completed_status.end();
     }
 };
 
@@ -3087,6 +3249,7 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 }
 
 ggml_backend_meta_context::~ggml_backend_meta_context() {
+    delete pc_ready_worker;
     delete compute_workers;
     delete transfer_worker;
     delete phone_exec_completion_worker;
@@ -5909,6 +6072,88 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
         }
+    }
+
+    const char * pc_ready_queue_v1_env =
+        std::getenv("GGML_META_PC_READY_QUEUE_V1");
+    const bool pc_ready_queue_v1_requested =
+        pc_ready_queue_v1_env != nullptr &&
+        std::atoi(pc_ready_queue_v1_env) != 0;
+    const bool pc_ready_queue_v1 =
+        pc_ready_queue_v1_requested &&
+        pc_phone_exec_v1 &&
+        return_wavefront_graph &&
+        n_backends == 2;
+
+    auto ensure_pc_ready_worker =
+        [&]() -> ggml_backend_meta_pc_ready_worker * {
+            if (backend_ctx->pc_ready_worker == nullptr) {
+                backend_ctx->pc_ready_worker =
+                    new ggml_backend_meta_pc_ready_worker();
+            }
+            return backend_ctx->pc_ready_worker;
+        };
+
+    auto enqueue_pc_normal_graph =
+        [&](ggml_cgraph * graph,
+            const char * kind,
+            int layer,
+            int chunk,
+            size_t sg) -> uint64_t {
+            GGML_ASSERT(pc_ready_queue_v1);
+            GGML_ASSERT(graph != nullptr);
+            ggml_backend_t pc_backend =
+                backend_ctx->backend_configs[0].backend;
+            return ensure_pc_ready_worker()->enqueue(
+                ggml_backend_meta_pc_ready_worker::priority::NORMAL,
+                [pc_backend, graph](uint64_t) -> ggml_status {
+                    return ggml_backend_graph_compute_async(
+                        pc_backend, graph);
+                },
+                kind,
+                layer,
+                chunk,
+                sg,
+                pipeline_debug);
+        };
+
+    auto enqueue_pc_high_reduce =
+        [&](ggml_cgraph * graph,
+            int layer,
+            int chunk,
+            size_t sg) -> uint64_t {
+            GGML_ASSERT(pc_ready_queue_v1);
+            GGML_ASSERT(graph != nullptr);
+            ggml_backend_t pc_backend =
+                backend_ctx->backend_configs[0].backend;
+            return ensure_pc_ready_worker()->enqueue(
+                ggml_backend_meta_pc_ready_worker::priority::HIGH,
+                [pc_backend, graph](uint64_t) -> ggml_status {
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(
+                            pc_backend, graph);
+                    if (status == GGML_STATUS_SUCCESS) {
+                        // HIGH Reduce completion is the exact DOWN_READY fence.
+                        ggml_backend_synchronize(pc_backend);
+                    }
+                    return status;
+                },
+                "REDUCE",
+                layer,
+                chunk,
+                sg,
+                pipeline_debug);
+        };
+
+    if (pipeline_debug && pc_ready_queue_v1_requested) {
+        printf(
+            "[PC_READY_QUEUE_PLAN] requested=1 active=%d "
+            "queues=HIGH_REDUCE,NORMAL_COMPUTE "
+            "normal=ATTN_OR_PC_FFN phone=DEDICATED_FIFO "
+            "wavefront=%d pc_phone_exec_v1=%d\n",
+            pc_ready_queue_v1 ? 1 : 0,
+            return_wavefront_graph ? 1 : 0,
+            pc_phone_exec_v1 ? 1 : 0);
     }
 
     int64_t return_wave_dependency_wait_count  = 0;
@@ -11660,27 +11905,69 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     record_copy_wait(copy_us);
                     record_meta_copy(i, 1, 0, node_src, copy_us);
 
-                    const int64_t add_start_us = ggml_time_us();
-                    const ggml_status status = ggml_backend_graph_compute_async(
-                        bcj_dst.backend, cgraph_aux);
-                    const int64_t add_us = ggml_time_us() - add_start_us;
-                    reduce_add_submit_us = add_us;
-                    record_reduce_add(add_us, status == GGML_STATUS_SUCCESS);
+                    ggml_status status = GGML_STATUS_SUCCESS;
+                    if (pc_ready_queue_v1 &&
+                            return_wavefront_graph &&
+                            !handoff_to_phone) {
+                        const int64_t enqueue_begin_us = ggml_time_us();
+                        const uint64_t ready_task =
+                            enqueue_pc_high_reduce(
+                                cgraph_aux,
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                i);
+                        reduce_add_submit_us =
+                            ggml_time_us() - enqueue_begin_us;
+                        const int64_t reduce_wait_start_us =
+                            ggml_time_us();
+                        status =
+                            ensure_pc_ready_worker()->wait(
+                                ready_task);
+                        reduce_sync_us =
+                            ggml_time_us() - reduce_wait_start_us;
+                        record_reduce_add(
+                            reduce_add_submit_us,
+                            status == GGML_STATUS_SUCCESS);
+                    } else {
+                        const int64_t add_start_us = ggml_time_us();
+                        status = ggml_backend_graph_compute_async(
+                            bcj_dst.backend, cgraph_aux);
+                        const int64_t add_us =
+                            ggml_time_us() - add_start_us;
+                        reduce_add_submit_us = add_us;
+                        record_reduce_add(
+                            add_us,
+                            status == GGML_STATUS_SUCCESS);
+
+                        if (status == GGML_STATUS_SUCCESS &&
+                                return_wavefront_graph &&
+                                !handoff_to_phone) {
+                            // Legacy path: the exact DOWN_READY fence still
+                            // needs a device completion before publication.
+                            const int64_t reduce_sync_start_us =
+                                ggml_time_us();
+                            ggml_backend_synchronize(
+                                bcj_dst.backend);
+                            reduce_sync_us =
+                                ggml_time_us() -
+                                reduce_sync_start_us;
+                        }
+                    }
 
                     if (status != GGML_STATUS_SUCCESS) {
                         return finish_return(status);
                     }
 
                     if (return_wavefront_graph && !handoff_to_phone) {
-                        // The pending task is the exact DOWN_READY(L,C) fence.
-                        // Do not publish it until the PC reduce ADD is complete.
-                        const int64_t reduce_sync_start_us = ggml_time_us();
-                        ggml_backend_synchronize(bcj_dst.backend);
-                        reduce_sync_us = ggml_time_us() - reduce_sync_start_us;
                         if (pipeline_debug) {
                             GGML_LOG_INFO(
-                                "[RETURN_WAVEFRONT_DOWN_READY] layer=%d chunk=%d lane=%zu\n",
-                                prefill_down_layer_0, prefill_down_chunk_0, return_lane);
+                                "[RETURN_WAVEFRONT_DOWN_READY] "
+                                "layer=%d chunk=%d lane=%zu scheduler=%s\n",
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                return_lane,
+                                pc_ready_queue_v1 ?
+                                    "PC_READY_HIGH" : "LEGACY");
                         }
                     }
 
@@ -16786,7 +17073,26 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (c2p_parallel_ready) {
+            uint64_t pc_ready_normal_task = 0;
+            const bool ordinary_pc_ready_down =
+                pc_ready_queue_v1 &&
+                !c2p_prefill_exec &&
+                !ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, prefill_down_layer) &&
+                !layer_is_tensor_phone_primary(
+                    prefill_down_layer);
+            if (ordinary_pc_ready_down) {
+                ggml_cgraph * pc_graph =
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[i].cgraph_main;
+                pc_ready_normal_task =
+                    enqueue_pc_normal_graph(
+                        pc_graph,
+                        "PC_FFN",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i);
+            } else if (c2p_parallel_ready) {
                 compute_workers.start_graph(
                     0, c2p_pc_prefix_graph);
             } else {
@@ -16804,7 +17110,12 @@ auto prefill_norm_sg_has_prework =
                 pending_prefill_input_layer = -1;
                 pending_prefill_input_chunk = -1;
                 if (input_status != GGML_STATUS_SUCCESS) {
-                    compute_workers.wait(0);
+                    if (pc_ready_normal_task != 0) {
+                        ensure_pc_ready_worker()->wait(
+                            pc_ready_normal_task);
+                    } else {
+                        compute_workers.wait(0);
+                    }
                     if (c2p_pc_graph != nullptr) {
                         c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                     }
@@ -17010,7 +17321,11 @@ auto prefill_norm_sg_has_prework =
                     // the return/reduce worker.
                     const int64_t pc_wait_begin_us =
                         ggml_time_us();
-                    pc_status = compute_workers.wait(0);
+                    pc_status =
+                        pc_ready_normal_task != 0 ?
+                            ensure_pc_ready_worker()->wait(
+                                pc_ready_normal_task) :
+                            compute_workers.wait(0);
                     const int64_t pc_wait_us =
                         ggml_time_us() - pc_wait_begin_us;
 
@@ -17163,8 +17478,25 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
-        compute_workers.start(norm_backend, i);
-        compute_status = compute_workers.wait(norm_backend);
+        if (pc_ready_queue_v1 &&
+                norm_backend == 0 &&
+                prefill_norm_layer >= return_wavefront_first_layer) {
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            const uint64_t task =
+                enqueue_pc_normal_graph(
+                    pc_graph,
+                    "ATTN_OR_NORM",
+                    prefill_norm_layer,
+                    prefill_norm_chunk,
+                    i);
+            compute_status =
+                ensure_pc_ready_worker()->wait(task);
+        } else {
+            compute_workers.start(norm_backend, i);
+            compute_status = compute_workers.wait(norm_backend);
+        }
 
         if (direct_hidden_bound && norm_graph != nullptr) {
             norm_graph->uid = saved_norm_uid;
@@ -17189,8 +17521,25 @@ auto prefill_norm_sg_has_prework =
 
     } else if (subgraph_is_prefill_pc_only(i)) {
 
-        compute_workers.start(0, i);
-        compute_status = compute_workers.wait(0);
+        const int pc_only_layer = subgraph_layer(i);
+        if (pc_ready_queue_v1 &&
+                pc_only_layer >= return_wavefront_first_layer) {
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            const uint64_t task =
+                enqueue_pc_normal_graph(
+                    pc_graph,
+                    "ATTN_OR_PC",
+                    pc_only_layer,
+                    -1,
+                    i);
+            compute_status =
+                ensure_pc_ready_worker()->wait(task);
+        } else {
+            compute_workers.start(0, i);
+            compute_status = compute_workers.wait(0);
+        }
 
         if (pipeline_debug) {
             ggml_cgraph * graph =
