@@ -15858,6 +15858,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 const auto & first =
                     region_pipe_chunks.at(0);
                 add_sg(first.norm_sg);
+                if (phone_main_local_active) {
+                    // Chunk0 needs the same private PC Router/FFN preparation
+                    // as future chunks. Without this synthetic pass the first
+                    // real C2P down SG would fall back to the legacy dual
+                    // compute path and bypass PHONE_C2P_READY.
+                    add_pc_prep(first.down_sg, 0);
+                }
                 add_sg(first.down_sg);
                 add_region(first);
 
