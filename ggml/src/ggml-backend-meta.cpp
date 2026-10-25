@@ -14130,6 +14130,7 @@ auto prefill_norm_sg_has_prework =
         if (phone_region_chunk_id >= 0) {
             bool found_end = false;
             bool found_phone_compute = false;
+            size_t pc_view_only_nodes = 0;
             for (size_t sg = i; sg < backend_ctx->n_subgraphs && !found_end; ++sg) {
                 ggml_cgraph * pc_part =
                     backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
@@ -14141,16 +14142,30 @@ auto prefill_norm_sg_has_prework =
                     const ggml_tensor * pc_node = pc_part->nodes[k];
                     const ggml_tensor * phone_node = phone_part->nodes[k];
                     if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
-                        printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
-                               "node=%s op=%s pc_elems=%" PRId64
-                               " phone_elems=%" PRId64 " phone_compute=%d "
-                               "reason=PC_COMPUTE_ACTIVE action=STOP\n",
-                               phone_region_chunk_id, sg, pc_node->name,
-                               ggml_op_name(pc_node->op),
-                               ggml_nelements(pc_node),
-                               ggml_nelements(phone_node),
-                               (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0);
-                        return GGML_STATUS_FAILED;
+                        // VIEW/RESHAPE/PERMUTE/TRANSPOSE only describe
+                        // tensor layout and do not execute a PC kernel.
+                        // They may inherit mirrored PC flags from the
+                        // pre-region C2P buffer. Do NOT waive real ops:
+                        // in particular CONT is a real copy and unsafe.
+                        const bool pc_metadata_only =
+                            pc_node->op == GGML_OP_VIEW ||
+                            pc_node->op == GGML_OP_RESHAPE ||
+                            pc_node->op == GGML_OP_PERMUTE ||
+                            pc_node->op == GGML_OP_TRANSPOSE;
+                        if (pc_metadata_only) {
+                            ++pc_view_only_nodes;
+                        } else {
+                            printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
+                                   "node=%s op=%s pc_elems=%" PRId64
+                                   " phone_elems=%" PRId64 " phone_compute=%d "
+                                   "reason=PC_COMPUTE_ACTIVE action=STOP\n",
+                                   phone_region_chunk_id, sg, pc_node->name,
+                                   ggml_op_name(pc_node->op),
+                                   ggml_nelements(pc_node),
+                                   ggml_nelements(phone_node),
+                                   (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0);
+                            return GGML_STATUS_FAILED;
+                        }
                     }
                     found_phone_compute =
                         found_phone_compute ||
@@ -14195,6 +14210,13 @@ auto prefill_norm_sg_has_prework =
                        phone_region_chunk_id, i,
                        !found_end ? "END_NOT_FOUND" : "NO_PHONE_COMPUTE");
                 return GGML_STATUS_FAILED;
+            }
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_GRAPH_OWNERSHIP] chunk=%d "
+                       "sg=%zu..%zu pc_metadata_only=%zu "
+                       "pc_compute=0 status=SAFE\n",
+                       phone_region_chunk_id, i, phone_block_end,
+                       pc_view_only_nodes);
             }
             phone_block_fused = true;
             phone_region_fused = true;
