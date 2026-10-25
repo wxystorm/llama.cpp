@@ -67,18 +67,15 @@ def main() -> int:
     observed = [(int(m.group(1)), m.group(2)) for m in begin_re.finditer(block)]
 
     expected = [
-        (0, "C2P_NORM"),
-        (0, "C2P_FFN_REDUCE"),
-        (0, "PHONE_REGION"),
+        (c, stage)
+        for c in range(n_chunks)
+        for stage in (
+            "C2P_NORM",
+            "C2P_FFN_REDUCE",
+            "PHONE_REGION",
+            "P2C_CONTINUE",
+        )
     ]
-    for c in range(1, n_chunks):
-        expected.extend([
-            (c, "C2P_NORM"),
-            (c - 1, "P2C_CONTINUE"),
-            (c, "C2P_FFN_REDUCE"),
-            (c, "PHONE_REGION"),
-        ])
-    expected.append((n_chunks - 1, "P2C_CONTINUE"))
 
     if observed != expected:
         print(f"FAIL: stage order mismatch\nexpected={expected}\nobserved={observed}")
@@ -98,6 +95,7 @@ def main() -> int:
         "PHONE_REGION_GRAPH_REJECT",
         "PHONE_REGION_SCRATCH_REJECT",
         "PHONE_REGION_CONTINUATION_REJECT",
+        "PREFILL_INPUT_PARK",
         "Compute error",
     ):
         if bad in block:
