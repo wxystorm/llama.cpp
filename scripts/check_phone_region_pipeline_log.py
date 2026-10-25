@@ -31,7 +31,8 @@ def main() -> int:
 
     plan_re = re.compile(
         r"\[PHONE_REGION_PIPE_PLAN\] active=(\d+) window=(\d+) "
-        r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) reason=([^\s]+)"
+        r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
+        r"(?:scratch_pool=(\d+) )?reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -40,7 +41,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(6)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(7)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -77,13 +78,38 @@ def main() -> int:
         if found != list(range(n_chunks)):
             print(f"FAIL: {event} chunks={found}; expected 0..{n_chunks - 1}")
             return 1
-    for bad in ("PHONE_REGION_GRAPH_REJECT", "PHONE_REGION_PIPE_ALIAS", "Compute error"):
+    for bad in ("PHONE_REGION_GRAPH_REJECT", "PHONE_REGION_SCRATCH_REJECT", "Compute error"):
         if bad in block:
             print(f"FAIL: found {bad}")
             return 1
 
+    scratch = list(re.finditer(
+        r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?status=BOUND",
+        block,
+    ))
+    if len(scratch) != n_chunks:
+        print(f"FAIL: scratch bindings={len(scratch)}; expected {n_chunks}")
+        return 1
+    slots = [(int(m.group(1)), int(m.group(2))) for m in scratch]
+    expected_slots = [(c, c % 2) for c in range(n_chunks)]
+    if slots != expected_slots:
+        print(f"FAIL: scratch slot order={slots}; expected={expected_slots}")
+        return 1
+
+    outputs = [
+        int(m.group(1))
+        for m in re.finditer(
+            r"\[PHONE_REGION_OUTPUT_SLOT\] chunk=(\d+).*?status=BOUND",
+            block,
+        )
+    ]
+    if outputs != list(range(n_chunks)):
+        print(f"FAIL: output slots={outputs}; expected 0..{n_chunks - 1}")
+        return 1
+
     print(f"PASS: {n_chunks} C2P -> Phone Region stages are interleaved "
           f"(window=2, {plan.group(4)} Meta schedule entries)")
+    print("PASS: window-2 Phone scratch slots and persistent chunk outputs are bound")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
     print("NOTE: this does not verify GPU kernel duration, KV parity or logits")
     return 0
