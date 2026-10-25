@@ -12890,6 +12890,174 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
         if (eligible) {
+            // Allocate every Region scratch/output buffer BEFORE the first
+            // Region graph is submitted. Allocating RPC/OpenCL buffers while
+            // a previous Region is running can serialize on the Phone GPU
+            // allocator/queue and turn a cheap host stage into ~700 ms.
+            const int64_t pool_prep_begin_us = ggml_time_us();
+            auto & phone_cfg = backend_ctx->backend_configs[1];
+            std::array<size_t, 2> slot_bytes { 0, 0 };
+            size_t output_bytes = 0;
+            size_t output_count = 0;
+            bool prep_ok = true;
+
+            for (size_t c = 0;
+                    c < region_pipe_chunks.size() && prep_ok; ++c) {
+                const auto & e = region_pipe_chunks.at((int) c);
+                char out_name[96];
+                std::snprintf(
+                    out_name, sizeof(out_name),
+                    "phone_region_chunk_end_%zu-45", c);
+                ggml_tensor * output =
+                    find_sg_named_tensor(1, e.end_sg, out_name);
+                ggml_tensor * output_root =
+                    phone_region_root(output);
+                if (output_root == nullptr ||
+                        output_root->buffer == nullptr ||
+                        output_root->data == nullptr) {
+                    prep_ok = false;
+                    region_pipe_reason =
+                        "POOL_OUTPUT_UNAVAILABLE";
+                    break;
+                }
+
+                if (phone_cfg.phone_region_output_bufs.size() <= c) {
+                    phone_cfg.phone_region_output_bufs.resize(c + 1);
+                }
+                const size_t output_need =
+                    ggml_backend_buffer_get_alloc_size(
+                        output_root->buffer, output_root);
+                auto & output_buf =
+                    phone_cfg.phone_region_output_bufs[c];
+                if (!output_buf ||
+                        ggml_backend_buffer_get_size(output_buf.get()) <
+                            output_need) {
+                    output_buf.reset(
+                        ggml_backend_alloc_buffer(
+                            phone_cfg.backend, output_need));
+                }
+                if (!output_buf) {
+                    prep_ok = false;
+                    region_pipe_reason =
+                        "POOL_OUTPUT_ALLOC_FAILED";
+                    break;
+                }
+                output_bytes +=
+                    ggml_backend_buffer_get_size(output_buf.get());
+                ++output_count;
+
+                const size_t slot_index = c % 2;
+                auto & slot =
+                    phone_cfg.phone_region_scratch_slots[slot_index];
+                std::set<ggml_backend_buffer_t> source_arenas;
+
+                for (size_t sg = e.begin_sg;
+                        sg <= e.end_sg; ++sg) {
+                    ggml_cgraph * graph =
+                        phone_cfg.cgraphs[sg].cgraph_main;
+                    if (graph == nullptr) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "POOL_REGION_GRAPH_MISSING";
+                        break;
+                    }
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        ggml_tensor * node = graph->nodes[k];
+                        if (node == nullptr ||
+                                !(node->flags &
+                                    GGML_TENSOR_FLAG_COMPUTE) ||
+                                node->view_src != nullptr ||
+                                node->op == GGML_OP_NONE) {
+                            continue;
+                        }
+                        ggml_tensor * root =
+                            phone_region_root(node);
+                        if (root == nullptr ||
+                                root == output_root) {
+                            continue;
+                        }
+                        if (root->buffer == nullptr ||
+                                root->data == nullptr) {
+                            prep_ok = false;
+                            region_pipe_reason =
+                                "POOL_SCRATCH_SOURCE_MISSING";
+                            break;
+                        }
+                        source_arenas.insert(root->buffer);
+                    }
+                    if (!prep_ok) {
+                        break;
+                    }
+                }
+
+                for (ggml_backend_buffer_t source :
+                        source_arenas) {
+                    auto it = std::find_if(
+                        slot.arenas.begin(), slot.arenas.end(),
+                        [&](const auto & arena) {
+                            return arena.source_buffer == source;
+                        });
+                    if (it == slot.arenas.end()) {
+                        slot.arenas.push_back({});
+                        it = std::prev(slot.arenas.end());
+                        it->source_buffer = source;
+                    }
+                    const size_t source_size =
+                        ggml_backend_buffer_get_size(source);
+                    if (!it->buffer ||
+                            ggml_backend_buffer_get_size(
+                                it->buffer.get()) < source_size) {
+                        it->buffer.reset(
+                            ggml_backend_alloc_buffer(
+                                phone_cfg.backend,
+                                source_size));
+                    }
+                    if (!it->buffer) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "POOL_SCRATCH_ALLOC_FAILED";
+                        break;
+                    }
+                }
+            }
+
+            if (prep_ok) {
+                for (size_t slot_index = 0;
+                        slot_index < 2; ++slot_index) {
+                    auto & slot =
+                        phone_cfg.phone_region_scratch_slots[
+                            slot_index];
+                    for (const auto & arena : slot.arenas) {
+                        if (arena.buffer) {
+                            slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    arena.buffer.get());
+                        }
+                    }
+                }
+            } else {
+                eligible = false;
+            }
+
+            const int64_t pool_prep_us =
+                ggml_time_us() - pool_prep_begin_us;
+            if (pipeline_debug ||
+                    (region_pipeline_env != nullptr &&
+                     std::atoi(region_pipeline_env) != 0)) {
+                printf("[PHONE_REGION_POOL_PREP] ready=%d "
+                       "outputs=%zu output_mib=%.3f "
+                       "slot0_mib=%.3f slot1_mib=%.3f "
+                       "alloc_ms=%.3f reason=%s\n",
+                       prep_ok ? 1 : 0,
+                       output_count,
+                       output_bytes / (1024.0 * 1024.0),
+                       slot_bytes[0] / (1024.0 * 1024.0),
+                       slot_bytes[1] / (1024.0 * 1024.0),
+                       pool_prep_us / 1000.0,
+                       prep_ok ? "READY" : region_pipe_reason);
+            }
+        }
+        if (eligible) {
             std::vector<bool> covered(backend_ctx->n_subgraphs, false);
             auto add_sg = [&](size_t sg) {
                 if (sg >= covered.size() || covered[sg]) {
@@ -12990,6 +13158,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         }
         const int64_t layer_wall_start_us = ggml_time_us();
+        int64_t phone_region_pre_graph_us = 0;
+        int64_t phone_region_graph_build_us = 0;
+        int64_t phone_region_output_bind_us = 0;
+        int64_t phone_region_scratch_bind_us = 0;
+        int64_t phone_region_submit_us = 0;
+        int64_t phone_region_submit_done_us = 0;
         const auto backend_times_before = backend_times_snapshot();
         const int64_t copy_0to1_before = n_backends > 1 ? copy_time_snapshot(0, 1) : 0;
         const int64_t copy_1to0_before = n_backends > 1 ? copy_time_snapshot(1, 0) : 0;
@@ -14897,9 +15071,19 @@ auto prefill_norm_sg_has_prework =
                 timing_last_layer = phone_block_last_layer;
             }
         }
+        const int64_t phone_region_build_begin_us =
+            phone_region_fused ? ggml_time_us() : 0;
+        if (phone_region_fused) {
+            phone_region_pre_graph_us =
+                phone_region_build_begin_us - layer_wall_start_us;
+        }
         ggml_cgraph * phone_graph = phone_block_fused ?
             build_phone_block_graph(i, phone_block_end) :
             backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (phone_region_fused) {
+            phone_region_graph_build_us =
+                ggml_time_us() - phone_region_build_begin_us;
+        }
         communication_sg = phone_block_fused ? phone_block_end : i;
 
         int direct_route_chunk = -1;
@@ -14953,9 +15137,15 @@ auto prefill_norm_sg_has_prework =
             ggml_tensor * region_output =
                 find_sg_named_tensor(
                     1, phone_block_end, output_name);
-            if (region_output == nullptr ||
-                    !bind_phone_region_output(
-                        phone_region_chunk_id, region_output)) {
+            const int64_t output_bind_begin_us =
+                ggml_time_us();
+            const bool output_bound =
+                region_output != nullptr &&
+                bind_phone_region_output(
+                    phone_region_chunk_id, region_output);
+            phone_region_output_bind_us =
+                ggml_time_us() - output_bind_begin_us;
+            if (!output_bound) {
                 printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
                        "reason=OUTPUT_BIND_FAILED action=STOP\n",
                        phone_region_chunk_id);
@@ -14963,10 +15153,16 @@ auto prefill_norm_sg_has_prework =
             }
             const size_t slot_index =
                 static_cast<size_t>(phone_region_chunk_id) % 2;
-            if (!bind_phone_region_scratch(
+            const int64_t scratch_bind_begin_us =
+                ggml_time_us();
+            const bool scratch_bound =
+                bind_phone_region_scratch(
                     phone_graph, phone_region_chunk_id,
                     slot_index, region_output,
-                    phone_region_scratch_backups)) {
+                    phone_region_scratch_backups);
+            phone_region_scratch_bind_us =
+                ggml_time_us() - scratch_bind_begin_us;
+            if (!scratch_bound) {
                 restore_region_bindings(
                     phone_region_scratch_backups);
                 printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
@@ -14991,6 +15187,13 @@ auto prefill_norm_sg_has_prework =
                 phone_graph->uid = 1;
             }
             phone_region_uid_rebound = true;
+            if (pipeline_debug) {
+                printf("[PHONE_REGION_CACHE_KEY] chunk=%d "
+                       "slot=%zu uid=%" PRIu64
+                       " policy=PERSISTENT_SLOT_UID\n",
+                       phone_region_chunk_id, slot_index,
+                       phone_graph->uid);
+            }
         }
 
         const int64_t phone_submit_begin_us = ggml_time_us();
@@ -15235,6 +15438,12 @@ auto prefill_norm_sg_has_prework =
         }
 
         const int64_t phone_submit_end_us = ggml_time_us();
+        if (phone_region_fused) {
+            phone_region_submit_us =
+                phone_submit_end_us - phone_submit_begin_us;
+            phone_region_submit_done_us =
+                phone_submit_end_us;
+        }
         if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_END] layers=%d..%d t=%" PRId64 " dur=%.3f ms\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_end_us,
@@ -15833,6 +16042,41 @@ auto prefill_norm_sg_has_prework =
             // Return-wavefront Attention is its own subgraph.  It must be
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
+        }
+
+        if (region_pipeline_active && pipeline_debug &&
+                pipeline_stage != nullptr &&
+                std::strcmp(
+                    pipeline_stage, "PHONE_REGION") == 0) {
+            const int64_t breakdown_now_us = ggml_time_us();
+            const int64_t post_submit_us =
+                phone_region_submit_done_us > 0 ?
+                    breakdown_now_us -
+                        phone_region_submit_done_us : 0;
+            const int64_t total_us =
+                breakdown_now_us - layer_wall_start_us;
+            const int64_t accounted_us =
+                phone_region_pre_graph_us +
+                phone_region_graph_build_us +
+                phone_region_output_bind_us +
+                phone_region_scratch_bind_us +
+                phone_region_submit_us +
+                post_submit_us;
+            printf("[PHONE_REGION_HOST_BREAKDOWN] chunk=%d "
+                   "pre_graph_ms=%.3f graph_build_ms=%.3f "
+                   "output_bind_ms=%.3f scratch_bind_ms=%.3f "
+                   "submit_ms=%.3f post_submit_ms=%.3f "
+                   "other_ms=%.3f total_ms=%.3f\n",
+                   pipeline_chunk,
+                   phone_region_pre_graph_us / 1000.0,
+                   phone_region_graph_build_us / 1000.0,
+                   phone_region_output_bind_us / 1000.0,
+                   phone_region_scratch_bind_us / 1000.0,
+                   phone_region_submit_us / 1000.0,
+                   post_submit_us / 1000.0,
+                   std::max<int64_t>(
+                       0, total_us - accounted_us) / 1000.0,
+                   total_us / 1000.0);
         }
 
         if (region_pipeline_active && pipeline_debug &&
