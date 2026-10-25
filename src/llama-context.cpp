@@ -2918,13 +2918,169 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 }
             }
 
-            result = run_hybrid_stage_block(
-                ubatch, stage, token_begin, block_tokens, stage_input, stage_output, gtype, mctx, sched_use,
-                res_use, ubatch_id, stage_index, block_index, block.action, block_outputs, apply_mctx, true, ret,
-                (profile_cpu || profile_tensor) ? &stage_timing : nullptr);
-            if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
-                finish(ret);
-                return nullptr;
+            const bool region_cuda_stage =
+                region_cuda_mirror != nullptr &&
+                stage.kind ==
+                    llama_hybrid_runtime_stage_kind::GPU;
+            if (region_cuda_stage) {
+                if (last_stage || stage_output == nullptr ||
+                        ubatch.pos == nullptr) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                        "reason=FINAL_OR_POSITION_UNSUPPORTED "
+                        "status=FAIL\n",
+                        ubatch_id, stage_index);
+                    finish(GGML_STATUS_FAILED);
+                    return nullptr;
+                }
+
+                std::vector<float> mirror_input;
+                if (first_stage) {
+                    if (ubatch.embd != nullptr) {
+                        const size_t offset =
+                            static_cast<size_t>(token_begin) *
+                            static_cast<size_t>(n_embd);
+                        const size_t count =
+                            static_cast<size_t>(block_tokens) *
+                            static_cast<size_t>(n_embd);
+                        mirror_input.assign(
+                            ubatch.embd + offset,
+                            ubatch.embd + offset + count);
+                    } else if (ubatch.token != nullptr) {
+                        std::vector<llama_token> tokens;
+                        tokens.reserve(block_tokens);
+                        for (uint32_t ti = 0;
+                                ti < block_tokens; ++ti) {
+                            tokens.push_back(
+                                ubatch.token[
+                                    token_begin + ti]);
+                        }
+                        std::string embed_reason;
+                        if (!llama_hybrid_cycle_embed_tokens(
+                                model, backend_cpu,
+                                tokens, mirror_input,
+                                embed_reason)) {
+                            LLAMA_LOG_ERROR(
+                                "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                                "reason=EMBED_%s status=FAIL\n",
+                                ubatch_id, stage_index,
+                                embed_reason.c_str());
+                            finish(GGML_STATUS_FAILED);
+                            return nullptr;
+                        }
+                    } else {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                            "reason=NO_TOKEN_OR_EMBD status=FAIL\n",
+                            ubatch_id, stage_index);
+                        finish(GGML_STATUS_FAILED);
+                        return nullptr;
+                    }
+                } else {
+                    const size_t count =
+                        static_cast<size_t>(block_tokens) *
+                        static_cast<size_t>(n_embd);
+                    mirror_input.assign(
+                        stage_input,
+                        stage_input + count);
+                }
+
+                const int64_t absolute_start =
+                    ubatch.pos[token_begin];
+                bool contiguous_positions = true;
+                for (uint32_t ti = 0;
+                        ti < block_tokens; ++ti) {
+                    contiguous_positions =
+                        contiguous_positions &&
+                        ubatch.pos[token_begin + ti] ==
+                            absolute_start +
+                                static_cast<int64_t>(ti);
+                }
+                if (!contiguous_positions) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                        "reason=NONCONTIGUOUS_POS status=FAIL\n",
+                        ubatch_id, stage_index);
+                    finish(GGML_STATUS_FAILED);
+                    return nullptr;
+                }
+
+                std::vector<float> mirror_output;
+                std::string mirror_reason;
+                const int64_t mirror_begin_us =
+                    ggml_time_us();
+                if (!region_cuda_mirror->execute_block(
+                        stage.layer_begin,
+                        stage.layer_end,
+                        absolute_start,
+                        block_tokens,
+                        mirror_input,
+                        mirror_output,
+                        mirror_reason,
+                        std::max(
+                            1,
+                            std::min(
+                                stage.inner_chunk_tokens,
+                                128)))) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                        "layers=[%d,%d) reason=%s status=FAIL\n",
+                        ubatch_id, stage_index,
+                        stage.layer_begin,
+                        stage.layer_end,
+                        mirror_reason.c_str());
+                    finish(GGML_STATUS_FAILED);
+                    return nullptr;
+                }
+                const size_t expected =
+                    static_cast<size_t>(block_tokens) *
+                    static_cast<size_t>(n_embd);
+                if (mirror_output.size() != expected) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                        "reason=OUTPUT_SHAPE status=FAIL\n",
+                        ubatch_id, stage_index);
+                    finish(GGML_STATUS_FAILED);
+                    return nullptr;
+                }
+                std::copy(
+                    mirror_output.begin(),
+                    mirror_output.end(),
+                    stage_output);
+                LLAMA_LOG_DEBUG(
+                    "[REGION_CUDA_STAGE] ub=%d stage=%zu "
+                    "layers=[%d,%d) pos=[%lld,%lld] "
+                    "tokens=%u wall_ms=%.3f resident=%d "
+                    "loads=%llu evictions=%llu status=OK\n",
+                    ubatch_id, stage_index,
+                    stage.layer_begin,
+                    stage.layer_end,
+                    (long long) absolute_start,
+                    (long long) (
+                        absolute_start +
+                        block_tokens - 1),
+                    block_tokens,
+                    (ggml_time_us() -
+                        mirror_begin_us) / 1000.0,
+                    region_cuda_mirror->resident_layers(),
+                    (unsigned long long)
+                        region_cuda_mirror->residency_loads(),
+                    (unsigned long long)
+                        region_cuda_mirror->residency_evictions());
+                ret = GGML_STATUS_SUCCESS;
+            } else {
+                result = run_hybrid_stage_block(
+                    ubatch, stage, token_begin, block_tokens,
+                    stage_input, stage_output, gtype, mctx, sched_use,
+                    res_use, ubatch_id, stage_index, block_index,
+                    block.action, block_outputs, apply_mctx, true, ret,
+                    (profile_cpu || profile_tensor) ?
+                        &stage_timing : nullptr);
+                if (result == nullptr ||
+                        ret != GGML_STATUS_SUCCESS) {
+                    finish(ret);
+                    return nullptr;
+                }
             }
         }
 
