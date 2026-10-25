@@ -14145,7 +14145,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
                 const phone_prefill_route_task route =
                     route_it->second;
-                state.ready_seq = route.seq;
+                state.ready_seq = route.producer_seq;
                 state.ready_lane =
                     static_cast<uint32_t>(route.lane);
                 state.ready_hidden = route.src_hidden;
