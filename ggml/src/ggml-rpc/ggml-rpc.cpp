@@ -3319,6 +3319,78 @@ static bool ggml_backend_rpc_phone_region_local_submit(
     return status && response.accepted != 0;
 }
 
+
+static bool ggml_backend_rpc_phone_region_partial_get(
+        ggml_backend_t backend,
+        uint32_t slot,
+        uint64_t seq,
+        void * data,
+        size_t size) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            slot >= 2 || seq == 0 ||
+            (size != 0 && data == nullptr)) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_PHONE_REGION_PARTIAL_MIN_PATCH = 15;
+    const std::string compute_key = rpc_ctx->endpoint + "_compute";
+    if (rpc_get_remote_patch(compute_key) <
+            RPC_PHONE_REGION_PARTIAL_MIN_PATCH) {
+        return false;
+    }
+
+    rpc_msg_get_snapshot_req request {};
+    request.device = rpc_ctx->device;
+    request.slot = slot;
+    request.seq = seq;
+    request.size = size;
+
+    auto sock =
+        get_phone_region_partial_socket(
+            rpc_ctx->endpoint,
+            slot & 1u);
+    if (sock == nullptr) {
+        return false;
+    }
+
+    const int64_t begin_us = ggml_time_us();
+    bool status =
+        send_rpc_cmd_compact_small(
+            sock,
+            RPC_CMD_GET_PHONE_REGION_PARTIAL,
+            request);
+    if (!status) {
+        return false;
+    }
+
+    if (size != 0) {
+        status = sock->recv_data(data, size);
+        if (!status) {
+            return false;
+        }
+    }
+
+    if (rpc_tensor_phone_stage_profile_enabled()) {
+        std::fprintf(
+            stderr,
+            "[PHONE_REGION_PARTIAL_GET] side=pc "
+            "slot=%u seq=%" PRIu64 " bytes=%zu "
+            "wall_ms=%.3f status=OK\n",
+            slot,
+            seq,
+            size,
+            (ggml_time_us() - begin_us) / 1000.0);
+        std::fflush(stderr);
+    }
+    return true;
+}
+
 static bool ggml_backend_rpc_set_tensor_async_return_wait(
         ggml_backend_t backend_dst,
         ggml_tensor * dst,
@@ -8208,6 +8280,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_phone_region_local_submit);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_region_partial_get);
     }
     GGML_UNUSED(reg);
 
