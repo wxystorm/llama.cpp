@@ -15907,7 +15907,18 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                 phone_main_local_active = true;
             } else {
-                eligible = false;
+                // PHONE_MAIN_LOCAL is an explicit architecture request, not a
+                // best-effort hint. Phase A may already have consumed aux
+                // tensors/graphs and cached remote graphs; falling back into
+                // the legacy schedule would mix two execution plans and leave
+                // pre-created C2P state behind. No blocking RX worker has been
+                // armed yet, so this is the clean fail-closed point.
+                region_c2p_overlap_chunks.clear();
+                printf(
+                    "[PHONE_MAIN_LOCAL_REJECT] "
+                    "phase=PREP reason=%s action=STOP\n",
+                    region_pipe_reason);
+                return GGML_STATUS_FAILED;
             }
 
             printf(
