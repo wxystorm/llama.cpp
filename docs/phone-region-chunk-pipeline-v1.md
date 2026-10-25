@@ -91,7 +91,7 @@ A fallback is *not* a failure of the existing serial Phone Region graph. It inte
 
 ## Required hardware validation
 
-1. Build PC and Phone server from compatible commits as applicable; test 2-token warmup first (V1 pipeline will stay disabled with one chunk).
+1. Build PC and Phone server from compatible commits as applicable; test 2-token warmup first. **Both the Region Graph and V1 pipeline now stay disabled for a single chunk**, so warmup follows the validated legacy Phone path. This is intentional: the single-chunk Region shape was not fused and exposed a Phone-side `GGML_OP_SET_ROWS` index assertion without providing any pipeline benefit.
 2. Run the 358-token known prompt with `GGML_META_PHONE_REGION_PIPELINE=1`. Verify the stage order and all three `PHONE_REGION_GRAPH` submissions. Check full L46 P2C reduce, final logits and generated text.
 3. Disable only the pipeline flag and repeat with **Phone Region graph still enabled**. This is the controlled serial-vs-pipeline comparison using identical graph mathematics.
 4. Verify Layer 34, Layer 45 and Layer 46 outputs, chunk boundaries and KV positions if a numerical drift appears. Do not treat plausible text as conclusive parity.
