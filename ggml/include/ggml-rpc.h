@@ -168,7 +168,8 @@ using ggml_backend_rpc_phone_region_local_submit_t = bool (*)(
         const struct ggml_cgraph * fold_graph,
         const ggml_tensor * partial,
         uint64_t partial_seq,
-        uint32_t partial_slot);
+        uint32_t partial_slot,
+        uint64_t scratch_reuse_seq);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
