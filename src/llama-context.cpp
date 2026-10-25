@@ -3950,6 +3950,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+    const bool region_cycle_runtime_enabled =
+        region_cuda_mirror != nullptr &&
+        directional_region_policy &&
+        model.arch == LLM_ARCH_QWEN3MOE;
+    std::vector<llama_hybrid_runtime_stage>
+        region_cycle_stages;
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const bool stage_queue_requested = stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0;
     const bool return_wavefront_requested =
@@ -4212,7 +4218,45 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const bool stage_serial_runtime_enabled =
         stage_serial_plan_eligible && !generalized_stage_queue_runtime_enabled && n_tokens_all > 1;
     uint32_t runtime_ubatch = cparams.n_ubatch;
-    if (stage_queue_plan_eligible) {
+    if (region_cycle_runtime_enabled) {
+        runtime_ubatch =
+            std::min<uint32_t>(
+                cparams.n_ubatch, 512);
+        region_cycle_stages =
+            llama_region_cycle_build_stages(
+                model,
+                std::max<int>(
+                    1, (int) runtime_ubatch));
+        if (region_cycle_stages.size() < 2) {
+            LLAMA_LOG_ERROR(
+                "[REGION_CYCLE_EXEC] reason=INVALID_STAGE_PLAN "
+                "stages=%zu status=FAIL\n",
+                region_cycle_stages.size());
+            return -2;
+        }
+        LLAMA_LOG_INFO(
+            "[REGION_CYCLE_EXEC] mode=PC_CUDA_MIRROR_META "
+            "batch=%u ubatch=%u stages=%zu "
+            "status=READY\n",
+            n_tokens_all,
+            runtime_ubatch,
+            region_cycle_stages.size());
+        for (size_t si = 0;
+                si < region_cycle_stages.size(); ++si) {
+            const auto & stage =
+                region_cycle_stages[si];
+            LLAMA_LOG_INFO(
+                "[REGION_CYCLE_STAGE] index=%zu kind=%s "
+                "layers=[%d,%d) macro=%d inner=%d\n",
+                si,
+                llama_hybrid_runtime_stage_name(
+                    stage.kind),
+                stage.layer_begin,
+                stage.layer_end,
+                stage.macro_tokens,
+                stage.inner_chunk_tokens);
+        }
+    } else if (stage_queue_plan_eligible) {
         const uint32_t xg = std::min<uint32_t>(cparams.n_ubatch, runtime_plan.gpu_chunk_tokens);
         const uint32_t n_macros = (n_tokens_all + xg - 1) / xg;
 
