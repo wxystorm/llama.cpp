@@ -6731,6 +6731,34 @@ bool rpc_server::phone_main_register(
         }
     }
 
+    bool local_c2p_plan = false;
+    {
+        std::lock_guard<std::mutex> lock(phone_main_mutex);
+        const auto c2p_it =
+            phone_c2p_states.find(
+                std::make_pair(
+                    request.device,
+                    request.chunk));
+        local_c2p_plan =
+            c2p_it != phone_c2p_states.end();
+    }
+    if (local_c2p_plan) {
+        std::lock_guard<std::mutex> graph_lock(
+            stored_graphs_mutex);
+        const auto it =
+            stored_graphs[request.device].find(
+                request.trigger_reduce_uid);
+        if (it == stored_graphs[request.device].end() ||
+                it->second.graph == nullptr) {
+            GGML_LOG_ERROR(
+                "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
+                " status=FAIL reason=TRIGGER_GRAPH_NOT_REGISTERED\n",
+                request.chunk,
+                request.trigger_reduce_uid);
+            return false;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(phone_main_mutex);
         if (phone_main_stop) {
@@ -7052,6 +7080,23 @@ bool rpc_server::phone_c2p_partial(
             input.size() !=
                 sizeof(request) + request.size) {
         return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> graph_lock(
+            stored_graphs_mutex);
+        const auto it =
+            stored_graphs[request.device].find(
+                request.reduce_graph_uid);
+        if (it == stored_graphs[request.device].end() ||
+                it->second.graph == nullptr) {
+            GGML_LOG_ERROR(
+                "[PHONE_C2P_PARTIAL] chunk=%d reduce_uid=%" PRIu64
+                " status=FAIL reason=REDUCE_GRAPH_NOT_REGISTERED\n",
+                request.chunk,
+                request.reduce_graph_uid);
+            return false;
+        }
     }
 
     const void * data =
