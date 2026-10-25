@@ -11134,23 +11134,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     trace_component("RESIDUAL", c2p_residual);
                 }
 
-                const int64_t pc_fold_begin_us = ggml_time_us();
-                ggml_backend_synchronize(bcj_dst.backend);
-                ggml_status status =
-                    ggml_backend_graph_compute_async(
-                        bcj_dst.backend, pc_fold_graph);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
-                ggml_backend_synchronize(bcj_dst.backend);
-                const int64_t pc_fold_us =
-                    ggml_time_us() - pc_fold_begin_us;
-
                 if (phone_main_local_active) {
                     const auto main_it =
                         phone_main_local_chunks.find(
                             prefill_down_chunk_0);
-                    const auto overlap_it =
+                    auto overlap_it =
                         region_c2p_overlap_chunks.find({
                             prefill_down_layer_0,
                             prefill_down_chunk_0,
@@ -11163,8 +11151,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             !main_it->second.main_registered ||
                             !main_it->second.c2p_registered ||
                             !overlap_it->second.c2p_ready_sent ||
+                            overlap_it->second.partial_tx_task != 0 ||
                             main_it->second.c2p_reduce_uid == 0 ||
                             main_it->second.c2p_phone_pc_partial ==
+                                nullptr ||
+                            backend_ctx->phone_main_pc_worker ==
                                 nullptr) {
                         printf(
                             "[PHONE_MAIN_LOCAL_REJECT] "
@@ -11173,8 +11164,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             prefill_down_chunk_0);
                         return GGML_STATUS_FAILED;
                     }
-                    auto & main_state =
-                        main_it->second;
 
                     const ggml_backend_rpc_phone_c2p_partial_t
                         c2p_partial =
@@ -11184,57 +11173,140 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         return GGML_STATUS_FAILED;
                     }
 
-                    const int64_t send_begin_us =
-                        ggml_time_us();
-                    const bool submitted =
-                        c2p_partial(
-                            bcj_dst.backend,
-                            bcj_src.backend,
-                            prefill_down_chunk_0,
-                            main_state.c2p_reduce_uid,
-                            node_dst,
-                            main_state.c2p_phone_pc_partial);
-                    const int64_t send_us =
-                        ggml_time_us() -
-                        send_begin_us;
-                    if (!submitted) {
-                        printf(
-                            "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d reduce_uid=%" PRIu64
-                            " reason=C2P_PARTIAL_SEND_FAILED "
-                            "action=STOP\n",
-                            prefill_down_chunk_0,
-                            main_state.c2p_reduce_uid);
-                        return GGML_STATUS_FAILED;
-                    }
+                    const int chunk =
+                        prefill_down_chunk_0;
+                    const int layer =
+                        prefill_down_layer_0;
+                    const uint64_t reduce_uid =
+                        main_it->second.c2p_reduce_uid;
+                    const uint64_t consume_seq =
+                        main_it->second.c2p_consume_seq;
+                    ggml_tensor * partial_dst =
+                        main_it->second.c2p_phone_pc_partial;
+                    ggml_backend_t pc_backend =
+                        bcj_dst.backend;
+                    ggml_backend_t phone_backend =
+                        bcj_src.backend;
+                    ggml_backend_meta_priority_worker *
+                        pc_worker =
+                            backend_ctx->phone_main_pc_worker;
+                    const bool local_debug =
+                        pipeline_debug;
 
-                    record_copy_wait(send_us);
-                    record_meta_copy(
-                        i, j_dst, j_src,
-                        node_dst, send_us);
-                    record_direct_copy();
-                    reduce_add_us += pc_fold_us;
+                    const uint64_t tx_task =
+                        pc_worker->enqueue(
+                            ggml_backend_meta_priority_worker::
+                                priority::LOW,
+                            [&, pc_backend,
+                             phone_backend,
+                             pc_fold_graph,
+                             node_dst,
+                             partial_dst,
+                             c2p_partial,
+                             chunk,
+                             layer,
+                             reduce_uid,
+                             consume_seq,
+                             local_debug]
+                            (uint64_t task_id) ->
+                            ggml_status {
+                                const int64_t fold_begin_us =
+                                    ggml_time_us();
+                                const ggml_status fold_status =
+                                    ggml_backend_graph_compute(
+                                        pc_backend,
+                                        pc_fold_graph);
+                                if (fold_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return fold_status;
+                                }
+                                ggml_backend_synchronize(
+                                    pc_backend);
+                                const int64_t fold_us =
+                                    ggml_time_us() -
+                                    fold_begin_us;
+
+                                const int64_t send_begin_us =
+                                    ggml_time_us();
+                                const bool submitted =
+                                    c2p_partial(
+                                        pc_backend,
+                                        phone_backend,
+                                        chunk,
+                                        reduce_uid,
+                                        node_dst,
+                                        partial_dst);
+                                const int64_t send_us =
+                                    ggml_time_us() -
+                                    send_begin_us;
+                                if (!submitted) {
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                record_copy_wait(send_us);
+                                record_meta_copy(
+                                    i,
+                                    j_dst,
+                                    j_src,
+                                    node_dst,
+                                    send_us);
+                                record_direct_copy();
+
+                                if (local_debug) {
+                                    printf(
+                                        "[PHONE_C2P_PARTIAL_SEND] "
+                                        "layer=%d chunk=%d "
+                                        "task=%" PRIu64
+                                        " reduce_uid=%" PRIu64
+                                        " consume_seq=%" PRIu64
+                                        " bytes=%zu pc_fold_ms=%.3f "
+                                        "send_ms=%.3f "
+                                        "priority=LOW wait_phone=0 "
+                                        "next=SERVER_ADMISSION "
+                                        "status=READY\n",
+                                        layer,
+                                        chunk,
+                                        task_id,
+                                        reduce_uid,
+                                        consume_seq,
+                                        ggml_nbytes(node_dst),
+                                        fold_us / 1000.0,
+                                        send_us / 1000.0);
+                                }
+                                return GGML_STATUS_SUCCESS;
+                            });
+
+                    overlap_it->second.partial_tx_task =
+                        tx_task;
                     ++reduce_to_primary_count;
 
                     if (pipeline_debug) {
                         printf(
-                            "[PHONE_C2P_PARTIAL_SEND] "
-                            "layer=%d chunk=%d reduce_uid=%" PRIu64
-                            " consume_seq=%" PRIu64
-                            " bytes=%zu pc_fold_ms=%.3f "
-                            "send_ms=%.3f wait_phone=0 "
-                            "next=SERVER_ADMISSION status=READY\n",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0,
-                            main_state.c2p_reduce_uid,
-                            main_state.c2p_consume_seq,
-                            ggml_nbytes(node_dst),
-                            pc_fold_us / 1000.0,
-                            send_us / 1000.0);
+                            "[PHONE_C2P_PARTIAL_ENQUEUE] "
+                            "layer=%d chunk=%d task=%" PRIu64
+                            " priority=LOW pending_high=%zu "
+                            "pending_low=%zu status=QUEUED\n",
+                            layer,
+                            chunk,
+                            tx_task,
+                            pc_worker->pending_high(),
+                            pc_worker->pending_low());
                     }
-
                     return GGML_STATUS_SUCCESS;
                 }
+
+                const int64_t pc_fold_begin_us =
+                    ggml_time_us();
+                ggml_backend_synchronize(bcj_dst.backend);
+                ggml_status status =
+                    ggml_backend_graph_compute_async(
+                        bcj_dst.backend, pc_fold_graph);
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+                ggml_backend_synchronize(bcj_dst.backend);
+                const int64_t pc_fold_us =
+                    ggml_time_us() - pc_fold_begin_us;
 
                 const int64_t copy_begin_us = ggml_time_us();
                 ggml_backend_tensor_copy_async(
