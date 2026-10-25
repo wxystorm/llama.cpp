@@ -13981,6 +13981,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             overlap_slot.phone_route_bufs[1],
                             storage_bytes(phone_weights)) &&
                         ensure_overlap_buf(
+                            phone_cfg.backend,
+                            overlap_slot.phone_partial_buf,
+                            storage_bytes(pc_partial)) &&
+                        ensure_overlap_buf(
                             pc_cfg.backend,
                             overlap_slot.pc_route_bufs[0],
                             storage_bytes(pc_topk)) &&
@@ -14017,6 +14021,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                     ggml_backend_buffer_get_size(
                                         route_buf.get());
                             }
+                        }
+                        if (overlap_slot.phone_partial_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.phone_partial_buf.get());
                         }
                         for (const auto & route_buf :
                                 overlap_slot.pc_route_bufs) {
