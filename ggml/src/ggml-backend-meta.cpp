@@ -14565,6 +14565,13 @@ auto prefill_norm_sg_has_prework =
         }
 
         int64_t subgraph_compute_wall_us = 0;
+
+        // These two values are also consumed by the communication/cleanup
+        // phase below, which is intentionally outside !compute_complete.
+        // Keep them in the per-SG loop scope instead of the compute block.
+        ggml_status compute_status = GGML_STATUS_SUCCESS;
+        bool region_c2p_prepared_exec = false;
+
         if (!compute_complete) {
     if (n_backends == 2) {
     ggml_tensor * phone_wdown =
@@ -14680,14 +14687,12 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    ggml_status compute_status = GGML_STATUS_SUCCESS;
-
     auto region_c2p_exec_it =
         is_prefill_down_sg ?
             region_c2p_overlap_chunks.find(
                 { prefill_down_layer, prefill_down_chunk }) :
             region_c2p_overlap_chunks.end();
-    const bool region_c2p_prepared_exec =
+    region_c2p_prepared_exec =
         region_pipeline_active &&
         region_pc_overlap_requested &&
         is_prefill_down_sg &&
