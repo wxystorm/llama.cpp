@@ -4089,6 +4089,9 @@ public:
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool phone_main_register(const rpc_msg_phone_main_register_req & request);
     bool phone_main_trigger_after_graph(uint32_t device, uint64_t graph_uid);
+    bool phone_c2p_register(const rpc_msg_phone_c2p_register_req & request);
+    bool phone_c2p_ready(const rpc_msg_phone_c2p_ready_req & request);
+    bool phone_c2p_partial(const std::vector<uint8_t> & input);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -4123,6 +4126,9 @@ private:
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
     bool graph_recompute_unlocked(
         const rpc_msg_graph_recompute_req & request);
+    bool phone_c2p_try_admit_reduce_locked(
+        uint32_t device,
+        int32_t chunk);
     void phone_main_loop();
 
 
@@ -4161,14 +4167,36 @@ private:
     // physical GPU lane with logical MAIN priority.
     std::mutex phone_gpu_mutex;
     std::condition_variable phone_gpu_cv;
-    size_t phone_main_pending = 0;
-    bool phone_main_running = false;
+    std::atomic<size_t> phone_main_pending { 0 };
+    std::atomic<bool> phone_main_running { false };
+
+    struct phone_main_job {
+        rpc_msg_phone_main_register_req plan {};
+        bool execute_trigger_reduce = false;
+    };
+    struct phone_c2p_state {
+        uint32_t device = 0;
+        int32_t chunk = -1;
+        uint64_t ffn_graph_uid = 0;
+        uint64_t consume_seq = 0;
+        uint64_t reduce_graph_uid = 0;
+        bool ready = false;
+        bool ffn_queued = false;
+        bool ffn_done = false;
+        bool partial_ready = false;
+        bool reduce_queued = false;
+        bool failed = false;
+    };
 
     std::mutex phone_main_mutex;
     std::condition_variable phone_main_cv;
     std::map<std::pair<uint32_t, uint64_t>,
              rpc_msg_phone_main_register_req> phone_main_plans;
-    std::deque<rpc_msg_phone_main_register_req> phone_main_jobs;
+    std::deque<phone_main_job> phone_main_jobs;
+    std::map<std::pair<uint32_t, int32_t>,
+             phone_c2p_state> phone_c2p_states;
+    std::deque<std::pair<uint32_t, int32_t>>
+        phone_c2p_ffn_jobs;
     std::thread phone_main_worker;
     bool phone_main_stop = false;
 
