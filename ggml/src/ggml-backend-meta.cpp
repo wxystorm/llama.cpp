@@ -12419,6 +12419,21 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         void * data = nullptr;
     };
     std::vector<phone_region_binding_backup> phone_region_output_backups;
+
+    struct phone_region_output_alias {
+        ggml_tensor * tensor = nullptr;
+        uintptr_t offset = 0;
+    };
+    struct phone_region_output_bind_plan {
+        ggml_tensor * root = nullptr;
+        ggml_backend_buffer_t target_buffer = nullptr;
+        uintptr_t target_base = 0;
+        size_t bytes = 0;
+        std::vector<phone_region_output_alias> aliases;
+    };
+    std::map<int, phone_region_output_bind_plan>
+        phone_region_output_plans;
+
     struct phone_region_output_restore_guard {
         std::vector<phone_region_binding_backup> & backups;
         ~phone_region_output_restore_guard() {
@@ -12459,97 +12474,35 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             if (n_backends != 2 || chunk < 0 || output == nullptr) {
                 return false;
             }
-            ggml_tensor * root = phone_region_root(output);
-            if (root == nullptr || root->buffer == nullptr ||
-                    root->data == nullptr) {
+            auto plan_it =
+                phone_region_output_plans.find(chunk);
+            if (plan_it == phone_region_output_plans.end()) {
+                return false;
+            }
+            auto & plan = plan_it->second;
+            if (phone_region_root(output) != plan.root ||
+                    plan.target_buffer == nullptr ||
+                    plan.target_base == 0 ||
+                    plan.aliases.empty()) {
                 return false;
             }
 
-            auto & cfg = backend_ctx->backend_configs[1];
-            const size_t chunk_index = static_cast<size_t>(chunk);
-            if (cfg.phone_region_output_bufs.size() <= chunk_index) {
-                cfg.phone_region_output_bufs.resize(chunk_index + 1);
-            }
-            const size_t need =
-                ggml_backend_buffer_get_alloc_size(root->buffer, root);
-            auto & output_buf = cfg.phone_region_output_bufs[chunk_index];
-            if (!output_buf ||
-                    ggml_backend_buffer_get_size(output_buf.get()) < need) {
-                output_buf.reset(
-                    ggml_backend_alloc_buffer(cfg.backend, need));
-            }
-            if (!output_buf) {
-                return false;
-            }
-
-            const uintptr_t old_root =
-                reinterpret_cast<uintptr_t>(root->data);
-            const uintptr_t new_root = reinterpret_cast<uintptr_t>(
-                ggml_backend_buffer_get_base(output_buf.get()));
-            if (old_root == 0 || new_root == 0) {
-                return false;
-            }
-
-            // Find every descriptor (including later L46 views) that aliases
-            // this chunk output root before changing any pointer.
-            std::set<ggml_tensor *> visited;
-            std::set<ggml_tensor *> family;
-            std::function<void(ggml_tensor *)> visit =
-                [&](ggml_tensor * tensor) {
-                    if (tensor == nullptr ||
-                            !visited.insert(tensor).second) {
-                        return;
-                    }
-                    if (phone_region_root(tensor) == root) {
-                        family.insert(tensor);
-                    }
-                    if (tensor->view_src != nullptr) {
-                        visit(tensor->view_src);
-                    }
-                    for (ggml_tensor * src : tensor->src) {
-                        visit(src);
-                    }
-                };
-            for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
-                ggml_cgraph * graph =
-                    cfg.cgraphs[sg].cgraph_main;
-                if (graph == nullptr) {
-                    continue;
-                }
-                for (int k = 0; k < graph->n_nodes; ++k) {
-                    visit(graph->nodes[k]);
-                }
-                for (int k = 0; k < graph->n_leafs; ++k) {
-                    visit(graph->leafs[k]);
-                }
-            }
-
-            for (ggml_tensor * tensor : family) {
-                if (tensor->data == nullptr) {
-                    return false;
-                }
-                const uintptr_t old_data =
-                    reinterpret_cast<uintptr_t>(tensor->data);
-                if (old_data < old_root ||
-                        old_data - old_root > need ||
-                        ggml_nbytes(tensor) > need - (old_data - old_root)) {
-                    return false;
-                }
-            }
-            for (ggml_tensor * tensor : family) {
+            // All remote base addresses and alias offsets were resolved during
+            // POOL_PREP, before any Phone Region graph was submitted. The hot
+            // path is now descriptor-only and cannot issue BUFFER_GET_BASE.
+            for (const auto & alias : plan.aliases) {
                 backup_region_binding(
-                    phone_region_output_backups, tensor);
-                const uintptr_t old_data =
-                    reinterpret_cast<uintptr_t>(tensor->data);
-                tensor->buffer = output_buf.get();
-                tensor->data = reinterpret_cast<void *>(
-                    new_root + (old_data - old_root));
+                    phone_region_output_backups,
+                    alias.tensor);
+                alias.tensor->buffer = plan.target_buffer;
+                alias.tensor->data = reinterpret_cast<void *>(
+                    plan.target_base + alias.offset);
             }
 
             if (pipeline_debug) {
                 printf("[PHONE_REGION_OUTPUT_SLOT] chunk=%d bytes=%zu "
-                       "aliases=%zu status=BOUND\n",
-                       chunk, need, family.size());
+                       "aliases=%zu mode=PREBOUND status=BOUND\n",
+                       chunk, plan.bytes, plan.aliases.size());
             }
             return true;
         };
@@ -12942,6 +12895,106 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         "POOL_OUTPUT_ALLOC_FAILED";
                     break;
                 }
+
+                // Prime the RPC buffer's lazy remote base lookup while the
+                // Phone GPU/control socket is idle. Later get_base() calls on
+                // this buffer become pure cached pointer reads.
+                const uintptr_t output_target_base =
+                    reinterpret_cast<uintptr_t>(
+                        ggml_backend_buffer_get_base(
+                            output_buf.get()));
+                const uintptr_t output_old_root =
+                    reinterpret_cast<uintptr_t>(
+                        output_root->data);
+                if (output_target_base == 0 ||
+                        output_old_root == 0) {
+                    prep_ok = false;
+                    region_pipe_reason =
+                        "POOL_OUTPUT_BASE_FAILED";
+                    break;
+                }
+
+                phone_region_output_bind_plan output_plan;
+                output_plan.root = output_root;
+                output_plan.target_buffer = output_buf.get();
+                output_plan.target_base = output_target_base;
+                output_plan.bytes = output_need;
+
+                // Pre-scan the descriptor family exactly once. The previous
+                // hot-path scan walked every Meta subgraph for every chunk and
+                // also triggered the lazy remote get_base under GPU load.
+                std::set<ggml_tensor *> visited;
+                std::set<ggml_tensor *> family;
+                std::function<void(ggml_tensor *)> visit_output =
+                    [&](ggml_tensor * tensor) {
+                        if (tensor == nullptr ||
+                                !visited.insert(tensor).second) {
+                            return;
+                        }
+                        if (phone_region_root(tensor) ==
+                                output_root) {
+                            family.insert(tensor);
+                        }
+                        if (tensor->view_src != nullptr) {
+                            visit_output(tensor->view_src);
+                        }
+                        for (ggml_tensor * src : tensor->src) {
+                            visit_output(src);
+                        }
+                    };
+                for (size_t sg = 0;
+                        sg < backend_ctx->n_subgraphs; ++sg) {
+                    ggml_cgraph * graph =
+                        phone_cfg.cgraphs[sg].cgraph_main;
+                    if (graph == nullptr) {
+                        continue;
+                    }
+                    for (int k = 0; k < graph->n_nodes; ++k) {
+                        visit_output(graph->nodes[k]);
+                    }
+                    for (int k = 0; k < graph->n_leafs; ++k) {
+                        visit_output(graph->leafs[k]);
+                    }
+                }
+                for (ggml_tensor * tensor : family) {
+                    if (tensor->data == nullptr) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "POOL_OUTPUT_ALIAS_DATA_MISSING";
+                        break;
+                    }
+                    const uintptr_t old_data =
+                        reinterpret_cast<uintptr_t>(
+                            tensor->data);
+                    if (old_data < output_old_root ||
+                            old_data - output_old_root >
+                                output_need ||
+                            ggml_nbytes(tensor) >
+                                output_need -
+                                    (old_data -
+                                     output_old_root)) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "POOL_OUTPUT_ALIAS_RANGE";
+                        break;
+                    }
+                    output_plan.aliases.push_back({
+                        tensor,
+                        old_data - output_old_root
+                    });
+                }
+                if (!prep_ok ||
+                        output_plan.aliases.empty()) {
+                    if (prep_ok) {
+                        region_pipe_reason =
+                            "POOL_OUTPUT_ALIAS_EMPTY";
+                        prep_ok = false;
+                    }
+                    break;
+                }
+                phone_region_output_plans[(int) c] =
+                    std::move(output_plan);
+
                 output_bytes +=
                     ggml_backend_buffer_get_size(output_buf.get());
                 ++output_count;
@@ -13018,6 +13071,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             "POOL_SCRATCH_ALLOC_FAILED";
                         break;
                     }
+
+                    // Prime both sides of the offset mapping now. The RPC
+                    // buffer backend caches base_ptr after the first query.
+                    if (ggml_backend_buffer_get_base(source) == nullptr ||
+                            ggml_backend_buffer_get_base(
+                                it->buffer.get()) == nullptr) {
+                        prep_ok = false;
+                        region_pipe_reason =
+                            "POOL_SCRATCH_BASE_FAILED";
+                        break;
+                    }
                 }
             }
 
@@ -13045,11 +13109,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     (region_pipeline_env != nullptr &&
                      std::atoi(region_pipeline_env) != 0)) {
                 printf("[PHONE_REGION_POOL_PREP] ready=%d "
-                       "outputs=%zu output_mib=%.3f "
+                       "outputs=%zu output_plans=%zu "
+                       "output_mib=%.3f "
                        "slot0_mib=%.3f slot1_mib=%.3f "
                        "alloc_ms=%.3f reason=%s\n",
                        prep_ok ? 1 : 0,
                        output_count,
+                       phone_region_output_plans.size(),
                        output_bytes / (1024.0 * 1024.0),
                        slot_bytes[0] / (1024.0 * 1024.0),
                        slot_bytes[1] / (1024.0 * 1024.0),
