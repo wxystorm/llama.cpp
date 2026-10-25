@@ -13341,10 +13341,15 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
             const uint64_t saved_uid = pc_graph->uid;
             pc_graph->uid = 0;
+            // This helper can run on the priority worker while the Meta
+            // scheduler submits unrelated subgraphs. Do not share the
+            // one-generation-per-backend compute_workers slot across threads.
+            // The PC-prep graph writes only its private route/partial buffers.
             const int64_t prep_begin_us = ggml_time_us();
-            compute_workers.start(0, sg);
             const ggml_status status =
-                compute_workers.wait(0);
+                ggml_backend_graph_compute(
+                    backend_ctx->backend_configs[0].backend,
+                    pc_graph);
             const int64_t prep_us =
                 ggml_time_us() - prep_begin_us;
             pc_graph->uid = saved_uid;
