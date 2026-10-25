@@ -4188,6 +4188,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         int chunk = -1;
         size_t slot = 0;
         uint64_t input_task = 0;
+        uint64_t pc_prep_task = 0;
         bool input_staged = false;
         bool pc_prepared = false;
         ggml_tensor * input_dst = nullptr;
@@ -15425,23 +15426,69 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 std::strcmp(
                     pipeline_stage,
                     "C2P_PC_PREP") == 0) {
-            const int64_t prep_stage_begin_us =
-                ggml_time_us();
-            const ggml_status prep_status =
-                prepare_region_c2p_pc(
-                    i, pipeline_chunk);
-            if (prep_status != GGML_STATUS_SUCCESS) {
-                return prep_status;
-            }
-            if (pipeline_debug) {
-                printf(
-                    "[PHONE_REGION_PIPE_STAGE] "
-                    "step=%zu chunk=%d sg=%zu "
-                    "stage=C2P_PC_PREP event=COMPLETED "
-                    "host_ms=%.3f status=OK\n",
-                    schedule_pos, pipeline_chunk, i,
-                    (ggml_time_us() -
-                        prep_stage_begin_us) / 1000.0);
+            if (phone_main_local_active) {
+                int prep_chunk = -1;
+                int prep_layer = -1;
+                if (!parse_prefill_sg(
+                        i, false,
+                        prep_chunk, prep_layer) ||
+                        prep_chunk != pipeline_chunk) {
+                    return GGML_STATUS_FAILED;
+                }
+                auto state_it =
+                    region_c2p_overlap_chunks.find(
+                        { prep_layer, prep_chunk });
+                if (state_it ==
+                        region_c2p_overlap_chunks.end() ||
+                        state_it->second.pc_prep_task != 0) {
+                    return GGML_STATUS_FAILED;
+                }
+                if (backend_ctx->prefill_pc_worker ==
+                        nullptr) {
+                    backend_ctx->prefill_pc_worker =
+                        new ggml_backend_meta_transfer_worker();
+                }
+                const size_t prep_sg = i;
+                const int prep_id = prep_chunk;
+                state_it->second.pc_prep_task =
+                    backend_ctx->prefill_pc_worker->enqueue(
+                        [&, prep_sg, prep_id](
+                            uint64_t) -> ggml_status {
+                            return prepare_region_c2p_pc(
+                                prep_sg, prep_id);
+                        });
+
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_MAIN_PC_PREP_ENQUEUE] "
+                        "layer=%d chunk=%d sg=%zu task=%" PRIu64
+                        " queue=PC_TENSOR status=QUEUED\n",
+                        prep_layer,
+                        prep_chunk,
+                        i,
+                        state_it->second.pc_prep_task);
+                }
+            } else {
+                const int64_t prep_stage_begin_us =
+                    ggml_time_us();
+                const ggml_status prep_status =
+                    prepare_region_c2p_pc(
+                        i, pipeline_chunk);
+                if (prep_status !=
+                        GGML_STATUS_SUCCESS) {
+                    return prep_status;
+                }
+                if (pipeline_debug) {
+                    printf(
+                        "[PHONE_REGION_PIPE_STAGE] "
+                        "step=%zu chunk=%d sg=%zu "
+                        "stage=C2P_PC_PREP event=COMPLETED "
+                        "host_ms=%.3f status=OK\n",
+                        schedule_pos, pipeline_chunk, i,
+                        (ggml_time_us() -
+                            prep_stage_begin_us) /
+                            1000.0);
+                }
             }
             continue;
         }
@@ -16000,6 +16047,34 @@ auto prefill_norm_sg_has_prework =
             region_c2p_overlap_chunks.find(
                 { prefill_down_layer, prefill_down_chunk }) :
             region_c2p_overlap_chunks.end();
+
+    if (phone_main_local_active &&
+            region_c2p_exec_it !=
+                region_c2p_overlap_chunks.end() &&
+            region_c2p_exec_it->second.pc_prep_task != 0 &&
+            !region_c2p_exec_it->second.pc_prepared) {
+        GGML_ASSERT(
+            backend_ctx->prefill_pc_worker != nullptr);
+        const int64_t prep_wait_begin_us =
+            ggml_time_us();
+        const ggml_status prep_status =
+            backend_ctx->prefill_pc_worker->wait(
+                region_c2p_exec_it->second.pc_prep_task);
+        if (prep_status != GGML_STATUS_SUCCESS) {
+            return prep_status;
+        }
+        if (pipeline_debug) {
+            printf(
+                "[PHONE_MAIN_PC_PREP_READY] "
+                "layer=%d chunk=%d task=%" PRIu64
+                " dependency_wait_ms=%.3f status=READY\n",
+                prefill_down_layer,
+                prefill_down_chunk,
+                region_c2p_exec_it->second.pc_prep_task,
+                (ggml_time_us() -
+                    prep_wait_begin_us) / 1000.0);
+        }
+    }
     region_c2p_prepared_exec =
         region_pipeline_active &&
         region_pc_overlap_requested &&
