@@ -15526,6 +15526,91 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         phone_main_pc_event_cv.notify_all();
                     };
 
+                // B1: reserve every producer sequence/lane and register all
+                // server-side C2P + MAIN plans before any blocking receive is
+                // posted. A protocol/register failure therefore leaves no
+                // GET_ROUTE/GET_SNAPSHOT worker stranded on data that can never
+                // arrive.
+                for (size_t c = 0;
+                        c < region_pipe_chunks.size();
+                        ++c) {
+                    const int chunk = (int) c;
+                    auto & state =
+                        phone_main_local_chunks.at(chunk);
+
+                    state.ready_seq =
+                        backend_ctx->next_phone_prefill_route_seq++;
+                    if (state.ready_seq == 0) {
+                        state.ready_seq =
+                            backend_ctx->next_phone_prefill_route_seq++;
+                    }
+                    state.ready_lane =
+                        static_cast<uint32_t>(
+                            c %
+                            ggml_backend_meta_context::
+                                PREFILL_ROUTE_LANES);
+
+                    if (!c2p_register(
+                            phone_cfg.backend,
+                            chunk,
+                            state.c2p_ffn_uid,
+                            state.c2p_consume_seq)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d phase=REGISTER "
+                            "reason=C2P_REGISTER_FAILED "
+                            "action=STOP\n",
+                            chunk);
+                        return GGML_STATUS_FAILED;
+                    }
+                    state.c2p_registered = true;
+
+                    if (!main_register(
+                            phone_cfg.backend,
+                            chunk,
+                            state.c2p_reduce_uid,
+                            state.region_uid,
+                            state.p2c_attention_uid,
+                            state.p2c_ffn_uid,
+                            state.ready_seq,
+                            state.ready_lane,
+                            state.ready_hidden,
+                            state.ready_topk,
+                            state.ready_weights,
+                            state.partial_seq,
+                            state.partial_slot,
+                            state.phone_folded_partial)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d phase=REGISTER "
+                            "reduce_uid=%" PRIu64
+                            " reason=MAIN_REGISTER_FAILED "
+                            "action=STOP\n",
+                            chunk,
+                            state.c2p_reduce_uid);
+                        return GGML_STATUS_FAILED;
+                    }
+                    state.main_registered = true;
+                    state.trigger_reduce_uid =
+                        state.c2p_reduce_uid;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PHONE_MAIN_PLAN_REGISTERED] "
+                            "chunk=%d ready_seq=%" PRIu64
+                            " ready_lane=%u partial_seq=%" PRIu64
+                            " c2p_ffn_uid=%" PRIu64
+                            " c2p_reduce_uid=%" PRIu64
+                            " status=READY\n",
+                            chunk,
+                            state.ready_seq,
+                            state.ready_lane,
+                            state.partial_seq,
+                            state.c2p_ffn_uid,
+                            state.c2p_reduce_uid);
+                    }
+                }
+
                 // Install every READY hook before posting any GET_ROUTE. This
                 // keeps the hook map immutable while RX workers are active.
                 for (size_t c = 0;
@@ -15749,17 +15834,26 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     }
                     const phone_prefill_route_task route =
                         route_it->second;
-                    state.ready_seq =
-                        route.producer_seq;
-                    state.ready_lane =
-                        static_cast<uint32_t>(
+                    if (route.producer_seq != state.ready_seq ||
+                            route.lane != state.ready_lane ||
+                            route.src_hidden != state.ready_hidden ||
+                            route.src_topk != state.ready_topk ||
+                            route.src_weights != state.ready_weights) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d phase=ARM "
+                            "reason=READY_RESERVATION_MISMATCH "
+                            "expected_seq=%" PRIu64
+                            " actual_seq=%" PRIu64
+                            " expected_lane=%u actual_lane=%zu "
+                            "action=STOP\n",
+                            chunk,
+                            state.ready_seq,
+                            route.producer_seq,
+                            state.ready_lane,
                             route.lane);
-                    state.ready_hidden =
-                        route.src_hidden;
-                    state.ready_topk =
-                        route.src_topk;
-                    state.ready_weights =
-                        route.src_weights;
+                        return GGML_STATUS_FAILED;
+                    }
 
                     state.partial_worker =
                         backend_ctx->
@@ -15830,51 +15924,8 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                                 return GGML_STATUS_SUCCESS;
                             });
 
-                    // Phone-side control is fully registered before Meta enters
-                    // the runtime schedule. C2P READY only admits the low
-                    // FFN; C2P PARTIAL plus FFN_DONE admits the pre-registered
-                    // Reduce as MAIN, which then continues Region -> L46.
-                    if (!c2p_register(
-                            phone_cfg.backend,
-                            chunk,
-                            state.c2p_ffn_uid,
-                            state.c2p_consume_seq)) {
-                        printf(
-                            "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d reason=C2P_REGISTER_FAILED "
-                            "action=STOP\n",
-                            chunk);
-                        return GGML_STATUS_FAILED;
-                    }
-                    state.c2p_registered = true;
-
-                    if (!main_register(
-                            phone_cfg.backend,
-                            chunk,
-                            state.c2p_reduce_uid,
-                            state.region_uid,
-                            state.p2c_attention_uid,
-                            state.p2c_ffn_uid,
-                            state.ready_seq,
-                            state.ready_lane,
-                            state.ready_hidden,
-                            state.ready_topk,
-                            state.ready_weights,
-                            state.partial_seq,
-                            state.partial_slot,
-                            state.phone_folded_partial)) {
-                        printf(
-                            "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d reduce_uid=%" PRIu64
-                            " reason=MAIN_REGISTER_FAILED "
-                            "action=STOP\n",
-                            chunk,
-                            state.c2p_reduce_uid);
-                        return GGML_STATUS_FAILED;
-                    }
-                    state.main_registered = true;
-                    state.trigger_reduce_uid =
-                        state.c2p_reduce_uid;
+                    // B3: server plans were registered before any RX task was
+                    // armed. From here on, workers only wait for producer data.
 
                     if (pipeline_debug) {
                         printf(
