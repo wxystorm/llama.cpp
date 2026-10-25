@@ -12847,16 +12847,49 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 reduce_add_us += pc_fold_us + phone_reduce_us;
                 ++reduce_to_primary_count;
 
+                // Stderr traces are deliberately flushed: stdout log order
+                // cannot identify the blocking step under pipe redirection.
+                // In particular, GPU_FENCE_DONE does not mean the caller has
+                // already completed the directional boundary.
+                if (region_chunk_continuation && pipeline_debug) {
+                    std::fprintf(stderr,
+                        "[REGION_HANG_TRACE] phase=C2P_AFTER_REDUCE "
+                        "layer=%d chunk=%d numeric_enabled=%d "
+                        "numeric_values=%zu output_complete=%d "
+                        "ab_trace=%d\n",
+                        prefill_down_layer_0, prefill_down_chunk_0,
+                        c2p_numeric_trace ? 1 : 0,
+                        c2p_pc_partial.size(),
+                        c2p_output_complete ? 1 : 0,
+                        ab_trace_requested ? 1 : 0);
+                    std::fflush(stderr);
+                }
+
                 if (c2p_numeric_trace &&
                         !c2p_pc_partial.empty() &&
                         phone_out_chunk->type == GGML_TYPE_F32) {
                     const size_t n = c2p_pc_partial.size();
                     std::vector<float> actual(n);
+                    if (region_chunk_continuation && pipeline_debug) {
+                        std::fprintf(stderr,
+                            "[REGION_HANG_TRACE] phase=NUMERIC_GET_BEGIN "
+                            "layer=%d chunk=%d bytes=%zu\n",
+                            prefill_down_layer_0, prefill_down_chunk_0,
+                            n * sizeof(float));
+                        std::fflush(stderr);
+                    }
                     ggml_backend_tensor_get(
                         phone_out_chunk,
                         actual.data(),
                         0,
                         n * sizeof(float));
+                    if (region_chunk_continuation && pipeline_debug) {
+                        std::fprintf(stderr,
+                            "[REGION_HANG_TRACE] phase=NUMERIC_GET_DONE "
+                            "layer=%d chunk=%d\n",
+                            prefill_down_layer_0, prefill_down_chunk_0);
+                        std::fflush(stderr);
+                    }
 
                     double diff_l2 = 0.0;
                     double actual_l2 = 0.0;
@@ -12969,6 +13002,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         region_async_partial ? 1 : 0);
                 }
 
+                if (region_chunk_continuation && pipeline_debug) {
+                    std::fprintf(stderr,
+                        "[REGION_HANG_TRACE] phase=C2P_RETURN "
+                        "layer=%d chunk=%d status=OK\n",
+                        prefill_down_layer_0, prefill_down_chunk_0);
+                    std::fflush(stderr);
+                }
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -15084,6 +15124,20 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             i, prefill_wave_attn_chunk, prefill_wave_attn_chunk_count,
             prefill_wave_attn_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
+        if (pipeline_debug && region_chunk_continuation) {
+            std::fprintf(stderr,
+                "[REGION_HANG_TRACE] phase=SG_BEGIN "
+                "uid=%" PRIu64 " sg=%zu/%zu "
+                "down_layer=%d down_chunk=%d norm_layer=%d norm_chunk=%d "
+                "phone_only=%d\n",
+                cgraph->uid, i, backend_ctx->n_subgraphs,
+                is_prefill_down_sg ? prefill_down_layer : -1,
+                is_prefill_down_sg ? prefill_down_chunk : -1,
+                is_prefill_norm_sg ? prefill_norm_layer : -1,
+                is_prefill_norm_sg ? prefill_norm_chunk : -1,
+                is_phone_only_sg ? 1 : 0);
+            std::fflush(stderr);
+        }
 
         // C2P decode FFN can appear as a PHONE_ONLY_SG because its terminal
         // ffn_moe_out node is Phone-active, even though the PC Router and PC
@@ -17845,6 +17899,14 @@ auto prefill_norm_sg_has_prework =
 
     subgraph_compute_wall_us = ggml_time_us() - compute_start_us;
     compute_wall_us += subgraph_compute_wall_us;
+    if (pipeline_debug && region_chunk_continuation) {
+        std::fprintf(stderr,
+            "[REGION_HANG_TRACE] phase=SG_COMPUTE_DONE "
+            "uid=%" PRIu64 " sg=%zu compute_status=%d wall_ms=%.3f\n",
+            cgraph->uid, i, (int) compute_status,
+            subgraph_compute_wall_us / 1000.0);
+        std::fflush(stderr);
+    }
 
     if (return_wavefront_graph) {
         int wave_profile_layer = -1;
@@ -18076,12 +18138,29 @@ auto prefill_norm_sg_has_prework =
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
             bool communication_complete = false;
+            if (pipeline_debug && region_chunk_continuation) {
+                std::fprintf(stderr,
+                    "[REGION_HANG_TRACE] phase=COMM_BEGIN "
+                    "uid=%" PRIu64 " sg=%zu compute_complete=%d\n",
+                    cgraph->uid, communication_sg,
+                    compute_complete ? 1 : 0);
+                std::fflush(stderr);
+            }
             const ggml_status specialized_status =
                 specialized_communication(
                     communication_sg, communication_complete, compute_complete,
                     force_phone_block_exit, phone_block_last_layer);
             if (specialized_status != GGML_STATUS_SUCCESS) {
                 return specialized_status;
+            }
+            if (pipeline_debug && region_chunk_continuation) {
+                std::fprintf(stderr,
+                    "[REGION_HANG_TRACE] phase=COMM_SPECIALIZED_DONE "
+                    "uid=%" PRIu64 " sg=%zu completed=%d status=%d\n",
+                    cgraph->uid, communication_sg,
+                    communication_complete ? 1 : 0,
+                    (int) specialized_status);
+                std::fflush(stderr);
             }
             if (!communication_complete && backend_ctx->comm_ctx) {
                 ++reduce_comm_count;
@@ -18108,6 +18187,13 @@ auto prefill_norm_sg_has_prework =
             const int64_t reduce_us = ggml_time_us() - reduce_start_us;
             reduce_wall_us += reduce_us;
             reduce_max_us = std::max(reduce_max_us, reduce_us);
+            if (pipeline_debug && region_chunk_continuation) {
+                std::fprintf(stderr,
+                    "[REGION_HANG_TRACE] phase=COMM_DONE "
+                    "uid=%" PRIu64 " sg=%zu wall_ms=%.3f\n",
+                    cgraph->uid, communication_sg, reduce_us / 1000.0);
+                std::fflush(stderr);
+            }
         }
         if (phone_block_fused) {
             i = communication_sg;
@@ -18199,6 +18285,14 @@ auto prefill_norm_sg_has_prework =
             // Return-wavefront Attention is its own subgraph.  It must be
             // included here or attn_ms only sees the tiny norm/PC-only pieces.
             tensor_attn_us += pc_compute_us;
+        }
+
+        if (pipeline_debug && region_chunk_continuation) {
+            std::fprintf(stderr,
+                "[REGION_HANG_TRACE] phase=SG_DONE "
+                "uid=%" PRIu64 " sg=%zu communication_sg=%zu\n",
+                cgraph->uid, i, communication_sg);
+            std::fflush(stderr);
         }
     }
 
