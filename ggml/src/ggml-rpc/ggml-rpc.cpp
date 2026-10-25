@@ -6161,6 +6161,232 @@ bool rpc_server::graph_recompute(
     return ok;
 }
 
+bool rpc_server::phone_main_register(
+        const rpc_msg_phone_main_register_req & request) {
+    if (request.device >= backends.size() ||
+            request.chunk < 0 ||
+            request.trigger_reduce_uid == 0 ||
+            request.region_graph_uid == 0 ||
+            request.p2c_attention_graph_uid == 0 ||
+            request.p2c_ffn_graph_uid == 0 ||
+            request.ready_seq == 0 ||
+            request.ready_lane >= RPC_ROUTE_TRANSFER_LANES ||
+            request.partial_seq == 0 ||
+            request.partial_slot >= 2 ||
+            request.partial_size == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < 3; ++i) {
+        if (request.ready_tensors[i].buffer == 0 ||
+                request.ready_tensors[i].data == 0 ||
+                request.ready_sizes[i] == 0) {
+            return false;
+        }
+    }
+    if (request.partial_tensor.buffer == 0 ||
+            request.partial_tensor.data == 0) {
+        return false;
+    }
+
+    const uint64_t required[] = {
+        request.region_graph_uid,
+        request.p2c_attention_graph_uid,
+        request.p2c_ffn_graph_uid,
+    };
+    for (uint64_t uid : required) {
+        const auto it =
+            stored_graphs[request.device].find(uid);
+        if (it == stored_graphs[request.device].end() ||
+                it->second.graph == nullptr) {
+            GGML_LOG_ERROR(
+                "[PHONE_MAIN_REGISTER] chunk=%d uid=%" PRIu64
+                " status=FAIL reason=GRAPH_NOT_REGISTERED\n",
+                request.chunk, uid);
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(phone_main_mutex);
+        if (phone_main_stop) {
+            return false;
+        }
+        const auto key =
+            std::make_pair(
+                request.device,
+                request.trigger_reduce_uid);
+        if (phone_main_plans.count(key) != 0) {
+            return false;
+        }
+        if (!phone_main_worker.joinable()) {
+            try {
+                phone_main_worker =
+                    std::thread([this]() {
+                        phone_main_loop();
+                    });
+            } catch (...) {
+                return false;
+            }
+        }
+        phone_main_plans.emplace(key, request);
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_MAIN_REGISTER] chunk=%d device=%u "
+        "trigger_uid=%" PRIu64
+        " region_uid=%" PRIu64
+        " p2c_attn_uid=%" PRIu64
+        " p2c_ffn_uid=%" PRIu64
+        " ready_seq=%" PRIu64
+        " partial_seq=%" PRIu64
+        " status=READY\n",
+        request.chunk,
+        request.device,
+        request.trigger_reduce_uid,
+        request.region_graph_uid,
+        request.p2c_attention_graph_uid,
+        request.p2c_ffn_graph_uid,
+        request.ready_seq,
+        request.partial_seq);
+    return true;
+}
+
+bool rpc_server::phone_main_trigger_after_graph(
+        uint32_t device,
+        uint64_t graph_uid) {
+    // Called while phone_gpu_mutex is held by the normal graph path.
+    std::lock_guard<std::mutex> lock(phone_main_mutex);
+    const auto key =
+        std::make_pair(device, graph_uid);
+    const auto it = phone_main_plans.find(key);
+    if (it == phone_main_plans.end()) {
+        return true;
+    }
+    if (phone_main_stop) {
+        return false;
+    }
+
+    phone_main_jobs.push_back(it->second);
+    const int chunk = it->second.chunk;
+    phone_main_plans.erase(it);
+    ++phone_main_pending;
+
+    GGML_LOG_INFO(
+        "[PHONE_MAIN_TRIGGER] chunk=%d device=%u "
+        "trigger_uid=%" PRIu64
+        " main_depth=%zu priority=MAIN status=QUEUED\n",
+        chunk, device, graph_uid,
+        phone_main_jobs.size());
+    phone_main_cv.notify_one();
+    return true;
+}
+
+void rpc_server::phone_main_loop() {
+    while (true) {
+        rpc_msg_phone_main_register_req plan {};
+        {
+            std::unique_lock<std::mutex> lock(phone_main_mutex);
+            phone_main_cv.wait(
+                lock,
+                [&]() {
+                    return phone_main_stop ||
+                           !phone_main_jobs.empty();
+                });
+            if (phone_main_stop &&
+                    phone_main_jobs.empty()) {
+                return;
+            }
+            plan = phone_main_jobs.front();
+            phone_main_jobs.pop_front();
+        }
+
+        std::unique_lock<std::mutex> gpu_lock(phone_gpu_mutex);
+        GGML_ASSERT(phone_main_pending > 0);
+        --phone_main_pending;
+        phone_main_running = true;
+
+        const int64_t main_begin_us = ggml_time_us();
+        bool ok = true;
+
+        rpc_msg_graph_recompute_req run {};
+        run.device = plan.device;
+
+        run.graph_uid = plan.region_graph_uid;
+        const int64_t region_begin_us = ggml_time_us();
+        ok = graph_recompute_unlocked(run);
+        const int64_t region_done_us = ggml_time_us();
+
+        if (ok) {
+            run.graph_uid =
+                plan.p2c_attention_graph_uid;
+            ok = graph_recompute_unlocked(run);
+        }
+        const int64_t attn_done_us = ggml_time_us();
+
+        if (ok) {
+            rpc_msg_route_snapshot_ready_req ready {};
+            ready.device = plan.device;
+            ready.lane = plan.ready_lane;
+            ready.seq = plan.ready_seq;
+            for (size_t i = 0; i < 3; ++i) {
+                ready.tensors[i] =
+                    plan.ready_tensors[i];
+                ready.sizes[i] =
+                    plan.ready_sizes[i];
+            }
+            rpc_msg_route_snapshot_ready_rsp response {};
+            ok = route_snapshot_ready(
+                    ready, response) &&
+                 response.result != 0;
+        }
+        const int64_t ready_done_us = ggml_time_us();
+
+        if (ok) {
+            run.graph_uid = plan.p2c_ffn_graph_uid;
+            ok = graph_recompute_unlocked(run);
+        }
+        const int64_t ffn_done_us = ggml_time_us();
+
+        if (ok) {
+            rpc_msg_snapshot_tensor_req partial {};
+            partial.device = plan.device;
+            partial.slot = plan.partial_slot;
+            partial.seq = plan.partial_seq;
+            partial.tensor = plan.partial_tensor;
+            partial.offset = 0;
+            partial.size = plan.partial_size;
+            ok = snapshot_tensor(partial);
+        }
+        const int64_t partial_done_us = ggml_time_us();
+
+        GGML_LOG_INFO(
+            "[PHONE_MAIN_CHAIN] chunk=%d "
+            "region_ms=%.3f attn_ms=%.3f "
+            "ready_stage_ms=%.3f ffn_ms=%.3f "
+            "partial_stage_ms=%.3f total_ms=%.3f "
+            "status=%s\n",
+            plan.chunk,
+            (region_done_us - region_begin_us) / 1000.0,
+            (attn_done_us - region_done_us) / 1000.0,
+            (ready_done_us - attn_done_us) / 1000.0,
+            (ffn_done_us - ready_done_us) / 1000.0,
+            (partial_done_us - ffn_done_us) / 1000.0,
+            (partial_done_us - main_begin_us) / 1000.0,
+            ok ? "OK" : "FAIL");
+
+        phone_main_running = false;
+        gpu_lock.unlock();
+        phone_gpu_cv.notify_all();
+
+        if (!ok) {
+            GGML_LOG_ERROR(
+                "[PHONE_MAIN_CHAIN] chunk=%d "
+                "status=FAIL action=STOP_LOCAL_CHAIN\n",
+                plan.chunk);
+        }
+    }
+}
+
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
     if (request.device >= backends.size() || request.slot >= 2) {
