@@ -13636,6 +13636,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                region_pipeline_active ? 1 : 0,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
+            printf(
+                "[PHONE_REGION_EVENT_PIPELINE] "
+                "active=1 window=2 pc_prework=NEXT_CHUNK "
+                "completion_wait=ASYNC_EVENT "
+                "phone_prework=DEFERRED_UNTIL_CONTINUATION "
+                "status=READY\n");
             for (const auto & entry : region_pipe_chunks) {
                 printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
                        "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
