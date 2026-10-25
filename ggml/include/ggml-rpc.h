@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    14
+#define RPC_PROTO_PATCH_VERSION    15
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -108,6 +108,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC \
     "ggml_backend_rpc_phone_region_local_submit"
 
+#define GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC \
+    "ggml_backend_rpc_phone_region_partial_get"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -170,6 +173,13 @@ using ggml_backend_rpc_phone_region_local_submit_t = bool (*)(
         uint64_t partial_seq,
         uint32_t partial_slot,
         uint64_t scratch_reuse_seq);
+
+using ggml_backend_rpc_phone_region_partial_get_t = bool (*)(
+        ggml_backend_t backend,
+        uint32_t slot,
+        uint64_t seq,
+        void * data,
+        size_t size);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
