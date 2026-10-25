@@ -12596,54 +12596,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ggml_time_us() - stage_begin_us;
                     partial_wire_src = pc_stage;
 
-                    auto & worker_slot =
-                        backend_ctx->prefill_return_workers[partial_lane];
-                    if (worker_slot == nullptr) {
-                        worker_slot =
-                            new ggml_backend_meta_transfer_worker();
-                    }
-                    auto * return_worker = worker_slot;
-                    auto wire_us =
-                        std::make_shared<int64_t>(0);
-
-                    const int layer = prefill_down_layer_0;
-                    const int chunk = prefill_down_chunk_0;
-                    const size_t bytes = ggml_nbytes(pc_stage);
-                    const bool debug = pipeline_debug;
-
-                    const uint64_t return_task =
-                        return_worker->enqueue(
-                            [pc_backend = bcj_dst.backend,
-                             phone_backend = bcj_src.backend,
-                             pc_stage,
-                             phone_tmp,
-                             wire_us,
-                             layer,
-                             chunk,
-                             bytes,
-                             debug]
-                            (uint64_t task_id) -> ggml_status {
-                                const int64_t wire_begin_us =
-                                    ggml_time_us();
-                                ggml_backend_tensor_copy_async(
-                                    pc_backend, phone_backend,
-                                    pc_stage, phone_tmp);
-                                ggml_backend_synchronize(phone_backend);
-                                *wire_us =
-                                    ggml_time_us() - wire_begin_us;
-
-                                if (debug) {
-                                    printf(
-                                        "[REGION_RETURN_TX] "
-                                        "direction=C2P layer=%d chunk=%d "
-                                        "lane=0 task=%" PRIu64 " bytes=%zu "
-                                        "wire_ms=%.3f status=DONE\n",
-                                        layer, chunk, task_id, bytes,
-                                        *wire_us / 1000.0);
-                                }
-                                return GGML_STATUS_SUCCESS;
-                            });
-
                     if (pipeline_debug) {
                         printf(
                             "[REGION_RETURN_STAGE] "
@@ -12655,26 +12607,124 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             partial_stage_us / 1000.0);
                     }
 
-                    const int64_t join_begin_us = ggml_time_us();
-                    const ggml_status return_status =
-                        return_worker->wait(return_task);
-                    partial_join_wait_us =
-                        ggml_time_us() - join_begin_us;
-                    if (return_status != GGML_STATUS_SUCCESS) {
-                        return return_status;
-                    }
-                    copy_us = *wire_us;
+                    if (region_chunk_continuation) {
+                        // Window=1 continuation is a strict dependency: L35(C)
+                        // must not run before C2P Reduce(C). There is no useful
+                        // overlap from queueing a transfer then immediately
+                        // joining its worker. Keep the RPC copy on the graph
+                        // coordinator thread and avoid a cross-thread completion
+                        // wait (and its backend synchronization interaction).
+                        if (pipeline_debug) {
+                            fprintf(stderr,
+                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
+                                    "phase=COPY_BEGIN bytes=%zu path=DIRECT_MAIN\n",
+                                    prefill_down_layer_0, prefill_down_chunk_0,
+                                    ggml_nbytes(pc_stage));
+                        }
+                        const int64_t wire_begin_us = ggml_time_us();
+                        ggml_backend_tensor_copy_async(
+                            bcj_dst.backend,
+                            bcj_src.backend,
+                            pc_stage,
+                            phone_tmp);
+                        if (pipeline_debug) {
+                            fprintf(stderr,
+                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
+                                    "phase=COPY_SUBMITTED path=DIRECT_MAIN\n",
+                                    prefill_down_layer_0, prefill_down_chunk_0);
+                        }
+                        ggml_backend_synchronize(bcj_src.backend);
+                        copy_us = ggml_time_us() - wire_begin_us;
+                        if (pipeline_debug) {
+                            fprintf(stderr,
+                                    "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
+                                    "phase=FENCE_DONE wall_ms=%.3f "
+                                    "path=DIRECT_MAIN\n",
+                                    prefill_down_layer_0, prefill_down_chunk_0,
+                                    copy_us / 1000.0);
+                            printf("[REGION_RETURN_TX] "
+                                   "direction=C2P layer=%d chunk=%d lane=0 "
+                                   "task=0 bytes=%zu wire_ms=%.3f "
+                                   "path=DIRECT_MAIN status=DONE\n",
+                                   prefill_down_layer_0, prefill_down_chunk_0,
+                                   ggml_nbytes(pc_stage), copy_us / 1000.0);
+                            printf("[REGION_RETURN_JOIN] "
+                                   "direction=C2P layer=%d chunk=%d lane=0 "
+                                   "task=0 wait_ms=0.000 window=1 "
+                                   "path=DIRECT_MAIN status=OK\n",
+                                   prefill_down_layer_0, prefill_down_chunk_0);
+                            fflush(stdout);
+                        }
+                    } else {
+                        auto & worker_slot =
+                            backend_ctx->prefill_return_workers[partial_lane];
+                        if (worker_slot == nullptr) {
+                            worker_slot =
+                                new ggml_backend_meta_transfer_worker();
+                        }
+                        auto * return_worker = worker_slot;
+                        auto wire_us =
+                            std::make_shared<int64_t>(0);
 
-                    if (pipeline_debug) {
-                        printf(
-                            "[REGION_RETURN_JOIN] "
-                            "direction=C2P layer=%d chunk=%d lane=0 "
-                            "task=%" PRIu64 " wait_ms=%.3f "
-                            "window=1 status=OK\n",
-                            prefill_down_layer_0,
-                            prefill_down_chunk_0,
-                            return_task,
-                            partial_join_wait_us / 1000.0);
+                        const int layer = prefill_down_layer_0;
+                        const int chunk = prefill_down_chunk_0;
+                        const size_t bytes = ggml_nbytes(pc_stage);
+                        const bool debug = pipeline_debug;
+
+                        const uint64_t return_task =
+                            return_worker->enqueue(
+                                [pc_backend = bcj_dst.backend,
+                                 phone_backend = bcj_src.backend,
+                                 pc_stage,
+                                 phone_tmp,
+                                 wire_us,
+                                 layer,
+                                 chunk,
+                                 bytes,
+                                 debug]
+                                (uint64_t task_id) -> ggml_status {
+                                    const int64_t wire_begin_us =
+                                        ggml_time_us();
+                                    ggml_backend_tensor_copy_async(
+                                        pc_backend, phone_backend,
+                                        pc_stage, phone_tmp);
+                                    ggml_backend_synchronize(phone_backend);
+                                    *wire_us =
+                                        ggml_time_us() - wire_begin_us;
+
+                                    if (debug) {
+                                        printf(
+                                            "[REGION_RETURN_TX] "
+                                            "direction=C2P layer=%d chunk=%d "
+                                            "lane=0 task=%" PRIu64 " bytes=%zu "
+                                            "wire_ms=%.3f status=DONE\n",
+                                            layer, chunk, task_id, bytes,
+                                            *wire_us / 1000.0);
+                                    }
+                                    return GGML_STATUS_SUCCESS;
+                                });
+
+                        const int64_t join_begin_us = ggml_time_us();
+                        const ggml_status return_status =
+                            return_worker->wait(return_task);
+                        partial_join_wait_us =
+                            ggml_time_us() - join_begin_us;
+                        if (return_status != GGML_STATUS_SUCCESS) {
+                            return return_status;
+                        }
+                        copy_us = *wire_us;
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[REGION_RETURN_JOIN] "
+                                "direction=C2P layer=%d chunk=%d lane=0 "
+                                "task=%" PRIu64 " wait_ms=%.3f "
+                                "window=1 status=OK\n",
+                                prefill_down_layer_0,
+                                prefill_down_chunk_0,
+                                return_task,
+                                partial_join_wait_us / 1000.0);
+                        }
                     }
                 } else {
                     const int64_t copy_begin_us = ggml_time_us();
@@ -12692,10 +12742,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     i, j_dst, j_src, node_dst, copy_us);
                 record_direct_copy();
 
+                if (region_chunk_continuation && pipeline_debug) {
+                    fprintf(stderr,
+                            "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
+                            "phase=PARITY_BEGIN\n",
+                            prefill_down_layer_0, prefill_down_chunk_0);
+                }
                 directional_wire_parity("C2P",
                     prefill_down_layer_0, prefill_down_chunk_0,
                     "PC_PARTIAL_PLUS_RESIDUAL", j_dst, j_src,
                     partial_wire_src, phone_tmp);
+                if (region_chunk_continuation && pipeline_debug) {
+                    fprintf(stderr,
+                            "[REGION_C2P_RETURN_SYNC] layer=%d chunk=%d "
+                            "phase=PARITY_DONE\n",
+                            prefill_down_layer_0, prefill_down_chunk_0);
+                }
 
                 const int64_t phone_reduce_begin_us = ggml_time_us();
                 status =
