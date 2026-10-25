@@ -6149,6 +6149,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     using phone_prefill_route_ready_hook_t =
         std::function<ggml_status(
+            bool,
             ggml_backend_t,
             ggml_tensor *, ggml_tensor *,
             ggml_tensor *, ggml_tensor *,
@@ -6362,7 +6363,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                         route_set_stage_ready(nullptr, nullptr);
 
+                        const auto hook_it =
+                            phone_prefill_route_ready_hooks.find(
+                                { layer, chunk });
                         if (!used) {
+                            if (hook_it !=
+                                    phone_prefill_route_ready_hooks.end()) {
+                                return hook_it->second(
+                                    false,
+                                    route_dst_backend,
+                                    stage_hidden, dst_hidden,
+                                    stage_topk, dst_topk,
+                                    stage_weights, dst_weights);
+                            }
                             return GGML_STATUS_FAILED;
                         }
 
@@ -6389,12 +6402,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 route_us / 1000.0);
                         }
 
-                        const auto hook_it =
-                            phone_prefill_route_ready_hooks.find(
-                                { layer, chunk });
                         if (hook_it !=
                                 phone_prefill_route_ready_hooks.end()) {
                             return hook_it->second(
+                                true,
                                 route_dst_backend,
                                 stage_hidden, dst_hidden,
                                 stage_topk, dst_topk,
@@ -6486,9 +6497,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         bool pc_ffn_ready = false;
         bool phone_partial_ready = false;
         bool pc_reduce_queued = false;
+        bool pc_event_failed = false;
+        ggml_status pc_event_status =
+            GGML_STATUS_SUCCESS;
     };
     std::map<int, phone_main_local_chunk_state>
         phone_main_local_chunks;
+    std::mutex phone_main_pc_event_mutex;
+    std::condition_variable phone_main_pc_event_cv;
 
     struct tensor_expert_load_accum {
         uint64_t assignments = 0;
