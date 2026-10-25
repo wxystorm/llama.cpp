@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    13
+#define RPC_PROTO_PATCH_VERSION    14
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -105,6 +105,9 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC \
     "ggml_backend_rpc_wait_ready_seq"
 
+#define GGML_BACKEND_RPC_PHONE_REGION_LOCAL_SUBMIT_PROC \
+    "ggml_backend_rpc_phone_region_local_submit"
+
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
 
@@ -150,6 +153,21 @@ using ggml_backend_rpc_set_tensor_async_return_wait_t = bool (*)(
         size_t size,
         uint64_t phone_ffn_seq,
         size_t return_lane);
+
+using ggml_backend_rpc_phone_region_local_submit_t = bool (*)(
+        ggml_backend_t backend,
+        int chunk,
+        const struct ggml_cgraph * region_graph,
+        const struct ggml_cgraph * attn_graph,
+        const ggml_tensor * ready_hidden,
+        const ggml_tensor * ready_topk,
+        const ggml_tensor * ready_weights,
+        uint64_t ready_seq,
+        uint32_t ready_lane,
+        const struct ggml_cgraph * ffn_graph,
+        const ggml_tensor * partial,
+        uint64_t partial_seq,
+        uint32_t partial_slot);
 
 enum ggml_backend_local_file_result {
     GGML_BACKEND_LOCAL_FILE_NOT_SUPPORTED,
