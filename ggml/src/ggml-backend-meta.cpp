@@ -17339,11 +17339,20 @@ auto prefill_norm_sg_has_prework =
                    (phone_submit_end_us - phone_submit_begin_us) / 1000.0);
         }
         if (pipeline_debug && phone_region_fused) {
-            printf("[PHONE_REGION_GRAPH_DONE] chunk=%d sg=%zu..%zu "
-                   "wall_ms=%.3f status=%d\n",
-                   phone_region_chunk_id, i, phone_block_end,
-                   (phone_submit_end_us - phone_submit_begin_us) / 1000.0,
-                   (int) compute_status);
+            if (region_local_main_active) {
+                printf("[PHONE_REGION_MAIN_ACK] chunk=%d sg=%zu..%zu "
+                       "submit_ms=%.3f status=QUEUED\n",
+                       phone_region_chunk_id, i, phone_block_end,
+                       (phone_submit_end_us - phone_submit_begin_us) /
+                           1000.0);
+            } else {
+                printf("[PHONE_REGION_GRAPH_DONE] chunk=%d sg=%zu..%zu "
+                       "wall_ms=%.3f status=%d\n",
+                       phone_region_chunk_id, i, phone_block_end,
+                       (phone_submit_end_us - phone_submit_begin_us) /
+                           1000.0,
+                       (int) compute_status);
+            }
         }
 
         if (pipeline_debug) {
@@ -17991,9 +18000,10 @@ auto prefill_norm_sg_has_prework =
 
         if (region_pipeline_active && pipeline_debug &&
                 pipeline_stage != nullptr) {
-            // A Region stage is only submitted here. Its exact producer
-            // completion is consumed later by P2C_CONTINUE via the dedicated
-            // per-sequence wait socket; all other stages complete normally.
+            // PHONE_REGION is a submit boundary. In local-MAIN mode the ACK
+            // only means the server accepted the complete Region->L46 task;
+            // producer completion never returns to the PC scheduler. The next
+            // PC-visible events are READY and PARTIAL data delivery.
             printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
                    "sg=%zu stage=%s event=%s host_ms=%.3f status=OK\n",
                    schedule_pos, pipeline_chunk, communication_sg,
