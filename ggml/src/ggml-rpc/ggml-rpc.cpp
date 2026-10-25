@@ -7189,9 +7189,11 @@ void rpc_server::phone_main_loop() {
             const bool ok =
                 graph_recompute_unlocked(run);
             const int64_t done_us = ggml_time_us();
-            gpu_lock.unlock();
-            phone_gpu_cv.notify_all();
 
+            // Close the LOW->MAIN admission race while still owning the
+            // physical GPU lane. If PARTIAL is already ready, admission
+            // increments phone_main_pending before gpu_lock is released, so a
+            // normal RPC graph cannot slip between C2P_FFN and its Reduce.
             {
                 std::lock_guard<std::mutex> lock(
                     phone_main_mutex);
@@ -7207,6 +7209,9 @@ void rpc_server::phone_main_loop() {
                     }
                 }
             }
+
+            gpu_lock.unlock();
+            phone_gpu_cv.notify_all();
 
             GGML_LOG_INFO(
                 "[PHONE_C2P_FFN_DONE] chunk=%d device=%u "
