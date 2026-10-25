@@ -15428,6 +15428,24 @@ auto prefill_norm_sg_has_prework =
         } else if (!pc_phone_exact_prefill_dep &&
                    has_pending_prefill_reduce() &&
                    !continues_prefill_layer) {
+            if (pc_phone_exec_v1 && pipeline_debug) {
+                ggml_cgraph * barrier_graph =
+                    backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                const char * barrier_last =
+                    barrier_graph != nullptr &&
+                    barrier_graph->n_nodes > 0 ?
+                        barrier_graph->nodes[
+                            barrier_graph->n_nodes - 1]->name :
+                        "(empty)";
+                printf(
+                    "[PC_PHONE_BARRIER_FALLBACK] "
+                    "sg=%zu last=%s norm=%d down=%d "
+                    "reason=NON_CHUNK_SG\n",
+                    i,
+                    barrier_last,
+                    is_prefill_norm_sg ? 1 : 0,
+                    is_prefill_down_sg ? 1 : 0);
+            }
             size_t pending_lanes = 0;
             int barrier_layer = -1;
             for (size_t slot = 0;
