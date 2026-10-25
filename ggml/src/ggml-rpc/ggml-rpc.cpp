@@ -695,6 +695,28 @@ struct ggml_backend_rpc_buffer_context {
     std::array<std::shared_ptr<socket_t>, 2> snapshot_transfer_socks {};
 };
 
+// Phone MAIN client helpers are declared before the ordinary RPC helper
+// definitions below. Keep only narrow forward declarations here rather than
+// moving the feature into the low-level transport section.
+static bool send_rpc_cmd(
+        socket_ptr sock,
+        enum rpc_cmd cmd,
+        const void * input,
+        size_t input_size,
+        void * output,
+        size_t output_size);
+static uint8_t rpc_get_remote_patch(
+        const std::string & socket_key);
+static rpc_tensor serialize_tensor(
+        const ggml_tensor * tensor);
+static uint64_t rpc_graph_effective_uid(
+        const ggml_cgraph * cgraph);
+static void serialize_graph(
+        uint32_t device,
+        uint64_t graph_uid,
+        const ggml_cgraph * cgraph,
+        std::vector<uint8_t> & output);
+
 static bool ggml_backend_rpc_graph_register(
         ggml_backend_t backend,
         const ggml_cgraph * graph,
