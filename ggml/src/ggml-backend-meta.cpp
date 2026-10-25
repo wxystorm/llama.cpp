@@ -16579,11 +16579,22 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return GGML_STATUS_SUCCESS;
         };
 
+    struct phone_main_pc_pause_guard {
+        ggml_backend_meta_priority_worker * worker = nullptr;
+        bool active = false;
+        ~phone_main_pc_pause_guard() {
+            if (active && worker != nullptr) {
+                worker->resume_after_graph_arena();
+            }
+        }
+    };
+
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
                 region_pipe_schedule.size() : backend_ctx->n_subgraphs);
             ++schedule_pos) {
+        phone_main_pc_pause_guard pc_pause_guard;
         size_t i = region_pipeline_active ?
             region_pipe_schedule[schedule_pos].sg : schedule_pos;
         int pipeline_chunk = -1;
@@ -18587,6 +18598,33 @@ auto prefill_norm_sg_has_prework =
             layer_is_tensor_phone_primary(prefill_norm_layer);
 
         const size_t norm_backend = phone_primary_prefill_norm ? 1 : 0;
+
+        // C2P norm output and its residual are copied into private per-slot
+        // storage by specialized_communication later in this same SG. Pause
+        // PC Tensor work from the moment before graph execution until those
+        // snapshots complete, otherwise a concurrent P2C FFN could reuse the
+        // shared gallocr arena between norm completion and the copies.
+        if (phone_main_local_active &&
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, prefill_norm_layer)) {
+            auto * pc_worker =
+                backend_ctx->phone_main_pc_worker;
+            if (pc_worker == nullptr) {
+                return GGML_STATUS_FAILED;
+            }
+            pc_worker->pause_for_graph_arena();
+            pc_pause_guard.worker = pc_worker;
+            pc_pause_guard.active = true;
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_MAIN_PC_ARENA_PAUSE] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "reason=C2P_NORM_SNAPSHOT status=PAUSED\n",
+                    prefill_norm_layer,
+                    prefill_norm_chunk,
+                    i);
+            }
+        }
 
         ggml_cgraph * norm_graph =
             backend_ctx->backend_configs[norm_backend].
