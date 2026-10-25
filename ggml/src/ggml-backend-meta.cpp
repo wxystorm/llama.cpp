@@ -2880,6 +2880,51 @@ ggml_backend_meta_get_phone_main_register(ggml_backend_t backend) {
             reg, GGML_BACKEND_RPC_PHONE_MAIN_REGISTER_PROC));
 }
 
+static ggml_backend_rpc_phone_c2p_register_t
+ggml_backend_meta_get_phone_c2p_register(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_c2p_register_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_C2P_REGISTER_PROC));
+}
+
+static ggml_backend_rpc_phone_c2p_ready_t
+ggml_backend_meta_get_phone_c2p_ready(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_c2p_ready_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_C2P_READY_PROC));
+}
+
+static ggml_backend_rpc_phone_c2p_partial_t
+ggml_backend_meta_get_phone_c2p_partial(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_c2p_partial_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_C2P_PARTIAL_PROC));
+}
+
 static ggml_backend_rpc_set_tensor_async_return_t
 ggml_backend_meta_get_set_tensor_async_return(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
