@@ -8109,6 +8109,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             return GGML_STATUS_FAILED;
                         }
 
+                        if (old_it->second.partial_tx_task != 0) {
+                            if (backend_ctx->phone_main_pc_worker ==
+                                    nullptr) {
+                                return GGML_STATUS_FAILED;
+                            }
+                            const ggml_status tx_status =
+                                backend_ctx->phone_main_pc_worker->wait(
+                                    old_it->second.partial_tx_task);
+                            if (tx_status !=
+                                    GGML_STATUS_SUCCESS) {
+                                printf(
+                                    "[REGION_C2P_OVERLAP_REJECT] "
+                                    "old_chunk=%d task=%" PRIu64
+                                    " reason=PARTIAL_TX_FAILED "
+                                    "status=%d action=STOP\n",
+                                    old_chunk,
+                                    old_it->second.partial_tx_task,
+                                    (int) tx_status);
+                                return tx_status;
+                            }
+                        }
+
                         const uint64_t consume_seq =
                             old_it->second.consume_seq;
                         const int64_t wait_begin_us =
@@ -19920,6 +19942,30 @@ auto prefill_norm_sg_has_prework =
             const int layer = it->second.layer;
             const int chunk = it->second.chunk;
             const size_t slot = it->second.slot;
+            if (it->second.partial_tx_task != 0) {
+                if (backend_ctx->phone_main_pc_worker ==
+                        nullptr) {
+                    return GGML_STATUS_FAILED;
+                }
+                const ggml_status tx_status =
+                    backend_ctx->phone_main_pc_worker->wait(
+                        it->second.partial_tx_task);
+                if (tx_status != GGML_STATUS_SUCCESS) {
+                    printf(
+                        "[REGION_C2P_OVERLAP_REJECT] "
+                        "layer=%d chunk=%d slot=%zu "
+                        "task=%" PRIu64
+                        " reason=FINAL_PARTIAL_TX_FAILED "
+                        "status=%d action=STOP\n",
+                        layer,
+                        chunk,
+                        slot,
+                        it->second.partial_tx_task,
+                        (int) tx_status);
+                    return tx_status;
+                }
+            }
+
             const uint64_t consume_seq =
                 it->second.consume_seq;
             if (consume_seq == 0) {
