@@ -4372,6 +4372,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         bool pc_prepared = false;
         bool c2p_registered = false;
         bool c2p_ready_sent = false;
+        bool slot_active = false;
         ggml_tensor * input_dst = nullptr;
         ggml_tensor * pc_input_stage = nullptr;
         ggml_tensor * pc_topk = nullptr;
@@ -6186,7 +6187,17 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     state.pc_prepared ? 1 : 0,
                     reason != nullptr ? reason : "UNKNOWN");
             }
-            region_c2p_overlap_chunks.erase(it);
+            if (phone_main_local_active) {
+                state.slot_active = false;
+                state.input_task = 0;
+                state.input_staged = false;
+                // Keep the pre-created map node alive. Local-MAIN PC workers
+                // may concurrently access other chunk elements; avoiding
+                // insert/erase keeps the std::map structure immutable for the
+                // whole runtime schedule.
+            } else {
+                region_c2p_overlap_chunks.erase(it);
+            }
         };
 
     auto phone_prefill_direct_defer_eligible =
@@ -8181,6 +8192,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     state.layer = prefill_norm_layer;
                     state.chunk = prefill_norm_chunk;
                     state.slot = slot_index;
+                    state.slot_active = true;
+                    state.input_task = 0;
+                    state.pc_prep_task = 0;
+                    state.partial_tx_task = 0;
+                    state.input_staged = false;
+                    state.pc_prepared = false;
+                    state.c2p_ready_sent = false;
                     state.input_dst = dst;
 
                     if (phone_main_local_active) {
@@ -14966,6 +14984,18 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         backend_ctx->next_phone_prefill_ffn_seq++;
                 }
 
+                auto & runtime_c2p_state =
+                    region_c2p_overlap_chunks[
+                        { 34, chunk }];
+                runtime_c2p_state.layer = 34;
+                runtime_c2p_state.chunk = chunk;
+                runtime_c2p_state.slot = c % 2;
+                runtime_c2p_state.phone_ffn_uid =
+                    state.c2p_ffn_uid;
+                runtime_c2p_state.consume_seq =
+                    state.c2p_consume_seq;
+                runtime_c2p_state.slot_active = false;
+
                 // Remote graph descriptors now own the private buffer addresses.
                 // Restore host graph descriptors; runtime binding will reattach
                 // the same slot before READY is sent.
@@ -19936,9 +19966,17 @@ auto prefill_norm_sg_has_prework =
             return GGML_STATUS_FAILED;
         }
 
-        while (!region_c2p_overlap_chunks.empty()) {
-            const auto it =
-                region_c2p_overlap_chunks.begin();
+        while (true) {
+            auto it =
+                std::find_if(
+                    region_c2p_overlap_chunks.begin(),
+                    region_c2p_overlap_chunks.end(),
+                    [](const auto & entry) {
+                        return entry.second.slot_active;
+                    });
+            if (it == region_c2p_overlap_chunks.end()) {
+                break;
+            }
             const int layer = it->second.layer;
             const int chunk = it->second.chunk;
             const size_t slot = it->second.slot;
@@ -20018,6 +20056,10 @@ auto prefill_norm_sg_has_prework =
                 chunk,
                 "FINAL_REDUCE_CONSUMED");
         }
+
+        // All local workers and consume credits have retired. Structural
+        // mutation is safe again.
+        region_c2p_overlap_chunks.clear();
     }
 
     if (!region_c2p_overlap_chunks.empty()) {
