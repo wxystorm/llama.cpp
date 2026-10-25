@@ -356,37 +356,34 @@ def main() -> int:
         )
         return 1
 
-    continuation_credits = [
+    local_continuations = [
         (int(m.group(1)), int(m.group(2)))
         for m in re.finditer(
-            r"\[PHONE_REGION_CONTINUATION_CREDIT\] "
-            r"chunk=(\d+) seq=\d+ marked=(\d+) p2c_sg=\d+",
+            r"\[PHONE_REGION_LOCAL_CONTINUATION\] "
+            r"chunk=(\d+) slot=(\d+) "
+            r"dependency=PHONE_COMPUTE_FIFO "
+            r"pc_completion_wait=0 status=QUEUED",
             block,
         )
     ]
-    if continuation_credits != [(c, 1) for c in range(n_chunks)]:
+    expected_local = [(c, c % 2) for c in range(n_chunks)]
+    if local_continuations != expected_local:
         print(
-            "FAIL: continuation credits="
-            f"{continuation_credits}; expected every chunk marked=1"
+            f"FAIL: local continuations={local_continuations}; "
+            f"expected={expected_local}"
         )
         return 1
 
-    continuation_waits = [
-        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        for m in re.finditer(
-            r"\[PHONE_REGION_CONTINUATION_WAIT\] "
-            r"chunk=(\d+) seq=\d+ slot=(\d+) "
-            r"wait_ms=[0-9.]+ slot_released=(\d+) status=READY",
-            block,
-        )
-    ]
-    expected_waits = [(c, c % 2, 1) for c in range(n_chunks)]
-    if continuation_waits != expected_waits:
-        print(
-            f"FAIL: continuation waits={continuation_waits}; "
-            f"expected={expected_waits}"
-        )
-        return 1
+    for forbidden in (
+        "[PHONE_REGION_CONTINUATION_WAIT]",
+        "[PHONE_REGION_CONTINUATION_CREDIT]",
+        "[PHONE_REGION_EVENT_REGISTER]",
+        "[PHONE_REGION_EVENT_READY]",
+        "[PHONE_REGION_MAIN_READY]",
+    ):
+        if forbidden in block:
+            print(f"FAIL: obsolete PC completion-control marker present: {forbidden}")
+            return 1
 
     seq_reuse = list(re.finditer(
         r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?"
@@ -395,10 +392,10 @@ def main() -> int:
     ))
     for m in seq_reuse:
         chunk = int(m.group(1))
-        if chunk >= 2 and m.group(4) != "NONE":
+        if chunk >= 2 and m.group(4) != "SEQ":
             print(
-                f"FAIL: chunk {chunk} should reuse a slot already released "
-                f"by continuation, wait_mode={m.group(4)}"
+                f"FAIL: chunk {chunk} must protect scratch reuse with "
+                f"BUFFER_REUSE_ONLY seq credit, wait_mode={m.group(4)}"
             )
             return 1
 
@@ -420,8 +417,8 @@ def main() -> int:
         f"{plan.group(4)} Meta schedule entries)"
     )
     print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
-    print("PASS: every Region completion credit is consumed by its own L46 continuation")
-    print("PASS: continuation releases the scratch slot before later reuse")
+    print("PASS: Region -> L46 uses Phone FIFO ordering with no PC completion wait")
+    print("PASS: Region completion seq is used only for scratch-slot reuse")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
     print("NOTE: this does not verify GPU kernel duration, KV parity or logits")
     return 0
