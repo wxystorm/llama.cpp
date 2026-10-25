@@ -12925,6 +12925,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     break;
                 }
             }
+
+            if (eligible && pipeline_debug) {
+                for (size_t sg = last_region_end + 1;
+                        sg < backend_ctx->n_subgraphs; ++sg) {
+                    bool owned = false;
+                    for (const auto & entry :
+                            region_pipe_chunks) {
+                        const auto & e = entry.second;
+                        if (sg >= e.continuation_begin_sg &&
+                                sg <= e.continuation_end_sg) {
+                            owned = true;
+                            break;
+                        }
+                    }
+                    if (!owned) {
+                        printf(
+                            "[PHONE_REGION_CONTINUATION_SHARED] "
+                            "sg=%zu reason=OUTSIDE_EXPLICIT_L46_RANGE\n",
+                            sg);
+                    }
+                }
+            }
         }
 
         bool region_pipe_isolation_needed = false;
