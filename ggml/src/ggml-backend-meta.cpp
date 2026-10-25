@@ -11032,19 +11032,41 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 const bool last_chunk =
                     prefill_is_last_down_chunk(i, prefill_down_layer_0);
+                auto local_overlap_it =
+                    region_c2p_overlap_chunks.find({
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                    });
+                const bool private_residual =
+                    phone_main_local_active &&
+                    local_overlap_it !=
+                        region_c2p_overlap_chunks.end() &&
+                    local_overlap_it->second.pc_prepared &&
+                    local_overlap_it->second.pc_residual_stage !=
+                        nullptr;
+
                 ggml_tensor * pc_residual =
-                    find_recent_ffn_inp(0, i, prefill_down_layer_0);
+                    private_residual ?
+                        local_overlap_it->second.pc_residual_stage :
+                        find_recent_ffn_inp(
+                            0, i, prefill_down_layer_0);
                 ggml_tensor * phone_l_out =
                     find_layer_output(1, prefill_down_layer_0);
 
                 GGML_ASSERT(pc_residual != nullptr);
                 GGML_ASSERT(phone_l_out != nullptr);
-                GGML_ASSERT(
-                    ggml_nbytes(pc_residual) ==
-                    ggml_nbytes(phone_l_out));
 
                 const size_t chunk_offset = down_chunk_offset(
                     0, true, prefill_down_layer_0, prefill_down_chunk_0);
+                if (private_residual) {
+                    GGML_ASSERT(
+                        ggml_nbytes(pc_residual) ==
+                        ggml_nbytes(node_dst));
+                } else {
+                    GGML_ASSERT(
+                        ggml_nbytes(pc_residual) ==
+                        ggml_nbytes(phone_l_out));
+                }
 
                 // At this boundary both FFN shard outputs are live and are the
                 // exact tensors consumed by the C2P reduction. Capture them
@@ -11064,10 +11086,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 // PC: fold the residual into the local FFN partial in-place.
                 ggml_tensor * residual_chunk = get_node_aux(node_dst);
                 residual_chunk->view_src = pc_residual;
-                residual_chunk->view_offs = chunk_offset;
+                residual_chunk->view_offs =
+                    private_residual ? 0 : chunk_offset;
                 ggml_backend_view_init(residual_chunk);
                 GGML_ASSERT(
-                    chunk_offset + ggml_nbytes(residual_chunk) <=
+                    residual_chunk->view_offs +
+                        ggml_nbytes(residual_chunk) <=
                     ggml_nbytes(pc_residual));
 
                 ggml_tensor * pc_fold = get_node_aux(node_dst);
