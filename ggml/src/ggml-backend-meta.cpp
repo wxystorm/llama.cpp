@@ -15537,19 +15537,43 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 ggml_time_us();
             for (auto & entry :
                     phone_main_local_chunks) {
-                auto & state = entry.second;
-                if (state.join_worker == nullptr ||
-                        state.join_task == 0) {
-                    printf(
-                        "[PHONE_MAIN_LOCAL_REJECT] "
-                        "chunk=%d reason=PC_JOIN_NOT_ARMED "
-                        "action=STOP\n",
-                        entry.first);
+                uint64_t join_task = 0;
+                ggml_backend_meta_transfer_worker *
+                    join_worker = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(
+                        phone_main_pc_event_mutex);
+                    phone_main_pc_event_cv.wait(
+                        lock,
+                        [&]() {
+                            const auto & state =
+                                phone_main_local_chunks
+                                    .at(entry.first);
+                            return state.join_task != 0 ||
+                                   state.pc_event_failed;
+                        });
+                    auto & state =
+                        phone_main_local_chunks
+                            .at(entry.first);
+                    if (state.pc_event_failed) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reason=PC_EVENT_FAILED "
+                            "status=%d action=STOP\n",
+                            entry.first,
+                            (int) state.pc_event_status);
+                        return state.pc_event_status;
+                    }
+                    join_task = state.join_task;
+                    join_worker = state.join_worker;
+                }
+
+                if (join_worker == nullptr ||
+                        join_task == 0) {
                     return GGML_STATUS_FAILED;
                 }
                 const ggml_status join_status =
-                    state.join_worker->wait(
-                        state.join_task);
+                    join_worker->wait(join_task);
                 if (join_status !=
                         GGML_STATUS_SUCCESS) {
                     printf(
