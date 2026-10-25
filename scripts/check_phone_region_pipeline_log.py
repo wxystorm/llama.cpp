@@ -206,19 +206,38 @@ def main() -> int:
             return 1
 
         for c in range(n_chunks - 1):
-            region_submit = block.find(
-                f"stage=PHONE_REGION event=BEGIN",
-                0,
+            region_match = re.search(
+                rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
+                rf"stage=PHONE_REGION event=BEGIN",
+                block,
             )
-            prep_pos = block.find(
-                f"[REGION_C2P_PC_PREP] layer=34 chunk={c + 1} "
+            prep_match = re.search(
+                rf"\[REGION_C2P_PC_PREP\] layer=34 chunk={c + 1} "
+                rf"sg=\d+ slot=\d+ .*?status=READY",
+                block,
             )
-            cont_pos = block.find(
-                f"chunk={c} ",
-                prep_pos if prep_pos >= 0 else 0,
+            cont_match = re.search(
+                rf"\[PHONE_REGION_PIPE_STAGE\].*?chunk={c} .*?"
+                rf"stage=P2C_CONTINUE event=BEGIN",
+                block,
             )
-            if prep_pos < 0:
-                print(f"FAIL: missing PC prep marker for chunk {c + 1}")
+            if region_match is None or prep_match is None or cont_match is None:
+                print(
+                    f"FAIL: missing overlap ordering marker for "
+                    f"Region{c} -> PC_PREP{c + 1} -> CONTINUE{c}"
+                )
+                return 1
+            if not (
+                region_match.start()
+                < prep_match.start()
+                < cont_match.start()
+            ):
+                print(
+                    f"FAIL: overlap order for chunk {c}: "
+                    f"region={region_match.start()} "
+                    f"prep={prep_match.start()} "
+                    f"continue={cont_match.start()}"
+                )
                 return 1
 
         reject = re.search(
