@@ -5607,7 +5607,7 @@ bool rpc_server::run_phone_region_local_task(
         return false;
     }
 
-    if (!snapshot_tensor(task.partial)) {
+    if (!phone_region_partial_publish(task.partial)) {
         return false;
     }
 
@@ -5952,6 +5952,167 @@ bool rpc_server::get_tensor_batch3(
             (ggml_time_us() - server_begin_us) / 1000.0);
     }
     return true;
+}
+
+
+bool rpc_server::phone_region_partial_publish(
+        const rpc_msg_snapshot_tensor_req & request) {
+    if (request.device >= backends.size() ||
+            request.slot >= 2 ||
+            request.seq == 0) {
+        return false;
+    }
+
+    struct ggml_init_params params {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_ptr { ggml_init(params) };
+    GGML_ASSERT(ctx_ptr != nullptr);
+
+    ggml_tensor * tensor =
+        deserialize_tensor(ctx_ptr.get(), &request.tensor);
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return false;
+    }
+    if (!ensure_opencl_tensor_extra(tensor)) {
+        GGML_LOG_ERROR(
+            "[%s] failed to initialize OpenCL tensor state for '%s'\n",
+            __func__, tensor->name);
+        return false;
+    }
+
+    const uint64_t tensor_size = ggml_nbytes(tensor);
+    if (request.offset > tensor_size ||
+            request.size > tensor_size - request.offset) {
+        return false;
+    }
+
+    rpc_snapshot_slot & slot =
+        phone_region_partial_devices[request.device]->
+            slots[request.slot];
+
+    const int64_t free_wait_begin_us = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lock(slot.mutex);
+        slot.cv.wait(
+            lock,
+            [&]() {
+                return slot.state == rpc_snapshot_state::FREE;
+            });
+        slot.free_wait_us =
+            ggml_time_us() - free_wait_begin_us;
+        slot.fill_us = 0;
+        slot.state = rpc_snapshot_state::FILLING;
+        slot.seq = request.seq;
+        slot.data.resize(
+            static_cast<size_t>(request.size));
+    }
+
+    const int64_t fill_begin_us = ggml_time_us();
+    ggml_backend_tensor_get(
+        tensor,
+        slot.data.data(),
+        static_cast<size_t>(request.offset),
+        static_cast<size_t>(request.size));
+    const int64_t fill_us =
+        ggml_time_us() - fill_begin_us;
+
+    int64_t free_wait_us = 0;
+    {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        slot.fill_us = fill_us;
+        free_wait_us = slot.free_wait_us;
+        slot.state = rpc_snapshot_state::READY;
+    }
+    slot.cv.notify_all();
+
+    std::fprintf(
+        stderr,
+        "[PHONE_REGION_PARTIAL_PUBLISH] side=phone "
+        "slot=%u seq=%" PRIu64 " bytes=%" PRIu64
+        " free_wait_ms=%.3f fill_ms=%.3f status=READY\n",
+        request.slot,
+        request.seq,
+        request.size,
+        free_wait_us / 1000.0,
+        fill_us / 1000.0);
+    std::fflush(stderr);
+    return true;
+}
+
+bool rpc_server::send_phone_region_partial(
+        const rpc_msg_get_snapshot_req & request,
+        socket_ptr sock) {
+    if (request.device >= backends.size() ||
+            request.slot >= 2 ||
+            request.seq == 0) {
+        return false;
+    }
+
+    rpc_snapshot_slot & slot =
+        phone_region_partial_devices[request.device]->
+            slots[request.slot];
+
+    const uint8_t * data = nullptr;
+    size_t size = 0;
+    const int64_t wait_begin_us = ggml_time_us();
+    {
+        std::unique_lock<std::mutex> lock(slot.mutex);
+        slot.cv.wait(
+            lock,
+            [&]() {
+                return slot.state == rpc_snapshot_state::READY;
+            });
+
+        if (slot.seq != request.seq ||
+                slot.data.size() != request.size) {
+            GGML_LOG_ERROR(
+                "[PHONE_REGION_PARTIAL_MISMATCH] "
+                "device=%u slot=%u request_seq=%" PRIu64
+                " slot_seq=%" PRIu64
+                " request_size=%" PRIu64
+                " slot_size=%zu state=%d\n",
+                request.device,
+                request.slot,
+                request.seq,
+                slot.seq,
+                request.size,
+                slot.data.size(),
+                (int) slot.state);
+            return false;
+        }
+
+        slot.state = rpc_snapshot_state::SENDING;
+        data = slot.data.data();
+        size = slot.data.size();
+    }
+
+    const int64_t send_begin_us = ggml_time_us();
+    const bool status = sock->send_data(data, size);
+    const int64_t send_us =
+        ggml_time_us() - send_begin_us;
+
+    {
+        std::lock_guard<std::mutex> lock(slot.mutex);
+        slot.state = rpc_snapshot_state::FREE;
+    }
+    slot.cv.notify_all();
+
+    std::fprintf(
+        stderr,
+        "[PHONE_REGION_PARTIAL_SEND] side=phone "
+        "slot=%u seq=%" PRIu64 " bytes=%zu "
+        "ready_wait_ms=%.3f send_ms=%.3f status=%s\n",
+        request.slot,
+        request.seq,
+        size,
+        (send_begin_us - wait_begin_us) / 1000.0,
+        send_us / 1000.0,
+        status ? "OK" : "FAIL");
+    std::fflush(stderr);
+    return status;
 }
 
 bool rpc_server::snapshot_tensor(const rpc_msg_snapshot_tensor_req & request) {
