@@ -32,7 +32,8 @@ def main() -> int:
     plan_re = re.compile(
         r"\[PHONE_REGION_PIPE_PLAN\] active=(\d+) window=(\d+) "
         r"chunks=(\d+) stages=(\d+) meta_sgs=(\d+) "
-        r"(?:scratch_pool=(\d+) )?reason=([^\s]+)"
+        r"(?:scratch_pool=(\d+) )?"
+        r"(?:continuation=(\d+) )?reason=([^\s]+)"
     )
     plans = list(plan_re.finditer(text))
     if not plans:
@@ -41,7 +42,7 @@ def main() -> int:
     ready = [match for match in plans if match.group(1) == "1"]
     if not ready:
         last = plans[-1]
-        print(f"FALLBACK: pipeline inactive, reason={last.group(7)}")
+        print(f"FALLBACK: pipeline inactive, reason={last.group(8)}")
         return 2
 
     # The final active plan covers one Meta execution. Model warmup can
@@ -54,16 +55,31 @@ def main() -> int:
         print("FAIL: expected window=2 with at least two chunks")
         return 1
 
+    if plan.group(7) != "1":
+        print("FAIL: expected continuation=1 in PHONE_REGION_PIPE_PLAN")
+        return 1
+
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
-        r"stage=(C2P_NORM|C2P_FFN_REDUCE|PHONE_REGION) event=BEGIN"
+        r"stage=(C2P_NORM|C2P_FFN_REDUCE|PHONE_REGION|P2C_CONTINUE) "
+        r"event=BEGIN"
     )
     observed = [(int(m.group(1)), m.group(2)) for m in begin_re.finditer(block)]
+
     expected = [
-        (c, stage)
-        for c in range(n_chunks)
-        for stage in ("C2P_NORM", "C2P_FFN_REDUCE", "PHONE_REGION")
+        (0, "C2P_NORM"),
+        (0, "C2P_FFN_REDUCE"),
+        (0, "PHONE_REGION"),
     ]
+    for c in range(1, n_chunks):
+        expected.extend([
+            (c, "C2P_NORM"),
+            (c - 1, "P2C_CONTINUE"),
+            (c, "C2P_FFN_REDUCE"),
+            (c, "PHONE_REGION"),
+        ])
+    expected.append((n_chunks - 1, "P2C_CONTINUE"))
+
     if observed != expected:
         print(f"FAIL: stage order mismatch\nexpected={expected}\nobserved={observed}")
         return 1
@@ -128,6 +144,38 @@ def main() -> int:
         print(f"FAIL: unmarked slot credit: {credits}")
         return 1
 
+    continuation_credits = [
+        (int(m.group(1)), int(m.group(2)))
+        for m in re.finditer(
+            r"\[PHONE_REGION_CONTINUATION_CREDIT\] "
+            r"chunk=(\d+) seq=\d+ marked=(\d+) p2c_sg=\d+",
+            block,
+        )
+    ]
+    if continuation_credits != [(c, 1) for c in range(n_chunks)]:
+        print(
+            "FAIL: continuation credits="
+            f"{continuation_credits}; expected every chunk marked=1"
+        )
+        return 1
+
+    continuation_waits = [
+        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        for m in re.finditer(
+            r"\[PHONE_REGION_CONTINUATION_WAIT\] "
+            r"chunk=(\d+) seq=\d+ slot=(\d+) "
+            r"wait_ms=[0-9.]+ slot_released=(\d+) status=READY",
+            block,
+        )
+    ]
+    expected_waits = [(c, c % 2, 1) for c in range(n_chunks)]
+    if continuation_waits != expected_waits:
+        print(
+            f"FAIL: continuation waits={continuation_waits}; "
+            f"expected={expected_waits}"
+        )
+        return 1
+
     seq_reuse = list(re.finditer(
         r"\[PHONE_REGION_SCRATCH\] chunk=(\d+) slot=(\d+).*?"
         r"reuse_wait_ms=([0-9.]+) wait_mode=(\w+)",
@@ -135,8 +183,11 @@ def main() -> int:
     ))
     for m in seq_reuse:
         chunk = int(m.group(1))
-        if chunk >= 2 and m.group(4) != "SEQ":
-            print(f"FAIL: chunk {chunk} reused slot with wait_mode={m.group(4)}")
+        if chunk >= 2 and m.group(4) != "NONE":
+            print(
+                f"FAIL: chunk {chunk} should reuse a slot already released "
+                f"by continuation, wait_mode={m.group(4)}"
+            )
             return 1
 
     outputs = [
@@ -150,9 +201,12 @@ def main() -> int:
         print(f"FAIL: output slots={outputs}; expected 0..{n_chunks - 1}")
         return 1
 
-    print(f"PASS: {n_chunks} C2P -> Phone Region stages are interleaved "
-          f"(window=2, {plan.group(4)} Meta schedule entries)")
-    print("PASS: window-2 Phone scratch slots and persistent chunk outputs are bound")
+    print(
+        f"PASS: {n_chunks} C2P -> Phone Region -> L46 continuations are "
+        f"chunk-pipelined (window=2, {plan.group(4)} Meta schedule entries)"
+    )
+    print("PASS: every Region completion credit is consumed by its own L46 continuation")
+    print("PASS: continuation releases the scratch slot before later reuse")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
     print("NOTE: this does not verify GPU kernel duration, KV parity or logits")
     return 0
