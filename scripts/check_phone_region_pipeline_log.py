@@ -266,7 +266,7 @@ def main() -> int:
         for pattern, event in [
             (r"\[PHONE_REGION_MAIN_LOCAL\] chunk=(\d+).*?status=SUBMITTED", "MAIN submit"),
             (r"\[PHONE_REGION_P2C_PC_CONSUMER\] layer=46 chunk=(\d+).*?phone_submit=0 status=OK", "PC READY consumer"),
-            (r"\[PHONE_REGION_PARTIAL_CONSUME\] layer=46 chunk=(\d+).*?source=SNAPSHOT status=OK", "PARTIAL consumer"),
+            (r"\[PHONE_REGION_PARTIAL_CONSUME\] layer=46 chunk=(\d+).*?source=PARTIAL_MAILBOX status=OK", "PARTIAL consumer"),
         ]:
             found = [int(m.group(1)) for m in re.finditer(pattern, block)]
             if found != list(range(n_chunks)):
@@ -277,7 +277,7 @@ def main() -> int:
             int(m.group(1))
             for m in re.finditer(
                 r"\[REGION_P2C_PREFILL\] layer=46 chunk=(\d+).*?"
-                r"source=PHONE_MAIN_SNAPSHOT status=OK",
+                r"source=PHONE_MAIN_PARTIAL status=OK",
                 block,
             )
         ]
@@ -293,6 +293,10 @@ def main() -> int:
             return 1
         if "[PHONE_REGION_GRAPH_DONE]" in block:
             print("FAIL: local-main trace still contains synchronous Region GRAPH_DONE")
+            return 1
+
+        if "[RPC_SNAPSHOT_MISMATCH]" in block:
+            print("FAIL: generic snapshot mismatch leaked into Phone MAIN path")
             return 1
     else:
         found = [
