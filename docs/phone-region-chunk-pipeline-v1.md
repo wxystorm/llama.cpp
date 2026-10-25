@@ -251,6 +251,46 @@ existing P2C reduction protocol keeps its previous final-output shape. For
 three L46 chunks, `REGION_P2C_PREFILL` must report `last=0` for chunks 0/1
 and `last=1` only for chunk 2.
 
+## Event-pipeline PC overlap
+
+The correctness-first continuation schedule is intentionally kept in graph
+order, but a Region submission no longer leaves the PC idle. Once
+`PHONE_REGION(c)` has been submitted, Meta arms an asynchronous completion
+watch for its exact producer sequence and uses the PC to prepare the next C2P
+chunk:
+
+```
+Phone: Region(c) ----------------------> READY -> L46(c)
+PC:             C2P PC prework(c+1) ---^
+```
+
+PC prework copies the next chunk's L34 FFN norm into private storage, computes
+the PC Router and expert shard, and keeps Router TopK/weights plus the PC
+partial in per-chunk private buffers. It does **not** copy anything to Phone and
+does not submit the next Phone FFN. Therefore the current chunk's L46
+continuation keeps priority on the Phone queue.
+
+Expected traces are:
+
+```
+[PHONE_REGION_EVENT_PIPELINE] ... pc_prework=NEXT_CHUNK completion_wait=ASYNC_EVENT ...
+[PHONE_REGION_COMPLETION_WATCH] chunk=N ... status=ARMED
+[REGION_C2P_PC_PREWORK] layer=34 chunk=N+1 ... state=PC_READY_PHONE_DEFERRED status=OK
+[PHONE_REGION_COMPLETION_EVENT] chunk=N ... status=READY
+[PHONE_REGION_CONTINUATION_WAIT] chunk=N ... wait_ms=... producer_ms=... wait_mode=ASYNC_EVENT ...
+[REGION_C2P_NORM_STAGE_CONSUME] layer=34 chunk=N+1 ... source=PC_PRIVATE_STAGE ...
+[REGION_C2P_PC_PREWORK_CONSUME] layer=34 chunk=N+1 ... status=PC_READY
+[REGION_C2P_FFN_DEFERRED_PHONE] ... chunk=N+1 ... status=JOIN
+[REGION_C2P_PC_PREWORK_RELEASE] ... chunk=N+1 ... status=RELEASED_AFTER_REDUCE
+```
+
+`producer_ms` measures Phone Region producer time from watch arm to the READY
+event. `wait_ms` is only the remaining scheduler wait when the continuation is
+reached. The difference indicates how much Region producer time was occupied by
+safe PC-side prework. A later phase may move continuation dispatch fully onto
+Phone, but this version deliberately keeps Phone work submission deferred until
+the previous continuation has completed.
+
 ## Required hardware validation
 
 1. Build PC and Phone server from compatible commits as applicable; test 2-token warmup first. **Both the Region Graph and V1 pipeline now stay disabled for a single chunk**, so warmup follows the validated legacy Phone path. This is intentional: the single-chunk Region shape was not fused and exposed a Phone-side `GGML_OP_SET_ROWS` index assertion without providing any pipeline benefit.
