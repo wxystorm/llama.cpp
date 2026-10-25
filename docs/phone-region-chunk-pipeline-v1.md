@@ -138,6 +138,47 @@ Expected three-chunk trace:
 
 If the seq feature is unavailable, the experimental pipeline fails preflight. At runtime, any missing marker/wait falls back to the previous global fence for correctness. Patch 13 changes the RPC protocol, so **PC and Phone server must be rebuilt from the same commit**.
 
+### Per-chunk Region -> L46 continuation
+
+The per-slot fence removed the false whole-queue drain, but a hardware trace still showed about 1.02 s waiting for Region0 itself and a later L45 boundary charged about 1.74 s to Phone->PC copy wait. The remaining problem was control-flow ordering: Meta submitted all Region chunks before it entered the post-Region L46 Tensor/P2C subgraphs.
+
+The continuation branch discovers, for each Region chunk, the exact post-Region L46 subgraph range that consumes that chunk's private `phone_region_chunk_end_<chunk>-45` output. Each Region publishes a completion seq, and the matching L46 continuation waits for only that seq before it starts.
+
+For three chunks the intended scheduling order is:
+
+```
+C2P_NORM(0)
+C2P_FFN_REDUCE(0)
+REGION(0)
+
+C2P_NORM(1)          # PC-owned prework may overlap Region0
+P2C_CONTINUE(0)      # waits only Region0, then immediately enters L46
+C2P_FFN_REDUCE(1)
+REGION(1)
+
+C2P_NORM(2)
+P2C_CONTINUE(1)
+C2P_FFN_REDUCE(2)
+REGION(2)
+
+P2C_CONTINUE(2)
+```
+
+The L46 Phone branch may start PC FFN/return work asynchronously using the existing prefill workers, so after the Phone part of the continuation has been submitted/completed, later Region work can proceed while the previous chunk's PC/return path remains in flight.
+
+The continuation consumes the same Region completion credit that previously existed only to protect scratch reuse. Once `P2C_CONTINUE(c)` has observed Region(c) complete, its scratch slot is explicitly released. Therefore a later chunk reusing that slot should no longer wait on the old producer:
+
+```
+[PHONE_REGION_CONTINUATION_CREDIT] chunk=0 seq=... marked=1 p2c_sg=...
+[PHONE_REGION_CONTINUATION_WAIT] chunk=0 seq=... slot=0 wait_ms=... slot_released=1 status=READY
+...
+[PHONE_REGION_SCRATCH] chunk=2 slot=0 ... reuse_wait_ms=0... wait_mode=NONE status=BOUND
+```
+
+The pipeline plan now reports `continuation=1`, and each chunk reports its discovered continuation range as `p2c=[begin,end]`. Discovery fails closed on ambiguous or overlapping post-Region topology rather than reordering unknown subgraphs.
+
+This continuation change does **not** change the RPC protocol; it still uses RPC 4.0.13 and the patch-13 completion-wait primitive.
+
 Each Region stage now also prints:
 
 ```
