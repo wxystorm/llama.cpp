@@ -2361,8 +2361,10 @@ struct ggml_backend_meta_context {
         struct phone_region_scratch_slot {
             std::vector<phone_region_scratch_arena> arenas;
             int owner_chunk = -1;
+            uint64_t completion_seq = 0;
         };
         std::array<phone_region_scratch_slot, 2> phone_region_scratch_slots;
+        uint64_t phone_region_next_completion_seq = 1;
 
         // Region outputs live longer than scratch: L46 consumes them only
         // after the per-chunk Region submission. Keep one compact output
@@ -2862,6 +2864,24 @@ ggml_backend_meta_get_phone_ffn_mark_ready(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(
             reg,
             GGML_BACKEND_RPC_PHONE_FFN_MARK_READY_PROC));
+}
+
+static ggml_backend_rpc_wait_ready_seq_t
+ggml_backend_meta_get_wait_ready_seq(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ggml_backend_rpc_wait_ready_seq_t>(
+        ggml_backend_reg_get_proc_address(
+            reg,
+            GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC));
 }
 
 static ggml_backend_rpc_set_tensor_async_return_wait_t
@@ -12525,16 +12545,41 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             // explicitly before overwriting a slot that previously belonged
             // to another chunk.
             int64_t reuse_wait_us = 0;
+            const char * reuse_wait_mode = "NONE";
             if (slot.owner_chunk >= 0) {
                 const int64_t wait_begin_us = ggml_time_us();
-                const ggml_backend_rpc_fence_t rpc_fence =
-                    ggml_backend_meta_get_rpc_fence(phone_backend);
-                if (rpc_fence != nullptr) {
-                    rpc_fence(phone_backend);
+                bool waited_by_seq = false;
+                if (slot.completion_seq != 0) {
+                    const ggml_backend_rpc_wait_ready_seq_t
+                        wait_ready =
+                            ggml_backend_meta_get_wait_ready_seq(
+                                phone_backend);
+                    if (wait_ready != nullptr) {
+                        waited_by_seq =
+                            wait_ready(
+                                phone_backend,
+                                slot.completion_seq);
+                    }
+                }
+
+                if (waited_by_seq) {
+                    reuse_wait_mode = "SEQ";
                 } else {
-                    ggml_backend_synchronize(phone_backend);
+                    // Fail-safe fallback for a missing/newer RPC feature:
+                    // retain the previous whole-device fence rather than
+                    // reusing scratch before the producer is complete.
+                    const ggml_backend_rpc_fence_t rpc_fence =
+                        ggml_backend_meta_get_rpc_fence(
+                            phone_backend);
+                    if (rpc_fence != nullptr) {
+                        rpc_fence(phone_backend);
+                    } else {
+                        ggml_backend_synchronize(phone_backend);
+                    }
+                    reuse_wait_mode = "GLOBAL_FENCE";
                 }
                 reuse_wait_us = ggml_time_us() - wait_begin_us;
+                slot.completion_seq = 0;
             }
 
             ggml_tensor * output_root = phone_region_root(output);
@@ -12669,11 +12714,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             if (pipeline_debug) {
                 printf("[PHONE_REGION_SCRATCH] chunk=%d slot=%zu "
                        "arenas=%zu tensors=%zu bytes=%.3f MiB "
-                       "reuse_wait_ms=%.3f status=BOUND\n",
+                       "reuse_wait_ms=%.3f wait_mode=%s status=BOUND\n",
                        chunk, slot_index, arena_map.size(),
                        family.size(),
                        scratch_bytes / (1024.0 * 1024.0),
-                       reuse_wait_us / 1000.0);
+                       reuse_wait_us / 1000.0,
+                       reuse_wait_mode);
             }
             return true;
         };
@@ -12853,6 +12899,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             size_t output_bytes = 0;
             size_t output_count = 0;
             bool prep_ok = true;
+
+            // Pre-connect the independent completion-wait socket while the
+            // Phone is idle. seq=0 is capability-only and does not consume a
+            // marker. The marker itself is sent on the compute socket after
+            // each Region graph, preserving graph -> marker order.
+            const ggml_backend_rpc_phone_ffn_mark_ready_t
+                region_mark_ready =
+                    ggml_backend_meta_get_phone_ffn_mark_ready(
+                        phone_cfg.backend);
+            const ggml_backend_rpc_wait_ready_seq_t
+                region_wait_ready =
+                    ggml_backend_meta_get_wait_ready_seq(
+                        phone_cfg.backend);
+            const bool region_seq_fence_ready =
+                region_mark_ready != nullptr &&
+                region_wait_ready != nullptr &&
+                region_mark_ready(phone_cfg.backend, 0) &&
+                region_wait_ready(phone_cfg.backend, 0);
+            if (!region_seq_fence_ready) {
+                prep_ok = false;
+                region_pipe_reason =
+                    "POOL_SEQ_FENCE_UNAVAILABLE";
+            }
 
             for (size_t c = 0;
                     c < region_pipe_chunks.size() && prep_ok; ++c) {
@@ -13112,13 +13181,14 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        "outputs=%zu output_plans=%zu "
                        "output_mib=%.3f "
                        "slot0_mib=%.3f slot1_mib=%.3f "
-                       "alloc_ms=%.3f reason=%s\n",
+                       "seq_fence=%d alloc_ms=%.3f reason=%s\n",
                        prep_ok ? 1 : 0,
                        output_count,
                        phone_region_output_plans.size(),
                        output_bytes / (1024.0 * 1024.0),
                        slot_bytes[0] / (1024.0 * 1024.0),
                        slot_bytes[1] / (1024.0 * 1024.0),
+                       region_seq_fence_ready ? 1 : 0,
                        pool_prep_us / 1000.0,
                        prep_ok ? "READY" : region_pipe_reason);
             }
@@ -15275,6 +15345,67 @@ auto prefill_norm_sg_has_prework =
         }
         compute_workers.start_graph(1, phone_graph);
         compute_status = compute_workers.wait(1);
+
+        if (region_pipeline_active && phone_region_fused &&
+                compute_status == GGML_STATUS_SUCCESS) {
+            const size_t slot_index =
+                static_cast<size_t>(
+                    phone_region_chunk_id) % 2;
+            auto & phone_cfg =
+                backend_ctx->backend_configs[1];
+            auto & slot =
+                phone_cfg.phone_region_scratch_slots[
+                    slot_index];
+
+            // Only chunks whose scratch slot will be reused in this Meta
+            // execution need a completion marker. This avoids leaving
+            // unconsumed sequence IDs on the server after the final use.
+            const bool will_reuse_slot =
+                phone_region_chunk_id >= 0 &&
+                static_cast<size_t>(
+                    phone_region_chunk_id + 2) <
+                    region_pipe_chunks.size();
+            if (will_reuse_slot) {
+                constexpr uint64_t REGION_SEQ_PREFIX =
+                    0xA000000000000000ULL;
+                constexpr uint64_t REGION_SEQ_MASK =
+                    0x0FFFFFFFFFFFFFFFULL;
+                uint64_t local_seq =
+                    phone_cfg
+                        .phone_region_next_completion_seq++;
+                local_seq &= REGION_SEQ_MASK;
+                if (local_seq == 0) {
+                    local_seq =
+                        phone_cfg
+                            .phone_region_next_completion_seq++;
+                    local_seq &= REGION_SEQ_MASK;
+                    if (local_seq == 0) {
+                        local_seq = 1;
+                    }
+                }
+                const uint64_t seq =
+                    REGION_SEQ_PREFIX | local_seq;
+                const ggml_backend_rpc_phone_ffn_mark_ready_t
+                    mark_ready =
+                        ggml_backend_meta_get_phone_ffn_mark_ready(
+                            phone_cfg.backend);
+                const bool marked =
+                    mark_ready != nullptr &&
+                    mark_ready(phone_cfg.backend, seq);
+                slot.completion_seq =
+                    marked ? seq : 0;
+                if (pipeline_debug) {
+                    printf("[PHONE_REGION_SLOT_CREDIT] "
+                           "chunk=%d slot=%zu seq=%" PRIu64
+                           " marked=%d future_chunk=%d\n",
+                           phone_region_chunk_id,
+                           slot_index,
+                           seq,
+                           marked ? 1 : 0,
+                           phone_region_chunk_id + 2);
+                }
+            }
+        }
 
         // wait(1) means ggml_backend_graph_compute_async() has consumed and
         // serialized the graph descriptors. The GPU may still be executing,
