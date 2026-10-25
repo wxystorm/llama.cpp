@@ -59,6 +59,46 @@ def main() -> int:
         print("FAIL: expected continuation=1 in PHONE_REGION_PIPE_PLAN")
         return 1
 
+    attn_plans = list(re.finditer(
+        r"\[PHONE_TENSOR_ATTN_CHUNK_PLAN\] layer=46 chunks=(\d+) "
+        r"tokens=\d+ mode=P2C status=READY",
+        text,
+    ))
+    if not attn_plans or int(attn_plans[-1].group(1)) != n_chunks:
+        print(
+            "FAIL: missing/mismatched PHONE_TENSOR_ATTN_CHUNK_PLAN "
+            f"for {n_chunks} chunks"
+        )
+        return 1
+
+    attn_chunks = [
+        (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        for m in re.finditer(
+            r"\[PHONE_TENSOR_ATTN_CHUNK\] layer=46 chunk=(\d+) "
+            r"begin=(\d+) tokens=(\d+) "
+            r"source=REGION_L45 status=BUILT",
+            text,
+        )
+    ]
+    if len(attn_chunks) < n_chunks:
+        print(
+            f"FAIL: L46 Attention chunk markers={attn_chunks}; "
+            f"expected at least {n_chunks}"
+        )
+        return 1
+    attn_chunks = attn_chunks[-n_chunks:]
+    if [chunk for chunk, _, _ in attn_chunks] != list(range(n_chunks)):
+        print(
+            f"FAIL: L46 Attention chunk order={attn_chunks}; "
+            f"expected 0..{n_chunks - 1}"
+        )
+        return 1
+    for i in range(1, len(attn_chunks)):
+        prev_begin, prev_tokens = attn_chunks[i - 1][1], attn_chunks[i - 1][2]
+        if attn_chunks[i][1] != prev_begin + prev_tokens:
+            print(f"FAIL: non-contiguous L46 Attention chunks={attn_chunks}")
+            return 1
+
     begin_re = re.compile(
         r"\[PHONE_REGION_PIPE_STAGE\].*?chunk=(\d+).*?"
         r"stage=(C2P_NORM|C2P_FFN_REDUCE|PHONE_REGION|P2C_CONTINUE) "
@@ -95,6 +135,8 @@ def main() -> int:
         "PHONE_REGION_GRAPH_REJECT",
         "PHONE_REGION_SCRATCH_REJECT",
         "PHONE_REGION_CONTINUATION_REJECT",
+        "PHONE_REGION_CONTINUATION_DEPENDENCY",
+        "CONTINUATION_FUTURE_REGION_INPUT",
         "PREFILL_INPUT_PARK",
         "Compute error",
     ):
@@ -208,6 +250,7 @@ def main() -> int:
         f"PASS: {n_chunks} C2P -> Phone Region -> L46 continuations are "
         f"chunk-pipelined (window=2, {plan.group(4)} Meta schedule entries)"
     )
+    print("PASS: L46 Attention/QKV/KV/Router/FFN is built per Region chunk")
     print("PASS: every Region completion credit is consumed by its own L46 continuation")
     print("PASS: continuation releases the scratch slot before later reuse")
     print("PASS: corresponding L34, Phone, and L46 stages returned successfully")
