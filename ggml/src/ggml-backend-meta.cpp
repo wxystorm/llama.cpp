@@ -2382,6 +2382,7 @@ struct ggml_backend_meta_context {
         int owner_layer = -1;
         int owner_chunk = -1;
         ggml_backend_buffer_ptr phone_input_buf;
+        ggml_backend_buffer_ptr pc_input_buf;
         // Future C2P Router metadata must not land in stock Phone gallocr
         // storage while MAIN owns the GPU/scratch. Keep TopK/weights private
         // for the whole overlap-slot lifetime, just like the hidden input.
@@ -4252,6 +4253,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         bool c2p_registered = false;
         bool c2p_ready_sent = false;
         ggml_tensor * input_dst = nullptr;
+        ggml_tensor * pc_input_stage = nullptr;
         ggml_tensor * pc_topk = nullptr;
         ggml_tensor * pc_weights = nullptr;
         ggml_tensor * pc_partial = nullptr;
@@ -13973,6 +13975,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             overlap_slot.phone_input_buf,
                             storage_bytes(phone_input)) &&
                         ensure_overlap_buf(
+                            pc_cfg.backend,
+                            overlap_slot.pc_input_buf,
+                            storage_bytes(phone_input)) &&
+                        ensure_overlap_buf(
                             phone_cfg.backend,
                             overlap_slot.phone_route_bufs[0],
                             storage_bytes(phone_topk)) &&
@@ -14013,6 +14019,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             c2p_slot_bytes[slot_index] +=
                                 ggml_backend_buffer_get_size(
                                     overlap_slot.phone_input_buf.get());
+                        }
+                        if (overlap_slot.pc_input_buf) {
+                            c2p_slot_bytes[slot_index] +=
+                                ggml_backend_buffer_get_size(
+                                    overlap_slot.pc_input_buf.get());
                         }
                         for (const auto & route_buf :
                                 overlap_slot.phone_route_bufs) {
