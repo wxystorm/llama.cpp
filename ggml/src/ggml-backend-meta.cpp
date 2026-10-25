@@ -8068,17 +8068,90 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     if (slot.owner_chunk >= 0 &&
                             (slot.owner_chunk != prefill_norm_chunk ||
                              slot.owner_layer != prefill_norm_layer)) {
-                        printf(
-                            "[REGION_C2P_OVERLAP_REJECT] "
-                            "layer=%d chunk=%d slot=%zu "
-                            "owner_layer=%d owner_chunk=%d "
-                            "reason=INPUT_SLOT_BUSY action=STOP\n",
-                            prefill_norm_layer,
-                            prefill_norm_chunk,
-                            slot_index,
-                            slot.owner_layer,
-                            slot.owner_chunk);
-                        return GGML_STATUS_FAILED;
+                        if (!phone_main_local_active) {
+                            printf(
+                                "[REGION_C2P_OVERLAP_REJECT] "
+                                "layer=%d chunk=%d slot=%zu "
+                                "owner_layer=%d owner_chunk=%d "
+                                "reason=INPUT_SLOT_BUSY action=STOP\n",
+                                prefill_norm_layer,
+                                prefill_norm_chunk,
+                                slot_index,
+                                slot.owner_layer,
+                                slot.owner_chunk);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        const int old_layer = slot.owner_layer;
+                        const int old_chunk = slot.owner_chunk;
+                        const auto old_it =
+                            region_c2p_overlap_chunks.find(
+                                { old_layer, old_chunk });
+                        const ggml_backend_rpc_wait_ready_seq_t
+                            wait_consumed =
+                                ggml_backend_meta_get_wait_ready_seq(
+                                    bcj_dst.backend);
+                        if (old_it ==
+                                region_c2p_overlap_chunks.end() ||
+                                old_it->second.consume_seq == 0 ||
+                                wait_consumed == nullptr) {
+                            printf(
+                                "[REGION_C2P_OVERLAP_REJECT] "
+                                "layer=%d chunk=%d slot=%zu "
+                                "owner_layer=%d owner_chunk=%d "
+                                "reason=MISSING_CONSUME_CREDIT "
+                                "action=STOP\n",
+                                prefill_norm_layer,
+                                prefill_norm_chunk,
+                                slot_index,
+                                old_layer,
+                                old_chunk);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        const uint64_t consume_seq =
+                            old_it->second.consume_seq;
+                        const int64_t wait_begin_us =
+                            ggml_time_us();
+                        const bool consumed =
+                            wait_consumed(
+                                bcj_dst.backend,
+                                consume_seq);
+                        const int64_t wait_us =
+                            ggml_time_us() -
+                            wait_begin_us;
+                        if (!consumed) {
+                            printf(
+                                "[REGION_C2P_OVERLAP_REJECT] "
+                                "layer=%d chunk=%d slot=%zu "
+                                "old_chunk=%d consume_seq=%" PRIu64
+                                " reason=CONSUME_WAIT_FAILED "
+                                "action=STOP\n",
+                                prefill_norm_layer,
+                                prefill_norm_chunk,
+                                slot_index,
+                                old_chunk,
+                                consume_seq);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        if (pipeline_debug) {
+                            printf(
+                                "[PHONE_C2P_SLOT_REUSE_WAIT] "
+                                "new_chunk=%d old_chunk=%d slot=%zu "
+                                "consume_seq=%" PRIu64
+                                " wait_ms=%.3f phase=REDUCE_DONE "
+                                "status=REUSABLE\n",
+                                prefill_norm_chunk,
+                                old_chunk,
+                                slot_index,
+                                consume_seq,
+                                wait_us / 1000.0);
+                        }
+                        release_region_c2p_overlap_chunk(
+                            old_layer,
+                            old_chunk,
+                            "REDUCE_CONSUMED");
                     }
 
                     slot.owner_layer = prefill_norm_layer;
@@ -8087,6 +8160,44 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     state.chunk = prefill_norm_chunk;
                     state.slot = slot_index;
                     state.input_dst = dst;
+
+                    if (phone_main_local_active) {
+                        const auto main_it =
+                            phone_main_local_chunks.find(
+                                prefill_norm_chunk);
+                        if (main_it ==
+                                phone_main_local_chunks.end() ||
+                                !main_it->second.c2p_registered ||
+                                main_it->second.c2p_ffn_uid == 0 ||
+                                main_it->second.c2p_consume_seq == 0) {
+                            printf(
+                                "[PHONE_MAIN_LOCAL_REJECT] "
+                                "chunk=%d reason=C2P_PLAN_NOT_REGISTERED "
+                                "action=STOP\n",
+                                prefill_norm_chunk);
+                            return GGML_STATUS_FAILED;
+                        }
+                        state.phone_ffn_uid =
+                            main_it->second.c2p_ffn_uid;
+                        state.consume_seq =
+                            main_it->second.c2p_consume_seq;
+                        state.c2p_registered = true;
+
+                        state.pc_input_stage =
+                            get_node_aux(src);
+                        state.pc_input_stage->buffer =
+                            slot.pc_input_buf.get();
+                        state.pc_input_stage->data =
+                            ggml_backend_buffer_get_base(
+                                slot.pc_input_buf.get());
+                        if (state.pc_input_stage->data == nullptr ||
+                                !ggml_are_same_layout(
+                                    src,
+                                    state.pc_input_stage)) {
+                            return GGML_STATUS_FAILED;
+                        }
+                    }
+
                     bind_c2p_private_storage(
                         1,
                         dst,
@@ -8096,16 +8207,46 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     overlap_state = &state;
                 }
 
+                ggml_tensor * input_stage =
+                    overlap_state != nullptr &&
+                    phone_main_local_active ?
+                        overlap_state->pc_input_stage :
+                        dst;
+                const bool local_input_stage =
+                    overlap_state != nullptr &&
+                    phone_main_local_active;
                 const uint64_t input_task =
                     backend_ctx->prefill_input_worker->enqueue(
-                        [&, src, dst, i](uint64_t) -> ggml_status {
-                            const int64_t copy_start_us = ggml_time_us();
-                            ggml_backend_tensor_copy_async(
-                                bcj_src.backend, bcj_dst.backend, src, dst);
+                        [&, src, dst, input_stage, i,
+                         local_input_stage](
+                            uint64_t) -> ggml_status {
+                            const int64_t copy_start_us =
+                                ggml_time_us();
+                            if (local_input_stage) {
+                                ggml_backend_tensor_copy_async(
+                                    bcj_src.backend,
+                                    bcj_src.backend,
+                                    src,
+                                    input_stage);
+                                ggml_backend_synchronize(
+                                    bcj_src.backend);
+                            } else {
+                                ggml_backend_tensor_copy_async(
+                                    bcj_src.backend,
+                                    bcj_dst.backend,
+                                    src,
+                                    dst);
+                            }
                             const int64_t copy_us =
-                                ggml_time_us() - copy_start_us;
+                                ggml_time_us() -
+                                copy_start_us;
                             record_copy_wait(copy_us);
-                            record_meta_copy(i, 0, 1, src, copy_us);
+                            record_meta_copy(
+                                i,
+                                0,
+                                local_input_stage ? 0 : 1,
+                                src,
+                                copy_us);
                             return GGML_STATUS_SUCCESS;
                         });
 
@@ -8116,12 +8257,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             "[REGION_C2P_INPUT_STAGE] "
                             "layer=%d chunk=%d slot=%zu "
                             "task=%" PRIu64 " bytes=%zu "
-                            "status=QUEUED\n",
+                            "target=%s status=QUEUED\n",
                             prefill_norm_layer,
                             prefill_norm_chunk,
                             overlap_state->slot,
                             input_task,
-                            ggml_nbytes(dst));
+                            ggml_nbytes(dst),
+                            phone_main_local_active ?
+                                "PC_PRIVATE" : "PHONE_PRIVATE");
                     }
                 } else {
                     pending_prefill_input_task = input_task;
