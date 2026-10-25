@@ -15045,6 +15045,17 @@ auto prefill_norm_sg_has_prework =
                 n_backends == 2 &&
                 ggml_backend_meta_tensor_c2p_layer(
                     backend_ctx, prefill_down_layer);
+            region_c2p_pc_prework_state * c2p_pc_prework =
+                c2p_prefill_exec ?
+                    find_region_c2p_pc_prework(
+                        prefill_down_layer,
+                        prefill_down_chunk) :
+                    nullptr;
+            const bool c2p_pc_preworked =
+                c2p_pc_prework != nullptr &&
+                c2p_pc_prework->ready &&
+                c2p_pc_prework->status ==
+                    GGML_STATUS_SUCCESS;
 
             std::vector<c2p_route_binding_backup> c2p_bindings;
             ggml_tensor * c2p_src_topk = nullptr;
@@ -15166,11 +15177,22 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (c2p_parallel_ready) {
-                compute_workers.start_graph(
-                    0, c2p_pc_prefix_graph);
-            } else {
-                compute_workers.start(0, i);
+            if (!c2p_pc_preworked) {
+                if (c2p_parallel_ready) {
+                    compute_workers.start_graph(
+                        0, c2p_pc_prefix_graph);
+                } else {
+                    compute_workers.start(0, i);
+                }
+            } else if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_PC_PREWORK_CONSUME] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "prework_ms=%.3f status=PC_READY\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i,
+                    c2p_pc_prework->wall_us / 1000.0);
             }
 
             if (has_async_prefill_input) {
@@ -15221,7 +15243,10 @@ auto prefill_norm_sg_has_prework =
                 // The pin is required because the PC graph itself consumes the
                 // Router outputs and would otherwise be free to recycle their
                 // arena storage before Meta performs the cross-device copy.
-                pc_status = compute_workers.wait(0);
+                pc_status =
+                    c2p_pc_preworked ?
+                        c2p_pc_prework->status :
+                        compute_workers.wait(0);
                 if (c2p_pc_graph != nullptr) {
                     c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                 }
@@ -15308,7 +15333,32 @@ auto prefill_norm_sg_has_prework =
                             weights_us / 1000.0);
                     }
 
-                    if (c2p_parallel_ready) {
+                    if (c2p_pc_preworked) {
+                        // PC Router + expert shard already completed while the
+                        // previous Phone Region was in flight. Only expose the
+                        // staged Router outputs to Phone and run the Phone
+                        // expert shard now, preserving continuation priority.
+                        restore_c2p_route_bindings(
+                            c2p_bindings);
+                        const int64_t phone_begin_us =
+                            ggml_time_us();
+                        compute_workers.start(1, i);
+                        phone_status =
+                            compute_workers.wait(1);
+                        if (pipeline_debug) {
+                            printf(
+                                "[REGION_C2P_FFN_DEFERRED_PHONE] "
+                                "phase=PREFILL layer=%d chunk=%d "
+                                "phone_wall_ms=%.3f pc_status=%d "
+                                "phone_status=%d status=JOIN\n",
+                                prefill_down_layer,
+                                prefill_down_chunk,
+                                (ggml_time_us() - phone_begin_us) /
+                                    1000.0,
+                                (int) pc_status,
+                                (int) phone_status);
+                        }
+                    } else if (c2p_parallel_ready) {
                         ggml_cgraph * c2p_pc_suffix_graph =
                             build_region_graph_slice(
                                 c2p_pc_graph,
