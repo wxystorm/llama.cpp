@@ -16922,101 +16922,174 @@ auto prefill_norm_sg_has_prework =
             }
         }
 
-        ggml_backend_synchronize(pc_cfg.backend);
+        if (phone_main_local_active) {
+            const ggml_backend_rpc_phone_c2p_ready_t
+                c2p_ready =
+                    ggml_backend_meta_get_phone_c2p_ready(
+                        phone_cfg.backend);
+            if (c2p_ready == nullptr ||
+                    !state.c2p_registered ||
+                    state.c2p_ready_sent ||
+                    state.pc_input_stage == nullptr ||
+                    state.input_dst == nullptr) {
+                printf(
+                    "[PHONE_MAIN_LOCAL_REJECT] "
+                    "layer=%d chunk=%d reason=C2P_READY_STATE "
+                    "action=STOP\n",
+                    prefill_down_layer,
+                    prefill_down_chunk);
+                return GGML_STATUS_FAILED;
+            }
 
-        const int64_t topk_begin_us =
-            ggml_time_us();
-        ggml_backend_tensor_copy_async(
-            pc_cfg.backend,
-            phone_cfg.backend,
-            state.pc_topk,
-            dst_topk);
-        ggml_backend_synchronize(phone_cfg.backend);
-        const int64_t topk_us =
-            ggml_time_us() - topk_begin_us;
-        record_copy_wait(topk_us);
-        record_meta_copy(
-            i, 0, 1, state.pc_topk, topk_us);
-        record_direct_copy();
+            const int64_t ready_begin_us =
+                ggml_time_us();
+            const bool ready_sent =
+                c2p_ready(
+                    pc_cfg.backend,
+                    phone_cfg.backend,
+                    prefill_down_chunk,
+                    state.pc_input_stage,
+                    state.input_dst,
+                    state.pc_topk,
+                    dst_topk,
+                    state.pc_weights,
+                    dst_weights);
+            const int64_t ready_us =
+                ggml_time_us() -
+                ready_begin_us;
+            if (!ready_sent) {
+                printf(
+                    "[PHONE_MAIN_LOCAL_REJECT] "
+                    "layer=%d chunk=%d reason=C2P_READY_SEND "
+                    "action=STOP\n",
+                    prefill_down_layer,
+                    prefill_down_chunk);
+                return GGML_STATUS_FAILED;
+            }
 
-        const int64_t weights_begin_us =
-            ggml_time_us();
-        ggml_backend_tensor_copy_async(
-            pc_cfg.backend,
-            phone_cfg.backend,
-            state.pc_weights,
-            dst_weights);
-        ggml_backend_synchronize(phone_cfg.backend);
-        const int64_t weights_us =
-            ggml_time_us() - weights_begin_us;
-        record_copy_wait(weights_us);
-        record_meta_copy(
-            i, 0, 1, state.pc_weights, weights_us);
-        record_direct_copy();
+            state.c2p_ready_sent = true;
+            compute_status = GGML_STATUS_SUCCESS;
+            record_copy_wait(ready_us);
+            record_meta_copy(
+                i, 0, 1,
+                state.pc_input_stage,
+                ready_us);
+            record_direct_copy();
 
-        directional_wire_parity(
-            "C2P",
-            prefill_down_layer,
-            prefill_down_chunk,
-            "ROUTER_TOPK",
-            0, 1,
-            state.pc_topk,
-            dst_topk);
-        directional_wire_parity(
-            "C2P",
-            prefill_down_layer,
-            prefill_down_chunk,
-            "ROUTER_WEIGHTS",
-            0, 1,
-            state.pc_weights,
-            dst_weights);
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_C2P_READY_SEND] "
+                    "layer=%d chunk=%d slot=%zu "
+                    "hidden_bytes=%zu topk_bytes=%zu "
+                    "weights_bytes=%zu total_ms=%.3f "
+                    "phone_compute_wait=0 priority=C2P_FFN "
+                    "status=QUEUED\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    state.slot,
+                    ggml_nbytes(state.pc_input_stage),
+                    ggml_nbytes(state.pc_topk),
+                    ggml_nbytes(state.pc_weights),
+                    ready_us / 1000.0);
+            }
+        } else {
+            ggml_backend_synchronize(pc_cfg.backend);
 
-        if (pipeline_debug) {
-            printf(
-                "[REGION_C2P_ROUTE] layer=%d chunk=%d "
-                "direction=PC_TO_PHONE "
-                "topk_bytes=%zu weights_bytes=%zu "
-                "topk_ms=%.3f weights_ms=%.3f "
-                "owner=PC trigger=PC_PREP_REUSE status=OK\n",
+            const int64_t topk_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend,
+                phone_cfg.backend,
+                state.pc_topk,
+                dst_topk);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t topk_us =
+                ggml_time_us() - topk_begin_us;
+            record_copy_wait(topk_us);
+            record_meta_copy(
+                i, 0, 1, state.pc_topk, topk_us);
+            record_direct_copy();
+
+            const int64_t weights_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_cfg.backend,
+                phone_cfg.backend,
+                state.pc_weights,
+                dst_weights);
+            ggml_backend_synchronize(phone_cfg.backend);
+            const int64_t weights_us =
+                ggml_time_us() - weights_begin_us;
+            record_copy_wait(weights_us);
+            record_meta_copy(
+                i, 0, 1, state.pc_weights, weights_us);
+            record_direct_copy();
+
+            directional_wire_parity(
+                "C2P",
                 prefill_down_layer,
                 prefill_down_chunk,
-                ggml_nbytes(state.pc_topk),
-                ggml_nbytes(state.pc_weights),
-                topk_us / 1000.0,
-                weights_us / 1000.0);
-        }
-
-        ggml_cgraph * phone_graph =
-            phone_cfg.cgraphs[i].cgraph_main;
-        GGML_ASSERT(phone_graph != nullptr);
-        const uint64_t saved_phone_uid =
-            phone_graph->uid;
-        phone_graph->uid = 0;
-        const int64_t phone_begin_us =
-            ggml_time_us();
-        compute_workers.start(1, i);
-        compute_status =
-            compute_workers.wait(1);
-        const int64_t phone_us =
-            ggml_time_us() - phone_begin_us;
-        phone_graph->uid =
-            saved_phone_uid;
-
-        if (pipeline_debug) {
-            printf(
-                "[REGION_C2P_PC_REUSE] "
-                "layer=%d chunk=%d sg=%zu slot=%zu "
-                "input_wait_ms=%.3f phone_ms=%.3f "
-                "pc_partial=%s status=%s\n",
+                "ROUTER_TOPK",
+                0, 1,
+                state.pc_topk,
+                dst_topk);
+            directional_wire_parity(
+                "C2P",
                 prefill_down_layer,
                 prefill_down_chunk,
-                i,
-                state.slot,
-                input_wait_us / 1000.0,
-                phone_us / 1000.0,
-                state.pc_partial->name,
-                compute_status == GGML_STATUS_SUCCESS ?
-                    "OK" : "FAIL");
+                "ROUTER_WEIGHTS",
+                0, 1,
+                state.pc_weights,
+                dst_weights);
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_ROUTE] layer=%d chunk=%d "
+                    "direction=PC_TO_PHONE "
+                    "topk_bytes=%zu weights_bytes=%zu "
+                    "topk_ms=%.3f weights_ms=%.3f "
+                    "owner=PC trigger=PC_PREP_REUSE status=OK\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    ggml_nbytes(state.pc_topk),
+                    ggml_nbytes(state.pc_weights),
+                    topk_us / 1000.0,
+                    weights_us / 1000.0);
+            }
+
+            ggml_cgraph * phone_graph =
+                phone_cfg.cgraphs[i].cgraph_main;
+            GGML_ASSERT(phone_graph != nullptr);
+            const uint64_t saved_phone_uid =
+                phone_graph->uid;
+            phone_graph->uid = 0;
+            const int64_t phone_begin_us =
+                ggml_time_us();
+            compute_workers.start(1, i);
+            compute_status =
+                compute_workers.wait(1);
+            const int64_t phone_us =
+                ggml_time_us() - phone_begin_us;
+            phone_graph->uid =
+                saved_phone_uid;
+
+            if (pipeline_debug) {
+                printf(
+                    "[REGION_C2P_PC_REUSE] "
+                    "layer=%d chunk=%d sg=%zu slot=%zu "
+                    "input_wait_ms=%.3f phone_ms=%.3f "
+                    "pc_partial=%s status=%s\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i,
+                    state.slot,
+                    input_wait_us / 1000.0,
+                    phone_us / 1000.0,
+                    state.pc_partial->name,
+                    compute_status ==
+                            GGML_STATUS_SUCCESS ?
+                        "OK" : "FAIL");
+            }
         }
     } else if (is_prefill_down_sg) {
         const bool has_async_prefill_input =
