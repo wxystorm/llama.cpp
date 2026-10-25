@@ -15056,7 +15056,97 @@ auto prefill_norm_sg_has_prework =
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
 
-        if (pipeline_phone_prefill_down) {
+        const auto local_main_it =
+            phone_region_local_main_chunks.find(
+                prefill_down_chunk);
+        const bool region_local_main_p2c_down =
+            region_pipeline_active &&
+            region_local_main_active &&
+            prefill_down_layer == 46 &&
+            local_main_it !=
+                phone_region_local_main_chunks.end() &&
+            local_main_it->second.submitted &&
+            route_it != pending_phone_prefill_routes.end();
+
+        if (region_local_main_p2c_down) {
+            // Phone MAIN already owns L46 Attention/Router, local FFN and
+            // residual fold. This SG is now a pure PC consumer: wait only
+            // for READY, run the PC FFN shard, then let the ordinary P2C
+            // reduction path consume the independently staged PARTIAL.
+            const phone_prefill_route_task route =
+                route_it->second;
+            GGML_ASSERT(route.worker != nullptr);
+            GGML_ASSERT(route.task != 0);
+
+            const int64_t route_wait_begin_us =
+                ggml_time_us();
+            const ggml_status route_status =
+                route.worker->wait(route.task);
+            const int64_t route_wait_us =
+                ggml_time_us() -
+                route_wait_begin_us;
+            if (route_status != GGML_STATUS_SUCCESS) {
+                return route_status;
+            }
+
+            ggml_backend_t pc_backend =
+                backend_ctx->backend_configs[0].backend;
+            ggml_cgraph * pc_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            GGML_ASSERT(pc_graph != nullptr);
+
+            const int64_t stage_copy_begin_us =
+                ggml_time_us();
+            ggml_backend_tensor_copy_async(
+                pc_backend, pc_backend,
+                route.stage_hidden,
+                route.dst_hidden);
+            ggml_backend_tensor_copy_async(
+                pc_backend, pc_backend,
+                route.stage_topk,
+                route.dst_topk);
+            ggml_backend_tensor_copy_async(
+                pc_backend, pc_backend,
+                route.stage_weights,
+                route.dst_weights);
+            ggml_backend_synchronize(pc_backend);
+            const int64_t stage_copy_us =
+                ggml_time_us() -
+                stage_copy_begin_us;
+
+            const int64_t pc_begin_us =
+                ggml_time_us();
+            compute_status =
+                ggml_backend_graph_compute(
+                    pc_backend, pc_graph);
+            const int64_t pc_compute_us =
+                ggml_time_us() -
+                pc_begin_us;
+            if (compute_status !=
+                    GGML_STATUS_SUCCESS) {
+                return compute_status;
+            }
+
+            if (pipeline_debug ||
+                    tensor_phone_stage_profile) {
+                printf(
+                    "[PHONE_REGION_P2C_PC_CONSUMER] "
+                    "layer=%d chunk=%d sg=%zu "
+                    "ready_seq=%" PRIu64
+                    " route_wait_ms=%.3f "
+                    "stage_copy_ms=%.3f "
+                    "pc_compute_ms=%.3f "
+                    "phone_submit=0 status=OK\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i,
+                    route.producer_seq,
+                    route_wait_us / 1000.0,
+                    stage_copy_us / 1000.0,
+                    pc_compute_us / 1000.0);
+            }
+        } else if (pipeline_phone_prefill_down) {
             const phone_prefill_route_task route = route_it->second;
             GGML_ASSERT(route.worker != nullptr);
             GGML_ASSERT(route.task != 0);
