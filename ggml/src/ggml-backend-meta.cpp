@@ -8259,6 +8259,63 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                     state.pc_input_stage)) {
                             return GGML_STATUS_FAILED;
                         }
+
+                        // The low-priority PC fold can execute after later
+                        // C2P chunks have reused the normal graph arena. Take
+                        // a private per-slot snapshot of this chunk's residual
+                        // now, while the producing graph's values are live.
+                        ggml_tensor * residual_full =
+                            find_recent_ffn_inp(
+                                0, i, prefill_norm_layer);
+                        if (residual_full == nullptr) {
+                            printf(
+                                "[PHONE_MAIN_LOCAL_REJECT] "
+                                "layer=%d chunk=%d "
+                                "reason=C2P_RESIDUAL_SOURCE_MISSING "
+                                "action=STOP\n",
+                                prefill_norm_layer,
+                                prefill_norm_chunk);
+                            return GGML_STATUS_FAILED;
+                        }
+
+                        const size_t residual_offset =
+                            down_chunk_offset(
+                                0, true,
+                                prefill_norm_layer,
+                                prefill_norm_chunk);
+                        state.pc_residual_src =
+                            get_node_aux(src);
+                        state.pc_residual_src->view_src =
+                            residual_full;
+                        state.pc_residual_src->view_offs =
+                            residual_offset;
+                        ggml_backend_view_init(
+                            state.pc_residual_src);
+
+                        state.pc_residual_stage =
+                            get_node_aux(src);
+                        state.pc_residual_stage->buffer =
+                            slot.pc_residual_buf.get();
+                        state.pc_residual_stage->data =
+                            ggml_backend_buffer_get_base(
+                                slot.pc_residual_buf.get());
+                        if (state.pc_residual_stage->data == nullptr ||
+                                !ggml_are_same_layout(
+                                    state.pc_residual_src,
+                                    state.pc_residual_stage) ||
+                                residual_offset +
+                                    ggml_nbytes(
+                                        state.pc_residual_src) >
+                                    ggml_nbytes(residual_full)) {
+                            printf(
+                                "[PHONE_MAIN_LOCAL_REJECT] "
+                                "layer=%d chunk=%d "
+                                "reason=C2P_RESIDUAL_STAGE_LAYOUT "
+                                "action=STOP\n",
+                                prefill_norm_layer,
+                                prefill_norm_chunk);
+                            return GGML_STATUS_FAILED;
+                        }
                     }
 
                     bind_c2p_private_storage(
@@ -8275,12 +8332,28 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_main_local_active ?
                         overlap_state->pc_input_stage :
                         dst;
+                ggml_tensor * residual_src =
+                    overlap_state != nullptr &&
+                    phone_main_local_active ?
+                        overlap_state->pc_residual_src :
+                        nullptr;
+                ggml_tensor * residual_stage =
+                    overlap_state != nullptr &&
+                    phone_main_local_active ?
+                        overlap_state->pc_residual_stage :
+                        nullptr;
                 const bool local_input_stage =
                     overlap_state != nullptr &&
                     phone_main_local_active;
+                if (local_input_stage &&
+                        (residual_src == nullptr ||
+                         residual_stage == nullptr)) {
+                    return GGML_STATUS_FAILED;
+                }
                 const uint64_t input_task =
                     backend_ctx->prefill_input_worker->enqueue(
-                        [&, src, dst, input_stage, i,
+                        [&, src, dst, input_stage,
+                         residual_src, residual_stage, i,
                          local_input_stage](
                             uint64_t) -> ggml_status {
                             const int64_t copy_start_us =
@@ -8291,6 +8364,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                     bcj_src.backend,
                                     src,
                                     input_stage);
+                                ggml_backend_tensor_copy_async(
+                                    bcj_src.backend,
+                                    bcj_src.backend,
+                                    residual_src,
+                                    residual_stage);
                                 ggml_backend_synchronize(
                                     bcj_src.backend);
                             } else {
@@ -8310,6 +8388,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                                 local_input_stage ? 0 : 1,
                                 src,
                                 copy_us);
+                            if (local_input_stage) {
+                                record_meta_copy(
+                                    i, 0, 0,
+                                    residual_src,
+                                    copy_us);
+                            }
                             return GGML_STATUS_SUCCESS;
                         });
 
@@ -11062,13 +11146,41 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
 
                 // PC: fold the residual into the local FFN partial in-place.
-                ggml_tensor * residual_chunk = get_node_aux(node_dst);
-                residual_chunk->view_src = pc_residual;
-                residual_chunk->view_offs = chunk_offset;
-                ggml_backend_view_init(residual_chunk);
-                GGML_ASSERT(
-                    chunk_offset + ggml_nbytes(residual_chunk) <=
-                    ggml_nbytes(pc_residual));
+                ggml_tensor * residual_chunk = nullptr;
+                if (phone_main_local_active) {
+                    const auto overlap_it =
+                        region_c2p_overlap_chunks.find({
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                        });
+                    if (overlap_it ==
+                                region_c2p_overlap_chunks.end() ||
+                            overlap_it->second.pc_residual_stage ==
+                                nullptr ||
+                            !ggml_are_same_layout(
+                                node_dst,
+                                overlap_it->second.pc_residual_stage)) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "layer=%d chunk=%d "
+                            "reason=C2P_RESIDUAL_SNAPSHOT_MISSING "
+                            "action=STOP\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0);
+                        return GGML_STATUS_FAILED;
+                    }
+                    residual_chunk =
+                        overlap_it->second.pc_residual_stage;
+                } else {
+                    residual_chunk = get_node_aux(node_dst);
+                    residual_chunk->view_src = pc_residual;
+                    residual_chunk->view_offs = chunk_offset;
+                    ggml_backend_view_init(residual_chunk);
+                    GGML_ASSERT(
+                        chunk_offset +
+                            ggml_nbytes(residual_chunk) <=
+                        ggml_nbytes(pc_residual));
+                }
 
                 ggml_tensor * pc_fold = get_node_aux(node_dst);
                 pc_fold->view_src =
