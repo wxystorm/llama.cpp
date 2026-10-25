@@ -343,6 +343,54 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
         }
     }
+    const char * pc_prefix_chunk_env =
+        std::getenv("LLAMA_HYBRID_PC_PREFIX_CHUNK");
+    const bool pc_prefix_chunk_requested =
+        pc_prefix_chunk_env != nullptr &&
+        std::atoi(pc_prefix_chunk_env) != 0;
+    bool pc_prefix_chunk_enabled = false;
+    const int pc_prefix_first = layer_begin;
+    constexpr int pc_prefix_end = 34; // exclusive; L34 is the C2P Tensor layer.
+
+    if (pc_prefix_chunk_requested &&
+            phone_region_first == 35 &&
+            pc_prefix_first == 0 &&
+            layer_end > pc_prefix_end &&
+            phone_region_chunks.size() > 1) {
+        bool pc_only = true;
+        for (int prefix_il = pc_prefix_first;
+                prefix_il < pc_prefix_end;
+                ++prefix_il) {
+            pc_only = pc_only &&
+                model.hybrid_layer_mode(prefix_il) ==
+                    llama_hybrid_layer_mode::PC_ONLY &&
+                cvec->tensor_for(prefix_il) == nullptr &&
+                (size_t) prefix_il <
+                    cparams.embeddings_layer_inp.size() &&
+                !cparams.embeddings_layer_inp[
+                    (size_t) prefix_il];
+        }
+        pc_prefix_chunk_enabled =
+            pc_only &&
+            model.hybrid_layer_mode(pc_prefix_end) ==
+                llama_hybrid_layer_mode::TENSOR_C2P;
+    }
+
+    if (pc_prefix_chunk_requested) {
+        LLAMA_LOG_ERROR(
+            "[PC_PREFIX_CHUNK_PLAN] enabled=%d layers=[%d,%d) "
+            "tensor_layer=%d tokens=%" PRId64 " chunks=%zu "
+            "order=CHUNK_MAJOR status=%s\n",
+            pc_prefix_chunk_enabled ? 1 : 0,
+            pc_prefix_first,
+            pc_prefix_end,
+            pc_prefix_end,
+            n_tokens,
+            phone_region_chunks.size(),
+            pc_prefix_chunk_enabled ?
+                "READY" : "SKIP_UNSUPPORTED");
+    }
+
     if (phone_region_requested) {
         LLAMA_LOG_ERROR(
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
