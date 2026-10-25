@@ -2365,6 +2365,11 @@ struct ggml_backend_meta_context {
         // directly into the scheduler graph arena: later chunk graphs may
         // legitimately reuse that arena before the boundary drains.
         ggml_backend_buffer_ptr region_boundary_output_stage_buf;
+        // Directional C2P continuation survives multiple Meta graph_compute
+        // calls. PC residual is immutable; Phone l_out is the sole reducer
+        // output and must remain address-stable for later chunk views.
+        ggml_backend_buffer_ptr region_c2p_pc_residual_stage_buf;
+        ggml_backend_buffer_ptr region_c2p_phone_output_stage_buf;
 
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
@@ -2390,6 +2395,7 @@ struct ggml_backend_meta_context {
     struct region_prefill_boundary_state {
         bool active = false;
         bool complete = false;
+        bool residual_ready = false; // C2P PC source snapshot completed
         int layer = -1;
         int next_chunk = 0;
         size_t full_bytes = 0;
@@ -5392,6 +5398,132 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
         return nullptr;
+    };
+
+    // Reattach Phone continuation views to the stable C2P output on every
+    // graph_compute call. The scheduler can split a logical full graph into
+    // several Meta graphs, whose simple tensor containers are rotated. A
+    // previous graph's l_out tensor pointer is therefore never retained.
+    auto bind_region_c2p_phone_backing = [&](int layer) -> bool {
+        const auto & state = backend_ctx->region_c2p_prefill;
+        auto & stage_buf = backend_ctx->backend_configs[1]
+                               .region_c2p_phone_output_stage_buf;
+        if (!region_chunk_continuation || !state.active ||
+                state.layer != layer || state.full_bytes == 0 ||
+                stage_buf == nullptr) {
+            return false;
+        }
+
+        ggml_backend_buffer_t stable = stage_buf.get();
+        auto * base = static_cast<uint8_t *>(
+            ggml_backend_buffer_get_base(stable));
+        GGML_ASSERT(ggml_backend_buffer_get_size(stable) >= state.full_bytes);
+
+        char output_name[64];
+        std::snprintf(output_name, sizeof(output_name), "l_out-%d", layer);
+        size_t bound_entries = 0;
+        size_t rebound_graphs = 0;
+
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            ggml_cgraph * graph = backend_ctx->backend_configs[1]
+                                      .cgraphs[sg].cgraph_main;
+            if (graph == nullptr) {
+                continue;
+            }
+
+            bool graph_changed = false;
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                ggml_tensor * node = graph->nodes[k];
+                if (node == nullptr) {
+                    continue;
+                }
+
+                int entry_chunk = -1;
+                int entry_layer = -1;
+                const bool is_entry =
+                    std::sscanf(node->name,
+                                "region_cont_entry_chunk_%d-%d",
+                                &entry_chunk, &entry_layer) == 2 &&
+                    entry_layer == layer + 1;
+
+                // Only VIEWs of l_out-L (and l_out-L itself) are rebound.
+                // No unrelated graph tensors or backend allocations change.
+                std::vector<ggml_tensor *> chain;
+                for (ggml_tensor * t = node;
+                        t != nullptr && chain.size() < 32;
+                        t = t->view_src) {
+                    chain.push_back(t);
+                }
+                ggml_tensor * root =
+                    chain.empty() ? nullptr : chain.back();
+                if (root == nullptr ||
+                        std::strcmp(root->name, output_name) != 0) {
+                    if (is_entry) {
+                        printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
+                               "chunk=%d entry=%s root=%s "
+                               "status=BAD_VIEW_SOURCE\n",
+                               layer, sg, entry_chunk, node->name,
+                               root != nullptr ? root->name : "(null)");
+                        return false;
+                    }
+                    continue;
+                }
+                if (root->view_src != nullptr ||
+                        ggml_nbytes(root) != state.full_bytes) {
+                    printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
+                           "root=%s bytes=%zu expected=%zu "
+                           "status=BAD_ROOT\n",
+                           layer, sg, root->name, ggml_nbytes(root),
+                           state.full_bytes);
+                    return false;
+                }
+
+                bool changed =
+                    root->buffer != stable || root->data != base;
+                root->buffer = stable;
+                root->data = base;
+                // Update already-materialized simple VIEW addresses, which
+                // are not recomputed automatically after reassigning root.
+                for (int v = (int) chain.size() - 2; v >= 0; --v) {
+                    ggml_tensor * view = chain[(size_t) v];
+                    ggml_tensor * parent = chain[(size_t) v + 1];
+                    if (view->view_offs > ggml_nbytes(parent)) {
+                        printf("[REGION_C2P_PHONE_BIND] layer=%d sg=%zu "
+                               "tensor=%s status=BAD_VIEW_OFFSET\n",
+                               layer, sg, view->name);
+                        return false;
+                    }
+                    void * wanted =
+                        static_cast<uint8_t *>(parent->data) +
+                        view->view_offs;
+                    changed |=
+                        view->buffer != stable || view->data != wanted;
+                    view->buffer = stable;
+                    view->data = wanted;
+                }
+
+                if (is_entry) {
+                    ++bound_entries;
+                    if (node->buffer != stable) {
+                        return false;
+                    }
+                }
+                graph_changed |= changed;
+            }
+
+            if (graph_changed) {
+                // GPU/RPC graph cache keys must not reuse the old addresses.
+                graph->uid = 0;
+                ++rebound_graphs;
+            }
+        }
+
+        if (pipeline_debug && (bound_entries || rebound_graphs)) {
+            printf("[REGION_C2P_PHONE_BIND] layer=%d bytes=%zu "
+                   "entries=%zu rebound_graphs=%zu owner=PHONE status=OK\n",
+                   layer, state.full_bytes, bound_entries, rebound_graphs);
+        }
+        return true;
     };
 
     // Read-only A/B correctness captures for a single Tensor layer.
@@ -11724,20 +11856,47 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ((size_t) prefill_down_chunk_0 %
                          ggml_backend_meta_context::PREFILL_RETURN_LANES) :
                         0;
+                // The full-layer ffn_inp is not necessarily in the current
+                // Meta graph for chunk > 0. Capture it once on chunk 0 and
+                // use the PC-owned snapshot, never a stale simple-tensor ptr.
                 ggml_tensor * pc_residual =
-                    find_recent_ffn_inp(0, i, prefill_down_layer_0);
+                    (!region_chunk_continuation ||
+                     prefill_down_chunk_0 == 0) ?
+                        find_recent_ffn_inp(
+                            0, i, prefill_down_layer_0) : nullptr;
                 ggml_tensor * phone_l_out =
                     find_layer_output(1, prefill_down_layer_0);
-
-                GGML_ASSERT(pc_residual != nullptr);
-                GGML_ASSERT(phone_l_out != nullptr);
-                GGML_ASSERT(
-                    ggml_nbytes(pc_residual) ==
-                    ggml_nbytes(phone_l_out));
+                size_t full_hidden_bytes = 0;
 
                 if (region_chunk_continuation) {
-                    const size_t full_hidden_bytes =
-                        ggml_nbytes(phone_l_out);
+                    if (prefill_down_chunk_0 == 0) {
+                        GGML_ASSERT(pc_residual != nullptr);
+                        full_hidden_bytes = ggml_nbytes(pc_residual);
+                    } else {
+                        const auto & prior =
+                            backend_ctx->region_c2p_prefill;
+                        GGML_ASSERT(prior.active);
+                        GGML_ASSERT(prior.residual_ready);
+                        GGML_ASSERT(prior.layer == prefill_down_layer_0);
+                        full_hidden_bytes = prior.full_bytes;
+                    }
+                    // A Phone l_out producer may only be present in another
+                    // graph_compute. Its persistent buffer is authoritative.
+                    if (phone_l_out != nullptr) {
+                        GGML_ASSERT(
+                            ggml_nbytes(phone_l_out) ==
+                            full_hidden_bytes);
+                    }
+                } else {
+                    GGML_ASSERT(pc_residual != nullptr);
+                    GGML_ASSERT(phone_l_out != nullptr);
+                    GGML_ASSERT(
+                        ggml_nbytes(pc_residual) ==
+                        ggml_nbytes(phone_l_out));
+                    full_hidden_bytes = ggml_nbytes(phone_l_out);
+                }
+
+                if (region_chunk_continuation) {
                     if (prefill_down_chunk_0 == 0) {
                         backend_ctx->region_prefill_hidden_bytes =
                             full_hidden_bytes;
@@ -11773,8 +11932,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         output_state.complete = false;
                         output_state.layer = prefill_down_layer_0;
                         output_state.next_chunk = 0;
-                        output_state.full_bytes =
-                            ggml_nbytes(phone_l_out);
+                        output_state.full_bytes = full_hidden_bytes;
                         output_state.bytes_reserved = 0;
                     }
 
@@ -11782,8 +11940,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         output_state.layer ==
                         prefill_down_layer_0);
                     GGML_ASSERT(
-                        output_state.full_bytes ==
-                        ggml_nbytes(phone_l_out));
+                        output_state.full_bytes == full_hidden_bytes);
                     GGML_ASSERT(
                         output_state.next_chunk ==
                         prefill_down_chunk_0);
@@ -11826,6 +11983,69 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         last_chunk;
                 }
 
+                if (region_chunk_continuation) {
+                    auto & state = backend_ctx->region_c2p_prefill;
+                    auto & pc_stage_buf =
+                        backend_ctx->backend_configs[0]
+                            .region_c2p_pc_residual_stage_buf;
+                    auto & phone_stage_buf =
+                        backend_ctx->backend_configs[1]
+                            .region_c2p_phone_output_stage_buf;
+
+                    if (prefill_down_chunk_0 == 0) {
+                        GGML_ASSERT(pc_residual != nullptr);
+                        GGML_ASSERT(
+                            ggml_is_contiguous(pc_residual));
+                        GGML_ASSERT(pc_residual->type == node_dst->type);
+                        if (pc_stage_buf == nullptr ||
+                                ggml_backend_buffer_get_size(
+                                    pc_stage_buf.get()) < state.full_bytes) {
+                            pc_stage_buf.reset(
+                                ggml_backend_alloc_buffer(
+                                    bcj_dst.backend, state.full_bytes));
+                        }
+                        GGML_ASSERT(pc_stage_buf != nullptr);
+
+                        ggml_tensor * snapshot =
+                            get_node_aux(pc_residual);
+                        snapshot->buffer = pc_stage_buf.get();
+                        snapshot->data = ggml_backend_buffer_get_base(
+                            pc_stage_buf.get());
+                        const int64_t snapshot_begin_us = ggml_time_us();
+                        ggml_backend_tensor_copy_async(
+                            bcj_dst.backend, bcj_dst.backend,
+                            pc_residual, snapshot);
+                        ggml_backend_synchronize(bcj_dst.backend);
+                        state.residual_ready = true;
+                        if (pipeline_debug) {
+                            printf("[REGION_C2P_RESIDUAL_STAGE] "
+                                   "layer=%d bytes=%zu copy_ms=%.3f "
+                                   "owner=PC status=READY\n",
+                                   state.layer, state.full_bytes,
+                                   (ggml_time_us() - snapshot_begin_us) /
+                                       1000.0);
+                        }
+                    }
+                    GGML_ASSERT(state.residual_ready);
+                    GGML_ASSERT(pc_stage_buf != nullptr);
+                    GGML_ASSERT(
+                        ggml_backend_buffer_get_size(pc_stage_buf.get()) >=
+                        state.full_bytes);
+
+                    if (phone_stage_buf == nullptr ||
+                            ggml_backend_buffer_get_size(
+                                phone_stage_buf.get()) < state.full_bytes) {
+                        phone_stage_buf.reset(
+                            ggml_backend_alloc_buffer(
+                                bcj_src.backend, state.full_bytes));
+                    }
+                    GGML_ASSERT(phone_stage_buf != nullptr);
+                    if (!bind_region_c2p_phone_backing(
+                            prefill_down_layer_0)) {
+                        return GGML_STATUS_FAILED;
+                    }
+                }
+
                 // At this boundary both FFN shard outputs are live and are the
                 // exact tensors consumed by the C2P reduction. Capture them
                 // here instead of reading a remote graph tail after the graph
@@ -11843,12 +12063,34 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                 // PC: fold the residual into the local FFN partial in-place.
                 ggml_tensor * residual_chunk = get_node_aux(node_dst);
-                residual_chunk->view_src = pc_residual;
-                residual_chunk->view_offs = chunk_offset;
-                ggml_backend_view_init(residual_chunk);
-                GGML_ASSERT(
-                    chunk_offset + ggml_nbytes(residual_chunk) <=
-                    ggml_nbytes(pc_residual));
+                if (region_chunk_continuation) {
+                    ggml_backend_buffer_t stable =
+                        backend_ctx->backend_configs[0]
+                            .region_c2p_pc_residual_stage_buf.get();
+                    GGML_ASSERT(stable != nullptr);
+                    GGML_ASSERT(
+                        chunk_offset + ggml_nbytes(residual_chunk) <=
+                        backend_ctx->region_c2p_prefill.full_bytes);
+                    residual_chunk->buffer = stable;
+                    residual_chunk->data =
+                        static_cast<uint8_t *>(
+                            ggml_backend_buffer_get_base(stable)) +
+                        chunk_offset;
+                    if (pipeline_debug) {
+                        printf("[REGION_C2P_RESIDUAL] layer=%d chunk=%d "
+                               "source=PERSISTENT_PC offset=%zu bytes=%zu "
+                               "status=OK\n",
+                               prefill_down_layer_0, prefill_down_chunk_0,
+                               chunk_offset, ggml_nbytes(residual_chunk));
+                    }
+                } else {
+                    residual_chunk->view_src = pc_residual;
+                    residual_chunk->view_offs = chunk_offset;
+                    ggml_backend_view_init(residual_chunk);
+                    GGML_ASSERT(
+                        chunk_offset + ggml_nbytes(residual_chunk) <=
+                        ggml_nbytes(pc_residual));
+                }
 
                 ggml_tensor * pc_fold = get_node_aux(node_dst);
                 pc_fold->view_src =
@@ -11874,41 +12116,58 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     set_tmp_data(phone_tmp, j_src, 0);
                 }
 
-                // Phone: write the completed chunk directly into l_out.
+                // Phone Reduce is the only writer of this layer's output.
+                // Write directly into stable storage so L35(C) can consume it
+                // even if its VIEW belongs to a later Meta graph_compute.
                 ggml_tensor * phone_out_chunk = get_node_aux(node_src);
-                phone_out_chunk->view_src = phone_l_out;
-                phone_out_chunk->view_offs = chunk_offset;
                 phone_out_chunk->op = GGML_OP_ADD;
                 phone_out_chunk->src[0] = node_src;
                 phone_out_chunk->src[1] = phone_tmp;
                 phone_out_chunk->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                ggml_backend_view_init(phone_out_chunk);
+                if (region_chunk_continuation) {
+                    ggml_backend_buffer_t stable =
+                        backend_ctx->backend_configs[1]
+                            .region_c2p_phone_output_stage_buf.get();
+                    GGML_ASSERT(stable != nullptr);
+                    phone_out_chunk->buffer = stable;
+                    phone_out_chunk->data =
+                        static_cast<uint8_t *>(
+                            ggml_backend_buffer_get_base(stable)) +
+                        chunk_offset;
+                } else {
+                    phone_out_chunk->view_src = phone_l_out;
+                    phone_out_chunk->view_offs = chunk_offset;
+                    ggml_backend_view_init(phone_out_chunk);
+                }
                 GGML_ASSERT(
                     chunk_offset + ggml_nbytes(phone_out_chunk) <=
-                    ggml_nbytes(phone_l_out));
+                    full_hidden_bytes);
 
                 ggml_cgraph * phone_reduce_graph = get_cgraph_aux();
                 phone_reduce_graph->nodes[0] = phone_out_chunk;
                 phone_reduce_graph->n_nodes = 1;
 
                 const bool disable_c2p_output_producer =
-                    last_chunk ||
-                    (region_chunk_continuation &&
-                     prefill_down_chunk_0 == 0);
+                    last_chunk || region_chunk_continuation;
                 if (disable_c2p_output_producer) {
                     ggml_tensor * disabled_phone_l_out =
                         disable_layer_output_producers(
                             1, i + 1, prefill_down_layer_0);
-                    GGML_ASSERT(disabled_phone_l_out == phone_l_out);
+                    if (!region_chunk_continuation) {
+                        GGML_ASSERT(disabled_phone_l_out == phone_l_out);
+                    } else if (disabled_phone_l_out != nullptr &&
+                               phone_l_out != nullptr) {
+                        GGML_ASSERT(disabled_phone_l_out == phone_l_out);
+                    }
 
-                    // PC l_out is not an owner in C2P.  In continuation mode
-                    // disable the stable backing producer before chunk 0 can
-                    // enter L35; subsequent chunks are filled by their own
-                    // Phone Reduce before the matching consumer is admitted.
+                    // PC is not the C2P output owner. A later graph may no
+                    // longer contain the original l_out producer at all.
                     ggml_tensor * disabled_pc_l_out =
                         disable_layer_output_producers(
                             0, i + 1, prefill_down_layer_0);
-                    GGML_ASSERT(disabled_pc_l_out != nullptr);
+                    if (!region_chunk_continuation) {
+                        GGML_ASSERT(disabled_pc_l_out != nullptr);
+                    }
                 }
 
                 const bool c2p_numeric_trace =
@@ -12495,13 +12754,42 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         ab_full_tokens() >= ab_min_tokens) {
                     // This is the authoritative C2P layer output: all chunks
                     // have been reduced into the Phone-owned l_out buffer.
-                    ab_dump_tensor(1, -1, "l_out", phone_l_out);
+                    ggml_tensor * full_phone_out = phone_l_out;
+                    if (full_phone_out == nullptr &&
+                            region_chunk_continuation) {
+                        // A later graph may have no l_out node of its own.
+                        // Capture the stable full output with a temporary
+                        // descriptor, not a pointer from an earlier graph.
+                        const auto & state =
+                            backend_ctx->region_c2p_prefill;
+                        GGML_ASSERT(ggml_is_contiguous(node_src));
+                        GGML_ASSERT(node_src->ne[2] == 1);
+                        GGML_ASSERT(node_src->ne[3] == 1);
+                        GGML_ASSERT(node_src->nb[1] > 0);
+                        GGML_ASSERT(
+                            state.full_bytes % node_src->nb[1] == 0);
+                        full_phone_out = get_node_aux(node_src);
+                        full_phone_out->ne[1] =
+                            state.full_bytes / node_src->nb[1];
+                        full_phone_out->nb[2] = state.full_bytes;
+                        full_phone_out->nb[3] = state.full_bytes;
+                        ggml_set_name(full_phone_out,
+                                      "region_c2p_phone_stable_l_out");
+                        auto * stable =
+                            backend_ctx->backend_configs[1]
+                                .region_c2p_phone_output_stage_buf.get();
+                        full_phone_out->buffer = stable;
+                        full_phone_out->data =
+                            ggml_backend_buffer_get_base(stable);
+                    }
+                    GGML_ASSERT(full_phone_out != nullptr);
+                    ab_dump_tensor(1, -1, "l_out", full_phone_out);
                     printf(
                         "[AB_C2P_L_OUT_READY] layer=%d tokens=%" PRId64
                         " owner=PHONE tensor=%s status=CAPTURED\n",
                         prefill_down_layer_0,
                         ab_full_tokens(),
-                        phone_l_out->name);
+                        full_phone_out->name);
                 }
 
                 if (pipeline_debug) {
@@ -14532,6 +14820,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         if (region_commit_status != GGML_STATUS_SUCCESS) {
             return region_commit_status;
         }
+    }
+
+    // Every new Meta graph can materialize new Phone VIEW descriptors. Bind
+    // those to the already-committed C2P output before any Phone work starts.
+    if (region_chunk_continuation &&
+            backend_ctx->region_c2p_prefill.active &&
+            backend_ctx->region_c2p_prefill.next_chunk > 0 &&
+            !bind_region_c2p_phone_backing(
+                backend_ctx->region_c2p_prefill.layer)) {
+        return GGML_STATUS_FAILED;
     }
 
     bool ab_next_entry_dumped = false;
