@@ -2422,6 +2422,11 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
+    // V1 endpoint separation: ordinary PC-primary Tensor FFN work destined
+    // for Phone is submitted through its own FIFO instead of borrowing the
+    // PC Meta compute-worker control path. Directional C2P/P2C and Region
+    // execution keep their existing paths for now.
+    ggml_backend_meta_transfer_worker * phone_exec_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
     ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
@@ -3058,6 +3063,7 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
+    delete phone_exec_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
     for (auto * worker : prefill_return_workers) {
@@ -4001,6 +4007,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     };
     std::vector<reduce_copy_stats> reduce_copy_by_direction(n_backends*n_backends);
     const bool pipeline_debug = std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr;
+    const char * pc_phone_exec_v1_env =
+        std::getenv("GGML_META_PC_PHONE_EXEC_V1");
+    const bool pc_phone_exec_v1 =
+        pc_phone_exec_v1_env != nullptr &&
+        std::atoi(pc_phone_exec_v1_env) != 0;
     // Only the complete Phone Region prefill graph may use this opt-in
     // reordered stage schedule. Set to true after structural validation.
     const char * region_pipeline_env =
@@ -12661,6 +12672,74 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     }
     ggml_backend_meta_compute_workers & compute_workers = *backend_ctx->compute_workers;
     compute_workers.reset_timings();
+
+    auto ensure_phone_exec_worker = [&]() -> ggml_backend_meta_transfer_worker * {
+        GGML_ASSERT(n_backends == 2);
+        if (backend_ctx->phone_exec_worker == nullptr) {
+            backend_ctx->phone_exec_worker =
+                new ggml_backend_meta_transfer_worker();
+        }
+        return backend_ctx->phone_exec_worker;
+    };
+
+    auto enqueue_phone_exec_graph =
+        [&](ggml_cgraph * graph, size_t sg, int layer, int chunk) -> uint64_t {
+            GGML_ASSERT(pc_phone_exec_v1);
+            GGML_ASSERT(n_backends == 2);
+            GGML_ASSERT(graph != nullptr);
+
+            ggml_backend_meta_transfer_worker * worker =
+                ensure_phone_exec_worker();
+            ggml_backend_t phone_backend =
+                backend_ctx->backend_configs[1].backend;
+
+            return worker->enqueue(
+                [&, graph, phone_backend, sg, layer, chunk]
+                (uint64_t task_id) -> ggml_status {
+                    const int64_t begin_us = ggml_time_us();
+                    if (pipeline_debug) {
+                        printf(
+                            "[PC_PHONE_EXEC_V1] side=PHONE event=BEGIN "
+                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d\n",
+                            task_id, sg, layer, chunk);
+                    }
+
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(
+                            phone_backend, graph);
+                    const int64_t end_us = ggml_time_us();
+
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            compute_workers.mutex);
+                        compute_workers.backend_time_us[1] +=
+                            end_us - begin_us;
+                        compute_workers.backend_call_count[1] += 1;
+                        compute_workers.completed_time_us[1] =
+                            end_us;
+                    }
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PC_PHONE_EXEC_V1] side=PHONE event=END "
+                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d "
+                            "wall_ms=%.3f status=%d\n",
+                            task_id, sg, layer, chunk,
+                            (end_us - begin_us) / 1000.0,
+                            (int) status);
+                    }
+                    return status;
+                });
+        };
+
+    if (pc_phone_exec_v1 && pipeline_debug) {
+        printf(
+            "[PC_PHONE_EXEC_V1_PLAN] active=1 "
+            "scope=LEGACY_PC_PRIMARY_PREFILL "
+            "pc=COMPUTE_WORKER phone=DEDICATED_FIFO "
+            "join=BEFORE_REDUCE directional=UNCHANGED\n");
+    }
+
     int64_t compute_wall_us = 0;
     int64_t reduce_wall_us  = 0;
     bool compute_complete = false;
@@ -16444,9 +16523,73 @@ auto prefill_norm_sg_has_prework =
                     restore_c2p_route_bindings(c2p_bindings);
                 }
             } else {
-                compute_workers.start(1, i);
-                pc_status = compute_workers.wait(0);
-                phone_status = compute_workers.wait(1);
+                const bool legacy_pc_primary_split =
+                    pc_phone_exec_v1 &&
+                    n_backends == 2 &&
+                    !ggml_backend_meta_tensor_p2c_layer(
+                        backend_ctx, prefill_down_layer) &&
+                    !layer_is_tensor_phone_primary(
+                        prefill_down_layer);
+
+                if (legacy_pc_primary_split) {
+                    ggml_cgraph * phone_graph =
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[i].cgraph_main;
+                    const int64_t enqueue_begin_us =
+                        ggml_time_us();
+                    const uint64_t phone_task =
+                        enqueue_phone_exec_graph(
+                            phone_graph, i,
+                            prefill_down_layer,
+                            prefill_down_chunk);
+                    const int64_t enqueue_us =
+                        ggml_time_us() - enqueue_begin_us;
+
+                    // PC and Phone now have distinct executors. PC finishes
+                    // its own FFN shard without driving the Phone worker.
+                    const int64_t pc_wait_begin_us =
+                        ggml_time_us();
+                    pc_status = compute_workers.wait(0);
+                    const int64_t pc_wait_us =
+                        ggml_time_us() - pc_wait_begin_us;
+
+                    // V1 still joins at the true data dependency: reduction
+                    // cannot consume the Phone partial before it exists.
+                    // Later iterations can move this join into an RX/REDUCE
+                    // ready queue without changing the endpoint boundary.
+                    ggml_backend_meta_transfer_worker * phone_worker =
+                        ensure_phone_exec_worker();
+                    const bool phone_done_before_join =
+                        phone_worker->is_completed(phone_task);
+                    const int64_t join_begin_us =
+                        ggml_time_us();
+                    phone_status =
+                        phone_worker->wait(phone_task);
+                    const int64_t join_us =
+                        ggml_time_us() - join_begin_us;
+
+                    if (pipeline_debug) {
+                        printf(
+                            "[PC_PHONE_EXEC_V1] side=PC event=JOIN_BEFORE_REDUCE "
+                            "task=%" PRIu64 " sg=%zu layer=%d chunk=%d "
+                            "enqueue_ms=%.3f pc_wait_ms=%.3f "
+                            "phone_ready_before_join=%d join_ms=%.3f "
+                            "pc_status=%d phone_status=%d\n",
+                            phone_task, i,
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            enqueue_us / 1000.0,
+                            pc_wait_us / 1000.0,
+                            phone_done_before_join ? 1 : 0,
+                            join_us / 1000.0,
+                            (int) pc_status,
+                            (int) phone_status);
+                    }
+                } else {
+                    compute_workers.start(1, i);
+                    pc_status = compute_workers.wait(0);
+                    phone_status = compute_workers.wait(1);
+                }
             }
 
             if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
