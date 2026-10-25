@@ -8409,6 +8409,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             const int64_t copy_start_us =
                                 ggml_time_us();
                             if (local_input_stage) {
+                                // The norm graph was submitted asynchronously
+                                // by compute_workers. Fence it before copying
+                                // its outputs into private slot storage.
+                                ggml_backend_synchronize(
+                                    bcj_src.backend);
                                 ggml_backend_tensor_copy_async(
                                     bcj_src.backend,
                                     bcj_src.backend,
