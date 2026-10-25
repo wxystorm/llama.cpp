@@ -6151,17 +6151,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     // publishes READY. The consumer never reads a live producer tensor.
     auto prearm_phone_prefill_route =
         [&](size_t sg, int layer, int chunk) -> bool {
-            if (!phone_prefill_producer_route ||
-                    !phone_prefill_chunk_pipeline ||
-                    phone_primary_strict_route ||
+            const bool legacy_route_mode =
+                phone_prefill_producer_route &&
+                phone_prefill_chunk_pipeline &&
+                !phone_primary_strict_route &&
+                std::getenv(
+                    "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") !=
+                    nullptr &&
+                std::getenv(
+                    "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") !=
+                    nullptr;
+            if ((!legacy_route_mode &&
+                 !phone_main_local_requested) ||
                     chunk < 0 ||
-                    n_backends != 2 ||
-                    std::getenv(
-                        "LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") ==
-                        nullptr ||
-                    std::getenv(
-                        "LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") ==
-                        nullptr) {
+                    n_backends != 2) {
                 return false;
             }
 
@@ -13382,8 +13385,45 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     break;
                 }
 
+                size_t continuation_route =
+                    region_pipe_invalid_sg;
+                for (size_t sg = continuation_begin;
+                        sg <= continuation_down; ++sg) {
+                    int route_layer = -1;
+                    int route_chunk = -1;
+                    if (tensor_phone_stage_route_identity(
+                            sg, route_layer, route_chunk) &&
+                            route_layer == 46 &&
+                            route_chunk == (int) c) {
+                        if (continuation_route <
+                                region_pipe_invalid_sg) {
+                            eligible = false;
+                            region_pipe_reason =
+                                "CONTINUATION_ROUTE_AMBIGUOUS";
+                            break;
+                        }
+                        continuation_route = sg;
+                    }
+                }
+                if (!eligible) {
+                    break;
+                }
+                if (continuation_route >=
+                        region_pipe_invalid_sg ||
+                        continuation_route <
+                            continuation_begin ||
+                        continuation_route >=
+                            continuation_down) {
+                    eligible = false;
+                    region_pipe_reason =
+                        "CONTINUATION_ROUTE_NOT_FOUND";
+                    break;
+                }
+
                 e.continuation_begin_sg =
                     continuation_begin;
+                e.continuation_route_sg =
+                    continuation_route;
                 e.continuation_end_sg =
                     continuation_down;
 
@@ -14163,11 +14203,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             for (const auto & entry : region_pipe_chunks) {
                 printf("[PHONE_REGION_PIPE_CHUNK] chunk=%d "
                        "c2p_norm=%zu c2p_down=%zu region=[%zu,%zu] "
-                       "p2c=[%zu,%zu] status=READY\n",
+                       "p2c=[%zu,%zu,%zu] status=READY\n",
                        entry.first,
                        entry.second.norm_sg, entry.second.down_sg,
                        entry.second.begin_sg, entry.second.end_sg,
                        entry.second.continuation_begin_sg,
+                       entry.second.continuation_route_sg,
                        entry.second.continuation_end_sg);
             }
         }
