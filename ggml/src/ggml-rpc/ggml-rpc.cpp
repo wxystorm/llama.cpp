@@ -266,6 +266,9 @@ enum rpc_cmd {
     RPC_CMD_WAIT_READY_SEQ,
     RPC_CMD_GRAPH_REGISTER,
     RPC_CMD_PHONE_MAIN_REGISTER,
+    RPC_CMD_PHONE_C2P_REGISTER,
+    RPC_CMD_PHONE_C2P_READY,
+    RPC_CMD_PHONE_C2P_PARTIAL,
     RPC_CMD_COUNT,
 };
 
@@ -289,6 +292,9 @@ static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_AS
 static_assert(RPC_CMD_WAIT_READY_SEQ == 33, "RPC_CMD_WAIT_READY_SEQ must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GRAPH_REGISTER == 34, "RPC_CMD_GRAPH_REGISTER must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PHONE_MAIN_REGISTER == 35, "RPC_CMD_PHONE_MAIN_REGISTER must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_C2P_REGISTER == 36, "RPC_CMD_PHONE_C2P_REGISTER must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_C2P_READY == 37, "RPC_CMD_PHONE_C2P_READY must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_C2P_PARTIAL == 38, "RPC_CMD_PHONE_C2P_PARTIAL must be before RPC_CMD_COUNT");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -503,6 +509,39 @@ struct rpc_msg_phone_main_register_req {
 };
 
 struct rpc_msg_phone_main_register_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_phone_c2p_register_req {
+    uint32_t device;
+    int32_t chunk;
+    uint64_t ffn_graph_uid;
+    uint64_t consume_seq;
+};
+
+struct rpc_msg_phone_c2p_register_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_phone_c2p_ready_req {
+    uint32_t device;
+    int32_t chunk;
+};
+
+struct rpc_msg_phone_c2p_ready_rsp {
+    uint8_t result;
+};
+
+struct rpc_msg_phone_c2p_partial_req {
+    uint32_t device;
+    int32_t chunk;
+    uint64_t reduce_graph_uid;
+    rpc_tensor tensor;
+    uint64_t offset;
+    uint64_t size;
+};
+
+struct rpc_msg_phone_c2p_partial_rsp {
     uint8_t result;
 };
 
