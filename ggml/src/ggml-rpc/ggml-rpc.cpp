@@ -7208,17 +7208,6 @@ void rpc_server::phone_main_loop() {
                 }
             }
 
-            if (ok) {
-                {
-                    std::lock_guard<std::mutex> lock(
-                        phone_ffn_ready_mutex);
-                    phone_ffn_ready_seqs[
-                        c2p_key.first].insert(
-                            consume_seq);
-                }
-                phone_ffn_ready_cv.notify_all();
-            }
-
             GGML_LOG_INFO(
                 "[PHONE_C2P_FFN_DONE] chunk=%d device=%u "
                 "ffn_uid=%" PRIu64
@@ -7260,6 +7249,47 @@ void rpc_server::phone_main_loop() {
             reduce_begin_us = ggml_time_us();
             ok = graph_recompute_unlocked(run);
             reduce_done_us = ggml_time_us();
+
+            // C2P slot ownership includes Phone input, route metadata and the
+            // Phone FFN partial. FFN_DONE alone is too early to recycle the
+            // slot because the local Reduce still consumes that partial.
+            // Publish the consume credit only after Reduce has completed.
+            if (ok) {
+                uint64_t consume_seq = 0;
+                {
+                    std::lock_guard<std::mutex> lock(
+                        phone_main_mutex);
+                    const auto state_it =
+                        phone_c2p_states.find(
+                            std::make_pair(
+                                plan.device,
+                                plan.chunk));
+                    if (state_it !=
+                            phone_c2p_states.end()) {
+                        consume_seq =
+                            state_it->second.consume_seq;
+                    }
+                }
+                if (consume_seq == 0) {
+                    ok = false;
+                } else {
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            phone_ffn_ready_mutex);
+                        phone_ffn_ready_seqs[
+                            plan.device].insert(
+                                consume_seq);
+                    }
+                    phone_ffn_ready_cv.notify_all();
+                    GGML_LOG_INFO(
+                        "[PHONE_C2P_CONSUME_READY] "
+                        "chunk=%d device=%u seq=%" PRIu64
+                        " phase=REDUCE_DONE status=READY\n",
+                        plan.chunk,
+                        plan.device,
+                        consume_seq);
+                }
+            }
         }
 
         run.graph_uid = plan.region_graph_uid;
