@@ -457,6 +457,25 @@ bool llama_region_cuda_mirror::execute_layer(
         return false;
     }
 
+    // Mirror KV follows the same absolute position frontier supplied by
+    // the ordinary llama memory manager. A clear/seq-rm can rewind that
+    // frontier; stale entries at and after token_start are harmless because
+    // the next attention call overwrites them before they become visible.
+    if (token_start >= 0 &&
+            token_start <
+                resource->kv->committed_tokens) {
+        if (llama_hybrid_cycle_verbose()) {
+            std::printf(
+                "[REGION_CUDA_KV] layer=%d event=REWIND "
+                "from=%lld to=%lld status=OK\n",
+                layer,
+                (long long) resource->kv->committed_tokens,
+                (long long) token_start);
+        }
+        resource->kv->committed_tokens =
+            token_start;
+    }
+
     const int64_t hidden =
         model_->hparams.n_embd;
     const int64_t topk =
