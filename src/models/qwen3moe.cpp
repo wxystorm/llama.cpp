@@ -730,8 +730,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // L34's complete Phone-owned output is the immutable input to
             // each chunk; only the Phone Full region is re-tiled here.
             GGML_ASSERT(inpL->ne[1] == n_tokens);
-            ggml_tensor * region_entry = ggml_cont(ctx0, inpL);
-            cb(region_entry, "phone_region_input", il);
+            // The C2P final reduction has already materialized the complete
+            // l_out-34 in the Phone-owned tensor buffer. Creating a CONT
+            // here is not a harmless view: Meta marks it COMPUTE on both
+            // PC and Phone and may recompute from the stale PC mirror.
+            // Keep the C2P buffer as the only Region input owner and make
+            // per-chunk VIEWs directly into it (no duplicate full-batch copy).
+            GGML_ASSERT(ggml_is_contiguous(inpL));
+            ggml_tensor * region_entry = inpL;
 
             std::vector<ggml_tensor *> region_outputs;
             region_outputs.reserve(phone_region_chunks.size());
