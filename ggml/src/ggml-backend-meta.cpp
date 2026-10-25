@@ -4188,6 +4188,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         phone_main_local_env != nullptr &&
         std::atoi(phone_main_local_env) != 0;
     bool phone_main_local_active = false;
+    size_t phone_main_tail_join_sg = SIZE_MAX;
     const bool meta_timing_debug =
         pipeline_debug || std::getenv("GGML_META_TIMING_DEBUG") != nullptr;
     const bool return_path_debug = std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr;
@@ -15579,6 +15580,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             for (size_t sg = last_region_end + 1;
                     sg < backend_ctx->n_subgraphs; ++sg) {
                 if (!covered[sg]) {
+                    if (phone_main_local_active &&
+                            phone_main_tail_join_sg == SIZE_MAX) {
+                        phone_main_tail_join_sg = sg;
+                    }
                     add_sg(sg);
                 }
             }
@@ -15603,7 +15608,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         printf("[PHONE_REGION_PIPE_PLAN] active=%d "
                "window=2 chunks=%zu stages=%zu meta_sgs=%zu "
                "scratch_pool=%d continuation=%d pc_overlap=%d "
-               "phone_main_local=%d reason=%s\n",
+               "phone_main_local=%d tail_join_sg=%zu reason=%s\n",
                region_pipeline_active ? 1 : 0,
                region_pipe_chunks.size(),
                region_pipe_schedule.size(),
@@ -15614,6 +15619,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                    region_pc_overlap_requested ? 1 : 0,
                region_pipeline_active &&
                    phone_main_local_active ? 1 : 0,
+               phone_main_tail_join_sg,
                region_pipe_reason);
         if (region_pipeline_active && pipeline_debug) {
             for (const auto & entry : region_pipe_chunks) {
@@ -15635,6 +15641,85 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     bool ab_next_entry_dumped = false;
     bool phone_main_pc_join_drained = false;
+
+    auto drain_phone_main_pc_joins =
+        [&](size_t boundary_sg) -> ggml_status {
+            if (!region_pipeline_active ||
+                    !phone_main_local_active ||
+                    phone_main_pc_join_drained) {
+                return GGML_STATUS_SUCCESS;
+            }
+
+            const int64_t join_begin_us = ggml_time_us();
+            for (auto & entry : phone_main_local_chunks) {
+                uint64_t join_task = 0;
+                ggml_backend_meta_transfer_worker *
+                    join_worker = nullptr;
+                {
+                    std::unique_lock<std::mutex> lock(
+                        phone_main_pc_event_mutex);
+                    phone_main_pc_event_cv.wait(
+                        lock,
+                        [&]() {
+                            const auto & state =
+                                phone_main_local_chunks
+                                    .at(entry.first);
+                            return state.join_task != 0 ||
+                                   state.pc_event_failed;
+                        });
+                    auto & state =
+                        phone_main_local_chunks.at(
+                            entry.first);
+                    if (state.pc_event_failed) {
+                        printf(
+                            "[PHONE_MAIN_LOCAL_REJECT] "
+                            "chunk=%d reason=PC_EVENT_FAILED "
+                            "status=%d action=STOP\n",
+                            entry.first,
+                            (int) state.pc_event_status);
+                        return state.pc_event_status;
+                    }
+                    join_task = state.join_task;
+                    join_worker = state.join_worker;
+                }
+
+                if (join_worker == nullptr ||
+                        join_task == 0) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PC_JOIN_NOT_QUEUED "
+                        "boundary_sg=%zu action=STOP\n",
+                        entry.first, boundary_sg);
+                    return GGML_STATUS_FAILED;
+                }
+                const ggml_status join_status =
+                    join_worker->wait(join_task);
+                if (join_status !=
+                        GGML_STATUS_SUCCESS) {
+                    printf(
+                        "[PHONE_MAIN_LOCAL_REJECT] "
+                        "chunk=%d reason=PC_JOIN_FAILED "
+                        "status=%d action=STOP\n",
+                        entry.first,
+                        (int) join_status);
+                    return join_status;
+                }
+            }
+
+            phone_main_pc_join_drained = true;
+            if (pipeline_debug) {
+                printf(
+                    "[PHONE_MAIN_PC_TAIL_READY] "
+                    "chunks=%zu wait_ms=%.3f "
+                    "boundary_sg=%zu status=READY\n",
+                    phone_main_local_chunks.size(),
+                    (ggml_time_us() -
+                        join_begin_us) / 1000.0,
+                    boundary_sg);
+            }
+            return GGML_STATUS_SUCCESS;
+        };
+
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
@@ -15880,69 +15965,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         if (region_pipeline_active &&
                 phone_main_local_active &&
                 !phone_main_pc_join_drained &&
-                subgraph_layer(i) >= 47) {
-            const int64_t join_begin_us =
-                ggml_time_us();
-            for (auto & entry :
-                    phone_main_local_chunks) {
-                uint64_t join_task = 0;
-                ggml_backend_meta_transfer_worker *
-                    join_worker = nullptr;
-                {
-                    std::unique_lock<std::mutex> lock(
-                        phone_main_pc_event_mutex);
-                    phone_main_pc_event_cv.wait(
-                        lock,
-                        [&]() {
-                            const auto & state =
-                                phone_main_local_chunks
-                                    .at(entry.first);
-                            return state.join_task != 0 ||
-                                   state.pc_event_failed;
-                        });
-                    auto & state =
-                        phone_main_local_chunks
-                            .at(entry.first);
-                    if (state.pc_event_failed) {
-                        printf(
-                            "[PHONE_MAIN_LOCAL_REJECT] "
-                            "chunk=%d reason=PC_EVENT_FAILED "
-                            "status=%d action=STOP\n",
-                            entry.first,
-                            (int) state.pc_event_status);
-                        return state.pc_event_status;
-                    }
-                    join_task = state.join_task;
-                    join_worker = state.join_worker;
-                }
-
-                if (join_worker == nullptr ||
-                        join_task == 0) {
-                    return GGML_STATUS_FAILED;
-                }
-                const ggml_status join_status =
-                    join_worker->wait(join_task);
-                if (join_status !=
-                        GGML_STATUS_SUCCESS) {
-                    printf(
-                        "[PHONE_MAIN_LOCAL_REJECT] "
-                        "chunk=%d reason=PC_JOIN_FAILED "
-                        "status=%d action=STOP\n",
-                        entry.first,
-                        (int) join_status);
-                    return join_status;
-                }
-            }
-            phone_main_pc_join_drained = true;
-            if (pipeline_debug) {
-                printf(
-                    "[PHONE_MAIN_PC_TAIL_READY] "
-                    "chunks=%zu wait_ms=%.3f "
-                    "next_layer=%d status=READY\n",
-                    phone_main_local_chunks.size(),
-                    (ggml_time_us() -
-                        join_begin_us) / 1000.0,
-                    subgraph_layer(i));
+                phone_main_tail_join_sg != SIZE_MAX &&
+                i == phone_main_tail_join_sg) {
+            const ggml_status tail_status =
+                drain_phone_main_pc_joins(i);
+            if (tail_status != GGML_STATUS_SUCCESS) {
+                return tail_status;
             }
         }
 
@@ -19265,6 +19293,17 @@ auto prefill_norm_sg_has_prework =
                    std::strcmp(pipeline_stage, "PHONE_REGION") == 0 ?
                        "SUBMITTED" : "COMPLETED",
                    (ggml_time_us() - layer_wall_start_us) / 1000.0);
+        }
+    }
+
+    if (region_pipeline_active &&
+            phone_main_local_active &&
+            !phone_main_pc_join_drained) {
+        const ggml_status tail_status =
+            drain_phone_main_pc_joins(
+                phone_main_tail_join_sg);
+        if (tail_status != GGML_STATUS_SUCCESS) {
+            return tail_status;
         }
     }
 
