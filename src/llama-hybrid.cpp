@@ -1,5 +1,6 @@
 #include "llama-hybrid.h"
 #include "llama-region-ring.h"
+#include "llama-region-ring-planner.h"
 
 #include "../ggml/src/ggml-impl.h"
 #include "ggml-backend.h"
@@ -8287,3 +8288,202 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     return found;
 }
 
+
+
+bool llama_hybrid_region_ring_planner_dry_run(
+        int tokens, int kv_start, int baseline_chunk) {
+    llama_hybrid_profile profile;
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        if (!g_llama_hybrid_runtime_profile.has_value()) {
+            LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=NO_HYBRID_PROFILE "
+                            "action=KEEP_FIXED_RING\n");
+            return false;
+        }
+        profile = *g_llama_hybrid_runtime_profile;
+    }
+    if (tokens < 16 || profile.n_layer <= 0 || profile.n_embd <= 0 ||
+        baseline_chunk <= 0) {
+        LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=INVALID_DIMENSIONS "
+                        "tokens=%d baseline_x=%d\n", tokens, baseline_chunk);
+        return false;
+    }
+
+    llama_ring_planner::model model;
+    model.layers = profile.n_layer;
+    model.tokens = tokens;
+    model.kv_start = std::max(0, kv_start);
+    model.hidden = profile.n_embd;
+    model.window = 2;
+    model.max_tail = 12;
+    model.shared_phone_link = true; // Conservative Wi-Fi contention.
+
+    // Current READY V1 re-registers nearly every distinct Graph UID. Charge
+    // each Phone task for an approximate registration until shape/slot/position
+    // template reuse has been verified; never silently assume a cache hit.
+    double graph_wire_ms = 0.0;
+    constexpr size_t OBSERVED_P5_GRAPH_BYTES = 117676;
+    if (!llama_hybrid_transfer_cost(
+            profile.pc_to_phone, OBSERVED_P5_GRAPH_BYTES,
+            graph_wire_ms)) {
+        LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=NO_PC_TO_PHONE_PROFILE\n");
+        return false;
+    }
+    model.phone_register_ms = std::max(0.0, profile.rpc_submit_ms) +
+                              graph_wire_ms;
+
+    model.compute_ms = [&profile](
+            llama_region_ring_device dev, int layers,
+            int query_tokens, int kv_tokens, double & cost) -> bool {
+        const auto & block = dev == llama_region_ring_device::CPU ?
+            profile.cpu_layer_blocks :
+            dev == llama_region_ring_device::GPU ?
+            profile.gpu_layer_blocks : profile.phone_layer_blocks;
+        const auto & attn = dev == llama_region_ring_device::CPU ?
+            profile.cpu_attn :
+            dev == llama_region_ring_device::GPU ?
+            profile.gpu_attn : profile.phone_attn;
+
+        double base = 0.0;
+        double attn_ref = 0.0;
+        double attn_now = 0.0;
+        const bool use_compute_est = dev == llama_region_ring_device::PHONE;
+        if (!llama_hybrid_layer_block_total_cost(
+                    block, query_tokens, layers, use_compute_est, base) ||
+            !llama_hybrid_attn_cost(
+                    attn, query_tokens, query_tokens, attn_ref) ||
+            !llama_hybrid_attn_cost(
+                    attn, query_tokens, kv_tokens, attn_now)) {
+            return false;
+        }
+        cost = base + layers * (attn_now - attn_ref);
+        return std::isfinite(cost) && cost >= 0.0;
+    };
+
+    model.transfer_ms = [&profile](
+            llama_region_ring_device src,
+            llama_region_ring_device dst,
+            size_t bytes, double & cost) -> bool {
+        // A GPU<->CPU crossing uses the measured GPU->PC staging curve as a
+        // first approximation. Its uncertainty must be checked by A/B timing.
+        const auto & points =
+            src == llama_region_ring_device::PHONE ?
+                (!profile.phone_to_pc.empty() ?
+                    profile.phone_to_pc :
+                    profile.snapshot_phone_to_pc) :
+            dst == llama_region_ring_device::PHONE ?
+                profile.pc_to_phone : profile.gpu_to_pc;
+        return llama_hybrid_transfer_cost(points, bytes, cost);
+    };
+
+    const size_t weight_fallback = profile.total_weight_bytes_per_layer;
+    const bool have_layer_weights =
+        profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
+        weight_fallback != 0;
+    if (have_layer_weights) {
+        model.memory_feasible = [&profile, &model, weight_fallback](
+                const llama_ring_planner::candidate & candidate) -> bool {
+            std::vector<llama_region_ring_region> regions;
+            if (!llama_ring_planner::make_regions(
+                    candidate, model.layers, regions)) {
+                return false;
+            }
+            std::array<long double, 3> usage {};
+            for (const auto & region : regions) {
+                const auto idx = (size_t) region.device;
+                for (int l = region.layer_begin; l < region.layer_end; ++l) {
+                    const size_t weight = profile.layer_weight_bytes.size() ==
+                        (size_t) profile.n_layer ?
+                        profile.layer_weight_bytes[(size_t) l] : weight_fallback;
+                    usage[idx] += (long double) weight;
+                    usage[idx] += (long double) profile.kv_bytes_per_token_per_layer *
+                                  (model.kv_start + model.tokens);
+                }
+            }
+            usage[0] += (long double) profile.non_layer_weight_bytes;
+            const int sizes[] = {candidate.xc, candidate.xg, candidate.xp};
+            for (size_t i = 0; i < 3; ++i) {
+                usage[i] += (long double) model.window * sizes[i] *
+                            model.hidden * sizeof(float) * 3;
+            }
+            const size_t free_bytes[] = {
+                profile.pc_free_mem,
+                profile.gpu_free_mem,
+                profile.phone_free_mem
+            };
+            const long double fraction[] = {0.85L, 0.90L, 0.90L};
+            for (size_t i = 0; i < 3; ++i) {
+                if (free_bytes[i] != 0 &&
+                    usage[i] > (long double) free_bytes[i] * fraction[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+    }
+
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
+        "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
+        "phone_points=%zu h2p_points=%zu p2h_points=%zu "
+        "register_ms_per_task=%.3f weights=%s "
+        "network=SHARED_CONSERVATIVE action=DRY_RUN\n",
+        tokens, model.kv_start,
+        profile.cpu_layer_blocks.size(), profile.gpu_layer_blocks.size(),
+        profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
+        profile.phone_to_pc.size(), model.phone_register_ms,
+        have_layer_weights ? "ESTIMATED" : "UNKNOWN");
+
+    const auto result = llama_ring_planner::search(model, 192);
+    // Measure the same reference on the SAME interpolation model, rather
+    // than comparing two predictions from different profile parameters.
+    auto baseline_regions = llama_region_ring_from_env(profile.n_layer);
+    llama_ring_planner::candidate baseline;
+    baseline.xc = baseline.xg = baseline.xp = baseline_chunk;
+    const bool base_ok =
+        llama_ring_planner::simulate(model, baseline_regions, baseline);
+
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_PLAN_SEARCH] enumerated=%zu profiled=%zu "
+        "simulated=%zu reject_memory=%zu reject_profile=%zu "
+        "reject_dag=%zu baseline_profile=%s\n",
+        result.enumerated, result.profiled, result.simulated,
+        result.rejected_memory, result.rejected_profile,
+        result.rejected_deadlock, base_ok ? "OK" : "MISSING");
+
+    if (!result.valid) {
+        LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=NO_VALID_CANDIDATE "
+                        "action=KEEP_FIXED_RING\n");
+        return false;
+    }
+
+    for (size_t i = 0; i < result.top.size(); ++i) {
+        const auto & c = result.top[i];
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_CANDIDATE] rank=%zu cycles=%d "
+            "C=%d G=%d P=%d tail_C=%d tail_G=%d "
+            "XC=%d XG=%d XP=%d balance=%.4f wall_ms=%.3f "
+            "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
+            "tasks=%d edges=%d peak_per_edge_slots=%d\n",
+            i + 1, c.cycles, c.c, c.g, c.p, c.tail_c, c.tail_g,
+            c.xc, c.xg, c.xp, c.balance, c.wall_ms,
+            c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
+            c.tasks, c.edges, c.max_live_slots);
+    }
+    const auto & best = result.selected;
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_PLAN_SELECTED] mode=DRY_RUN cycles=%d "
+        "C=%d G=%d P=%d tail_C=%d tail_G=%d "
+        "XC=%d XG=%d XP=%d predicted_ms=%.3f "
+        "baseline_predicted_ms=%.3f balance=%.4f\n",
+        best.cycles, best.c, best.g, best.p,
+        best.tail_c, best.tail_g, best.xc, best.xg, best.xp,
+        best.wall_ms, base_ok ? baseline.wall_ms : -1.0,
+        best.balance);
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_PLAN_APPLY] mode=DRY_RUN applied=0 "
+        "reason=INTERVAL_READY_AND_DYNAMIC_PHONE_OWNERSHIP_NOT_YET_ENABLED "
+        "runtime_layout=UNCHANGED runtime_chunk=%d status=SAFE\n",
+        baseline_chunk);
+    return true;
+}
