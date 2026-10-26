@@ -2,6 +2,7 @@
 
 // Experimental CPU -> CUDA -> Phone region ring.  This header is intentionally
 // independent of GGML so its task dependencies can be tested in isolation.
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstddef>
