@@ -2918,6 +2918,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const int64_t begin_us = ggml_time_us();
 
     if (threaded_execution) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_WORKERS_PLAN] workers=3 fifo=PER_DEVICE "
+            "kv_views=PER_DEVICE window=%zu backend=SHARED_GATED "
+            "graph_overlap=0 status=READY\n", output_window);
         // The device FIFO and the host slots are concurrent; the actual
         // ggml_backend_t instances are not. Three real workers may claim and
         // wait simultaneously, but only one may build/execute/synchronize a
