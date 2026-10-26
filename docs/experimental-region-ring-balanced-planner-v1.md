@@ -147,3 +147,43 @@ Diagnostic names:
 Tests: 2-token warmup, 358-token Prefill including a 38-token tail, longer 512/1024 contexts, both 64↔32 transitions, Window=2 slot reuse, duplicate/out-of-order READY, cancellation, GPU/Phone memory limits, and full output/logit/selected `l_out` parity. Dense and MoE use the same scheduler abstraction but have different profiled costs.
 
 V1 explicitly does **not** introduce new Tensor split FFN/Reduce semantics, on-the-fly Layer migration, fabricated graph UID reuse, or bypass existing ownership/fusion guards.
+
+
+## 8. Implemented Dry-run search — runnable Phase A
+
+The planner is now implemented behind an explicit opt-in. Phases B/C/D (actual heterogeneous READY/Slot scheduling, Phone graph placement, dynamic PC-tail final output) are not yet enabled.
+
+- `src/llama-region-ring-planner.h` implements search for repeated `[C,G,P]×N` plus optional `C_tail/G_tail`, with independent `XC/XG/XP`, interpolated costs supplied by callbacks, a conservative shared network lane, per-Region KV ordering, token-interval edge coverage, staging-buffer transfer, and 2 outstanding producer slots per edge.
+- `src/llama-hybrid.cpp` connects measured `cpu_layer_blocks`, `gpu_layer_blocks`, `phone_layer_blocks`, attention-KV interpolation, directional transfer cost curves and estimated weight/KV/scratch memory budgets. It conservatively includes Phone graph registration overhead by layer count. Estimated memory is not a real weight allocator.
+- `src/llama.cpp` reuses the existing Hybrid Auto hardware profiler when dry-run is requested, even if `--hybrid-auto` was not otherwise enabled, **without publishing or changing the model placement**. A measured Profile can be used even when the old legacy Hybrid layout search found no feasible plan. If hardware profiling itself fails, the fixed Ring continues.
+- `src/llama-context.cpp` calls the search at the start of a large prefill ubatch. Logs include reference predicted time and the highest-ranked candidate configurations. The **actual** Stage list, KV cache and Phone RPC execution are never modified by this option.
+- `tests/test-region-ring-planner.cpp` tests exact 54-task uniform reference, different PC and Phone interval sizes, PC tail, missing Profile and memory filters. `test-region-ring-planner` is registered as a standalone C++17 CTest target and its checks run even in Release with NDEBUG.
+
+### Quick start
+
+Checkout branch `exp/region-ring-balanced-planner-20261026`, recompile PC `llama-cli` (the existing protocol-v17 Phone RPC server from the READY-autostart branch can be reused), keep the same fixed Ring flags and add:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_RING_PLANNER = "dry-run"
+$env:GGML_META_RING_PHONE_FUSION = "1"
+$env:GGML_META_RING_PHONE_AUTOSTART = "1"
+```
+
+To build and run the standalone test when `LLAMA_BUILD_TESTS=ON`:
+
+```powershell
+cmake --build build-tensor-v2 --config Release --target test-region-ring-planner -j 8
+ctest --test-dir build-tensor-v2 -C Release -R "^test-region-ring-planner$" --output-on-failure
+```
+
+Search these PC log markers:
+
+```powershell
+Select-String -Path ".\region-pair.log" -Pattern '\[REGION_RING_PLAN_PROFILE\]','\[REGION_RING_PLAN_SEARCH\]','\[REGION_RING_PLAN_CANDIDATE\]','\[REGION_RING_PLAN_SELECTED\]','\[REGION_RING_PLAN_REJECT\]','\[REGION_RING_PLAN_APPLY\]','\[REGION_RING_SUM\]'
+```
+
+`[REGION_RING_PLAN_APPLY] mode=DRY_RUN applied=0` is expected and mandatory for this phase. `predicted_ms` is estimated and should be calibrated against repeated, Release-mode `REGION_RING_SUM wall_ms`; no claims of speedup until an applied plan is verified.
+
+Current bounded coarse search uses `N=2..4`, `C=2..12`, `G=1..8`, `P=2..8`, PC tail up to 12 layers, `XC/XG={32,64,128}`, `XP={16,32,64,128}`, and 192 full DAG simulations after profile/balance pruning. These bounds and a conservative serialized Wi-Fi lane do not prove global optimality. The CPU↔CUDA transfer estimate uses the GPU→PC profile as a proxy and needs calibration. The conservative Phone graph registration estimate assumes new UIDs until safe template reuse is confirmed.
+
+If the selected layout moves a Phone Region, changes XC/XG/XP or ends with PC layers, it remains a **proposed** layout only. Before application, implement the interval-aware runtime and generalize current hard-coded Phone Graph/last-logits ownership guards.
