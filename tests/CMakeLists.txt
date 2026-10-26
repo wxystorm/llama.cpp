@@ -315,6 +315,13 @@ target_include_directories(test-hybrid-boundary PRIVATE ${PROJECT_SOURCE_DIR}/sr
 # The ring scheduler tests only the standalone header. Do not link
 # llama-common/get-model.cpp or model/backend DLLs into this pure unit test.
 add_executable(test-region-ring test-region-ring.cpp)
+# A standalone test does not inherit llama-common's C++17 requirement.
+# On MSVC, the default language mode may otherwise be C++14, making
+# std::optional unavailable and causing cascading errors in the test.
+set_target_properties(test-region-ring PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
 target_include_directories(test-region-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring)
 
