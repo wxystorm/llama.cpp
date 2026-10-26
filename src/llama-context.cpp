@@ -4541,6 +4541,48 @@ int llama_context::decode(const llama_batch & batch_inp) {
         tensor_phone_last_layer = il + 1;
     }
 
+    // The dedicated five-stage architecture must publish exactly one C2P
+    // and one P2C layer. Do this check before any Meta graph is built:
+    // a stale Ring or legacy policy must not be silently executed instead.
+    const char * directional_pair_env =
+        std::getenv("LLAMA_HYBRID_DIRECTIONAL_PAIR");
+    if (directional_pair_env != nullptr &&
+            std::atoi(directional_pair_env) != 0) {
+        int c2p = -1;
+        int p2c = -1;
+        int c2p_count = 0;
+        int p2c_count = 0;
+        int phone_only_count = 0;
+        for (int il = 0; il < (int) hparams.n_layer(); ++il) {
+            const auto mode = model.hybrid_layer_mode(il);
+            if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+                c2p = il;
+                ++c2p_count;
+            } else if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+                p2c = il;
+                ++p2c_count;
+            } else if (mode == llama_hybrid_layer_mode::PHONE_ONLY) {
+                ++phone_only_count;
+            }
+        }
+        if (c2p_count != 1 || p2c_count != 1 ||
+                p2c <= c2p + 1 ||
+                phone_only_count != p2c - c2p - 1) {
+            throw std::runtime_error(
+                "directional pair has inconsistent C2P/Phone/P2C "
+                "model policy before Meta graph compute");
+        }
+        if (n_tokens_all > 1) {
+            LLAMA_LOG_ERROR(
+                "[DIRECTIONAL_PAIR_EXEC] phase=PREFILL "
+                "tokens=%u c2p=%d phone=[%d,%d) p2c=%d "
+                "pc_suffix=[%d,%u) "
+                "exec=EXISTING_META_DIRECTIONAL status=POLICY_OK\n",
+                n_tokens_all, c2p, c2p + 1, p2c, p2c,
+                p2c + 1, hparams.n_layer());
+        }
+    }
+
     for (ggml_backend_t backend : backend_ptrs) {
         if (directional_region_policy) {
             ggml_backend_meta_set_tensor_phone_primary_layer_mask(
