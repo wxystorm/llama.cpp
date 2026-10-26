@@ -162,6 +162,48 @@ Inspect `REGION_RING_PLAN_PROFILE`, `REGION_RING_TOPOLOGY_SEARCH`,
 candidate listing alone. Correctness and performance need real-device
 A/B testing; this refactor has not been hardware-validated.
 
+## P8 output-bridge false rejection (2026-10-27)
+
+On the first real `apply-topology` run with an internal Phone span
+`[10,18)`, Meta successfully constructed the 503-node P8 graph:
+
+```text
+[PHONE_BLOCK_FUSED] sg=0..15 layers=10..17 nodes=503
+[PHONE_RING_AUTO] side=pc event=OUTPUT_READY layer=17 sg=16 status=OK
+[REGION_RING_PHONE_FUSION] event=REJECT sg=16 reason=PAIR_OUT_OF_RANGE
+```
+
+The reject was a **misclassification**. SG16 is the deliberately
+separate single-node `l_out-17` output bridge; it is not an incomplete
+Phone Attention/FFN pair. The previous fail-closed guard rejected any
+Phone-only graph that could not start a complete pair, including this
+already completed bridge.
+
+The fix tracks the output bridge **only** after (a) the exact mirrored
+single-node `l_out-N` marker is validated and (b) the outstanding
+Phone graph completion sequence was consumed successfully by
+`phone_ring_auto_wait`. That SG follows Meta's preexisting bridge
+communication path and does not call `find_phone_block` again. All
+other incomplete or unexpected Phone-only prefill graphs remain
+fail-closed, and single-token decode remains on the original per-SG
+path.
+
+On the next real run, after each fused internal Phone region, expect:
+
+```text
+[PHONE_RING_AUTO] side=pc event=OUTPUT_READY layer=17 sg=16 ... status=OK
+[REGION_RING_PHONE_FUSION] event=OUTPUT_BRIDGE sg=16 layer=17 action=PASS_THROUGH status=READY
+```
+
+No `event=REJECT reason=PAIR_OUT_OF_RANGE` is expected at that same
+terminal bridge. This fix is **only PC-side Meta code**; a working RPC
+patch-18 Phone server does not need rebuilding for this particular
+change. Build the PC and rerun the model. Verify both Phone regions,
+`REGION_RING_FINAL_OWNER result=MAIN`, drained output slots,
+`REGION_RING_SUM complete=1`, and numeric/token parity. Neither full
+success nor performance improvement has yet been established by the
+previous failed run.
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
