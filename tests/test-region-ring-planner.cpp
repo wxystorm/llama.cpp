@@ -122,6 +122,21 @@ int main() {
            selected.selected.tail_c + selected.selected.tail_g == m.layers);
     REQUIRE(selected.top.size() <= 5);
 
+    // General topology may change Phone P5 to P8, the number of cycles,
+    // and the final logits owner; but Chunk64 and Window=2 remain fixed.
+    model general_profile = mock_profile();
+    const result general = search_supported_topology(general_profile,64,96);
+    REQUIRE(general.valid && general.simulated > 0);
+    REQUIRE(general.selected.xc == 64 &&
+            general.selected.xg == 64 &&
+            general.selected.xp == 64);
+    std::vector<llama_region_ring_region> general_regions;
+    REQUIRE(make_regions(general.selected,48,general_regions));
+    REQUIRE(llama_region_ring_apply_topology_compatible(
+        general_regions,48));
+    REQUIRE(general.selected.max_live_slots <= 2);
+    REQUIRE(!search_supported_topology(general_profile,128).valid);
+
     // Runtime APPLY-safe uses a separate constrained search. It may ONLY
     // move the C/G boundaries within the three existing 11-layer PC windows;
     // it must preserve all three Phone P5 regions, CUDA11 total and Chunk64.
