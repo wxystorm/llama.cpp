@@ -18211,10 +18211,12 @@ auto prefill_norm_sg_has_prework =
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
             } else if (ring_phone_fusion && !eligible_probe_only && is_phone_only_sg) {
-                if (ring_phone_dynamic) {
-                    // A model-selected P2..P8 span is valid only if its entire
-                    // Meta graph was captured. Falling back silently could
-                    // break the Phone l_out handoff and downstream KV order.
+                if (ring_phone_dynamic &&
+                        fusion_reason != "RING_DECODE_NOT_FUSABLE") {
+                    // Prefill P2..P8 must be an exact complete fused graph.
+                    // Single-token decode retains the existing per-SG
+                    // execution path, because FFN graph fusion is disabled
+                    // for decode by the original kernel contract.
                     printf("[REGION_RING_PHONE_FUSION] event=REJECT sg=%zu "
                            "failed_sg=%zu reason=%s "
                            "mode=PLAN_OWNED status=FAIL\n",
