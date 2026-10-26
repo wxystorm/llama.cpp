@@ -63,7 +63,7 @@ inline bool llama_region_ring_enabled() {
 }
 
 inline std::vector<llama_region_ring_region> llama_region_ring_parse(
-        const std::string & spec, int n_layer) {
+        const std::string & spec, int n_layer, bool allow_pc_tail = false) {
     // L0..L47: CPU7 / GPU4 / Phone5 / CPU7 / GPU4 / Phone5 /
     //          CPU8 / GPU3 / Phone5.  Counts: CPU22, GPU11, Phone15.
     const std::string layout = spec.empty() ?
@@ -136,12 +136,51 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         }
     }
 
-    if (regions.size() < 6 || regions.size() % 3 != 0 || layer != n_layer) {
+    const size_t full_cycles = regions.size() / 3;
+    const size_t pc_tail_stages = regions.size() % 3;
+    if (full_cycles < 2 || layer != n_layer ||
+            (!allow_pc_tail && pc_tail_stages != 0) ||
+            (allow_pc_tail && full_cycles > 4)) {
         throw std::runtime_error(
-            "region ring requires at least two CPU/GPU/Phone cycles "
-            "covering every layer exactly once");
+            allow_pc_tail ?
+                "region topology requires 2-4 CPU/GPU/Phone cycles and "
+                "an optional CPU/GPU tail covering every layer" :
+                "region ring requires at least two CPU/GPU/Phone cycles "
+                "covering every layer exactly once");
     }
     return regions;
+}
+
+// Enforce the general Plan contract before allocating any weights. The
+// legacy parser intentionally remains strict unless allow_pc_tail is set.
+inline bool llama_region_ring_apply_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer) {
+    if (regions.size() < 6 || regions.size() > 14 ||
+            n_layer <= 0 || regions.front().layer_begin != 0 ||
+            regions.back().layer_end != n_layer) {
+        return false;
+    }
+    const size_t cycles = regions.size() / 3;
+    if (cycles < 2 || cycles > 4) {
+        return false;
+    }
+    int next_layer = 0;
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto & r = regions[i];
+        const auto expected = static_cast<llama_region_ring_device>(i % 3);
+        if (r.device != expected || r.layer_begin != next_layer ||
+                r.layer_end <= r.layer_begin || r.layer_end > n_layer) {
+            return false;
+        }
+        if (expected == llama_region_ring_device::PHONE &&
+                (r.layer_end - r.layer_begin < 2 ||
+                 r.layer_end - r.layer_begin > 8)) {
+            return false;
+        }
+        next_layer = r.layer_end;
+    }
+    return next_layer == n_layer;
 }
 
 // Canonical Ring layout spelling, shared by the model loader, runtime
