@@ -320,6 +320,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_apply_safe =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"apply-safe") == 0;
+        const bool ring_plan_topology_preview =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"topology-preview") == 0;
         if (ring_plan_apply_safe &&
                 (!llama_region_ring_enabled() ||
                  params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
@@ -343,7 +346,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_planner_profile_requested =
             params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
             llama_region_ring_enabled() &&
-            (ring_plan_dry_run || ring_plan_apply_safe);
+            (ring_plan_dry_run || ring_plan_apply_safe ||
+             ring_plan_topology_preview);
         if ((params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
@@ -352,6 +356,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
                            ring_plan_apply_safe ? "APPLY_SAFE" :
+                           ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
                            ring_plan_dry_run ? "DRY_RUN" : "OFF");
 
             if (!llama_hybrid_autoplan(ml, params, best)) {
@@ -384,6 +389,22 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
         }
 
+        if (ring_plan_topology_preview) {
+            // This is deliberately non-applying. Only apply-safe may change
+            // model weight placement in the current runtime.
+            int chunk_tokens = 64;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+                chunk_tokens = std::atoi(raw);
+            }
+            int target_tokens = 358;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS")) {
+                target_tokens = std::atoi(raw);
+            }
+            (void) llama_hybrid_region_ring_planner_topology_preview(
+                target_tokens,0,chunk_tokens);
+        }
         if (ring_plan_apply_safe) {
             int chunk_tokens = 128;
             if (const char * raw = std::getenv(
