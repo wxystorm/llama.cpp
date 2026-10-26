@@ -4579,7 +4579,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 "pc_suffix=[%d,%u) "
                 "exec=EXISTING_META_DIRECTIONAL status=POLICY_OK\n",
                 n_tokens_all, c2p, c2p + 1, p2c, p2c,
-                p2c + 1, hparams.n_layer());
+                p2c + 1, (unsigned) hparams.n_layer());
         }
     }
 
