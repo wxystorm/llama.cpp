@@ -4579,20 +4579,68 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
-        if (const char * env = std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+        if (model.hybrid_ring_plan_chunk_tokens > 0) {
+            // A model loaded with Planner-selected CUDA/CPU weights must not
+            // reinterpret its Stage shape after environment variables change.
+            region_ring_chunk_tokens =
+                model.hybrid_ring_plan_chunk_tokens;
+        } else if (const char * env =
+                std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
             region_ring_chunk_tokens = std::atoi(env);
         }
         if (region_ring_chunk_tokens <= 0) {
             throw std::runtime_error("region ring chunk tokens must be positive");
         }
     }
+    const std::vector<llama_region_ring_region> ring_runtime_regions =
+        region_ring_v1 ?
+            (model.hybrid_ring_plan_layout.empty() ?
+                llama_region_ring_from_env(model.hparams.n_layer()) :
+                llama_region_ring_parse(model.hybrid_ring_plan_layout,
+                                        model.hparams.n_layer())) :
+            std::vector<llama_region_ring_region>{};
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
             llama_region_ring_runtime_stages(
-                llama_region_ring_from_env(model.hparams.n_layer()),
-                region_ring_chunk_tokens) :
+                ring_runtime_regions,region_ring_chunk_tokens) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+    if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
+        // Every executable Stage must match the model's actual weight and
+        // KV owner; a split between placement and task routing is fatal.
+        if (!llama_region_ring_apply_safe_phone_shape(ring_runtime_regions) ||
+                region_ring_chunk_tokens != 64 ||
+                model.pc_layer_backends.size() <
+                    (size_t) model.hparams.n_layer()) {
+            throw std::runtime_error(
+                "Planner Ring runtime shape does not match loaded weights");
+        }
+        for (const auto & r : ring_runtime_regions) {
+            for (int il = r.layer_begin; il < r.layer_end; ++il) {
+                const bool phone =
+                    r.device == llama_region_ring_device::PHONE;
+                const bool gpu =
+                    r.device == llama_region_ring_device::GPU;
+                const bool owner_ok = phone ?
+                    model.hybrid_layer_mode(il) ==
+                        llama_hybrid_layer_mode::PHONE_ONLY :
+                    model.hybrid_layer_mode(il) ==
+                        llama_hybrid_layer_mode::PC_ONLY &&
+                    (model.pc_layer_backends[(size_t) il] ==
+                        llama_pc_layer_backend::CUDA) == gpu;
+                if (!owner_ok) {
+                    throw std::runtime_error(
+                        "Planner Ring runtime/model backend ownership mismatch");
+                }
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+            "phase=RUNTIME_STAGES applied=1 "
+            "layout=%s chunk=%d window=2 status=CONSISTENT\n",
+            model.hybrid_ring_plan_layout.c_str(),
+            region_ring_chunk_tokens);
+    }
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN] regions=%zu chunk_tokens=%d "
