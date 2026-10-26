@@ -4240,7 +4240,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     std::deque<llama_prefill_pipe_slot *> tensor_ready_q;
 
     llama_prefill_pipe_slot * prev                     = nullptr;
-    bool legacy_pipeline_runtime_enabled = std::getenv("LLAMA_PREFILL_STAGE_PIPELINE") != nullptr;
+    // Ring's ready/serial/full modes are mutually exclusive with the legacy
+    // prefill pipeline. A stale LLAMA_PREFILL_STAGE_PIPELINE environment
+    // variable must not silently reroute the Ring full-graph reference.
+    bool legacy_pipeline_runtime_enabled =
+        !region_ring_v1 && std::getenv("LLAMA_PREFILL_STAGE_PIPELINE") != nullptr;
     bool pipeline_runtime_enabled = stage_queue_runtime_enabled || legacy_pipeline_runtime_enabled;
 
     const auto stage_queue_handoff = [&](llama_prefill_pipe_slot & slot) {
@@ -4975,6 +4979,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_LOG_WARN(
                 "[HYBRID_EXEC] ub=%d serial stage path unsupported for this ubatch; using full graph\n",
                 ubatch_id);
+        }
+
+        if (region_ring_v1 && ring_exec == "full" && ubatch.n_tokens > 1) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EXEC] mode=full ub=%d tokens=%u "
+                "path=DEFAULT_GGML_FULL_GRAPH legacy_pipeline=DISABLED\n",
+                ubatch_id, ubatch.n_tokens);
         }
 
         const bool pipe_candidate =
