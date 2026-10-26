@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 struct llama_hybrid_transfer_point {
@@ -565,6 +566,12 @@ LLAMA_API void llama_hybrid_runtime_plan_clear();
 // returns false if the measured Profile cannot score the search space.
 LLAMA_API bool llama_hybrid_region_ring_planner_dry_run(
     int tokens, int kv_start, int baseline_chunk);
+// Returns true and a validated per-model layout only when the predicted gain
+// exceeds the configured threshold and the current Phone/Chunk protocol is
+// unchanged. Called before model weight loading; no live runtime mutation.
+LLAMA_API bool llama_hybrid_region_ring_planner_apply_safe(
+    int tokens, int kv_start, int baseline_chunk,
+    std::string & selected_layout);
 
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(
