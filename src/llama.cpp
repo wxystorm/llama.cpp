@@ -391,23 +391,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_topology_preview =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"topology-preview") == 0;
-        if (ring_plan_apply_safe &&
+        const bool ring_plan_apply_topology =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"apply-topology") == 0;
+        if ((ring_plan_apply_safe || ring_plan_apply_topology) &&
                 (!llama_region_ring_enabled() ||
                  params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
                  params.hybrid_auto)) {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n");
+                "[REGION_RING_PLAN_REJECT] mode=%s "
+                "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n",
+                ring_plan_apply_topology ? "APPLY_TOPOLOGY" : "APPLY_SAFE");
             return {-1,nullptr};
         }
-        if (ring_plan_apply_safe) {
+        if (ring_plan_apply_safe || ring_plan_apply_topology) {
             const char * ring_exec =
                 std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
             if (ring_exec == nullptr ||
                     std::strcmp(ring_exec,"fifo-pc-phone") != 0) {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                    "reason=REQUIRES_FIFO_PC_PHONE_RUNTIME\n");
+                    "[REGION_RING_PLAN_REJECT] mode=%s "
+                    "reason=REQUIRES_FIFO_PC_PHONE_RUNTIME\n",
+                    ring_plan_apply_topology ? "APPLY_TOPOLOGY" : "APPLY_SAFE");
                 return {-1,nullptr};
             }
         }
@@ -415,7 +420,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
             llama_region_ring_enabled() &&
             (ring_plan_dry_run || ring_plan_apply_safe ||
-             ring_plan_topology_preview);
+             ring_plan_topology_preview || ring_plan_apply_topology);
         if ((params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
@@ -423,6 +428,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            "ring_planner=%s\n",
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
+                           ring_plan_apply_topology ? "APPLY_TOPOLOGY" :
                            ring_plan_apply_safe ? "APPLY_SAFE" :
                            ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
                            ring_plan_dry_run ? "DRY_RUN" : "OFF");
@@ -472,6 +478,72 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
             (void) llama_hybrid_region_ring_planner_topology_preview(
                 target_tokens,0,chunk_tokens);
+        }
+        if (ring_plan_apply_topology) {
+            // Automatic variable-topology selection is opt-in and a
+            // pre-weight-load decision. The selected layout becomes a
+            // model-owned immutable policy, not a runtime environment read.
+            int chunk_tokens = 64;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+                char * stop = nullptr;
+                const long n = std::strtol(raw,&stop,10);
+                if (stop == raw || *stop != '\0' || n != 64) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_TOPOLOGY "
+                        "reason=REQUIRES_CHUNK_64\n");
+                    return {-1,nullptr};
+                }
+                chunk_tokens = (int) n;
+            }
+            int target_tokens = 358;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS")) {
+                char * stop = nullptr;
+                const long n = std::strtol(raw,&stop,10);
+                if (stop == raw || *stop != '\0' ||
+                        n < 16 || n > 16384) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_TOPOLOGY "
+                        "reason=INVALID_TARGET_TOKENS\n");
+                    return {-1,nullptr};
+                }
+                target_tokens = (int) n;
+            }
+            // Keep unsupported Phone graph modes from reaching weight
+            // allocation. Failure to find a scored candidate is different:
+            // that retains the original tested fixed Ring layout.
+            const char * fusion = std::getenv("GGML_META_RING_PHONE_FUSION");
+            const char * autostart = std::getenv("GGML_META_RING_PHONE_AUTOSTART");
+            const char * exit_fix = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
+            if (!fusion || std::strcmp(fusion,"1") != 0 ||
+                    !autostart || std::strcmp(autostart,"1") != 0 ||
+                    !exit_fix || std::strcmp(exit_fix,"1") != 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=APPLY_TOPOLOGY "
+                    "reason=REQUIRES_PHONE_FUSION_AUTOSTART_EXIT_FIX\n");
+                return {-1,nullptr};
+            }
+            std::string selected_layout;
+            const bool selected =
+                llama_hybrid_region_ring_planner_apply_topology(
+                    target_tokens,0,chunk_tokens,selected_layout);
+            if (selected && !selected_layout.empty()) {
+                model_ptr->hybrid_ring_plan_layout = selected_layout;
+                model_ptr->hybrid_ring_plan_chunk_tokens = chunk_tokens;
+                model_ptr->hybrid_ring_plan_topology = true;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_TOPOLOGY "
+                    "phase=MODEL_LOAD applied=1 layout=%s "
+                    "chunk=%d target_tokens=%d status=MODEL_OWNED\n",
+                    selected_layout.c_str(),chunk_tokens,target_tokens);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_TOPOLOGY "
+                    "phase=MODEL_LOAD applied=0 "
+                    "status=FIXED_BASELINE_UNCHANGED\n");
+            }
         }
         if (ring_plan_apply_safe) {
             int chunk_tokens = 128;
