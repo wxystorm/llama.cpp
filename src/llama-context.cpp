@@ -3066,7 +3066,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                             "[REGION_RING_BACKEND_SPLIT] device=%s "
                                             "region=%zu chunk=%zu split=%d/%d "
                                             "compute=%s resource_mask=0x%016" PRIx64
-                                            " unresolved=%d\\n",
+                                            " unresolved=%d\n",
                                             name, task.region, task.chunk, split,
                                             n_splits, ggml_backend_name(target),
                                             split_mask, (int) (split_mask >> 63));
@@ -3085,7 +3085,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "region=%zu chunk=%zu n_splits=%d "
                                     "resource_mask=0x%016" PRIx64
                                     " cross_backend=%d unresolved=%d "
-                                    "gate=GLOBAL status=OBSERVED\\n",
+                                    "gate=CONTEXT_SHARED status=OBSERVED\n",
                                     name, task.region, task.chunk, n_splits,
                                     task_mask, cross ? 1 : 0,
                                     unresolved ? 1 : 0);
