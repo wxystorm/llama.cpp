@@ -8005,6 +8005,24 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile_print(profile);
 
+    // The Region Ring dry-run search requires measured compute/transfer
+    // samples, not a feasible legacy Hybrid placement. Cache the independent
+    // Profile immediately after measurement so a legacy placement rejection
+    // cannot silently disable the Ring Planner. No runtime plan is applied.
+    const char * ring_plan_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+    if (llama_region_ring_enabled() && ring_plan_env != nullptr &&
+            std::strcmp(ring_plan_env, "dry-run") == 0) {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        g_llama_hybrid_runtime_profile = profile;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=CACHED "
+            "cpu=%zu gpu=%zu phone=%zu applied=0\n",
+            profile.cpu_layer_blocks.size(),
+            profile.gpu_layer_blocks.size(),
+            profile.phone_layer_blocks.size());
+    }
+
     llama_hybrid_constraints constraints;
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
