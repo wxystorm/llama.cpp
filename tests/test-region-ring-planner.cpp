@@ -1,11 +1,18 @@
 // Standalone, deterministic Planner DAG tests; no model, CUDA or Phone needed.
 #include "llama-region-ring-planner.h"
-#include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 using namespace llama_ring_planner;
+#define REQUIRE(expr) do { \
+    if (!(expr)) { \
+        std::fprintf(stderr, "REGION_RING_PLANNER_TEST_FAIL line=%d expr=%s\n", \
+                     __LINE__, #expr); \
+        std::abort(); \
+    } \
+} while (0)
 
 static model mock_profile() {
     model m;
@@ -36,11 +43,11 @@ int main() {
     uniform.p = 5;
     std::vector<llama_region_ring_region> regions;
     std::string reason;
-    assert(make_regions(uniform, m.layers, regions));
-    assert(regions.size() == 9);
-    assert(simulate(m, regions, uniform, &reason));
-    assert(uniform.tasks == 54 && uniform.max_live_slots <= 2);
-    assert(uniform.wall_ms > 0.0);
+    REQUIRE(make_regions(uniform, m.layers, regions));
+    REQUIRE(regions.size() == 9);
+    REQUIRE(simulate(m, regions, uniform, &reason));
+    REQUIRE(uniform.tasks == 54 && uniform.max_live_slots <= 2);
+    REQUIRE(uniform.wall_ms > 0.0);
 
     // One PC Chunk splits into two or four Phone Chunks. The output Slot
     // is released when all transfers have entered downstream staging.
@@ -48,9 +55,9 @@ int main() {
     smaller_phone.xc = 64;
     smaller_phone.xg = 32;
     smaller_phone.xp = 16;
-    assert(simulate(m, regions, smaller_phone, &reason));
-    assert(smaller_phone.tasks > uniform.tasks);
-    assert(smaller_phone.max_live_slots <= 2);
+    REQUIRE(simulate(m, regions, smaller_phone, &reason));
+    REQUIRE(smaller_phone.tasks > uniform.tasks);
+    REQUIRE(smaller_phone.max_live_slots <= 2);
 
     // Many Phone producers feed a larger PC Chunk: test interval gather and
     // exact-coverage prerequisites without assuming identical Chunk IDs.
@@ -58,23 +65,23 @@ int main() {
     larger_pc.xc = 128;
     larger_pc.xg = 64;
     larger_pc.xp = 32;
-    assert(simulate(m, regions, larger_pc, &reason));
-    assert(larger_pc.max_live_slots <= 2);
+    REQUIRE(simulate(m, regions, larger_pc, &reason));
+    REQUIRE(larger_pc.max_live_slots <= 2);
 
     // A non-dividing three-cycle width gives a PC-only final suffix.
     candidate tail = uniform;
     tail.p = 4;
     tail.tail_c = 3;
-    assert(make_regions(tail, m.layers, regions));
-    assert(regions.size() == 10 && regions.back().device == device::CPU);
-    assert(simulate(m, regions, tail, &reason));
+    REQUIRE(make_regions(tail, m.layers, regions));
+    REQUIRE(regions.size() == 10 && regions.back().device == device::CPU);
+    REQUIRE(simulate(m, regions, tail, &reason));
 
     // A suffix may end on CUDA instead of CPU.
     tail.tail_c = 1;
     tail.tail_g = 2;
-    assert(make_regions(tail, m.layers, regions));
-    assert(regions.back().device == device::GPU);
-    assert(simulate(m, regions, tail, &reason));
+    REQUIRE(make_regions(tail, m.layers, regions));
+    REQUIRE(regions.back().device == device::GPU);
+    REQUIRE(simulate(m, regions, tail, &reason));
 
     // If required Profile data is absent, reject the estimate, never invent
     // a speed. This is DRY_RUN: no real Ring runtime state is changed.
@@ -84,22 +91,22 @@ int main() {
         ms = 1.0;
         return true;
     };
-    assert(!simulate(incomplete, regions, tail, &reason));
-    assert(reason == "COMPUTE_PROFILE_MISSING");
+    REQUIRE(!simulate(incomplete, regions, tail, &reason));
+    REQUIRE(reason == "COMPUTE_PROFILE_MISSING");
 
     model limited = mock_profile();
     limited.memory_feasible = [](const candidate & p) {
         return p.cycles * p.p <= 15 && p.cycles * p.g <= 12;
     };
     const result selected = search(limited, 80);
-    assert(selected.valid && selected.simulated > 0);
-    assert(selected.selected.wall_ms > 0.0);
-    assert(selected.selected.cycles * selected.selected.p <= 15);
-    assert(selected.selected.cycles * selected.selected.g <= 12);
-    assert(selected.selected.cycles *
+    REQUIRE(selected.valid && selected.simulated > 0);
+    REQUIRE(selected.selected.wall_ms > 0.0);
+    REQUIRE(selected.selected.cycles * selected.selected.p <= 15);
+    REQUIRE(selected.selected.cycles * selected.selected.g <= 12);
+    REQUIRE(selected.selected.cycles *
                (selected.selected.c + selected.selected.g + selected.selected.p) +
            selected.selected.tail_c + selected.selected.tail_g == m.layers);
-    assert(selected.top.size() <= 5);
+    REQUIRE(selected.top.size() <= 5);
 
     std::printf("REGION_RING_PLANNER_TEST status=PASS baseline_ms=%.3f "
                 "hetero_ms=%.3f selected_ms=%.3f "
