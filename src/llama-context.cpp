@@ -2370,10 +2370,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         // schedule Meta/RPC work on a Phone graph that could still be
         // executing from a detached upstream worker.
         for (int split = 0; split < n_splits; ++split) {
-            const auto * target = ggml_backend_sched_get_split_backend(
+            ggml_backend_t target = ggml_backend_sched_get_split_backend(
                 sched_use,split);
-            if (ggml_backend_is_meta(
-                    const_cast<ggml_backend_t>(target))) {
+            if (ggml_backend_is_meta(target)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_FINAL_OWNER] stage=%zu "
                     "status=REJECT reason=PC_TAIL_HAS_META_SPLIT\n",
