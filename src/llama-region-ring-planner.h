@@ -537,4 +537,125 @@ inline supported_result search_supported_fixed_phone(
     return result;
 }
 
+    
+// Executable general-topology search. Unlike the research-only search(),
+// every candidate uses the same fixed 64-token chunk and 2-slot protocol
+// as the runtime. Different CPU/CUDA/Phone counts and a PC tail are legal.
+// Coarse filtering keeps measured profiling work bounded; selected candidates
+// must also survive the exact FIFO/KV/slot event simulation.
+inline result search_supported_topology(
+        const model & m, int chunk_tokens, int max_simulations = 192) {
+    result out;
+    if (m.layers < 6 || m.tokens <= 0 || chunk_tokens != 64 ||
+            m.window != 2 || !m.pc_compute_gate || max_simulations <= 0) {
+        return out;
+    }
+    std::vector<candidate> coarse;
+    for (int cycles = 2; cycles <= 4; ++cycles) {
+        for (int c = 2; c <= 12; ++c) {
+            for (int g = 1; g <= 8; ++g) {
+                for (int p = 2; p <= 8; ++p) {
+                    const int tail = m.layers - cycles * (c + g + p);
+                    if (tail < 0 || tail > m.max_tail) {
+                        continue;
+                    }
+                    for (int tail_g = 0; tail_g <= tail; ++tail_g) {
+                        candidate choice;
+                        choice.cycles = cycles;
+                        choice.c = c;
+                        choice.g = g;
+                        choice.p = p;
+                        choice.tail_c = tail - tail_g;
+                        choice.tail_g = tail_g;
+                        choice.xc = choice.xg = choice.xp = chunk_tokens;
+                        std::vector<llama_region_ring_region> regions;
+                        if (!make_regions(choice, m.layers, regions) ||
+                                !llama_region_ring_apply_topology_compatible(
+                                    regions, m.layers)) {
+                            continue;
+                        }
+                        ++out.enumerated;
+                        if ((m.memory_feasible && !m.memory_feasible(choice)) ||
+                                (m.region_memory_feasible &&
+                                 !m.region_memory_feasible(regions))) {
+                            ++out.rejected_memory;
+                            continue;
+                        }
+                        if (!estimate_balance(m, choice)) {
+                            ++out.rejected_profile;
+                            continue;
+                        }
+                        ++out.profiled;
+                        coarse.push_back(std::move(choice));
+                    }
+                }
+            }
+        }
+    }
+    std::sort(coarse.begin(), coarse.end(), [](const candidate & a,
+                                               const candidate & b) {
+        if (a.coarse_ms != b.coarse_ms) {
+            return a.coarse_ms < b.coarse_ms;
+        }
+        return a.balance < b.balance;
+    });
+    // Sample different cycle/Phone geometries first, then use the remaining
+    // budget for the best-scored layouts. This avoids concentrating all tests
+    // in one family of equivalent layer totals.
+    std::vector<candidate> shortlist;
+    std::vector<std::pair<int,int>> families;
+    for (const auto & choice : coarse) {
+        const std::pair<int,int> key {choice.cycles, choice.p};
+        if (std::find(families.begin(),families.end(),key) != families.end()) {
+            continue;
+        }
+        families.push_back(key);
+        shortlist.push_back(choice);
+        if ((int) shortlist.size() >= max_simulations / 3) {
+            break;
+        }
+    }
+    for (const auto & choice : coarse) {
+        if ((int) shortlist.size() >= max_simulations) {
+            break;
+        }
+        const auto same = [&](const candidate & a) {
+            return std::make_tuple(a.cycles,a.c,a.g,a.p,a.tail_c,a.tail_g) ==
+                   std::make_tuple(choice.cycles,choice.c,choice.g,choice.p,
+                                   choice.tail_c,choice.tail_g);
+        };
+        if (std::any_of(shortlist.begin(),shortlist.end(),same)) {
+            continue;
+        }
+        shortlist.push_back(choice);
+    }
+    for (auto choice : shortlist) {
+        std::vector<llama_region_ring_region> regions;
+        if (!make_regions(choice, m.layers, regions)) {
+            continue;
+        }
+        if (!simulate(m, regions, choice)) {
+            ++out.rejected_deadlock;
+            continue;
+        }
+        ++out.simulated;
+        out.top.push_back(choice);
+    }
+    std::sort(out.top.begin(),out.top.end(),
+              [](const candidate & a,const candidate & b) {
+        if (std::abs(a.wall_ms-b.wall_ms) > 0.05) {
+            return a.wall_ms < b.wall_ms;
+        }
+        return a.balance < b.balance;
+    });
+    if (!out.top.empty()) {
+        out.selected = out.top.front();
+        out.valid = true;
+        if (out.top.size() > 5) {
+            out.top.resize(5);
+        }
+    }
+    return out;
+}
+
 } // namespace llama_ring_planner
