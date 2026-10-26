@@ -122,6 +122,70 @@ int main() {
            selected.selected.tail_c + selected.selected.tail_g == m.layers);
     REQUIRE(selected.top.size() <= 5);
 
+    // Runtime APPLY-safe uses a separate constrained search. It may ONLY
+    // move the C/G boundaries within the three existing 11-layer PC windows;
+    // it must preserve all three Phone P5 regions, CUDA11 total and Chunk64.
+    const auto baseline_regions = llama_region_ring_parse("", 48);
+    model apply_profile = mock_profile();
+    const supported_result supported =
+        search_supported_fixed_phone(apply_profile,baseline_regions,64);
+    REQUIRE(supported.baseline_valid && supported.valid);
+    REQUIRE(supported.enumerated > 0 && supported.simulated > 0);
+    REQUIRE(supported.selected.estimate.wall_ms > 0.0);
+    REQUIRE(supported.selected.estimate.wall_ms <=
+            supported.baseline.estimate.wall_ms + 1e-6);
+    REQUIRE(supported.selected.estimate.xc == 64 &&
+            supported.selected.estimate.xg == 64 &&
+            supported.selected.estimate.xp == 64);
+    REQUIRE(llama_region_ring_apply_safe_phone_shape(
+            supported.selected.regions));
+    REQUIRE(llama_region_ring_apply_safe_compatible(
+            baseline_regions,supported.selected.regions));
+    REQUIRE(llama_region_ring_layer_counts(
+            supported.selected.regions) ==
+            llama_region_ring_layer_counts(baseline_regions));
+    REQUIRE(supported.top.size() <= 5);
+    for (const auto & choice : supported.top) {
+        REQUIRE(llama_region_ring_apply_safe_compatible(
+                baseline_regions,choice.regions));
+        REQUIRE(llama_region_ring_apply_safe_phone_shape(choice.regions));
+        REQUIRE(choice.estimate.tasks == 54);
+        REQUIRE(choice.estimate.max_live_slots <= 2);
+    }
+
+    model only_baseline = mock_profile();
+    only_baseline.region_memory_feasible = [&](
+            const std::vector<llama_region_ring_region> & r) {
+        return llama_region_ring_layout_string(r) ==
+               llama_region_ring_layout_string(baseline_regions);
+    };
+    const auto single_supported =
+        search_supported_fixed_phone(only_baseline,baseline_regions,64);
+    REQUIRE(single_supported.valid && single_supported.simulated == 1);
+    REQUIRE(llama_region_ring_layout_string(
+            single_supported.selected.regions) ==
+            llama_region_ring_layout_string(baseline_regions));
+
+    model no_memory = mock_profile();
+    no_memory.region_memory_feasible = [](
+            const std::vector<llama_region_ring_region> &) {
+        return false;
+    };
+    const auto none_supported =
+        search_supported_fixed_phone(no_memory,baseline_regions,64);
+    REQUIRE(none_supported.baseline_valid && !none_supported.valid);
+    REQUIRE(none_supported.rejected_memory == none_supported.enumerated);
+
+    model unsupported_window = mock_profile();
+    unsupported_window.window = 3;
+    REQUIRE(!search_supported_fixed_phone(
+            unsupported_window,baseline_regions,64).valid);
+    REQUIRE(!search_supported_fixed_phone(
+            apply_profile,baseline_regions,128).valid);
+    REQUIRE(!search_supported_fixed_phone(
+            apply_profile,llama_region_ring_parse(
+                "C11,G6,P7,C11,G5,P8",48),64).valid);
+
     std::printf("REGION_RING_PLANNER_TEST status=PASS baseline_ms=%.3f "
                 "hetero_ms=%.3f selected_ms=%.3f "
                 "simulated=%zu coarse=%zu\n",
