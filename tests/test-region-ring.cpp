@@ -56,6 +56,49 @@ static void test_layout() {
           other_counts[2] == 15, "two-cycle layout device totals");
 }
 
+static void test_apply_safe_compatibility() {
+    const auto baseline = llama_region_ring_parse("", 48);
+    check(llama_region_ring_apply_safe_phone_shape(baseline),
+          "baseline must satisfy the apply-safe Phone shape");
+    check(llama_region_ring_apply_safe_compatible(baseline,baseline),
+          "baseline must be compatible with itself");
+    check(llama_region_ring_layout_string(baseline) ==
+          "C7,G4,P5,C7,G4,P5,C8,G3,P5",
+          "canonical Ring encoding has changed");
+
+    // Reassign exactly one CUDA layer between the first two PC windows;
+    // Phone L11..15, L27..31, L43..47 and aggregate CUDA11 stay unchanged.
+    const auto safe = llama_region_ring_parse(
+        "C8,G3,P5,C6,G5,P5,C8,G3,P5",48);
+    check(llama_region_ring_apply_safe_phone_shape(safe),
+          "safe candidate changed the Phone regions");
+    check(llama_region_ring_apply_safe_compatible(baseline,safe),
+          "safe CPU/CUDA shift rejected");
+    check(llama_region_ring_layout_string(safe) ==
+          "C8,G3,P5,C6,G5,P5,C8,G3,P5",
+          "safe candidate serialized incorrectly");
+
+    const auto different_gpu_total = llama_region_ring_parse(
+        "C8,G3,P5,C7,G4,P5,C8,G3,P5",48);
+    check(!llama_region_ring_apply_safe_compatible(
+            baseline,different_gpu_total),
+          "candidate silently reduced CUDA weight count");
+    const auto moved_phone = llama_region_ring_parse(
+        "C8,G4,P5,C6,G4,P5,C8,G3,P5",48);
+    check(!llama_region_ring_apply_safe_phone_shape(moved_phone),
+          "moved Phone region passed fixed-graph check");
+    check(!llama_region_ring_apply_safe_compatible(baseline,moved_phone),
+          "moved Phone region passed compatibility check");
+    const auto tail_or_different_cycles = llama_region_ring_parse(
+        "C11,G6,P7,C11,G5,P8",48);
+    check(!llama_region_ring_apply_safe_compatible(
+            baseline,tail_or_different_cycles),
+          "two-cycle alternative passed safe-apply constraints");
+    check(!llama_region_ring_apply_safe_phone_shape(
+            tail_or_different_cycles),
+          "two-cycle alternative passed fixed Phone shape");
+}
+
 static void test_dependencies() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 128);
@@ -422,6 +465,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_apply_safe_compatibility();
+        std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
         std::fprintf(stderr, "[REGION_RING_TEST] dependencies=PASS\n");
         test_duplicate_completion();
