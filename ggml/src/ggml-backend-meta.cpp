@@ -13540,7 +13540,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     const bool ring_phone_fusion =
         n_backends == 2 && ring_exec != nullptr && ring_fuse != nullptr &&
         std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
-        std::strcmp(ring_fuse, "1") == 0;
+        (std::strcmp(ring_fuse, "1") == 0 ||
+         std::strcmp(ring_fuse, "probe") == 0);
+    const bool ring_phone_fusion_probe =
+        ring_phone_fusion && std::strcmp(ring_fuse, "probe") == 0;
 
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
         if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
@@ -17850,10 +17853,21 @@ auto prefill_norm_sg_has_prework =
         } else {
             phone_block_fused = find_phone_block(
                 i, phone_block_end, first_fused_layer, phone_block_last_layer);
+            if (phone_block_fused && ring_phone_fusion_probe &&
+                    phone_block_last_layer - first_fused_layer + 1 == 5) {
+                printf("[REGION_RING_PHONE_FUSION] event=PROBE sg=%zu..%zu "
+                       "layers=[%d,%d) meta_sgs=%zu "
+                       "action=KEEP_LEGACY status=ELIGIBLE\n",
+                       i, phone_block_end, first_fused_layer,
+                       phone_block_last_layer + 1,
+                       phone_block_end - i + 1);
+                phone_block_fused = false;
+            }
             if (phone_block_fused) {
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
-            } else if (ring_phone_fusion && is_phone_only_sg) {
+            } else if (ring_phone_fusion && !ring_phone_fusion_probe &&
+                    is_phone_only_sg) {
                 // Diagnose a missed P5 fusion only at a candidate Region
                 // beginning. A skipped fusion is always a correct fallback
                 // to the original per-SG execution, not partial fusion.

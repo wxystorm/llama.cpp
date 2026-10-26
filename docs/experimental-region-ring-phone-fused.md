@@ -10,7 +10,7 @@ This uses the phone RPC server's **existing** UID-based `GRAPH_COMPUTE` / `GRAPH
 
 ## Eligibility (reject partial fusion, preserve original path)
 
-- Both flags must be present on PC: exact `fifo-pc-phone` mode and `GGML_META_RING_PHONE_FUSION=1`; the default is disabled.
+- Both flags must be present on PC: exact `fifo-pc-phone` mode and `GGML_META_RING_PHONE_FUSION=1`; the default is disabled. A safer eligibility-only mode is `GGML_META_RING_PHONE_FUSION=probe`: it prints `event=PROBE` for structurally valid P5 blocks but still executes every original unfused SG.
 - Meta topology must be exactly two simple Backends: PC CPU plus Phone RPC. Phone SG pairs must be individually Phone-only. A mirrored PC compute node causes **the whole fusion to be skipped**, never partially dropped.
 - Each pair must represent one Qwen3-style attention subgraph starting at `norm-L` or `l_out-(L-1)`, followed by an `ffn_inp-L` to `ffn_moe_out-L` Phone subgraph, and have multi-token input (single-token Decode stays on the unmodified path).
 - Five pairs must be consecutive (10 SGs, five consecutive layers). There must be a following output bridge or PC consumer. Partial P5 graphs continue through the original un-fused SG execution.
@@ -31,7 +31,8 @@ $env:LLAMA_HYBRID_REGION_RING_LAYOUT='C7,G4,P5,C7,G4,P5,C8,G3,P5'
 $env:LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS='64'
 $env:LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX='1'
 $env:LLAMA_HYBRID_REGION_RING_EXEC='fifo-pc-phone'
-$env:GGML_META_RING_PHONE_FUSION='1'
+$env:GGML_META_RING_PHONE_FUSION='probe' # first run: eligibility only
+$env:GGML_META_RING_PHONE_FUSION='1'     # second run: enable actual fusion
 
 # Use exactly the same Qwen3-30B-A3B-Q4_K_M GGUF, Prompt, seed, num tokens
 # and existing Phone RPC server. No protocol changes are required.
@@ -50,7 +51,7 @@ Observe diagnostics in both PC and optionally phone logs:
 [REGION_RING_SUM] tokens=358 chunks=6 executed=54 complete=1 ... status=0
 ```
 
-For 358 prompt tokens there are six Chunks and three P5 Regions, i.e. up to 18 P5 submissions (three additional P5 submissions per 2-token warmup run). Fusion logs may report `event=SKIP ... fallback=LEGACY_PHONE_SGS` if structural validation is not met. A skipped case is a deliberate correctness-preserving fallback. The Meta logical `subgraphs=11` count **does not** become 1: fusion reduces remote graph submissions, not the original Meta graph splitter's logical count.
+First run with `probe`: look for `[REGION_RING_PHONE_FUSION] event=PROBE ... action=KEEP_LEGACY status=ELIGIBLE`. This run should not produce `event=SUBMIT`. Then set the flag to `1` and compare. For 358 prompt tokens there are six Chunks and three P5 Regions, i.e. up to 18 P5 submissions (three additional P5 submissions per 2-token warmup run). Fusion logs may report `event=SKIP ... fallback=LEGACY_PHONE_SGS` if structural validation is not met. A skipped case is a deliberate correctness-preserving fallback. The Meta logical `subgraphs=11` count **does not** become 1: fusion reduces remote graph submissions, not the original Meta graph splitter's logical count.
 
 ### Compact PowerShell log filter
 
