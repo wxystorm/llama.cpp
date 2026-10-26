@@ -4568,6 +4568,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
     const std::string ring_exec = region_ring_v1 ?
         (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
+    if (!model.hybrid_ring_plan_layout.empty() &&
+            (!region_ring_v1 || ring_exec != "fifo-pc-phone")) {
+        throw std::runtime_error(
+            "model-owned Ring Plan requires the same "
+            "LLAMA_HYBRID_REGION_RING_V1=1 and "
+            "LLAMA_HYBRID_REGION_RING_EXEC=fifo-pc-phone used during "
+            "weight placement");
+    }
     if (region_ring_v1 && ring_exec != "ready" &&
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
