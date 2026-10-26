@@ -333,8 +333,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     return {-1, nullptr};
                 }
                 LLAMA_LOG_WARN(
-                    "[REGION_RING_PLAN_PROFILE] reason=PROFILE_NOT_AVAILABLE "
-                    "action=KEEP_FIXED_RING\n");
+                    "[REGION_RING_PLAN_PROFILE] reason=LEGACY_AUTO_PLAN_UNAVAILABLE "
+                    "measured_profile=MAY_BE_CACHED action=KEEP_FIXED_RING\n");
             } else if (params.hybrid_auto) {
                 llama_hybrid_plan_print(best);
                 if (!llama_hybrid_runtime_plan_set(best)) {
