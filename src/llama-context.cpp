@@ -3755,8 +3755,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN] regions=%zu chunk_tokens=%d "
-            "execution=COOPERATIVE_READY_QUEUE status=READY
-",
+            "execution=COOPERATIVE_READY_QUEUE status=READY\n",
             runtime_stages.size(), region_ring_chunk_tokens);
     }
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
