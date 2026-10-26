@@ -7890,7 +7890,7 @@ static bool llama_hybrid_collect_device_profile(
     }
 
     if (!cpu || !phone) {
-        LLAMA_LOG_ERROR("%s: automatic planning requires CPU and RPC backends\n", __func__);
+        LLAMA_LOG_ERROR("%s: profiling requires CPU and RPC backends\n", __func__);
         return false;
     }
 
@@ -7900,7 +7900,7 @@ static bool llama_hybrid_collect_device_profile(
         ml.get_arch() != LLM_ARCH_QWEN3 &&
         !is_qwen3_moe) {
         LLAMA_LOG_ERROR(
-            "%s: hybrid auto does not support architecture %s\n",
+            "%s: device profiling does not support architecture %s\n",
             __func__, ml.get_arch_name().c_str());
         return false;
     }
@@ -8508,7 +8508,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     }
 
     LLAMA_LOG_ERROR(
-        "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
+        "[REGION_RING_PLAN_PROFILE] source=INDEPENDENT_DEVICE_PROBES "
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
         "register_ms_per_task=%.3f weights=%s "
