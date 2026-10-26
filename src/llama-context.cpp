@@ -649,6 +649,15 @@ llama_context::~llama_context() {
             }
         }
     }
+    // Auxiliary schedulers reference backend_ptrs; tear them down while their
+    // underlying backend instances are still alive.
+    for (auto & worker : region_ring_worker_resources) {
+        if (worker.sched) {
+            ggml_backend_sched_synchronize(worker.sched.get());
+        }
+        worker.res.reset();
+        worker.sched.reset();
+    }
     ggml_opt_free(opt_ctx);
 }
 
