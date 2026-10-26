@@ -8472,31 +8472,112 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
     if (topology_preview) {
+        const bool apply = selected_layout != nullptr;
         if (baseline_chunk != 64) {
-            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 reason=CHUNK_MUST_BE_64\n");
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_SELECT] mode=%s applied=0 "
+                "reason=CHUNK_MUST_BE_64\n",
+                apply ? "APPLY_TOPOLOGY" : "TOPOLOGY_PREVIEW");
             return false;
         }
-        const auto result = llama_ring_planner::search_supported_topology(model,64,192);
-        LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_SEARCH] enumerated=%zu profiled=%zu simulated=%zu "
-                        "reject_memory=%zu reject_profile=%zu reject_dag=%zu applied=0\n",
-                        result.enumerated,result.profiled,result.simulated,
-                        result.rejected_memory,result.rejected_profile,result.rejected_deadlock);
-        for (size_t i = 0; i < result.top.size(); ++i) {
-            const auto & c = result.top[i];
+        // Real execution needs a CPU/CUDA tail, so the last graph can
+        // produce canonical logits. Preview retains the wider research set.
+        const auto search = llama_ring_planner::search_supported_topology(
+            model,64,192,apply);
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_TOPOLOGY_SEARCH] mode=%s enumerated=%zu "
+            "profiled=%zu simulated=%zu reject_memory=%zu "
+            "reject_profile=%zu reject_dag=%zu applied=0\n",
+            apply ? "APPLY_TOPOLOGY" : "TOPOLOGY_PREVIEW",
+            search.enumerated,search.profiled,search.simulated,
+            search.rejected_memory,search.rejected_profile,
+            search.rejected_deadlock);
+        for (size_t i = 0; i < search.top.size(); ++i) {
+            const auto & c = search.top[i];
             std::vector<llama_region_ring_region> r;
             if (!llama_ring_planner::make_regions(c,model.layers,r)) {
                 continue;
             }
-            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_CANDIDATE] rank=%zu layout=%s "
-                            "cycles=%d phone_layers=%d tail_c=%d tail_g=%d "
-                            "predicted_ms=%.3f applied=0 status=PREVIEW_ONLY\n",
-                            i + 1,llama_region_ring_layout_string(r).c_str(),
-                            c.cycles,c.p,c.tail_c,c.tail_g,c.wall_ms);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_CANDIDATE] mode=%s rank=%zu "
+                "layout=%s cycles=%d phone_layers=%d "
+                "tail_c=%d tail_g=%d predicted_ms=%.3f "
+                "applied=0 status=%s\n",
+                apply ? "APPLY_TOPOLOGY" : "TOPOLOGY_PREVIEW",
+                i+1,llama_region_ring_layout_string(r).c_str(),
+                c.cycles,c.p,c.tail_c,c.tail_g,c.wall_ms,
+                apply ? "RUNTIME_COMPATIBLE" : "PREVIEW_ONLY");
         }
-        LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 "
-                        "reason=PHONE_FUSION_AND_FINAL_OWNER_UNSUPPORTED "
-                        "runtime_layout=UNCHANGED\n");
-        return result.valid;
+        if (!search.valid) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_SELECT] mode=%s applied=0 "
+                "reason=NO_SCOREABLE_GENERAL_TOPOLOGY "
+                "status=KEEP_FIXED_RING\n",
+                apply ? "APPLY_TOPOLOGY" : "TOPOLOGY_PREVIEW");
+            return false;
+        }
+        if (!apply) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_PREVIEW] applied=0 "
+                "reason=SIMULATION_ONLY runtime_layout=UNCHANGED\n");
+            return true;
+        }
+
+        const auto baseline_regions = llama_region_ring_from_env(model.layers);
+        llama_ring_planner::candidate baseline;
+        baseline.xc = baseline.xg = baseline.xp = 64;
+        std::vector<llama_region_ring_region> best_regions;
+        const bool baseline_valid = llama_ring_planner::simulate(
+            model,baseline_regions,baseline);
+        if (!baseline_valid ||
+                !llama_ring_planner::make_regions(
+                    search.selected,model.layers,best_regions) ||
+                !llama_region_ring_apply_topology_compatible(
+                    best_regions,model.layers) ||
+                best_regions.back().device == llama_region_ring_device::PHONE) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_SELECT] mode=APPLY_TOPOLOGY "
+                "applied=0 reason=BASELINE_OR_FINAL_OWNER_UNSUPPORTED "
+                "status=KEEP_FIXED_RING\n");
+            return false;
+        }
+        double min_gain_pct = 2.0;
+        if (const char * raw = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PLAN_MIN_GAIN_PCT")) {
+            char * stop = nullptr;
+            const double threshold = std::strtod(raw,&stop);
+            if (stop != raw && *stop == '\0' &&
+                    std::isfinite(threshold) && threshold >= 0.0 &&
+                    threshold <= 50.0) {
+                min_gain_pct = threshold;
+            }
+        }
+        const double gain_pct = 100.0 * (
+            baseline.wall_ms - search.selected.wall_ms) / baseline.wall_ms;
+        if (!(gain_pct >= min_gain_pct)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_TOPOLOGY_SELECT] mode=APPLY_TOPOLOGY "
+                "applied=0 predicted_ms=%.3f baseline_ms=%.3f "
+                "gain_pct=%.3f required_gain_pct=%.3f "
+                "reason=GAIN_BELOW_THRESHOLD status=KEEP_FIXED_RING\n",
+                search.selected.wall_ms,baseline.wall_ms,
+                gain_pct,min_gain_pct);
+            return false;
+        }
+        *selected_layout = llama_region_ring_layout_string(best_regions);
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_SELECTED] mode=APPLY_TOPOLOGY "
+            "source=AUTO layout=%s tokens=%d chunk=64 "
+            "predicted_ms=%.3f baseline_predicted_ms=%.3f "
+            "gain_pct=%.3f required_gain_pct=%.3f "
+            "status=SUPPORTED_FOR_REAL_DEVICE_TEST\n",
+            selected_layout->c_str(),tokens,search.selected.wall_ms,
+            baseline.wall_ms,gain_pct,min_gain_pct);
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_APPLY] mode=APPLY_TOPOLOGY "
+            "phase=PRE_MODEL_LOAD selected=1 layout=%s chunk=64 "
+            "status=AWAIT_MODEL_PLACEMENT\n",selected_layout->c_str());
+        return true;
     }
     if (selected_layout != nullptr) {
         // Real APPLY is deliberately narrower than research-mode search:
@@ -8759,6 +8840,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     return true;
 }
 
+
+bool llama_hybrid_region_ring_planner_apply_topology(
+        int tokens, int kv_start, int baseline_chunk,
+        std::string & selected_layout) {
+    return llama_hybrid_region_ring_planner_evaluate(
+        tokens,kv_start,baseline_chunk,&selected_layout,true);
+}
 
 bool llama_hybrid_region_ring_planner_topology_preview(
         int tokens, int kv_start, int baseline_chunk) {
