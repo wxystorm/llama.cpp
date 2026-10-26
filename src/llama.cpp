@@ -424,23 +424,34 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if ((params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
-            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u target_ubatch=%u "
-                           "ring_planner=%s\n",
-                           params.hybrid_target_ctx,
-                           params.hybrid_target_ubatch_tokens,
-                           ring_plan_apply_topology ? "APPLY_TOPOLOGY" :
-                           ring_plan_apply_safe ? "APPLY_SAFE" :
-                           ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
-                           ring_plan_dry_run ? "DRY_RUN" : "OFF");
-
-            if (!llama_hybrid_autoplan(ml, params, best)) {
+            if (params.hybrid_auto) {
+                LLAMA_LOG_INFO(
+                    "[HYBRID_AUTO] profiling and legacy candidate scoring "
+                    "begins target_ctx=%u target_ubatch=%u\n",
+                    params.hybrid_target_ctx,
+                    params.hybrid_target_ubatch_tokens);
+            } else {
+                LLAMA_LOG_INFO(
+                    "[REGION_RING_PLAN_PROFILE] phase=MEASURE_BEGIN "
+                    "source=INDEPENDENT_DEVICE_PROBES mode=%s "
+                    "legacy_candidates=SKIPPED\n",
+                    ring_plan_apply_topology ? "APPLY_TOPOLOGY" :
+                    ring_plan_apply_safe ? "APPLY_SAFE" :
+                    ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
+                    "DRY_RUN");
+            }
+            const bool profile_ready = params.hybrid_auto ?
+                llama_hybrid_autoplan(ml, params, best) :
+                llama_hybrid_region_ring_collect_profile(ml,params);
+            if (!profile_ready) {
                 if (params.hybrid_auto) {
                     LLAMA_LOG_ERROR("[HYBRID_AUTO] planner failed\n");
                     return {-1, nullptr};
                 }
                 LLAMA_LOG_WARN(
-                    "[REGION_RING_PLAN_PROFILE] reason=LEGACY_AUTO_PLAN_UNAVAILABLE "
-                    "measured_profile=MAY_BE_CACHED action=KEEP_FIXED_RING\n");
+                    "[REGION_RING_PLAN_PROFILE] phase=MODEL_LOAD "
+                    "reason=DEVICE_PROBE_UNAVAILABLE "
+                    "measured_profile=NOT_CACHED action=KEEP_FIXED_RING\n");
             } else if (params.hybrid_auto) {
                 llama_hybrid_plan_print(best);
                 if (!llama_hybrid_runtime_plan_set(best)) {
@@ -458,8 +469,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     best.phone_chunk_tokens, best.predicted_ms);
             } else {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
-                    "phase=MODEL_LOAD status=AVAILABLE applied=0\n");
+                    "[REGION_RING_PLAN_PROFILE] source=INDEPENDENT_DEVICE_PROBES "
+                    "phase=MODEL_LOAD status=AVAILABLE "
+                    "legacy_candidates=SKIPPED applied=0\n");
             }
         }
 
