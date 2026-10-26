@@ -126,6 +126,11 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    // Region Ring owns CUDA layers as a separate PC backend. The Meta backend
+    // must contain exactly [CPU, Phone RPC], whether or not the legacy Hybrid
+    // auto-placement switch is enabled.
+    const bool ring_tensor =
+        params.split_mode == LLAMA_SPLIT_MODE_TENSOR && llama_region_ring_enabled();
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -137,16 +142,62 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
             }
-            LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
-            for (size_t i = 0; i < n_devs; ++i) {
-                LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+            if (ring_tensor) {
+                // --device may explicitly include CUDA, but Ring does not
+                // permit CUDA as a Meta child: CUDA is added separately when
+                // CPU/GPU layer ownership is constructed.
+                ggml_backend_dev_t cpu_dev =
+                    ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                ggml_backend_dev_t rpc_dev = nullptr;
+                size_t rpc_count = 0;
+                for (size_t i = 0; i < n_devs; ++i) {
+                    ggml_backend_dev_t dev = params.devices[i];
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    const bool is_rpc = reg != nullptr &&
+                        ggml_backend_reg_name(reg) == std::string("RPC");
+                    if (is_rpc) {
+                        rpc_dev = dev;
+                        ++rpc_count;
+                    } else {
+                        LLAMA_LOG_INFO(
+                            "[REGION_RING_META_DEVICES] source=EXPLICIT excluded=%s "
+                            "reason=NOT_RPC_META_CHILD\n",
+                            ggml_backend_dev_name(dev));
+                    }
+                }
+                if (cpu_dev == nullptr || rpc_count != 1) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_META_DEVICES] source=EXPLICIT "
+                        "cpu_present=%d rpc_count=%zu status=REJECT "
+                        "reason=REQUIRES_ONE_CPU_AND_ONE_PHONE_RPC\n",
+                        cpu_dev != nullptr ? 1 : 0, rpc_count);
+                    return false;
+                }
+                ggml_backend_dev_t pair[2] = { cpu_dev, rpc_dev };
+                model->get_split_state_ud.n_devices = 2;
+                model->get_split_state_ud.model = model;
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                        pair, 2, llama_meta_device_get_split_state,
+                        &model->get_split_state_ud)
+                });
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_META_DEVICES] source=EXPLICIT "
+                    "meta_count=2 primary=%s secondary=%s "
+                    "cuda=PC_STANDALONE status=READY\n",
+                    ggml_backend_dev_name(pair[0]), ggml_backend_dev_name(pair[1]));
+            } else {
+                LLAMA_LOG_INFO("%s: creating a Meta device with %zu devices\n", __func__, n_devs);
+                for (size_t i = 0; i < n_devs; ++i) {
+                    LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
+                }
+                model->get_split_state_ud.n_devices = n_devs;
+                model->get_split_state_ud.model = model;
+                model->devices.push_back({
+                    true, ggml_backend_meta_device(
+                    params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
+                });
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
-            model->devices.push_back({
-                true, ggml_backend_meta_device(
-                params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
-            });
         } else {
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
@@ -175,7 +226,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 if (reg != nullptr && ggml_backend_reg_name(reg) == std::string("RPC")) {
                     has_rpc = true;
                 }
-                if (params.hybrid_auto &&
+                // The old Hybrid Auto used to exclude local CUDA from Meta;
+                // new Ring Planners also require this when --hybrid-auto is off.
+                if ((params.hybrid_auto || ring_tensor) &&
                     (reg == nullptr || ggml_backend_reg_name(reg) != std::string("RPC"))) {
                     continue;
                 }
@@ -190,6 +243,21 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             if (devs.empty()) {
                 LLAMA_LOG_ERROR("%s: LLAMA_SPLIT_MODE_TENSOR needs >= 1 devices\n", __func__);
                 return false;
+            }
+            if (ring_tensor && (cpu_dev == nullptr || !has_rpc || devs.size() != 2)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_META_DEVICES] source=DISCOVERED "
+                    "meta_count=%zu cpu_present=%d rpc_present=%d "
+                    "status=REJECT reason=REQUIRES_ONE_CPU_AND_ONE_PHONE_RPC\n",
+                    devs.size(), cpu_dev != nullptr ? 1 : 0, has_rpc ? 1 : 0);
+                return false;
+            }
+            if (ring_tensor) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_META_DEVICES] source=DISCOVERED "
+                    "meta_count=2 primary=%s secondary=%s "
+                    "cuda=PC_STANDALONE status=READY\n",
+                    ggml_backend_dev_name(devs[0]), ggml_backend_dev_name(devs[1]));
             }
 
             LLAMA_LOG_INFO("%s: creating a Meta device for tensor parallelism from %zu devices:\n", __func__, devs.size());
