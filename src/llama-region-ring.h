@@ -144,6 +144,90 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
     return regions;
 }
 
+// Canonical Ring layout spelling, shared by the model loader, runtime
+// scheduler and Planner. The selected Plan is stored on llama_model; this
+// function is not a global mutable environment override.
+inline std::string llama_region_ring_layout_string(
+        const std::vector<llama_region_ring_region> & regions) {
+    std::string out;
+    for (const auto & r : regions) {
+        if (!out.empty()) { out += ","; }
+        const char letter =
+            r.device == llama_region_ring_device::CPU ? 'C' :
+            r.device == llama_region_ring_device::GPU ? 'G' : 'P';
+        out += letter;
+        out += std::to_string(r.layer_end - r.layer_begin);
+    }
+    return out;
+}
+
+// Phase-1 APPLY supports changing ONLY the CPU/CUDA boundary inside
+// existing PC windows. Phone regions, their layers/KV, cycle count,
+// total PC/CUDA weights and last-Phone logits owner must not change.
+// No PC tail, nonuniform Chunk or new Phone graph shape is permitted.
+inline bool llama_region_ring_apply_safe_compatible(
+        const std::vector<llama_region_ring_region> & baseline,
+        const std::vector<llama_region_ring_region> & proposed) {
+    if (baseline.size() < 6 || baseline.size() != proposed.size() ||
+            baseline.size() % 3 != 0 ||
+            baseline.front().layer_begin != 0 ||
+            proposed.front().layer_begin != 0) {
+        return false;
+    }
+    int baseline_gpu_layers = 0;
+    int proposed_gpu_layers = 0;
+    for (size_t i = 0; i < baseline.size(); i += 3) {
+        const auto & bc = baseline[i];
+        const auto & bg = baseline[i + 1];
+        const auto & bp = baseline[i + 2];
+        const auto & c = proposed[i];
+        const auto & g = proposed[i + 1];
+        const auto & p = proposed[i + 2];
+        if (bc.device != llama_region_ring_device::CPU ||
+            bg.device != llama_region_ring_device::GPU ||
+            bp.device != llama_region_ring_device::PHONE ||
+            c.device != bc.device || g.device != bg.device ||
+            p.device != bp.device ||
+            bc.layer_end != bg.layer_begin ||
+            bg.layer_end != bp.layer_begin ||
+            c.layer_begin != bc.layer_begin ||
+            c.layer_begin >= c.layer_end ||
+            c.layer_end != g.layer_begin ||
+            g.layer_begin >= g.layer_end ||
+            g.layer_end != bp.layer_begin ||
+            p.layer_begin != bp.layer_begin ||
+            p.layer_end != bp.layer_end ||
+            p.layer_begin >= p.layer_end ||
+            (i > 0 && baseline[i - 1].layer_end != bc.layer_begin) ||
+            (i > 0 && proposed[i - 1].layer_end != c.layer_begin)) {
+            return false;
+        }
+        baseline_gpu_layers += bg.layer_end - bg.layer_begin;
+        proposed_gpu_layers += g.layer_end - g.layer_begin;
+    }
+    return baseline_gpu_layers == proposed_gpu_layers &&
+           baseline.back().layer_end == proposed.back().layer_end;
+}
+
+// Phone READY/Fusion/ownership on the current 48-layer Qwen3 MoE has
+// only been exercised with these three exact five-layer Phone regions.
+inline bool llama_region_ring_apply_safe_phone_shape(
+        const std::vector<llama_region_ring_region> & regions) {
+    if (regions.size() != 9 || regions.back().layer_end != 48) {
+        return false;
+    }
+    const int begins[3] = {11, 27, 43};
+    const int ends[3]   = {16, 32, 48};
+    for (int i = 0; i < 3; ++i) {
+        const auto & p = regions[3 * i + 2];
+        if (p.device != llama_region_ring_device::PHONE ||
+            p.layer_begin != begins[i] || p.layer_end != ends[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::vector<llama_region_ring_region> llama_region_ring_from_env(
         int n_layer) {
     const char * spec = std::getenv("LLAMA_HYBRID_REGION_RING_LAYOUT");
