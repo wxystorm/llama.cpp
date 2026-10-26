@@ -645,6 +645,12 @@ struct llama_model {
     std::vector<float>                   hybrid_tensor_pc_ratios;
     std::vector<llama_pc_layer_backend>  pc_layer_backends;
 
+    // Profile-selected Ring plan is model-owned. Weight placement and every
+    // context created from this model must use the SAME immutable layout.
+    // Empty means use the legacy LLAMA_HYBRID_REGION_RING_LAYOUT setting.
+    std::string hybrid_ring_plan_layout;
+    int hybrid_ring_plan_chunk_tokens = 0;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
