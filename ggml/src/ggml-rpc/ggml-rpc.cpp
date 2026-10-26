@@ -3301,10 +3301,18 @@ static bool ggml_backend_rpc_phone_ring_auto_ready(
         std::vector<uint8_t> graph_data;
         serialize_graph(ctx->device, uid, graph, graph_data);
         rpc_msg_phone_ring_ack registered {};
-        if (!send_rpc_cmd(sock, RPC_CMD_PHONE_RING_REGISTER,
+        const bool registration_sent =
+            send_rpc_cmd(sock, RPC_CMD_PHONE_RING_REGISTER,
                 graph_data.data(), graph_data.size(),
-                &registered, sizeof(registered)) ||
-                registered.accepted == 0) {
+                &registered, sizeof(registered));
+        if (!registration_sent || registered.accepted == 0) {
+            std::fprintf(stderr,
+                "[PHONE_RING_AUTO] side=pc event=REGISTER "
+                "layer=%d uid=%" PRIu64 " nodes=%d bytes=%zu "
+                "transport=%s accepted=%u status=FAIL\n",
+                first_layer,uid,graph->n_nodes,graph_data.size(),
+                registration_sent ? "OK" : "FAIL",
+                (unsigned) registered.accepted);
             return false;
         }
         cache->ring_auto_graph_uids.insert(uid);
