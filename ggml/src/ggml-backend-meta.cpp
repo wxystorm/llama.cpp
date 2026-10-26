@@ -7741,6 +7741,113 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
 
+        // Region Ring Phone->PC terminal bridge (experimental, opt-in).
+        // Do not manually ADD at FFN completion: the following l_out graph
+        // already owns the residual ADD.  Keep the FFN output Phone-local,
+        // run the original l_out exactly once, then transfer that completed
+        // tensor to the PC side.  This avoids the previously observed triple
+        // ADD (at FFN handoff, normal l_out graph and l_out handoff).
+        const char * ring_mode_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_V1");
+        const char * ring_exit_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
+        const bool ring_exit_fix =
+            ring_mode_env != nullptr && std::atoi(ring_mode_env) != 0 &&
+            ring_exit_env != nullptr && std::atoi(ring_exit_env) != 0;
+
+        if (ring_exit_fix &&
+                n_backends == 2 &&
+                active_count == 1 && active_backend == 1) {
+            int ring_layer = -1;
+            int parsed = 0;
+            const bool phone_ffn =
+                std::sscanf(nodes[1]->name, "ffn_moe_out-%d%n",
+                    &ring_layer, &parsed) == 1 &&
+                nodes[1]->name[parsed] == '\0';
+            if (phone_ffn && i + 1 < backend_ctx->n_subgraphs &&
+                    subgraph_is_exact_l_out_bridge(i + 1, ring_layer)) {
+                ggml_tensor * pc_output =
+                    disable_layer_output_producers(0, i + 1, ring_layer);
+                if (pc_output == nullptr ||
+                        std::strcmp(pc_output->name,
+                            backend_ctx->backend_configs[1]
+                                .cgraphs[i + 1].cgraph_main->nodes[0]->name) != 0) {
+                    printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                           "action=KEEP_PHONE_FFN status=REJECT\n",
+                           ring_layer, i);
+                    return GGML_STATUS_FAILED;
+                }
+                handled = true;
+                printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                       "action=KEEP_PHONE_FFN_NEXT_L_OUT status=OK\n",
+                       ring_layer, i);
+                return GGML_STATUS_SUCCESS;
+            }
+
+            ring_layer = -1;
+            parsed = 0;
+            const bool phone_l_out =
+                std::sscanf(nodes[1]->name, "l_out-%d%n",
+                    &ring_layer, &parsed) == 1 &&
+                nodes[1]->name[parsed] == '\0';
+            if (phone_l_out && i > 0 &&
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[i].cgraph_main->n_nodes == 1 &&
+                    backend_ctx->backend_configs[1]
+                        .cgraphs[i].cgraph_main->n_nodes == 1 &&
+                    std::strcmp(nodes[0]->name, nodes[1]->name) == 0 &&
+                    (nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                char expected_ffn[64];
+                std::snprintf(expected_ffn, sizeof(expected_ffn),
+                    "ffn_moe_out-%d", ring_layer);
+                ggml_cgraph * prev_phone =
+                    backend_ctx->backend_configs[1].cgraphs[i - 1].cgraph_main;
+                const bool is_terminal_bridge =
+                    prev_phone != nullptr && prev_phone->n_nodes > 0 &&
+                    std::strcmp(prev_phone->nodes[prev_phone->n_nodes - 1]->name,
+                        expected_ffn) == 0;
+                if (is_terminal_bridge) {
+                    if (nodes[0]->type != nodes[1]->type ||
+                            ggml_nbytes(nodes[0]) != ggml_nbytes(nodes[1]) ||
+                            !ggml_is_contiguous(nodes[0]) ||
+                            !ggml_is_contiguous(nodes[1])) {
+                        printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                               "action=COPY_L_OUT status=REJECT_SHAPE\n",
+                               ring_layer, i);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    auto & src_backend = backend_ctx->backend_configs[1];
+                    auto & dst_backend = backend_ctx->backend_configs[0];
+                    const ggml_backend_rpc_fence_t fence =
+                        ggml_backend_meta_get_rpc_fence(src_backend.backend);
+                    if (fence != nullptr) {
+                        fence(src_backend.backend);
+                    } else {
+                        ggml_backend_synchronize(src_backend.backend);
+                    }
+
+                    const int64_t copy_begin_us = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        src_backend.backend, dst_backend.backend,
+                        nodes[1], nodes[0]);
+                    ggml_backend_synchronize(dst_backend.backend);
+                    const int64_t copy_us = ggml_time_us() - copy_begin_us;
+                    record_copy_wait(copy_us);
+                    record_meta_copy(i, 1, 0, nodes[0], copy_us);
+                    record_direct_copy();
+                    debug_terminal_handoff_dst = nodes[0];
+                    handled = true;
+                    printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                           "action=COPY_COMPUTED_L_OUT bytes=%zu "
+                           "copy_ms=%.3f status=OK\n",
+                           ring_layer, i, ggml_nbytes(nodes[0]),
+                           copy_us / 1000.0);
+                    return GGML_STATUS_SUCCESS;
+                }
+            }
+        }
+
         // C2P prefill completes l_out chunk-by-chunk directly on Phone and
         // disables both legacy l_out producers on the terminal chunk.  The
         // resulting l_out bridge subgraph is therefore intentionally inactive;
@@ -9153,71 +9260,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
-        // Region Ring may terminate a full Phone-only region at an exact
-        // l_out bridge.  The legacy test of "next Phone compute" can report
-        // true for that bridge even though its result is consumed by PC.
-        // The generic fallback then sends only ffn_moe_out to PC, leaving
-        // the Phone-owned ffn_inp/residual unaccounted for at the boundary.
-        //
-        // Keep this fix opt-in until numerical parity with the known-good
-        // contiguous Phone layout has been established.
-        const char * ring_env =
-            std::getenv("LLAMA_HYBRID_REGION_RING_V1");
-        const bool ring_requested =
-            ring_env != nullptr && std::atoi(ring_env) != 0;
-        const char * ring_exit_env =
-            std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
-        const bool ring_exit_fix =
-            ring_requested && ring_exit_env != nullptr &&
-            std::atoi(ring_exit_env) != 0;
-        int ring_exit_layer = -1;
-        int ring_exit_name_end = 0;
-        const bool ring_exit_named_ffn =
-            ring_requested &&
-            n_backends == 2 && active_count == 1 && active_backend == 1 &&
-            nodes[1] != nullptr &&
-            std::sscanf(nodes[1]->name, "ffn_moe_out-%d%n",
-                &ring_exit_layer, &ring_exit_name_end) == 1 &&
-            nodes[1]->name[ring_exit_name_end] == '\0';
-        const bool ring_exit_bridge =
-            ring_exit_named_ffn &&
-            i + 1 < backend_ctx->n_subgraphs &&
-            subgraph_is_exact_l_out_bridge(i + 1, ring_exit_layer) &&
-            !phone_primary_tensor_sg &&
-            !inferred_phone_primary_tensor &&
-            !forced_phone_primary_tensor &&
-            !c2p_tensor_sg;
-        if (ring_exit_named_ffn && i + 2 == backend_ctx->n_subgraphs) {
-            const auto & pc_next =
-                backend_ctx->backend_configs[0].cgraphs[i + 1].cgraph_main;
-            const auto & phone_next =
-                backend_ctx->backend_configs[1].cgraphs[i + 1].cgraph_main;
-            printf("[REGION_RING_EXIT_PROBE] layer=%d sg=%zu "
-                   "exact_bridge=%d pc_next=%s phone_next=%s "
-                   "pc_nodes=%d phone_nodes=%d "
-                   "next_pc=%d next_phone=%d fix=%d\n",
-                   ring_exit_layer, i, (int) ring_exit_bridge,
-                   pc_next != nullptr && pc_next->n_nodes > 0 ?
-                       pc_next->nodes[pc_next->n_nodes - 1]->name : "(none)",
-                   phone_next != nullptr && phone_next->n_nodes > 0 ?
-                       phone_next->nodes[phone_next->n_nodes - 1]->name : "(none)",
-                   pc_next != nullptr ? pc_next->n_nodes : -1,
-                   phone_next != nullptr ? phone_next->n_nodes : -1,
-                   (int) subgraph_will_execute_pc(i + 1),
-                   (int) subgraph_will_execute_phone(i + 1),
-                   (int) ring_exit_fix);
-        }
-        const bool ring_exit_takeover =
-            ring_exit_bridge && ring_exit_fix;
-
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
             !c2p_tensor_sg &&
-            (ring_exit_takeover ||
-             force_phone_block_exit ||
+            (force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
 
@@ -9537,21 +9586,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 (i + 1 >= backend_ctx->n_subgraphs ||
                  has_layer_output_producer(0, i + 1, layer));
 
-            // Never silently fall back to an FFN-only transfer after opting
-            // into a complete Phone -> PC residual handoff.
-            if (ring_exit_takeover &&
-                (layer != ring_exit_layer ||
-                 src_residual == nullptr ||
-                 !external_backend_handoff)) {
-                printf("[REGION_RING_EXIT] layer=%d sg=%zu "
-                       "resolved_layer=%d residual=%s external=%d "
-                       "status=REJECT\n",
-                       ring_exit_layer, i, layer,
-                       src_residual != nullptr ? src_residual->name : "(null)",
-                       (int) external_backend_handoff);
-                return GGML_STATUS_FAILED;
-            }
-
             if (external_handoff_candidate && !external_backend_handoff && pipeline_debug) {
                 printf("[META_HANDOFF_SKIP] sg=%zu layer=%d node=%s reason=no_pc_l_out_producer\n",
                     i, layer, nodes[1]->name);
@@ -9714,13 +9748,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 if (external_backend_handoff) {
                     debug_terminal_handoff_dst = dst_l_out;
-                }
-                if (ring_exit_takeover) {
-                    printf("[REGION_RING_EXIT] layer=%d sg=%zu "
-                           "action=PHONE_RESIDUAL_ADD_COPY "
-                           "tensor=%s bytes=%zu status=OK\n",
-                           layer, i, dst_l_out->name,
-                           ggml_nbytes(dst_l_out));
                 }
 
                 if (pipeline_debug) {
