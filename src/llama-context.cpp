@@ -2234,6 +2234,34 @@ bool llama_context::copy_hybrid_stage_output(
     }
 
     ggml_backend_tensor_get(stage_output, output, 0, (size_t) n_tokens * n_embd * sizeof(float));
+
+    // Diagnostics only. The hidden-state copy is already required by the
+    // stage executor, so inspecting it does not add a backend synchronization.
+    if (llama_region_ring_enabled() &&
+        std::getenv("LLAMA_HYBRID_REGION_RING_TRACE") != nullptr) {
+        const size_t count = (size_t) n_tokens * (size_t) n_embd;
+        double sum = 0.0;
+        double sq_sum = 0.0;
+        double max_abs = 0.0;
+        size_t nonfinite = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const double value = (double) output[i];
+            if (!std::isfinite(value)) {
+                ++nonfinite;
+                continue;
+            }
+            sum += value;
+            sq_sum += value * value;
+            max_abs = std::max(max_abs, std::abs(value));
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_BOUNDARY] stage=%zu block=%zu tokens=%u "
+            "elements=%zu sum=%.9f l2=%.9f max_abs=%.9f "
+            "nonfinite=%zu v0=%.9f\n",
+            stage_index, block_index, n_tokens, count,
+            sum, std::sqrt(sq_sum), max_abs, nonfinite,
+            count > 0 ? (double) output[0] : 0.0);
+    }
     return true;
 }
 
@@ -3736,6 +3764,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
     const bool region_ring_v1 = llama_region_ring_enabled();
+    const char * ring_exec_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+    const std::string ring_exec = region_ring_v1 ?
+        (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
+    if (region_ring_v1 && ring_exec != "ready" &&
+        ring_exec != "serial" && ring_exec != "full") {
+        throw std::runtime_error(
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, serial or full");
+    }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
         if (const char * env = std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
@@ -3755,8 +3792,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN] regions=%zu chunk_tokens=%d "
-            "execution=COOPERATIVE_READY_QUEUE status=READY\n",
-            runtime_stages.size(), region_ring_chunk_tokens);
+            "execution=%s status=READY\n",
+            runtime_stages.size(), region_ring_chunk_tokens,
+            ring_exec == "ready" ? "COOPERATIVE_READY_QUEUE" :
+            ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
+                                   "FULL_GRAPH_REFERENCE");
     }
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const char * pc_phone_exec_v1_env =
@@ -5013,16 +5053,31 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_tensor_ready_bytes = 0;
                 hybrid_phone_ready_bytes = 0;
             }
-        } else if (region_ring_v1 && ubatch.n_tokens > 1 &&
+        } else if (region_ring_v1 && ring_exec != "full" &&
+                   ubatch.n_tokens > 1 &&
                    cparams.causal_attn && ubatch.token != nullptr &&
                    ubatch.embd == nullptr && ubatch.n_pos == 1 &&
                    !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
                    !cparams.embeddings && !cparams.embeddings_nextn &&
                    cparams.cb_eval == nullptr) {
-            res = process_ubatch_region_ring(
-                ubatch, ctx_type_to_graph_type(cparams.ctx_type),
-                mctx.get(), sched.get(), gf_res_prev.get(),
-                runtime_stages, ubatch_id, status);
+            // A/B diagnostics with IDENTICAL model layer ownership:
+            // ready  = interleaved Region x Chunk execution;
+            // serial = all chunks of one Region before the next Region.
+            // Full-graph mode falls through to the existing ggml path.
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EXEC] mode=%s ub=%d tokens=%u\n",
+                ring_exec.c_str(), ubatch_id, ubatch.n_tokens);
+            if (ring_exec == "serial") {
+                res = process_ubatch_staged(
+                    ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                    mctx.get(), sched.get(), gf_res_prev.get(),
+                    runtime_stages, ubatch_id, status);
+            } else {
+                res = process_ubatch_region_ring(
+                    ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                    mctx.get(), sched.get(), gf_res_prev.get(),
+                    runtime_stages, ubatch_id, status);
+            }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
                 ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched.get(), gf_res_prev.get(),
