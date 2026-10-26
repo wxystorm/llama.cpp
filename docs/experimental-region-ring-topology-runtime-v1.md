@@ -51,6 +51,37 @@ cycles and a PC tail. As with the existing `apply-safe`, this is a Plan
 
 Never turn on unrestricted application by simply removing guards.
 
+## Device topology hotfix (2026-10-26)
+
+The first real Qwen3 `topology-preview` run successfully enumerated 3,529
+layouts and simulated 192 of them, but failed later at
+`llama-model.cpp:995: GGML_ASSERT(ud->n_devices == 2)`.
+
+Root cause in model device preparation: when the legacy `--hybrid-auto`
+flag is **off**, the preexisting Tensor mode included a local CUDA GPU
+in Meta's child devices. Region Ring needs exactly the ordered pair
+`Meta(CPU, Phone RPC)`, with CUDA registered as a separate PC
+backend when GPU Region weights are placed.
+
+The new model-device setup now:
+
+- Filters standalone local GPU backends out of Meta whenever Region
+  Ring + Tensor split is active, irrespective of `--hybrid-auto`.
+- Normalizes explicit `--device` selections to one CPU and one RPC
+  Meta child, excluding any selected local CUDA from Meta.
+- Rejects missing/multiple RPC devices with a clear
+  `REGION_RING_META_DEVICES status=REJECT` message instead of crashing
+  during weight placement.
+- Logs `[REGION_RING_META_DEVICES] ... meta_count=2 ... status=READY`
+  when prepared correctly.
+
+The legacy Hybrid Auto profile may still log
+`no scoreable hybrid plans`. This is **not** an error in the
+independent general-topology preview, provided the cached CPU/CUDA/Phone
+Profile is available and `REGION_RING_TOPOLOGY_SEARCH` is logged.
+
+**Not yet validated** on a real PC+Phone deployment after this hotfix.
+
 ## PC-only standalone tests
 
 ```powershell
