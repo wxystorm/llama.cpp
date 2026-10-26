@@ -1667,14 +1667,41 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             throw std::runtime_error("hybrid runtime plan layer count does not match the model");
         }
 
+        const bool region_ring = llama_region_ring_enabled();
+        const std::vector<llama_region_ring_region> ring_regions =
+            region_ring ?
+                (hybrid_ring_plan_layout.empty() ?
+                    llama_region_ring_from_env(n_layer) :
+                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
+                std::vector<llama_region_ring_region>{};
+        const bool planner_ring_owned =
+            region_ring && !hybrid_ring_plan_layout.empty();
+        const std::array<int, 3> ring_counts =
+            region_ring ? llama_region_ring_layer_counts(ring_regions) :
+                          std::array<int, 3>{};
+
+        // For an APPLIED Plan, the model-owned C/G/P counts are
+        // authoritative, not stale FIXED_* environment values. The
+        // GPU total is nevertheless required to match the original.
         const double pc_pct = has_runtime_plan ?
-            100.0 * runtime_plan.pc_layers / n_layer : llama_hybrid_pc_pct();
-        const int pc_layers = has_runtime_plan ? runtime_plan.pc_layers : std::clamp(
-            (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
-        const int phone_layers = has_runtime_plan ? runtime_plan.phone_layers :
+            100.0 * runtime_plan.pc_layers / n_layer :
+            planner_ring_owned ?
+                100.0 * (ring_counts[0]+ring_counts[1]) / n_layer :
+                llama_hybrid_pc_pct();
+        const int pc_layers = planner_ring_owned ?
+            ring_counts[0]+ring_counts[1] :
+            has_runtime_plan ? runtime_plan.pc_layers : std::clamp(
+                (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
+        const int phone_layers = planner_ring_owned ?
+            ring_counts[2] :
+            has_runtime_plan ? runtime_plan.phone_layers :
             std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
-        const int gpu_pc_layers = has_runtime_plan ? runtime_plan.gpu_pc_layers : llama_hybrid_gpu_pc_layers();
-        const std::string pc_layout = has_runtime_plan ? "gpu-cpu-tensor-phone" :
+        const int gpu_pc_layers = planner_ring_owned ?
+            ring_counts[1] :
+            has_runtime_plan ? runtime_plan.gpu_pc_layers :
+            llama_hybrid_gpu_pc_layers();
+        const std::string pc_layout = has_runtime_plan ?
+            "gpu-cpu-tensor-phone" :
             (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
 
         if (has_runtime_plan) {
@@ -1683,14 +1710,6 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             pimpl->tensor_split_owned[1] = 1.0f - runtime_plan.tensor_pc_ratio;
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
-
-        const bool region_ring = llama_region_ring_enabled();
-        const std::vector<llama_region_ring_region> ring_regions =
-            region_ring ?
-                (hybrid_ring_plan_layout.empty() ?
-                    llama_region_ring_from_env(n_layer) :
-                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
-                std::vector<llama_region_ring_region>{};
         if (region_ring && !hybrid_ring_plan_layout.empty()) {
             const auto original = llama_region_ring_from_env(n_layer);
             if (!llama_region_ring_apply_safe_phone_shape(original) ||
