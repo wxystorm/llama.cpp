@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
+#include "llama-region-ring.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -178,6 +179,24 @@ static std::vector<llama_hybrid_runtime_stage> llama_hybrid_build_runtime_stages
                            plan.phone_chunk_tokens, 0 });
     }
 
+    return stages;
+}
+
+static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
+        const std::vector<llama_region_ring_region> & regions,
+        int chunk_tokens) {
+    std::vector<llama_hybrid_runtime_stage> stages;
+    stages.reserve(regions.size());
+    for (const auto & region : regions) {
+        const auto kind =
+            region.device == llama_region_ring_device::CPU ?
+                llama_hybrid_runtime_stage_kind::CPU :
+            region.device == llama_region_ring_device::GPU ?
+                llama_hybrid_runtime_stage_kind::GPU :
+                llama_hybrid_runtime_stage_kind::PHONE;
+        stages.push_back({
+            kind, region.layer_begin, region.layer_end, chunk_tokens, 0});
+    }
     return stages;
 }
 
@@ -2644,6 +2663,118 @@ bool llama_context::run_hybrid_wave_probe(
     return true;
 }
 
+llm_graph_result * llama_context::process_ubatch_region_ring(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_backend_sched_t sched_use,
+        llm_graph_result * res_use,
+        const std::vector<llama_hybrid_runtime_stage> & stages,
+        int ubatch_id,
+        ggml_status & ret) {
+    auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
+    if (kv_mctx == nullptr || stages.size() < 6) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const int32_t saved_outputs = n_outputs;
+    const int n_embd = model.hparams.n_embd;
+    std::vector<llama_region_ring_region> regions;
+    regions.reserve(stages.size());
+    for (const auto & stage : stages) {
+        const auto device =
+            stage.kind == llama_hybrid_runtime_stage_kind::CPU ?
+                llama_region_ring_device::CPU :
+            stage.kind == llama_hybrid_runtime_stage_kind::GPU ?
+                llama_region_ring_device::GPU :
+                llama_region_ring_device::PHONE;
+        regions.push_back({device, stage.layer_begin, stage.layer_end});
+    }
+    const int chunk_tokens = stages.front().macro_tokens;
+    llama_region_ring_ready ready(regions, (int) ubatch.n_tokens, chunk_tokens);
+    std::vector<std::vector<float>> outputs(
+        ready.n_regions() - 1);
+    for (auto & hidden : outputs) {
+        hidden.resize((size_t) n_embd * ubatch.n_tokens);
+    }
+
+    bool apply_mctx = true;
+    llm_graph_result * result = nullptr;
+    ret = GGML_STATUS_SUCCESS;
+    size_t executed = 0;
+    const int64_t begin_us = ggml_time_us();
+
+    while (!ready.all_done() && ret == GGML_STATUS_SUCCESS) {
+        const auto next = ready.take();
+        if (!next) {
+            LLAMA_LOG_ERROR("[REGION_RING] event=DEADLOCK finished=%zu\n",
+                ready.finished());
+            ret = GGML_STATUS_FAILED;
+            break;
+        }
+        const auto task = *next;
+        const bool first = task.region == 0;
+        const bool last = task.region + 1 == stages.size();
+        const auto & stage = stages[task.region];
+        float * input = first ? nullptr :
+            outputs[task.region - 1].data() +
+            (size_t) task.token_begin * n_embd;
+        float * output = last ? nullptr :
+            outputs[task.region].data() +
+            (size_t) task.token_begin * n_embd;
+        int32_t block_outputs = 0;
+        if (last) {
+            for (int i = 0; i < task.n_tokens; ++i) {
+                block_outputs +=
+                    ubatch.output[task.token_begin + i] != 0;
+            }
+        }
+        const int64_t task_begin_us = ggml_time_us();
+        LLAMA_LOG_DEBUG(
+            "[REGION_RING] event=BEGIN device=%s region=%zu "
+            "layers=[%d,%d) chunk=%zu tokens=[%d,%d) "
+            "cpu_q=%zu gpu_q=%zu phone_q=%zu\n",
+            llama_region_ring_device_name(regions[task.region].device),
+            task.region, stage.layer_begin, stage.layer_end,
+            task.chunk, task.token_begin,
+            task.token_begin + task.n_tokens,
+            ready.queue_size(llama_region_ring_device::CPU),
+            ready.queue_size(llama_region_ring_device::GPU),
+            ready.queue_size(llama_region_ring_device::PHONE));
+
+        result = run_hybrid_stage_block(
+            ubatch, stage, task.token_begin, task.n_tokens,
+            input, output, gtype, mctx, sched_use, res_use,
+            ubatch_id, task.region, task.chunk,
+            llama_hybrid_boundary_action::PASS,
+            block_outputs, apply_mctx, true, ret);
+        if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
+            break;
+        }
+        ready.complete(task);
+        ++executed;
+        LLAMA_LOG_DEBUG(
+            "[REGION_RING] event=END device=%s region=%zu chunk=%zu "
+            "wall_ms=%.3f finished=%zu\n",
+            llama_region_ring_device_name(regions[task.region].device),
+            task.region, task.chunk,
+            (ggml_time_us() - task_begin_us) / 1000.0,
+            ready.finished());
+    }
+    kv_mctx->clear_stage_range();
+    n_outputs = saved_outputs;
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_SUM] tokens=%u chunk_tokens=%d regions=%zu "
+        "chunks=%zu executed=%zu complete=%d wall_ms=%.3f "
+        "mode=COOPERATIVE_READY_QUEUE status=%d\n",
+        ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
+        executed, ready.all_done() ? 1 : 0,
+        (ggml_time_us() - begin_us) / 1000.0, (int) ret);
+    return ret == GGML_STATUS_SUCCESS && ready.all_done() ?
+        result : nullptr;
+}
+
 llm_graph_result * llama_context::process_ubatch_staged(
         const llama_ubatch &                          ubatch,
         llm_graph_type                                gtype,
@@ -3604,9 +3735,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 backend, tensor_phone_first_layer, tensor_phone_last_layer);
         }
     }
+    const bool region_ring_v1 = llama_region_ring_enabled();
+    int region_ring_chunk_tokens = 128;
+    if (region_ring_v1) {
+        if (const char * env = std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+            region_ring_chunk_tokens = std::atoi(env);
+        }
+        if (region_ring_chunk_tokens <= 0) {
+            throw std::runtime_error("region ring chunk tokens must be positive");
+        }
+    }
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
+        region_ring_v1 ?
+            llama_region_ring_runtime_stages(
+                llama_region_ring_from_env(model.hparams.n_layer()),
+                region_ring_chunk_tokens) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+    if (region_ring_v1) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN] regions=%zu chunk_tokens=%d "
+            "execution=COOPERATIVE_READY_QUEUE status=READY
+",
+            runtime_stages.size(), region_ring_chunk_tokens);
+    }
     const char * stage_queue_env = std::getenv("LLAMA_HYBRID_STAGE_QUEUE");
     const char * pc_phone_exec_v1_env =
         std::getenv("GGML_META_PC_PHONE_EXEC_V1");
@@ -3618,8 +3770,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // full GPU+CPU+TENSOR graph.  Make the executor opt-in self-contained
     // instead of requiring a second stage-queue environment switch.
     const bool stage_queue_requested =
-        (stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0) ||
-        pc_phone_exec_v1_requested;
+        !region_ring_v1 &&
+        ((stage_queue_env != nullptr && std::atoi(stage_queue_env) != 0) ||
+         pc_phone_exec_v1_requested);
     const bool return_wavefront_requested =
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr ||
         pc_phone_exec_v1_requested;
@@ -4861,6 +5014,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 hybrid_tensor_ready_bytes = 0;
                 hybrid_phone_ready_bytes = 0;
             }
+        } else if (region_ring_v1 && ubatch.n_tokens > 1 &&
+                   cparams.causal_attn && ubatch.token != nullptr &&
+                   ubatch.embd == nullptr && ubatch.n_pos == 1 &&
+                   !ubatch.equal_seqs() && ubatch.n_seqs_unq == 1 &&
+                   !cparams.embeddings && !cparams.embeddings_nextn &&
+                   cparams.cb_eval == nullptr) {
+            res = process_ubatch_region_ring(
+                ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(), sched.get(), gf_res_prev.get(),
+                runtime_stages, ubatch_id, status);
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
                 ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), sched.get(), gf_res_prev.get(),
