@@ -2884,9 +2884,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     std::array<ggml_backend_sched_t, 3> ring_sched = {sched_use, sched_use, sched_use};
     std::array<llm_graph_result *, 3> ring_res = {res_use, res_use, res_use};
     if (isolate_device_resources) {
-        // The caller uses the main scheduler to discover and extract logits
-        // after this function returns. The last Phone Region must still write
-        // the final output into the canonical graph result/scheduler.
+        // The caller extracts logits from its canonical main result.
+        // Legacy Ring finishes on Phone. General topology switches the
+        // last CPU/CUDA task to that same canonical scheduler.
         if (!device_fifo_simulation || sched_use != sched.get() ||
             res_use != gf_res_prev.get() ||
             (!model.hybrid_ring_plan_topology &&
@@ -4731,11 +4731,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             "[REGION_RING_PHONE_PLAN] layout=%s phone_regions=%zu "
             "meta_count=%zu final_device=%s status=READY\n",
             model.hybrid_ring_plan_layout.c_str(),
-            std::count_if(ring_runtime_regions.begin(),
-                          ring_runtime_regions.end(),
-                          [](const llama_region_ring_region & r) {
-                              return r.device == llama_region_ring_device::PHONE;
-                          }), meta_count,
+            (size_t) std::count_if(ring_runtime_regions.begin(),
+                                  ring_runtime_regions.end(),
+                                  [](const llama_region_ring_region & r) {
+                                      return r.device == llama_region_ring_device::PHONE;
+                                  }), meta_count,
             llama_region_ring_device_name(ring_runtime_regions.back().device));
     }
     if (region_ring_v1) {
