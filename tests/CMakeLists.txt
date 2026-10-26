@@ -310,6 +310,8 @@ target_include_directories(test-hybrid PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-hybrid)
 
 llama_build_and_test(test-hybrid-boundary.cpp)
+llama_build_and_test(test-region-ring.cpp)
+target_include_directories(test-region-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_include_directories(test-hybrid-boundary PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 llama_build_and_test(test-meta-return-stall-profile.cpp)
