@@ -13545,16 +13545,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     const bool ring_phone_fusion_probe =
         ring_phone_fusion && std::strcmp(ring_fuse, "probe") == 0;
 
-    auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
-        if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
-                !subgraph_is_phone_only(i) || !subgraph_is_phone_only(i + 1)) {
+    auto phone_sg_pair_same_layer = [&](size_t i, int & layer,
+                                       std::string * reason = nullptr) -> bool {
+        auto reject = [&](const char * msg) -> bool {
+            if (reason != nullptr) {
+                *reason = msg;
+            }
             return false;
+        };
+        if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs) {
+            return reject("PAIR_OUT_OF_RANGE");
+        }
+        if (!subgraph_is_phone_only(i)) {
+            return reject("ATTN_SG_NOT_PHONE_OWNED");
+        }
+        if (!subgraph_is_phone_only(i + 1)) {
+            return reject("FFN_SG_NOT_PHONE_OWNED");
         }
 
         ggml_cgraph * g0 = backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
         ggml_cgraph * g1 = backend_ctx->backend_configs[1].cgraphs[i + 1].cgraph_main;
         if (g0 == nullptr || g1 == nullptr || g0->n_nodes == 0 || g1->n_nodes == 0) {
-            return false;
+            return reject("EMPTY_SUBGRAPH");
         }
 
         int attn_layer = -1;
@@ -13566,13 +13578,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         if (is_attn && is_ffn && attn_layer == ffn_layer) {
             // Keep legacy Phone-primary Tensor protection unchanged.
             if (layer_is_tensor_phone_primary(attn_layer)) {
-                return false;
+                return reject("SPLIT_PHONE_PRIMARY_LAYER");
             }
             layer = attn_layer;
             return true;
         }
         if (!ring_phone_fusion) {
-            return false;
+            return reject("LEGACY_MARKERS_NOT_MATCHED");
         }
 
         // Only fuse pure Phone-owned multi-token Region graphs. Decode and
@@ -13588,7 +13600,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 ffn_layer < 0 || last_layer != ffn_layer ||
                 g1->nodes[0]->ne[1] <= 1 ||
                 layer_is_tensor_phone_primary(ffn_layer)) {
-            return false;
+            return reject("RING_FFN_MARKERS_OR_SHAPE");
         }
 
         const char * attention_first = g0->nodes[0]->name;
@@ -13602,7 +13614,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             std::sscanf(attention_first, "l_out-%d%n", &input_layer, &parsed) == 1 &&
             attention_first[parsed] == '\0' && input_layer + 1 == ffn_layer;
         if (!starts_with_norm && !starts_with_previous_lout) {
-            return false;
+            return reject("RING_ATTN_INPUT_MARKER");
         }
 
         // The two SGs must be exclusively Phone-compute. Terminal labels
@@ -13614,26 +13626,45 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
             if (pc == nullptr || phone == nullptr ||
                     pc->n_nodes != phone->n_nodes) {
-                return false;
+                return reject("MIRRORED_GRAPH_SHAPE_DIFFERENT");
             }
             bool has_phone_compute = false;
             for (int k = 0; k < pc->n_nodes; ++k) {
                 if (pc->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    if (reason != nullptr) {
+                        char detail[256];
+                        std::snprintf(
+                            detail, sizeof(detail),
+                            "PC_ACTIVE_NODE:sg=%zu:k=%d:name=%.120s:op=%s",
+                            sg, k, pc->nodes[k]->name,
+                            ggml_op_name(pc->nodes[k]->op));
+                        *reason = detail;
+                    }
                     return false;
                 }
                 has_phone_compute |=
                     (phone->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
             }
             if (!has_phone_compute) {
-                return false;
+                return reject("SUBGRAPH_PHONE_HAS_NO_COMPUTE");
             }
         }
         layer = ffn_layer;
         return true;
     };
-    auto find_phone_block = [&](size_t start, size_t & end, int & first_layer, int & last_layer) -> bool {
+    auto find_phone_block = [&](size_t start, size_t & end, int & first_layer,
+                                int & last_layer, std::string * reason = nullptr,
+                                size_t * failed_sg = nullptr) -> bool {
         int layer = -1;
-        if (!phone_sg_pair_same_layer(start, layer)) {
+        std::string pair_reason;
+        if (!phone_sg_pair_same_layer(start, layer,
+                                      reason != nullptr ? &pair_reason : nullptr)) {
+            if (reason != nullptr) {
+                *reason = pair_reason;
+            }
+            if (failed_sg != nullptr) {
+                *failed_sg = start;
+            }
             return false;
         }
 
@@ -13642,20 +13673,45 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         end = start + 1;
         for (size_t next = start + 2; next + 1 < backend_ctx->n_subgraphs; next += 2) {
             int next_layer = -1;
-            if (!phone_sg_pair_same_layer(next, next_layer) || next_layer != last_layer + 1) {
+            pair_reason.clear();
+            if (!phone_sg_pair_same_layer(
+                        next, next_layer, reason != nullptr ? &pair_reason : nullptr)) {
+                if (reason != nullptr) {
+                    *reason = pair_reason;
+                }
+                if (failed_sg != nullptr) {
+                    *failed_sg = next;
+                }
+                break;
+            }
+            if (next_layer != last_layer + 1) {
+                if (reason != nullptr) {
+                    *reason = "NEXT_LAYER_NOT_CONSECUTIVE";
+                }
+                if (failed_sg != nullptr) {
+                    *failed_sg = next;
+                }
                 break;
             }
             last_layer = next_layer;
             end = next + 1;
         }
         if (ring_phone_fusion) {
-            // Do not fuse a partial Region. The validated Ring uses P5 and
-            // its final Phone FFN is followed by an output bridge or PC
-            // logits consumer. This restriction also prevents accidentally
-            // grouping an unrelated single-layer Phone operation.
+            // Only a complete five-layer P5 may enter fused execution.
             if (last_layer - first_layer + 1 != 5 ||
-                    end - start + 1 != 10 ||
-                    end + 1 >= backend_ctx->n_subgraphs) {
+                    end - start + 1 != 10) {
+                if (reason != nullptr && reason->empty()) {
+                    *reason = "PARTIAL_FIVE_LAYER_REGION";
+                }
+                return false;
+            }
+            if (end + 1 >= backend_ctx->n_subgraphs) {
+                if (reason != nullptr) {
+                    *reason = "MISSING_OUTPUT_BRIDGE";
+                }
+                if (failed_sg != nullptr) {
+                    *failed_sg = end + 1;
+                }
                 return false;
             }
         }
@@ -17851,8 +17907,12 @@ auto prefill_norm_sg_has_prework =
             timing_first_layer = 35;
             timing_last_layer = 45;
         } else {
+            std::string fusion_reason;
+            size_t fusion_failed_sg = i;
             phone_block_fused = find_phone_block(
-                i, phone_block_end, first_fused_layer, phone_block_last_layer);
+                i, phone_block_end, first_fused_layer, phone_block_last_layer,
+                ring_phone_fusion ? &fusion_reason : nullptr,
+                ring_phone_fusion ? &fusion_failed_sg : nullptr);
             if (phone_block_fused && ring_phone_fusion_probe &&
                     phone_block_last_layer - first_fused_layer + 1 == 5) {
                 printf("[REGION_RING_PHONE_FUSION] event=PROBE sg=%zu..%zu "
@@ -17866,11 +17926,9 @@ auto prefill_norm_sg_has_prework =
             if (phone_block_fused) {
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
-            } else if (ring_phone_fusion && !ring_phone_fusion_probe &&
-                    is_phone_only_sg) {
-                // Diagnose a missed P5 fusion only at a candidate Region
-                // beginning. A skipped fusion is always a correct fallback
-                // to the original per-SG execution, not partial fusion.
+            } else if (ring_phone_fusion && is_phone_only_sg) {
+                // A missed fusion must not suppress any Meta communication:
+                // the original per-subgraph execution remains untouched.
                 ggml_cgraph * candidate =
                     backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
                 if (candidate != nullptr && candidate->n_nodes > 0) {
@@ -17880,9 +17938,51 @@ auto prefill_norm_sg_has_prework =
                                     &first_layer, &chars) == 1 &&
                             first_name[chars] == '\0') {
                         printf("[REGION_RING_PHONE_FUSION] event=SKIP sg=%zu "
-                               "layer=%d reason=INCOMPLETE_OR_MIXED_OWNERSHIP "
+                               "layer=%d failed_sg=%zu reason=%s "
                                "fallback=LEGACY_PHONE_SGS\n",
-                               i, first_layer);
+                               i, first_layer, fusion_failed_sg,
+                               fusion_reason.empty() ?
+                                   "UNCLASSIFIED" : fusion_reason.c_str());
+                        if (ring_phone_fusion_probe ||
+                                std::getenv("GGML_META_RING_PHONE_FUSION_TRACE") != nullptr) {
+                            const size_t trace_end = std::min(
+                                backend_ctx->n_subgraphs, i + size_t(12));
+                            for (size_t sg = i; sg < trace_end; ++sg) {
+                                ggml_cgraph * phone =
+                                    backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+                                ggml_cgraph * pc =
+                                    backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+                                if (phone == nullptr || pc == nullptr || phone->n_nodes == 0 ||
+                                        pc->n_nodes != phone->n_nodes) {
+                                    printf("[REGION_RING_PHONE_SG] sg=%zu reason=GRAPH_SHAPE_MISMATCH\n", sg);
+                                    continue;
+                                }
+                                int pc_active = 0, phone_active = 0;
+                                const ggml_tensor * first_pc_active = nullptr;
+                                for (int k = 0; k < pc->n_nodes; ++k) {
+                                    if ((pc->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                                        ++pc_active;
+                                        if (first_pc_active == nullptr) {
+                                            first_pc_active = pc->nodes[k];
+                                        }
+                                    }
+                                    phone_active +=
+                                        (phone->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                                }
+                                printf("[REGION_RING_PHONE_SG] sg=%zu nodes=%d "
+                                       "first=%s last=%s tokens=%" PRId64 " "
+                                       "phone_owned=%d pc_active=%d phone_active=%d "
+                                       "pc_first_active=%s pc_op=%s\n",
+                                       sg, phone->n_nodes, phone->nodes[0]->name,
+                                       phone->nodes[phone->n_nodes - 1]->name,
+                                       phone->nodes[0]->ne[1],
+                                       subgraph_is_phone_only(sg) ? 1 : 0,
+                                       pc_active, phone_active,
+                                       first_pc_active ? first_pc_active->name : "(none)",
+                                       first_pc_active ?
+                                           ggml_op_name(first_pc_active->op) : "(none)");
+                            }
+                        }
                     }
                 }
             }
