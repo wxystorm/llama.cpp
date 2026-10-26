@@ -9187,10 +9187,22 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
             !c2p_tensor_sg;
-        if (ring_exit_bridge) {
+        if (ring_exit_named_ffn && i + 2 == backend_ctx->n_subgraphs) {
+            const auto & pc_next =
+                backend_ctx->backend_configs[0].cgraphs[i + 1].cgraph_main;
+            const auto & phone_next =
+                backend_ctx->backend_configs[1].cgraphs[i + 1].cgraph_main;
             printf("[REGION_RING_EXIT_PROBE] layer=%d sg=%zu "
-                   "next_pc=%d next_phone=%d fix=%d status=EXACT_BRIDGE\\n",
-                   ring_exit_layer, i,
+                   "exact_bridge=%d pc_next=%s phone_next=%s "
+                   "pc_nodes=%d phone_nodes=%d "
+                   "next_pc=%d next_phone=%d fix=%d\n",
+                   ring_exit_layer, i, (int) ring_exit_bridge,
+                   pc_next != nullptr && pc_next->n_nodes > 0 ?
+                       pc_next->nodes[pc_next->n_nodes - 1]->name : "(none)",
+                   phone_next != nullptr && phone_next->n_nodes > 0 ?
+                       phone_next->nodes[phone_next->n_nodes - 1]->name : "(none)",
+                   pc_next != nullptr ? pc_next->n_nodes : -1,
+                   phone_next != nullptr ? phone_next->n_nodes : -1,
                    (int) subgraph_will_execute_pc(i + 1),
                    (int) subgraph_will_execute_phone(i + 1),
                    (int) ring_exit_fix);
@@ -9533,7 +9545,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                  !external_backend_handoff)) {
                 printf("[REGION_RING_EXIT] layer=%d sg=%zu "
                        "resolved_layer=%d residual=%s external=%d "
-                       "status=REJECT\\n",
+                       "status=REJECT\n",
                        ring_exit_layer, i, layer,
                        src_residual != nullptr ? src_residual->name : "(null)",
                        (int) external_backend_handoff);
@@ -9706,7 +9718,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (ring_exit_takeover) {
                     printf("[REGION_RING_EXIT] layer=%d sg=%zu "
                            "action=PHONE_RESIDUAL_ADD_COPY "
-                           "tensor=%s bytes=%zu status=OK\\n",
+                           "tensor=%s bytes=%zu status=OK\n",
                            layer, i, dst_l_out->name,
                            ggml_nbytes(dst_l_out));
                 }
