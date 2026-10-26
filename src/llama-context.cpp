@@ -2258,11 +2258,44 @@ bool llama_context::copy_hybrid_stage_output(
 
     ggml_tensor * stage_output = res->get_stage_output();
     const int64_t n_embd = model.hparams.n_embd;
-    if (stage_output == nullptr || stage_output->type != GGML_TYPE_F32 || !ggml_is_contiguous(stage_output) ||
-        stage_output->ne[0] != n_embd || stage_output->ne[1] != n_tokens) {
-        LLAMA_LOG_INFO(
-            "[HYBRID_EXEC] ub=%d stage=%zu block=%zu invalid stage output\n",
-            ubatch_id, stage_index, block_index);
+    const bool present = stage_output != nullptr;
+    const bool f32 = present && stage_output->type == GGML_TYPE_F32;
+    const bool contiguous = present && ggml_is_contiguous(stage_output);
+    const bool dimensions = present &&
+        stage_output->ne[0] == n_embd &&
+        stage_output->ne[1] == (int64_t) n_tokens &&
+        stage_output->ne[2] == 1 && stage_output->ne[3] == 1;
+    if (!present || !f32 || !contiguous || !dimensions) {
+        const char * reason = !present ? "STAGE_OUTPUT_NULL" :
+            !f32 ? "STAGE_OUTPUT_NOT_F32" :
+            !dimensions ? "STAGE_OUTPUT_SHAPE_MISMATCH" :
+            "STAGE_OUTPUT_NOT_CONTIGUOUS";
+        if (present) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_OUTPUT_COPY_REJECT] reason=%s "
+                "ub=%d stage=%zu chunk=%zu res=%p tensor=%p "
+                "name=%.80s type=%d ne=[%" PRId64 ",%" PRId64
+                ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] "
+                "contiguous=%d buffer=%p data=%p "
+                "expected_type=%d expected_ne=[%" PRId64 ",%u,1,1]\n",
+                reason,ubatch_id,stage_index,block_index,
+                (void *) res,(void *) stage_output,stage_output->name,
+                (int) stage_output->type,
+                stage_output->ne[0],stage_output->ne[1],
+                stage_output->ne[2],stage_output->ne[3],
+                stage_output->nb[0],stage_output->nb[1],
+                stage_output->nb[2],stage_output->nb[3],
+                contiguous ? 1 : 0,
+                (void *) stage_output->buffer,stage_output->data,
+                (int) GGML_TYPE_F32,n_embd,n_tokens);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_OUTPUT_COPY_REJECT] reason=%s "
+                "ub=%d stage=%zu chunk=%zu res=%p "
+                "expected_type=%d expected_ne=[%" PRId64 ",%u,1,1]\n",
+                reason,ubatch_id,stage_index,block_index,
+                (void *) res,(int) GGML_TYPE_F32,n_embd,n_tokens);
+        }
         return false;
     }
 
@@ -2371,6 +2404,31 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         return nullptr;
     }
 
+    // Record the exact Stage output tensor before the detached Phone graph
+    // runs. A failed stage copy can then distinguish a malformed graph from
+    // metadata/lifetime corruption after the PC gate is released.
+    const bool probe_phone_output =
+        model.hybrid_ring_plan_topology &&
+        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        stage_output != nullptr;
+    ggml_tensor * prepared_output = probe_phone_output ?
+        result->get_stage_output() : nullptr;
+    const int64_t prepared_ne0 = prepared_output ? prepared_output->ne[0] : -1;
+    const int64_t prepared_ne1 = prepared_output ? prepared_output->ne[1] : -1;
+    const int prepared_type = prepared_output ? (int) prepared_output->type : -1;
+    const bool prepared_contiguous =
+        prepared_output && ggml_is_contiguous(prepared_output);
+    if (probe_phone_output) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_STAGE_OUTPUT] phase=PRE_COMPUTE "
+            "stage=%zu chunk=%zu tokens=%u res=%p tensor=%p "
+            "type=%d ne=[%" PRId64 ",%" PRId64 "] "
+            "contiguous=%d expected_ne=[%" PRId64 ",%u]\n",
+            stage_index,block_index,block_tokens,(void *) result,
+            (void *) prepared_output,prepared_type,prepared_ne0,prepared_ne1,
+            prepared_contiguous ? 1 : 0,
+            model.hparams.n_embd,block_tokens);
+    }
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     if (model.hybrid_ring_plan_topology &&
             stage.layer_end == (int) model.hparams.n_layer() &&
@@ -2492,6 +2550,27 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     if (stage_output != nullptr) {
+        if (probe_phone_output) {
+            ggml_tensor * computed_output = result->get_stage_output();
+            const int64_t ne0 = computed_output ? computed_output->ne[0] : -1;
+            const int64_t ne1 = computed_output ? computed_output->ne[1] : -1;
+            const int type = computed_output ? (int) computed_output->type : -1;
+            const bool contiguous =
+                computed_output && ggml_is_contiguous(computed_output);
+            const bool changed =
+                computed_output != prepared_output ||
+                ne0 != prepared_ne0 || ne1 != prepared_ne1 ||
+                type != prepared_type ||
+                contiguous != prepared_contiguous;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_STAGE_OUTPUT] phase=POST_COMPUTE "
+                "stage=%zu chunk=%zu tokens=%u res=%p tensor=%p "
+                "type=%d ne=[%" PRId64 ",%" PRId64 "] "
+                "contiguous=%d metadata_changed=%d\n",
+                stage_index,block_index,block_tokens,(void *) result,
+                (void *) computed_output,type,ne0,ne1,
+                contiguous ? 1 : 0,changed ? 1 : 0);
+        }
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         if (!copy_hybrid_stage_output(
                 result, sched_use, stage_output, block_tokens, ubatch_id,
