@@ -559,6 +559,13 @@ LLAMA_API bool llama_hybrid_runtime_predict_tensor_compute(
 LLAMA_API bool llama_hybrid_runtime_predict_full_prefill(
     int tokens, llama_hybrid_full_prefill_prediction & prediction);
 LLAMA_API void llama_hybrid_runtime_plan_clear();
+
+// Profile-driven, non-applying Region Ring load/Chunk Planner. Logs
+// candidate C/G/P cycles, independent XC/XG/XP and optional PC tail;
+// returns false if the measured Profile cannot score the search space.
+LLAMA_API bool llama_hybrid_region_ring_planner_dry_run(
+    int tokens, int kv_start, int baseline_chunk);
+
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(
     int tokens, int chunk_tokens);
