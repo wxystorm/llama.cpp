@@ -591,6 +591,13 @@ LLAMA_API bool llama_hybrid_runtime_prefill_dag_enabled();
 LLAMA_API int  llama_hybrid_runtime_prefill_dag_max_ahead();
 LLAMA_API bool llama_hybrid_runtime_prefill_dag_eligible(int layer_begin, int layer_end);
 
+// Collect/cache CPU/CUDA/Phone compute, memory and transfer measurements
+// for Region Ring without enumerating or scoring legacy Hybrid plans.
+// Returns false if mandatory device probes are unavailable. This function
+// does not publish a legacy placement plan.
+LLAMA_API bool llama_hybrid_region_ring_collect_profile(
+    llama_model_loader & ml, const llama_model_params & params);
+
 LLAMA_API bool llama_hybrid_autoplan(llama_model_loader &       ml,
                                      const llama_model_params & params,
                                      llama_hybrid_plan &        best_plan);
