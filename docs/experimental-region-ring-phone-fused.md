@@ -70,3 +70,27 @@ Select-String -Path $log -Pattern '\[REGION_RING_PHONE_FUSION\]', '\[RPC_GRAPH\]
 ## Next: actual on-phone autonomous execution
 
 Once fused Graph parity and performance pass, the following distinct feature can be developed: pre-register a **shape/slot/KV-safe** graph template on the Phone server, bind incoming Chunk data in a Phone-owned Buffer, use transfer-complete READY plus ordered KV credits to enqueue that template in `phone_region_main_loop()`, and return a completion event without a new PC Graph command. Only after that should the model-building logic be moved to Phone CPU to construct P Regions locally from Qwen3 metadata and GGUF weights. Existing `phone_region_main_loop()` and `stored_graphs` are foundations but do not yet implement this for Region Ring.
+
+
+## Diagnostic update after first SKIP-only run
+
+The first opt-in test reported repeated `event=SKIP sg=0 layer=11/27/43` for all Phone Regions. The 358-token run still completed 54/54 jobs in **3772.754 ms**, with **1728.482 ms** observed PC–Phone interval overlap, no leaked Window=2 slots, and matching first three Top-1 token/logit pairs. **No Phone fusion `event=SUBMIT` was observed; do not attribute this run's timing to fusion.** Earlier broad `INCOMPLETE_OR_MIXED_OWNERSHIP` messages did not pinpoint the rejected condition.
+
+The follow-up diagnostic commit `05c7222557251c1d5308804362d40c60035ce017` preserves the same execution and fusion eligibility, but reports **the exact first rejected SG** and its failure reason. For `probe`, it additionally prints up to 12 consecutive Meta SG descriptors: first/last node names, token dimension, phone-ownership classification, PC/Phone active node counts, and an example PC active operation if any. `probe` does not fuse and does not change the original graph execution.
+
+Suggested short diagnostic run:
+
+```powershell
+git fetch origin
+git switch exp/region-ring-phone-fused-20261026
+cmake --build build-tensor-v2 --config Release --target llama-cli -j 8
+
+$env:LLAMA_HYBRID_REGION_RING_EXEC = 'fifo-pc-phone'
+$env:GGML_META_RING_PHONE_FUSION = 'probe'
+# Run the same 358-token Prompt and server configuration.
+Select-String -Path '.\region-pair.log' -Pattern '\[REGION_RING_PHONE_FUSION\]', '\[REGION_RING_PHONE_SG\]', '\[REGION_RING_SUM\]', '^top\[0\]:'
+```
+
+`GGML_META_RING_PHONE_FUSION=1` still activates real fusion only when *all* existing ownership checks pass. `GGML_META_RING_PHONE_FUSION_TRACE=1` enables the SG descriptors even when fusion is set to `1`. If failure says `PC_ACTIVE_NODE`, **do not** remove the guard until that operation's role in Meta's reduction/transfer semantics is understood. If it says `RING_FFN_MARKERS_OR_SHAPE`, inspect the logged actual first/last tensor names and adjust the recognizer to the real Qwen3-MoE graph rather than assuming a fixed SG boundary. `FFN_SG_NOT_PHONE_OWNED` can likewise reflect an actual cross-backend step; fusion must not skip it.
+
+Do not change the verified `fifo-pc-phone` reference branch. Repeat the same A/B parity and timing tests only *after* eligibility is correctly established.
