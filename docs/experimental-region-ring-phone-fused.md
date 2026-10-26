@@ -115,3 +115,83 @@ Select-String -Path '.\region-pair.log' -Pattern '\[REGION_RING_PHONE_FUSION\]',
 `event=PROBE ... status=ELIGIBLE` means a complete five-layer candidate passed. The probe retains legacy per-SG execution, and an eligible PROBE is no longer followed by a misleading generic `SKIP`. If a candidate still prints `SKIP`, preserve its `failed_sg`, `reason` and the following `REGION_RING_PHONE_SG` records; do not disable guards just to force a fusion.
 
 After successful probe, set `GGML_META_RING_PHONE_FUSION=1`, then verify `event=SUBMIT` / `event=DONE`, RPC graph command counts, output parity and repeated Prefill timing against `fifo-pc-phone` with the fusion flag unset. Because this graph-fusion code is newly changed and not yet built or tested on the user's devices, **no new performance gain or correct fused result is claimed**.
+
+
+## Experiment: Phone READY-driven Region Ring execution (protocol v17)
+
+This experiment is built on top of the validated first two fused P5 regions. It is intentionally separate from `GGML_META_RING_PHONE_FUSION=1`, and is **disabled by default**. It does not change `exp/region-ring-phone-fused-20261026` or the original overlap baseline.
+
+### Design
+
+- **PC prepares the graph**: the existing Meta fusion builds an exact ten-SG / five-layer Phone graph for L11–L15 or L27–L31. PC registers the serialized graph on the Phone RPC server by its UID. For a repeated UID on the same compute socket, registration is skipped. This is *lazy registration when each shape/slot graph is first encountered*; it is not yet a separate model-load-time prewarm pass.
+- **PC transfers the input** using the existing Region boundary path. An explicit Phone synchronization currently confirms the prior input writes are visible before posting READY. This conservative fence can be optimized only after Buffer Ownership is verified.
+- **PC publishes `INPUT_READY`**, containing `device, first_layer, graph_uid, completion_seq`. This event does **not** invoke `GRAPH_COMPUTE` / `GRAPH_RECOMPUTE` on the client. It is a small control notification of input completion, not a compute command.
+- **Phone MAIN worker receives READY and starts the already registered graph**. Execution uses the shared RPC graph/GPU gate so other Graph execution cannot interleave. After the device synchronizes, the Phone publishes a success/failure completion for the given sequence.
+- **PC consumes the completion only at the exact next `l_out-15` or `l_out-31` bridge**, then executes the original `l_out` calculation and Phone→PC handoff. This prevents stale-output races. Other GPU/CPU tasks remain scheduled under the original Region Ring worker model.
+- **Fallbacks remain unchanged**: L43–L47, single-token Decode, nonmatching shapes/ownership, and disabled auto mode all use the existing path. The server's legacy Region local queue remains intact.
+- **KV/slot order** remains controlled by the existing outer Region Ring dependencies, `window=2` host buffer lifetime, and Phone MAIN FIFO. This first stage does not yet independently rebuild KV dependencies from serialized graph nodes. Never bypass the upstream Region task/slot credits.
+
+### Build BOTH PC and Phone
+
+The new RPC wire commands require **protocol 4.0.17**. The current RPC HELLO rejects mismatched versions, so PC and Phone must use the same new branch; do not reuse the Phone server binary from the previous protocol 4.0.16 branch.
+
+PC (PowerShell):
+
+```powershell
+git fetch origin
+git switch exp/region-ring-phone-ready-autostart-20261026
+git pull --ff-only
+cmake --build build-tensor-v2 --config Release --target llama-cli -j 8
+```
+
+Phone (Termux, adapt build directory if necessary):
+
+```sh
+git fetch origin
+git switch exp/region-ring-phone-ready-autostart-20261026
+git pull --ff-only
+cmake --build build-region-v1 --target ggml-rpc-server -j 6
+```
+
+**Restart the Phone RPC server** after rebuilding, and keep the same model, Prompt, Seed, Chunk size, Region layout, PC and Phone flags from the known-good fused run.
+
+### Mode selection
+
+```powershell
+$env:LLAMA_HYBRID_REGION_RING_V1 = '1'
+$env:LLAMA_HYBRID_REGION_RING_EXEC = 'fifo-pc-phone'
+$env:LLAMA_HYBRID_REGION_RING_LAYOUT = 'C7,G4,P5,C7,G4,P5,C8,G3,P5'
+$env:LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX = '1'
+$env:LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS = '64'
+$env:GGML_META_RING_PHONE_FUSION = '1'
+$env:GGML_META_RING_PHONE_AUTOSTART = '1'
+```
+
+Unset `GGML_META_RING_PHONE_AUTOSTART` to revert **only execution control** to the prior PC-initiated fused graph dispatch (after using matching protocol binaries); or switch both PC and Phone back to the prior branch for a wholly unchanged reference.
+
+### Expected logs (two eligible P5 regions per Chunk)
+
+```text
+[PHONE_RING_AUTO] side=pc event=REGISTER layer=11 ... status=OK
+[PHONE_RING_AUTO] side=phone event=GRAPH_REGISTERED ... status=OK
+[PHONE_RING_AUTO] side=pc event=INPUT_READY layer=11 ... status=QUEUED
+[PHONE_RING_AUTO] side=phone event=READY_ENQUEUED layer=11 ...
+[PHONE_RING_AUTO] side=phone event=EXECUTE_DONE layer=11 ... status=OK
+[PHONE_RING_AUTO] side=pc event=OUTPUT_WAIT ... status=OK
+[PHONE_RING_AUTO] side=pc event=OUTPUT_READY layer=15 sg=10 ... status=OK
+[REGION_RING_EXIT] layer=15 sg=10 action=COPY_COMPUTED_L_OUT ... status=OK
+[REGION_RING_WORKERS_SUM] ... finished=54 completed=54 ...
+[REGION_RING_OWNERSHIP_SUM] window=2 live_slots=0 ... status=DRAINED
+```
+
+For the 358-token Prefill (6 Chunks) expect 12 `INPUT_READY` / `EXECUTE_DONE` pairs, split across L11–L15 and L27–L31. `REGISTER` may occur fewer than 12 times if UID/shape/slot cache hits. `REGION_RING_PHONE_FUSION event=SUBMIT/DONE` is intentionally suppressed for this auto mode to avoid confusing *queued* with *computed*.
+
+### Acceptance gates
+
+1. Start with a 2-token warmup; verify registration, READY enqueue, Phone MAIN execution and only-then `l_out` output consumption.
+2. Run a 358-token full Prefill. Require 54/54 Region jobs complete, `window=2 live_slots=0`, L15/L31 handoffs intact, no RPC EOF/deadlock or worker failure.
+3. Compare generated output text, token IDs and as many logits as available against the known-good fused mode. Top-1 consistency alone is insufficient for numerical parity.
+4. Compare multiple warmup-adjusted Release A/B Prefill timings. The conservative pre-READY synchronization and lazy first-time registration may cost more than the previous ~4 s result. Do not claim speedup until measured.
+5. Confirm Phone server logs `READY_ENQUEUED` and `EXECUTE_DONE`, not just client `INPUT_READY`. If the Phone error flag is reported, the completion wait returns failure; do not continue to `l_out` with stale data.
+
+This mode is the **first** autonomy milestone, not full Phone local Graph Builder. PC still constructs and registers each new graph template, and still sends the small INPUT_READY event after completing the transfer. Future phases may pre-register all shape/slot templates at model setup and attach READY directly to the final data-plane write.
