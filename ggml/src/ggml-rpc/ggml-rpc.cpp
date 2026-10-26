@@ -3183,6 +3183,71 @@ static bool ggml_backend_rpc_wait_ready_seq(
 }
 
 
+// The registered Phone graph must span exactly 2..8 consecutive complete
+// layers. Keep this RPC-side check independent from the host Planner. No
+// protocol wire fields are added: the first/last markers are already in the
+// graph that both endpoints serialize and validate.
+static bool rpc_phone_ring_graph_span(
+        const ggml_cgraph * graph, int first_layer, int & last_layer) {
+    if (graph == nullptr || graph->n_nodes < 4 ||
+            graph->nodes[0] == nullptr ||
+            graph->nodes[graph->n_nodes - 1] == nullptr ||
+            first_layer < 0) {
+        return false;
+    }
+    int actual_first = -1;
+    int actual_last = -1;
+    int consumed = 0;
+    const char * first_name = graph->nodes[0]->name;
+    if (std::sscanf(first_name,"norm-%d%n",&actual_first,&consumed) != 1 ||
+            consumed <= 0 || first_name[consumed] != '\0' ||
+            actual_first != first_layer) {
+        return false;
+    }
+    consumed = 0;
+    const char * last_name = graph->nodes[graph->n_nodes - 1]->name;
+    if (std::sscanf(last_name,"ffn_moe_out-%d%n",&actual_last,&consumed) != 1 ||
+            consumed <= 0 || last_name[consumed] != '\0' ||
+            actual_last < first_layer + 1 || actual_last > first_layer + 7) {
+        return false;
+    }
+    const size_t width = (size_t) (actual_last - first_layer + 1);
+    std::vector<uint8_t> norms(width,0);
+    std::vector<uint8_t> ffn_outputs(width,0);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr) {
+            return false;
+        }
+        const char * name = node->name;
+        int layer = -1;
+        int n = 0;
+        if (std::sscanf(name,"norm-%d%n",&layer,&n) == 1 &&
+                n > 0 && name[n] == '\0') {
+            if (layer < first_layer || layer > actual_last) {
+                return false;
+            }
+            norms[(size_t) (layer-first_layer)] = 1;
+        }
+        layer = -1;
+        n = 0;
+        if (std::sscanf(name,"ffn_moe_out-%d%n",&layer,&n) == 1 &&
+                n > 0 && name[n] == '\0') {
+            if (layer < first_layer || layer > actual_last) {
+                return false;
+            }
+            ffn_outputs[(size_t) (layer-first_layer)] = 1;
+        }
+    }
+    for (size_t i = 0; i < width; ++i) {
+        if (norms[i] != 1 || ffn_outputs[i] != 1) {
+            return false;
+        }
+    }
+    last_layer = actual_last;
+    return true;
+}
+
 static bool ggml_backend_rpc_phone_ring_auto_ready(
         ggml_backend_t backend,
         const ggml_cgraph * graph,
@@ -3207,9 +3272,13 @@ static bool ggml_backend_rpc_phone_ring_auto_ready(
     if (graph == nullptr && completion_seq == 0) {
         return true;
     }
-    if (graph == nullptr || graph->n_nodes <= 0 || graph->uid == 0 ||
-            completion_seq == 0 ||
-            (first_layer != 11 && first_layer != 27)) {
+    int last_layer = -1;
+    if (graph == nullptr || graph->uid == 0 || completion_seq == 0 ||
+            !rpc_phone_ring_graph_span(graph,first_layer,last_layer)) {
+        std::fprintf(stderr,
+            "[PHONE_RING_AUTO] side=pc event=REJECT first_layer=%d "
+            "reason=INVALID_REGISTERED_PHONE_GRAPH status=FAIL\n",
+            first_layer);
         return false;
     }
     const uint64_t uid = rpc_graph_effective_uid(graph);
@@ -5710,14 +5779,11 @@ bool rpc_server::phone_ring_input_ready(
         rpc_msg_phone_ring_ack & response) {
     response.accepted = 0;
     if (request.device >= backends.size() ||
-            request.graph_uid == 0 || request.seq == 0 ||
-            (request.first_layer != 11 && request.first_layer != 27)) {
+            request.graph_uid == 0 || request.seq == 0) {
         return true;
     }
-    // Do not acknowledge a READY for an unknown graph or one whose first
-    // and final layer markers disagree with the guarded five-layer Region.
-    // The PC pre-registers this graph; the Phone never infers it from a
-    // partial input transfer.
+    // Derive and validate the exact 2..8 layer graph from the registered
+    // server-owned graph. Do not trust just the request.first_layer field.
     {
         std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
         const auto it = stored_graphs[request.device].find(request.graph_uid);
@@ -5727,15 +5793,20 @@ bool rpc_server::phone_ring_input_ready(
             return true;
         }
         const ggml_cgraph * g = it->second.graph;
-        char begin[32], end[32];
-        std::snprintf(begin, sizeof(begin), "norm-%u", request.first_layer);
-        std::snprintf(end, sizeof(end), "ffn_moe_out-%u",
-                      request.first_layer + 4);
-        if (g->nodes[0] == nullptr || g->nodes[g->n_nodes - 1] == nullptr ||
-                std::strcmp(g->nodes[0]->name, begin) != 0 ||
-                std::strcmp(g->nodes[g->n_nodes - 1]->name, end) != 0) {
+        int last_layer = -1;
+        if (!rpc_phone_ring_graph_span(
+                g,(int) request.first_layer,last_layer)) {
+            std::fprintf(stderr,
+                "[PHONE_RING_AUTO] side=phone event=REJECT "
+                "first_layer=%u uid=%" PRIu64 " "
+                "reason=GRAPH_LAYER_SPAN_INVALID status=FAIL\n",
+                request.first_layer,request.graph_uid);
             return true;
         }
+        std::fprintf(stderr,
+            "[PHONE_RING_AUTO] side=phone event=VALIDATE "
+            "layers=[%u,%d) graph_uid=%" PRIu64 " status=READY\n",
+            request.first_layer,last_layer + 1,request.graph_uid);
     }
 
     rpc_phone_region_local_task task;
