@@ -726,6 +726,16 @@ void llama_context::sched_reserve() {
 
     synchronize();
 
+    // Recreate auxiliary Ring schedulers whenever the normal scheduler is
+    // re-reserved; they must not retain graph allocators from an old context.
+    for (auto & worker : region_ring_worker_resources) {
+        if (worker.sched) {
+            ggml_backend_sched_synchronize(worker.sched.get());
+        }
+        worker.res.reset();
+        worker.sched.reset();
+    }
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs   = cparams.n_seq_max;
@@ -1274,6 +1284,13 @@ bool llama_context::memory_update(bool optimize) {
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
         gf_res_pipe->reset();
+        // The same KV cache is shared by Ring's auxiliary Graph Results.
+        // Invalidate their reuse state after any memory module update.
+        for (auto & worker : region_ring_worker_resources) {
+            if (worker.res) {
+                worker.res->reset();
+            }
+        }
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2700,6 +2717,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const std::vector<llama_hybrid_runtime_stage> & stages,
         int ubatch_id,
         bool device_fifo_simulation,
+        bool isolate_device_resources,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2720,6 +2738,68 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 llama_region_ring_device::PHONE;
         regions.push_back({device, stage.layer_begin, stage.layer_end});
     }
+    // Scheduler/Graph Result ownership differs by device in the experimental
+    // isolated mode. Only the scheduler state is independent at this stage:
+    // ggml_backend_t handles, KV state, n_outputs, and threadpools remain shared.
+    // Do not run the three execution paths on separate threads yet.
+    std::array<ggml_backend_sched_t, 3> ring_sched = {sched_use, sched_use, sched_use};
+    std::array<llm_graph_result *, 3> ring_res = {res_use, res_use, res_use};
+    if (isolate_device_resources) {
+        // The caller uses the main scheduler to discover and extract logits
+        // after this function returns. The last Phone Region must still write
+        // the final output into the canonical graph result/scheduler.
+        if (!device_fifo_simulation || sched_use != sched.get() ||
+            res_use != gf_res_prev.get() ||
+            regions.back().device != llama_region_ring_device::PHONE) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_RESOURCE] status=REJECT reason=UNSAFE_FINAL_OUTPUT_OWNER\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        const size_t max_nodes =
+            graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
+            auto & worker = region_ring_worker_resources[dev];
+            if (!worker.sched) {
+                worker.sched.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    max_nodes, false, cparams.op_offload));
+                if (!worker.sched) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_RESOURCE] device=%s status=ALLOC_FAILED\n",
+                        dev == 0 ? "CPU" : "GPU");
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+            }
+            if (!worker.res) {
+                worker.res.reset(new llm_graph_result(max_nodes));
+            }
+            ring_sched[dev] = worker.sched.get();
+            ring_res[dev] = worker.res.get();
+        }
+
+        if (ring_sched[0] == ring_sched[1] ||
+            ring_sched[0] == ring_sched[2] ||
+            ring_sched[1] == ring_sched[2] ||
+            ring_res[0] == ring_res[1] ||
+            ring_res[0] == ring_res[2] ||
+            ring_res[1] == ring_res[2]) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_RESOURCE] status=REJECT reason=RESOURCE_ALIAS\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_RESOURCE] cpu_sched=%p cpu_res=%p "
+            "gpu_sched=%p gpu_res=%p phone_sched=%p phone_res=%p "
+            "backend=SHARED kv=SHARED threads=1 status=ISOLATED_SCHED_ONLY\n",
+            (void *) ring_sched[0], (void *) ring_res[0],
+            (void *) ring_sched[1], (void *) ring_res[1],
+            (void *) ring_sched[2], (void *) ring_res[2]);
+    }
+
     const int chunk_tokens = stages.front().macro_tokens;
     llama_region_ring_ready ready(regions, (int) ubatch.n_tokens, chunk_tokens);
     std::vector<std::vector<float>> outputs(
@@ -2790,11 +2870,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         result = run_hybrid_stage_block(
             ubatch, stage, task.token_begin, task.n_tokens,
-            input, output, gtype, mctx, sched_use, res_use,
+            input, output, gtype, mctx,
+            ring_sched[(size_t) regions[task.region].device],
+            ring_res[(size_t) regions[task.region].device],
             ubatch_id, task.region, task.chunk,
             llama_hybrid_boundary_action::PASS,
             block_outputs, apply_mctx, true, ret);
-        if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
+        if (result == nullptr || ret != GGML_STATUS_SUCCESS ||
+            (isolate_device_resources && last && result != res_use)) {
             if (device_fifo_simulation) {
                 ready.fail(task);
                 if (ret == GGML_STATUS_SUCCESS) {
@@ -2822,6 +2905,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        isolate_device_resources ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
         device_fifo_simulation ? "DEVICE_FIFO_SIMULATION" : "COOPERATIVE_READY_QUEUE",
         (int) ret);
     return ret == GGML_STATUS_SUCCESS && ready.all_done() ?
@@ -3794,9 +3878,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::string ring_exec = region_ring_v1 ?
         (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
     if (region_ring_v1 && ring_exec != "ready" &&
-        ring_exec != "fifo" && ring_exec != "serial" && ring_exec != "full") {
+        ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
+        ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -3821,6 +3906,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             runtime_stages.size(), region_ring_chunk_tokens,
             ring_exec == "ready" ? "COOPERATIVE_READY_QUEUE" :
             ring_exec == "fifo" ? "DEVICE_FIFO_SIMULATION" :
+            ring_exec == "fifo-isolated" ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5100,6 +5186,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // A/B diagnostics with IDENTICAL model layer ownership:
             // ready  = interleaved Region x Chunk execution;
             // fifo   = single-threaded simulation with per-device claims;
+            // fifo-isolated = FIFO + separate CPU/GPU scheduler and graph states;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5114,7 +5201,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 res = process_ubatch_region_ring(
                     ubatch, ctx_type_to_graph_type(cparams.ctx_type),
                     mctx.get(), sched.get(), gf_res_prev.get(),
-                    runtime_stages, ubatch_id, ring_exec == "fifo", status);
+                    runtime_stages, ubatch_id,
+                    ring_exec == "fifo" || ring_exec == "fifo-isolated",
+                    ring_exec == "fifo-isolated", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(

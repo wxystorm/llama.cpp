@@ -11,6 +11,7 @@
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
 
+#include <array>
 #include <map>
 #include <vector>
 
@@ -361,6 +362,7 @@ private:
                                        const std::vector<llama_hybrid_runtime_stage> & stages,
                                        int                                             ubatch_id,
                                        bool                                            device_fifo_simulation,
+                                       bool                                            isolate_device_resources,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(
@@ -489,6 +491,16 @@ private:
 
     ggml_backend_sched_ptr sched;
     ggml_backend_sched_ptr sched_pipe;
+
+    // Region Ring opt-in resource isolation (no concurrent GGML execution yet).
+    // CPU and CUDA get independent scheduler/graph allocation state; the Phone
+    // stage intentionally retains sched/gf_res_prev for final logits extraction.
+    // All three schedulers still reference the same backend objects and KV ctx.
+    struct region_ring_worker_resource {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::array<region_ring_worker_resource, 2> region_ring_worker_resources;
 
     bool sched_need_reserve = true;
 
