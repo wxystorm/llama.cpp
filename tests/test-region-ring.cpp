@@ -56,6 +56,52 @@ static void test_layout() {
           other_counts[2] == 15, "two-cycle layout device totals");
 }
 
+
+static void test_general_topology() {
+    const auto two_cycle_tail = llama_region_ring_parse(
+        "C6,G4,P8,C6,G4,P8,C8,G4",48,true);
+    check(two_cycle_tail.size() == 8,
+          "two-cycle PC tail stage count");
+    check(llama_region_ring_apply_topology_compatible(two_cycle_tail,48),
+          "two-cycle PC tail must be supported");
+    check(two_cycle_tail.back().device == llama_region_ring_device::GPU,
+          "PC GPU tail must be final owner");
+    check(llama_region_ring_layer_counts(two_cycle_tail) ==
+          std::array<int,3>{20,12,16},
+          "two-cycle PC tail device totals");
+    check(llama_region_ring_layout_string(two_cycle_tail) ==
+          "C6,G4,P8,C6,G4,P8,C8,G4",
+          "two-cycle tail Plan serialization");
+    const auto cpu_tail = llama_region_ring_parse(
+        "C6,G4,P8,C6,G4,P8,C12",48,true);
+    check(cpu_tail.back().device == llama_region_ring_device::CPU,
+          "CPU tail owner");
+    check(llama_region_ring_apply_topology_compatible(cpu_tail,48),
+          "CPU tail compatible");
+    const auto phone_last = llama_region_ring_parse(
+        "C7,G4,P5,C7,G4,P5,C8,G3,P5",48,true);
+    check(llama_region_ring_apply_topology_compatible(phone_last,48),
+          "original topology remains compatible");
+    bool legacy_rejected = false;
+    try {
+        (void) llama_region_ring_parse(
+            "C6,G4,P8,C6,G4,P8,C8,G4",48);
+    } catch (const std::exception &) {
+        legacy_rejected = true;
+    }
+    check(legacy_rejected,
+          "legacy fixed Ring must still reject PC tail");
+    bool invalid_rejected = false;
+    try {
+        (void) llama_region_ring_parse(
+            "C6,G4,P8,C6,G4,P8,G12",48,true);
+    } catch (const std::exception &) {
+        invalid_rejected = true;
+    }
+    check(invalid_rejected,
+          "general Ring must reject a tail without a CPU stage");
+}
+
 static void test_apply_safe_compatibility() {
     const auto baseline = llama_region_ring_parse("", 48);
     check(llama_region_ring_apply_safe_phone_shape(baseline),
@@ -465,6 +511,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_general_topology();
+        std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
         test_apply_safe_compatibility();
         std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
