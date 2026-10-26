@@ -22,9 +22,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 //
@@ -2742,6 +2744,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool isolate_device_resources,
         bool own_stage_resources,
         bool task_local_graph_outputs,
+        bool threaded_execution,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2832,6 +2835,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    // The worker variant requires all earlier ownership protections.
+    // In particular, no worker may run a graph without the Backend gate.
+    if (threaded_execution &&
+        (!device_fifo_simulation || !isolate_device_resources ||
+         !own_stage_resources || !task_local_graph_outputs)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_WORKERS] status=REJECT reason=OWNERSHIP_GUARDS_MISSING\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (task_local_graph_outputs) {
         // The schedulers still share the exact same backend instances.
         // Graph execution and threadpool selection must remain under
@@ -2904,6 +2917,197 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     size_t next_device = 0;
     const int64_t begin_us = ggml_time_us();
 
+    if (threaded_execution) {
+        // The device FIFO and the host slots are concurrent; the actual
+        // ggml_backend_t instances are not. Three real workers may claim and
+        // wait simultaneously, but only one may build/execute/synchronize a
+        // GGML graph at a time until Meta/CUDA/CPU backend state is separated.
+        struct ring_worker_state {
+            size_t          completed       = 0;
+            int64_t         ready_wait_us   = 0;
+            int64_t         backend_wait_us = 0;
+            int64_t         backend_exec_us = 0;
+            ggml_status     status          = GGML_STATUS_SUCCESS;
+            llm_graph_result * final_result = nullptr;
+        };
+        std::array<ring_worker_state, 3> worker_states;
+        const std::array<llama_region_ring_device, 3> devices = {
+            llama_region_ring_device::CPU,
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::PHONE,
+        };
+        auto run_worker = [&](size_t dev) {
+            auto & state = worker_states[dev];
+            const auto device = devices[dev];
+            const char * name = llama_region_ring_device_name(device);
+            bool worker_apply_mctx = false; // canonical KV ubatch was applied once above
+            std::optional<llama_region_ring_task> active_task;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_WORKER] device=%s event=START "
+                "scheduler=%p result=%p kv_view=%p\n",
+                name, (void *) ring_sched[dev], (void *) ring_res[dev],
+                (void *) worker_kv_views[dev].get());
+            try {
+                while (true) {
+                    const int64_t wait_begin_us = ggml_time_us();
+                    const auto next = ready.wait_take(device);
+                    state.ready_wait_us += ggml_time_us() - wait_begin_us;
+                    if (!next) {
+                        break; // all done, or cancelled by another worker
+                    }
+
+                    const auto task = *next;
+                    active_task = task;
+                    const bool first = task.region == 0;
+                    const bool last = task.region + 1 == stages.size();
+                    const auto & stage = stages[task.region];
+                    const size_t host_token_begin =
+                        (task.chunk % output_window) * (size_t) chunk_tokens;
+                    float * input = first ? nullptr :
+                        outputs[task.region - 1].data() + host_token_begin * n_embd;
+                    float * output = last ? nullptr :
+                        outputs[task.region].data() + host_token_begin * n_embd;
+
+                    int32_t block_outputs = 0;
+                    if (last) {
+                        for (int i = 0; i < task.n_tokens; ++i) {
+                            block_outputs += ubatch.output[task.token_begin + i] != 0;
+                        }
+                    }
+
+                    LLAMA_LOG_DEBUG(
+                        "[REGION_RING_WORKER] device=%s event=CLAIM "
+                        "region=%zu chunk=%zu tokens=%d\n",
+                        name, task.region, task.chunk, task.n_tokens);
+
+                    ggml_status task_status = GGML_STATUS_SUCCESS;
+                    llm_graph_result * task_result = nullptr;
+                    bool cancelled_before_compute = false;
+                    const int64_t backend_begin_us = ggml_time_us();
+                    {
+                        // Includes model.build_graph(), all input writes, CUDA,
+                        // Meta/RPC dispatch and the final scheduler synchronize.
+                        std::unique_lock<std::mutex> backend_lock(
+                            region_ring_backend_execution_mutex);
+                        state.backend_wait_us += ggml_time_us() - backend_begin_us;
+                        if (ready.failed()) {
+                            cancelled_before_compute = true;
+                        } else {
+                            const int64_t compute_begin_us = ggml_time_us();
+                            task_result = run_hybrid_stage_block(
+                                ubatch, stage, task.token_begin, task.n_tokens,
+                                input, output, gtype, worker_kv_views[dev].get(),
+                                ring_sched[dev], ring_res[dev],
+                                ubatch_id, task.region, task.chunk,
+                                llama_hybrid_boundary_action::PASS,
+                                block_outputs, worker_apply_mctx, true,
+                                task_status, nullptr, true);
+                            state.backend_exec_us += ggml_time_us() - compute_begin_us;
+                        }
+                    }
+                    // Do not publish a downstream READY while the producer's
+                    // graph or transfer is running. run_hybrid_stage_block()
+                    // already synchronizes both intermediate hidden copies
+                    // and final outputs before returning.
+                    if (cancelled_before_compute || task_result == nullptr ||
+                        task_status != GGML_STATUS_SUCCESS ||
+                        (last && task_result != res_use)) {
+                        state.status = task_status == GGML_STATUS_SUCCESS ?
+                            GGML_STATUS_FAILED : task_status;
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_WORKER] device=%s event=FAIL "
+                            "region=%zu chunk=%zu status=%d\n",
+                            name, task.region, task.chunk, (int) state.status);
+                        ready.fail(task);
+                        active_task.reset();
+                        break;
+                    }
+
+                    ready.complete(task);
+                    active_task.reset();
+                    ++state.completed;
+                    if (last) {
+                        state.final_result = task_result;
+                    }
+                    LLAMA_LOG_DEBUG(
+                        "[REGION_RING_WORKER] device=%s event=DONE "
+                        "region=%zu chunk=%zu completed=%zu\n",
+                        name, task.region, task.chunk, state.completed);
+                }
+            } catch (const std::exception & e) {
+                state.status = GGML_STATUS_FAILED;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_WORKER] device=%s event=EXCEPTION "
+                    "region=%zu chunk=%zu reason=%s\n",
+                    name, active_task ? active_task->region : stages.size(),
+                    active_task ? active_task->chunk : ready.n_chunks(),
+                    e.what());
+                ready.cancel();
+            } catch (...) {
+                state.status = GGML_STATUS_FAILED;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_WORKER] device=%s event=EXCEPTION reason=UNKNOWN\n",
+                    name);
+                ready.cancel();
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_WORKER_SUM] device=%s completed=%zu "
+                "ready_wait_ms=%.3f backend_wait_ms=%.3f backend_exec_ms=%.3f "
+                "status=%d\n",
+                name, state.completed,
+                state.ready_wait_us / 1000.0,
+                state.backend_wait_us / 1000.0,
+                state.backend_exec_us / 1000.0, (int) state.status);
+        };
+
+        std::vector<std::thread> workers;
+        bool launched_all = false;
+        try {
+            workers.reserve(devices.size());
+            for (size_t dev = 0; dev < devices.size(); ++dev) {
+                workers.emplace_back(run_worker, dev);
+            }
+            launched_all = true;
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_WORKERS] event=LAUNCH_FAIL reason=%s\n", e.what());
+            ready.cancel();
+        } catch (...) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_WORKERS] event=LAUNCH_FAIL reason=UNKNOWN\n");
+            ready.cancel();
+        }
+        const size_t created = workers.size();
+        size_t joined = 0;
+        for (auto & worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+                ++joined;
+            }
+        }
+        for (size_t dev = 0; dev < worker_states.size(); ++dev) {
+            executed += worker_states[dev].completed;
+            if (worker_states[dev].status != GGML_STATUS_SUCCESS &&
+                ret == GGML_STATUS_SUCCESS) {
+                ret = worker_states[dev].status;
+            }
+        }
+        result = worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
+        if (!launched_all || created != devices.size() ||
+            joined != devices.size() || ready.failed() || !ready.all_done() ||
+            result == nullptr || result != res_use) {
+            if (ret == GGML_STATUS_SUCCESS) {
+                ret = GGML_STATUS_FAILED;
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_WORKERS_SUM] created=%zu joined=%zu "
+            "finished=%zu completed=%zu backend_gate=GLOBAL "
+            "graph_overlap=0 final_owner=%s status=%s\n",
+            created, joined, ready.finished(), executed,
+            result == res_use && result != nullptr ? "MAIN" : "INVALID",
+            ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+    } else {
     while (!ready.all_done() && ret == GGML_STATUS_SUCCESS) {
         std::optional<llama_region_ring_task> next;
         if (device_fifo_simulation) {
@@ -3001,6 +3205,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             (ggml_time_us() - task_begin_us) / 1000.0,
             ready.finished());
     }
+    } // old serial/cooperative execution modes
     kv_mctx->clear_stage_range();
     if (task_local_graph_outputs) {
         const bool unchanged = n_outputs == (uint32_t) saved_outputs;
@@ -3033,6 +3238,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
         task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
         own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
         isolate_device_resources ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
@@ -4010,9 +4216,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1 && ring_exec != "ready" &&
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
+        ring_exec != "fifo-workers" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -4040,6 +4247,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo-isolated" ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
             ring_exec == "fifo-owned" ? "DEVICE_FIFO_OWNED_SIMULATION" :
             ring_exec == "fifo-state" ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
+            ring_exec == "fifo-workers" ? "DEVICE_FIFO_GATED_WORKERS" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5322,6 +5530,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-isolated = FIFO + separate CPU/GPU scheduler and graph states;
             // fifo-owned = per-worker KV views + gated backends + 2-slot credits;
             // fifo-state = explicit per-task graph output count; same Backend gate;
+            // fifo-workers = three real host threads, one shared Backend graph gate;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5338,11 +5547,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     mctx.get(), sched.get(), gf_res_prev.get(),
                     runtime_stages, ubatch_id,
                     ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
-                        ring_exec == "fifo-owned" || ring_exec == "fifo-state",
+                        ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
+                        ring_exec == "fifo-workers",
                     ring_exec == "fifo-isolated" || ring_exec == "fifo-owned" ||
-                        ring_exec == "fifo-state",
-                    ring_exec == "fifo-owned" || ring_exec == "fifo-state",
-                    ring_exec == "fifo-state", status);
+                        ring_exec == "fifo-state" || ring_exec == "fifo-workers",
+                    ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
+                        ring_exec == "fifo-workers",
+                    ring_exec == "fifo-state" || ring_exec == "fifo-workers",
+                    ring_exec == "fifo-workers", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
