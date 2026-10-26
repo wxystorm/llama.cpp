@@ -2363,6 +2363,26 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
+    if (model.hybrid_ring_plan_topology &&
+            stage.layer_end == (int) model.hparams.n_layer() &&
+            stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
+        // The last CPU/CUDA stage writes canonical logits. It must not
+        // schedule Meta/RPC work on a Phone graph that could still be
+        // executing from a detached upstream worker.
+        for (int split = 0; split < n_splits; ++split) {
+            const auto * target = ggml_backend_sched_get_split_backend(
+                sched_use,split);
+            if (ggml_backend_is_meta(
+                    const_cast<ggml_backend_t>(target))) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_FINAL_OWNER] stage=%zu "
+                    "status=REJECT reason=PC_TAIL_HAS_META_SPLIT\n",
+                    stage_index);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+    }
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     const bool detached_phone = pc_phone_overlap && phone_pc_gate != nullptr;
     if (detached_phone) {
