@@ -204,6 +204,55 @@ change. Build the PC and rerun the model. Verify both Phone regions,
 success nor performance improvement has yet been established by the
 previous failed run.
 
+## General-topology PC tail must own its output head (2026-10-27)
+
+An applied 8-Region Plan completed the P8 `l_out-17` bridge and
+progressed into GPU tail `[46,48)`, but then failed:
+
+```text
+[REGION_RING_PHONE_FUSION] event=OUTPUT_BRIDGE sg=16 layer=17 action=PASS_THROUGH status=READY
+[REGION_RING_FINAL_OWNER] stage=7 status=REJECT reason=PC_TAIL_HAS_META_SPLIT
+```
+
+Root cause: `llama_model_base::load_tensors()` historically placed
+**all Hybrid output weights** under Meta(CPU,RPC), regardless of the
+last Region's CPU/CUDA device. The final output-norm / LM-head graph
+therefore included Meta even though the last transformer layers were
+on the PC. In contrast, `apply-topology` explicitly uses a canonical
+PC-owned final output stage.
+
+Fix: only when `region_ring && hybrid_ring_plan_topology`, set
+`pimpl->dev_output = {cpu_dev, &pimpl->cpu_buft_list}`. CPU_DIRECT
+output ownership is deliberately conservative for both CPU and CUDA
+tails. It avoids unexpected GPU VRAM allocations from moving the
+large output projection to CUDA. Existing fixed Ring/Legacy Hybrid
+placements are unaffected.
+
+The final stage still verifies **every** scheduler split is non-Meta.
+No Meta/RPC split is silently allowed. After rebuilding the PC client,
+expect:
+
+```text
+[REGION_RING_OUTPUT_PLACEMENT] mode=APPLY_TOPOLOGY output=CPU_DIRECT ... meta_rpc=DISABLED status=READY
+[REGION_RING_FINAL_GRAPH] stage=7 layers=[46,48) cpu_splits=... gpu_splits=... meta_splits=0 output=CPU_DIRECT status=PC_ONLY_READY
+[REGION_RING_FINAL_OWNER] device=GPU region=7 ... result=MAIN status=READY
+```
+
+`device=GPU` describes the tail **Region worker**; the final output
+projection actually runs on CPU_DIRECT. A CUDA-placed output head
+would require an explicit GPU-memory-aware Plan and is deferred.
+
+The previously observed `REGION_RING_BACKEND_SPLIT` output also showed
+CPU regions borrowing CUDA compute due to scheduler offload. That
+is a separate performance/ownership optimization, not this output
+placement bug.
+
+Correctness of final logits / Decode and an actual successful Prefill
+remain **unverified** after this change. Rebuild PC from the new
+commit, retain a working RPC patch-18 Phone, and compare final output
+against the fixed layout only after all 48 Region×Chunk tasks (for an
+8-Region layout with six chunks) complete.
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
