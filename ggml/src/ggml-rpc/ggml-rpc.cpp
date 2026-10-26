@@ -5714,6 +5714,30 @@ bool rpc_server::phone_ring_input_ready(
             (request.first_layer != 11 && request.first_layer != 27)) {
         return true;
     }
+    // Do not acknowledge a READY for an unknown graph or one whose first
+    // and final layer markers disagree with the guarded five-layer Region.
+    // The PC pre-registers this graph; the Phone never infers it from a
+    // partial input transfer.
+    {
+        std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
+        const auto it = stored_graphs[request.device].find(request.graph_uid);
+        if (it == stored_graphs[request.device].end() ||
+                it->second.graph == nullptr ||
+                it->second.graph->n_nodes < 10) {
+            return true;
+        }
+        const ggml_cgraph * g = it->second.graph;
+        char begin[32], end[32];
+        std::snprintf(begin, sizeof(begin), "norm-%u", request.first_layer);
+        std::snprintf(end, sizeof(end), "ffn_moe_out-%u",
+                      request.first_layer + 4);
+        if (g->nodes[0] == nullptr || g->nodes[g->n_nodes - 1] == nullptr ||
+                std::strcmp(g->nodes[0]->name, begin) != 0 ||
+                std::strcmp(g->nodes[g->n_nodes - 1]->name, end) != 0) {
+            return true;
+        }
+    }
+
     rpc_phone_region_local_task task;
     task.ring_auto = true;
     task.ring_device = request.device;
