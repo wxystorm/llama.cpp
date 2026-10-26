@@ -329,6 +329,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n");
             return {-1,nullptr};
         }
+        if (ring_plan_apply_safe) {
+            const char * ring_exec =
+                std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+            if (ring_exec == nullptr ||
+                    std::strcmp(ring_exec,"fifo-pc-phone") != 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                    "reason=REQUIRES_FIFO_PC_PHONE_RUNTIME\n");
+                return {-1,nullptr};
+            }
+        }
         const bool ring_planner_profile_requested =
             params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
             llama_region_ring_enabled() &&
