@@ -3002,11 +3002,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ready.finished());
     }
     kv_mctx->clear_stage_range();
-    if (task_local_graph_outputs && n_outputs != (uint32_t) saved_outputs) {
+    if (task_local_graph_outputs) {
+        const bool unchanged = n_outputs == (uint32_t) saved_outputs;
         LLAMA_LOG_ERROR(
-            "[REGION_RING_TASK_STATE] status=FAIL reason=SHARED_OUTPUTS_CHANGED "
-            "expected=%d actual=%u\n", saved_outputs, n_outputs);
-        ret = GGML_STATUS_FAILED;
+            "[REGION_RING_TASK_STATE_SUM] tasks=%zu "
+            "task_outputs=EXPLICIT context_outputs_unchanged=%d "
+            "final_graph=MAIN backend=SHARED_GATED status=%s\n",
+            executed, unchanged ? 1 : 0,
+            unchanged ? "PASS" : "FAIL");
+        if (!unchanged) {
+            ret = GGML_STATUS_FAILED;
+        }
     }
     n_outputs = saved_outputs;
     if (own_stage_resources) {
