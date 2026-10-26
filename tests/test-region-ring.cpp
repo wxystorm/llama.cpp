@@ -1,66 +1,129 @@
 #include "llama-region-ring.h"
 
-#include <array>
-#include <cassert>
+#include <cstdio>
+#include <exception>
 #include <stdexcept>
 #include <vector>
 
-int main() {
-    const auto regions = llama_region_ring_parse("", 48);
-    assert(regions.size() == 9);
-    const auto counts = llama_region_ring_layer_counts(regions);
-    assert(counts[0] == 22 && counts[1] == 11 && counts[2] == 15);
-    assert(regions[0].layer_begin == 0 && regions[0].layer_end == 7);
-    assert(regions[8].layer_begin == 43 && regions[8].layer_end == 48);
-
-    for (const auto & bad : {"C7,G4,P5,C7,G4,P5,C8,G3,P6",
-                            "C7,P4,G5,C7,G4,P5,C8,G3,P5",
-                            "C7,G4,P5,C7,G4,P5,C8,G3",
-                            "C7,G4,P5,C7,G4,P5,C8,G3,P5,"}) {
-        bool rejected = false;
-        try { llama_region_ring_parse(bad, 48); }
-        catch (const std::runtime_error &) { rejected = true; }
-        assert(rejected);
+// Never use assert() here: CTest runs this test in Release and NDEBUG
+// removes all assertions, potentially hiding broken scheduler invariants.
+static void check(bool condition, const char * message) {
+    if (!condition) {
+        throw std::runtime_error(message);
     }
+}
 
+static void check_rejected(const char * layout) {
+    bool rejected = false;
+    try {
+        llama_region_ring_parse(layout, 48);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected, "invalid layout was accepted");
+}
+
+static void test_layout() {
+    const auto regions = llama_region_ring_parse("", 48);
+    check(regions.size() == 9, "default region count should be 9");
+
+    const auto counts = llama_region_ring_layer_counts(regions);
+    check(counts[0] == 22 && counts[1] == 11 && counts[2] == 15,
+          "default device layer counts do not match C22/G11/P15");
+    check(regions.front().layer_begin == 0 &&
+          regions.front().layer_end == 7, "default first region is incorrect");
+    check(regions.back().layer_begin == 43 &&
+          regions.back().layer_end == 48, "default last region is incorrect");
+
+    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P6");
+    check_rejected("C7,P4,G5,C7,G4,P5,C8,G3,P5");
+    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3");
+    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P5,");
+
+    // Verify the proposed two-cycle A/B layout as well.
+    const auto alternative =
+        llama_region_ring_parse("C11,G6,P7,C11,G5,P8", 48);
+    const auto other_counts = llama_region_ring_layer_counts(alternative);
+    check(alternative.size() == 6, "two-cycle layout region count");
+    check(other_counts[0] == 22 && other_counts[1] == 11 &&
+          other_counts[2] == 15, "two-cycle layout device totals");
+}
+
+static void test_dependencies() {
+    const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 128);
-    assert(ready.n_chunks() == 3);
-    assert(ready.n_regions() == 9);
+    check(ready.n_chunks() == 3, "358 tokens must form 3 chunks");
+    check(ready.n_regions() == 9, "expected 9 regions");
 
-    std::vector<std::vector<int>> finished(
-        9, std::vector<int>(3, 0));
-    size_t popped = 0;
+    std::vector<std::vector<int>> finished(9, std::vector<int>(3, 0));
+    size_t completed = 0;
     while (ready.has_ready()) {
         const auto job = ready.take();
-        assert(job);
-        assert(job->token_begin == (int) job->chunk * 128);
-        assert(job->n_tokens == (job->chunk == 2 ? 102 : 128));
+        check(job.has_value(), "has_ready but take returned no task");
+        check(job->region < finished.size() &&
+              job->chunk < finished[job->region].size(),
+              "queued task has an out-of-bounds region or chunk");
+        check(job->token_begin == (int) job->chunk * 128,
+              "task token offset is wrong");
+        check(job->n_tokens == (job->chunk == 2 ? 102 : 128),
+              "task chunk size is wrong");
         if (job->region > 0) {
-            assert(finished[job->region - 1][job->chunk] == 1);
+            check(finished[job->region - 1][job->chunk] == 1,
+                  "downstream region ran before upstream completed");
         }
         if (job->chunk > 0) {
-            assert(finished[job->region][job->chunk - 1] == 1);
+            check(finished[job->region][job->chunk - 1] == 1,
+                  "KV chunk was scheduled out of order");
         }
-        assert(finished[job->region][job->chunk] == 0);
+        check(finished[job->region][job->chunk] == 0,
+              "task was scheduled more than once");
         finished[job->region][job->chunk] = 1;
         ready.complete(*job);
-        ++popped;
+        ++completed;
     }
-    assert(popped == 27);
-    assert(ready.all_done());
-    assert(!ready.take());
+    check(completed == 27, "9 regions x 3 chunks should execute 27 tasks");
+    check(ready.all_done(), "scheduler drained before all tasks completed");
+    check(!ready.take().has_value(), "scheduler returned a task after drain");
+}
 
-    // A region must not release its second chunk before the first completes.
-    llama_region_ring_ready one(regions, 256, 128);
-    const auto first = one.take();
-    assert(first && first->region == 0 && first->chunk == 0);
-    assert(!one.has_ready());
-    one.complete(*first);
-    assert(one.queue_size(llama_region_ring_device::CPU) == 1);
-    assert(one.queue_size(llama_region_ring_device::GPU) == 1);
-    bool duplicate_rejected = false;
-    try { one.complete(*first); }
-    catch (const std::runtime_error &) { duplicate_rejected = true; }
-    assert(duplicate_rejected);
-    return 0;
+static void test_duplicate_completion() {
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 256, 128);
+    const auto first = ready.take();
+    check(first.has_value(), "first task was not available");
+    check(first->region == 0 && first->chunk == 0,
+          "unexpected first task");
+    check(!ready.has_ready(), "another task became ready too early");
+    ready.complete(*first);
+    check(ready.queue_size(llama_region_ring_device::CPU) == 1,
+          "CPU chunk 1 was not queued");
+    check(ready.queue_size(llama_region_ring_device::GPU) == 1,
+          "GPU chunk 0 was not queued");
+    bool rejected = false;
+    try {
+        ready.complete(*first);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected, "duplicate task completion was accepted");
+}
+
+int main() {
+    std::fprintf(stderr, "[REGION_RING_TEST] begin\n");
+    try {
+        test_layout();
+        std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_dependencies();
+        std::fprintf(stderr, "[REGION_RING_TEST] dependencies=PASS\n");
+        test_duplicate_completion();
+        std::fprintf(stderr, "[REGION_RING_TEST] duplicate=PASS\n");
+        std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
+        return 0;
+    } catch (const std::exception & e) {
+        std::fprintf(stderr, "[REGION_RING_TEST] status=FAIL reason=%s\n", e.what());
+        return 1;
+    } catch (...) {
+        std::fprintf(stderr, "[REGION_RING_TEST] status=FAIL reason=unknown exception\n");
+        return 1;
+    }
 }
