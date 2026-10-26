@@ -456,7 +456,7 @@ inline supported_result search_supported_fixed_phone(
         int chunk_tokens) {
     supported_result result;
     if (!llama_region_ring_apply_safe_phone_shape(baseline) ||
-            m.layers != 48 || m.tokens <= 0 || chunk_tokens <= 0 ||
+            m.layers != 48 || m.tokens <= 0 || chunk_tokens != 64 ||
             m.window != 2 || !m.pc_compute_gate) {
         return result;
     }
