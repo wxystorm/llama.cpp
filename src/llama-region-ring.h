@@ -97,8 +97,18 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
                std::isspace((unsigned char) layout[pos])) {
             ++pos;
         }
-        if (pos < layout.size() && layout[pos++] != ',') {
+        // Reaching the end after a valid region is normal. Only treat the
+        // end as a trailing comma if we actually consumed a separator.
+        if (pos == layout.size()) {
+            break;
+        }
+        if (layout[pos] != ',') {
             throw std::runtime_error("region ring stages must be comma-separated");
+        }
+        ++pos;
+        while (pos < layout.size() &&
+               std::isspace((unsigned char) layout[pos])) {
+            ++pos;
         }
         if (pos == layout.size()) {
             throw std::runtime_error("trailing comma in region ring");
