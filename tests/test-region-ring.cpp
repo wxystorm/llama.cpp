@@ -39,6 +39,10 @@ static void test_layout() {
     check_rejected("C7,P4,G5,C7,G4,P5,C8,G3,P5");
     check_rejected("C7,G4,P5,C7,G4,P5,C8,G3");
     check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P5,");
+    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P5, ");
+    const auto spaced =
+        llama_region_ring_parse(" C7, G4, P5, C7, G4, P5, C8, G3, P5  ", 48);
+    check(spaced.size() == 9, "valid layout with spaces was rejected");
 
     // Verify the proposed two-cycle A/B layout as well.
     const auto alternative =
