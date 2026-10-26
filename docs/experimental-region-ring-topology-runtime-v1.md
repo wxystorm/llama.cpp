@@ -303,6 +303,52 @@ Select-String -Path ".\\ring-pc-full.log" `
 
 No phone server rebuild is required for these PC-only diagnostics.
 
+## Phone chunk 3 intermediate output shape diagnostic (2026-10-27)
+
+An 8-stage `C6,G4,P8,C6,G4,P8,C8,G4` Prefill run with 358 tokens
+completed the Phone P8 compute and `OUTPUT_WAIT status=OK`, then failed
+on the **first Phone region**, stage 2, chunk 3:
+
+```text
+[REGION_RING_STAGE_FAIL] phase=OUTPUT_COPY stage=2 device=PHONE layers=[10,18) chunk=3 tokens=64 detached_phone=1 status=-1
+[REGION_RING_SUM] ... regions=8 chunks=6 executed=23 complete=0 status=-1
+```
+
+This is **not** a GPU output-head error. Code inspection confirms
+`copy_hybrid_stage_output()` returns false only if
+`res->get_stage_output()` is absent, not F32, not contiguous, or does
+not match the required `[n_embd,n_tokens]` 2D shape. The actual
+`ggml_backend_tensor_get()` happens *after* this check, so no
+evidence currently shows a failed data copy or a failed Phone RPC
+graph. It is unsafe to relax these shape checks without identifying
+the mismatch.
+
+This revision logs:
+
+- `[REGION_RING_STAGE_OUTPUT] phase=PRE_COMPUTE`: Phone result pointer,
+  tensor pointer, type, shape, contiguity **before** detached execution
+- `phase=POST_COMPUTE`: the same after all Phone completion waits,
+  with `metadata_changed=1` if fields/pointer changed
+- `[REGION_RING_OUTPUT_COPY_REJECT]`: precise failure reason, actual
+  `ne[0..3]`, strides, buffer/data pointers and expected shape
+
+If PRE and POST differ, investigate graph ownership and metadata
+lifetime while the Phone worker runs concurrently with PC workers.
+If both are invalid in exactly the same way, investigate Qwen3 MoE
+Stage output graph construction and output pruning instead.
+
+Rebuild only the PC executable, then capture both stdout and stderr
+in one log. Suggested PowerShell command to filter it:
+
+```powershell
+Select-String -Path ".\\region-pair.log" -Pattern 'REGION_RING_STAGE_OUTPUT|REGION_RING_OUTPUT_COPY_REJECT|REGION_RING_STAGE_FAIL|PHONE_RING_AUTO.*OUTPUT_WAIT|REGION_RING_SUM' |
+    ForEach-Object { $_.Line }
+```
+
+These extra checks do not alter Phone Graph execution or Relax CPU/Phone
+buffer ownership. PC and Phone RPC patch remain unchanged. **No complete
+Prefill or numerical parity validation has been claimed.**
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
