@@ -1,4 +1,5 @@
 #include "llama-hybrid.h"
+#include "llama-region-ring.h"
 
 #include "../ggml/src/ggml-impl.h"
 #include "ggml-backend.h"
@@ -8007,6 +8008,17 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
+    if (llama_region_ring_enabled()) {
+        const auto counts = llama_region_ring_layer_counts(
+            llama_region_ring_from_env(profile.n_layer));
+        constraints.fixed_tensor_layers = 0;
+        constraints.fixed_pc_layers = counts[0] + counts[1];
+        constraints.fixed_phone_layers = counts[2];
+        constraints.fixed_gpu_pc_layers = counts[1];
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_FIXED] cpu=%d gpu=%d phone=%d tensor=0\n",
+            counts[0], counts[1], counts[2]);
+    }
     if (const char * value =
             std::getenv("LLAMA_HYBRID_FIXED_TENSOR_LAYERS")) {
         char * end = nullptr;
