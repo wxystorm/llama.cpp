@@ -13579,6 +13579,26 @@ if (phone_status != GGML_STATUS_SUCCESS) {
          std::strcmp(ring_fuse, "probe") == 0);
     const bool ring_phone_fusion_probe =
         ring_phone_fusion && std::strcmp(ring_fuse, "probe") == 0;
+    // The model-owned mask is present only for opt-in variable-topology
+    // plans. Legacy P5 fusion retains its strict fixed-layout behavior.
+    const bool ring_phone_dynamic =
+        ring_phone_fusion && !backend_ctx->ring_phone_layer_mask.empty();
+    auto ring_phone_range = [&](int layer, int & begin, int & end) -> bool {
+        const auto & mask = backend_ctx->ring_phone_layer_mask;
+        if (!ring_phone_dynamic || layer < 0 ||
+                (size_t) layer >= mask.size() || mask[(size_t) layer] == 0) {
+            return false;
+        }
+        begin = layer;
+        end = layer + 1;
+        while (begin > 0 && mask[(size_t) begin - 1] == 1) {
+            --begin;
+        }
+        while ((size_t) end < mask.size() && mask[(size_t) end] == 1) {
+            ++end;
+        }
+        return end > begin && end < (int) mask.size();
+    };
     const char * ring_auto_env =
         std::getenv("GGML_META_RING_PHONE_AUTOSTART");
     const bool ring_phone_autostart =
@@ -13742,11 +13762,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         // A PC-only/partial operation remains a hard rejection. Do not
         // mutate either graph's flags: the terminal l_out bridge still needs
         // the original PC-side producer-disable and Phone->PC copy path.
-        const bool validated_ring_p5_layer =
-            (ffn_layer >= 11 && ffn_layer <= 15) ||
-            (ffn_layer >= 27 && ffn_layer <= 31);
-        if (ring_phone_fusion && !validated_ring_p5_layer) {
-            return reject("RING_P5_LAYER_NOT_VALIDATED");
+        int region_begin = -1;
+        int region_end = -1;
+        const bool validated_ring_layer = ring_phone_dynamic ?
+            ring_phone_range(ffn_layer,region_begin,region_end) :
+            ((ffn_layer >= 11 && ffn_layer <= 15) ||
+             (ffn_layer >= 27 && ffn_layer <= 31));
+        if (ring_phone_fusion && !validated_ring_layer) {
+            return reject(ring_phone_dynamic ?
+                "RING_PLAN_PHONE_LAYER_OUTSIDE_MASK" :
+                "RING_P5_LAYER_NOT_VALIDATED");
         }
         for (size_t sg = i; sg <= i + 1; ++sg) {
             ggml_cgraph * phone =
@@ -13807,10 +13832,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 std::getenv("LLAMA_HYBRID_REGION_RING_V1");
             const char * exit_fix =
                 std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
-            // The mirror-flag exception is only proven for this Region Ring
-            // layout and its exact terminal l_out handoff behavior.
-            if (layout == nullptr ||
-                    std::strcmp(layout, "C7,G4,P5,C7,G4,P5,C8,G3,P5") != 0 ||
+            // Dynamic mode uses model-owned Phone spans, not a mutable
+            // layout environment variable. Preserve the old strict P5 guard.
+            if ((!ring_phone_dynamic &&
+                 (layout == nullptr ||
+                  std::strcmp(layout, "C7,G4,P5,C7,G4,P5,C8,G3,P5") != 0)) ||
                     ring_enabled == nullptr || std::atoi(ring_enabled) == 0 ||
                     exit_fix == nullptr || std::atoi(exit_fix) == 0) {
                 if (reason != nullptr) {
@@ -13835,8 +13861,22 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return false;
         }
 
+        int planned_begin = -1;
+        int planned_end = -1;
+        if (ring_phone_dynamic &&
+                (!ring_phone_range(layer,planned_begin,planned_end) ||
+                 layer != planned_begin)) {
+            if (reason != nullptr) {
+                *reason = "RING_PLAN_PHONE_START_MISMATCH";
+            }
+            if (failed_sg != nullptr) {
+                *failed_sg = start;
+            }
+            return false;
+        }
         if (ring_phone_fusion &&
-                (start != 0 || (layer != 11 && layer != 27))) {
+                (start != 0 ||
+                 (!ring_phone_dynamic && layer != 11 && layer != 27))) {
             if (reason != nullptr) {
                 *reason = "RING_P5_START_NOT_VALIDATED";
             }
@@ -13874,11 +13914,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             end = next + 1;
         }
         if (ring_phone_fusion) {
-            // Only a complete five-layer P5 may enter fused execution.
-            if (last_layer - first_layer + 1 != 5 ||
-                    end - start + 1 != 10) {
+            const int expected_layers = ring_phone_dynamic ?
+                planned_end - planned_begin : 5;
+            // Never fuse across a missing/mixed-owner Meta subgraph. The
+            // final l_out must still be outside this fused compute graph.
+            if (last_layer - first_layer + 1 != expected_layers ||
+                    end - start + 1 != (size_t) (2 * expected_layers)) {
                 if (reason != nullptr && reason->empty()) {
-                    *reason = "PARTIAL_FIVE_LAYER_REGION";
+                    *reason = ring_phone_dynamic ?
+                        "PARTIAL_PLAN_PHONE_REGION" :
+                        "PARTIAL_FIVE_LAYER_REGION";
                 }
                 return false;
             }
@@ -15551,11 +15596,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         size_t i = region_pipeline_active ?
             region_pipe_schedule[schedule_pos].sg : schedule_pos;
         if (ring_phone_autostart && !pending_ring_auto_outputs.empty()) {
-            for (int terminal_layer : { 15, 31 }) {
-                const auto pending =
-                    pending_ring_auto_outputs.find(terminal_layer);
-                if (pending == pending_ring_auto_outputs.end() ||
-                        !subgraph_is_exact_l_out_bridge(i, terminal_layer)) {
+            for (auto pending = pending_ring_auto_outputs.begin();
+                    pending != pending_ring_auto_outputs.end();) {
+                const int terminal_layer = pending->first;
+                if ((!ring_phone_dynamic &&
+                     terminal_layer != 15 && terminal_layer != 31) ||
+                        !subgraph_is_exact_l_out_bridge(i,terminal_layer)) {
+                    ++pending;
                     continue;
                 }
                 // This is a real input dependency for l_out, not a per-layer
@@ -15570,7 +15617,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 if (!ok) {
                     return GGML_STATUS_FAILED;
                 }
-                pending_ring_auto_outputs.erase(pending);
+                pending = pending_ring_auto_outputs.erase(pending);
             }
         }
         int pipeline_chunk = -1;
@@ -18375,7 +18422,8 @@ auto prefill_norm_sg_has_prework =
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
                 !ring_phone_autostart &&
-                phone_block_last_layer - first_fused_layer + 1 == 5) {
+                (ring_phone_dynamic ||
+                 phone_block_last_layer - first_fused_layer + 1 == 5)) {
             printf("[REGION_RING_PHONE_FUSION] event=SUBMIT sg=%zu..%zu "
                    "layers=[%d,%d) meta_sgs=%zu rpc_graphs=1 nodes=%d "
                    "pc_shadow_compute=%zu uid=%" PRIu64 " status=READY\n",
@@ -18683,7 +18731,8 @@ auto prefill_norm_sg_has_prework =
         } else {
             if (ring_phone_autostart && phone_block_fused &&
                     !phone_region_fused &&
-                    (first_fused_layer == 11 || first_fused_layer == 27)) {
+                    (ring_phone_dynamic ||
+                     first_fused_layer == 11 || first_fused_layer == 27)) {
                 // The final input copy is already complete by this stage.
                 // Fence across RPC transfer/compute sockets before publishing
                 // READY so the server never reads partially written buffers.
@@ -19033,7 +19082,8 @@ auto prefill_norm_sg_has_prework =
         }
         if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
                 !ring_phone_autostart &&
-                phone_block_last_layer - first_fused_layer + 1 == 5) {
+                (ring_phone_dynamic ||
+                 phone_block_last_layer - first_fused_layer + 1 == 5)) {
             printf("[REGION_RING_PHONE_FUSION] event=DONE sg=%zu..%zu "
                    "layers=[%d,%d) submit_ms=%.3f "
                    "status=%d\n",
