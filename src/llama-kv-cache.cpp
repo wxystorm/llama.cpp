@@ -2534,11 +2534,17 @@ bool llama_kv_cache_context::next() {
         return false;
     }
 
+    stage_batch_applied = false;
     return true;
 }
 
 bool llama_kv_cache_context::apply() {
     assert(!llama_memory_status_is_fail(status));
+    // A stage view is read-only with respect to ubatch slot assignment.
+    // Calling apply() on multiple worker views would race on shared KV cells.
+    if (stage_only_view) {
+        return false;
+    }
 
     // no ubatches -> this is a KV cache update
     if (ubatches.empty()) {
@@ -2549,6 +2555,7 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+    stage_batch_applied = true;
 
     return true;
 }
@@ -2687,6 +2694,19 @@ bool llama_kv_cache_context::set_stage_range(size_t ubatch_index, uint32_t token
 void llama_kv_cache_context::clear_stage_range() {
     has_stage_sinfo = false;
     stage_sinfo.clear();
+}
+
+std::unique_ptr<llama_kv_cache_context> llama_kv_cache_context::make_stage_view() const {
+    if (!stage_batch_applied || ubatches.empty() || i_cur >= sinfos.size()) {
+        return nullptr;
+    }
+    // Copy only metadata (including slot indices and ubatch descriptors).
+    // The underlying KV tensors and their allocator remain shared and are
+    // protected by per-layer KV ordering and the experimental backend gate.
+    auto view = std::unique_ptr<llama_kv_cache_context>(new llama_kv_cache_context(*this));
+    view->stage_only_view = true;
+    view->clear_stage_range();
+    return view;
 }
 
 const llama_kv_cache::slot_info & llama_kv_cache_context::current_sinfo() const {

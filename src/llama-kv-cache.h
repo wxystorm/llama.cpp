@@ -5,6 +5,7 @@
 #include "llama-kv-cells.h"
 #include "llama-memory.h"
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -408,6 +409,11 @@ public:
     bool set_stage_range(size_t ubatch_index, uint32_t token_begin, uint32_t n_tokens);
     void clear_stage_range();
 
+    // Duplicate mutable stage-range metadata AFTER the parent has applied the
+    // ubatch to KV once. The returned view shares the underlying KV storage,
+    // but cannot apply or update it. One view is owned by each device worker.
+    std::unique_ptr<llama_kv_cache_context> make_stage_view() const;
+
 private:
     llama_memory_status status;
 
@@ -433,6 +439,8 @@ private:
 
     llama_kv_cache::slot_info stage_sinfo;
     bool                      has_stage_sinfo = false;
+    bool                      stage_batch_applied = false;
+    bool                      stage_only_view = false;
 
     std::vector<llama_ubatch> ubatches;
 
