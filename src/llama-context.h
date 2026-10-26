@@ -352,6 +352,16 @@ private:
                                       int                                             ubatch_id,
                                       ggml_status &                                   ret);
 
+    llm_graph_result * process_ubatch_region_ring(
+                                       const llama_ubatch &                            ubatch,
+                                       llm_graph_type                                  gtype,
+                                       llama_memory_context_i *                       mctx,
+                                       ggml_backend_sched_t                           sched_use,
+                                       llm_graph_result *                             res_use,
+                                       const std::vector<llama_hybrid_runtime_stage> & stages,
+                                       int                                             ubatch_id,
+                                       ggml_status &                                   ret);
+
     bool run_hybrid_wave_probe(
                                       uint32_t                          probe_tokens,
                                       int                               probe_layers,
