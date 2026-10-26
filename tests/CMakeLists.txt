@@ -327,6 +327,16 @@ find_package(Threads REQUIRED)
 target_link_libraries(test-region-ring PRIVATE Threads::Threads)
 llama_test(test-region-ring)
 
+# Standalone dry-run Planner: no model/backend dependencies.
+add_executable(test-region-ring-planner test-region-ring-planner.cpp)
+set_target_properties(test-region-ring-planner PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+target_include_directories(test-region-ring-planner PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-region-ring-planner)
+
+
 llama_build_and_test(test-meta-return-stall-profile.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
