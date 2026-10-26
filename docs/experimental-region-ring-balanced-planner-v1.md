@@ -4,15 +4,48 @@ Status: design specification / implementation roadmap. **No planner code is enab
 
 ## 1. Design objective
 
-Optimize a **whole finite Prefill** rather than one isolated Chunk. Each cycle has consecutive CPU (C), CUDA (G), Phone GPU (P) Regions; independent device workers can pipeline adjacent token intervals. A balanced cycle does not require equal layer counts, and even equal single-Chunk Region time may not minimize fill+drain, communication and Window=2 stalls.
+**Primary idea:** each C→G→P cycle is a two-sided producer/consumer pipeline. Balance the rate at which PC (CPU+CUDA) produces a Chunk for Phone against the rate at which Phone processes and returns one to PC for the next cycle. Use measured per-layer/per-Chunk Profile costs and interpolation, then minimize the wall time of the **entire finite Prefill**. Equal layer counts or exactly equal single-task times are not themselves the objective.
+
+Different token intervals can run concurrently on CPU, CUDA and Phone. Balance is an efficient coarse search filter; the full simulation must include pipeline fill/drain, Window=2 stalls, network direction sharing, actual CPU/CUDA overlap and graph registration.
 
 Known 48-layer reference: `C7,G4,P5,C7,G4,P5,C8,G3,P5` (three cycles of 16 layers), common `X=64`, 358 tokens producing 6 Chunks and 54 Region tasks, Window=2. Phone fusion/autostart currently validates only L11–15 and L27–31; L43–47 remains conservative legacy execution.
 
 The planner jointly chooses:
-* per-cycle contiguous layer counts `(C_i,G_i,P_i)` with `C_i+G_i+P_i=16` in the initial search, each count positive, and all 48 layers covered in order;
+* the **number of complete C→G→P cycles**, and (initially repeated or near-repeated) per-cycle contiguous layer counts `(C_i,G_i,P_i)`; **do not require `C_i+G_i+P_i=16`**. All model layers are covered by cycles plus an optional PC-only suffix `C_tail/G_tail`. The full 48-layer constraint is `Σ_i(C_i+G_i+P_i)+C_tail+G_tail=48`;
 * independent `X_CPU`, `X_GPU`, `X_PHONE` Chunk token sizes, optionally per cycle later;
 * Token partitions, output-slot/credit requirements and reusable Phone Graph shape/slot/KV keys;
 * predicted full-Prefill makespan, resource occupancy, memory peak and transfer/registration cost.
+
+### 1.1. Producer/consumer throughput balance
+
+Let `T_C(C,x,K)`, `T_G(G,x,K)`, `T_P(P,x,K)` be the measured/interpolated times to execute the CPU, CUDA, Phone portions for query Chunk size `x` and KV length `K`. Let `D_CP(x)` and `D_PC(x)` be the C2P/P2C transfer costs, including genuine input-ready fencing where applicable.
+
+For **identical Chunk sizes** and limited overlap, the user's coarse cycle-balance equation is:
+
+`T_C(C,x,K) + T_G(G,x,K) + D_CP(x) ≈ T_P(P,x,K) + D_PC(x)`.
+
+For **different Chunk sizes**, compare effective time per token, not raw milliseconds:
+
+`s_C=T_C(C,X_C,K)/X_C`, `s_G=T_G(G,X_G,K)/X_G`, `s_P=T_P(P,X_P,K)/X_P`,
+`d_CP=D_CP(q)/q`, `d_PC=D_PC(q)/q`, for a common token reference interval `q` or by summing exact interval transfers.
+
+A simple sequential PC-side filter is `s_PC_seq=s_C+s_G+d_CP` vs `s_PHONE=s_P+d_PC`. If separate CPU/CUDA workers truly overlap processing **different Chunks**, a throughput-oriented PC estimate can approach `max(s_C,s_G)+d_CP`. The estimator must identify the actual PC gate/overlap from profiling; neither expression can be blindly treated as final makespan.
+
+- `s_PC >> s_PHONE`: PC is slower; Phone queue starves. Consider shifting eligible work from CPU/CUDA to Phone, or adjusting sizes.
+- `s_PC << s_PHONE`: Phone is slower; PC builds a queue, Window credits eventually block. Consider shifting eligible work from Phone to CPU/CUDA or selecting more efficient Phone Chunk sizes.
+- `s_PC ≈ s_PHONE`: viable steady-state balance, but still check network and finite-prompt fill/drain.
+
+Reverse flow is not a second independent throughput target: the Phone's output rate into the next PC cycle is constrained by the same token interval dependencies. The shared Wi-Fi path can become a third bottleneck, especially when C2P and P2C contend. Use **actual two-way network measurements** instead of treating their byte-transfer times as fully independent.
+
+For the whole multi-cycle Ring, CPU, CUDA, Phone and transfers are reused by all cycles. A necessary long-run lower bound on per-token initiation interval is approximately the **maximum of aggregate per-device/per-link service demand**, not merely the sum within one cycle. Use the interval-DAG simulator for the final score.
+
+### 1.2. Remaining layers are PC-owned
+
+Search `N` near-identical balanced cycles first. If the model's `n_layer` is not divisible by their total cycle width, **assign the remainder to a PC-only tail**, choosing CPU and/or CUDA by Profile and memory feasibility. The final layout can be `[C,G,P]×N → [C_tail,G_tail]`; a tail of zero layers is allowed.
+
+Example only, not a predicted optimum: three `C7,G4,P4` cycles cover 45 of 48 layers; the remaining 3 may run on PC. Do **not** silently extend Phone P or stretch the final cycle simply to consume the remainder.
+
+The PC tail adds final latency and consumes memory/bandwidth. Its own cost must be included in full-Prefill score. The final Phone→PC boundary is still needed to feed that suffix; the suffix must own final logits. The current Ring parser requires complete C/G/P cycles and the isolated scheduler expects a final Phone owner, so **tail execution remains DRY_RUN until parser, stage-output and final-logit ownership are generalized and parity-tested**.
 
 Do **not** apply altered Phone layer boundaries until arbitrary P-region Graph fusion, Phone READY registration and final output ownership have been generalized. The original P5 endpoints are hard-coded safety guards today.
 
@@ -35,7 +68,11 @@ Initial coarse X candidates (anchors, not choices made in advance):
 * Refine promising cases with `{48,96}`, balanced tails and measured interpolation uncertainty.
 * For 358 tokens, consider the 38-token tail under 64 and avoid an unhelpful 6-token tail under 32 by validated bounded tail coalescing.
 
-Layer search first compares per-cycle partitions near the known reference, e.g. `C7,G4,P5` vs `C6,G5,P5`; broader `P4/P6` alternatives are **score-only** until they can use a genuinely dynamic Phone graph identity/ownership path. Candidate P placements must satisfy weight residency, Phone memory and graph correctness constraints, not just predicted compute speed.
+Layer search should **not** be limited to a 16-layer sum per loop. Stage 1 enumerates candidate repeated `(C,G,P)` widths and cycle counts `N`, computes any remaining layers as a PC suffix, and ranks coarse candidates by their producer/consumer **per-token rate mismatch** and feasibility. Stage 2 refines near-repeated per-cycle counts, Chunk sizes and tail CPU/CUDA split using the finite-Prefill DAG simulator.
+
+Known-good `C7,G4,P5` vs alternative `C6,G5,P5`, `C7,G4,P4` etc. are only search examples. Moving any P endpoints or enabling a PC tail is **score-only** until generalized graph ownership and final-output runtime guards pass.
+
+Early pruning: both rate estimates finite and supported by Profile, Phone weight residency / remaining memory feasible, GPU residency and LRU upload estimated, no invalid direction or slot mapping, no missing Profile anchor for critical cases. Re-evaluate the best candidates with actual KV per interval and measured CPU↔CUDA concurrency.
 
 Profile task costs as functions of actual token interval, Layer count and KV length:
 `T_region(device, region, n_query, K_i)` including Graph preparation, device compute, scratch, cache misses and unavoidable copies. Use real `K_i` per interval rather than one constant KV approximation.
@@ -48,9 +85,9 @@ Profile separately:
 
 ## 4. Load balancing is a dependency-DAG simulation
 
-Build task nodes `(region, token_begin, token_end)`, with compute lanes `PC_CPU`, `PC_CUDA`, `PHONE_MAIN`, and transfer lanes `H2P/P2H`. Match the actual PC gate, shared resources, Phone Main FIFO and output Window credits. Include all three 16-layer cycles, start-up/fill, steady state and drain.
+Build task nodes `(region, token_begin, token_end)` with compute lanes `PC_CPU`, `PC_CUDA`, `PHONE_MAIN` and transfer lanes `H2P/P2H`. Model full-model layer coverage as **N variable-width C/G/P cycles, followed optionally by PC C/G tail**. Match the actual PC gate, shared resources, Phone Main FIFO and output Window credits. Include startup/fill, all steady-state intervals, tail processing and final drain.
 
-For each physical resource d, report busy time, idle time and critical-path blocking time. Within each cycle report `C_i_ms/G_i_ms/P_i_ms` as a diagnostic; do not simply force them equal. Approximate steady-state initiation interval is bounded by the busiest lane, but rank plans by the **simulator's total makespan** on the actual finite Prompt.
+For each physical resource d, report busy time, idle time and critical-path blocking time. Within each cycle report `C_i_ms/G_i_ms/P_i_ms`, `s_PC`, `s_PHONE`, producer/consumer rate mismatch and buffer occupancy. Approximate steady-state initiation interval is bounded by the busiest **aggregate** lane across all cycles. Rank candidates by the **simulator's total makespan** on the actual finite Prompt; use rate equality only for quick pruning / explaining bottlenecks.
 
 Score priority:
 1. Correctness + feasible memory + no deadlocks + safe graph ownership (hard constraints).
@@ -79,7 +116,7 @@ The first correctness target is `PC64 -> Phone32 -> PC64`; next test the inverse
 
 ### A. MEASURE + DRY_RUN (first code milestone)
 
-Collect per-region CPU/CUDA/Phone and transfer timings, then enumerate (C/G/P,X_CPU,X_GPU,X_PHONE) candidates. Simulate full 358-token Prefill; print the chosen theoretical layout and predicted wall time, but **execute the original nine Regions with uniform 64**. Env opt-in suggestion: `LLAMA_HYBRID_REGION_RING_PLANNER=dry-run`. Compare predicted baseline wall time with repeated real measurements; reject missing/uncertain profile data.
+Collect per-region CPU/CUDA/Phone and transfer timings, then enumerate `(N,C_i,G_i,P_i,C_tail,G_tail,X_CPU,X_GPU,X_PHONE)` candidates. First filter by estimated PC↔Phone per-token service-rate mismatch, then score complete 358-token Prefill including PC tail and shared network effects; print the selected theoretical layout and predicted wall time, but **execute the original nine Regions with uniform 64**. Env opt-in suggestion: `LLAMA_HYBRID_REGION_RING_PLANNER=dry-run`. Compare predicted baseline wall time with repeated real measurements; reject missing/uncertain profile data.
 
 ### B. Interval-aware READY/Slot scheduler
 
@@ -91,7 +128,7 @@ First apply hetero X in a fixed layout, with P5 UID/shape/slot validation and re
 
 ### D. Apply per-cycle C/G/P layer balancing
 
-Generalize Phone graph validators and autostart beyond L11/L27; protect the final P-region with final logits ownership checks. Reallocate device weights and CUDA/Phone residency safely before starting inference. Apply a selected plan at request setup, never halfway through a Prefill.
+Generalize Phone graph validators and autostart beyond L11/L27; support an optional **PC-only CPU/CUDA tail** after the last P-region, including correct Phone→PC transfer, final logits ownership and a generalized Ring parser. Reallocate device weights and CUDA/Phone residency safely before starting inference. Apply a selected plan at request setup, never halfway through a Prefill.
 
 ### E. A/B and auto-select
 
@@ -101,7 +138,7 @@ Compare repeated Release medians of complete Prefill wall time, busy/idle, overl
 
 Diagnostic names:
 * `[REGION_RING_PLAN_PROFILE]` device, region, query tokens, K_i, compute/copy/transfer times.
-* `[REGION_RING_PLAN_CANDIDATE]` each candidate's cycle partition, X sizes, projected wall, occupancy, memory.
+* `[REGION_RING_PLAN_CANDIDATE]` each candidate's cycle count, C/G/P partition, PC tail, X sizes, estimated s_PC/s_PHONE, projected wall, occupancy, memory.
 * `[REGION_RING_PLAN_SELECTED]` full layout, per-Region intervals, predicted wall.
 * `[REGION_RING_PLAN_APPLY] mode=DRY_RUN|APPLIED` with explicit validation and rejection reasons.
 * `[REGION_RING_EDGE_READY]` producer range, consumer range, coverage, Slot credits.
