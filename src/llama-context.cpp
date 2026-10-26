@@ -2366,20 +2366,42 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     if (model.hybrid_ring_plan_topology &&
             stage.layer_end == (int) model.hparams.n_layer() &&
             stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
-        // The last CPU/CUDA stage writes canonical logits. It must not
-        // schedule Meta/RPC work on a Phone graph that could still be
-        // executing from a detached upstream worker.
+        // The last CPU/CUDA stage must produce logits using only its
+        // PC-owned layer weights and the CPU_DIRECT output projection.
+        // An unintentional Meta split would again expose a live RPC child.
+        // Do not drop this guard: model load must place the output head
+        // correctly instead of silently executing Meta here.
+        int cpu_splits = 0;
+        int gpu_splits = 0;
         for (int split = 0; split < n_splits; ++split) {
             ggml_backend_t target = ggml_backend_sched_get_split_backend(
                 sched_use,split);
             if (ggml_backend_is_meta(target)) {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_FINAL_OWNER] stage=%zu "
+                    "[REGION_RING_FINAL_OWNER] stage=%zu block=%zu "
+                    "split=%d/%d backend=%s output_expected=CPU_DIRECT "
                     "status=REJECT reason=PC_TAIL_HAS_META_SPLIT\n",
-                    stage_index);
+                    stage_index,block_index,split,n_splits,
+                    ggml_backend_name(target));
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
+            auto * target_device = ggml_backend_get_device(target);
+            if (target_device != nullptr &&
+                    ggml_backend_dev_type(target_device) ==
+                        GGML_BACKEND_DEVICE_TYPE_GPU) {
+                ++gpu_splits;
+            } else {
+                ++cpu_splits;
+            }
+        }
+        if (block_index == 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_FINAL_GRAPH] stage=%zu layers=[%d,%d) "
+                "cpu_splits=%d gpu_splits=%d meta_splits=0 "
+                "output=CPU_DIRECT status=PC_ONLY_READY\n",
+                stage_index,stage.layer_begin,stage.layer_end,
+                cpu_splits,gpu_splits);
         }
     }
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
