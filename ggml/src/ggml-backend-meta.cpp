@@ -18312,6 +18312,32 @@ auto prefill_norm_sg_has_prework =
             phone_region_pre_graph_us =
                 phone_region_build_begin_us - layer_wall_start_us;
         }
+        if (ring_phone_dynamic && phone_block_fused && !phone_region_fused) {
+            // A larger P8 fuse must fit in Meta's graph arena. Legacy fused
+            // graph construction uses an assert; Plan mode must fail cleanly.
+            size_t node_count = 0;
+            bool capacity_ok = i < backend_ctx->cgraphs_phone_fused.size();
+            const size_t cap = capacity_ok ?
+                (size_t) backend_ctx->cgraphs_phone_fused[i]->size : 0;
+            for (size_t j = i; j <= phone_block_end && capacity_ok; ++j) {
+                const auto * g =
+                    backend_ctx->backend_configs[1].cgraphs[j].cgraph_main;
+                if (g == nullptr || g->n_nodes < 0 ||
+                        (size_t) g->n_nodes > cap - node_count) {
+                    capacity_ok = false;
+                } else {
+                    node_count += (size_t) g->n_nodes;
+                }
+            }
+            if (!capacity_ok) {
+                printf("[REGION_RING_PHONE_FUSION] event=REJECT "
+                       "layers=[%d,%d) nodes=%zu capacity=%zu "
+                       "reason=PHONE_GRAPH_CAPACITY status=FAIL\n",
+                       first_fused_layer,phone_block_last_layer + 1,
+                       node_count,cap);
+                return GGML_STATUS_FAILED;
+            }
+        }
         ggml_cgraph * phone_graph = phone_block_fused ?
             build_phone_block_graph(i, phone_block_end) :
             backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
