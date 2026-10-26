@@ -48,6 +48,19 @@ int main() {
     REQUIRE(simulate(m, regions, uniform, &reason));
     REQUIRE(uniform.tasks == 54 && uniform.max_live_slots <= 2);
     REQUIRE(uniform.wall_ms > 0.0);
+    // PC CPU and CUDA share the real execution gate: their aggregate
+    // compute demand cannot exceed elapsed wall time in the gated model.
+    REQUIRE(uniform.pc_gate_busy_ms <= uniform.wall_ms + 1e-6);
+    REQUIRE(std::fabs(uniform.pc_gate_busy_ms -
+                     uniform.busy_ms[0] - uniform.busy_ms[1]) < 1e-6);
+
+    // The counterfactual independent-device model is retained for future
+    // backend ownership experiments, but must be opt-in.
+    model independent_pc = mock_profile();
+    independent_pc.pc_compute_gate = false;
+    candidate independent_uniform = uniform;
+    REQUIRE(simulate(independent_pc, regions, independent_uniform, &reason));
+    REQUIRE(independent_uniform.wall_ms > 0.0);
 
     // One PC Chunk splits into two or four Phone Chunks. The output Slot
     // is released when all transfers have entered downstream staging.
@@ -58,6 +71,7 @@ int main() {
     REQUIRE(simulate(m, regions, smaller_phone, &reason));
     REQUIRE(smaller_phone.tasks > uniform.tasks);
     REQUIRE(smaller_phone.max_live_slots <= 2);
+    REQUIRE(smaller_phone.pc_gate_busy_ms <= smaller_phone.wall_ms + 1e-6);
 
     // Many Phone producers feed a larger PC Chunk: test interval gather and
     // exact-coverage prerequisites without assuming identical Chunk IDs.
