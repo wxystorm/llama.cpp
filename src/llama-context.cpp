@@ -2250,8 +2250,11 @@ bool llama_context::copy_hybrid_stage_output(
         uint32_t             n_tokens,
         int                  ubatch_id,
         size_t               stage_index,
-        size_t               block_index) {
-    ggml_backend_sched_synchronize(sched_use);
+        size_t               block_index,
+        bool                 graph_already_synchronized) {
+    if (!graph_already_synchronized) {
+        ggml_backend_sched_synchronize(sched_use);
+    }
 
     ggml_tensor * stage_output = res->get_stage_output();
     const int64_t n_embd = model.hparams.n_embd;
@@ -2315,7 +2318,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool                               synchronize,
         ggml_status &                      ret,
         llama_hybrid_stage_timing *        timing,
-        bool                               task_local_graph_outputs) {
+        bool                               task_local_graph_outputs,
+        bool                               pc_phone_overlap,
+        std::unique_lock<std::mutex> *     phone_pc_gate,
+        int64_t *                          phone_remote_begin_us,
+        int64_t *                          phone_remote_end_us) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2357,7 +2364,67 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    const bool detached_phone = pc_phone_overlap && phone_pc_gate != nullptr;
+    if (detached_phone) {
+        // Phone has exactly one Meta split in the validated Ring. Do ALL
+        // shared Graph preparation and Host->Meta input handoff under the PC
+        // gate. The split may not compute on, or read from, CUDA. Source CPU
+        // Host slots are immutable until ready.complete() releases credit.
+        const int n_backends = ggml_backend_sched_get_n_backends(sched_use);
+        if (!phone_pc_gate->owns_lock() || n_backends != 3 || n_splits != 1 ||
+            !ggml_backend_is_meta(ggml_backend_sched_get_split_backend(sched_use, 0)) ||
+            ggml_backend_sched_get_split_backend(sched_use, 0) !=
+                ggml_backend_sched_get_backend(sched_use, 0)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PC_PHONE] stage=%zu block=%zu event=REJECT "
+                "reason=UNSUPPORTED_PHONE_SPLITS splits=%d backends=%d\n",
+                stage_index, block_index, n_splits, n_backends);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        const uint64_t mask = ggml_backend_sched_get_split_resource_mask(sched_use, 0);
+        const uint64_t permitted =
+            (UINT64_C(1) << 0) | (UINT64_C(1) << (n_backends - 1));
+        if ((mask & ~permitted) != 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PC_PHONE] stage=%zu block=%zu event=REJECT "
+                "reason=PHONE_RESOURCE_CONFLICT mask=0x%016" PRIx64 "\n",
+                stage_index, block_index, mask);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        ret = ggml_backend_sched_prepare_split(sched_use, 0);
+        if (ret != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PC_PHONE] stage=%zu block=%zu event=FAIL "
+                "reason=PHONE_INPUT_PREPARE status=%d\n",
+                stage_index, block_index, (int) ret);
+            return nullptr;
+        }
+        // Only Meta's separate CPU/RPC child Backends execute from here.
+        // Crucially, do NOT call the ordinary graph_compute_range() here:
+        // it mutates *all* Backend thread configurations, including PC.
+        ggml_backend_t meta = ggml_backend_sched_get_split_backend(sched_use, 0);
+        phone_pc_gate->unlock();
+        const int64_t detached_begin_us = ggml_time_us();
+        if (phone_remote_begin_us) {
+            *phone_remote_begin_us = detached_begin_us;
+        }
+        LLAMA_LOG_DEBUG(
+            "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
+            "event=PHONE_DETACHED_BEGIN\n", stage_index, block_index);
+        ret = ggml_backend_sched_compute_split(sched_use, 0);
+        // Drain Meta's own CPU+RPC operations before reading output or
+        // publishing downstream READY. Do not synchronize the full Scheduler:
+        // that would also touch PC CPU/CUDA while PC workers are running.
+        ggml_backend_synchronize(meta);
+    } else if (pc_phone_overlap) {
+        // PC workers own CUDA0+CPU Schedulers only, and share the PC gate.
+        // Thread settings were initialized once BEFORE workers launched.
+        ret = ggml_backend_sched_compute_range(sched_use, 0, n_splits);
+    } else {
+        ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
+    }
     if (timing != nullptr) {
         timing->compute_range_us += ggml_time_us() - compute_begin_us;
     }
@@ -2368,7 +2435,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     if (stage_output != nullptr) {
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         if (!copy_hybrid_stage_output(
-                result, sched_use, stage_output, block_tokens, ubatch_id, stage_index, block_index)) {
+                result, sched_use, stage_output, block_tokens, ubatch_id,
+                stage_index, block_index, detached_phone)) {
             if (timing != nullptr) {
                 timing->sync_us += ggml_time_us() - sync_begin_us;
             }
@@ -2378,12 +2446,20 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         if (timing != nullptr) {
             timing->sync_us += ggml_time_us() - sync_begin_us;
         }
-    } else if (synchronize) {
+    } else if (synchronize && !detached_phone) {
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         ggml_backend_sched_synchronize(sched_use);
         if (timing != nullptr) {
             timing->sync_us += ggml_time_us() - sync_begin_us;
         }
+    }
+    if (detached_phone) {
+        if (phone_remote_end_us) {
+            *phone_remote_end_us = ggml_time_us();
+        }
+        LLAMA_LOG_DEBUG(
+            "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
+            "event=PHONE_DETACHED_END\n", stage_index, block_index);
     }
 
     return result;
@@ -2746,6 +2822,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool task_local_graph_outputs,
         bool threaded_execution,
         bool audit_backend_resources,
+        bool pc_phone_overlap,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2785,14 +2862,51 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             return nullptr;
         }
 
+        if (pc_phone_overlap) {
+            // This first concurrent mode is supported only for the validated
+            // outer topology Meta(CPU,RPC0), CUDA0, CPU. No replacement of
+            // GGML model weights, no new Meta instance and no CPU-only path.
+            const bool topology_ok = backend_ptrs.size() == 3 &&
+                ggml_backend_is_meta(backend_ptrs[0]) &&
+                backend_ptrs[2] == backend_cpu &&
+                ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[1])) ==
+                    GGML_BACKEND_DEVICE_TYPE_GPU;
+            if (!topology_ok) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PC_PHONE] event=REJECT reason=OUTER_BACKEND_TOPOLOGY\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
             auto & worker = region_ring_worker_resources[dev];
+            const size_t start = pc_phone_overlap ? 1 : 0;
+            const size_t count = backend_ptrs.size() - start;
+            // A reused llama_context may have cached schedulers from an A/B
+            // mode switch. Recreate only if the exact backend list changed.
+            bool matches = worker.sched &&
+                ggml_backend_sched_get_n_backends(worker.sched.get()) == (int) count;
+            if (matches) {
+                for (size_t i = 0; i < count; ++i) {
+                    if (ggml_backend_sched_get_backend(worker.sched.get(), (int) i) !=
+                        backend_ptrs[start + i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if (worker.sched && !matches) {
+                ggml_backend_sched_synchronize(worker.sched.get());
+                worker.res.reset();
+                worker.sched.reset();
+            }
             if (!worker.sched) {
                 worker.sched.reset(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                    max_nodes, false, cparams.op_offload));
+                    backend_ptrs.data() + start,
+                    backend_buft.data() + start,
+                    (int) count, max_nodes, false, cparams.op_offload));
                 if (!worker.sched) {
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_RESOURCE] device=%s status=ALLOC_FAILED\n",
@@ -2806,6 +2920,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             ring_sched[dev] = worker.sched.get();
             ring_res[dev] = worker.res.get();
+            if (pc_phone_overlap) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PC_SCHED] worker=%s backends=%d "
+                    "first=%s last=%s offload=%d meta_registered=0 status=READY\n",
+                    dev == 0 ? "CPU" : "GPU",
+                    ggml_backend_sched_get_n_backends(ring_sched[dev]),
+                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], 0)),
+                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], (int) count - 1)),
+                    cparams.op_offload ? 1 : 0);
+            }
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -2849,6 +2973,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (audit_backend_resources && !threaded_execution) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_BACKEND_OWNERSHIP] status=REJECT reason=REQUIRES_WORKERS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (pc_phone_overlap &&
+        (!threaded_execution || !audit_backend_resources || cparams.cb_eval != nullptr)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PC_PHONE] event=REJECT "
+            "reason=UNSAFE_WORKER_OR_EVAL_CALLBACK\n");
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -2902,9 +3034,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
         LLAMA_LOG_ERROR(
-            "[REGION_RING_BACKEND_OWNERSHIP] mode=AUDIT_ONLY "
+            "[REGION_RING_BACKEND_OWNERSHIP] mode=%s "
             "split_inputs=INCLUDED meta_inner=OBSERVED "
-            "graph_gate=CONTEXT_SHARED compute_overlap=0 status=READY\n");
+            "graph_gate=%s compute_overlap=%s status=READY\n",
+            pc_phone_overlap ? "PC_PHONE_SPLIT" : "AUDIT_ONLY",
+            pc_phone_overlap ? "PC_GATE_PLUS_META" : "CONTEXT_SHARED",
+            pc_phone_overlap ? "MEASURED" : "0");
     }
     const int chunk_tokens = stages.front().macro_tokens;
     const size_t output_window = own_stage_resources ? 2 : 0;
@@ -2955,10 +3090,36 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const int64_t begin_us = ggml_time_us();
 
     if (threaded_execution) {
+        if (pc_phone_overlap) {
+            // graph_compute_range() used to mutate ALL backend thread configs
+            // at every stage. That would race Meta CPU execution after we
+            // detach Phone. Configure once before starting any host workers.
+            const bool batched = ubatch.n_tokens > 1;
+            const int n_threads = batched ? cparams.n_threads_batch : cparams.n_threads;
+            ggml_threadpool_t tp = batched ? threadpool_batch : threadpool;
+            if (backend_cpu != nullptr) {
+                auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+                auto * set_threadpool_fn = (decltype(ggml_backend_cpu_set_threadpool) *)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cpu_set_threadpool");
+                if (set_threadpool_fn) {
+                    set_threadpool_fn(backend_cpu, tp);
+                }
+            }
+            for (const auto & entry : set_n_threads_fns) {
+                entry.second(entry.first, n_threads);
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PC_PHONE_THREADS] threads=%d batched=%d "
+                "backend_config=ONCE_BEFORE_WORKERS status=READY\n",
+                n_threads, batched ? 1 : 0);
+        }
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_PLAN] workers=3 fifo=PER_DEVICE "
-            "kv_views=PER_DEVICE window=%zu backend=SHARED_GATED "
-            "graph_overlap=0 status=READY\n", output_window);
+            "kv_views=PER_DEVICE window=%zu backend=%s "
+            "graph_overlap=%s status=READY\n",
+            output_window,
+            pc_phone_overlap ? "PC_GATE_PLUS_META" : "SHARED_GATED",
+            pc_phone_overlap ? "MEASURED" : "0");
         // The device FIFO and the host slots are concurrent; the actual
         // ggml_backend_t instances are not. Three real workers may claim and
         // wait simultaneously, but only one may build/execute/synchronize a
@@ -2973,6 +3134,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t        backend_mask    = 0;
             size_t          cross_backend_tasks = 0;
             size_t          unknown_backend_tasks = 0;
+            std::vector<std::pair<int64_t, int64_t>> compute_intervals;
         };
         std::array<ring_worker_state, 3> worker_states;
         const std::array<llama_region_ring_device, 3> devices = {
@@ -3038,6 +3200,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             cancelled_before_compute = true;
                         } else {
                             const int64_t compute_begin_us = ggml_time_us();
+                            int64_t phone_remote_begin_us = 0;
+                            int64_t phone_remote_end_us = 0;
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
@@ -3045,8 +3209,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 ubatch_id, task.region, task.chunk,
                                 llama_hybrid_boundary_action::PASS,
                                 block_outputs, worker_apply_mctx, true,
-                                task_status, nullptr, true);
-                            state.backend_exec_us += ggml_time_us() - compute_begin_us;
+                                task_status, nullptr, true, pc_phone_overlap,
+                                pc_phone_overlap && dev == 2 ? &backend_lock : nullptr,
+                                &phone_remote_begin_us, &phone_remote_end_us);
+                            const int64_t compute_end_us = ggml_time_us();
+                            state.backend_exec_us += compute_end_us - compute_begin_us;
+                            if (pc_phone_overlap && task_result != nullptr &&
+                                task_status == GGML_STATUS_SUCCESS) {
+                                if (dev == 2 && phone_remote_begin_us > 0 &&
+                                    phone_remote_end_us >= phone_remote_begin_us) {
+                                    state.compute_intervals.emplace_back(
+                                        phone_remote_begin_us, phone_remote_end_us);
+                                } else if (dev != 2) {
+                                    state.compute_intervals.emplace_back(
+                                        compute_begin_us, compute_end_us);
+                                }
+                            }
                             if (task_result != nullptr &&
                                 task_status == GGML_STATUS_SUCCESS &&
                                 audit_backend_resources) {
@@ -3054,9 +3232,27 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     ring_sched[dev]);
                                 uint64_t task_mask = 0;
                                 for (int split = 0; split < n_splits; ++split) {
-                                    const uint64_t split_mask =
+                                    const uint64_t local_mask =
                                         ggml_backend_sched_get_split_resource_mask(
                                             ring_sched[dev], split);
+                                    uint64_t split_mask = local_mask & (UINT64_C(1) << 63);
+                                    // Convert per-Scheduler bits into original
+                                    // [Meta,CUDA0,CPU] indices for consistent
+                                    // A/B audit (PC Scheduler omits Meta).
+                                    const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
+                                    for (int b = 0; b < n_local; ++b) {
+                                        if ((local_mask & (UINT64_C(1) << b)) == 0) {
+                                            continue;
+                                        }
+                                        ggml_backend_t handle = ggml_backend_sched_get_backend(ring_sched[dev], b);
+                                        const auto it = std::find(backend_ptrs.begin(), backend_ptrs.end(), handle);
+                                        if (it == backend_ptrs.end() ||
+                                            (size_t) (it - backend_ptrs.begin()) >= 63) {
+                                            split_mask |= UINT64_C(1) << 63;
+                                        } else {
+                                            split_mask |= UINT64_C(1) << (size_t) (it - backend_ptrs.begin());
+                                        }
+                                    }
                                     task_mask |= split_mask;
                                     if (task.chunk == 0 || (split_mask >> 63) != 0) {
                                         ggml_backend_t target =
@@ -3066,7 +3262,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                             "[REGION_RING_BACKEND_SPLIT] device=%s "
                                             "region=%zu chunk=%zu split=%d/%d "
                                             "compute=%s resource_mask=0x%016" PRIx64
-                                            " unresolved=%d\n",
+                                            " unresolved=%d scope=OUTER\n",
                                             name, task.region, task.chunk, split,
                                             n_splits, ggml_backend_name(target),
                                             split_mask, (int) (split_mask >> 63));
@@ -3085,10 +3281,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "region=%zu chunk=%zu n_splits=%d "
                                     "resource_mask=0x%016" PRIx64
                                     " cross_backend=%d unresolved=%d "
-                                    "gate=CONTEXT_SHARED status=OBSERVED\n",
+                                    "gate=%s scope=OUTER status=OBSERVED\n",
                                     name, task.region, task.chunk, n_splits,
                                     task_mask, cross ? 1 : 0,
-                                    unresolved ? 1 : 0);
+                                    unresolved ? 1 : 0,
+                                    pc_phone_overlap ? "PC_GATE_PLUS_META" : "CONTEXT_SHARED");
                             }
                         }
                     }
@@ -3191,16 +3388,35 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = GGML_STATUS_FAILED;
             }
         }
+        const int64_t pc_phone_overlap_us = pc_phone_overlap ?
+            llama_region_ring_interval_overlap_us(
+                worker_states[0].compute_intervals, worker_states[2].compute_intervals) +
+            llama_region_ring_interval_overlap_us(
+                worker_states[1].compute_intervals, worker_states[2].compute_intervals) : 0;
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_SUM] created=%zu joined=%zu "
             "finished=%zu completed=%zu cpu_tasks=%zu gpu_tasks=%zu "
-            "phone_tasks=%zu backend_gate=CONTEXT_SHARED "
-            "graph_overlap=0 final_owner=%s status=%s\n",
+            "phone_tasks=%zu backend_gate=%s "
+            "graph_overlap=%s final_owner=%s status=%s\n",
             created, joined, ready.finished(), executed,
             worker_states[0].completed, worker_states[1].completed,
             worker_states[2].completed,
+            pc_phone_overlap ? "PC_GATE_PLUS_META" : "CONTEXT_SHARED",
+            pc_phone_overlap ? "MEASURED" : "0",
             result == res_use && result != nullptr ? "MAIN" : "INVALID",
             ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        if (pc_phone_overlap) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PC_PHONE_SUM] cpu_intervals=%zu gpu_intervals=%zu "
+                "phone_intervals=%zu overlap_ms=%.3f pc_gate=CPU_CUDA "
+                "phone_compute=DETACHED phone_prepare=PC_GATE "
+                "window=%zu status=%s\n",
+                worker_states[0].compute_intervals.size(),
+                worker_states[1].compute_intervals.size(),
+                worker_states[2].compute_intervals.size(),
+                pc_phone_overlap_us / 1000.0, output_window,
+                ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        }
         if (audit_backend_resources) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_BACKEND_OWNERSHIP_SUM] "
@@ -3208,7 +3424,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 " phone_mask=0x%016" PRIx64
                 " cpu_cross=%zu gpu_cross=%zu phone_cross=%zu "
                 "cpu_unresolved=%zu gpu_unresolved=%zu phone_unresolved=%zu "
-                "compute_overlap=0 status=%s\n",
+                "compute_overlap=%s status=%s\n",
                 worker_states[0].backend_mask,
                 worker_states[1].backend_mask,
                 worker_states[2].backend_mask,
@@ -3218,6 +3434,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker_states[0].unknown_backend_tasks,
                 worker_states[1].unknown_backend_tasks,
                 worker_states[2].unknown_backend_tasks,
+                pc_phone_overlap ? "MEASURED" : "0",
                 ret == GGML_STATUS_SUCCESS ? "AUDITED" : "INCOMPLETE");
         }
     } else {
@@ -3352,6 +3569,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
         audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
+        pc_phone_overlap ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
         threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
         task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
         own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
@@ -4331,9 +4549,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
         ring_exec != "fifo-workers" && ring_exec != "fifo-backend-audit" &&
+        ring_exec != "fifo-pc-phone" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, fifo-pc-phone, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -4363,6 +4582,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo-state" ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
             ring_exec == "fifo-workers" ? "DEVICE_FIFO_GATED_WORKERS" :
             ring_exec == "fifo-backend-audit" ? "DEVICE_FIFO_BACKEND_AUDIT" :
+            ring_exec == "fifo-pc-phone" ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5647,6 +5867,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-state = explicit per-task graph output count; same Backend gate;
             // fifo-workers = three real host threads, one shared Backend graph gate;
             // fifo-backend-audit = workers + actual split/resource/Meta child audit;
+            // fifo-pc-phone = PC CPU+CUDA shared execution, Meta/RPC independent;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5664,16 +5885,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     runtime_stages, ubatch_id,
                     ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
                         ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-pc-phone",
                     ring_exec == "fifo-isolated" || ring_exec == "fifo-owned" ||
                         ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
-                        ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-backend-audit" || ring_exec == "fifo-pc-phone",
                     ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-pc-phone",
                     ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
-                        ring_exec == "fifo-backend-audit",
-                    ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
-                    ring_exec == "fifo-backend-audit", status);
+                        ring_exec == "fifo-backend-audit" || ring_exec == "fifo-pc-phone",
+                    ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-pc-phone",
+                    ring_exec == "fifo-backend-audit" || ring_exec == "fifo-pc-phone",
+                    ring_exec == "fifo-pc-phone", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(

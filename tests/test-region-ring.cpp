@@ -403,6 +403,20 @@ static void test_window_failure_wakes_workers() {
     }
 }
 
+static void test_pc_phone_overlap_intervals() {
+    const std::vector<std::pair<int64_t, int64_t>> pc {
+        {0, 20}, {30, 60}, {70, 90}
+    };
+    const std::vector<std::pair<int64_t, int64_t>> phone {
+        {10, 40}, {50, 75}
+    };
+    // [10,20]=10 + [30,40]=10 + [50,60]=10 + [70,75]=5.
+    check(llama_region_ring_interval_overlap_us(pc, phone) == 35,
+          "PC/Phone interval intersection is wrong");
+    check(llama_region_ring_interval_overlap_us(pc, {{100, 120}}) == 0,
+          "disjoint intervals counted as overlap");
+}
+
 int main() {
     std::fprintf(stderr, "[REGION_RING_TEST] begin\n");
     try {
@@ -424,6 +438,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
         test_window_failure_wakes_workers();
         std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
+        test_pc_phone_overlap_intervals();
+        std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
         return 0;
     } catch (const std::exception & e) {

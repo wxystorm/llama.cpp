@@ -29,6 +29,25 @@ struct llama_region_ring_region {
     int layer_end; // exclusive
 };
 
+// Exact intersection of disjoint PC execution intervals with disjoint
+// Phone-compute intervals. Both vectors are written by their owner threads
+// and inspected only AFTER all worker threads have joined.
+inline int64_t llama_region_ring_interval_overlap_us(
+        const std::vector<std::pair<int64_t, int64_t>> & pc,
+        const std::vector<std::pair<int64_t, int64_t>> & phone) {
+    int64_t overlap = 0;
+    for (const auto & a : pc) {
+        for (const auto & b : phone) {
+            const int64_t lo = std::max(a.first, b.first);
+            const int64_t hi = std::min(a.second, b.second);
+            if (hi > lo) {
+                overlap += hi - lo;
+            }
+        }
+    }
+    return overlap;
+}
+
 inline const char * llama_region_ring_device_name(llama_region_ring_device device) {
     switch (device) {
         case llama_region_ring_device::CPU:   return "CPU";

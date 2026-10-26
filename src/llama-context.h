@@ -369,6 +369,7 @@ private:
                                        bool                                            task_local_graph_outputs,
                                        bool                                            threaded_execution,
                                        bool                                            audit_backend_resources,
+                                       bool                                            pc_phone_overlap,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(
@@ -396,7 +397,11 @@ private:
                                       bool                                 synchronize,
                                       ggml_status &                        ret,
                                       llama_hybrid_stage_timing *          timing = nullptr,
-                                      bool                                 task_local_graph_outputs = false);
+                                      bool                                 task_local_graph_outputs = false,
+                                      bool                                 pc_phone_overlap = false,
+                                      std::unique_lock<std::mutex> *       phone_pc_gate = nullptr,
+                                      int64_t *                            phone_remote_begin_us = nullptr,
+                                      int64_t *                            phone_remote_end_us = nullptr);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
@@ -405,7 +410,8 @@ private:
                                       uint32_t             n_tokens,
                                       int                  ubatch_id,
                                       size_t               stage_index,
-                                      size_t               block_index);
+                                      size_t               block_index,
+                                      bool                 graph_already_synchronized = false);
 
     ggml_status graph_compute_range(ggml_backend_sched_t sched_use, int first_split, int last_split, bool batched);
 
