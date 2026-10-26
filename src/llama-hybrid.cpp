@@ -8472,12 +8472,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
 
     if (topology_preview) {
         if (baseline_chunk != 64) {
-            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 reason=CHUNK_MUST_BE_64\\n");
+            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 reason=CHUNK_MUST_BE_64\n");
             return false;
         }
         const auto result = llama_ring_planner::search_supported_topology(model,64,192);
         LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_SEARCH] enumerated=%zu profiled=%zu simulated=%zu "
-                        "reject_memory=%zu reject_profile=%zu reject_dag=%zu applied=0\\n",
+                        "reject_memory=%zu reject_profile=%zu reject_dag=%zu applied=0\n",
                         result.enumerated,result.profiled,result.simulated,
                         result.rejected_memory,result.rejected_profile,result.rejected_deadlock);
         for (size_t i = 0; i < result.top.size(); ++i) {
@@ -8488,13 +8488,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
             LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_CANDIDATE] rank=%zu layout=%s "
                             "cycles=%d phone_layers=%d tail_c=%d tail_g=%d "
-                            "predicted_ms=%.3f applied=0 status=PREVIEW_ONLY\\n",
+                            "predicted_ms=%.3f applied=0 status=PREVIEW_ONLY\n",
                             i + 1,llama_region_ring_layout_string(r).c_str(),
                             c.cycles,c.p,c.tail_c,c.tail_g,c.wall_ms);
         }
         LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 "
                         "reason=PHONE_FUSION_AND_FINAL_OWNER_UNSUPPORTED "
-                        "runtime_layout=UNCHANGED\\n");
+                        "runtime_layout=UNCHANGED\n");
         return result.valid;
     }
     if (selected_layout != nullptr) {
