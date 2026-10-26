@@ -1678,6 +1678,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         arch == LLM_ARCH_QWEN2 ||
         arch == LLM_ARCH_QWEN3 ||
         arch == LLM_ARCH_QWEN3MOE;
+    if (llama_hybrid_directional_pair_requested() &&
+            (!hybrid_arch || params.split_mode != LLAMA_SPLIT_MODE_TENSOR)) {
+        throw std::runtime_error(
+            "LLAMA_HYBRID_DIRECTIONAL_PAIR requires a supported hybrid "
+            "model and --split-mode tensor");
+    }
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_plan runtime_plan;
