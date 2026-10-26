@@ -377,9 +377,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-1, nullptr};
         }
 
-        // Phase-1 APPLY-safe must choose a model-owned layout BEFORE weight
-        // allocation. Both modes reuse the measured Hybrid Profile, never
-        // publish the incompatible legacy Hybrid placement Plan.
+        // Model-owned Region Ring Plan selection must finish BEFORE weight
+        // allocation. Preview, APPLY-safe and APPLY-topology share measured
+        // device profiles; only apply modes may publish a model-owned layout.
         const char * ring_planner_env =
             std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
         const bool ring_plan_dry_run =
@@ -464,8 +464,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         }
 
         if (ring_plan_topology_preview) {
-            // This is deliberately non-applying. Only apply-safe may change
-            // model weight placement in the current runtime.
+            // This is deliberately non-applying; apply-topology performs
+            // its own separate pre-weight-load model-owned selection.
             int chunk_tokens = 64;
             if (const char * raw = std::getenv(
                     "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
