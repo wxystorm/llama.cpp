@@ -4621,7 +4621,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             (model.hybrid_ring_plan_layout.empty() ?
                 llama_region_ring_from_env(model.hparams.n_layer()) :
                 llama_region_ring_parse(model.hybrid_ring_plan_layout,
-                                        model.hparams.n_layer())) :
+                                        model.hparams.n_layer(),
+                                        model.hybrid_ring_plan_topology)) :
             std::vector<llama_region_ring_region>{};
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
@@ -4632,8 +4633,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
         // Every executable Stage must match the model's actual weight and
         // KV owner; a split between placement and task routing is fatal.
-        if (!llama_region_ring_apply_safe_phone_shape(ring_runtime_regions) ||
-                region_ring_chunk_tokens != 64 ||
+        const bool shape_ok = model.hybrid_ring_plan_topology ?
+            llama_region_ring_apply_topology_compatible(
+                ring_runtime_regions,model.hparams.n_layer()) &&
+                ring_runtime_regions.back().device !=
+                    llama_region_ring_device::PHONE :
+            llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
+        if (!shape_ok || region_ring_chunk_tokens != 64 ||
                 model.pc_layer_backends.size() <
                     (size_t) model.hparams.n_layer()) {
             throw std::runtime_error(
@@ -4659,11 +4665,59 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
         LLAMA_LOG_ERROR(
-            "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+            "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
             "layout=%s chunk=%d window=2 status=CONSISTENT\n",
+            model.hybrid_ring_plan_topology ? "APPLY_TOPOLOGY" : "APPLY_SAFE",
             model.hybrid_ring_plan_layout.c_str(),
             region_ring_chunk_tokens);
+    }
+    if (region_ring_v1 && model.hybrid_ring_plan_topology) {
+        // The selected model, not LLAMA_HYBRID_REGION_RING_LAYOUT,
+        // supplies the Phone Graph Fusion ownership mask.
+        const char * fusion = std::getenv("GGML_META_RING_PHONE_FUSION");
+        const char * autostart = std::getenv("GGML_META_RING_PHONE_AUTOSTART");
+        const char * exit_fix = std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
+        if (fusion == nullptr || std::strcmp(fusion,"1") != 0 ||
+                autostart == nullptr || std::strcmp(autostart,"1") != 0 ||
+                exit_fix == nullptr || std::strcmp(exit_fix,"1") != 0) {
+            throw std::runtime_error(
+                "apply-topology requires exact Phone Fusion=1, "
+                "Phone Autostart=1 and Phone Exit Fix=1");
+        }
+        std::vector<uint8_t> phone_mask(model.hparams.n_layer(),0);
+        for (const auto & r : ring_runtime_regions) {
+            if (r.device == llama_region_ring_device::PHONE) {
+                std::fill(phone_mask.begin()+r.layer_begin,
+                          phone_mask.begin()+r.layer_end,1);
+            }
+        }
+        size_t meta_count = 0;
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (!ggml_backend_is_meta(backend)) {
+                continue;
+            }
+            if (!ggml_backend_meta_set_region_ring_phone_mask(
+                    backend,phone_mask.data(),phone_mask.size())) {
+                throw std::runtime_error(
+                    "failed to register immutable Phone Plan mask in Meta");
+            }
+            ++meta_count;
+        }
+        if (meta_count != 1) {
+            throw std::runtime_error(
+                "apply-topology requires exactly one Meta(CPU,Phone RPC)");
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PHONE_PLAN] layout=%s phone_regions=%zu "
+            "meta_count=%zu final_device=%s status=READY\n",
+            model.hybrid_ring_plan_layout.c_str(),
+            std::count_if(ring_runtime_regions.begin(),
+                          ring_runtime_regions.end(),
+                          [](const llama_region_ring_region & r) {
+                              return r.device == llama_region_ring_device::PHONE;
+                          }), meta_count,
+            llama_region_ring_device_name(ring_runtime_regions.back().device));
     }
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(
