@@ -2124,7 +2124,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
-    if (!hybrid_layer_modes.empty()) {
+    if (region_ring && hybrid_ring_plan_topology) {
+        // The final CPU/CUDA Region executes on a PC-only scheduler. The
+        // output norm and LM head must therefore be PC-owned as well.
+        // Previously all Hybrid models placed these weights on Meta,
+        // introducing a Meta(CPU,RPC) scheduler split into the final
+        // graph even though all transformer layers were on the PC.
+        //
+        // Keep the output on CPU_DIRECT for both CPU and CUDA tails:
+        // sending a potentially large output projection to CUDA would
+        // change the Plan's VRAM budget. PC schedulers already support
+        // CUDA -> CPU activation transfer for the final projection.
+        // Legacy Phone-tail Ring and old Hybrid placement are unchanged.
+        if (cpu_dev == nullptr) {
+            throw std::runtime_error(
+                "apply-topology requires CPU backend for PC-owned logits");
+        }
+        pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_OUTPUT_PLACEMENT] mode=APPLY_TOPOLOGY "
+            "output=CPU_DIRECT final_region=%s "
+            "meta_rpc=DISABLED status=READY\n",
+            llama_region_ring_device_name(ring_regions.back().device));
+    } else if (!hybrid_layer_modes.empty()) {
         if (meta_dev == nullptr) {
             throw std::runtime_error(format(
                 "%s: no Meta backend found for hybrid output", __func__));
