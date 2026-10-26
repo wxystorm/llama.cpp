@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-hybrid.h"
+#include "llama-directional-pair.h"
 #include "llama-region-ring.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -431,9 +432,17 @@ static bool llama_hybrid_force_phone_primary_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+// New single-switch entrypoint, built on the already validated directional
+// Tensor/Meta implementation. The legacy flag remains a rollback/A-B path.
+static bool llama_hybrid_directional_pair_requested() {
+    const char * value = std::getenv("LLAMA_HYBRID_DIRECTIONAL_PAIR");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 static bool llama_hybrid_region_boundary_v1_enabled() {
     const char * value = std::getenv("LLAMA_HYBRID_REGION_BOUNDARY_V1");
-    return value != nullptr && std::atoi(value) != 0;
+    return llama_hybrid_directional_pair_requested() ||
+        (value != nullptr && std::atoi(value) != 0);
 }
 
 static int llama_hybrid_region_boundary_env_int(
@@ -453,6 +462,11 @@ llama_build_region_boundary_v1_policy(int n_layer) {
     const bool c2p_only =
         llama_hybrid_region_boundary_env_int(
             "LLAMA_HYBRID_REGION_C2P_ONLY", 0) != 0;
+    if (c2p_only && llama_hybrid_directional_pair_requested()) {
+        throw std::runtime_error(
+            "LLAMA_HYBRID_DIRECTIONAL_PAIR requires both C2P and P2C; "
+            "unset LLAMA_HYBRID_REGION_C2P_ONLY");
+    }
 
     const int default_c2p =
         n_layer == 48 ? 34 : std::max(1, (2 * n_layer) / 3);
@@ -485,23 +499,30 @@ llama_build_region_boundary_v1_policy(int n_layer) {
     const int p2c_layer = llama_hybrid_region_boundary_env_int(
         "LLAMA_HYBRID_REGION_P2C_LAYER", default_p2c);
 
-    if (n_layer < 5 ||
-            c2p_layer < 0 ||
-            p2c_layer <= c2p_layer + 1 ||
-            p2c_layer >= n_layer - 1) {
-        throw std::runtime_error(
-            "invalid directional Region: require "
-            "0 <= C2P < P2C-1 and P2C < n_layer-1");
-    }
+    // One definition of the exact five-stage topology; unit-tested without
+    // loading a model. C2P owns Attention on PC, P2C on Phone.
+    const auto directional = llama_directional_pair_plan::make(
+        n_layer, c2p_layer, p2c_layer);
 
     std::vector<llama_hybrid_layer_mode> policy(
         n_layer, llama_hybrid_layer_mode::PC_ONLY);
-    policy[c2p_layer] = llama_hybrid_layer_mode::TENSOR_C2P;
-    std::fill(
-        policy.begin() + c2p_layer + 1,
-        policy.begin() + p2c_layer,
-        llama_hybrid_layer_mode::PHONE_ONLY);
-    policy[p2c_layer] = llama_hybrid_layer_mode::TENSOR_P2C;
+    for (int il = 0; il < n_layer; ++il) {
+        switch (directional.stage_at(il)) {
+            case llama_directional_pair_stage::PC_PREFIX:
+            case llama_directional_pair_stage::PC_SUFFIX:
+                policy[il] = llama_hybrid_layer_mode::PC_ONLY;
+                break;
+            case llama_directional_pair_stage::C2P_TENSOR:
+                policy[il] = llama_hybrid_layer_mode::TENSOR_C2P;
+                break;
+            case llama_directional_pair_stage::PHONE_FULL:
+                policy[il] = llama_hybrid_layer_mode::PHONE_ONLY;
+                break;
+            case llama_directional_pair_stage::P2C_TENSOR:
+                policy[il] = llama_hybrid_layer_mode::TENSOR_P2C;
+                break;
+        }
+    }
 
     LLAMA_LOG_ERROR(
         "[REGION_BOUNDARY_V1] mode=DIRECTIONAL_PAIR "
@@ -515,6 +536,18 @@ llama_build_region_boundary_v1_policy(int n_layer) {
         p2c_layer + 1,
         n_layer,
         n_layer);
+    if (llama_hybrid_directional_pair_requested()) {
+        LLAMA_LOG_ERROR(
+            "[DIRECTIONAL_PAIR_PLAN] pc0=[0,%d) c2p=%d "
+            "phone=[%d,%d) p2c=%d pc1=[%d,%d) "
+            "c2p_owner=PHONE p2c_owner=PC "
+            "engine=EXISTING_META_DIRECTIONAL status=READY\n",
+            directional.pc_prefix_end(),
+            directional.c2p_layer,
+            directional.phone_begin(), directional.phone_end(),
+            directional.p2c_layer,
+            directional.pc_suffix_begin(), directional.pc_suffix_end());
+    }
     return policy;
 }
 
@@ -1685,6 +1718,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         const bool region_ring = llama_region_ring_enabled();
+        const bool directional_pair = llama_hybrid_directional_pair_requested();
+        if (directional_pair && region_ring) {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_DIRECTIONAL_PAIR conflicts with "
+                "LLAMA_HYBRID_REGION_RING_V1; disable Ring first");
+        }
+        if (directional_pair && has_runtime_plan) {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_DIRECTIONAL_PAIR requires a fixed "
+                "directional policy; disable HYBRID_AUTO");
+        }
         const std::vector<llama_region_ring_region> ring_regions =
             region_ring ? llama_region_ring_from_env(n_layer) :
                           std::vector<llama_region_ring_region>{};
@@ -1855,6 +1899,48 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             for (int k = 0; k < n_gpu_pc; ++k) {
                 pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
             }
+        }
+
+        if (directional_pair) {
+            int c2p = -1;
+            int p2c = -1;
+            for (int il = 0; il < n_layer; ++il) {
+                if (hybrid_layer_modes[il] ==
+                        llama_hybrid_layer_mode::TENSOR_C2P) {
+                    c2p = il;
+                } else if (hybrid_layer_modes[il] ==
+                        llama_hybrid_layer_mode::TENSOR_P2C) {
+                    p2c = il;
+                }
+            }
+            if (c2p < 0 || p2c <= c2p) {
+                throw std::runtime_error(
+                    "directional pair policy lacks exactly ordered "
+                    "C2P and P2C boundaries");
+            }
+            int prefix_cuda = 0;
+            int suffix_cuda = 0;
+            for (int il = 0; il < n_layer; ++il) {
+                if (pc_layer_backends[il] != llama_pc_layer_backend::CUDA ||
+                        hybrid_layer_modes[il] !=
+                            llama_hybrid_layer_mode::PC_ONLY) {
+                    continue;
+                }
+                if (il < c2p) {
+                    ++prefix_cuda;
+                } else if (il > p2c) {
+                    ++suffix_cuda;
+                }
+            }
+            LLAMA_LOG_ERROR(
+                "[DIRECTIONAL_PAIR_BACKENDS] pc_prefix_cpu=%d "
+                "pc_prefix_cuda=%d phone_full=%d pc_suffix_cpu=%d "
+                "pc_suffix_cuda=%d tensor_c2p=%d tensor_p2c=%d "
+                "status=READY\n",
+                c2p - prefix_cuda, prefix_cuda,
+                p2c - c2p - 1,
+                n_layer - p2c - 1 - suffix_cuda, suffix_cuda,
+                c2p, p2c);
         }
 
         if (n_gpu_pc > 0) {
