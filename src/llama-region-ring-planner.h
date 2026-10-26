@@ -59,6 +59,10 @@ struct model {
     std::function<bool(device, int, int, int, double &)> compute_ms;
     std::function<bool(device, device, size_t, double &)> transfer_ms;
     std::function<bool(const candidate &)> memory_feasible;
+    // Unlike memory_feasible(candidate), this callback accepts per-cycle
+    // C/G boundaries. It is used ONLY by the real APPLY-safe search.
+    std::function<bool(const std::vector<llama_region_ring_region> &)>
+        region_memory_feasible;
 };
 
 inline int chunk_for(const candidate & c, device d) {
@@ -422,6 +426,115 @@ inline result search(const model & m, int max_simulations = 192) {
         if(out.top.size()>5) out.top.resize(5);
     }
     return out;
+}
+
+// Phase-1 supported search: keep the model's exact Phone regions and
+// original CUDA weight count, adjust only CPU/CUDA boundaries inside the
+// three 11-layer PC windows. No changes to Chunk, KV, Phone graph UID
+// location, final logits ownership, or live output-slot protocol.
+struct supported_choice {
+    std::vector<llama_region_ring_region> regions;
+    candidate estimate;
+    int gpu_shift = 0;
+};
+
+struct supported_result {
+    bool valid = false;
+    bool baseline_valid = false;
+    supported_choice selected;
+    supported_choice baseline;
+    size_t enumerated = 0;
+    size_t simulated = 0;
+    size_t rejected_memory = 0;
+    size_t rejected_profile = 0;
+    std::vector<supported_choice> top;
+};
+
+inline supported_result search_supported_fixed_phone(
+        const model & m,
+        const std::vector<llama_region_ring_region> & baseline,
+        int chunk_tokens) {
+    supported_result result;
+    if (!llama_region_ring_apply_safe_phone_shape(baseline) ||
+            m.layers != 48 || m.tokens <= 0 || chunk_tokens <= 0 ||
+            m.window != 2 || !m.pc_compute_gate) {
+        return result;
+    }
+    result.baseline.regions = baseline;
+    result.baseline.estimate.xc = chunk_tokens;
+    result.baseline.estimate.xg = chunk_tokens;
+    result.baseline.estimate.xp = chunk_tokens;
+    if (!simulate(m,baseline,result.baseline.estimate)) {
+        return result;
+    }
+    result.baseline_valid = true;
+
+    int pc_starts[3] = {};
+    int pc_widths[3] = {};
+    int baseline_g[3] = {};
+    int gpu_total = 0;
+    for (int i = 0; i < 3; ++i) {
+        const int j = i * 3;
+        pc_starts[i] = baseline[j].layer_begin;
+        pc_widths[i] = baseline[j + 2].layer_begin - pc_starts[i];
+        baseline_g[i] = baseline[j + 1].layer_end -
+                        baseline[j + 1].layer_begin;
+        gpu_total += baseline_g[i];
+    }
+
+    for (int g0 = 1; g0 < pc_widths[0]; ++g0) {
+        for (int g1 = 1; g1 < pc_widths[1]; ++g1) {
+            const int g2 = gpu_total - g0 - g1;
+            if (g2 <= 0 || g2 >= pc_widths[2]) {
+                continue;
+            }
+            const int gs[3] = {g0,g1,g2};
+            supported_choice choice;
+            choice.regions.reserve(baseline.size());
+            for (int i = 0; i < 3; ++i) {
+                const int begin = pc_starts[i];
+                const int middle = begin + pc_widths[i] - gs[i];
+                const int end = begin + pc_widths[i];
+                choice.regions.push_back({device::CPU, begin,middle});
+                choice.regions.push_back({device::GPU,middle,end});
+                choice.regions.push_back(baseline[i*3+2]);
+                choice.gpu_shift += std::abs(gs[i]-baseline_g[i]);
+            }
+            ++result.enumerated;
+            if (!llama_region_ring_apply_safe_compatible(
+                    baseline,choice.regions)) {
+                ++result.rejected_profile;
+                continue;
+            }
+            if (m.region_memory_feasible &&
+                    !m.region_memory_feasible(choice.regions)) {
+                ++result.rejected_memory;
+                continue;
+            }
+            choice.estimate.xc = chunk_tokens;
+            choice.estimate.xg = chunk_tokens;
+            choice.estimate.xp = chunk_tokens;
+            if (!simulate(m,choice.regions,choice.estimate)) {
+                ++result.rejected_profile;
+                continue;
+            }
+            ++result.simulated;
+            result.top.push_back(std::move(choice));
+        }
+    }
+    std::sort(result.top.begin(),result.top.end(),
+        [](const supported_choice &a,const supported_choice &b) {
+            if (std::abs(a.estimate.wall_ms-b.estimate.wall_ms) > 0.05) {
+                return a.estimate.wall_ms < b.estimate.wall_ms;
+            }
+            return a.gpu_shift < b.gpu_shift;
+        });
+    if (!result.top.empty()) {
+        result.selected=result.top.front();
+        result.valid=true;
+        if (result.top.size()>5) result.top.resize(5);
+    }
+    return result;
 }
 
 } // namespace llama_ring_planner
