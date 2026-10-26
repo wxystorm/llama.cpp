@@ -8386,6 +8386,42 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_PHONE_RING_REGISTER: {
+                std::vector<uint8_t> payload;
+                if (!recv_msg(sock, payload)) {
+                    return;
+                }
+                rpc_msg_phone_ring_ack rsp {};
+                rsp.accepted = server.graph_compute(payload, true) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_RING_INPUT_READY: {
+                rpc_msg_phone_ring_ready_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) {
+                    return;
+                }
+                rpc_msg_phone_ring_ack rsp {};
+                if (!server.phone_ring_input_ready(req, rsp) ||
+                        !send_msg(sock, &rsp, sizeof(rsp))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_RING_WAIT: {
+                rpc_msg_phone_ring_wait_req req {};
+                if (!recv_msg(sock, &req, sizeof(req))) {
+                    return;
+                }
+                rpc_msg_phone_ring_ack rsp {};
+                if (!server.phone_ring_wait(req, rsp) ||
+                        !send_msg(sock, &rsp, sizeof(rsp))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_PHONE_REGION_PARTIAL: {
                 rpc_msg_get_snapshot_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -8806,6 +8842,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_wait_ready_seq);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_RING_AUTO_READY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_ring_auto_ready);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PHONE_RING_AUTO_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_ring_auto_wait);
     }
     if (std::strcmp(
             name,
