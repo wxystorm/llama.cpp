@@ -330,6 +330,13 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int            ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
+    // Advisory resource mask for one Scheduler split. Bit i corresponds to
+    // ggml_backend_sched_get_backend(sched, i). The mask includes the split
+    // compute Backend and all source Backends for cross-backend inputs.
+    // Bit 63 indicates an input whose Backend cannot be resolved. This is
+    // for ownership diagnostics, NOT proof of safe concurrent execution:
+    // internal Meta/RPC resources and graph allocator state are not covered.
+    GGML_API uint64_t       ggml_backend_sched_get_split_resource_mask(ggml_backend_sched_t sched, int split_id);
     GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,
@@ -508,6 +515,12 @@ extern "C" {
         int64_t return_recv_payload_us;
         int64_t return_rpc_total_us;
     };
+
+    // Read-only inspection of Meta's separately instantiated inner Backends.
+    // The returned handles belong to Meta; callers must never free them.
+    GGML_API bool           ggml_backend_is_meta(ggml_backend_t backend);
+    GGML_API size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(

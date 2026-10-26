@@ -368,6 +368,7 @@ private:
                                        bool                                            own_stage_resources,
                                        bool                                            task_local_graph_outputs,
                                        bool                                            threaded_execution,
+                                       bool                                            audit_backend_resources,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(

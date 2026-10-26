@@ -2294,6 +2294,34 @@ ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, 
     return sched->backends[sched->splits[split_id].backend_id];
 }
 
+uint64_t ggml_backend_sched_get_split_resource_mask(ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    GGML_ASSERT(sched->n_backends > 0 && sched->n_backends < 64);
+
+    const ggml_backend_sched_split & split = sched->splits[split_id];
+    GGML_ASSERT(split.backend_id >= 0 && split.backend_id < sched->n_backends);
+    uint64_t mask = UINT64_C(1) << split.backend_id;
+
+    // prepare_split() may synchronize or copy from a producer backend even
+    // when that backend does not execute a node in this split. Account for
+    // every such input source, not just the compute backend.
+    for (int i = 0; i < split.n_inputs; ++i) {
+        ggml_backend_t src = ggml_backend_sched_get_tensor_backend(sched, split.inputs[i]);
+        if (src == nullptr) {
+            mask |= UINT64_C(1) << 63;
+            continue;
+        }
+        const int src_id = ggml_backend_sched_backend_id(sched, src);
+        if (src_id < 0 || src_id >= sched->n_backends) {
+            mask |= UINT64_C(1) << 63;
+        } else {
+            mask |= UINT64_C(1) << src_id;
+        }
+    }
+    return mask;
+}
+
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;

@@ -2745,6 +2745,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool own_stage_resources,
         bool task_local_graph_outputs,
         bool threaded_execution,
+        bool audit_backend_resources,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2845,6 +2846,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    if (audit_backend_resources && !threaded_execution) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_BACKEND_OWNERSHIP] status=REJECT reason=REQUIRES_WORKERS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (task_local_graph_outputs) {
         // The schedulers still share the exact same backend instances.
         // Graph execution and threadpool selection must remain under
@@ -2868,6 +2875,36 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "[REGION_RING_TASK_STATE] outputs=TASK_LOCAL "
             "context_outputs=READ_ONLY kv_views=3 "
             "graph_threads=1 status=READY\n");
+    }
+    if (audit_backend_resources) {
+        // A Meta backend constructs its own CPU and RPC backend instances.
+        // The PC's standalone CPU Backend is a separate handle, even though
+        // both run on the same host. No new backend is allocated here.
+        for (size_t outer = 0; outer < backend_ptrs.size(); ++outer) {
+            ggml_backend_t meta = backend_ptrs[outer];
+            if (!ggml_backend_is_meta(meta)) {
+                continue;
+            }
+            for (size_t inner = 0; inner < ggml_backend_meta_n_backends(meta); ++inner) {
+                ggml_backend_t backend = ggml_backend_meta_simple_backend(meta, inner);
+                bool alias = false;
+                for (size_t other = 0; other < backend_ptrs.size(); ++other) {
+                    if (backend == backend_ptrs[other]) {
+                        alias = true;
+                    }
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_META_CHILD] outer=%zu inner=%zu handle=%p "
+                    "name=%s device_type=%d aliases_outer=%d status=OBSERVED\n",
+                    outer, inner, (void *) backend, ggml_backend_name(backend),
+                    dev ? (int) ggml_backend_dev_type(dev) : -1, alias ? 1 : 0);
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_BACKEND_OWNERSHIP] mode=AUDIT_ONLY "
+            "split_inputs=INCLUDED meta_inner=OBSERVED "
+            "graph_gate=CONTEXT_SHARED compute_overlap=0 status=READY\n");
     }
     const int chunk_tokens = stages.front().macro_tokens;
     const size_t output_window = own_stage_resources ? 2 : 0;
@@ -2933,6 +2970,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             int64_t         backend_exec_us = 0;
             ggml_status     status          = GGML_STATUS_SUCCESS;
             llm_graph_result * final_result = nullptr;
+            uint64_t        backend_mask    = 0;
+            size_t          cross_backend_tasks = 0;
+            size_t          unknown_backend_tasks = 0;
         };
         std::array<ring_worker_state, 3> worker_states;
         const std::array<llama_region_ring_device, 3> devices = {
@@ -3007,6 +3047,49 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 block_outputs, worker_apply_mctx, true,
                                 task_status, nullptr, true);
                             state.backend_exec_us += ggml_time_us() - compute_begin_us;
+                            if (task_result != nullptr &&
+                                task_status == GGML_STATUS_SUCCESS &&
+                                audit_backend_resources) {
+                                const int n_splits = ggml_backend_sched_get_n_splits(
+                                    ring_sched[dev]);
+                                uint64_t task_mask = 0;
+                                for (int split = 0; split < n_splits; ++split) {
+                                    const uint64_t split_mask =
+                                        ggml_backend_sched_get_split_resource_mask(
+                                            ring_sched[dev], split);
+                                    task_mask |= split_mask;
+                                    if (task.chunk == 0 || (split_mask >> 63) != 0) {
+                                        ggml_backend_t target =
+                                            ggml_backend_sched_get_split_backend(
+                                                ring_sched[dev], split);
+                                        LLAMA_LOG_ERROR(
+                                            "[REGION_RING_BACKEND_SPLIT] device=%s "
+                                            "region=%zu chunk=%zu split=%d/%d "
+                                            "compute=%s resource_mask=0x%016" PRIx64
+                                            " unresolved=%d\\n",
+                                            name, task.region, task.chunk, split,
+                                            n_splits, ggml_backend_name(target),
+                                            split_mask, (int) (split_mask >> 63));
+                                    }
+                                }
+                                state.backend_mask |= task_mask;
+                                const uint64_t expected_mask = dev == 0 ?
+                                    UINT64_C(1) << 2 : dev == 1 ?
+                                    UINT64_C(1) << 1 : UINT64_C(1);
+                                const bool cross = (task_mask & ~expected_mask) != 0;
+                                const bool unresolved = (task_mask >> 63) != 0;
+                                state.cross_backend_tasks += cross;
+                                state.unknown_backend_tasks += unresolved;
+                                LLAMA_LOG_ERROR(
+                                    "[REGION_RING_BACKEND_TASK] device=%s "
+                                    "region=%zu chunk=%zu n_splits=%d "
+                                    "resource_mask=0x%016" PRIx64
+                                    " cross_backend=%d unresolved=%d "
+                                    "gate=GLOBAL status=OBSERVED\\n",
+                                    name, task.region, task.chunk, n_splits,
+                                    task_mask, cross ? 1 : 0,
+                                    unresolved ? 1 : 0);
+                            }
                         }
                     }
                     // Do not publish a downstream READY while the producer's
@@ -3057,11 +3140,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_WORKER_SUM] device=%s completed=%zu "
                 "ready_wait_ms=%.3f backend_wait_ms=%.3f backend_exec_ms=%.3f "
-                "status=%d\n",
+                "resource_mask=0x%016" PRIx64 " cross_backend_tasks=%zu "
+                "unresolved_tasks=%zu status=%d\n",
                 name, state.completed,
                 state.ready_wait_us / 1000.0,
                 state.backend_wait_us / 1000.0,
-                state.backend_exec_us / 1000.0, (int) state.status);
+                state.backend_exec_us / 1000.0, state.backend_mask,
+                state.cross_backend_tasks, state.unknown_backend_tasks,
+                (int) state.status);
         };
 
         std::vector<std::thread> workers;
@@ -3115,6 +3201,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             worker_states[2].completed,
             result == res_use && result != nullptr ? "MAIN" : "INVALID",
             ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        if (audit_backend_resources) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_BACKEND_OWNERSHIP_SUM] "
+                "cpu_mask=0x%016" PRIx64 " gpu_mask=0x%016" PRIx64
+                " phone_mask=0x%016" PRIx64
+                " cpu_cross=%zu gpu_cross=%zu phone_cross=%zu "
+                "cpu_unresolved=%zu gpu_unresolved=%zu phone_unresolved=%zu "
+                "compute_overlap=0 status=%s\n",
+                worker_states[0].backend_mask,
+                worker_states[1].backend_mask,
+                worker_states[2].backend_mask,
+                worker_states[0].cross_backend_tasks,
+                worker_states[1].cross_backend_tasks,
+                worker_states[2].cross_backend_tasks,
+                worker_states[0].unknown_backend_tasks,
+                worker_states[1].unknown_backend_tasks,
+                worker_states[2].unknown_backend_tasks,
+                ret == GGML_STATUS_SUCCESS ? "AUDITED" : "INCOMPLETE");
+        }
     } else {
     while (!ready.all_done() && ret == GGML_STATUS_SUCCESS) {
         std::optional<llama_region_ring_task> next;
@@ -3246,6 +3351,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
         threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
         task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
         own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
@@ -4224,10 +4330,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1 && ring_exec != "ready" &&
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
-        ring_exec != "fifo-workers" &&
+        ring_exec != "fifo-workers" && ring_exec != "fifo-backend-audit" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -4256,6 +4362,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo-owned" ? "DEVICE_FIFO_OWNED_SIMULATION" :
             ring_exec == "fifo-state" ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
             ring_exec == "fifo-workers" ? "DEVICE_FIFO_GATED_WORKERS" :
+            ring_exec == "fifo-backend-audit" ? "DEVICE_FIFO_BACKEND_AUDIT" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5539,6 +5646,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-owned = per-worker KV views + gated backends + 2-slot credits;
             // fifo-state = explicit per-task graph output count; same Backend gate;
             // fifo-workers = three real host threads, one shared Backend graph gate;
+            // fifo-backend-audit = workers + actual split/resource/Meta child audit;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5556,13 +5664,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     runtime_stages, ubatch_id,
                     ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
                         ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers",
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
                     ring_exec == "fifo-isolated" || ring_exec == "fifo-owned" ||
-                        ring_exec == "fifo-state" || ring_exec == "fifo-workers",
+                        ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
+                        ring_exec == "fifo-backend-audit",
                     ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers",
-                    ring_exec == "fifo-state" || ring_exec == "fifo-workers",
-                    ring_exec == "fifo-workers", status);
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                    ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
+                        ring_exec == "fifo-backend-audit",
+                    ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                    ring_exec == "fifo-backend-audit", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
