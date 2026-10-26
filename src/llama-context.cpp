@@ -2513,7 +2513,24 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         // Crucially, do NOT call the ordinary graph_compute_range() here:
         // it mutates *all* Backend thread configurations, including PC.
         ggml_backend_t meta = ggml_backend_sched_get_split_backend(sched_use, 0);
-        phone_pc_gate->unlock();
+        // Debug-only A/B isolation: keep the existing shared Backend gate
+        // during the remote Phone computation to distinguish a concurrent
+        // graph/Meta-buffer-lifetime race from a deterministic bad split.
+        // Normal execution releases the gate exactly as before.
+        const char * gate_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_STRICT_BACKEND_GATE");
+        const bool strict_backend_gate =
+            model.hybrid_ring_plan_topology &&
+            gate_env != nullptr && std::strcmp(gate_env,"1") == 0;
+        if (!strict_backend_gate) {
+            phone_pc_gate->unlock();
+        } else {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GATE_POLICY] stage=%zu chunk=%zu "
+                "mode=STRICT_PHONE_GRAPH gate=HELD_FOR_REMOTE "
+                "overlap=DISABLED_FOR_DIAGNOSIS\n",
+                stage_index,block_index);
+        }
         const int64_t detached_begin_us = ggml_time_us();
         if (phone_remote_begin_us) {
             *phone_remote_begin_us = detached_begin_us;
