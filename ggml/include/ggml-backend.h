@@ -534,6 +534,12 @@ extern "C" {
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_set_tensor_p2c_layer_mask(
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
+    // Model-owned Region Ring Phone ownership mask. Unlike the sparse
+    // Tensor-primary mask, this describes complete Phone-only layers.
+    // Non-empty masks must have internal Phone runs of 2..8 layers and
+    // end on a PC-owned layer. An empty mask clears general-topology mode.
+    GGML_API bool ggml_backend_meta_set_region_ring_phone_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 
