@@ -349,6 +349,82 @@ These extra checks do not alter Phone Graph execution or Relax CPU/Phone
 buffer ownership. PC and Phone RPC patch remain unchanged. **No complete
 Prefill or numerical parity validation has been claimed.**
 
+## Meta Graph ownership and Phone Worker scheduler fix (2026-10-27)
+
+A subsequent run completed both fused Phone P8 graphs, including the
+second `l_out-35` bridge, but the Meta backend then asserted while
+trying to split a **PC-only** compute tensor:
+
+```text
+[META_SIMPLE_NONMETA] name=norm-36 op=RMS_NORM buffer=0x0 index=1 ne=[2048,64,1,1]
+GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer)) failed
+```
+
+The selected Plan has Phone `[28,36)`, then CPU `[36,44)`,
+then GPU `[44,48)`. `norm-36` is *not* Phone-owned and must not
+be mapped into a Meta CPU/RPC compute graph.
+
+A code review exposed a concrete scheduler ownership bug:
+`src/llama-context.cpp` constructed **all three worker schedulers**
+with backend-list offset 1 when `pc_phone_overlap` was enabled.
+That intentionally removes Meta for **CPU/GPU** workers but
+incorrectly removed it for the **Phone** worker too. The Phone
+scheduler now gets the full `[Meta,CUDA0,CPU]` list, while CPU and
+GPU workers retain `[CUDA0,CPU]`. At initialization, require:
+
+```text
+[REGION_RING_PC_SCHED] worker=CPU ... meta_registered=0 status=READY
+[REGION_RING_PC_SCHED] worker=GPU ... meta_registered=0 status=READY
+[REGION_RING_PHONE_SCHED] worker=PHONE ... meta_registered=1 status=READY
+```
+
+If the Phone scheduler cannot include Meta, it is rejected before
+any Graph compute. Correct device ownership is required even though
+the Meta backend may use its separate local CPU child internally.
+
+The Meta backend now also fails closed **before rotating the Meta
+tensor-container graph cache** if any model-owned Phone graph has a
+non-Meta compute tensor without the preexisting host-view exception.
+This replaces the raw `META_SIMPLE_NONMETA` assert with a diagnostic
+showing the graph UID, first/last node, offending op/buffer, and
+`norm_layer`/Phone ownership:
+
+```text
+[REGION_RING_META_GRAPH_REJECT] ... name=norm-36 ... norm_layer=36 phone_owned=0 reason=NON_META_COMPUTE_NODE status=FAIL
+```
+
+It is **not** safe to pretend `norm-36` is allocated in Meta or to
+skip its RMS_NORM calculation. If the new rejection still appears,
+the remaining root cause needs investigation with the graph UID and
+scheduler ownership logs; the scheduler-list fix is a hypothesis
+supported by source inspection, not yet hardware-proven.
+
+A diagnostic-only A/B env var can temporarily serialize Phone
+execution under the shared backend gate:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_RING_STRICT_BACKEND_GATE = "1"
+```
+
+This disables PC/Phone overlap for the experiment; **do not measure
+performance** with it. Remove the variable to restore normal overlap:
+
+```powershell
+Remove-Item Env:LLAMA_HYBRID_REGION_RING_STRICT_BACKEND_GATE -ErrorAction SilentlyContinue
+```
+
+The `expected_ne` logging for Phone Stage outputs also now casts
+the uint32 `model.hparams.n_embd` to int64 before printing with
+`PRId64`; the earlier enormous printed dimension was a printf
+format mismatch, not an actual tensor size.
+
+Rebuild the **PC** executable from this revision. The Phone RPC
+patch-18 binary is unchanged. Start with the normal concurrent
+`apply-topology` test, inspect the three scheduler initialization
+lines and `REGION_RING_META_GRAPH_REJECT`. Only if needed run the
+strict-gate A/B test. Real-device correctness/parity and throughput
+remain **unverified**.
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
