@@ -18019,7 +18019,20 @@ auto prefill_norm_sg_has_prework =
                                     continue;
                                 }
                                 int pc_active = 0, phone_active = 0;
+                                int marker_norm = -1, marker_attn_norm = -1;
+                                int marker_ffn_inp = -1, marker_ffn_out = -1;
+                                int marker_l_out = -1;
                                 const ggml_tensor * first_pc_active = nullptr;
+                                auto trace_marker = [](const char * name,
+                                                      const char * pattern,
+                                                      int & out) {
+                                    int layer = -1, n = 0;
+                                    if (out < 0 &&
+                                            std::sscanf(name, pattern, &layer, &n) == 1 &&
+                                            n > 0 && name[n] == '\0') {
+                                        out = layer;
+                                    }
+                                };
                                 for (int k = 0; k < pc->n_nodes; ++k) {
                                     if ((pc->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
                                         ++pc_active;
@@ -18029,11 +18042,19 @@ auto prefill_norm_sg_has_prework =
                                     }
                                     phone_active +=
                                         (phone->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                                    const char * node_name = phone->nodes[k]->name;
+                                    trace_marker(node_name, "norm-%d%n", marker_norm);
+                                    trace_marker(node_name, "attn_norm-%d%n", marker_attn_norm);
+                                    trace_marker(node_name, "ffn_inp-%d%n", marker_ffn_inp);
+                                    trace_marker(node_name, "ffn_moe_out-%d%n", marker_ffn_out);
+                                    trace_marker(node_name, "l_out-%d%n", marker_l_out);
                                 }
                                 printf("[REGION_RING_PHONE_SG] sg=%zu nodes=%d "
                                        "first=%s last=%s tokens=%" PRId64 " "
                                        "phone_owned=%d pc_active=%d phone_active=%d "
-                                       "pc_first_active=%s pc_op=%s\n",
+                                       "pc_first_active=%s pc_op=%s "
+                                       "norm=%d attn_norm=%d ffn_inp=%d "
+                                       "ffn_moe_out=%d l_out=%d\n",
                                        sg, phone->n_nodes, phone->nodes[0]->name,
                                        phone->nodes[phone->n_nodes - 1]->name,
                                        phone->nodes[0]->ne[1],
@@ -18041,7 +18062,9 @@ auto prefill_norm_sg_has_prework =
                                        pc_active, phone_active,
                                        first_pc_active ? first_pc_active->name : "(none)",
                                        first_pc_active ?
-                                           ggml_op_name(first_pc_active->op) : "(none)");
+                                           ggml_op_name(first_pc_active->op) : "(none)",
+                                       marker_norm, marker_attn_norm,
+                                       marker_ffn_inp, marker_ffn_out, marker_l_out);
                             }
                         }
                     }
