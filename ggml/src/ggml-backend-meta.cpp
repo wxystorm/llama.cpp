@@ -13687,7 +13687,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         const bool validated_ring_p5_layer =
             (ffn_layer >= 11 && ffn_layer <= 15) ||
             (ffn_layer >= 27 && ffn_layer <= 31);
-        if (!validated_ring_p5_layer) {
+        if (ring_phone_fusion && !validated_ring_p5_layer) {
             return reject("RING_P5_LAYER_NOT_VALIDATED");
         }
         for (size_t sg = i; sg <= i + 1; ++sg) {
@@ -13706,6 +13706,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 const bool phone_compute =
                     (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
                 if (pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    // Outside the explicit Ring opt-in, preserve the legacy
+                    // strict PC-inactive acceptance rule unchanged.
+                    if (!ring_phone_fusion) {
+                        return reject("PC_ACTIVE_NODE");
+                    }
                     bool exact_phone_mirror =
                         phone_compute && pc_node->op == phone_node->op &&
                         pc_node->type == phone_node->type;
