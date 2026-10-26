@@ -13676,8 +13676,20 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return reject("RING_ATTN_INPUT_MARKER_MISSING");
         }
 
-        // The two SGs must be exclusively Phone-compute. Terminal labels
-        // alone cannot prove ownership: reject any mirrored PC compute node.
+        // Meta dispatches a Phone-only SG on backend 1 only. Its PC graph
+        // is still a mirror of the GGML graph and can retain COMPUTE flags,
+        // even though those PC nodes are never submitted by this path.
+        // For the two validated internal P5 Regions, accept ONLY PC flags
+        // whose matching Phone node also computes the same op and shape.
+        // A PC-only/partial operation remains a hard rejection. Do not
+        // mutate either graph's flags: the terminal l_out bridge still needs
+        // the original PC-side producer-disable and Phone->PC copy path.
+        const bool validated_ring_p5_layer =
+            (ffn_layer >= 11 && ffn_layer <= 15) ||
+            (ffn_layer >= 27 && ffn_layer <= 31);
+        if (!validated_ring_p5_layer) {
+            return reject("RING_P5_LAYER_NOT_VALIDATED");
+        }
         for (size_t sg = i; sg <= i + 1; ++sg) {
             ggml_cgraph * phone =
                 backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
@@ -13689,20 +13701,31 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
             bool has_phone_compute = false;
             for (int k = 0; k < pc->n_nodes; ++k) {
-                if (pc->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) {
-                    if (reason != nullptr) {
-                        char detail[256];
-                        std::snprintf(
-                            detail, sizeof(detail),
-                            "PC_ACTIVE_NODE:sg=%zu:k=%d:name=%.120s:op=%s",
-                            sg, k, pc->nodes[k]->name,
-                            ggml_op_name(pc->nodes[k]->op));
-                        *reason = detail;
+                const ggml_tensor * pc_node = pc->nodes[k];
+                const ggml_tensor * phone_node = phone->nodes[k];
+                const bool phone_compute =
+                    (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                if (pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    bool exact_phone_mirror =
+                        phone_compute && pc_node->op == phone_node->op &&
+                        pc_node->type == phone_node->type;
+                    for (int d = 0; d < GGML_MAX_DIMS && exact_phone_mirror; ++d) {
+                        exact_phone_mirror = pc_node->ne[d] == phone_node->ne[d];
                     }
-                    return false;
+                    if (!exact_phone_mirror) {
+                        if (reason != nullptr) {
+                            char detail[256];
+                            std::snprintf(
+                                detail, sizeof(detail),
+                                "PC_COMPUTE_NOT_PHONE_MIRROR:sg=%zu:k=%d:name=%.120s:op=%s",
+                                sg, k, pc_node->name,
+                                ggml_op_name(pc_node->op));
+                            *reason = detail;
+                        }
+                        return false;
+                    }
                 }
-                has_phone_compute |=
-                    (phone->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                has_phone_compute |= phone_compute;
             }
             if (!has_phone_compute) {
                 return reject("SUBGRAPH_PHONE_HAS_NO_COMPUTE");
@@ -13714,6 +13737,28 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     auto find_phone_block = [&](size_t start, size_t & end, int & first_layer,
                                 int & last_layer, std::string * reason = nullptr,
                                 size_t * failed_sg = nullptr) -> bool {
+        if (ring_phone_fusion) {
+            const char * layout =
+                std::getenv("LLAMA_HYBRID_REGION_RING_LAYOUT");
+            const char * ring_enabled =
+                std::getenv("LLAMA_HYBRID_REGION_RING_V1");
+            const char * exit_fix =
+                std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
+            // The mirror-flag exception is only proven for this Region Ring
+            // layout and its exact terminal l_out handoff behavior.
+            if (layout == nullptr ||
+                    std::strcmp(layout, "C7,G4,P5,C7,G4,P5,C8,G3,P5") != 0 ||
+                    ring_enabled == nullptr || std::atoi(ring_enabled) == 0 ||
+                    exit_fix == nullptr || std::atoi(exit_fix) == 0) {
+                if (reason != nullptr) {
+                    *reason = "RING_LAYOUT_OR_EXIT_FIX_NOT_VALIDATED";
+                }
+                if (failed_sg != nullptr) {
+                    *failed_sg = start;
+                }
+                return false;
+            }
+        }
         int layer = -1;
         std::string pair_reason;
         if (!phone_sg_pair_same_layer(start, layer,
@@ -13727,6 +13772,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return false;
         }
 
+        if (ring_phone_fusion &&
+                (start != 0 || (layer != 11 && layer != 27))) {
+            if (reason != nullptr) {
+                *reason = "RING_P5_START_NOT_VALIDATED";
+            }
+            if (failed_sg != nullptr) {
+                *failed_sg = start;
+            }
+            return false;
+        }
         first_layer = layer;
         last_layer = layer;
         end = start + 1;
@@ -13773,8 +13828,33 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
                 return false;
             }
+            // Only the ten Phone SGs enter the fused graph. The exact
+            // final l_out must remain separate so the existing exit fix
+            // disables the PC producer and copies the Phone result once.
+            if (!subgraph_is_exact_l_out_bridge(end + 1, last_layer)) {
+                if (reason != nullptr) {
+                    *reason = "RING_TERMINAL_L_OUT_BRIDGE_NOT_EXACT";
+                }
+                if (failed_sg != nullptr) {
+                    *failed_sg = end + 1;
+                }
+                return false;
+            }
         }
         return true;
+    };
+    auto count_ring_phone_pc_shadows = [&](size_t start, size_t end) -> size_t {
+        size_t count = 0;
+        for (size_t sg = start; sg <= end; ++sg) {
+            ggml_cgraph * pc =
+                backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+            GGML_ASSERT(pc != nullptr);
+            for (int k = 0; k < pc->n_nodes; ++k) {
+                count += (pc->nodes[k]->flags &
+                          GGML_TENSOR_FLAG_COMPUTE) != 0;
+            }
+        }
+        return count;
     };
     auto build_phone_block_graph = [&](size_t start, size_t end) -> ggml_cgraph * {
         GGML_ASSERT(start <= end && end < backend_ctx->n_subgraphs);
@@ -17976,11 +18056,12 @@ auto prefill_norm_sg_has_prework =
             if (phone_block_fused && ring_phone_fusion_probe &&
                     phone_block_last_layer - first_fused_layer + 1 == 5) {
                 printf("[REGION_RING_PHONE_FUSION] event=PROBE sg=%zu..%zu "
-                       "layers=[%d,%d) meta_sgs=%zu "
+                       "layers=[%d,%d) meta_sgs=%zu pc_shadow_compute=%zu "
                        "action=KEEP_LEGACY status=ELIGIBLE\n",
                        i, phone_block_end, first_fused_layer,
                        phone_block_last_layer + 1,
-                       phone_block_end - i + 1);
+                       phone_block_end - i + 1,
+                       count_ring_phone_pc_shadows(i, phone_block_end));
                 phone_block_fused = false;
                 eligible_probe_only = true;
             }
@@ -18201,10 +18282,11 @@ auto prefill_norm_sg_has_prework =
                 phone_block_last_layer - first_fused_layer + 1 == 5) {
             printf("[REGION_RING_PHONE_FUSION] event=SUBMIT sg=%zu..%zu "
                    "layers=[%d,%d) meta_sgs=%zu rpc_graphs=1 nodes=%d "
-                   "uid=%" PRIu64 " status=READY\n",
+                   "pc_shadow_compute=%zu uid=%" PRIu64 " status=READY\n",
                    i, phone_block_end, first_fused_layer,
                    phone_block_last_layer + 1,
                    phone_block_end - i + 1, phone_graph->n_nodes,
+                   count_ring_phone_pc_shadows(i, phone_block_end),
                    phone_graph->uid);
         }
         if (pipeline_debug && phone_block_fused && !phone_region_fused) {
