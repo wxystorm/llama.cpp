@@ -17853,6 +17853,24 @@ auto prefill_norm_sg_has_prework =
             if (phone_block_fused) {
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
+            } else if (ring_phone_fusion && is_phone_only_sg) {
+                // Diagnose a missed P5 fusion only at a candidate Region
+                // beginning. A skipped fusion is always a correct fallback
+                // to the original per-SG execution, not partial fusion.
+                ggml_cgraph * candidate =
+                    backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                if (candidate != nullptr && candidate->n_nodes > 0) {
+                    const char * first_name = candidate->nodes[0]->name;
+                    int first_layer = -1, chars = 0;
+                    if (std::sscanf(first_name, "norm-%d%n",
+                                    &first_layer, &chars) == 1 &&
+                            first_name[chars] == '\0') {
+                        printf("[REGION_RING_PHONE_FUSION] event=SKIP sg=%zu "
+                               "layer=%d reason=INCOMPLETE_OR_MIXED_OWNERSHIP "
+                               "fallback=LEGACY_PHONE_SGS\n",
+                               i, first_layer);
+                    }
+                }
             }
         }
         const int64_t phone_region_build_begin_us =
