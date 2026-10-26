@@ -50,7 +50,7 @@ struct model {
     int window = 2;
     int max_tail = 12;
     bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
-    double phone_register_ms = 0.0; // Conservative once per Phone task.
+    double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
     std::function<bool(device, device, size_t, double &)> transfer_ms;
@@ -146,7 +146,13 @@ inline bool simulate(const model & m,
                 !std::isfinite(ms) || ms < 0.0) {
                 return reject("COMPUTE_PROFILE_MISSING");
             }
-            if (d == device::PHONE) { ms += m.phone_register_ms; }
+            if (d == device::PHONE) {
+                // The registered graph scales with the number of Phone
+                // layers; never apply the same 314-node/P5 registration
+                // estimate unchanged to arbitrary P2/P8 candidates.
+                ms += m.phone_register_ms *
+                      (double) (regions[r].layer_end - regions[r].layer_begin) / 5.0;
+            }
             const int id = (int) tasks.size();
             tasks.push_back({(int) r, begin, end, previous, 0, 0, 0, ms});
             by_region[r].push_back(id);
