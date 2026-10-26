@@ -3300,6 +3300,62 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     }
 
     if (needs_rebuild) {
+        if (!backend_ctx->ring_phone_layer_mask.empty()) {
+            // In a model-owned Phone Region the outer Meta split must not
+            // contain a COMPUTE node from the following PC-only Region.
+            // Detect this BEFORE rotating Meta's tensor-container cache:
+            // mapping a null/foreign buffer through simple_tensor() would
+            // assert and obscure the offending outer graph and its UID.
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (node == nullptr) {
+                    fprintf(stderr,
+                        "[REGION_RING_META_GRAPH_REJECT] uid=%" PRIu64
+                        " node=%d/%d reason=NULL_GRAPH_NODE "
+                        "status=FAIL\n",
+                        cgraph->uid,i,cgraph->n_nodes);
+                    return GGML_STATUS_FAILED;
+                }
+                if (ggml_backend_buffer_is_meta(node->buffer)) {
+                    continue;
+                }
+                if (node->view_src != nullptr &&
+                        node->view_src->op == GGML_OP_NONE &&
+                        ggml_backend_buffer_is_host(node->view_src->buffer)) {
+                    // Existing Meta graph construction intentionally keeps
+                    // certain host-only view nodes unchanged.
+                    continue;
+                }
+                int named_layer = -1;
+                const int has_norm_layer =
+                    std::sscanf(node->name,"norm-%d",&named_layer) == 1;
+                const bool phone_owned =
+                    has_norm_layer && named_layer >= 0 &&
+                    (size_t) named_layer <
+                        backend_ctx->ring_phone_layer_mask.size() &&
+                    backend_ctx->ring_phone_layer_mask[(size_t) named_layer] != 0;
+                fprintf(stderr,
+                    "[REGION_RING_META_GRAPH_REJECT] uid=%" PRIu64
+                    " node=%d/%d nodes=%d first=%s last=%s "
+                    "name=%s op=%s tensor=%p buffer=%p "
+                    "src0=%s src0_buf=%p "
+                    "norm_layer=%d phone_owned=%d "
+                    "reason=NON_META_COMPUTE_NODE status=FAIL\n",
+                    cgraph->uid,i,cgraph->n_nodes,cgraph->n_nodes,
+                    cgraph->n_nodes > 0 && cgraph->nodes[0] ?
+                        cgraph->nodes[0]->name : "(null)",
+                    cgraph->n_nodes > 0 &&
+                            cgraph->nodes[cgraph->n_nodes - 1] ?
+                        cgraph->nodes[cgraph->n_nodes - 1]->name : "(null)",
+                    node->name,ggml_op_name(node->op),
+                    (const void *) node,(void *) node->buffer,
+                    node->src[0] ? node->src[0]->name : "(null)",
+                    node->src[0] ? (void *) node->src[0]->buffer : nullptr,
+                    has_norm_layer ? named_layer : -1,
+                    phone_owned ? 1 : 0);
+                return GGML_STATUS_FAILED;
+            }
+        }
         std::set<ggml_backend_buffer_t> used_buffers;
         for (int i = 0; i < cgraph->n_leafs; i++) {
             if (ggml_backend_buffer_is_meta(cgraph->leafs[i]->buffer)) {
