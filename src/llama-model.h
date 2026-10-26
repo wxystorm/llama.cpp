@@ -650,6 +650,9 @@ struct llama_model {
     // Empty means use the legacy LLAMA_HYBRID_REGION_RING_LAYOUT setting.
     std::string hybrid_ring_plan_layout;
     int hybrid_ring_plan_chunk_tokens = 0;
+    // Explicitly distinguish a variable-topology Plan from the original
+    // fixed-Phone APPLY-safe Plan. Not inferred from mutable environment.
+    bool hybrid_ring_plan_topology = false;
 
     std::vector<llama_layer> layers;
 
