@@ -36,6 +36,7 @@ struct candidate {
     double coarse_ms = 0.0;
     double wall_ms = 0.0;
     std::array<double, 3> busy_ms {};
+    double pc_gate_busy_ms = 0.0;
     std::array<double, 3> transfer_busy_ms {};
     int tasks = 0;
     int edges = 0;
@@ -50,6 +51,9 @@ struct model {
     int window = 2;
     int max_tail = 12;
     bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
+    // Runtime region_ring_backend_execution_mutex serializes PC CPU/CUDA
+    // graph execution. Phone computation can overlap after READY releases it.
+    bool pc_compute_gate = true;
     double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
@@ -185,6 +189,8 @@ inline bool simulate(const model & m,
     for (auto & t : tasks) { t.remaining_outputs = t.outputs; }
     std::priority_queue<event> events;
     std::array<bool, 3> device_busy {}, link_busy {};
+    bool pc_compute_gate_busy = false;
+    int next_pc_device = 0;  // Round-robin tie break across PC CPU/CUDA.
     std::vector<int> live_slots(regions.size(), 0);
     std::array<double, 3> busy_ms {}, transfer_busy_ms {};
     double now = 0.0;
@@ -205,8 +211,14 @@ inline bool simulate(const model & m,
             events.push({now + it.duration, (int) e, true});
             scheduled = true;
         }
-        for (int dev = 0; dev < 3; ++dev) {
-            if (device_busy[dev]) { continue; }
+        for (int turn = 0; turn < 3; ++turn) {
+            const int dev = m.pc_compute_gate && turn < 2 ?
+                (turn == 0 ? next_pc_device : 1 - next_pc_device) : turn;
+            if (device_busy[dev] ||
+                (m.pc_compute_gate && dev != (int) device::PHONE &&
+                 pc_compute_gate_busy)) {
+                continue;
+            }
             // Downstream-first scheduling helps clear Window credits without
             // overtaking the previous KV interval in a single Region.
             for (int r = (int) regions.size() - 1; r >= 0; --r) {
@@ -227,6 +239,10 @@ inline bool simulate(const model & m,
                 auto & t = tasks[selected];
                 t.started = true;
                 device_busy[dev] = true;
+                if (m.pc_compute_gate && dev != (int) device::PHONE) {
+                    pc_compute_gate_busy = true;
+                    next_pc_device = 1 - dev;
+                }
                 if (r + 1 < (int) regions.size()) {
                     ++live_slots[r];
                     for (int s : live_slots) { max_live = std::max(max_live, s); }
@@ -260,7 +276,12 @@ inline bool simulate(const model & m,
                 auto & t = tasks[current.id];
                 if (t.done) { return reject("DUPLICATE_TASK_DONE"); }
                 t.done = true;
-                device_busy[(int) regions[t.region].device] = false;
+                const int finished_device = (int) regions[t.region].device;
+                device_busy[finished_device] = false;
+                if (m.pc_compute_gate &&
+                    finished_device != (int) device::PHONE) {
+                    pc_compute_gate_busy = false;
+                }
                 ++completed;
             }
         }
@@ -268,7 +289,14 @@ inline bool simulate(const model & m,
     if (std::any_of(live_slots.begin(), live_slots.end(), [](int x){return x != 0;})) {
         return reject("LIVE_SLOTS_NOT_DRAINED");
     }
+    if (m.pc_compute_gate &&
+        busy_ms[(int) device::CPU] + busy_ms[(int) device::GPU] >
+        now + std::max(1e-6, 1e-9 * now)) {
+        return reject("PC_GATE_OVERCOMMITTED");
+    }
     c.wall_ms = now;
+    c.pc_gate_busy_ms = busy_ms[(int) device::CPU] +
+                        busy_ms[(int) device::GPU];
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
     c.tasks = n_tasks;
@@ -297,7 +325,9 @@ inline bool estimate_balance(const model & m, candidate & c) {
     const double gpu_total = c.cycles*tg/c.xg + c.tail_g*(tg/c.xg/std::max(c.g,1));
     const double phone_total = c.cycles*tp/c.xp;
     const double net_total = c.cycles*(cp+pc)/ref_tokens;
-    c.coarse_ms = m.tokens*std::max({cpu_total,gpu_total,phone_total,net_total}) +
+    const double pc_gate_total = m.pc_compute_gate ?
+        cpu_total + gpu_total : std::max(cpu_total,gpu_total);
+    c.coarse_ms = m.tokens*std::max({pc_gate_total,phone_total,net_total}) +
                   m.tokens*0.03*c.balance*std::max(s_pc,s_phone);
     return std::isfinite(c.coarse_ms);
 }
