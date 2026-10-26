@@ -1672,7 +1672,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             region_ring ?
                 (hybrid_ring_plan_layout.empty() ?
                     llama_region_ring_from_env(n_layer) :
-                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
+                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer,
+                                         hybrid_ring_plan_topology)) :
                 std::vector<llama_region_ring_region>{};
         const bool ring_layout_owned = region_ring && !has_runtime_plan;
         const std::array<int, 3> ring_counts =
@@ -1713,19 +1714,22 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
         if (region_ring && !hybrid_ring_plan_layout.empty()) {
             const auto original = llama_region_ring_from_env(n_layer);
-            if (!llama_region_ring_apply_safe_phone_shape(original) ||
-                    !llama_region_ring_apply_safe_compatible(
-                        original,ring_regions) ||
-                    hybrid_ring_plan_chunk_tokens != 64) {
+            const bool shape_ok = hybrid_ring_plan_topology ?
+                llama_region_ring_apply_topology_compatible(ring_regions,n_layer) &&
+                    ring_regions.back().device != llama_region_ring_device::PHONE :
+                llama_region_ring_apply_safe_phone_shape(original) &&
+                    llama_region_ring_apply_safe_compatible(original,ring_regions);
+            if (!shape_ok || hybrid_ring_plan_chunk_tokens != 64) {
                 throw std::runtime_error(
-                    "Ring selected Plan violates fixed Phone, GPU weight "
-                    "or Chunk ownership constraints");
+                    "Ring selected Plan violates model-owned Phone, GPU, "
+                    "final output or Chunk ownership constraints");
             }
             LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                "[REGION_RING_PLAN_APPLY] mode=%s "
                 "phase=WEIGHT_PLACEMENT applied=1 "
                 "layout=%s original=%s chunk=%d "
                 "status=CONSISTENT\n",
+                hybrid_ring_plan_topology ? "APPLY_TOPOLOGY" : "APPLY_SAFE",
                 hybrid_ring_plan_layout.c_str(),
                 llama_region_ring_layout_string(original).c_str(),
                 hybrid_ring_plan_chunk_tokens);
