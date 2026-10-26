@@ -8515,6 +8515,75 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                    w[1] <= baseline_weights[1] + tolerance &&
                    w[2] <= baseline_weights[2] + tolerance;
         };
+        // For deterministic A/B integration testing, accept an explicit
+        // Plan only through the SAME strict safe-layout and memory guards as
+        // the automatic search. No model or context state is mutated here.
+        // This overrides ranking, not layer ownership or graph legality.
+        if (const char * requested =
+                std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
+            if (*requested != '\0') {
+                std::vector<llama_region_ring_region> manual;
+                try {
+                    manual = llama_region_ring_parse(requested,model.layers);
+                } catch (const std::exception &e) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "source=MANUAL reason=INVALID_LAYOUT detail=%s "
+                        "status=KEEP_BASELINE\n",e.what());
+                    return false;
+                }
+                if (!llama_region_ring_apply_safe_compatible(
+                        baseline_regions,manual) ||
+                    !llama_region_ring_apply_safe_phone_shape(manual)) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "source=MANUAL reason=UNSUPPORTED_OWNERSHIP "
+                        "layout=%s status=KEEP_BASELINE\n",
+                        requested);
+                    return false;
+                }
+                if (model.region_memory_feasible &&
+                        !model.region_memory_feasible(manual)) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "source=MANUAL reason=MEMORY_BUDGET "
+                        "layout=%s status=KEEP_BASELINE\n",
+                        requested);
+                    return false;
+                }
+                llama_ring_planner::candidate manual_estimate;
+                manual_estimate.xc = baseline_chunk;
+                manual_estimate.xg = baseline_chunk;
+                manual_estimate.xp = baseline_chunk;
+                std::string simulate_reason;
+                if (!llama_ring_planner::simulate(
+                        model,manual,manual_estimate,&simulate_reason)) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "source=MANUAL reason=PROFILE_OR_DAG_%s "
+                        "status=KEEP_BASELINE\n",
+                        simulate_reason.c_str());
+                    return false;
+                }
+                *selected_layout =
+                    llama_region_ring_layout_string(manual);
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_SELECTED] mode=APPLY_SAFE "
+                    "source=MANUAL layout=%s tokens=%d chunk=%d "
+                    "predicted_ms=%.3f "
+                    "status=SUPPORTED_OVERRIDE\n",
+                    selected_layout->c_str(),tokens,baseline_chunk,
+                    manual_estimate.wall_ms);
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                    "phase=PRE_MODEL_LOAD selected=1 source=MANUAL "
+                    "layout=%s chunk=%d "
+                    "status=AWAIT_MODEL_PLACEMENT\n",
+                    selected_layout->c_str(),baseline_chunk);
+                return true;
+            }
+        }
+
         const auto supported =
             llama_ring_planner::search_supported_fixed_phone(
                 model, baseline_regions, baseline_chunk);
