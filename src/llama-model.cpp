@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-hybrid.h"
+#include "llama-region-ring.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -1683,13 +1684,46 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             this->params.tensor_split = pimpl->tensor_split_owned.data();
         }
 
-        hybrid_layer_modes = llama_hybrid_region_boundary_v1_enabled() ?
+        const bool region_ring = llama_region_ring_enabled();
+        const std::vector<llama_region_ring_region> ring_regions =
+            region_ring ? llama_region_ring_from_env(n_layer) :
+                          std::vector<llama_region_ring_region>{};
+        if (region_ring && runtime_plan.tensor_layers != 0) {
+            throw std::runtime_error("region ring needs T=0; set LLAMA_HYBRID_FIXED_TENSOR_LAYERS=0");
+        }
+        if (region_ring) {
+            const auto counts = llama_region_ring_layer_counts(ring_regions);
+            if (counts[0] + counts[1] != pc_layers || counts[2] != phone_layers ||
+                    counts[1] != gpu_pc_layers) {
+                throw std::runtime_error(
+                    "region ring layout differs from planner: fix PC/Phone/GPU counts");
+            }
+        }
+
+        hybrid_layer_modes = region_ring ?
+            std::vector<llama_hybrid_layer_mode>(n_layer, llama_hybrid_layer_mode::PC_ONLY) :
+            llama_hybrid_region_boundary_v1_enabled() ?
             llama_build_region_boundary_v1_policy(n_layer) :
             (has_runtime_plan ?
                 llama_build_hybrid_plan_policy(
                     n_layer, runtime_plan.pc_layers, runtime_plan.tensor_layers,
                     runtime_plan.phone_layers, runtime_plan.tensor_phone_primary) :
                 llama_build_hybrid_policy(n_layer, pc_layers, phone_layers, pc_layout));
+
+        if (region_ring) {
+            for (const auto & region : ring_regions) {
+                for (int il = region.layer_begin; il < region.layer_end; ++il) {
+                    hybrid_layer_modes[il] =
+                        region.device == llama_region_ring_device::PHONE ?
+                        llama_hybrid_layer_mode::PHONE_ONLY :
+                        llama_hybrid_layer_mode::PC_ONLY;
+                }
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_LAYOUT] device=%s layers=[%d,%d) status=READY\n",
+                    llama_region_ring_device_name(region.device),
+                    region.layer_begin, region.layer_end);
+            }
+        }
 
         hybrid_tensor_pc_ratios.assign(
             n_layer,
@@ -1808,8 +1842,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         const int n_gpu_pc = std::min<int>(
             gpu_pc_layers, pc_layer_ids.size());
-        for (int k = 0; k < n_gpu_pc; ++k) {
-            pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+        if (region_ring) {
+            for (const auto & region : ring_regions) {
+                if (region.device != llama_region_ring_device::GPU) {
+                    continue;
+                }
+                for (int il = region.layer_begin; il < region.layer_end; ++il) {
+                    pc_layer_backends[il] = llama_pc_layer_backend::CUDA;
+                }
+            }
+        } else {
+            for (int k = 0; k < n_gpu_pc; ++k) {
+                pc_layer_backends[pc_layer_ids[k]] = llama_pc_layer_backend::CUDA;
+            }
         }
 
         if (n_gpu_pc > 0) {
