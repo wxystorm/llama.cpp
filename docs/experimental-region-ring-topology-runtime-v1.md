@@ -253,6 +253,56 @@ commit, retain a working RPC patch-18 Phone, and compare final output
 against the fixed layout only after all 48 Region×Chunk tasks (for an
 8-Region layout with six chunks) complete.
 
+## First unresolved failure after PC-owned output head (2026-10-27)
+
+The next real run successfully used the model-owned CPU_DIRECT output
+placement and constructed the PC-only final graph:
+
+```text
+[REGION_RING_FINAL_GRAPH] stage=7 layers=[46,48) cpu_splits=1 gpu_splits=1 meta_splits=0 output=CPU_DIRECT status=PC_ONLY_READY
+[REGION_RING_FINAL_OWNER] device=GPU region=7 result=MAIN status=READY
+```
+
+The run **still failed**, but on a different worker:
+
+```text
+[REGION_RING_WORKER] device=PHONE event=FAIL region=2 chunk=3 status=-1
+[REGION_RING_SUM] tokens=358 regions=8 chunks=6 executed=23 complete=0 status=-1
+```
+
+The user-supplied filtered excerpt contains no underlying
+Phone/RPC/graph-allocation failure line for this task. Therefore the
+root cause is **not established**; do not alter KV/FIFO credit ordering,
+Graph cache identity, or RPC synchronization based on guesswork.
+
+Added diagnostics without changing execution:
+
+- `REGION_RING_STAGE_FAIL phase=PREPARE`: failure allocating or preparing
+  the stage graph
+- `phase=COMPUTE`: scheduler or Meta backend returned non-success
+- `phase=OUTPUT_COPY`: intermediate hidden output validation/copy failed
+- `REGION_RING_WORKER event=FAIL ... reason=...`: distinguishes a null
+  stage result, bad return owner, non-success status and cancellation
+- `PHONE_RING_AUTO side=pc event=REGISTER ... status=FAIL`: report both
+  RPC transport success and remote registration acknowledgement
+- GPU terminal resource audit now inspects the actual **MAIN** scheduler,
+  rather than stale GPU worker graph split state; prints
+  `scheduler=MAIN` or `scheduler=WORKER`.
+
+For a useful failure reproduction, capture unfiltered PC stdout **and**
+stderr. Keep the Phone server log separately. Look for the **first**
+`REGION_RING_STAGE_FAIL` and preceding Meta/RPC error; end-of-run
+`FINAL_OWNER result=MAIN` only means the canonical output pointer was
+selected, not that all workers succeeded.
+
+```powershell
+Select-String -Path ".\\ring-pc-full.log" `
+    -Pattern 'REGION_RING_STAGE_FAIL|REGION_RING_WORKER|PHONE_RING_AUTO|REGION_RING_PHONE_FUSION|failed to allocate graph|GGML_ASSERT|RPC.*FAIL|REGION_RING_FINAL_GRAPH' `
+    -Context 4,6 | Out-File ".\\ring-pc-failure-context.log"
+```
+
+No phone server rebuild is required for these PC-only diagnostics.
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
