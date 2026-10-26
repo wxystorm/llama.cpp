@@ -336,6 +336,15 @@ set_target_properties(test-region-ring-planner PROPERTIES
 target_include_directories(test-region-ring-planner PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring-planner)
 
+# Directional pair topology policy test; no model/RPC server required.
+add_executable(test-directional-pair test-directional-pair.cpp)
+set_target_properties(test-directional-pair PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF)
+target_include_directories(test-directional-pair PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-directional-pair)
+
 
 llama_build_and_test(test-meta-return-stall-profile.cpp)
 if (TARGET gguf-model-data)
