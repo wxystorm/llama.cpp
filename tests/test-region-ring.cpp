@@ -102,6 +102,60 @@ static void test_general_topology() {
           "general Ring must reject a tail without a CPU stage");
 }
 
+static void test_variable_topology_window2_fifo() {
+    const char * layouts[] = {
+        "C6,G4,P8,C6,G4,P8,C8,G4",
+        "C5,G6,P8,C5,G6,P8,C10"
+    };
+    for (const char * layout : layouts) {
+        const auto regions = llama_region_ring_parse(layout,48,true);
+        check(llama_region_ring_apply_topology_compatible(regions,48),
+              "general runtime layout failed structural validation");
+        check(regions.back().device != llama_region_ring_device::PHONE,
+              "general runtime must finish on PC");
+        llama_region_ring_ready ready(regions,358,64,2);
+        std::vector<std::vector<int>> done(
+            regions.size(),std::vector<int>(6,0));
+        const std::array<llama_region_ring_device,3> devices = {
+            llama_region_ring_device::CPU,
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::PHONE
+        };
+        size_t completed = 0;
+        while (!ready.all_done()) {
+            bool progressed = false;
+            for (const auto device : devices) {
+                auto job = ready.try_take(device);
+                if (!job) {
+                    continue;
+                }
+                check(job->region < regions.size() && job->chunk < 6,
+                      "general FIFO task outside Region or Chunk range");
+                check(regions[job->region].device == device,
+                      "general FIFO claimed incorrect device");
+                check(done[job->region][job->chunk] == 0,
+                      "general FIFO duplicate completion");
+                check(job->region == 0 ||
+                          done[job->region-1][job->chunk] == 1,
+                      "general FIFO upstream dependency violated");
+                check(job->chunk == 0 ||
+                          done[job->region][job->chunk-1] == 1,
+                      "general FIFO KV ordering violated");
+                done[job->region][job->chunk] = 1;
+                ready.complete(*job);
+                ++completed;
+                progressed = true;
+            }
+            check(progressed,"general FIFO deadlocked");
+        }
+        check(completed == regions.size() * 6,
+              "general FIFO task count mismatch");
+        check(ready.live_output_slots() == 0,
+              "general FIFO leaked a host output slot");
+        check(!ready.failed(),"general FIFO reported failure");
+    }
+}
+
 static void test_apply_safe_compatibility() {
     const auto baseline = llama_region_ring_parse("", 48);
     check(llama_region_ring_apply_safe_phone_shape(baseline),
@@ -512,7 +566,9 @@ int main() {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
         test_general_topology();
-        std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
+        test_variable_topology_window2_fifo();
+        std::fprintf(stderr,
+                     "[REGION_RING_TEST] general_topology_window2=PASS\n");
         test_apply_safe_compatibility();
         std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
