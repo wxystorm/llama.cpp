@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <condition_variable>
@@ -2933,6 +2934,36 @@ ggml_backend_meta_get_wait_ready_seq(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(
             reg,
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC));
+}
+
+static ggml_backend_rpc_phone_ring_auto_ready_t
+ggml_backend_meta_get_phone_ring_auto_ready(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_ring_auto_ready_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_RING_AUTO_READY_PROC));
+}
+
+static ggml_backend_rpc_phone_ring_auto_wait_t
+ggml_backend_meta_get_phone_ring_auto_wait(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    return reinterpret_cast<ggml_backend_rpc_phone_ring_auto_wait_t>(
+        ggml_backend_reg_get_proc_address(
+            reg, GGML_BACKEND_RPC_PHONE_RING_AUTO_WAIT_PROC));
 }
 
 static ggml_backend_rpc_phone_region_local_submit_t
@@ -13544,6 +13575,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
          std::strcmp(ring_fuse, "probe") == 0);
     const bool ring_phone_fusion_probe =
         ring_phone_fusion && std::strcmp(ring_fuse, "probe") == 0;
+    const char * ring_auto_env =
+        std::getenv("GGML_META_RING_PHONE_AUTOSTART");
+    const bool ring_phone_autostart =
+        ring_phone_fusion && !ring_phone_fusion_probe &&
+        ring_auto_env != nullptr && std::strcmp(ring_auto_env, "1") == 0;
+    const auto phone_ring_auto_ready = ring_phone_autostart ?
+        ggml_backend_meta_get_phone_ring_auto_ready(
+            backend_ctx->backend_configs[1].backend) : nullptr;
+    const auto phone_ring_auto_wait = ring_phone_autostart ?
+        ggml_backend_meta_get_phone_ring_auto_wait(
+            backend_ctx->backend_configs[1].backend) : nullptr;
+    if (ring_phone_autostart) {
+        if (phone_ring_auto_ready == nullptr ||
+                phone_ring_auto_wait == nullptr ||
+                !phone_ring_auto_ready(
+                    backend_ctx->backend_configs[1].backend, nullptr, 0, 0) ||
+                !phone_ring_auto_wait(
+                    backend_ctx->backend_configs[1].backend, 0)) {
+            printf("[PHONE_RING_AUTO] side=pc event=REJECT "
+                   "reason=PHONE_RPC_V17_REQUIRED status=FAIL\n");
+            return GGML_STATUS_FAILED;
+        }
+    }
 
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer,
                                        std::string * reason = nullptr) -> bool {
@@ -15476,6 +15530,10 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // prefill_wave_attn_out_group_*.  Track the group so the exact predecessor
     // dependency is consumed once, before any Q/K/V prework starts.
     std::set<std::pair<int, int>> return_wave_attn_dependency_started;
+    // Completion is consumed only at the exact final l_out bridge. Until
+    // then the Phone MAIN worker owns execution and PC may do other work.
+    std::map<int, uint64_t> pending_ring_auto_outputs;
+    static std::atomic<uint64_t> next_ring_auto_seq { 1 };
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
@@ -15483,6 +15541,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             ++schedule_pos) {
         size_t i = region_pipeline_active ?
             region_pipe_schedule[schedule_pos].sg : schedule_pos;
+        if (ring_phone_autostart && !pending_ring_auto_outputs.empty()) {
+            for (int terminal_layer : { 15, 31 }) {
+                const auto pending =
+                    pending_ring_auto_outputs.find(terminal_layer);
+                if (pending == pending_ring_auto_outputs.end() ||
+                        !subgraph_is_exact_l_out_bridge(i, terminal_layer)) {
+                    continue;
+                }
+                // This is a real input dependency for l_out, not a per-layer
+                // PC control barrier: the Phone graph was already queued by
+                // INPUT_READY. Ensure it has completed before l_out and copy.
+                const uint64_t seq = pending->second;
+                const bool ok = phone_ring_auto_wait(
+                    backend_ctx->backend_configs[1].backend, seq);
+                printf("[PHONE_RING_AUTO] side=pc event=OUTPUT_READY "
+                       "layer=%d sg=%zu seq=%" PRIu64 " status=%s\n",
+                       terminal_layer, i, seq, ok ? "OK" : "FAIL");
+                if (!ok) {
+                    return GGML_STATUS_FAILED;
+                }
+                pending_ring_auto_outputs.erase(pending);
+            }
+        }
         int pipeline_chunk = -1;
         const char * pipeline_stage = nullptr;
         if (region_pipeline_active) {
@@ -18284,6 +18365,7 @@ auto prefill_norm_sg_has_prework =
 
         const int64_t phone_submit_begin_us = ggml_time_us();
         if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
+                !ring_phone_autostart &&
                 phone_block_last_layer - first_fused_layer + 1 == 5) {
             printf("[REGION_RING_PHONE_FUSION] event=SUBMIT sg=%zu..%zu "
                    "layers=[%d,%d) meta_sgs=%zu rpc_graphs=1 nodes=%d "
@@ -18590,8 +18672,41 @@ auto prefill_norm_sg_has_prework =
                        scratch_reuse_seq);
             }
         } else {
-            compute_workers.start_graph(1, phone_graph);
-            compute_status = compute_workers.wait(1);
+            if (ring_phone_autostart && phone_block_fused &&
+                    !phone_region_fused &&
+                    (first_fused_layer == 11 || first_fused_layer == 27)) {
+                // The final input copy is already complete by this stage.
+                // Fence across RPC transfer/compute sockets before publishing
+                // READY so the server never reads partially written buffers.
+                auto phone_backend =
+                    backend_ctx->backend_configs[1].backend;
+                const int64_t transfer_fence_begin_us = ggml_time_us();
+                ggml_backend_synchronize(phone_backend);
+                const int64_t transfer_fence_us =
+                    ggml_time_us() - transfer_fence_begin_us;
+                const uint64_t seq =
+                    UINT64_C(0xB000000000000000) |
+                    (next_ring_auto_seq.fetch_add(1) &
+                     UINT64_C(0x0FFFFFFFFFFFFFFF));
+                if (!phone_ring_auto_ready(
+                        phone_backend, phone_graph, first_fused_layer, seq)) {
+                    printf("[PHONE_RING_AUTO] side=pc event=REJECT "
+                           "layer=%d reason=REGISTER_OR_READY_FAILED "
+                           "status=FAIL\n", first_fused_layer);
+                    return GGML_STATUS_FAILED;
+                }
+                pending_ring_auto_outputs[phone_block_last_layer] = seq;
+                compute_status = GGML_STATUS_SUCCESS;
+                printf("[PHONE_RING_AUTO] side=pc event=READY "
+                       "layers=[%d,%d) sg=%zu..%zu seq=%" PRIu64 " "
+                       "transfer_fence_ms=%.3f status=QUEUED\n",
+                       first_fused_layer, phone_block_last_layer + 1,
+                       i, phone_block_end, seq,
+                       transfer_fence_us / 1000.0);
+            } else {
+                compute_workers.start_graph(1, phone_graph);
+                compute_status = compute_workers.wait(1);
+            }
 
             if (region_pipeline_active && phone_region_fused &&
                     compute_status == GGML_STATUS_SUCCESS) {
@@ -18901,6 +19016,7 @@ auto prefill_norm_sg_has_prework =
                 phone_submit_end_us;
         }
         if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
+                !ring_phone_autostart &&
                 phone_block_last_layer - first_fused_layer + 1 == 5) {
             printf("[REGION_RING_PHONE_FUSION] event=DONE sg=%zu..%zu "
                    "layers=[%d,%d) submit_ms=%.3f "
