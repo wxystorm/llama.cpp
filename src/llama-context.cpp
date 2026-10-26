@@ -2830,6 +2830,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
 
+    // Planner runs ONLY in explicit dry-run mode, before the fixed Ring
+    // execution. It reads the measured Hybrid profile, predicts alternative
+    // layer/Chunk layouts and never changes stages, KV or scheduler state.
+    const char * ring_plan_mode =
+        std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+    if (pc_phone_overlap && ring_plan_mode != nullptr &&
+            std::strcmp(ring_plan_mode, "dry-run") == 0 &&
+            ubatch.n_tokens >= 32) {
+        const int kv_start =
+            ubatch.pos != nullptr && ubatch.n_pos == 1 ?
+            std::max(0, (int) ubatch.pos[0]) : 0;
+        (void) llama_hybrid_region_ring_planner_dry_run(
+            (int) ubatch.n_tokens, kv_start, stages.front().macro_tokens);
+    }
+
     const int32_t saved_outputs = n_outputs;
     const int n_embd = model.hparams.n_embd;
     std::vector<llama_region_ring_region> regions;
