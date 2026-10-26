@@ -136,6 +136,31 @@ int main() {
         general_regions,48));
     REQUIRE(general.selected.max_live_slots <= 2);
     REQUIRE(!search_supported_topology(general_profile,128).valid);
+    const result executable = search_supported_topology(
+        general_profile,64,96,true);
+    REQUIRE(executable.valid && executable.simulated > 0);
+    std::vector<llama_region_ring_region> executable_regions;
+    REQUIRE(make_regions(executable.selected,48,executable_regions));
+    REQUIRE(executable_regions.back().device != device::PHONE);
+    REQUIRE(executable.selected.tail_c + executable.selected.tail_g > 0);
+    REQUIRE(executable.selected.max_live_slots <= 2);
+    REQUIRE(executable.selected.tasks ==
+            (int) executable_regions.size() * 6);
+    candidate example;
+    example.cycles = 2;
+    example.c = 6;
+    example.g = 4;
+    example.p = 8;
+    example.tail_c = 8;
+    example.tail_g = 4;
+    example.xc = example.xg = example.xp = 64;
+    std::vector<llama_region_ring_region> example_regions;
+    REQUIRE(make_regions(example,48,example_regions));
+    REQUIRE(example_regions.size() == 8);
+    REQUIRE(example_regions.back().device == device::GPU);
+    REQUIRE(simulate(general_profile,example_regions,example,&reason));
+    REQUIRE(example.tasks == 48);
+    REQUIRE(example.max_live_slots <= 2);
 
     // Runtime APPLY-safe uses a separate constrained search. It may ONLY
     // move the C/G boundaries within the three existing 11-layer PC windows;
