@@ -8,7 +8,7 @@ This experimental mode is based on the validated `fifo-state` commit `32e3a234`.
 
 Tasks are acquired with the condition-variable `ready.wait_take(device)`. Only a completed synchronous Graph/transfer may call `ready.complete(task)`, which publishes the downstream Region's READY and returns the consumed input credit. The two Host F32 output Slots per Region boundary obey `FREE -> WRITING -> READY -> READING -> FREE`.
 
-**Backend execution is intentionally still serialized**: each worker acquires `region_ring_backend_execution_mutex` before calling `run_hybrid_stage_block()` and holds it through Graph preparation, Meta RPC, CUDA/CPU compute and backend synchronization. `ready.complete` runs outside the Backend lock so scheduling and credit releases are asynchronous to other host workers. This is a concurrency **correctness** experiment, not true overlapping CPU/CUDA/Phone compute.
+**Backend execution is intentionally still serialized within the llama_context instance**: each worker acquires `region_ring_backend_execution_mutex` before calling `run_hybrid_stage_block()` and holds it through Graph preparation, Meta RPC, CUDA/CPU compute and backend synchronization. `ready.complete` runs outside the Backend lock so scheduling and credit releases are asynchronous to other host workers. This is a concurrency **correctness** experiment, not true overlapping CPU/CUDA/Phone compute.
 
 ## Thread exit and failures
 
@@ -44,7 +44,7 @@ $env:LLAMA_HYBRID_REGION_RING_EXEC = 'fifo-workers'
 [REGION_RING_WORKER_SUM] device=CPU completed=18 ... status=0
 [REGION_RING_WORKER_SUM] device=GPU completed=18 ... status=0
 [REGION_RING_WORKER_SUM] device=PHONE completed=18 ... status=0
-[REGION_RING_WORKERS_SUM] created=3 joined=3 finished=54 completed=54 backend_gate=GLOBAL graph_overlap=0 final_owner=MAIN status=PASS
+[REGION_RING_WORKERS_SUM] created=3 joined=3 finished=54 completed=54 cpu_tasks=18 gpu_tasks=18 phone_tasks=18 backend_gate=CONTEXT_SHARED graph_overlap=0 final_owner=MAIN status=PASS
 [REGION_RING_TASK_STATE_SUM] tasks=54 ... context_outputs_unchanged=1 ... status=PASS
 [REGION_RING_OWNERSHIP_SUM] window=2 live_slots=0 finished=54 status=DRAINED
 [REGION_RING_SUM] tokens=358 chunks=6 executed=54 complete=1 ... mode=DEVICE_FIFO_GATED_WORKERS status=0

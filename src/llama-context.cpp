@@ -3099,6 +3099,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         result = worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
         if (!launched_all || created != devices.size() ||
             joined != devices.size() || ready.failed() || !ready.all_done() ||
+            executed != ready.finished() ||
             result == nullptr || result != res_use) {
             if (ret == GGML_STATUS_SUCCESS) {
                 ret = GGML_STATUS_FAILED;
@@ -3106,9 +3107,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_SUM] created=%zu joined=%zu "
-            "finished=%zu completed=%zu backend_gate=GLOBAL "
+            "finished=%zu completed=%zu cpu_tasks=%zu gpu_tasks=%zu "
+            "phone_tasks=%zu backend_gate=CONTEXT_SHARED "
             "graph_overlap=0 final_owner=%s status=%s\n",
             created, joined, ready.finished(), executed,
+            worker_states[0].completed, worker_states[1].completed,
+            worker_states[2].completed,
             result == res_use && result != nullptr ? "MAIN" : "INVALID",
             ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
     } else {
