@@ -2427,7 +2427,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             stage_index,block_index,block_tokens,(void *) result,
             (void *) prepared_output,prepared_type,prepared_ne0,prepared_ne1,
             prepared_contiguous ? 1 : 0,
-            model.hparams.n_embd,block_tokens);
+            (int64_t) model.hparams.n_embd,block_tokens);
     }
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     if (model.hybrid_ring_plan_topology &&
@@ -3046,7 +3046,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
             auto & worker = region_ring_worker_resources[dev];
-            const size_t start = pc_phone_overlap ? 1 : 0;
+            // PC workers must never drive Meta, because Phone computation
+            // stays detached. Conversely the Phone worker must INCLUDE Meta:
+            // its PHONE_ONLY weights live in Meta(CPU,RPC), not CUDA0/CPU.
+            // The old generic "start=1" accidentally removed Meta from all
+            // three worker schedulers, including PHONE.
+            const bool phone_worker = dev == 2;
+            const size_t start = pc_phone_overlap && !phone_worker ? 1 : 0;
             const size_t count = backend_ptrs.size() - start;
             // A reused llama_context may have cached schedulers from an A/B
             // mode switch. Recreate only if the exact backend list changed.
@@ -3085,14 +3091,48 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ring_sched[dev] = worker.sched.get();
             ring_res[dev] = worker.res.get();
             if (pc_phone_overlap) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_PC_SCHED] worker=%s backends=%d "
-                    "first=%s last=%s offload=%d meta_registered=0 status=READY\n",
-                    dev == 0 ? "CPU" : "GPU",
-                    ggml_backend_sched_get_n_backends(ring_sched[dev]),
-                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], 0)),
-                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], (int) count - 1)),
-                    cparams.op_offload ? 1 : 0);
+                ggml_backend_t first_backend =
+                    ggml_backend_sched_get_backend(ring_sched[dev],0);
+                const bool meta_registered =
+                    ggml_backend_is_meta(first_backend);
+                if (phone_worker) {
+                    if (!meta_registered || count != backend_ptrs.size()) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PHONE_SCHED] worker=PHONE "
+                            "meta_registered=%d backends=%zu "
+                            "reason=PHONE_REQUIRES_META status=REJECT\n",
+                            meta_registered ? 1 : 0,count);
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PHONE_SCHED] worker=PHONE "
+                        "backends=%zu first=%s last=%s "
+                        "meta_registered=1 status=READY\n",
+                        count,ggml_backend_name(first_backend),
+                        ggml_backend_name(
+                            ggml_backend_sched_get_backend(
+                                ring_sched[dev],(int) count - 1)));
+                } else {
+                    if (meta_registered) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PC_SCHED] worker=%s "
+                            "reason=META_NOT_ALLOWED status=REJECT\n",
+                            dev == 0 ? "CPU" : "GPU");
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PC_SCHED] worker=%s backends=%zu "
+                        "first=%s last=%s offload=%d "
+                        "meta_registered=0 status=READY\n",
+                        dev == 0 ? "CPU" : "GPU",count,
+                        ggml_backend_name(first_backend),
+                        ggml_backend_name(
+                            ggml_backend_sched_get_backend(
+                                ring_sched[dev],(int) count - 1)),
+                        cparams.op_offload ? 1 : 0);
+                }
             }
         }
 
