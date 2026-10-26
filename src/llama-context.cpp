@@ -2767,6 +2767,38 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 llama_region_ring_device::PHONE;
         regions.push_back({device, stage.layer_begin, stage.layer_end});
     }
+    if (strict_cpu_scheduler) {
+        // Before pinning computation, also verify the underlying model owns
+        // every CPU Region layer on the actual CPU device. Otherwise a
+        // CPU-only Scheduler might unexpectedly copy CUDA-resident weights.
+        const auto cpu_device = backend_cpu != nullptr ?
+            ggml_backend_get_device(backend_cpu) : nullptr;
+        if (cpu_device == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_CPU_LAYOUT] status=FAIL reason=CPU_BACKEND_MISSING\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        size_t owned_layers = 0;
+        for (const auto & region : regions) {
+            if (region.device != llama_region_ring_device::CPU) {
+                continue;
+            }
+            for (int il = region.layer_begin; il < region.layer_end; ++il) {
+                if (model.dev_layer(il) != cpu_device) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_CPU_LAYOUT] layer=%d status=FAIL "
+                        "reason=MODEL_WEIGHT_DEVICE_NOT_CPU\n", il);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                ++owned_layers;
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_CPU_LAYOUT] layers=%zu device=CPU_DIRECT status=READY\n",
+            owned_layers);
+    }
     // Scheduler/Graph Result ownership differs by device in the experimental
     // isolated mode. Only the scheduler state is independent at this stage:
     // ggml_backend_t handles, KV state, n_outputs, and threadpools remain shared.
