@@ -268,6 +268,9 @@ enum rpc_cmd {
     RPC_CMD_WAIT_READY_SEQ,
     RPC_CMD_PHONE_REGION_LOCAL_SUBMIT,
     RPC_CMD_GET_PHONE_REGION_PARTIAL,
+    RPC_CMD_PHONE_RING_REGISTER,
+    RPC_CMD_PHONE_RING_INPUT_READY,
+    RPC_CMD_PHONE_RING_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -291,6 +294,9 @@ static_assert(RPC_CMD_SET_TENSOR_ASYNC_RETURN_WAIT == 32, "RPC_CMD_SET_TENSOR_AS
 static_assert(RPC_CMD_WAIT_READY_SEQ == 33, "RPC_CMD_WAIT_READY_SEQ must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_PHONE_REGION_LOCAL_SUBMIT == 34, "RPC_CMD_PHONE_REGION_LOCAL_SUBMIT must be before RPC_CMD_COUNT");
 static_assert(RPC_CMD_GET_PHONE_REGION_PARTIAL == 35, "RPC_CMD_GET_PHONE_REGION_PARTIAL must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_PHONE_RING_REGISTER == 36, "RPC_CMD_PHONE_RING_REGISTER index");
+static_assert(RPC_CMD_PHONE_RING_INPUT_READY == 37, "RPC_CMD_PHONE_RING_INPUT_READY index");
+static_assert(RPC_CMD_PHONE_RING_WAIT == 38, "RPC_CMD_PHONE_RING_WAIT index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -536,6 +542,20 @@ struct rpc_msg_phone_region_local_submit_req {
 struct rpc_msg_phone_region_local_submit_rsp {
     uint8_t accepted;
 };
+struct rpc_msg_phone_ring_ready_req {
+    uint32_t device;
+    uint32_t first_layer;
+    uint64_t graph_uid;
+    uint64_t seq;
+};
+struct rpc_msg_phone_ring_wait_req {
+    uint32_t device;
+    uint32_t reserved;
+    uint64_t seq;
+};
+struct rpc_msg_phone_ring_ack {
+    uint8_t accepted;
+};
 
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
@@ -614,6 +634,10 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     std::unordered_set<uint64_t> graph_uids;
+
+    std::mutex ring_auto_cache_mutex;
+    std::unordered_set<uint64_t> ring_auto_graph_uids;
+    const socket_t * ring_auto_cache_socket = nullptr;
 
     std::mutex fused_set_graph_cache_mutex;
     std::unordered_set<uint64_t> fused_set_graph_uids;
@@ -3158,6 +3182,108 @@ static bool ggml_backend_rpc_wait_ready_seq(
     return status;
 }
 
+
+static bool ggml_backend_rpc_phone_ring_auto_ready(
+        ggml_backend_t backend,
+        const ggml_cgraph * graph,
+        int first_layer,
+        uint64_t completion_seq) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto * dev = ggml_backend_get_device(backend);
+    auto * cache = dev != nullptr ?
+        static_cast<ggml_backend_rpc_device_context *>(dev->context) : nullptr;
+    if (ctx == nullptr || cache == nullptr) {
+        return false;
+    }
+    auto sock = get_socket(ctx->endpoint);
+    if (sock == nullptr ||
+            rpc_get_remote_patch(ctx->endpoint + "_compute") < 17) {
+        return false;
+    }
+    // Capability query (Meta calls this before dispatching the first graph).
+    if (graph == nullptr && completion_seq == 0) {
+        return true;
+    }
+    if (graph == nullptr || graph->n_nodes <= 0 || graph->uid == 0 ||
+            completion_seq == 0 ||
+            (first_layer != 11 && first_layer != 27)) {
+        return false;
+    }
+    const uint64_t uid = rpc_graph_effective_uid(graph);
+    std::lock_guard<std::mutex> lock(cache->ring_auto_cache_mutex);
+    if (cache->ring_auto_cache_socket != sock.get()) {
+        cache->ring_auto_cache_socket = sock.get();
+        cache->ring_auto_graph_uids.clear();
+    }
+    if (cache->ring_auto_graph_uids.find(uid) ==
+            cache->ring_auto_graph_uids.end()) {
+        std::vector<uint8_t> graph_data;
+        serialize_graph(ctx->device, uid, graph, graph_data);
+        rpc_msg_phone_ring_ack registered {};
+        if (!send_rpc_cmd(sock, RPC_CMD_PHONE_RING_REGISTER,
+                graph_data.data(), graph_data.size(),
+                &registered, sizeof(registered)) ||
+                registered.accepted == 0) {
+            return false;
+        }
+        cache->ring_auto_graph_uids.insert(uid);
+        std::fprintf(stderr,
+            "[PHONE_RING_AUTO] side=pc event=REGISTER layer=%d "
+            "uid=%" PRIu64 " nodes=%d bytes=%zu status=OK\n",
+            first_layer, uid, graph->n_nodes, graph_data.size());
+    }
+    rpc_msg_phone_ring_ready_req ready {};
+    ready.device = ctx->device;
+    ready.first_layer = static_cast<uint32_t>(first_layer);
+    ready.graph_uid = uid;
+    ready.seq = completion_seq;
+    rpc_msg_phone_ring_ack accepted {};
+    const bool ok = send_rpc_cmd(sock, RPC_CMD_PHONE_RING_INPUT_READY,
+        &ready, sizeof(ready), &accepted, sizeof(accepted));
+    std::fprintf(stderr,
+        "[PHONE_RING_AUTO] side=pc event=INPUT_READY layer=%d "
+        "uid=%" PRIu64 " seq=%" PRIu64 " status=%s\n",
+        first_layer, uid, completion_seq,
+        ok && accepted.accepted ? "QUEUED" : "FAIL");
+    return ok && accepted.accepted != 0;
+}
+
+static bool ggml_backend_rpc_phone_ring_auto_wait(
+        ggml_backend_t backend,
+        uint64_t completion_seq) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto sock = get_socket_role(
+        ctx->endpoint, rpc_socket_role::COMPLETION_WAIT);
+    if (sock == nullptr ||
+            rpc_get_remote_patch(ctx->endpoint + "_completion_wait") < 17) {
+        return false;
+    }
+    if (completion_seq == 0) {
+        return true;
+    }
+    rpc_msg_phone_ring_wait_req req {};
+    req.device = ctx->device;
+    req.seq = completion_seq;
+    rpc_msg_phone_ring_ack rsp {};
+    const int64_t t0 = ggml_time_us();
+    const bool ok = send_rpc_cmd(sock, RPC_CMD_PHONE_RING_WAIT,
+        &req, sizeof(req), &rsp, sizeof(rsp));
+    std::fprintf(stderr,
+        "[PHONE_RING_AUTO] side=pc event=OUTPUT_WAIT "
+        "seq=%" PRIu64 " wait_ms=%.3f status=%s\n",
+        completion_seq, (ggml_time_us() - t0) / 1000.0,
+        ok && rsp.accepted ? "OK" : "FAIL");
+    return ok && rsp.accepted != 0;
+}
 
 static bool ggml_backend_rpc_phone_region_local_submit(
         ggml_backend_t backend,
