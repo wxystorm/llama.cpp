@@ -8468,8 +8468,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
         profile.phone_to_pc.size(), model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
-        selected_layout != nullptr ? "APPLY_SAFE" :
-        topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
+        topology_preview ?
+            (selected_layout != nullptr ? "APPLY_TOPOLOGY" : "TOPOLOGY_PREVIEW") :
+        selected_layout != nullptr ? "APPLY_SAFE" : "DRY_RUN");
 
     if (topology_preview) {
         const bool apply = selected_layout != nullptr;
