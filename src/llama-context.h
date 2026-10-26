@@ -360,6 +360,7 @@ private:
                                        llm_graph_result *                             res_use,
                                        const std::vector<llama_hybrid_runtime_stage> & stages,
                                        int                                             ubatch_id,
+                                       bool                                            device_fifo_simulation,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(

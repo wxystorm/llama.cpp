@@ -7,8 +7,10 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -169,10 +171,14 @@ public:
         for (size_t chunk = 0; chunk < n_chunks; ++chunk) {
             input_ready_[0][chunk] = 1;
         }
-        offer(0, 0);
+        offer_locked(0, 0);
     }
 
     bool has_ready() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_) {
+            return false;
+        }
         for (const auto & queue : queues_) {
             if (!queue.empty()) {
                 return true;
@@ -182,56 +188,145 @@ public:
     }
 
     bool all_done() const {
-        return finished_ == regions_.size() * chunk_sizes_.size();
+        std::lock_guard<std::mutex> lock(mutex_);
+        return all_done_locked();
+    }
+
+    bool failed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return failed_;
     }
 
     size_t n_chunks() const { return chunk_sizes_.size(); }
     size_t n_regions() const { return regions_.size(); }
-    size_t finished() const { return finished_; }
 
-    size_t queue_size(llama_region_ring_device device) const {
-        return queues_[(size_t) device].size();
+    size_t finished() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return finished_;
     }
 
+    size_t queue_size(llama_region_ring_device device) const {
+        const size_t dev = device_index(device);
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queues_[dev].size();
+    }
+
+    // Preserve the original cooperative round-robin entry point for "ready".
     std::optional<llama_region_ring_task> take() {
-        for (size_t pass = 0; pass < 3; ++pass) {
-            const size_t dev = (next_device_ + pass) % 3;
-            auto & queue = queues_[dev];
-            if (queue.empty()) {
-                continue;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_) {
+            return std::nullopt;
+        }
+        for (size_t pass = 0; pass < queues_.size(); ++pass) {
+            const size_t dev = (next_device_ + pass) % queues_.size();
+            if (auto task = take_device_locked(dev)) {
+                next_device_ = (dev + 1) % queues_.size();
+                return task;
             }
-            auto task = queue.front();
-            queue.pop_front();
-            if (state_[task.region][task.chunk] != 1) {
-                throw std::runtime_error("region ring task was claimed twice");
-            }
-            state_[task.region][task.chunk] = 2;
-            next_device_ = (dev + 1) % 3;
-            return task;
         }
         return std::nullopt;
     }
 
-    void complete(const llama_region_ring_task & task) {
-        if (task.region >= regions_.size() ||
-            task.chunk >= chunk_sizes_.size() ||
-            state_[task.region][task.chunk] != 2) {
-            throw std::runtime_error("invalid region ring completion");
-        }
-        state_[task.region][task.chunk] = 3;
-        ++finished_;
+    // New device-owned FIFO claim. This does not block or rotate other queues.
+    std::optional<llama_region_ring_task> try_take(llama_region_ring_device device) {
+        const size_t dev = device_index(device);
+        std::lock_guard<std::mutex> lock(mutex_);
+        return failed_ ? std::nullopt : take_device_locked(dev);
+    }
 
-        // Publish the current chunk to its next region. The downstream task
-        // will be queued only after its own previous chunk has committed KV.
-        if (task.region + 1 < regions_.size()) {
-            input_ready_[task.region + 1][task.chunk] = 1;
-            offer(task.region + 1, task.chunk);
+    // Ready for future independent workers. No worker is launched in Step 1.
+    // A waiter exits on cancellation/failure or after the whole ring drains.
+    std::optional<llama_region_ring_task> wait_take(llama_region_ring_device device) {
+        const size_t dev = device_index(device);
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] {
+            return failed_ || all_done_locked() || !queues_[dev].empty();
+        });
+        if (failed_ || all_done_locked()) {
+            return std::nullopt;
         }
-        offer(task.region, task.chunk + 1);
+        return take_device_locked(dev);
+    }
+
+    void complete(const llama_region_ring_task & task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!valid_running_locked(task)) {
+                throw std::runtime_error("invalid region ring completion");
+            }
+            state_[task.region][task.chunk] = 3;
+            ++finished_;
+
+            // If another worker failed, drain in-flight work without publishing
+            // any new tasks. Existing READY entries become unclaimable.
+            if (!failed_) {
+                if (task.region + 1 < regions_.size()) {
+                    input_ready_[task.region + 1][task.chunk] = 1;
+                    offer_locked(task.region + 1, task.chunk);
+                }
+                offer_locked(task.region, task.chunk + 1);
+            }
+        }
+        cv_.notify_all();
+    }
+
+    void fail(const llama_region_ring_task & task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!valid_running_locked(task)) {
+                throw std::runtime_error("invalid region ring failure");
+            }
+            state_[task.region][task.chunk] = 4;
+            failed_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    // Used when an executor fails outside a claimed task.
+    void cancel() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            failed_ = true;
+        }
+        cv_.notify_all();
     }
 
 private:
-    void offer(size_t region, size_t chunk) {
+    static size_t device_index(llama_region_ring_device device) {
+        const size_t dev = (size_t) device;
+        if (dev >= 3) {
+            throw std::runtime_error("invalid region ring device");
+        }
+        return dev;
+    }
+
+    bool all_done_locked() const {
+        return finished_ == regions_.size() * chunk_sizes_.size();
+    }
+
+    bool valid_running_locked(const llama_region_ring_task & task) const {
+        return task.region < regions_.size() &&
+               task.chunk < chunk_sizes_.size() &&
+               state_[task.region][task.chunk] == 2;
+    }
+
+    std::optional<llama_region_ring_task> take_device_locked(size_t dev) {
+        auto & queue = queues_[dev];
+        if (queue.empty()) {
+            return std::nullopt;
+        }
+        const auto task = queue.front();
+        queue.pop_front();
+        if (state_[task.region][task.chunk] != 1 ||
+            (size_t) regions_[task.region].device != dev) {
+            throw std::runtime_error("region ring task was claimed twice or by wrong device");
+        }
+        state_[task.region][task.chunk] = 2;
+        return task;
+    }
+
+    // Called only while holding mutex_, except from the constructor.
+    void offer_locked(size_t region, size_t chunk) {
         if (region >= regions_.size() ||
             chunk >= chunk_sizes_.size() ||
             state_[region][chunk] != 0 ||
@@ -248,9 +343,12 @@ private:
     std::vector<int> chunk_begins_;
     std::vector<int> chunk_sizes_;
     std::vector<std::vector<uint8_t>> input_ready_;
-    // 0=not queued, 1=ready, 2=running, 3=complete
+    // 0=not queued, 1=ready, 2=running, 3=complete, 4=failed
     std::vector<std::vector<uint8_t>> state_;
     std::array<std::deque<llama_region_ring_task>, 3> queues_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
     size_t finished_ = 0;
     size_t next_device_ = 0;
+    bool failed_ = false;
 };

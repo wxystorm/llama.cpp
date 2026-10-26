@@ -323,6 +323,8 @@ set_target_properties(test-region-ring PROPERTIES
     CXX_STANDARD_REQUIRED ON
     CXX_EXTENSIONS OFF)
 target_include_directories(test-region-ring PRIVATE ${PROJECT_SOURCE_DIR}/src)
+find_package(Threads REQUIRED)
+target_link_libraries(test-region-ring PRIVATE Threads::Threads)
 llama_test(test-region-ring)
 
 llama_build_and_test(test-meta-return-stall-profile.cpp)

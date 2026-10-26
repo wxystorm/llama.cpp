@@ -2699,6 +2699,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         llm_graph_result * res_use,
         const std::vector<llama_hybrid_runtime_stage> & stages,
         int ubatch_id,
+        bool device_fifo_simulation,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2731,10 +2732,26 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     llm_graph_result * result = nullptr;
     ret = GGML_STATUS_SUCCESS;
     size_t executed = 0;
+    size_t next_device = 0;
     const int64_t begin_us = ggml_time_us();
 
     while (!ready.all_done() && ret == GGML_STATUS_SUCCESS) {
-        const auto next = ready.take();
+        std::optional<llama_region_ring_task> next;
+        if (device_fifo_simulation) {
+            // Step 1: claim from each device-owned FIFO through the new API,
+            // but keep execution on this one thread and reuse the proven
+            // GGML execution and Phone l_out handoff paths.
+            for (size_t pass = 0; pass < 3; ++pass) {
+                const size_t dev = (next_device + pass) % 3;
+                next = ready.try_take(static_cast<llama_region_ring_device>(dev));
+                if (next) {
+                    next_device = (dev + 1) % 3;
+                    break;
+                }
+            }
+        } else {
+            next = ready.take();
+        }
         if (!next) {
             LLAMA_LOG_ERROR("[REGION_RING] event=DEADLOCK finished=%zu\n",
                 ready.finished());
@@ -2778,6 +2795,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             llama_hybrid_boundary_action::PASS,
             block_outputs, apply_mctx, true, ret);
         if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
+            if (device_fifo_simulation) {
+                ready.fail(task);
+                if (ret == GGML_STATUS_SUCCESS) {
+                    ret = GGML_STATUS_FAILED;
+                }
+            }
             break;
         }
         ready.complete(task);
@@ -2795,10 +2818,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     LLAMA_LOG_ERROR(
         "[REGION_RING_SUM] tokens=%u chunk_tokens=%d regions=%zu "
         "chunks=%zu executed=%zu complete=%d wall_ms=%.3f "
-        "mode=COOPERATIVE_READY_QUEUE status=%d\n",
+        "mode=%s status=%d\n",
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
-        (ggml_time_us() - begin_us) / 1000.0, (int) ret);
+        (ggml_time_us() - begin_us) / 1000.0,
+        device_fifo_simulation ? "DEVICE_FIFO_SIMULATION" : "COOPERATIVE_READY_QUEUE",
+        (int) ret);
     return ret == GGML_STATUS_SUCCESS && ready.all_done() ?
         result : nullptr;
 }
@@ -3769,9 +3794,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::string ring_exec = region_ring_v1 ?
         (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
     if (region_ring_v1 && ring_exec != "ready" &&
-        ring_exec != "serial" && ring_exec != "full") {
+        ring_exec != "fifo" && ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -3795,6 +3820,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             "execution=%s status=READY\n",
             runtime_stages.size(), region_ring_chunk_tokens,
             ring_exec == "ready" ? "COOPERATIVE_READY_QUEUE" :
+            ring_exec == "fifo" ? "DEVICE_FIFO_SIMULATION" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5073,6 +5099,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                    cparams.cb_eval == nullptr) {
             // A/B diagnostics with IDENTICAL model layer ownership:
             // ready  = interleaved Region x Chunk execution;
+            // fifo   = single-threaded simulation with per-device claims;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5087,7 +5114,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 res = process_ubatch_region_ring(
                     ubatch, ctx_type_to_graph_type(cparams.ctx_type),
                     mctx.get(), sched.get(), gf_res_prev.get(),
-                    runtime_stages, ubatch_id, status);
+                    runtime_stages, ubatch_id, ring_exec == "fifo", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(

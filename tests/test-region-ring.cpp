@@ -1,8 +1,11 @@
 #include "llama-region-ring.h"
 
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 // Never use assert() here: CTest runs this test in Release and NDEBUG
@@ -112,6 +115,140 @@ static void test_duplicate_completion() {
     check(rejected, "duplicate task completion was accepted");
 }
 
+
+static void test_device_fifo_simulation() {
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 358, 64);
+    check(ready.n_chunks() == 6, "358 tokens must form 6 chunks at 64");
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
+          "GPU started before CPU produced an input");
+    check(!ready.try_take(llama_region_ring_device::PHONE).has_value(),
+          "Phone started before GPU produced an input");
+
+    std::vector<std::vector<int>> done(9, std::vector<int>(6, 0));
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    size_t executed = 0;
+    while (!ready.all_done()) {
+        bool progressed = false;
+        for (auto device : devices) {
+            const auto job = ready.try_take(device);
+            if (!job) {
+                continue;
+            }
+            check(regions[job->region].device == device,
+                  "device FIFO returned another device's task");
+            check(job->chunk < 6 && job->region < 9, "task index out of range");
+            check(job->token_begin == (int) job->chunk * 64,
+                  "device FIFO task token offset is wrong");
+            check(job->n_tokens == (job->chunk == 5 ? 38 : 64),
+                  "device FIFO task token size is wrong");
+            check(done[job->region][job->chunk] == 0, "duplicate FIFO claim");
+            check(job->region == 0 || done[job->region - 1][job->chunk] == 1,
+                  "FIFO crossed unfinished upstream region");
+            check(job->chunk == 0 || done[job->region][job->chunk - 1] == 1,
+                  "FIFO violated per-region KV chunk order");
+            done[job->region][job->chunk] = 1;
+            ready.complete(*job);
+            ++executed;
+            progressed = true;
+        }
+        check(progressed, "device FIFO simulation deadlocked");
+    }
+    check(executed == 54, "expected exactly 54 Region x Chunk tasks");
+    check(ready.finished() == 54 && !ready.failed(), "FIFO did not drain cleanly");
+    for (auto device : devices) {
+        check(!ready.try_take(device).has_value(), "task available after FIFO drain");
+    }
+}
+
+static void test_parallel_scheduler_only() {
+    // Mock workers exercise only the header-level dependency scheduler.
+    // No GGML graph is executed concurrently in Step 1.
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 358, 64);
+    std::array<std::atomic<int>, 54> seen{};
+    std::atomic<int> completed{0};
+    std::atomic<int> errors{0};
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    std::array<std::thread, 3> workers;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        const auto device = devices[i];
+        workers[i] = std::thread([&, device] {
+            try {
+                while (const auto job = ready.wait_take(device)) {
+                    const size_t index = job->region * 6 + job->chunk;
+                    const bool in_range = job->region < regions.size() &&
+                                          job->chunk < 6;
+                    const bool correct_device =
+                        in_range && regions[job->region].device == device;
+                    const bool upstream_done = in_range &&
+                        (job->region == 0 ||
+                         seen[(job->region - 1) * 6 + job->chunk].load() == 1);
+                    const bool kv_ordered = in_range &&
+                        (job->chunk == 0 ||
+                         seen[job->region * 6 + job->chunk - 1].load() == 1);
+                    if (!in_range || !correct_device || !upstream_done ||
+                        !kv_ordered || seen[index].exchange(1) != 0) {
+                        ++errors;
+                        ready.fail(*job);
+                        return;
+                    }
+                    ready.complete(*job);
+                    ++completed;
+                }
+            } catch (...) {
+                ++errors;
+                ready.cancel();
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    check(errors.load() == 0, "concurrent mock workers violated an invariant");
+    check(completed.load() == 54, "concurrent mock workers lost tasks");
+    check(ready.all_done() && !ready.failed(),
+          "concurrent scheduler did not drain all tasks");
+}
+
+static void test_failure_and_wakeup() {
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 128, 64);
+    const auto first = ready.try_take(llama_region_ring_device::CPU);
+    check(first.has_value(), "failed to claim initial CPU task");
+    ready.fail(*first);
+    check(ready.failed() && !ready.has_ready(),
+          "failed scheduler still exposes READY tasks");
+    check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
+          "failed scheduler allowed another task to be claimed");
+    check(!ready.wait_take(llama_region_ring_device::GPU).has_value(),
+          "waiter did not exit after failure");
+    bool rejected = false;
+    try {
+        ready.complete(*first);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected, "failed task was incorrectly accepted as completed");
+
+    llama_region_ring_ready cancelled(regions, 128, 64);
+    std::atomic<bool> woke{false};
+    std::thread waiter([&] {
+        woke.store(!cancelled.wait_take(llama_region_ring_device::PHONE));
+    });
+    cancelled.cancel();
+    waiter.join();
+    check(woke.load() && cancelled.failed(), "cancellation did not wake waiter");
+}
+
 int main() {
     std::fprintf(stderr, "[REGION_RING_TEST] begin\n");
     try {
@@ -121,6 +258,12 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] dependencies=PASS\n");
         test_duplicate_completion();
         std::fprintf(stderr, "[REGION_RING_TEST] duplicate=PASS\n");
+        test_device_fifo_simulation();
+        std::fprintf(stderr, "[REGION_RING_TEST] device_fifo=PASS\n");
+        test_parallel_scheduler_only();
+        std::fprintf(stderr, "[REGION_RING_TEST] parallel_scheduler=PASS\n");
+        test_failure_and_wakeup();
+        std::fprintf(stderr, "[REGION_RING_TEST] failure=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
         return 0;
     } catch (const std::exception & e) {
