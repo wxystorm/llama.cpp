@@ -8013,7 +8013,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
     if (llama_region_ring_enabled() && ring_plan_env != nullptr &&
             (std::strcmp(ring_plan_env, "dry-run") == 0 ||
-             std::strcmp(ring_plan_env, "apply-safe") == 0)) {
+             std::strcmp(ring_plan_env, "apply-safe") == 0 ||
+             std::strcmp(ring_plan_env, "topology-preview") == 0)) {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
         g_llama_hybrid_runtime_profile = profile;
         LLAMA_LOG_ERROR(
@@ -8311,7 +8312,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
 static bool llama_hybrid_region_ring_planner_evaluate(
         int tokens, int kv_start, int baseline_chunk,
-        std::string * selected_layout) {
+        std::string * selected_layout, bool topology_preview = false) {
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
@@ -8469,6 +8470,33 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
         selected_layout != nullptr ? "APPLY_SAFE" : "DRY_RUN");
 
+    if (topology_preview) {
+        if (baseline_chunk != 64) {
+            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 reason=CHUNK_MUST_BE_64\\n");
+            return false;
+        }
+        const auto result = llama_ring_planner::search_supported_topology(model,64,192);
+        LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_SEARCH] enumerated=%zu profiled=%zu simulated=%zu "
+                        "reject_memory=%zu reject_profile=%zu reject_dag=%zu applied=0\\n",
+                        result.enumerated,result.profiled,result.simulated,
+                        result.rejected_memory,result.rejected_profile,result.rejected_deadlock);
+        for (size_t i = 0; i < result.top.size(); ++i) {
+            const auto & c = result.top[i];
+            std::vector<llama_region_ring_region> r;
+            if (!llama_ring_planner::make_regions(c,model.layers,r)) {
+                continue;
+            }
+            LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_CANDIDATE] rank=%zu layout=%s "
+                            "cycles=%d phone_layers=%d tail_c=%d tail_g=%d "
+                            "predicted_ms=%.3f applied=0 status=PREVIEW_ONLY\\n",
+                            i + 1,llama_region_ring_layout_string(r).c_str(),
+                            c.cycles,c.p,c.tail_c,c.tail_g,c.wall_ms);
+        }
+        LLAMA_LOG_ERROR("[REGION_RING_TOPOLOGY_PREVIEW] applied=0 "
+                        "reason=PHONE_FUSION_AND_FINAL_OWNER_UNSUPPORTED "
+                        "runtime_layout=UNCHANGED\\n");
+        return result.valid;
+    }
     if (selected_layout != nullptr) {
         // Real APPLY is deliberately narrower than research-mode search:
         // keep three previously validated Phone P5 windows and the exact
@@ -8730,6 +8758,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     return true;
 }
 
+
+bool llama_hybrid_region_ring_planner_topology_preview(
+        int tokens, int kv_start, int baseline_chunk) {
+    return llama_hybrid_region_ring_planner_evaluate(
+        tokens,kv_start,baseline_chunk,nullptr,true);
+}
 
 bool llama_hybrid_region_ring_planner_dry_run(
         int tokens, int kv_start, int baseline_chunk) {
