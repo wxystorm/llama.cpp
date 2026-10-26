@@ -2718,6 +2718,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int ubatch_id,
         bool device_fifo_simulation,
         bool isolate_device_resources,
+        bool own_stage_resources,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2800,15 +2801,52 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             (void *) ring_sched[2], (void *) ring_res[2]);
     }
 
+    if (own_stage_resources && !isolate_device_resources) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     const int chunk_tokens = stages.front().macro_tokens;
-    llama_region_ring_ready ready(regions, (int) ubatch.n_tokens, chunk_tokens);
-    std::vector<std::vector<float>> outputs(
-        ready.n_regions() - 1);
+    const size_t output_window = own_stage_resources ? 2 : 0;
+    llama_region_ring_ready ready(
+        regions, (int) ubatch.n_tokens, chunk_tokens, output_window);
+
+    // In ownership mode each producer edge has exactly two fixed host slots.
+    // The ready queue owns the corresponding FREE/WRITING/READY/READING credit.
+    // A slot is not released until the downstream Region has fully consumed it.
+    const size_t host_tokens_per_edge = own_stage_resources ?
+        output_window * (size_t) chunk_tokens : (size_t) ubatch.n_tokens;
+    std::vector<std::vector<float>> outputs(ready.n_regions() - 1);
     for (auto & hidden : outputs) {
-        hidden.resize((size_t) n_embd * ubatch.n_tokens);
+        hidden.resize((size_t) n_embd * host_tokens_per_edge);
     }
 
     bool apply_mctx = true;
+    std::array<std::unique_ptr<llama_kv_cache_context>, 3> worker_kv_views;
+    if (own_stage_resources) {
+        // Exactly one ubatch assignment against the actual KV cache.
+        // All later Region builders receive a private stage-range view;
+        // calling apply() on a worker view is forbidden by the KV API.
+        if (!kv_mctx->apply()) {
+            LLAMA_LOG_ERROR("[REGION_RING_OWNERSHIP] status=FAIL reason=KV_APPLY\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        apply_mctx = false;
+        for (size_t dev = 0; dev < worker_kv_views.size(); ++dev) {
+            worker_kv_views[dev] = kv_mctx->make_stage_view();
+            if (!worker_kv_views[dev]) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_OWNERSHIP] status=FAIL reason=KV_STAGE_VIEW device=%zu\n",
+                    dev);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_OWNERSHIP] window=%zu slots_per_edge=%zu "
+            "kv_views=3 kv_storage=SHARED backend=SHARED_GATED "
+            "graph_threads=1 status=READY\n", output_window, output_window);
+    }
     llm_graph_result * result = nullptr;
     ret = GGML_STATUS_SUCCESS;
     size_t executed = 0;
@@ -2842,12 +2880,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool first = task.region == 0;
         const bool last = task.region + 1 == stages.size();
         const auto & stage = stages[task.region];
+        const size_t host_token_begin = own_stage_resources ?
+            (task.chunk % output_window) * (size_t) chunk_tokens :
+            (size_t) task.token_begin;
         float * input = first ? nullptr :
-            outputs[task.region - 1].data() +
-            (size_t) task.token_begin * n_embd;
+            outputs[task.region - 1].data() + host_token_begin * n_embd;
         float * output = last ? nullptr :
-            outputs[task.region].data() +
-            (size_t) task.token_begin * n_embd;
+            outputs[task.region].data() + host_token_begin * n_embd;
         int32_t block_outputs = 0;
         if (last) {
             for (int i = 0; i < task.n_tokens; ++i) {
@@ -2868,14 +2907,28 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ready.queue_size(llama_region_ring_device::GPU),
             ready.queue_size(llama_region_ring_device::PHONE));
 
-        result = run_hybrid_stage_block(
-            ubatch, stage, task.token_begin, task.n_tokens,
-            input, output, gtype, mctx,
-            ring_sched[(size_t) regions[task.region].device],
-            ring_res[(size_t) regions[task.region].device],
-            ubatch_id, task.region, task.chunk,
-            llama_hybrid_boundary_action::PASS,
-            block_outputs, apply_mctx, true, ret);
+        auto execute_stage = [&]() -> llm_graph_result * {
+            llama_memory_context_i * task_mctx = own_stage_resources ?
+                worker_kv_views[(size_t) regions[task.region].device].get() : mctx;
+            return run_hybrid_stage_block(
+                ubatch, stage, task.token_begin, task.n_tokens,
+                input, output, gtype, task_mctx,
+                ring_sched[(size_t) regions[task.region].device],
+                ring_res[(size_t) regions[task.region].device],
+                ubatch_id, task.region, task.chunk,
+                llama_hybrid_boundary_action::PASS,
+                block_outputs, apply_mctx, true, ret);
+        };
+        if (own_stage_resources) {
+            // The three scheduler instances still share ggml_backend_t.
+            // Protect n_outputs / backend runtime / Meta RPC access together.
+            // This gate is intentionally broad until the shared backends
+            // are replaced with thread-safe, independently owned contexts.
+            std::lock_guard<std::mutex> lock(region_ring_backend_execution_mutex);
+            result = execute_stage();
+        } else {
+            result = execute_stage();
+        }
         if (result == nullptr || ret != GGML_STATUS_SUCCESS ||
             (isolate_device_resources && last && result != res_use)) {
             if (device_fifo_simulation) {
@@ -2898,6 +2951,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     }
     kv_mctx->clear_stage_range();
     n_outputs = saved_outputs;
+    if (own_stage_resources) {
+        const size_t live = ready.live_output_slots();
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_OWNERSHIP_SUM] window=%zu live_slots=%zu "
+            "finished=%zu status=%s\n",
+            output_window, live, ready.finished(),
+            live == 0 && ready.all_done() ? "DRAINED" : "INCOMPLETE");
+        if (ret == GGML_STATUS_SUCCESS && live != 0) {
+            ret = GGML_STATUS_FAILED;
+        }
+    }
     LLAMA_LOG_ERROR(
         "[REGION_RING_SUM] tokens=%u chunk_tokens=%d regions=%zu "
         "chunks=%zu executed=%zu complete=%d wall_ms=%.3f "
@@ -2905,6 +2969,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
         isolate_device_resources ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
         device_fifo_simulation ? "DEVICE_FIFO_SIMULATION" : "COOPERATIVE_READY_QUEUE",
         (int) ret);
@@ -3879,9 +3944,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
     if (region_ring_v1 && ring_exec != "ready" &&
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
+        ring_exec != "fifo-owned" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -3907,6 +3973,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "ready" ? "COOPERATIVE_READY_QUEUE" :
             ring_exec == "fifo" ? "DEVICE_FIFO_SIMULATION" :
             ring_exec == "fifo-isolated" ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
+            ring_exec == "fifo-owned" ? "DEVICE_FIFO_OWNED_SIMULATION" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5187,6 +5254,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // ready  = interleaved Region x Chunk execution;
             // fifo   = single-threaded simulation with per-device claims;
             // fifo-isolated = FIFO + separate CPU/GPU scheduler and graph states;
+            // fifo-owned = per-worker KV views + gated backends + 2-slot credits;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5202,8 +5270,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     ubatch, ctx_type_to_graph_type(cparams.ctx_type),
                     mctx.get(), sched.get(), gf_res_prev.get(),
                     runtime_stages, ubatch_id,
-                    ring_exec == "fifo" || ring_exec == "fifo-isolated",
-                    ring_exec == "fifo-isolated", status);
+                    ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
+                        ring_exec == "fifo-owned",
+                    ring_exec == "fifo-isolated" || ring_exec == "fifo-owned",
+                    ring_exec == "fifo-owned", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(

@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <mutex>
 #include <vector>
 
 struct llama_model;
@@ -363,6 +364,7 @@ private:
                                        int                                             ubatch_id,
                                        bool                                            device_fifo_simulation,
                                        bool                                            isolate_device_resources,
+                                       bool                                            own_stage_resources,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(
@@ -501,6 +503,12 @@ private:
         llm_graph_result_ptr   res;
     };
     std::array<region_ring_worker_resource, 2> region_ring_worker_resources;
+
+    // Both auxiliary schedulers and the canonical Phone scheduler still hold
+    // the same backend_ptrs. During the ownership experiment, serialize the
+    // entire graph prepare/compute/sync until backend-specific contexts and
+    // safe per-backend locks exist. This is NOT parallel GGML execution.
+    std::mutex region_ring_backend_execution_mutex;
 
     bool sched_need_reserve = true;
 
