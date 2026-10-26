@@ -566,6 +566,10 @@ LLAMA_API void llama_hybrid_runtime_plan_clear();
 // returns false if the measured Profile cannot score the search space.
 LLAMA_API bool llama_hybrid_region_ring_planner_dry_run(
     int tokens, int kv_start, int baseline_chunk);
+// Search variable Region geometry but never apply it until the runtime
+// can own arbitrary Phone Graphs and the final output backend.
+LLAMA_API bool llama_hybrid_region_ring_planner_topology_preview(
+    int tokens, int kv_start, int baseline_chunk);
 // Returns true and a validated per-model layout only when the predicted gain
 // exceeds the configured threshold and the current Phone/Chunk protocol is
 // unchanged. Called before model weight loading; no live runtime mutation.
