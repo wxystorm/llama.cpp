@@ -2436,6 +2436,9 @@ struct ggml_backend_meta_context {
     std::vector<uint8_t>        tensor_phone_layer_mask;
     std::vector<uint8_t>        tensor_c2p_layer_mask;
     std::vector<uint8_t>        tensor_p2c_layer_mask;
+    // Immutable during Ring execution: full Phone-layer ownership from the
+    // model-selected general topology, not from environment or graph guesses.
+    std::vector<uint8_t>        ring_phone_layer_mask;
 
     ggml_backend_meta_tensor_profile tensor_profile {};
     std::mutex                       tensor_profile_mutex;
@@ -20407,6 +20410,51 @@ bool ggml_backend_meta_set_tensor_p2c_layer_mask(
             "first=%d last=%d\n",
             n_layers, selected, first, last);
     }
+    return true;
+}
+
+bool ggml_backend_meta_set_region_ring_phone_mask(
+        ggml_backend_t backend, const uint8_t * mask, size_t n_layers) {
+    if (!ggml_backend_is_meta(backend) ||
+            (mask == nullptr) != (n_layers == 0) ||
+            n_layers > 65536) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_meta_context *) backend->context;
+    if (mask == nullptr) {
+        ctx->ring_phone_layer_mask.clear();
+        return true;
+    }
+    // General graph fusion is only enabled for internal Phone runs. The
+    // final logits must belong to a PC tail, where the canonical scheduler
+    // owns the last CPU/CUDA graph.
+    if (n_layers < 7 || mask[n_layers - 1] != 0) {
+        return false;
+    }
+    size_t runs = 0;
+    for (size_t i = 0; i < n_layers;) {
+        if (mask[i] > 1) {
+            return false;
+        }
+        if (mask[i] == 0) {
+            ++i;
+            continue;
+        }
+        const size_t begin = i;
+        while (i < n_layers && mask[i] == 1) {
+            ++i;
+        }
+        if (i - begin < 2 || i - begin > 8) {
+            return false;
+        }
+        ++runs;
+    }
+    if (runs < 2 || runs > 4) {
+        return false;
+    }
+    ctx->ring_phone_layer_mask.assign(mask,mask+n_layers);
+    printf("[REGION_RING_PHONE_MASK] layers=%zu phone_regions=%zu "
+           "mode=PLAN_OWNED status=READY\n",n_layers,runs);
     return true;
 }
 
