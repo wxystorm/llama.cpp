@@ -2870,7 +2870,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // the final output into the canonical graph result/scheduler.
         if (!device_fifo_simulation || sched_use != sched.get() ||
             res_use != gf_res_prev.get() ||
-            regions.back().device != llama_region_ring_device::PHONE) {
+            (!model.hybrid_ring_plan_topology &&
+             regions.back().device != llama_region_ring_device::PHONE)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_RESOURCE] status=REJECT reason=UNSAFE_FINAL_OUTPUT_OWNER\n");
             ret = GGML_STATUS_FAILED;
@@ -3227,7 +3228,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
-                                ring_sched[dev], ring_res[dev],
+                                last && model.hybrid_ring_plan_topology ?
+                                    sched_use : ring_sched[dev],
+                                last && model.hybrid_ring_plan_topology ?
+                                    res_use : ring_res[dev],
                                 ubatch_id, task.region, task.chunk,
                                 llama_hybrid_boundary_action::PASS,
                                 block_outputs, worker_apply_mctx, true,
@@ -3401,7 +3405,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = worker_states[dev].status;
             }
         }
-        result = worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
+        const auto final_device = model.hybrid_ring_plan_topology ?
+            regions.back().device : llama_region_ring_device::PHONE;
+        result = worker_states[(size_t) final_device].final_result;
+        if (model.hybrid_ring_plan_topology) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_FINAL_OWNER] device=%s region=%zu "
+                "layers=[%d,%d) result=%s status=%s\n",
+                llama_region_ring_device_name(final_device),
+                regions.size() - 1,
+                regions.back().layer_begin,regions.back().layer_end,
+                result == res_use ? "MAIN" : "INVALID",
+                result == res_use ? "READY" : "FAIL");
+        }
         if (!launched_all || created != devices.size() ||
             joined != devices.size() || ready.failed() || !ready.all_done() ||
             executed != ready.finished() ||
