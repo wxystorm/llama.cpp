@@ -15595,6 +15595,11 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             ++schedule_pos) {
         size_t i = region_pipeline_active ?
             region_pipe_schedule[schedule_pos].sg : schedule_pos;
+        // The final l_out SG of a fused Phone block is a separate
+        // communication/ownership bridge, NOT a new Attention/FFN pair.
+        // Set this only after the exact l_out marker matched and the
+        // server acknowledged completion of its registered Phone graph.
+        int ring_phone_consumed_bridge_layer = -1;
         if (ring_phone_autostart && !pending_ring_auto_outputs.empty()) {
             for (auto pending = pending_ring_auto_outputs.begin();
                     pending != pending_ring_auto_outputs.end();) {
@@ -15616,6 +15621,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                        terminal_layer, i, seq, ok ? "OK" : "FAIL");
                 if (!ok) {
                     return GGML_STATUS_FAILED;
+                }
+                if (ring_phone_dynamic) {
+                    ring_phone_consumed_bridge_layer = terminal_layer;
                 }
                 pending = pending_ring_auto_outputs.erase(pending);
             }
@@ -18190,10 +18198,21 @@ auto prefill_norm_sg_has_prework =
         } else {
             std::string fusion_reason;
             size_t fusion_failed_sg = i;
-            phone_block_fused = find_phone_block(
-                i, phone_block_end, first_fused_layer, phone_block_last_layer,
-                ring_phone_fusion ? &fusion_reason : nullptr,
-                ring_phone_fusion ? &fusion_failed_sg : nullptr);
+            // OUTPUT_READY already consumed the exact terminal l_out
+            // bridge here. Do not reclassify that single SG as a new
+            // Phone-only Attention/FFN block; it must flow through the
+            // ordinary Meta communication/ownership path below.
+            if (ring_phone_dynamic && ring_phone_consumed_bridge_layer >= 0) {
+                phone_block_fused = false;
+                printf("[REGION_RING_PHONE_FUSION] event=OUTPUT_BRIDGE "
+                       "sg=%zu layer=%d action=PASS_THROUGH status=READY\n",
+                       i, ring_phone_consumed_bridge_layer);
+            } else {
+                phone_block_fused = find_phone_block(
+                    i, phone_block_end, first_fused_layer, phone_block_last_layer,
+                    ring_phone_fusion ? &fusion_reason : nullptr,
+                    ring_phone_fusion ? &fusion_failed_sg : nullptr);
+            }
             bool eligible_probe_only = false;
             if (phone_block_fused && ring_phone_fusion_probe &&
                     phone_block_last_layer - first_fused_layer + 1 == 5) {
@@ -18212,11 +18231,12 @@ auto prefill_norm_sg_has_prework =
                 timing_last_layer = phone_block_last_layer;
             } else if (ring_phone_fusion && !eligible_probe_only && is_phone_only_sg) {
                 if (ring_phone_dynamic &&
+                        ring_phone_consumed_bridge_layer < 0 &&
                         fusion_reason != "RING_DECODE_NOT_FUSABLE") {
                     // Prefill P2..P8 must be an exact complete fused graph.
-                    // Single-token decode retains the existing per-SG
-                    // execution path, because FFN graph fusion is disabled
-                    // for decode by the original kernel contract.
+                    // Only an exact l_out output bridge whose Phone READY
+                    // has already been consumed, or a single-token decode
+                    // SG, may retain the regular Meta execution path.
                     printf("[REGION_RING_PHONE_FUSION] event=REJECT sg=%zu "
                            "failed_sg=%zu reason=%s "
                            "mode=PLAN_OWNED status=FAIL\n",
