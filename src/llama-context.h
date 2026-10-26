@@ -342,7 +342,8 @@ private:
                                       llama_memory_context_i * mctx,
                                       ggml_status &            ret,
                                       bool                     apply_mctx = true,
-                                      const llama_hybrid_runtime_stage * stage = nullptr);
+                                      const llama_hybrid_runtime_stage * stage = nullptr,
+                                      int32_t                  outputs_override = -1);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,
@@ -365,6 +366,7 @@ private:
                                        bool                                            device_fifo_simulation,
                                        bool                                            isolate_device_resources,
                                        bool                                            own_stage_resources,
+                                       bool                                            task_local_graph_outputs,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(
@@ -391,7 +393,8 @@ private:
                                       bool &                               apply_mctx,
                                       bool                                 synchronize,
                                       ggml_status &                        ret,
-                                      llama_hybrid_stage_timing *          timing = nullptr);
+                                      llama_hybrid_stage_timing *          timing = nullptr,
+                                      bool                                 task_local_graph_outputs = false);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
@@ -408,7 +411,8 @@ private:
                                   const llama_ubatch &           ubatch,
                                   const llama_memory_context_i * mctx,
                                   llm_graph_type                 gtype,
-                                  ggml_backend_sched_t           sched_use) const;
+                                  ggml_backend_sched_t           sched_use,
+                                  int32_t                        outputs_override = -1) const;
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_use) const;
 

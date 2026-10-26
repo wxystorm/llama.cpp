@@ -1820,7 +1820,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  llama_memory_context_i * mctx,
                                                  ggml_status &            ret,
                                                  bool                     apply_mctx,
-                                                 const llama_hybrid_runtime_stage * stage) {
+                                                 const llama_hybrid_runtime_stage * stage,
+                                                 int32_t                  outputs_override) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -1856,7 +1857,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const int64_t graph_params_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
-    auto gparams = graph_params(res, ubatch, mctx, gtype, sched_use);
+    // The optional explicit task output count avoids writing shared n_outputs.
+    auto gparams = graph_params(res, ubatch, mctx, gtype, sched_use, outputs_override);
     if (stage != nullptr) {
         const int n_layer = model.hparams.n_layer();
         GGML_ASSERT(stage->layer_begin >= 0);
@@ -1976,7 +1978,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                 stage->layer_begin,
                 stage->layer_end,
                 ubatch.n_tokens,
-                n_outputs,
+                gparams.n_outputs,
                 reused_graph ? 1 : 0,
                 graph_nodes,
                 graph_splits,
@@ -2310,7 +2312,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool &                             apply_mctx,
         bool                               synchronize,
         ggml_status &                      ret,
-        llama_hybrid_stage_timing *        timing) {
+        llama_hybrid_stage_timing *        timing,
+        bool                               task_local_graph_outputs) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2322,7 +2325,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     llama_ubatch stage_ubatch = llama_hybrid_slice_ubatch(
         ubatch, token_begin, block_tokens, stage_input);
-    n_outputs = block_outputs;
+    if (block_outputs < 0) {
+        LLAMA_LOG_ERROR("[REGION_RING_TASK_STATE] status=REJECT reason=NEGATIVE_OUTPUTS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    // Old stage executors retain their original shared-field behavior.
+    // fifo-state instead passes this value directly into llm_graph_params.
+    if (!task_local_graph_outputs) {
+        n_outputs = block_outputs;
+    }
 
     LLAMA_LOG_DEBUG(
         "[HYBRID_EXEC] ub=%d stage=%zu kind=%s layers=[%d,%d) block=%zu action=%s tokens=[%u,%u)\n",
@@ -2331,7 +2343,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
     llm_graph_result * result = prepare_ubatch(
-        res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx, &stage);
+        res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
+        &stage, task_local_graph_outputs ? block_outputs : -1);
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -2728,6 +2741,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool device_fifo_simulation,
         bool isolate_device_resources,
         bool own_stage_resources,
+        bool task_local_graph_outputs,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2813,6 +2827,34 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (own_stage_resources && !isolate_device_resources) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (task_local_graph_outputs && !own_stage_resources) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (task_local_graph_outputs) {
+        // The schedulers still share the exact same backend instances.
+        // Graph execution and threadpool selection must remain under
+        // region_ring_backend_execution_mutex until backend ownership changes.
+        for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+            ggml_backend_t backend = backend_ptrs[i];
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            const int dev_type = dev ?
+                (int) ggml_backend_dev_type(dev) : -1;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_BACKEND] index=%zu handle=%p name=%s "
+                "device_type=%d schedulers=3 state=SHARED\n",
+                i, (void *) backend, ggml_backend_name(backend), dev_type);
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_BACKEND_SUM] handles=%zu schedulers=3 "
+            "backend=SHARED_GATED cpu_threadpool=SHARED meta_rpc=SHARED "
+            "graph_parallelism=DISABLED status=AUDITED\n",
+            backend_ptrs.size());
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_TASK_STATE] outputs=TASK_LOCAL "
+            "context_outputs=READ_ONLY kv_views=3 "
+            "graph_threads=1 status=READY\n");
     }
     const int chunk_tokens = stages.front().macro_tokens;
     const size_t output_window = own_stage_resources ? 2 : 0;
@@ -2926,7 +2968,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ring_res[(size_t) regions[task.region].device],
                 ubatch_id, task.region, task.chunk,
                 llama_hybrid_boundary_action::PASS,
-                block_outputs, apply_mctx, true, ret);
+                block_outputs, apply_mctx, true, ret, nullptr,
+                task_local_graph_outputs);
         };
         if (own_stage_resources) {
             // The three scheduler instances still share ggml_backend_t.
@@ -2959,6 +3002,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ready.finished());
     }
     kv_mctx->clear_stage_range();
+    if (task_local_graph_outputs && n_outputs != (uint32_t) saved_outputs) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_TASK_STATE] status=FAIL reason=SHARED_OUTPUTS_CHANGED "
+            "expected=%d actual=%u\n", saved_outputs, n_outputs);
+        ret = GGML_STATUS_FAILED;
+    }
     n_outputs = saved_outputs;
     if (own_stage_resources) {
         const size_t live = ready.live_output_slots();
@@ -2978,6 +3027,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
         own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
         isolate_device_resources ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
         device_fifo_simulation ? "DEVICE_FIFO_SIMULATION" : "COOPERATIVE_READY_QUEUE",
@@ -3953,10 +4003,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         (ring_exec_env != nullptr ? ring_exec_env : "ready") : "";
     if (region_ring_v1 && ring_exec != "ready" &&
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
-        ring_exec != "fifo-owned" &&
+        ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -3983,6 +4033,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo" ? "DEVICE_FIFO_SIMULATION" :
             ring_exec == "fifo-isolated" ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
             ring_exec == "fifo-owned" ? "DEVICE_FIFO_OWNED_SIMULATION" :
+            ring_exec == "fifo-state" ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5264,6 +5315,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo   = single-threaded simulation with per-device claims;
             // fifo-isolated = FIFO + separate CPU/GPU scheduler and graph states;
             // fifo-owned = per-worker KV views + gated backends + 2-slot credits;
+            // fifo-state = explicit per-task graph output count; same Backend gate;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5280,9 +5332,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     mctx.get(), sched.get(), gf_res_prev.get(),
                     runtime_stages, ubatch_id,
                     ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
-                        ring_exec == "fifo-owned",
-                    ring_exec == "fifo-isolated" || ring_exec == "fifo-owned",
-                    ring_exec == "fifo-owned", status);
+                        ring_exec == "fifo-owned" || ring_exec == "fifo-state",
+                    ring_exec == "fifo-isolated" || ring_exec == "fifo-owned" ||
+                        ring_exec == "fifo-state",
+                    ring_exec == "fifo-owned" || ring_exec == "fifo-state",
+                    ring_exec == "fifo-state", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
@@ -6561,7 +6615,8 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
                                              const llama_ubatch &           ubatch,
                                              const llama_memory_context_i * mctx,
                                              llm_graph_type                 gtype,
-                                             ggml_backend_sched_t           sched_use) const {
+                                             ggml_backend_sched_t           sched_use,
+                                             int32_t                        outputs_override) const {
     return {
         /*.arch        =*/model.arch,
         /*.hparams     =*/model.hparams,
@@ -6575,7 +6630,8 @@ llm_graph_params llama_context::graph_params(llm_graph_result *             res,
         /*.mctx        =*/mctx,
         /*.cross       =*/&cross,
         /*.samplers    =*/sampling.samplers,
-        /*.n_outputs   =*/n_outputs,
+        /*.n_outputs   =*/outputs_override >= 0 ?
+                              (uint32_t) outputs_override : n_outputs,
         /*.cb          =*/graph_get_cb(sched_use),
         /*.res         =*/res,
     };
