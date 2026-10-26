@@ -2868,6 +2868,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // GGML model weights, no new Meta instance and no CPU-only path.
             const bool topology_ok = backend_ptrs.size() == 3 &&
                 ggml_backend_is_meta(backend_ptrs[0]) &&
+                backend_ptrs[1] != nullptr &&
                 backend_ptrs[2] == backend_cpu &&
                 ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[1])) ==
                     GGML_BACKEND_DEVICE_TYPE_GPU;
@@ -3000,13 +3001,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_BACKEND_SUM] handles=%zu schedulers=3 "
-            "backend=SHARED_GATED cpu_threadpool=SHARED meta_rpc=SHARED "
-            "graph_parallelism=DISABLED status=AUDITED\n",
-            backend_ptrs.size());
+            "backend=%s cpu_threadpool=STABLE_CONFIG meta_rpc=SHARED "
+            "graph_parallelism=%s status=AUDITED\n",
+            backend_ptrs.size(),
+            pc_phone_overlap ? "PC_CPU_CUDA_AND_META" : "SHARED_GATED",
+            pc_phone_overlap ? "PC_PHONE_ENABLED" : "DISABLED");
         LLAMA_LOG_ERROR(
             "[REGION_RING_TASK_STATE] outputs=TASK_LOCAL "
             "context_outputs=READ_ONLY kv_views=3 "
-            "graph_threads=1 status=READY\n");
+            "graph_threads=%s status=READY\n",
+            pc_phone_overlap ? "PC_PLUS_PHONE" : "1");
     }
     if (audit_backend_resources) {
         // A Meta backend constructs its own CPU and RPC backend instances.
@@ -3080,8 +3084,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_OWNERSHIP] window=%zu slots_per_edge=%zu "
-            "kv_views=3 kv_storage=SHARED backend=SHARED_GATED "
-            "graph_threads=1 status=READY\n", output_window, output_window);
+            "kv_views=3 kv_storage=SHARED backend=%s "
+            "graph_threads=%s status=READY\n", output_window, output_window,
+            pc_phone_overlap ? "PC_GATE_PLUS_META" : "SHARED_GATED",
+            pc_phone_overlap ? "PC_PLUS_PHONE" : "1");
     }
     llm_graph_result * result = nullptr;
     ret = GGML_STATUS_SUCCESS;
@@ -3542,8 +3548,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         LLAMA_LOG_ERROR(
             "[REGION_RING_TASK_STATE_SUM] tasks=%zu "
             "task_outputs=EXPLICIT context_outputs_unchanged=%d "
-            "final_graph=MAIN backend=SHARED_GATED status=%s\n",
+            "final_graph=MAIN backend=%s status=%s\n",
             executed, unchanged ? 1 : 0,
+            pc_phone_overlap ? "PC_GATE_PLUS_META" : "SHARED_GATED",
             unchanged ? "PASS" : "FAIL");
         if (!unchanged) {
             ret = GGML_STATUS_FAILED;
@@ -3568,8 +3575,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
-        audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
         pc_phone_overlap ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
+        audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
         threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
         task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
         own_stage_resources ? "DEVICE_FIFO_OWNED_SIMULATION" :
