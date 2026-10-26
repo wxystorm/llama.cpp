@@ -544,7 +544,8 @@ inline supported_result search_supported_fixed_phone(
 // Coarse filtering keeps measured profiling work bounded; selected candidates
 // must also survive the exact FIFO/KV/slot event simulation.
 inline result search_supported_topology(
-        const model & m, int chunk_tokens, int max_simulations = 192) {
+        const model & m, int chunk_tokens, int max_simulations = 192,
+        bool require_pc_tail = false) {
     result out;
     if (m.layers < 6 || m.tokens <= 0 || chunk_tokens != 64 ||
             m.window != 2 || !m.pc_compute_gate || max_simulations <= 0) {
@@ -556,7 +557,8 @@ inline result search_supported_topology(
             for (int g = 1; g <= 8; ++g) {
                 for (int p = 2; p <= 8; ++p) {
                     const int tail = m.layers - cycles * (c + g + p);
-                    if (tail < 0 || tail > m.max_tail) {
+                    if (tail < 0 || tail > m.max_tail ||
+                            (require_pc_tail && tail == 0)) {
                         continue;
                     }
                     for (int tail_g = 0; tail_g <= tail; ++tail_g) {
