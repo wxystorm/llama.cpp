@@ -187,3 +187,12 @@ Select-String -Path ".\region-pair.log" -Pattern '\[REGION_RING_PLAN_PROFILE\]',
 Current bounded coarse search uses `N=2..4`, `C=2..12`, `G=1..8`, `P=2..8`, PC tail up to 12 layers, `XC/XG={32,64,128}`, `XP={16,32,64,128}`, and 192 full DAG simulations after profile/balance pruning. These bounds and a conservative serialized Wi-Fi lane do not prove global optimality. The CPU↔CUDA transfer estimate uses the GPU→PC profile as a proxy and needs calibration. The conservative Phone graph registration estimate assumes new UIDs until safe template reuse is confirmed.
 
 If the selected layout moves a Phone Region, changes XC/XG/XP or ends with PC layers, it remains a **proposed** layout only. Before application, implement the interval-aware runtime and generalize current hard-coded Phone Graph/last-logits ownership guards.
+
+
+### Calibration correction after the first real Dry-run
+
+The first observed 358-token Dry-run proposed `N=4,C3,G3,P4,PC_tail_C8,XC/XG/XP=128`, estimated `3400.191 ms`, while the **unchanged runtime** actually took `4036.169 ms`. These are **different layouts**, so the two wall-time values cannot be interpreted as a measured speedup. The 5 top-ranked candidates had aggregate layer counts close or identical (CPU20/CUDA12/Phone16) and CPU busy time dominated their estimated wall time.
+
+Root issue in the first simulation: it treated CPU and CUDA as two unconstrained simultaneous compute lanes, but the currently validated `fifo-pc-phone` runtime serializes their Graph compute through `region_ring_backend_execution_mutex` (Phone remote GPU execution may overlap after the lock is released). The predictor now sets `pc_compute_gate=true` by default, serializes CPU/CUDA Graph compute and uses combined PC compute demand in coarse ranking. An explicit `pc_compute_gate=false` remains only for a counterfactual future-backend-isolation test.
+
+New log marker `[REGION_RING_PLAN_BASELINE]` prints the **predicted fixed-layout** wall time and PC Gate busy estimate on a short independent line, so compare that number directly with the runtime's `[REGION_RING_SUM]` for the same request. Candidate logs now include `pc_gate_busy`. The simulator is still an approximation: input staging, GPU/Phone graph preparation within the outer PC gate, lazy graph registration, two-way network contention and exact GPU memory residency require additional calibration before real APPLY. Do not extrapolate a performance improvement from the original ungated 3400 ms prediction.
