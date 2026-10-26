@@ -1686,8 +1686,30 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         const bool region_ring = llama_region_ring_enabled();
         const std::vector<llama_region_ring_region> ring_regions =
-            region_ring ? llama_region_ring_from_env(n_layer) :
-                          std::vector<llama_region_ring_region>{};
+            region_ring ?
+                (hybrid_ring_plan_layout.empty() ?
+                    llama_region_ring_from_env(n_layer) :
+                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
+                std::vector<llama_region_ring_region>{};
+        if (region_ring && !hybrid_ring_plan_layout.empty()) {
+            const auto original = llama_region_ring_from_env(n_layer);
+            if (!llama_region_ring_apply_safe_phone_shape(original) ||
+                    !llama_region_ring_apply_safe_compatible(
+                        original,ring_regions) ||
+                    hybrid_ring_plan_chunk_tokens != 64) {
+                throw std::runtime_error(
+                    "Ring selected Plan violates fixed Phone, GPU weight "
+                    "or Chunk ownership constraints");
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                "phase=WEIGHT_PLACEMENT applied=1 "
+                "layout=%s original=%s chunk=%d "
+                "status=CONSISTENT\n",
+                hybrid_ring_plan_layout.c_str(),
+                llama_region_ring_layout_string(original).c_str(),
+                hybrid_ring_plan_chunk_tokens);
+        }
         if (region_ring && runtime_plan.tensor_layers != 0) {
             throw std::runtime_error("region ring needs T=0; set LLAMA_HYBRID_FIXED_TENSOR_LAYERS=0");
         }
