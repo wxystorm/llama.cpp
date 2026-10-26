@@ -12,7 +12,7 @@ This uses the phone RPC server's **existing** UID-based `GRAPH_COMPUTE` / `GRAPH
 
 - Both flags must be present on PC: exact `fifo-pc-phone` mode and `GGML_META_RING_PHONE_FUSION=1`; the default is disabled. A safer eligibility-only mode is `GGML_META_RING_PHONE_FUSION=probe`: it prints `event=PROBE` for structurally valid P5 blocks but still executes every original unfused SG.
 - Meta topology must be exactly two simple Backends: PC CPU plus Phone RPC. Phone SG pairs must be individually Phone-only. A mirrored PC compute node causes **the whole fusion to be skipped**, never partially dropped.
-- Each pair must represent one Qwen3-style attention subgraph starting at `norm-L` or `l_out-(L-1)`, followed by an `ffn_inp-L` to `ffn_moe_out-L` Phone subgraph, and have multi-token input (single-token Decode stays on the unmodified path).
+- Each pair must represent one Qwen3-style Attention/FFN layer. The recognizer now searches the paired SGs for the actual `ffn_inp-L` and `ffn_moe_out-L` nodes, rather than demanding that these be literal first/last SG nodes; the MoE output must still be in the second SG. The first SG must contain `norm-L`/`attn_norm-L` or previous `l_out-(L-1)`. Only multi-token graph shapes are eligible; Decode stays unmodified.
 - Five pairs must be consecutive (10 SGs, five consecutive layers). There must be a following output bridge or PC consumer. Partial P5 graphs continue through the original un-fused SG execution.
 - The existing Tensor Phone-primary protection remains intact; do not fuse a split FFN or graph that requires intermediate PC work.
 - `Window=2` Slot credits, KV chunk ordering, Meta output bridge, Phone `l_out` residual handling, and final MAIN Graph Result remain unchanged.
@@ -94,3 +94,24 @@ Select-String -Path '.\region-pair.log' -Pattern '\[REGION_RING_PHONE_FUSION\]',
 `GGML_META_RING_PHONE_FUSION=1` still activates real fusion only when *all* existing ownership checks pass. `GGML_META_RING_PHONE_FUSION_TRACE=1` enables the SG descriptors even when fusion is set to `1`. If failure says `PC_ACTIVE_NODE`, **do not** remove the guard until that operation's role in Meta's reduction/transfer semantics is understood. If it says `RING_FFN_MARKERS_OR_SHAPE`, inspect the logged actual first/last tensor names and adjust the recognizer to the real Qwen3-MoE graph rather than assuming a fixed SG boundary. `FFN_SG_NOT_PHONE_OWNED` can likewise reflect an actual cross-backend step; fusion must not skip it.
 
 Do not change the verified `fifo-pc-phone` reference branch. Repeat the same A/B parity and timing tests only *after* eligibility is correctly established.
+
+## Follow-up implementation: correct Qwen3-MoE markers (2026-10-26)
+
+Previously every P5 candidate fell back with `event=SKIP` even though the independent PC/Phone workload completed correctly (358-token Prefill `3772.754 ms`, `1728.482 ms` concurrent PC/Phone intervals, `54/54` tasks, zero Window=2 slot leaks and the expected first three Top-1 logits). That run **did not** contain actual graph fusion.
+
+The initial recognizer was stricter than the real Qwen3-MoE graph: `src/models/qwen3moe.cpp` labels the Attention residual as `ffn_inp-L` and MoE output as `ffn_moe_out-L`; `ggml-backend-meta.cpp` splits Meta subgraphs at `PARTIAL` and other graph boundaries, so those labels need not be at a subgraph's first or final node. The experimental recognizer now scans the actual nodes in the adjacent pair, checks that its two markers agree on layer `L`, requires `ffn_moe_out-L` inside the second subgraph with multi-token shape, and checks the first subgraph has a current-layer attention input marker. Existing PC compute ownership and complete-P5 checks remain enforced.
+
+The `REGION_RING_PHONE_SG` diagnostic now records layer IDs for `norm`, `attn_norm`, `ffn_inp`, `ffn_moe_out`, and `l_out` in each SG. A `-1` means that marker was absent from the SG. The trace still includes PC and Phone active compute counts and the first PC-active operation, when present.
+
+First run safely with `GGML_META_RING_PHONE_FUSION=probe` and confirm candidate classification without changing graph execution:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_RING_EXEC = 'fifo-pc-phone'
+$env:GGML_META_RING_PHONE_FUSION = 'probe'
+# Keep the original model, RPC server, layout, prompt, seed and other flags
+Select-String -Path '.\region-pair.log' -Pattern '\[REGION_RING_PHONE_FUSION\]', '\[REGION_RING_PHONE_SG\]', '\[REGION_RING_SUM\]', '^top\[0\]:'
+```
+
+`event=PROBE ... status=ELIGIBLE` means a complete five-layer candidate passed. The probe retains legacy per-SG execution, and an eligible PROBE is no longer followed by a misleading generic `SKIP`. If a candidate still prints `SKIP`, preserve its `failed_sg`, `reason` and the following `REGION_RING_PHONE_SG` records; do not disable guards just to force a fusion.
+
+After successful probe, set `GGML_META_RING_PHONE_FUSION=1`, then verify `event=SUBMIT` / `event=DONE`, RPC graph command counts, output parity and repeated Prefill timing against `fifo-pc-phone` with the fusion flag unset. Because this graph-fusion code is newly changed and not yet built or tested on the user's devices, **no new performance gain or correct fused result is claimed**.
