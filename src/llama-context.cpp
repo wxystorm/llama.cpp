@@ -2359,6 +2359,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
     apply_mctx = false;
     if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
+        if (model.hybrid_ring_plan_topology) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_STAGE_FAIL] phase=PREPARE stage=%zu "
+                "device=%s layers=[%d,%d) chunk=%zu tokens=%u "
+                "result=%p status=%d\n",
+                stage_index,llama_hybrid_runtime_stage_name(stage.kind),
+                stage.layer_begin,stage.layer_end,block_index,block_tokens,
+                (void *) result,(int) ret);
+        }
         return nullptr;
     }
 
@@ -2470,6 +2479,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         timing->compute_range_us += ggml_time_us() - compute_begin_us;
     }
     if (ret != GGML_STATUS_SUCCESS) {
+        if (model.hybrid_ring_plan_topology) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_STAGE_FAIL] phase=COMPUTE stage=%zu "
+                "device=%s layers=[%d,%d) chunk=%zu tokens=%u "
+                "detached_phone=%d splits=%d status=%d\n",
+                stage_index,llama_hybrid_runtime_stage_name(stage.kind),
+                stage.layer_begin,stage.layer_end,block_index,block_tokens,
+                detached_phone ? 1 : 0,n_splits,(int) ret);
+        }
         return nullptr;
     }
 
@@ -2482,6 +2500,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 timing->sync_us += ggml_time_us() - sync_begin_us;
             }
             ret = GGML_STATUS_FAILED;
+            if (model.hybrid_ring_plan_topology) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_STAGE_FAIL] phase=OUTPUT_COPY stage=%zu "
+                    "device=%s layers=[%d,%d) chunk=%zu tokens=%u "
+                    "detached_phone=%d status=%d\n",
+                    stage_index,llama_hybrid_runtime_stage_name(stage.kind),
+                    stage.layer_begin,stage.layer_end,block_index,block_tokens,
+                    detached_phone ? 1 : 0,(int) ret);
+            }
             return nullptr;
         }
         if (timing != nullptr) {
@@ -3266,13 +3293,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             const int64_t compute_begin_us = ggml_time_us();
                             int64_t phone_remote_begin_us = 0;
                             int64_t phone_remote_end_us = 0;
+                            // General topology's terminal stage uses the
+                            // canonical main scheduler for logits. Audit the
+                            // same scheduler that actually executed this
+                            // task, never the stale GPU/CPU worker scheduler.
+                            const bool use_main = last && model.hybrid_ring_plan_topology;
+                            ggml_backend_sched_t task_sched =
+                                use_main ? sched_use : ring_sched[dev];
+                            llm_graph_result * task_res =
+                                use_main ? res_use : ring_res[dev];
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
-                                last && model.hybrid_ring_plan_topology ?
-                                    sched_use : ring_sched[dev],
-                                last && model.hybrid_ring_plan_topology ?
-                                    res_use : ring_res[dev],
+                                task_sched, task_res,
                                 ubatch_id, task.region, task.chunk,
                                 llama_hybrid_boundary_action::PASS,
                                 block_outputs, worker_apply_mctx, true,
@@ -3296,22 +3329,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 task_status == GGML_STATUS_SUCCESS &&
                                 audit_backend_resources) {
                                 const int n_splits = ggml_backend_sched_get_n_splits(
-                                    ring_sched[dev]);
+                                    task_sched);
                                 uint64_t task_mask = 0;
                                 for (int split = 0; split < n_splits; ++split) {
                                     const uint64_t local_mask =
                                         ggml_backend_sched_get_split_resource_mask(
-                                            ring_sched[dev], split);
+                                            task_sched, split);
                                     uint64_t split_mask = local_mask & (UINT64_C(1) << 63);
                                     // Convert per-Scheduler bits into original
                                     // [Meta,CUDA0,CPU] indices for consistent
                                     // A/B audit (PC Scheduler omits Meta).
-                                    const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
+                                    const int n_local = ggml_backend_sched_get_n_backends(task_sched);
                                     for (int b = 0; b < n_local; ++b) {
                                         if ((local_mask & (UINT64_C(1) << b)) == 0) {
                                             continue;
                                         }
-                                        ggml_backend_t handle = ggml_backend_sched_get_backend(ring_sched[dev], b);
+                                        ggml_backend_t handle = ggml_backend_sched_get_backend(task_sched, b);
                                         const auto it = std::find(backend_ptrs.begin(), backend_ptrs.end(), handle);
                                         if (it == backend_ptrs.end() ||
                                             (size_t) (it - backend_ptrs.begin()) >= 63) {
@@ -3324,15 +3357,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     if (task.chunk == 0 || (split_mask >> 63) != 0) {
                                         ggml_backend_t target =
                                             ggml_backend_sched_get_split_backend(
-                                                ring_sched[dev], split);
+                                                task_sched, split);
                                         LLAMA_LOG_ERROR(
                                             "[REGION_RING_BACKEND_SPLIT] device=%s "
                                             "region=%zu chunk=%zu split=%d/%d "
                                             "compute=%s resource_mask=0x%016" PRIx64
-                                            " unresolved=%d scope=OUTER\n",
+                                            " unresolved=%d scope=OUTER scheduler=%s\n",
                                             name, task.region, task.chunk, split,
                                             n_splits, ggml_backend_name(target),
-                                            split_mask, (int) (split_mask >> 63));
+                                            split_mask, (int) (split_mask >> 63),
+                                            use_main ? "MAIN" : "WORKER");
                                     }
                                 }
                                 state.backend_mask |= task_mask;
@@ -3348,11 +3382,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "region=%zu chunk=%zu n_splits=%d "
                                     "resource_mask=0x%016" PRIx64
                                     " cross_backend=%d unresolved=%d "
-                                    "gate=%s scope=OUTER status=OBSERVED\n",
+                                    "gate=%s scope=OUTER scheduler=%s status=OBSERVED\n",
                                     name, task.region, task.chunk, n_splits,
                                     task_mask, cross ? 1 : 0,
                                     unresolved ? 1 : 0,
-                                    pc_phone_overlap ? "PC_GATE_PLUS_META" : "CONTEXT_SHARED");
+                                    pc_phone_overlap ? "PC_GATE_PLUS_META" : "CONTEXT_SHARED",
+                                    use_main ? "MAIN" : "WORKER");
                             }
                         }
                     }
@@ -3367,8 +3402,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             GGML_STATUS_FAILED : task_status;
                         LLAMA_LOG_ERROR(
                             "[REGION_RING_WORKER] device=%s event=FAIL "
-                            "region=%zu chunk=%zu status=%d\n",
-                            name, task.region, task.chunk, (int) state.status);
+                            "region=%zu chunk=%zu status=%d "
+                            "reason=%s returned=%p expected=%p cancelled=%d\n",
+                            name, task.region, task.chunk, (int) state.status,
+                            cancelled_before_compute ? "CANCELLED_BEFORE_COMPUTE" :
+                            task_result == nullptr ? "STAGE_RETURNED_NULL" :
+                            task_status != GGML_STATUS_SUCCESS ? "COMPUTE_STATUS" :
+                            "NON_CANONICAL_RESULT",
+                            (void *) task_result,(void *) (last ? res_use : ring_res[dev]),
+                            cancelled_before_compute ? 1 : 0);
                         ready.fail(task);
                         active_task.reset();
                         break;
