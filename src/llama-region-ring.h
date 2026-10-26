@@ -249,8 +249,8 @@ public:
         return failed_ ? std::nullopt : take_device_locked(dev);
     }
 
-    // Ready for future independent workers. No worker is launched in Step 1.
-    // A waiter exits on cancellation/failure or after the whole ring drains.
+    // Block a device-specific host worker until its next task owns the needed
+    // input and output credits, or all work completes / a failure cancels it.
     std::optional<llama_region_ring_task> wait_take(llama_region_ring_device device) {
         const size_t dev = device_index(device);
         std::unique_lock<std::mutex> lock(mutex_);

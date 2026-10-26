@@ -349,6 +349,60 @@ static void test_window_parallel_mock_workers() {
     check(ready.live_output_slots() == 0, "window mock leaked output credits");
 }
 
+static void test_window_failure_wakes_workers() {
+    // A real threaded scheduler must wake blocked CPU/PHONE workers when a
+    // different device fails. Keep the same 2-slot backpressure as prefill.
+    const auto regions = llama_region_ring_parse("", 48);
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    for (int iteration = 0; iteration < 12; ++iteration) {
+        llama_region_ring_ready ready(regions, 358, 64, 2);
+        std::atomic<int> injected{0};
+        std::atomic<int> errors{0};
+        std::array<std::thread, 3> workers;
+        for (size_t i = 0; i < workers.size(); ++i) {
+            const auto device = devices[i];
+            workers[i] = std::thread([&, device] {
+                try {
+                    while (const auto task = ready.wait_take(device)) {
+                        if (device == llama_region_ring_device::GPU &&
+                            task->region == 1 && task->chunk == 0) {
+                            ++injected;
+                            ready.fail(*task);
+                            return;
+                        }
+                        if (ready.failed()) {
+                            // Simulates an already-claimed task that is
+                            // cancelled before entering the backend gate.
+                            ready.fail(*task);
+                            return;
+                        }
+                        ready.complete(*task);
+                        std::this_thread::yield();
+                    }
+                } catch (...) {
+                    ++errors;
+                    ready.cancel();
+                }
+            });
+        }
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        check(errors.load() == 0, "failure worker threw during cancellation");
+        check(injected.load() == 1, "exactly one injected GPU failure expected");
+        check(ready.failed() && !ready.all_done(),
+              "injected GPU failure was not propagated");
+        for (const auto device : devices) {
+            check(!ready.wait_take(device).has_value(),
+                  "failed scheduler did not release a blocked worker");
+        }
+    }
+}
+
 int main() {
     std::fprintf(stderr, "[REGION_RING_TEST] begin\n");
     try {
@@ -368,6 +422,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_credits=PASS\n");
         test_window_parallel_mock_workers();
         std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
+        test_window_failure_wakes_workers();
+        std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
         return 0;
     } catch (const std::exception & e) {
