@@ -7865,9 +7865,12 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
     return true;
 }
 
-bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & params, llama_hybrid_plan & best_plan) {
-    llama_hybrid_runtime_plan_clear();
-
+// Shared hardware profiling phase used by both Legacy Hybrid Auto and the
+// independent Region Ring Planner. No legacy plan enumeration, memory
+// filtering or placement is performed by this function.
+static bool llama_hybrid_collect_device_profile(
+        llama_model_loader & ml, const llama_model_params & params,
+        llama_hybrid_profile & profile) {
     ggml_backend_ptr cpu;
     ggml_backend_ptr phone;
     ggml_backend_ptr gpu;
@@ -7942,7 +7945,6 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
-    llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
@@ -8005,24 +8007,73 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile_print(profile);
 
-    // The Region Ring dry-run search requires measured compute/transfer
-    // samples, not a feasible legacy Hybrid placement. Cache the independent
-    // Profile immediately after measurement so a legacy placement rejection
-    // cannot silently disable the Ring Planner. No runtime plan is applied.
-    const char * ring_plan_env =
-        std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
-    if (llama_region_ring_enabled() && ring_plan_env != nullptr &&
-            (std::strcmp(ring_plan_env, "dry-run") == 0 ||
-             std::strcmp(ring_plan_env, "apply-safe") == 0 ||
-             std::strcmp(ring_plan_env, "topology-preview") == 0)) {
-        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
-        g_llama_hybrid_runtime_profile = profile;
+    return true;
+}
+
+// Region Ring profiles are a standalone measurement artifact. A legacy
+// Hybrid placement may be infeasible even when CPU/CUDA/Phone/transfer
+// measurements are complete and sufficient for a Region topology search.
+bool llama_hybrid_region_ring_collect_profile(
+        llama_model_loader & ml, const llama_model_params & params) {
+    llama_hybrid_runtime_plan_clear();
+    if (!llama_region_ring_enabled() ||
+            params.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
         LLAMA_LOG_ERROR(
-            "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=CACHED "
-            "cpu=%zu gpu=%zu phone=%zu applied=0\n",
-            profile.cpu_layer_blocks.size(),
-            profile.gpu_layer_blocks.size(),
-            profile.phone_layer_blocks.size());
+            "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=FAILED "
+            "reason=REQUIRES_RING_TENSOR\n");
+        return false;
+    }
+
+    llama_hybrid_profile profile;
+    if (!llama_hybrid_collect_device_profile(ml,params,profile)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=FAILED "
+            "reason=DEVICE_PROBE_FAILED action=KEEP_FIXED_RING\n");
+        return false;
+    }
+    const bool has_cpu = !profile.cpu_layer_blocks.empty() &&
+                         !profile.cpu_attn.empty();
+    const bool has_gpu = !profile.gpu_layer_blocks.empty() &&
+                         !profile.gpu_attn.empty();
+    const bool has_phone = !profile.phone_layer_blocks.empty() &&
+                           !profile.phone_attn.empty();
+    const bool has_h2p = !profile.pc_to_phone.empty();
+    const bool has_p2c = !profile.phone_to_pc.empty() ||
+                         !profile.snapshot_phone_to_pc.empty();
+    const bool has_local_copy = !profile.gpu_to_pc.empty();
+    if (profile.n_layer <= 0 || profile.n_embd <= 0 ||
+            !has_cpu || !has_gpu || !has_phone ||
+            !has_h2p || !has_p2c || !has_local_copy) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=FAILED "
+            "reason=INCOMPLETE_DEVICE_PROFILE cpu=%d gpu=%d phone=%d "
+            "h2p=%d p2c=%d gpu_to_pc=%d action=KEEP_FIXED_RING\n",
+            has_cpu,has_gpu,has_phone,has_h2p,has_p2c,has_local_copy);
+        return false;
+    }
+    const int layers = profile.n_layer;
+    const size_t cpu_points = profile.cpu_layer_blocks.size();
+    const size_t gpu_points = profile.gpu_layer_blocks.size();
+    const size_t phone_points = profile.phone_layer_blocks.size();
+    {
+        std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+        g_llama_hybrid_runtime_profile = std::move(profile);
+    }
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=CACHED "
+        "source=INDEPENDENT_DEVICE_PROBES layers=%d cpu=%zu gpu=%zu "
+        "phone=%zu legacy_candidates=NOT_REQUIRED applied=0\n",
+        layers,cpu_points,gpu_points,phone_points);
+    return true;
+}
+
+// Legacy Hybrid Auto retains its original independent candidate scoring.
+bool llama_hybrid_autoplan(llama_model_loader & ml,
+        const llama_model_params & params, llama_hybrid_plan & best_plan) {
+    llama_hybrid_runtime_plan_clear();
+    llama_hybrid_profile profile;
+    if (!llama_hybrid_collect_device_profile(ml,params,profile)) {
+        return false;
     }
 
     llama_hybrid_constraints constraints;
