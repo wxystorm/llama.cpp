@@ -9153,13 +9153,59 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             subgraph_tensor_c2p_layer(
                 i, c2p_tensor_layer);
 
+        // Region Ring may terminate a full Phone-only region at an exact
+        // l_out bridge.  The legacy test of "next Phone compute" can report
+        // true for that bridge even though its result is consumed by PC.
+        // The generic fallback then sends only ffn_moe_out to PC, leaving
+        // the Phone-owned ffn_inp/residual unaccounted for at the boundary.
+        //
+        // Keep this fix opt-in until numerical parity with the known-good
+        // contiguous Phone layout has been established.
+        const char * ring_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_V1");
+        const bool ring_requested =
+            ring_env != nullptr && std::atoi(ring_env) != 0;
+        const char * ring_exit_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_EXIT_FIX");
+        const bool ring_exit_fix =
+            ring_requested && ring_exit_env != nullptr &&
+            std::atoi(ring_exit_env) != 0;
+        int ring_exit_layer = -1;
+        int ring_exit_name_end = 0;
+        const bool ring_exit_named_ffn =
+            ring_requested &&
+            n_backends == 2 && active_count == 1 && active_backend == 1 &&
+            nodes[1] != nullptr &&
+            std::sscanf(nodes[1]->name, "ffn_moe_out-%d%n",
+                &ring_exit_layer, &ring_exit_name_end) == 1 &&
+            nodes[1]->name[ring_exit_name_end] == '\0';
+        const bool ring_exit_bridge =
+            ring_exit_named_ffn &&
+            i + 1 < backend_ctx->n_subgraphs &&
+            subgraph_is_exact_l_out_bridge(i + 1, ring_exit_layer) &&
+            !phone_primary_tensor_sg &&
+            !inferred_phone_primary_tensor &&
+            !forced_phone_primary_tensor &&
+            !c2p_tensor_sg;
+        if (ring_exit_bridge) {
+            printf("[REGION_RING_EXIT_PROBE] layer=%d sg=%zu "
+                   "next_pc=%d next_phone=%d fix=%d status=EXACT_BRIDGE\\n",
+                   ring_exit_layer, i,
+                   (int) subgraph_will_execute_pc(i + 1),
+                   (int) subgraph_will_execute_phone(i + 1),
+                   (int) ring_exit_fix);
+        }
+        const bool ring_exit_takeover =
+            ring_exit_bridge && ring_exit_fix;
+
         const bool phone_owner_exit =
             n_backends == 2 && active_count == 1 && active_backend == 1 &&
             !phone_primary_tensor_sg &&
             !inferred_phone_primary_tensor &&
             !forced_phone_primary_tensor &&
             !c2p_tensor_sg &&
-            (force_phone_block_exit ||
+            (ring_exit_takeover ||
+             force_phone_block_exit ||
              i + 1 >= backend_ctx->n_subgraphs ||
              !subgraph_will_execute_phone(i + 1));
 
@@ -9479,6 +9525,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 (i + 1 >= backend_ctx->n_subgraphs ||
                  has_layer_output_producer(0, i + 1, layer));
 
+            // Never silently fall back to an FFN-only transfer after opting
+            // into a complete Phone -> PC residual handoff.
+            if (ring_exit_takeover &&
+                (layer != ring_exit_layer ||
+                 src_residual == nullptr ||
+                 !external_backend_handoff)) {
+                printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                       "resolved_layer=%d residual=%s external=%d "
+                       "status=REJECT\\n",
+                       ring_exit_layer, i, layer,
+                       src_residual != nullptr ? src_residual->name : "(null)",
+                       (int) external_backend_handoff);
+                return GGML_STATUS_FAILED;
+            }
+
             if (external_handoff_candidate && !external_backend_handoff && pipeline_debug) {
                 printf("[META_HANDOFF_SKIP] sg=%zu layer=%d node=%s reason=no_pc_l_out_producer\n",
                     i, layer, nodes[1]->name);
@@ -9641,6 +9702,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
                 if (external_backend_handoff) {
                     debug_terminal_handoff_dst = dst_l_out;
+                }
+                if (ring_exit_takeover) {
+                    printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+                           "action=PHONE_RESIDUAL_ADD_COPY "
+                           "tensor=%s bytes=%zu status=OK\\n",
+                           layer, i, dst_l_out->name,
+                           ggml_nbytes(dst_l_out));
                 }
 
                 if (pipeline_debug) {
