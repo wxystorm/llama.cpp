@@ -249,6 +249,106 @@ static void test_failure_and_wakeup() {
     check(woke.load() && cancelled.failed(), "cancellation did not wake waiter");
 }
 
+
+static void test_output_window_credits() {
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 358, 64, 2);
+    check(ready.output_window() == 2, "window credit mode not enabled");
+
+    const auto first = ready.try_take(llama_region_ring_device::CPU);
+    check(first && first->region == 0 && first->chunk == 0, "CPU R0C0 unavailable");
+    check(ready.live_output_slots() == 1, "R0C0 output lease not reserved");
+    ready.complete(*first);
+    const auto second = ready.try_take(llama_region_ring_device::CPU);
+    check(second && second->region == 0 && second->chunk == 1, "CPU R0C1 unavailable");
+    ready.complete(*second);
+    check(ready.live_output_slots() == 2, "expected two R0 output slots in use");
+    check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
+          "R0C2 overwrote R0C0 before R1 consumed it");
+
+    const auto gpu = ready.try_take(llama_region_ring_device::GPU);
+    check(gpu && gpu->region == 1 && gpu->chunk == 0, "GPU R1C0 unavailable");
+    check(ready.live_output_slots() == 3,
+          "GPU must retain the reading upstream slot while producing its own output");
+    ready.complete(*gpu);
+    const auto resumed = ready.try_take(llama_region_ring_device::CPU);
+    check(resumed && resumed->region == 0 && resumed->chunk == 2,
+          "R0C2 did not resume after downstream released the credit");
+    ready.complete(*resumed);
+
+    // In single-thread execution a blocked queue head must not block
+    // other ready regions on that device. All 54 tasks should drain.
+    size_t completed = 4;
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    while (!ready.all_done()) {
+        bool progress = false;
+        for (const auto device : devices) {
+            if (auto task = ready.try_take(device)) {
+                ready.complete(*task);
+                ++completed;
+                progress = true;
+            }
+        }
+        check(progress, "credit blocked all devices without a running task");
+    }
+    check(completed == 54 && !ready.failed(), "window credits lost tasks");
+    check(ready.live_output_slots() == 0, "credits remained after full drain");
+}
+
+static void test_window_parallel_mock_workers() {
+    // Tests READY, WRITING, READING, FREE and wakeups concurrently.
+    // NO concurrent llama.cpp or GGML graphs are executed here.
+    const auto regions = llama_region_ring_parse("", 48);
+    llama_region_ring_ready ready(regions, 358, 64, 2);
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    std::array<std::atomic<int>, 54> done{};
+    std::atomic<int> failures{0};
+    std::array<std::thread, 3> workers;
+    for (size_t i = 0; i < workers.size(); ++i) {
+        workers[i] = std::thread([&, dev = devices[i]] {
+            try {
+                while (auto task = ready.wait_take(dev)) {
+                    if (task->region >= regions.size() || task->chunk >= 6) {
+                        ++failures;
+                        ready.fail(*task);
+                        return;
+                    }
+                    const size_t index = task->region * 6 + task->chunk;
+                    const bool valid =
+                        regions[task->region].device == dev &&
+                        (task->region == 0 ||
+                         done[(task->region - 1) * 6 + task->chunk].load() == 1) &&
+                        (task->chunk == 0 ||
+                         done[task->region * 6 + task->chunk - 1].load() == 1);
+                    if (!valid || done[index].exchange(1) != 0) {
+                        ++failures;
+                        ready.fail(*task);
+                        return;
+                    }
+                    ready.complete(*task);
+                }
+            } catch (...) {
+                ++failures;
+                ready.cancel();
+            }
+        });
+    }
+    for (auto & worker : workers) {
+        worker.join();
+    }
+    check(failures.load() == 0, "concurrent window credit mock failed");
+    check(ready.all_done() && ready.finished() == 54, "window mock did not finish");
+    check(ready.live_output_slots() == 0, "window mock leaked output credits");
+}
+
 int main() {
     std::fprintf(stderr, "[REGION_RING_TEST] begin\n");
     try {
@@ -264,6 +364,10 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] parallel_scheduler=PASS\n");
         test_failure_and_wakeup();
         std::fprintf(stderr, "[REGION_RING_TEST] failure=PASS\n");
+        test_output_window_credits();
+        std::fprintf(stderr, "[REGION_RING_TEST] window_credits=PASS\n");
+        test_window_parallel_mock_workers();
+        std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
         return 0;
     } catch (const std::exception & e) {
