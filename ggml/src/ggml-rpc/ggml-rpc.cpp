@@ -4225,6 +4225,11 @@ struct rpc_opencl_tensor_storage_entry {
 
 
 struct rpc_phone_region_local_task {
+    bool ring_auto = false;
+    uint32_t ring_device = 0;
+    uint32_t ring_first_layer = 0;
+    uint64_t ring_graph_uid = 0;
+    uint64_t ring_seq = 0;
     int chunk = -1;
     std::array<std::vector<uint8_t>, 4> graphs;
     rpc_msg_route_snapshot_ready_req ready {};
@@ -4286,12 +4291,18 @@ public:
     bool phone_region_local_submit(
         const std::vector<uint8_t> & input,
         rpc_msg_phone_region_local_submit_rsp & response);
+    bool phone_ring_input_ready(
+        const rpc_msg_phone_ring_ready_req & request,
+        rpc_msg_phone_ring_ack & response);
+    bool phone_ring_wait(
+        const rpc_msg_phone_ring_wait_req & request,
+        rpc_msg_phone_ring_ack & response);
     bool get_route_snapshot(
         const rpc_msg_get_route_snapshot_req & request,
         std::vector<uint8_t> & response);
     bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
-    bool graph_compute(const std::vector<uint8_t> & input);
+    bool graph_compute(const std::vector<uint8_t> & input, bool register_only = false);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
@@ -4343,6 +4354,13 @@ private:
     std::deque<rpc_phone_region_local_task> phone_region_main_queue;
     std::thread phone_region_main_thread;
     bool phone_region_main_stop = false;
+
+    // Completion status is separate from the FFN ready-credit map, so
+    // failures cannot be mistaken for successful graph execution.
+    std::mutex phone_ring_completion_mutex;
+    std::condition_variable phone_ring_completion_cv;
+    std::unordered_map<uint64_t, bool> phone_ring_completions;
+
     std::unordered_set<ggml_backend_buffer_t> buffers;
 
     // Non-owning OpenCL-only tensor state. Entries are removed before the
@@ -5687,6 +5705,55 @@ bool rpc_server::phone_region_local_submit(
     return true;
 }
 
+bool rpc_server::phone_ring_input_ready(
+        const rpc_msg_phone_ring_ready_req & request,
+        rpc_msg_phone_ring_ack & response) {
+    response.accepted = 0;
+    if (request.device >= backends.size() ||
+            request.graph_uid == 0 || request.seq == 0 ||
+            (request.first_layer != 11 && request.first_layer != 27)) {
+        return true;
+    }
+    rpc_phone_region_local_task task;
+    task.ring_auto = true;
+    task.ring_device = request.device;
+    task.ring_first_layer = request.first_layer;
+    task.ring_graph_uid = request.graph_uid;
+    task.ring_seq = request.seq;
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        if (phone_region_main_stop) {
+            return true;
+        }
+        phone_region_main_queue.emplace_back(std::move(task));
+    }
+    phone_region_main_cv.notify_one();
+    response.accepted = 1;
+    std::fprintf(stderr,
+        "[PHONE_RING_AUTO] side=phone event=READY_ENQUEUED "
+        "layer=%u uid=%" PRIu64 " seq=%" PRIu64 "\n",
+        request.first_layer, request.graph_uid, request.seq);
+    return true;
+}
+
+bool rpc_server::phone_ring_wait(
+        const rpc_msg_phone_ring_wait_req & request,
+        rpc_msg_phone_ring_ack & response) {
+    response.accepted = 0;
+    if (request.device >= backends.size() || request.seq == 0) {
+        return true;
+    }
+    std::unique_lock<std::mutex> lock(phone_ring_completion_mutex);
+    phone_ring_completion_cv.wait(lock, [&]() {
+        return phone_ring_completions.find(request.seq) !=
+            phone_ring_completions.end();
+    });
+    auto it = phone_ring_completions.find(request.seq);
+    response.accepted = it->second ? 1 : 0;
+    phone_ring_completions.erase(it);
+    return true;
+}
+
 void rpc_server::phone_region_main_loop() {
     while (true) {
         rpc_phone_region_local_task task;
@@ -5704,6 +5771,37 @@ void rpc_server::phone_region_main_loop() {
             }
             task = std::move(phone_region_main_queue.front());
             phone_region_main_queue.pop_front();
+        }
+
+        if (task.ring_auto) {
+            const int64_t begin_us = ggml_time_us();
+            bool ok = false;
+            {
+                // The Phone MAIN graph gate excludes unrelated GPU submits
+                // while this Region modifies KV and its output buffers.
+                std::lock_guard<std::recursive_mutex> graph_lock(
+                    graph_compute_mutex);
+                rpc_msg_graph_recompute_req req {};
+                req.device = task.ring_device;
+                req.graph_uid = task.ring_graph_uid;
+                ok = graph_recompute(req);
+                if (ok) {
+                    ggml_backend_synchronize(backends[task.ring_device]);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(phone_ring_completion_mutex);
+                phone_ring_completions[task.ring_seq] = ok;
+            }
+            phone_ring_completion_cv.notify_all();
+            std::fprintf(stderr,
+                "[PHONE_RING_AUTO] side=phone event=EXECUTE_DONE "
+                "layer=%u uid=%" PRIu64 " seq=%" PRIu64 " "
+                "compute_ms=%.3f status=%s\n",
+                task.ring_first_layer, task.ring_graph_uid, task.ring_seq,
+                (ggml_time_us() - begin_us) / 1000.0,
+                ok ? "OK" : "FAIL");
+            continue;
         }
 
         const bool ok = run_phone_region_local_task(task);
@@ -6817,7 +6915,7 @@ bool rpc_server::set_tensor_graph_compute(
     return ok;
 }
 
-bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -6886,6 +6984,16 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+    if (register_only) {
+        // The server reconstructs and owns this graph, but does not run it.
+        // INPUT_READY will enqueue graph_recompute on Phone MAIN.
+        graph_entry.graph = graph;
+        std::fprintf(stderr,
+            "[PHONE_RING_AUTO] side=phone event=GRAPH_REGISTERED "
+            "device=%u uid=%" PRIu64 " nodes=%u status=OK\n",
+            device, graph_uid, n_nodes);
+        return true;
+    }
     const int64_t t0 = ggml_time_us();
 
     ggml_status status =
