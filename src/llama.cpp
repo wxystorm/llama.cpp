@@ -5,6 +5,7 @@
 #include "llama-chat.h"
 #include "llama-context.h"
 #include "llama-hybrid.h"
+#include "llama-region-ring.h"
 #include "llama-mmap.h"
 #include "llama-vocab.h"
 #include "llama-model-loader.h"
@@ -21,6 +22,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -307,31 +309,52 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-1, nullptr};
         }
 
-        if (params.hybrid_auto && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        // Dry-run Planner needs the hardware Profile even when HYBRID_AUTO
+        // was not requested. It uses the existing profiling implementation,
+        // but does NOT publish or apply the legacy Hybrid layer plan.
+        const char * ring_planner_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+        const bool ring_planner_profile_requested =
+            params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+            llama_region_ring_enabled() && ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env, "dry-run") == 0;
+        if ((params.hybrid_auto || ring_planner_profile_requested) &&
+                params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
-            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u target_ubatch=%u\n",
-                           params.hybrid_target_ctx, params.hybrid_target_ubatch_tokens);
+            LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u target_ubatch=%u "
+                           "ring_planner=%s\n",
+                           params.hybrid_target_ctx,
+                           params.hybrid_target_ubatch_tokens,
+                           ring_planner_profile_requested ? "DRY_RUN" : "OFF");
 
             if (!llama_hybrid_autoplan(ml, params, best)) {
-                LLAMA_LOG_ERROR("[HYBRID_AUTO] planner failed\n");
-                return {-1, nullptr};
+                if (params.hybrid_auto) {
+                    LLAMA_LOG_ERROR("[HYBRID_AUTO] planner failed\n");
+                    return {-1, nullptr};
+                }
+                LLAMA_LOG_WARN(
+                    "[REGION_RING_PLAN_PROFILE] reason=PROFILE_NOT_AVAILABLE "
+                    "action=KEEP_FIXED_RING\n");
+            } else if (params.hybrid_auto) {
+                llama_hybrid_plan_print(best);
+                if (!llama_hybrid_runtime_plan_set(best)) {
+                    LLAMA_LOG_ERROR("[HYBRID_AUTO] failed to publish plan\n");
+                    return {-1, nullptr};
+                }
+                LLAMA_LOG_ERROR(
+                    "[HYBRID_AUTO] selected T=%d primary=%s P=%d C=%d R=%.3f G=%d "
+                    "XG=%d XC=%d XT=%d XP=%d predicted=%.3f ms\n",
+                    best.tensor_layers,
+                    best.tensor_phone_primary ? "PHONE" : "PC",
+                    best.phone_layers, best.pc_layers, best.tensor_pc_ratio,
+                    best.gpu_pc_layers, best.gpu_chunk_tokens,
+                    best.cpu_chunk_tokens, best.tensor_chunk_tokens,
+                    best.phone_chunk_tokens, best.predicted_ms);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
+                    "phase=MODEL_LOAD status=AVAILABLE applied=0\n");
             }
-
-            llama_hybrid_plan_print(best);
-            if (!llama_hybrid_runtime_plan_set(best)) {
-                LLAMA_LOG_ERROR("[HYBRID_AUTO] failed to publish plan\n");
-                return {-1, nullptr};
-            }
-
-            LLAMA_LOG_ERROR(
-                "[HYBRID_AUTO] selected T=%d primary=%s P=%d C=%d R=%.3f G=%d "
-                "XG=%d XC=%d XT=%d XP=%d predicted=%.3f ms\n",
-                best.tensor_layers,
-                best.tensor_phone_primary ? "PHONE" : "PC",
-                best.phone_layers, best.pc_layers, best.tensor_pc_ratio,
-                best.gpu_pc_layers, best.gpu_chunk_tokens,
-                best.cpu_chunk_tokens, best.tensor_chunk_tokens,
-                best.phone_chunk_tokens, best.predicted_ms);
         }
 
         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
