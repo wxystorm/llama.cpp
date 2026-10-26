@@ -369,6 +369,7 @@ private:
                                        bool                                            task_local_graph_outputs,
                                        bool                                            threaded_execution,
                                        bool                                            audit_backend_resources,
+                                       bool                                            strict_cpu_scheduler,
                                        ggml_status &                                   ret);
 
     bool run_hybrid_wave_probe(

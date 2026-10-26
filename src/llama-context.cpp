@@ -2746,6 +2746,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool task_local_graph_outputs,
         bool threaded_execution,
         bool audit_backend_resources,
+        bool strict_cpu_scheduler,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || stages.size() < 6) {
@@ -2789,10 +2790,54 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
             auto & worker = region_ring_worker_resources[dev];
+            const bool cpu_only = strict_cpu_scheduler && dev == 0;
+
+            // A model context can be re-used between successive decode calls.
+            // Do not retain a scheduler from a different experimental mode.
+            // A strict CPU scheduler has exactly one Backend; all other modes
+            // keep the old full list in its original order.
+            bool matches = worker.sched != nullptr &&
+                ggml_backend_sched_get_n_backends(worker.sched.get()) ==
+                    (cpu_only ? 1 : (int) backend_ptrs.size());
+            if (matches && cpu_only) {
+                matches = ggml_backend_sched_get_backend(worker.sched.get(), 0) == backend_cpu;
+            }
+            if (matches && !cpu_only) {
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    if (ggml_backend_sched_get_backend(worker.sched.get(), (int) i) != backend_ptrs[i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+            if (worker.sched && !matches) {
+                ggml_backend_sched_synchronize(worker.sched.get());
+                worker.res.reset();
+                worker.sched.reset();
+            }
             if (!worker.sched) {
-                worker.sched.reset(ggml_backend_sched_new(
-                    backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
-                    max_nodes, false, cparams.op_offload));
+                if (cpu_only) {
+                    // CPU Region weights are loaded with CPU_DIRECT. Give
+                    // this Worker ONLY the canonical CPU backend so the GGML
+                    // allocator cannot offload host-weight ops to CUDA or
+                    // expand a GPU backend over neighbouring operators.
+                    const auto it = std::find(backend_ptrs.begin(), backend_ptrs.end(), backend_cpu);
+                    if (backend_cpu == nullptr || it == backend_ptrs.end()) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_CPU_BACKEND] status=FAIL reason=CPU_BACKEND_NOT_FOUND\n");
+                        ret = GGML_STATUS_FAILED;
+                        return nullptr;
+                    }
+                    const size_t idx = (size_t) (it - backend_ptrs.begin());
+                    ggml_backend_t cpu_handle = backend_cpu;
+                    ggml_backend_buffer_type_t cpu_buft = backend_buft[idx];
+                    worker.sched.reset(ggml_backend_sched_new(
+                        &cpu_handle, &cpu_buft, 1, max_nodes, false, false));
+                } else {
+                    worker.sched.reset(ggml_backend_sched_new(
+                        backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                        max_nodes, false, cparams.op_offload));
+                }
                 if (!worker.sched) {
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_RESOURCE] device=%s status=ALLOC_FAILED\n",
@@ -2806,6 +2851,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             ring_sched[dev] = worker.sched.get();
             ring_res[dev] = worker.res.get();
+            if (cpu_only) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_CPU_BACKEND] scheduler=%p cpu_backend=%p "
+                    "backends=%d op_offload=0 mode=CPU_ONLY status=READY\n",
+                    (void *) ring_sched[dev], (void *) backend_cpu,
+                    ggml_backend_sched_get_n_backends(ring_sched[dev]));
+            }
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -2849,6 +2901,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (audit_backend_resources && !threaded_execution) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_BACKEND_OWNERSHIP] status=REJECT reason=REQUIRES_WORKERS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (strict_cpu_scheduler && (!threaded_execution || !audit_backend_resources)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_CPU_BACKEND] status=REJECT reason=REQUIRES_AUDITED_WORKERS\n");
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -3047,6 +3105,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 block_outputs, worker_apply_mctx, true,
                                 task_status, nullptr, true);
                             state.backend_exec_us += ggml_time_us() - compute_begin_us;
+
+                            // Hard postcondition: the CPU Region may not run
+                            // a single compute Split on CUDA or Meta.
+                            if (strict_cpu_scheduler && dev == 0 &&
+                                task_result != nullptr &&
+                                task_status == GGML_STATUS_SUCCESS) {
+                                const int n_splits = ggml_backend_sched_get_n_splits(ring_sched[dev]);
+                                int bad_splits = 0;
+                                for (int i = 0; i < n_splits; ++i) {
+                                    if (ggml_backend_sched_get_split_backend(ring_sched[dev], i) != backend_cpu) {
+                                        ++bad_splits;
+                                    }
+                                }
+                                if (task.chunk == 0 || bad_splits > 0) {
+                                    LLAMA_LOG_ERROR(
+                                        "[REGION_RING_CPU_PLACEMENT] region=%zu chunk=%zu "
+                                        "splits=%d non_cpu_splits=%d status=%s\n",
+                                        task.region, task.chunk, n_splits, bad_splits,
+                                        n_splits > 0 && bad_splits == 0 ? "PASS" : "FAIL");
+                                }
+                                if (n_splits == 0 || bad_splits > 0) {
+                                    task_status = GGML_STATUS_FAILED;
+                                }
+                            }
                             if (task_result != nullptr &&
                                 task_status == GGML_STATUS_SUCCESS &&
                                 audit_backend_resources) {
@@ -3054,9 +3136,35 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     ring_sched[dev]);
                                 uint64_t task_mask = 0;
                                 for (int split = 0; split < n_splits; ++split) {
-                                    const uint64_t split_mask =
+                                    const uint64_t local_mask =
                                         ggml_backend_sched_get_split_resource_mask(
                                             ring_sched[dev], split);
+                                    // Resource masks are scheduler-local. A
+                                    // CPU-only scheduler has index 0 = CPU,
+                                    // while the full Scheduler has indices
+                                    // 0=Meta, 1=CUDA, 2=CPU. Convert all
+                                    // masks to the canonical outer list before
+                                    // comparing workers or aggregating data.
+                                    uint64_t split_mask =
+                                        local_mask & (UINT64_C(1) << 63);
+                                    const int n_local =
+                                        ggml_backend_sched_get_n_backends(ring_sched[dev]);
+                                    for (int i = 0; i < n_local; ++i) {
+                                        if ((local_mask & (UINT64_C(1) << i)) == 0) {
+                                            continue;
+                                        }
+                                        ggml_backend_t referenced =
+                                            ggml_backend_sched_get_backend(ring_sched[dev], i);
+                                        const auto it = std::find(
+                                            backend_ptrs.begin(), backend_ptrs.end(), referenced);
+                                        const size_t outer_index =
+                                            (size_t) (it - backend_ptrs.begin());
+                                        if (it == backend_ptrs.end() || outer_index >= 63) {
+                                            split_mask |= UINT64_C(1) << 63;
+                                        } else {
+                                            split_mask |= UINT64_C(1) << outer_index;
+                                        }
+                                    }
                                     task_mask |= split_mask;
                                     if (task.chunk == 0 || (split_mask >> 63) != 0) {
                                         ggml_backend_t target =
@@ -3066,7 +3174,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                             "[REGION_RING_BACKEND_SPLIT] device=%s "
                                             "region=%zu chunk=%zu split=%d/%d "
                                             "compute=%s resource_mask=0x%016" PRIx64
-                                            " unresolved=%d\n",
+                                            " unresolved=%d scope=OUTER\n",
                                             name, task.region, task.chunk, split,
                                             n_splits, ggml_backend_name(target),
                                             split_mask, (int) (split_mask >> 63));
@@ -3085,7 +3193,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "region=%zu chunk=%zu n_splits=%d "
                                     "resource_mask=0x%016" PRIx64
                                     " cross_backend=%d unresolved=%d "
-                                    "gate=CONTEXT_SHARED status=OBSERVED\n",
+                                    "gate=CONTEXT_SHARED scope=OUTER status=OBSERVED\n",
                                     name, task.region, task.chunk, n_splits,
                                     task_mask, cross ? 1 : 0,
                                     unresolved ? 1 : 0);
@@ -3351,6 +3459,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        strict_cpu_scheduler ? "DEVICE_FIFO_CPU_ONLY" :
         audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
         threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
         task_local_graph_outputs ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
@@ -4331,9 +4440,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ring_exec != "fifo" && ring_exec != "fifo-isolated" &&
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
         ring_exec != "fifo-workers" && ring_exec != "fifo-backend-audit" &&
+        ring_exec != "fifo-cpu-only" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, fifo-cpu-only, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     if (region_ring_v1) {
@@ -4363,6 +4473,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo-state" ? "DEVICE_FIFO_TASK_STATE_SIMULATION" :
             ring_exec == "fifo-workers" ? "DEVICE_FIFO_GATED_WORKERS" :
             ring_exec == "fifo-backend-audit" ? "DEVICE_FIFO_BACKEND_AUDIT" :
+            ring_exec == "fifo-cpu-only" ? "DEVICE_FIFO_CPU_ONLY" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -5647,6 +5758,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-state = explicit per-task graph output count; same Backend gate;
             // fifo-workers = three real host threads, one shared Backend graph gate;
             // fifo-backend-audit = workers + actual split/resource/Meta child audit;
+            // fifo-cpu-only = strict CPU-only Scheduler, audited Backend mask;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -5664,16 +5776,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     runtime_stages, ubatch_id,
                     ring_exec == "fifo" || ring_exec == "fifo-isolated" ||
                         ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-cpu-only",
                     ring_exec == "fifo-isolated" || ring_exec == "fifo-owned" ||
                         ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
-                        ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-backend-audit" || ring_exec == "fifo-cpu-only",
                     ring_exec == "fifo-owned" || ring_exec == "fifo-state" ||
-                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
+                        ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-cpu-only",
                     ring_exec == "fifo-state" || ring_exec == "fifo-workers" ||
-                        ring_exec == "fifo-backend-audit",
-                    ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit",
-                    ring_exec == "fifo-backend-audit", status);
+                        ring_exec == "fifo-backend-audit" || ring_exec == "fifo-cpu-only",
+                    ring_exec == "fifo-workers" || ring_exec == "fifo-backend-audit" ||
+                        ring_exec == "fifo-cpu-only",
+                    ring_exec == "fifo-backend-audit" || ring_exec == "fifo-cpu-only",
+                    ring_exec == "fifo-cpu-only", status);
             }
         } else if (stage_serial_candidate) {
             res = process_ubatch_staged(
