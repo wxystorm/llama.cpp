@@ -2124,7 +2124,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
-    if (region_ring && hybrid_ring_plan_topology) {
+    if (hybrid_ring_plan_topology) {
+        // The Plan flag is a persistent llama_model member. The temporary
+        // region_ring / ring_regions variables used by load_hparams() are
+        // not in scope in this load_tensors() function.
+        const auto planned_regions = llama_region_ring_parse(
+            hybrid_ring_plan_layout, n_layer_all, true);
+        if (!llama_region_ring_apply_topology_compatible(
+                planned_regions, n_layer_all) ||
+                planned_regions.back().device == llama_region_ring_device::PHONE) {
+            throw std::runtime_error(
+                "apply-topology output placement requires a valid PC final Region");
+        }
         // The final CPU/CUDA Region executes on a PC-only scheduler. The
         // output norm and LM head must therefore be PC-owned as well.
         // Previously all Hybrid models placed these weights on Meta,
@@ -2145,7 +2156,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             "[REGION_RING_OUTPUT_PLACEMENT] mode=APPLY_TOPOLOGY "
             "output=CPU_DIRECT final_region=%s "
             "meta_rpc=DISABLED status=READY\n",
-            llama_region_ring_device_name(ring_regions.back().device));
+            llama_region_ring_device_name(planned_regions.back().device));
     } else if (!hybrid_layer_modes.empty()) {
         if (meta_dev == nullptr) {
             throw std::runtime_error(format(
