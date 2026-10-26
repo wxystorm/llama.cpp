@@ -13587,34 +13587,93 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return reject("LEGACY_MARKERS_NOT_MATCHED");
         }
 
-        // Only fuse pure Phone-owned multi-token Region graphs. Decode and
-        // mixed PC/Phone FFN graphs continue on their original path.
-        const char * ffn_first = g1->nodes[0]->name;
-        const char * ffn_last = g1->nodes[g1->n_nodes - 1]->name;
-        int ffn_chars = 0, last_chars = 0, last_layer = -1;
-        ffn_layer = -1;
-        if (std::sscanf(ffn_first, "ffn_inp-%d%n", &ffn_layer, &ffn_chars) != 1 ||
-                ffn_first[ffn_chars] != '\0' ||
-                std::sscanf(ffn_last, "ffn_moe_out-%d%n", &last_layer, &last_chars) != 1 ||
-                ffn_last[last_chars] != '\0' ||
-                ffn_layer < 0 || last_layer != ffn_layer ||
-                g1->nodes[0]->ne[1] <= 1 ||
-                layer_is_tensor_phone_primary(ffn_layer)) {
-            return reject("RING_FFN_MARKERS_OR_SHAPE");
+        // Qwen3-MoE names the attention residual "ffn_inp-L" and the MoE
+        // result "ffn_moe_out-L". Meta splits at PARTIAL and other boundaries,
+        // so these labels may be INTERNAL nodes of either subgraph rather
+        // than the exact first/last node. Inspect the actual paired graphs
+        // without changing ownership flags or removing communication.
+        //
+        // The legacy marker path above is unchanged. Only the opt-in P5
+        // path accepts these additional marker positions.
+        auto exact_layer = [](const char * name, const char * pattern, int & out) -> bool {
+            int parsed_layer = -1;
+            int chars = 0;
+            if (std::sscanf(name, pattern, &parsed_layer, &chars) != 1 ||
+                    chars == 0 || name[chars] != '\0' || parsed_layer < 0) {
+                return false;
+            }
+            out = parsed_layer;
+            return true;
+        };
+
+        int input_layer = -1;
+        int output_layer = -1;
+        bool found_ffn_input = false;
+        bool found_ffn_output = false;
+        bool found_attention_start = false;
+        const ggml_tensor * ffn_output_node = nullptr;
+
+        for (int which = 0; which < 2; ++which) {
+            ggml_cgraph * graph = which == 0 ? g0 : g1;
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                const ggml_tensor * node = graph->nodes[k];
+                int parsed_layer = -1;
+                if (exact_layer(node->name, "ffn_inp-%d%n", parsed_layer)) {
+                    if (found_ffn_input && input_layer != parsed_layer) {
+                        return reject("RING_FFN_INPUT_MULTIPLE_LAYERS");
+                    }
+                    found_ffn_input = true;
+                    input_layer = parsed_layer;
+                }
+                if (exact_layer(node->name, "ffn_moe_out-%d%n", parsed_layer)) {
+                    // The second SG must finish the same layer's MoE.
+                    if (which != 1 || found_ffn_output) {
+                        return reject("RING_FFN_OUTPUT_OUTSIDE_SECOND_SG");
+                    }
+                    found_ffn_output = true;
+                    output_layer = parsed_layer;
+                    ffn_output_node = node;
+                }
+            }
+        }
+        if (!found_ffn_input) {
+            return reject("RING_FFN_INPUT_MARKER_MISSING");
+        }
+        if (!found_ffn_output) {
+            return reject("RING_FFN_OUTPUT_MARKER_MISSING");
+        }
+        ffn_layer = input_layer;
+        if (ffn_layer != output_layer || ffn_output_node == nullptr) {
+            return reject("RING_FFN_LAYER_MISMATCH");
+        }
+        if (ffn_output_node->ne[1] <= 1) {
+            return reject("RING_DECODE_NOT_FUSABLE");
+        }
+        if (layer_is_tensor_phone_primary(ffn_layer)) {
+            return reject("SPLIT_PHONE_PRIMARY_LAYER");
         }
 
-        const char * attention_first = g0->nodes[0]->name;
-        int input_layer = -1, parsed = 0;
-        const bool starts_with_norm =
-            std::sscanf(attention_first, "norm-%d%n", &input_layer, &parsed) == 1 &&
-            attention_first[parsed] == '\0' && input_layer == ffn_layer;
-        input_layer = -1;
-        parsed = 0;
-        const bool starts_with_previous_lout =
-            std::sscanf(attention_first, "l_out-%d%n", &input_layer, &parsed) == 1 &&
-            attention_first[parsed] == '\0' && input_layer + 1 == ffn_layer;
-        if (!starts_with_norm && !starts_with_previous_lout) {
-            return reject("RING_ATTN_INPUT_MARKER");
+        // The first SG must belong to this layer's Attention. A leading
+        // previous-layer l_out is a legitimate residual input; a leading
+        // norm/attn_norm of the current layer is the common case.
+        for (int k = 0; k < g0->n_nodes; ++k) {
+            const char * name = g0->nodes[k]->name;
+            int parsed_layer = -1;
+            if ((exact_layer(name, "norm-%d%n", parsed_layer) ||
+                 exact_layer(name, "attn_norm-%d%n", parsed_layer)) &&
+                    parsed_layer == ffn_layer) {
+                found_attention_start = true;
+                break;
+            }
+            parsed_layer = -1;
+            if (exact_layer(name, "l_out-%d%n", parsed_layer) &&
+                    parsed_layer + 1 == ffn_layer) {
+                found_attention_start = true;
+                break;
+            }
+        }
+        if (!found_attention_start) {
+            return reject("RING_ATTN_INPUT_MARKER_MISSING");
         }
 
         // The two SGs must be exclusively Phone-compute. Terminal labels
@@ -17913,6 +17972,7 @@ auto prefill_norm_sg_has_prework =
                 i, phone_block_end, first_fused_layer, phone_block_last_layer,
                 ring_phone_fusion ? &fusion_reason : nullptr,
                 ring_phone_fusion ? &fusion_failed_sg : nullptr);
+            bool eligible_probe_only = false;
             if (phone_block_fused && ring_phone_fusion_probe &&
                     phone_block_last_layer - first_fused_layer + 1 == 5) {
                 printf("[REGION_RING_PHONE_FUSION] event=PROBE sg=%zu..%zu "
@@ -17922,11 +17982,12 @@ auto prefill_norm_sg_has_prework =
                        phone_block_last_layer + 1,
                        phone_block_end - i + 1);
                 phone_block_fused = false;
+                eligible_probe_only = true;
             }
             if (phone_block_fused) {
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
-            } else if (ring_phone_fusion && is_phone_only_sg) {
+            } else if (ring_phone_fusion && !eligible_probe_only && is_phone_only_sg) {
                 // A missed fusion must not suppress any Meta communication:
                 // the original per-subgraph execution remains untouched.
                 ggml_cgraph * candidate =
