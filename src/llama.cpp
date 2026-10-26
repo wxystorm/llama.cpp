@@ -309,15 +309,30 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-1, nullptr};
         }
 
-        // Dry-run Planner needs the hardware Profile even when HYBRID_AUTO
-        // was not requested. It uses the existing profiling implementation,
-        // but does NOT publish or apply the legacy Hybrid layer plan.
+        // Phase-1 APPLY-safe must choose a model-owned layout BEFORE weight
+        // allocation. Both modes reuse the measured Hybrid Profile, never
+        // publish the incompatible legacy Hybrid placement Plan.
         const char * ring_planner_env =
             std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+        const bool ring_plan_dry_run =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"dry-run") == 0;
+        const bool ring_plan_apply_safe =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"apply-safe") == 0;
+        if (ring_plan_apply_safe &&
+                (!llama_region_ring_enabled() ||
+                 params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
+                 params.hybrid_auto)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n");
+            return {-1,nullptr};
+        }
         const bool ring_planner_profile_requested =
             params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
-            llama_region_ring_enabled() && ring_planner_env != nullptr &&
-            std::strcmp(ring_planner_env, "dry-run") == 0;
+            llama_region_ring_enabled() &&
+            (ring_plan_dry_run || ring_plan_apply_safe);
         if ((params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
@@ -325,7 +340,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            "ring_planner=%s\n",
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
-                           ring_planner_profile_requested ? "DRY_RUN" : "OFF");
+                           ring_plan_apply_safe ? "APPLY_SAFE" :
+                           ring_plan_dry_run ? "DRY_RUN" : "OFF");
 
             if (!llama_hybrid_autoplan(ml, params, best)) {
                 if (params.hybrid_auto) {
@@ -354,6 +370,60 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
                     "phase=MODEL_LOAD status=AVAILABLE applied=0\n");
+            }
+        }
+
+        if (ring_plan_apply_safe) {
+            int chunk_tokens = 128;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+                char * end = nullptr;
+                const long n = std::strtol(raw,&end,10);
+                if (end == raw || *end != '\0' || n < 1 ||
+                        n > 16384) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "reason=INVALID_RUNTIME_CHUNK\n");
+                    return {-1,nullptr};
+                }
+                chunk_tokens = (int) n;
+            }
+            int target_tokens = params.hybrid_target_ubatch_tokens > 0 ?
+                (int) params.hybrid_target_ubatch_tokens : 128;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS")) {
+                char * end = nullptr;
+                const long n = std::strtol(raw,&end,10);
+                if (end == raw || *end != '\0' || n < 16 ||
+                        n > 16384) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
+                        "reason=INVALID_TARGET_TOKENS\n");
+                    return {-1,nullptr};
+                }
+                target_tokens = (int) n;
+            }
+            std::string selected_layout;
+            const bool selected =
+                llama_hybrid_region_ring_planner_apply_safe(
+                    target_tokens, 0, chunk_tokens,selected_layout);
+            if (selected && !selected_layout.empty()) {
+                // The model permanently owns this decision. The graph
+                // scheduler reads these exact values from the same model;
+                // changing the process environment later cannot split
+                // graph execution from allocated model weight ownership.
+                model_ptr->hybrid_ring_plan_layout = selected_layout;
+                model_ptr->hybrid_ring_plan_chunk_tokens = chunk_tokens;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                    "phase=MODEL_LOAD applied=1 layout=%s "
+                    "chunk=%d target_tokens=%d status=MODEL_OWNED\n",
+                    selected_layout.c_str(),chunk_tokens,target_tokens);
+            } else {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                    "phase=MODEL_LOAD applied=0 "
+                    "status=FIXED_BASELINE_UNCHANGED\n");
             }
         }
 
