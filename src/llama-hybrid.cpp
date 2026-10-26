@@ -8008,17 +8008,39 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     constraints.target_ctx           = params.hybrid_target_ctx;
     constraints.score_kv_tokens      = params.hybrid_target_ctx;
     constraints.target_ubatch_tokens = params.hybrid_target_ubatch_tokens;
-    if (llama_region_ring_enabled()) {
+    const bool region_ring_requested = llama_region_ring_enabled();
+    if (region_ring_requested) {
+        // The Ring layout is the authoritative topology. Old environment
+        // overrides (e.g. PC=32 from a T1/P15 run) must not override it:
+        // C22+G11+P15+T0 accounts for all 48 layers, but PC=32 does not.
         const auto counts = llama_region_ring_layer_counts(
             llama_region_ring_from_env(profile.n_layer));
         constraints.fixed_tensor_layers = 0;
         constraints.fixed_pc_layers = counts[0] + counts[1];
         constraints.fixed_phone_layers = counts[2];
         constraints.fixed_gpu_pc_layers = counts[1];
+
+        for (const char * name : {
+                "LLAMA_HYBRID_FIXED_TENSOR_LAYERS",
+                "LLAMA_HYBRID_FIXED_PC_LAYERS",
+                "LLAMA_HYBRID_FIXED_PHONE_LAYERS",
+                "LLAMA_HYBRID_FIXED_TENSOR_PC_RATIO",
+                "LLAMA_HYBRID_FIXED_TENSOR_CHUNK_TOKENS" }) {
+            if (const char * value = std::getenv(name)) {
+                LLAMA_LOG_WARN(
+                    "[REGION_RING_IGNORE_FIXED] name=%s value=%s "
+                    "reason=RING_LAYOUT_IS_AUTHORITATIVE\n",
+                    name, value);
+            }
+        }
+
         LLAMA_LOG_ERROR(
-            "[REGION_RING_FIXED] cpu=%d gpu=%d phone=%d tensor=0\n",
-            counts[0], counts[1], counts[2]);
-    }
+            "[REGION_RING_FIXED] cpu=%d gpu=%d phone=%d pc=%d "
+            "tensor=0 gpu_pc=%d status=CONSISTENT\n",
+            counts[0], counts[1], counts[2],
+            counts[0] + counts[1], counts[1]);
+    } else {
+    // Legacy planner constraints only apply when Ring mode is disabled.
     if (const char * value =
             std::getenv("LLAMA_HYBRID_FIXED_TENSOR_LAYERS")) {
         char * end = nullptr;
@@ -8078,9 +8100,9 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 parsed);
         }
     }
-    // No fixed topology here: CPU_DIRECT is now part of the runtime model, so
-    // HYBRID_AUTO must search placement and chunking jointly instead of being
-    // constrained to the earlier T1/P0/C47/G11 validation layout.
+    }
+    // Legacy layout uses the automatic search; Ring fixes only the device
+    // layer totals and still searches chunk sizes within those constraints.
     const size_t pc_budget = llama_hybrid_effective_budget(
         constraints.pc_memory_budget, profile.pc_free_mem, LLAMA_HYBRID_PC_MEMORY_FRACTION);
     const size_t phone_budget = llama_hybrid_effective_budget(
