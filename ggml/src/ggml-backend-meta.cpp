@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -15533,7 +15534,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // Completion is consumed only at the exact final l_out bridge. Until
     // then the Phone MAIN worker owns execution and PC may do other work.
     std::map<int, uint64_t> pending_ring_auto_outputs;
-    static std::atomic<uint64_t> next_ring_auto_seq { 1 };
+    // Seed the credit space from wall-clock time rather than starting from
+    // one on every PC process restart. The Phone server may outlive a client.
+    static std::atomic<uint64_t> next_ring_auto_seq {
+        static_cast<uint64_t>(
+            std::chrono::system_clock::now().time_since_epoch().count())
+    };
     const int64_t meta_execute_begin_us = ggml_time_us();
     for (size_t schedule_pos = 0;
             schedule_pos < (region_pipeline_active ?
