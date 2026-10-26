@@ -8367,15 +8367,25 @@ bool llama_hybrid_region_ring_planner_dry_run(
         double attn_now = 0.0;
         const bool use_compute_est = dev == llama_region_ring_device::PHONE;
         if (!llama_hybrid_layer_block_total_cost(
-                    block, query_tokens, layers, use_compute_est, base) ||
-            !llama_hybrid_attn_cost(
+                block, query_tokens, layers, use_compute_est, base)) {
+            return false;
+        }
+        // Some Phone probes expose wall_ms before compute_est_ms is filled.
+        // Never interpret a zero compute estimate as a free GPU Region.
+        if (use_compute_est && base <= 0.0 &&
+                !llama_hybrid_layer_block_total_cost(
+                    block, query_tokens, layers, false, base)) {
+            return false;
+        }
+        if (!(base > 0.0) ||
+                !llama_hybrid_attn_cost(
                     attn, query_tokens, query_tokens, attn_ref) ||
-            !llama_hybrid_attn_cost(
+                !llama_hybrid_attn_cost(
                     attn, query_tokens, kv_tokens, attn_now)) {
             return false;
         }
         cost = base + layers * (attn_now - attn_ref);
-        return std::isfinite(cost) && cost >= 0.0;
+        return std::isfinite(cost) && cost > 0.0;
     };
 
     model.transfer_ms = [&profile](
