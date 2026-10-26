@@ -18680,8 +18680,15 @@ auto prefill_norm_sg_has_prework =
                 // READY so the server never reads partially written buffers.
                 auto phone_backend =
                     backend_ctx->backend_configs[1].backend;
+                const ggml_backend_rpc_fence_t rpc_fence =
+                    ggml_backend_meta_get_rpc_fence(phone_backend);
+                if (rpc_fence == nullptr) {
+                    printf("[PHONE_RING_AUTO] side=pc event=REJECT "
+                           "reason=RPC_FENCE_NOT_AVAILABLE status=FAIL\n");
+                    return GGML_STATUS_FAILED;
+                }
                 const int64_t transfer_fence_begin_us = ggml_time_us();
-                ggml_backend_synchronize(phone_backend);
+                rpc_fence(phone_backend);
                 const int64_t transfer_fence_us =
                     ggml_time_us() - transfer_fence_begin_us;
                 const uint64_t seq =
