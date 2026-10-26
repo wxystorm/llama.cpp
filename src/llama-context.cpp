@@ -3001,10 +3001,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_BACKEND_SUM] handles=%zu schedulers=3 "
-            "backend=%s cpu_threadpool=STABLE_CONFIG meta_rpc=SHARED "
+            "backend=%s cpu_threadpool=%s meta_rpc=SHARED "
             "graph_parallelism=%s status=AUDITED\n",
             backend_ptrs.size(),
             pc_phone_overlap ? "PC_CPU_CUDA_AND_META" : "SHARED_GATED",
+            pc_phone_overlap ? "ONCE_BEFORE_WORKERS" : "SHARED",
             pc_phone_overlap ? "PC_PHONE_ENABLED" : "DISABLED");
         LLAMA_LOG_ERROR(
             "[REGION_RING_TASK_STATE] outputs=TASK_LOCAL "
