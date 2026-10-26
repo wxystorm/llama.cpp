@@ -13529,6 +13529,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             return found;
         };
 
+    // An independent Region Ring Phone block is already represented as
+    // adjacent Phone-only Attention/FFN Meta subgraphs. The legacy fusion
+    // recognizes the "attn_out-L" marker, but Region Ring's attention SG
+    // ends at "node_N" and the next layer starts with "l_out-(L-1)".
+    // Reuse the EXISTING fused graph constructor and RPC UID cache; do not
+    // change the server protocol or fabricate a phone-side GGUF graph.
+    const char * ring_exec = std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+    const char * ring_fuse = std::getenv("GGML_META_RING_PHONE_FUSION");
+    const bool ring_phone_fusion =
+        n_backends == 2 && ring_exec != nullptr && ring_fuse != nullptr &&
+        std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
+        std::strcmp(ring_fuse, "1") == 0;
+
     auto phone_sg_pair_same_layer = [&](size_t i, int & layer) -> bool {
         if (n_backends != 2 || i + 1 >= backend_ctx->n_subgraphs ||
                 !subgraph_is_phone_only(i) || !subgraph_is_phone_only(i + 1)) {
@@ -13547,18 +13560,72 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             std::sscanf(g0->nodes[g0->n_nodes - 1]->name, "attn_out-%d", &attn_layer) == 1;
         const bool is_ffn =
             std::sscanf(g1->nodes[0]->name, "ffn_inp-%d", &ffn_layer) == 1;
-        if (!is_attn || !is_ffn || attn_layer != ffn_layer) {
+        if (is_attn && is_ffn && attn_layer == ffn_layer) {
+            // Keep legacy Phone-primary Tensor protection unchanged.
+            if (layer_is_tensor_phone_primary(attn_layer)) {
+                return false;
+            }
+            layer = attn_layer;
+            return true;
+        }
+        if (!ring_phone_fusion) {
             return false;
         }
 
-        // A Phone-primary Tensor layer also has Phone-owned Attention and
-        // ffn_inp, but its FFN is split across PC+Phone. It must not enter
-        // the pure PHONE_ONLY block-fusion / block-exit path.
-        if (layer_is_tensor_phone_primary(attn_layer)) {
+        // Only fuse pure Phone-owned multi-token Region graphs. Decode and
+        // mixed PC/Phone FFN graphs continue on their original path.
+        const char * ffn_first = g1->nodes[0]->name;
+        const char * ffn_last = g1->nodes[g1->n_nodes - 1]->name;
+        int ffn_chars = 0, last_chars = 0, last_layer = -1;
+        ffn_layer = -1;
+        if (std::sscanf(ffn_first, "ffn_inp-%d%n", &ffn_layer, &ffn_chars) != 1 ||
+                ffn_first[ffn_chars] != '\0' ||
+                std::sscanf(ffn_last, "ffn_moe_out-%d%n", &last_layer, &last_chars) != 1 ||
+                ffn_last[last_chars] != '\0' ||
+                ffn_layer < 0 || last_layer != ffn_layer ||
+                g1->nodes[0]->ne[1] <= 1 ||
+                layer_is_tensor_phone_primary(ffn_layer)) {
             return false;
         }
 
-        layer = attn_layer;
+        const char * attention_first = g0->nodes[0]->name;
+        int input_layer = -1, parsed = 0;
+        const bool starts_with_norm =
+            std::sscanf(attention_first, "norm-%d%n", &input_layer, &parsed) == 1 &&
+            attention_first[parsed] == '\0' && input_layer == ffn_layer;
+        input_layer = -1;
+        parsed = 0;
+        const bool starts_with_previous_lout =
+            std::sscanf(attention_first, "l_out-%d%n", &input_layer, &parsed) == 1 &&
+            attention_first[parsed] == '\0' && input_layer + 1 == ffn_layer;
+        if (!starts_with_norm && !starts_with_previous_lout) {
+            return false;
+        }
+
+        // The two SGs must be exclusively Phone-compute. Terminal labels
+        // alone cannot prove ownership: reject any mirrored PC compute node.
+        for (size_t sg = i; sg <= i + 1; ++sg) {
+            ggml_cgraph * phone =
+                backend_ctx->backend_configs[1].cgraphs[sg].cgraph_main;
+            ggml_cgraph * pc =
+                backend_ctx->backend_configs[0].cgraphs[sg].cgraph_main;
+            if (pc == nullptr || phone == nullptr ||
+                    pc->n_nodes != phone->n_nodes) {
+                return false;
+            }
+            bool has_phone_compute = false;
+            for (int k = 0; k < pc->n_nodes; ++k) {
+                if (pc->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) {
+                    return false;
+                }
+                has_phone_compute |=
+                    (phone->nodes[k]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+            }
+            if (!has_phone_compute) {
+                return false;
+            }
+        }
+        layer = ffn_layer;
         return true;
     };
     auto find_phone_block = [&](size_t start, size_t & end, int & first_layer, int & last_layer) -> bool {
@@ -13577,6 +13644,17 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
             last_layer = next_layer;
             end = next + 1;
+        }
+        if (ring_phone_fusion) {
+            // Do not fuse a partial Region. The validated Ring uses P5 and
+            // its final Phone FFN is followed by an output bridge or PC
+            // logits consumer. This restriction also prevents accidentally
+            // grouping an unrelated single-layer Phone operation.
+            if (last_layer - first_layer + 1 != 5 ||
+                    end - start + 1 != 10 ||
+                    end + 1 >= backend_ctx->n_subgraphs) {
+                return false;
+            }
         }
         return true;
     };
@@ -17903,6 +17981,16 @@ auto prefill_norm_sg_has_prework =
         }
 
         const int64_t phone_submit_begin_us = ggml_time_us();
+        if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
+                phone_block_last_layer - first_fused_layer + 1 == 5) {
+            printf("[REGION_RING_PHONE_FUSION] event=SUBMIT sg=%zu..%zu "
+                   "layers=[%d,%d) meta_sgs=%zu rpc_graphs=1 nodes=%d "
+                   "uid=%" PRIu64 " status=READY\n",
+                   i, phone_block_end, first_fused_layer,
+                   phone_block_last_layer + 1,
+                   phone_block_end - i + 1, phone_graph->n_nodes,
+                   phone_graph->uid);
+        }
         if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_BEGIN] layers=%d..%d t=%" PRId64 "\n", first_fused_layer,
                    phone_block_last_layer, phone_submit_begin_us);
@@ -18508,6 +18596,16 @@ auto prefill_norm_sg_has_prework =
                 phone_submit_end_us - phone_submit_begin_us;
             phone_region_submit_done_us =
                 phone_submit_end_us;
+        }
+        if (ring_phone_fusion && phone_block_fused && !phone_region_fused &&
+                phone_block_last_layer - first_fused_layer + 1 == 5) {
+            printf("[REGION_RING_PHONE_FUSION] event=DONE sg=%zu..%zu "
+                   "layers=[%d,%d) submit_ms=%.3f "
+                   "status=%d\n",
+                   i, phone_block_end, first_fused_layer,
+                   phone_block_last_layer + 1,
+                   (phone_submit_end_us - phone_submit_begin_us) / 1000.0,
+                   (int) compute_status);
         }
         if (pipeline_debug && phone_block_fused && !phone_region_fused) {
             printf("[PHONE_BLOCK_SUBMIT_END] layers=%d..%d t=%" PRId64 " dur=%.3f ms\n", first_fused_layer,
