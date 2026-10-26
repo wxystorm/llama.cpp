@@ -1674,29 +1674,30 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     llama_region_ring_from_env(n_layer) :
                     llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
                 std::vector<llama_region_ring_region>{};
-        const bool planner_ring_owned =
-            region_ring && !hybrid_ring_plan_layout.empty();
+        const bool ring_layout_owned = region_ring && !has_runtime_plan;
         const std::array<int, 3> ring_counts =
             region_ring ? llama_region_ring_layer_counts(ring_regions) :
                           std::array<int, 3>{};
 
-        // For an APPLIED Plan, the model-owned C/G/P counts are
-        // authoritative, not stale FIXED_* environment values. The
-        // GPU total is nevertheless required to match the original.
+        // Fixed Ring and applied Ring are both authoritative when no
+        // legacy Hybrid Auto placement was published. This also makes
+        // APPLY-safe rejection a genuine baseline fallback: it does not
+        // require stale LLAMA_HYBRID_PC_PCT/PHONE_LAYERS/GPU_PC_LAYERS
+        // variables to happen to match the fixed nine-stage Ring.
         const double pc_pct = has_runtime_plan ?
             100.0 * runtime_plan.pc_layers / n_layer :
-            planner_ring_owned ?
+            ring_layout_owned ?
                 100.0 * (ring_counts[0]+ring_counts[1]) / n_layer :
                 llama_hybrid_pc_pct();
-        const int pc_layers = planner_ring_owned ?
+        const int pc_layers = ring_layout_owned ?
             ring_counts[0]+ring_counts[1] :
             has_runtime_plan ? runtime_plan.pc_layers : std::clamp(
                 (int) std::llround(n_layer * pc_pct / 100.0), 0, n_layer);
-        const int phone_layers = planner_ring_owned ?
+        const int phone_layers = ring_layout_owned ?
             ring_counts[2] :
             has_runtime_plan ? runtime_plan.phone_layers :
             std::clamp(llama_hybrid_phone_layers(), 0, n_layer - pc_layers);
-        const int gpu_pc_layers = planner_ring_owned ?
+        const int gpu_pc_layers = ring_layout_owned ?
             ring_counts[1] :
             has_runtime_plan ? runtime_plan.gpu_pc_layers :
             llama_hybrid_gpu_pc_layers();
