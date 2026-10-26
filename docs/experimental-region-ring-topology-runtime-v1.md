@@ -112,6 +112,56 @@ Remove-Item Env:LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT -ErrorAction SilentlyContin
 `LLAMA_HYBRID_REGION_RING_LAYOUT` here is only the original fallback
 baseline; the new Planner's selected model-owned Plan overrides it.
 
+## Independent Region Ring device Profile (2026-10-27)
+
+New `llama_hybrid_region_ring_collect_profile()` measures and caches
+CPU/CUDA/Phone compute, attention, available memory, and PC/Phone
+transfer curves **without** running the legacy
+`llama_hybrid_enumerate_feasible_plans` /
+`llama_hybrid_score_plan` memory-and-score filter.
+
+The shared hardware probe implementation is
+`llama_hybrid_collect_device_profile()`. The separate entrypoints are:
+
+- Legacy `--hybrid-auto`: collect hardware measurements, then enumerate,
+  score, memory-filter and publish the legacy placement Plan.
+- Region `dry-run`, `topology-preview`, `apply-safe`,
+  `apply-topology` (without `--hybrid-auto`): collect hardware
+  measurements **only**, cache the Profile, and let the Region planner
+  independently search/simulate/validate its own topology.
+
+This fixes a missed mode check: `apply-topology` was not among the
+modes that cached Profile even though it had fully measured devices.
+A legacy `coarse_scoreable=0` or `no scoreable hybrid plans` can no
+longer block `apply-topology` by withholding the shared Profile.
+
+Expected new logging at load time:
+
+```text
+[REGION_RING_PLAN_PROFILE] phase=MEASURE_BEGIN source=INDEPENDENT_DEVICE_PROBES mode=APPLY_TOPOLOGY legacy_candidates=SKIPPED
+[REGION_RING_PLAN_PROFILE] phase=MEASURED status=CACHED source=INDEPENDENT_DEVICE_PROBES ... legacy_candidates=NOT_REQUIRED
+[REGION_RING_TOPOLOGY_SEARCH] mode=APPLY_TOPOLOGY ...
+```
+
+`phase=MEASURED status=FAILED` still retains the old fixed Ring,
+but it now identifies `DEVICE_PROBE_FAILED` or
+`INCOMPLETE_DEVICE_PROFILE` instead of hiding behind a legacy
+memory-filter failure. In particular, require usable CPU, CUDA,
+Phone, GPU->PC, PC->Phone and Phone->PC measurement points.
+
+Device Profile caching is in-memory and valid for the current model
+load; it is **not** an on-disk cache. Independent measurement still
+takes time on every new process/model-load.
+
+Verification: rebuild the **PC** `llama-cli` from this revision, keep
+the existing RPC patch-18 Phone binary (rebuild Phone only if it is
+older), and run exactly the same `apply-topology` command as below.
+Inspect `REGION_RING_PLAN_PROFILE`, `REGION_RING_TOPOLOGY_SEARCH`,
+`REGION_RING_PLAN_SELECTED` and all three
+`REGION_RING_PLAN_APPLY` phases. Never infer actual execution from
+candidate listing alone. Correctness and performance need real-device
+A/B testing; this refactor has not been hardware-validated.
+
 ## Verification gates
 
 1. Both binaries accept RPC protocol patch 18 and Phone server loads weights.
@@ -141,7 +191,7 @@ during weight loading is not automatically recoverable in the same
 process; restart with the previously tested branch and layout.
 
 For the old standalone `topology-preview`, setting that mode rather
-than `apply-topology` leaves all weights/stages unchanged. The old
-`llama_hybrid_autoplan: no scoreable hybrid plans` warning refers to
-legacy auto-placement and may coexist with a valid Region Planner
-profile.
+than `apply-topology` leaves all weights/stages unchanged. New Ring-only profiling bypasses legacy candidate scoring; that
+warning should not be emitted in these modes when
+`--hybrid-auto` is disabled. If it appears, verify the CLI flags
+and executable revision rather than assuming it is harmless.
