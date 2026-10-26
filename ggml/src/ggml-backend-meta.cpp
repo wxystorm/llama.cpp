@@ -18211,8 +18211,20 @@ auto prefill_norm_sg_has_prework =
                 timing_first_layer = first_fused_layer;
                 timing_last_layer = phone_block_last_layer;
             } else if (ring_phone_fusion && !eligible_probe_only && is_phone_only_sg) {
-                // A missed fusion must not suppress any Meta communication:
-                // the original per-subgraph execution remains untouched.
+                if (ring_phone_dynamic) {
+                    // A model-selected P2..P8 span is valid only if its entire
+                    // Meta graph was captured. Falling back silently could
+                    // break the Phone l_out handoff and downstream KV order.
+                    printf("[REGION_RING_PHONE_FUSION] event=REJECT sg=%zu "
+                           "failed_sg=%zu reason=%s "
+                           "mode=PLAN_OWNED status=FAIL\n",
+                           i,fusion_failed_sg,
+                           fusion_reason.empty() ?
+                               "INCOMPLETE_PHONE_GRAPH" : fusion_reason.c_str());
+                    return GGML_STATUS_FAILED;
+                }
+                // Legacy fixed P5: an incomplete fusion keeps the old
+                // per-subgraph execution and communication behavior.
                 ggml_cgraph * candidate =
                     backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
                 if (candidate != nullptr && candidate->n_nodes > 0) {
@@ -19771,6 +19783,14 @@ auto prefill_norm_sg_has_prework =
                        "SUBMITTED" : "COMPLETED",
                    (ggml_time_us() - layer_wall_start_us) / 1000.0);
         }
+    }
+
+    if (ring_phone_dynamic && !pending_ring_auto_outputs.empty()) {
+        const auto & pending = *pending_ring_auto_outputs.begin();
+        printf("[REGION_RING_PHONE_FUSION] event=REJECT "
+               "layer=%d seq=%" PRIu64 " reason=PHONE_OUTPUT_BRIDGE_NOT_CONSUMED "
+               "status=FAIL\n",pending.first,pending.second);
+        return GGML_STATUS_FAILED;
     }
 
     while (!pending_phone_prefill_pc_branches.empty()) {
