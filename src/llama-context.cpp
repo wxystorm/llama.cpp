@@ -3121,7 +3121,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
     // The worker variant requires all earlier ownership protections.
-    // In particular, no worker may run a graph without the Backend gate.
+    // Threaded overlap uses the short PREPARE gate plus per-backend execution
+    // gates; non-overlap ownership still uses the legacy broad backend gate.
     if (threaded_execution &&
         (!device_fifo_simulation || !isolate_device_resources ||
          !own_stage_resources || !task_local_graph_outputs)) {
@@ -3137,10 +3138,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
     if (pc_phone_overlap &&
-        (!threaded_execution || !audit_backend_resources || cparams.cb_eval != nullptr)) {
+        (!threaded_execution || !audit_backend_resources ||
+         cparams.cb_eval != nullptr || cparams.pipeline_parallel)) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PC_PHONE] event=REJECT "
-            "reason=UNSAFE_WORKER_OR_EVAL_CALLBACK\n");
+            "reason=UNSAFE_WORKER_EVAL_OR_PIPELINE "
+            "threaded=%d audit=%d eval_cb=%d pipeline_parallel=%d\n",
+            threaded_execution ? 1 : 0,
+            audit_backend_resources ? 1 : 0,
+            cparams.cb_eval != nullptr ? 1 : 0,
+            cparams.pipeline_parallel ? 1 : 0);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -3148,8 +3155,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // CPU auxiliary Scheduler is [CPU]. GPU Scheduler must be
         // [CUDA0,CPU] because GGML requires CPU as the final backend, but GPU
         // Region compute is rejected before execution if any split targets
-        // CPU. Keep the existing global execution gate for this validation;
-        // gate splitting is a separate change after compute ownership is proven.
+        // CPU. Graph mutation is protected by PREPARE; CPU/CUDA compute use
+        // independent execution gates.
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t backend = backend_ptrs[i];
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
