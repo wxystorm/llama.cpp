@@ -179,6 +179,9 @@ struct llama_hybrid_profile {
     double decode_tail_ms         = 0.0;
 
     std::vector<llama_hybrid_transfer_point> gpu_to_pc;
+    // Large pageable/host-resident weight upload measured with the same
+    // independent CUDA backend/stream used by Region Ring weight prefetch.
+    std::vector<llama_hybrid_transfer_point> gpu_weight_h2d;
     std::vector<llama_hybrid_transfer_point> pc_to_phone;
     std::vector<llama_hybrid_transfer_point> snapshot_phone_to_pc;
     std::vector<llama_hybrid_transfer_point> phone_to_pc;
