@@ -26,6 +26,10 @@ struct llama_hybrid_ffn_compute_point {
     int64_t local_ff      = 0;
     double  ms            = 0.0;
     size_t  runtime_bytes = 0;
+    // Host-side scheduler preparation work measured by HYBRID_PROFILE.
+    // Lock wait is intentionally excluded and is reconstructed by the
+    // Region Ring event simulator.
+    double  prepare_ms    = 0.0;
 };
 
 struct llama_hybrid_ffn_desc {
@@ -75,6 +79,8 @@ struct llama_hybrid_layer_compute_point {
     int    layers         = 0;
     double wall_ms        = 0.0;
     double compute_est_ms = 0.0;
+    // Total prepare time for this profiled block, excluding lock wait.
+    double prepare_ms     = 0.0;
 };
 
 struct llama_hybrid_attn_compute_point {
@@ -82,6 +88,8 @@ struct llama_hybrid_attn_compute_point {
     int    kv_tokens     = 0;
     double ms            = 0.0;
     size_t runtime_bytes = 0;
+    // Scheduler prepare time for the full-attention probe at this shape.
+    double prepare_ms    = 0.0;
 };
 
 struct llama_hybrid_decode_ratio_block_point {
