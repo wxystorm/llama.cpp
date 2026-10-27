@@ -2423,6 +2423,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
+    const bool gpu_weight_streaming =
+        ring_lane == 1 &&
+        model.hybrid_ring_gpu_weight_streaming &&
+        ggml_backend_sched_get_weight_cache(sched_use);
 
     // A GPU Scheduler retains CPU as its final fallback backend. GPU-first
     // Region Ring has one intentional exception to CUDA-only compute: stage 0
@@ -2501,9 +2505,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         } else {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
-                "splits=%d compute=%s status=PASS\n",
+                "splits=%d compute=%s weight_stream=%d status=PASS\n",
                 stage_index, block_index, n_splits,
-                ggml_backend_name(strict_compute_backend));
+                ggml_backend_name(strict_compute_backend),
+                gpu_weight_streaming ? 1 : 0);
         }
     }
 
@@ -2522,11 +2527,22 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 return nullptr;
             }
         } else if (ring_lane == 1) {
-            if (n_splits != 1 && !gpu_cpu_embedding_prefix) {
+            if (n_splits != 1 &&
+                    !gpu_cpu_embedding_prefix &&
+                    !gpu_weight_streaming) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GATE] stage=%zu block=%zu lane=GPU "
-                    "splits=%d status=REJECT reason=MULTI_SPLIT_UNVALIDATED\n",
+                    "splits=%d status=REJECT "
+                    "reason=MULTI_SPLIT_UNVALIDATED\n",
                     stage_index, block_index, n_splits);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (gpu_weight_streaming && n_splits <= 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT] stage=%zu block=%zu "
+                    "status=REJECT reason=NO_CUDA_SPLITS\n",
+                    stage_index, block_index);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
@@ -2589,8 +2605,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 ring_lane == 1 && target == strict_compute_backend;
 
             const uint64_t prepare_sync_mask =
-                ggml_backend_sched_get_split_prepare_sync_mask(
-                    sched_use, split);
+                gpu_weight_streaming ?
+                    ggml_backend_sched_get_split_mutable_sync_mask(
+                        sched_use, split) :
+                    ggml_backend_sched_get_split_prepare_sync_mask(
+                        sched_use, split);
             if ((prepare_sync_mask >> 63) != 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
@@ -2633,13 +2652,26 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
                     "lane=%d split=%d/%d backend=%s "
                     "sync_mask=0x%016" PRIx64 " cpu_required=%d "
-                    "status=READY\n",
+                    "weight_stream=%d status=READY\n",
                     stage_index, block_index, ring_lane, split, n_splits,
                     target ? ggml_backend_name(target) : "NULL",
-                    prepare_sync_mask, prepare_needs_cpu ? 1 : 0);
+                    prepare_sync_mask, prepare_needs_cpu ? 1 : 0,
+                    gpu_weight_streaming ? 1 : 0);
             }
 
+            const int64_t split_prepare_begin_us =
+                timing != nullptr ? ggml_time_us() : 0;
             ret = ggml_backend_sched_prepare_split(sched_use, split);
+            if (timing != nullptr) {
+                timing->prepare_us +=
+                    ggml_time_us() - split_prepare_begin_us;
+                timing->weight_upload_bytes +=
+                    ggml_backend_sched_get_last_weight_upload_bytes(
+                        sched_use);
+                timing->weight_cache_hit_bytes +=
+                    ggml_backend_sched_get_last_weight_cache_hit_bytes(
+                        sched_use);
+            }
             if (ret != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
@@ -2648,6 +2680,26 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     stage_index, block_index, ring_lane, split, n_splits,
                     (int) ret);
                 return nullptr;
+            }
+
+            if (gpu_weight_streaming) {
+                const size_t upload_bytes =
+                    ggml_backend_sched_get_last_weight_upload_bytes(
+                        sched_use);
+                const size_t hit_bytes =
+                    ggml_backend_sched_get_last_weight_cache_hit_bytes(
+                        sched_use);
+                if (block_index == 0 || upload_bytes > 0) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_GPU_WEIGHT] event=SPLIT_READY "
+                        "stage=%zu block=%zu split=%d/%d "
+                        "upload_mib=%.3f cache_hit_mib=%.3f "
+                        "cpu_gate=%d status=READY\n",
+                        stage_index, block_index, split, n_splits,
+                        upload_bytes / 1048576.0,
+                        hit_bytes / 1048576.0,
+                        prepare_needs_cpu ? 1 : 0);
+                }
             }
 
             ring_prepare_gate->unlock();
