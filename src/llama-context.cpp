@@ -3207,6 +3207,31 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool gpu_weight_streaming =
         isolate_device_resources && pc_phone_overlap &&
         model.hybrid_ring_gpu_weight_streaming;
+
+    // Weight Streaming V1.5 uses the two persistent CUDA banks as a rolling
+    // two-Region lookahead window. With the canonical G/C/P Ring, GPU Regions
+    // are ordered R0,R1,R2,... regardless of their absolute stage indices.
+    // Bank A owns even GPU-region ranks, Bank B owns odd ranks:
+    //   INIT: A=R0, B=R1
+    //   drain R0 -> A=R2
+    //   drain R1 -> B=R3
+    // and so on. The old demand-load path remains the correctness fallback.
+    std::vector<size_t> gpu_region_order;
+    std::vector<int> gpu_region_rank(stages.size(), -1);
+    if (gpu_weight_streaming) {
+        for (size_t region = 0; region < stages.size(); ++region) {
+            if (stages[region].kind != llama_hybrid_runtime_stage_kind::GPU) {
+                continue;
+            }
+            gpu_region_rank[region] = (int) gpu_region_order.size();
+            gpu_region_order.push_back(region);
+        }
+    }
+    const bool gpu_weight_prefetch =
+        gpu_weight_streaming && ubatch.n_tokens > 1 &&
+        gpu_region_order.size() >= 2;
+    std::array<bool, 2> gpu_bank_prefetched = {false, false};
+
     if (gpu_weight_streaming) {
         for (size_t bank = 1; bank <= 2; ++bank) {
             region_ring_worker_resources[bank].cached_region =
@@ -3214,10 +3239,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             region_ring_worker_resources[bank].last_use = 0;
         }
         region_ring_gpu_weight_bank_epoch = 0;
+        gpu_bank_prefetched.fill(false);
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
             "reason=NEW_UBATCH graph_cache=PRESERVED "
-            "region_metadata=CLEARED status=READY\n");
+            "region_metadata=CLEARED prefetch_window=%d status=READY\n",
+            gpu_weight_prefetch ? 2 : 0);
     }
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
@@ -3403,8 +3430,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT] phase=BANK_INIT banks=2 "
                 "canonical=CPU destination=CUDA "
-                "eviction=LRU load=DEMAND cache=PERSISTENT "
-                "status=READY\n");
+                "eviction=%s load=%s cache=PERSISTENT "
+                "demand_fallback=1 status=READY\n",
+                gpu_weight_prefetch ? "ROLLING_PARITY" : "LRU",
+                gpu_weight_prefetch ? "LOOKAHEAD_2" : "DEMAND");
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -3798,6 +3827,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             size_t          weight_bank_hits = 0;
             size_t          weight_bank_misses = 0;
             size_t          weight_bank_evictions = 0;
+            int64_t         weight_prefetch_us = 0;
+            size_t          weight_prefetch_upload_bytes = 0;
+            size_t          weight_prefetch_started = 0;
+            size_t          weight_prefetch_hits = 0;
+            size_t          weight_prefetch_failures = 0;
             std::vector<std::pair<int64_t, int64_t>> compute_intervals;
         };
         std::array<ring_worker_state, 3> worker_states;
@@ -3806,6 +3840,254 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             llama_region_ring_device::GPU,
             llama_region_ring_device::PHONE,
         };
+
+        int gpu_prefetch_tokens_max = 0;
+        if (gpu_weight_prefetch) {
+            for (size_t region : gpu_region_order) {
+                gpu_prefetch_tokens_max =
+                    std::max(gpu_prefetch_tokens_max,
+                             stages[region].macro_tokens);
+            }
+        }
+        std::vector<float> gpu_prefetch_hidden(
+            (size_t) std::max(0, gpu_prefetch_tokens_max) *
+                (size_t) n_embd,
+            0.0f);
+
+        // Populate one freed Bank with the first normal-shape chunk of a future
+        // GPU Region. prepare_ubatch() builds/binds the Bank graph, while
+        // prepare_split() performs only input/weight staging; no Region node is
+        // computed here. Actual execution later reuses the graph and converts
+        // the staged weight copies into cache hits. The representative hidden
+        // input is disposable because the real task overwrites graph inputs.
+        auto prefetch_gpu_region =
+            [&](size_t region, size_t bank_index,
+                const char * reason, size_t source_region) -> bool {
+                if (!gpu_weight_prefetch || bank_index >= 2 ||
+                        region >= stages.size() ||
+                        stages[region].kind !=
+                            llama_hybrid_runtime_stage_kind::GPU) {
+                    return false;
+                }
+
+                auto & state = worker_states[1];
+                auto & bank =
+                    region_ring_worker_resources[bank_index + 1];
+                const auto & prefetch_stage = stages[region];
+                const int prefetch_tokens = std::min(
+                    (int) ubatch.n_tokens,
+                    prefetch_stage.macro_tokens);
+                if (prefetch_tokens <= 0 ||
+                        gpu_prefetch_hidden.size() <
+                            (size_t) prefetch_tokens *
+                                (size_t) n_embd) {
+                    return false;
+                }
+
+                const std::string source_text =
+                    source_region ==
+                        std::numeric_limits<size_t>::max() ?
+                        "INIT" : std::to_string(source_region);
+                const int64_t prefetch_begin_us = ggml_time_us();
+                ++state.weight_prefetch_started;
+
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_PREFETCH] event=START "
+                    "region=%zu bank=%c source_region=%s reason=%s "
+                    "tokens=%d status=RUNNING\n",
+                    region, bank_index == 0 ? 'A' : 'B',
+                    source_text.c_str(), reason, prefetch_tokens);
+
+                auto fail_prefetch =
+                    [&](const char * fail_reason,
+                        ggml_status status) -> bool {
+                        if (worker_kv_views[1]) {
+                            worker_kv_views[1]->clear_stage_range();
+                        }
+                        {
+                            std::unique_lock<std::mutex> prepare_gate(
+                                region_ring_prepare_mutex);
+                            bank.res->reset();
+                            ggml_backend_sched_reset(bank.sched.get());
+                            ggml_backend_sched_set_weight_cache(
+                                bank.sched.get(), true);
+                        }
+                        bank.cached_region =
+                            std::numeric_limits<size_t>::max();
+                        bank.last_use = 0;
+                        gpu_bank_prefetched[bank_index] = false;
+                        ++state.weight_prefetch_failures;
+                        state.weight_prefetch_us +=
+                            ggml_time_us() - prefetch_begin_us;
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_GPU_WEIGHT_PREFETCH] event=FAIL "
+                            "region=%zu bank=%c source_region=%s "
+                            "reason=%s status=%d fallback=DEMAND_LOAD\n",
+                            region, bank_index == 0 ? 'A' : 'B',
+                            source_text.c_str(), fail_reason,
+                            (int) status);
+                        return false;
+                    };
+
+                if (!worker_kv_views[1] ||
+                        !worker_kv_views[1]->set_stage_range(
+                            ubatch_id, 0, prefetch_tokens)) {
+                    return fail_prefetch(
+                        "KV_STAGE_RANGE", GGML_STATUS_FAILED);
+                }
+
+                llama_ubatch prefetch_ubatch =
+                    llama_hybrid_slice_ubatch(
+                        ubatch, 0, prefetch_tokens,
+                        gpu_prefetch_hidden.data());
+
+                ggml_status prefetch_status = GGML_STATUS_SUCCESS;
+                llm_graph_result * prefetch_result = nullptr;
+                {
+                    std::unique_lock<std::mutex> prepare_gate(
+                        region_ring_prepare_mutex);
+                    prefetch_result = prepare_ubatch(
+                        bank.res.get(), bank.sched.get(),
+                        prefetch_ubatch, gtype,
+                        worker_kv_views[1].get(),
+                        prefetch_status, false,
+                        &prefetch_stage, 0, true, false);
+                }
+                if (prefetch_result == nullptr ||
+                        prefetch_status != GGML_STATUS_SUCCESS) {
+                    return fail_prefetch(
+                        "GRAPH_PREPARE", prefetch_status);
+                }
+
+                const int n_splits =
+                    ggml_backend_sched_get_n_splits(
+                        bank.sched.get());
+                if (n_splits <= 0) {
+                    return fail_prefetch(
+                        "NO_SPLITS", GGML_STATUS_FAILED);
+                }
+                for (int split = 0; split < n_splits; ++split) {
+                    if (ggml_backend_sched_get_split_backend(
+                            bank.sched.get(), split) !=
+                            backend_ptrs[1]) {
+                        return fail_prefetch(
+                            "NON_CUDA_SPLIT", GGML_STATUS_FAILED);
+                    }
+                }
+
+                size_t upload_bytes = 0;
+                size_t cache_hit_bytes = 0;
+                const int local_backends =
+                    ggml_backend_sched_get_n_backends(
+                        bank.sched.get());
+                if (local_backends <= 0 || local_backends >= 64) {
+                    return fail_prefetch(
+                        "INVALID_BACKEND_COUNT",
+                        GGML_STATUS_FAILED);
+                }
+                const uint64_t cpu_bit =
+                    UINT64_C(1) << (local_backends - 1);
+
+                for (int split = 0; split < n_splits; ++split) {
+                    const uint64_t mutable_sync_mask =
+                        ggml_backend_sched_get_split_mutable_sync_mask(
+                            bank.sched.get(), split);
+                    if ((mutable_sync_mask >> 63) != 0) {
+                        return fail_prefetch(
+                            "UNRESOLVED_SOURCE_BACKEND",
+                            GGML_STATUS_FAILED);
+                    }
+
+                    std::unique_lock<std::mutex> cpu_gate(
+                        region_ring_cpu_execution_mutex,
+                        std::defer_lock);
+                    std::unique_lock<std::mutex> cuda_gate(
+                        region_ring_cuda_execution_mutex,
+                        std::defer_lock);
+                    std::unique_lock<std::mutex> prepare_gate(
+                        region_ring_prepare_mutex,
+                        std::defer_lock);
+
+                    if ((mutable_sync_mask & cpu_bit) != 0) {
+                        cpu_gate.lock();
+                    }
+                    cuda_gate.lock();
+                    prepare_gate.lock();
+
+                    prefetch_status =
+                        ggml_backend_sched_prepare_split(
+                            bank.sched.get(), split);
+                    upload_bytes +=
+                        ggml_backend_sched_get_last_weight_upload_bytes(
+                            bank.sched.get());
+                    cache_hit_bytes +=
+                        ggml_backend_sched_get_last_weight_cache_hit_bytes(
+                            bank.sched.get());
+
+                    prepare_gate.unlock();
+                    cuda_gate.unlock();
+                    if (cpu_gate.owns_lock()) {
+                        cpu_gate.unlock();
+                    }
+
+                    if (prefetch_status != GGML_STATUS_SUCCESS) {
+                        return fail_prefetch(
+                            "SPLIT_PREPARE", prefetch_status);
+                    }
+                }
+
+                {
+                    std::unique_lock<std::mutex> cuda_gate(
+                        region_ring_cuda_execution_mutex);
+                    ggml_backend_synchronize(backend_ptrs[1]);
+                }
+                worker_kv_views[1]->clear_stage_range();
+
+                bank.cached_region = region;
+                bank.last_use =
+                    ++region_ring_gpu_weight_bank_epoch;
+                gpu_bank_prefetched[bank_index] = true;
+
+                const int64_t prefetch_us =
+                    ggml_time_us() - prefetch_begin_us;
+                state.weight_prefetch_us += prefetch_us;
+                state.weight_prefetch_upload_bytes +=
+                    upload_bytes;
+
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_PREFETCH] event=DONE "
+                    "region=%zu bank=%c source_region=%s reason=%s "
+                    "splits=%d upload_mib=%.3f cache_hit_mib=%.3f "
+                    "wall_ms=%.3f status=READY\n",
+                    region, bank_index == 0 ? 'A' : 'B',
+                    source_text.c_str(), reason, n_splits,
+                    upload_bytes / 1048576.0,
+                    cache_hit_bytes / 1048576.0,
+                    prefetch_us / 1000.0);
+                return true;
+            };
+
+        if (gpu_weight_prefetch) {
+            const size_t init_source =
+                std::numeric_limits<size_t>::max();
+            const bool bank_a_ready =
+                prefetch_gpu_region(
+                    gpu_region_order[0], 0,
+                    "INITIAL_WINDOW", init_source);
+            const bool bank_b_ready =
+                prefetch_gpu_region(
+                    gpu_region_order[1], 1,
+                    "INITIAL_WINDOW", init_source);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT_PREFETCH] event=WINDOW_READY "
+                "region0=%zu bankA=%d region1=%zu bankB=%d "
+                "window=2 status=%s\n",
+                gpu_region_order[0], bank_a_ready ? 1 : 0,
+                gpu_region_order[1], bank_b_ready ? 1 : 0,
+                bank_a_ready && bank_b_ready ?
+                    "READY" : "PARTIAL_FALLBACK");
+        }
+
         auto run_worker = [&](size_t dev) {
             auto & state = worker_states[dev];
             const auto device = devices[dev];
@@ -3882,11 +4164,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ring_res[dev];
                     int gpu_bank = -1;
                     bool gpu_bank_hit = false;
+                    bool gpu_prefetch_hit = false;
                     size_t evicted_region =
                         std::numeric_limits<size_t>::max();
 
                     if (dev == 1 && gpu_weight_streaming) {
-                        size_t selected_bank = 1;
+                        const int rank =
+                            task.region < gpu_region_rank.size() ?
+                                gpu_region_rank[task.region] : -1;
+                        size_t selected_bank =
+                            rank >= 0 ?
+                                1 + (size_t) (rank & 1) : 1;
+
                         for (size_t bank = 1; bank <= 2; ++bank) {
                             auto & candidate =
                                 region_ring_worker_resources[bank];
@@ -3897,35 +4186,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 break;
                             }
                         }
-                        if (!gpu_bank_hit) {
-                            const bool a_empty =
-                                region_ring_worker_resources[1].
-                                    cached_region ==
-                                std::numeric_limits<size_t>::max();
-                            const bool b_empty =
-                                region_ring_worker_resources[2].
-                                    cached_region ==
-                                std::numeric_limits<size_t>::max();
-                            if (a_empty) {
-                                selected_bank = 1;
-                            } else if (b_empty) {
-                                selected_bank = 2;
-                            } else {
-                                selected_bank =
-                                    region_ring_worker_resources[1].
-                                        last_use <=
-                                    region_ring_worker_resources[2].
-                                        last_use ? 1 : 2;
-                                evicted_region =
-                                    region_ring_worker_resources[
-                                        selected_bank].cached_region;
-                            }
 
-                            auto & selected =
-                                region_ring_worker_resources[
-                                    selected_bank];
-                            if (evicted_region !=
+                        auto & selected =
+                            region_ring_worker_resources[
+                                selected_bank];
+                        if (!gpu_bank_hit) {
+                            if (selected.cached_region !=
                                     std::numeric_limits<size_t>::max()) {
+                                evicted_region =
+                                    selected.cached_region;
                                 ggml_backend_sched_synchronize(
                                     selected.sched.get());
                                 selected.res->reset();
@@ -3936,14 +4205,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 ++state.weight_bank_evictions;
                             }
                             selected.cached_region = task.region;
+                            gpu_bank_prefetched[
+                                selected_bank - 1] = false;
                             ++state.weight_bank_misses;
                         } else {
                             ++state.weight_bank_hits;
+                            gpu_prefetch_hit =
+                                task.chunk == 0 &&
+                                gpu_bank_prefetched[
+                                    selected_bank - 1];
+                            if (gpu_prefetch_hit) {
+                                ++state.weight_prefetch_hits;
+                                gpu_bank_prefetched[
+                                    selected_bank - 1] = false;
+                            }
                         }
 
-                        auto & selected =
-                            region_ring_worker_resources[
-                                selected_bank];
                         selected.last_use =
                             ++region_ring_gpu_weight_bank_epoch;
                         task_sched = selected.sched.get();
@@ -3960,7 +4237,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             "evicted_region=%s status=READY\n",
                             task.region, task.chunk,
                             gpu_bank == 0 ? 'A' : 'B',
-                            gpu_bank_hit ? "HIT" : "MISS",
+                            gpu_prefetch_hit ? "PREFETCH_HIT" :
+                                (gpu_bank_hit ? "HIT" : "MISS"),
                             evicted_region_text.c_str());
                     }
 
@@ -4048,6 +4326,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "compute_range_ms=%.3f status=%d\n",
                                     task.region, task.chunk,
                                     gpu_bank == 0 ? 'A' : 'B',
+                                    gpu_prefetch_hit ?
+                                        "PREFETCH_HIT" :
                                     task_timing.weight_upload_bytes > 0 ?
                                         "MISS_LOAD" :
                                     task_timing.weight_cache_hit_bytes > 0 ?
@@ -4182,12 +4462,44 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
 
+                    const bool gpu_region_drained =
+                        dev == 1 && gpu_weight_prefetch &&
+                        task.chunk + 1 ==
+                            ready.n_chunks(task.region);
                     ready.complete(task);
-                    active_task.reset();
                     ++state.completed;
                     if (last) {
                         state.final_result = task_result;
                     }
+
+                    if (gpu_region_drained) {
+                        const int rank =
+                            task.region < gpu_region_rank.size() ?
+                                gpu_region_rank[task.region] : -1;
+                        const size_t next_rank =
+                            rank >= 0 ?
+                                (size_t) rank + 2 :
+                                gpu_region_order.size();
+                        if (next_rank < gpu_region_order.size()) {
+                            const size_t bank_index =
+                                (size_t) rank & 1;
+                            (void) prefetch_gpu_region(
+                                gpu_region_order[next_rank],
+                                bank_index,
+                                "REGION_DRAIN",
+                                task.region);
+                        } else {
+                            LLAMA_LOG_ERROR(
+                                "[REGION_RING_GPU_WEIGHT_PREFETCH] "
+                                "event=WINDOW_DRAIN region=%zu "
+                                "bank=%c next=NONE status=DONE\n",
+                                task.region,
+                                rank >= 0 && (rank & 1) ?
+                                    'B' : 'A');
+                        }
+                    }
+
+                    active_task.reset();
                     LLAMA_LOG_DEBUG(
                         "[REGION_RING_WORKER] device=%s event=DONE "
                         "region=%zu chunk=%zu completed=%zu\n",
@@ -4219,7 +4531,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "weight_stage_ms=%.3f weight_upload_mib=%.3f "
                 "weight_cache_hit_mib=%.3f "
                 "bank_hits=%zu bank_misses=%zu bank_evictions=%zu "
-                "status=%d\n",
+                "prefetch_ms=%.3f prefetch_upload_mib=%.3f "
+                "prefetch_started=%zu prefetch_hits=%zu "
+                "prefetch_failures=%zu status=%d\n",
                 name, state.completed,
                 state.ready_wait_us / 1000.0,
                 (pc_phone_overlap ?
@@ -4238,6 +4552,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 state.weight_bank_hits,
                 state.weight_bank_misses,
                 state.weight_bank_evictions,
+                state.weight_prefetch_us / 1000.0,
+                state.weight_prefetch_upload_bytes / 1048576.0,
+                state.weight_prefetch_started,
+                state.weight_prefetch_hits,
+                state.weight_prefetch_failures,
                 (int) state.status);
         };
 
