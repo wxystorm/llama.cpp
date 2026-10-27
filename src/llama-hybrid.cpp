@@ -8013,6 +8013,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
     if (llama_region_ring_enabled() && ring_plan_env != nullptr &&
             (std::strcmp(ring_plan_env, "dry-run") == 0 ||
+             std::strcmp(ring_plan_env, "apply-baseline") == 0 ||
              std::strcmp(ring_plan_env, "apply-safe") == 0 ||
              std::strcmp(ring_plan_env, "topology-preview") == 0)) {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
