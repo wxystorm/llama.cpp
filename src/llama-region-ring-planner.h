@@ -444,6 +444,81 @@ inline double relative_ring_mismatch(double lhs, double rhs) {
     return std::abs(lhs - rhs) / denom;
 }
 
+// Evaluate the same local ring equations for a concrete runtime layout whose
+// three cycles need not have identical C/G widths (the fixed baseline ends in
+// C8,G3,P5 rather than C7,G4,P5). A/B/D are the mean per-cycle station
+// service rates; aggregate service demand is kept separately.
+inline bool estimate_region_ring_balance(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        candidate & c) {
+    if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0 ||
+        regions.empty() || c.xc <= 0 || c.xg <= 0 || c.xp <= 0) {
+        return false;
+    }
+
+    const int kv = m.kv_start + m.tokens / 2;
+    std::array<double, 3> stage_sum {};
+    std::array<int, 3> stage_count {};
+    for (const auto & region : regions) {
+        const int d = (int) region.device;
+        if (d < 0 || d >= 3) {
+            return false;
+        }
+        const int x = chunk_for(c, region.device);
+        const int layers = region.layer_end - region.layer_begin;
+        double ms = 0.0;
+        if (layers <= 0 ||
+            !m.compute_ms(region.device, layers, x, kv, ms) ||
+            !std::isfinite(ms) || ms < 0.0) {
+            return false;
+        }
+        if (region.device == device::PHONE) {
+            ms += m.phone_register_ms * (double) layers / 5.0;
+        }
+        stage_sum[(size_t) d] += ms / x;
+        ++stage_count[(size_t) d];
+    }
+    if (stage_count[0] <= 0 || stage_count[1] <= 0 ||
+        stage_count[2] <= 0) {
+        return false;
+    }
+
+    const double A = stage_sum[0] / stage_count[0];
+    const double B = stage_sum[1] / stage_count[1];
+    const double D = stage_sum[2] / stage_count[2];
+
+    double p2c_ms = 0.0;
+    double c2p_ms = 0.0;
+    const size_t p2c_bytes =
+        (size_t) m.hidden * (size_t) c.xp * sizeof(float);
+    const size_t c2p_bytes =
+        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
+    if (!m.transfer_ms(device::PHONE, device::CPU, p2c_bytes, p2c_ms) ||
+        !m.transfer_ms(device::GPU, device::PHONE, c2p_bytes, c2p_ms)) {
+        return false;
+    }
+    const double TP2C = p2c_ms / c.xp;
+    const double TC2P = c2p_ms / c.xg;
+
+    const double e1 = relative_ring_mismatch(A, D + TP2C);
+    const double e2 = relative_ring_mismatch(A, B);
+    const double e3 = relative_ring_mismatch(D, B + TC2P);
+    if (!std::isfinite(e1) || !std::isfinite(e2) ||
+        !std::isfinite(e3)) {
+        return false;
+    }
+
+    c.ring_stage_ms_per_token = {A, B, D};
+    c.ring_p2c_ms_per_token = TP2C;
+    c.ring_c2p_ms_per_token = TC2P;
+    c.ring_error = {e1, e2, e3};
+    c.ring_error_max = std::max({e1, e2, e3});
+    c.ring_error_mean = (e1 + e2 + e3) / 3.0;
+    c.balance = c.ring_error_max;
+    return true;
+}
+
 inline bool estimate_balance(const model & m, candidate & c) {
     if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0 ||
         c.c <= 0 || c.g <= 0 || c.p <= 0 ||
@@ -779,9 +854,11 @@ inline result search_three_cycle_cgp(
     out.baseline.xg = chunk_tokens;
     out.baseline.xp = chunk_tokens;
     // Only 70 C/G/P geometries exist here, so compute the minimax equation
-    // score for every candidate but do not prune any of them. Exact FIFO
-    // simulation remains exhaustive in APPLY_CGP.
-    if (!estimate_balance(m, out.baseline) ||
+    // score for every candidate but do not prune any of them. The fixed
+    // baseline is slightly non-uniform (C7/G4/P5, C7/G4/P5, C8/G3/P5), so
+    // evaluate its concrete three-cycle layout instead of inventing one C/G.
+    // Exact FIFO simulation remains exhaustive in APPLY_CGP.
+    if (!estimate_region_ring_balance(m, baseline, out.baseline) ||
         !simulate(m, baseline, out.baseline)) {
         return out;
     }

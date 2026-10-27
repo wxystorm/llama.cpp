@@ -97,6 +97,20 @@ int main() {
     REQUIRE(std::fabs(equation.ring_error_max - 0.4) < 1e-9);
     REQUIRE(std::fabs(equation.balance - equation.ring_error_max) < 1e-12);
 
+    candidate nonuniform;
+    nonuniform.xc = nonuniform.xg = nonuniform.xp = 64;
+    const auto fixed_regions = llama_region_ring_parse("", 48);
+    REQUIRE(estimate_region_ring_balance(
+        equation_profile, fixed_regions, nonuniform));
+    // Baseline C widths 7,7,8 average to 22/3; G widths 4,4,3 to 11/3.
+    REQUIRE(std::fabs(nonuniform.ring_stage_ms_per_token[0] -
+                     22.0 / 3.0) < 1e-9);
+    REQUIRE(std::fabs(nonuniform.ring_stage_ms_per_token[1] -
+                     11.0 / 6.0) < 1e-9);
+    REQUIRE(std::fabs(nonuniform.ring_stage_ms_per_token[2] -
+                     3.75) < 1e-9);
+    REQUIRE(std::isfinite(nonuniform.ring_error_max));
+
     // Keep the historical gated model only as a regression comparison.
     model gated_pc = mock_profile();
     gated_pc.pc_compute_gate = true;
