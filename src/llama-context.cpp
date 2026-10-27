@@ -3308,6 +3308,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
+
+            if (gpu_weight_prefetch) {
+                ggml_backend_dev_t cuda_dev =
+                    ggml_backend_get_device(backend_ptrs[1]);
+                if (region_ring_cuda_transfer_backend &&
+                        ggml_backend_get_device(
+                            region_ring_cuda_transfer_backend.get()) != cuda_dev) {
+                    region_ring_cuda_transfer_backend.reset();
+                }
+                if (!region_ring_cuda_transfer_backend) {
+                    region_ring_cuda_transfer_backend.reset(
+                        ggml_backend_dev_init(cuda_dev, nullptr));
+                }
+                if (!region_ring_cuda_transfer_backend) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_GPU_WEIGHT_TRANSFER] event=INIT "
+                        "status=FAIL reason=BACKEND_INIT\n");
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_TRANSFER] event=INIT "
+                    "backend=%s device=%s mode=INDEPENDENT_STREAM status=READY\n",
+                    ggml_backend_name(region_ring_cuda_transfer_backend.get()),
+                    ggml_backend_dev_name(cuda_dev));
+            }
         }
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
@@ -3920,10 +3946,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             0.0f);
 
         // Only the dedicated host worker calls this function. Graph construction
-        // holds the short global PREPARE gate. The long weight H2D phase does
-        // NOT hold PREPARE, so CPU/Phone graph preparation can continue. CUDA
-        // execution remains conservatively gated for this first worker version;
-        // a separate transfer stream can relax that later.
+        // holds the short PREPARE gate; weight H2D then runs on a second CUDA
+        // backend instance/stream without CPU or CUDA compute gates.
         auto prefetch_gpu_region =
             [&](size_t region, size_t bank_index,
                 const char * reason, size_t source_region) -> bool {
@@ -3966,6 +3990,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ggml_status status) -> bool {
                         if (gpu_prefetch_kv_view) {
                             gpu_prefetch_kv_view->clear_stage_range();
+                        }
+                        if (region_ring_cuda_transfer_backend) {
+                            ggml_backend_synchronize(
+                                region_ring_cuda_transfer_backend.get());
                         }
                         {
                             std::unique_lock<std::mutex> prepare_gate(
@@ -4040,45 +4068,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 size_t upload_bytes = 0;
                 size_t cache_hit_bytes = 0;
-                const int local_backends =
-                    ggml_backend_sched_get_n_backends(
-                        bank.sched.get());
-                if (local_backends <= 0 || local_backends >= 64) {
+                if (!region_ring_cuda_transfer_backend) {
                     return fail_prefetch(
-                        "INVALID_BACKEND_COUNT",
-                        GGML_STATUS_FAILED);
+                        "TRANSFER_BACKEND", GGML_STATUS_FAILED);
                 }
-                const uint64_t cpu_bit =
-                    UINT64_C(1) << (local_backends - 1);
 
                 for (int split = 0; split < n_splits; ++split) {
-                    const uint64_t mutable_sync_mask =
-                        ggml_backend_sched_get_split_mutable_sync_mask(
-                            bank.sched.get(), split);
-                    if ((mutable_sync_mask >> 63) != 0) {
-                        return fail_prefetch(
-                            "UNRESOLVED_SOURCE_BACKEND",
-                            GGML_STATUS_FAILED);
-                    }
-
-                    std::unique_lock<std::mutex> cpu_gate(
-                        region_ring_cpu_execution_mutex,
-                        std::defer_lock);
-                    std::unique_lock<std::mutex> cuda_gate(
-                        region_ring_cuda_execution_mutex,
-                        std::defer_lock);
-
-                    if ((mutable_sync_mask & cpu_bit) != 0) {
-                        cpu_gate.lock();
-                    }
-                    cuda_gate.lock();
-
-                    // Bank scheduler/result ownership is exclusive while the
-                    // Bank is LOADING. Do not hold global PREPARE across the
-                    // potentially 100+ ms H2D copy.
                     prefetch_status =
-                        ggml_backend_sched_prepare_split(
-                            bank.sched.get(), split);
+                        ggml_backend_sched_prepare_split_weights_async(
+                            bank.sched.get(), split,
+                            region_ring_cuda_transfer_backend.get());
                     upload_bytes +=
                         ggml_backend_sched_get_last_weight_upload_bytes(
                             bank.sched.get());
@@ -4086,22 +4085,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ggml_backend_sched_get_last_weight_cache_hit_bytes(
                             bank.sched.get());
 
-                    cuda_gate.unlock();
-                    if (cpu_gate.owns_lock()) {
-                        cpu_gate.unlock();
-                    }
-
                     if (prefetch_status != GGML_STATUS_SUCCESS) {
                         return fail_prefetch(
-                            "SPLIT_PREPARE", prefetch_status);
+                            "WEIGHT_STAGE", prefetch_status);
                     }
                 }
 
-                {
-                    std::unique_lock<std::mutex> cuda_gate(
-                        region_ring_cuda_execution_mutex);
-                    ggml_backend_synchronize(backend_ptrs[1]);
-                }
+                ggml_backend_synchronize(
+                    region_ring_cuda_transfer_backend.get());
                 gpu_prefetch_kv_view->clear_stage_range();
 
                 // Publication to the GPU worker happens only after the caller
@@ -4171,8 +4162,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
                 "event=START role=CPU_DEDICATED "
-                "banks=2 cuda_gate=CONSERVATIVE prepare_gate=GRAPH_ONLY "
-                "status=READY\n");
+                "banks=2 transfer_stream=INDEPENDENT "
+                "cuda_gate=NONE prepare_gate=GRAPH_ONLY status=READY\n");
             try {
                 while (true) {
                     gpu_weight_prefetch_job job;
