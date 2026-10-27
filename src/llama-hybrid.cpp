@@ -767,6 +767,8 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
         profile.decode_tail_ms);
 
     llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
+    llama_hybrid_transfer_print(
+        "gpu_weight_h2d", profile.gpu_weight_h2d);
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
     llama_hybrid_transfer_print("phone_to_pc", profile.phone_to_pc);
@@ -5347,6 +5349,7 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
                                                ggml_backend_t         gpu_backend,
                                                ggml_backend_t         pc_backend) {
     profile.gpu_to_pc.clear();
+    profile.gpu_weight_h2d.clear();
     if (gpu_backend == nullptr) {
         return true;
     }
@@ -5354,7 +5357,8 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
         return false;
     }
 
-    const std::vector<int> token_sizes = llama_hybrid_probe_transfer_tokens(profile);
+    const std::vector<int> token_sizes =
+        llama_hybrid_probe_transfer_tokens(profile);
     if (token_sizes.empty()) {
         return false;
     }
@@ -5376,14 +5380,26 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
     gpu_tensors.reserve(token_sizes.size());
     pc_tensors.reserve(token_sizes.size());
     for (const int tokens : token_sizes) {
-        gpu_tensors.push_back(ggml_new_tensor_2d(gpu_ctx.get(), GGML_TYPE_F32, profile.n_embd, tokens));
-        pc_tensors.push_back(ggml_new_tensor_2d(pc_ctx.get(), GGML_TYPE_F32, profile.n_embd, tokens));
+        gpu_tensors.push_back(
+            ggml_new_tensor_2d(
+                gpu_ctx.get(), GGML_TYPE_F32,
+                profile.n_embd, tokens));
+        pc_tensors.push_back(
+            ggml_new_tensor_2d(
+                pc_ctx.get(), GGML_TYPE_F32,
+                profile.n_embd, tokens));
     }
 
-    ggml_backend_buffer_ptr gpu_buffer(ggml_backend_alloc_ctx_tensors(gpu_ctx.get(), gpu_backend));
-    ggml_backend_buffer_ptr pc_buffer(ggml_backend_alloc_ctx_tensors(pc_ctx.get(), pc_backend));
+    ggml_backend_buffer_ptr gpu_buffer(
+        ggml_backend_alloc_ctx_tensors(
+            gpu_ctx.get(), gpu_backend));
+    ggml_backend_buffer_ptr pc_buffer(
+        ggml_backend_alloc_ctx_tensors(
+            pc_ctx.get(), pc_backend));
     if (!gpu_buffer || !pc_buffer) {
-        LLAMA_LOG_ERROR("%s: failed to allocate GPU/PC transfer probe buffers\n", __func__);
+        LLAMA_LOG_ERROR(
+            "%s: failed to allocate GPU/PC transfer probe buffers\n",
+            __func__);
         return false;
     }
 
@@ -5394,10 +5410,15 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
         ggml_tensor * src = gpu_tensors[i];
         ggml_tensor * dst = pc_tensors[i];
         const size_t bytes = ggml_nbytes(src);
-        std::array<double, LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples;
+        std::array<double,
+            LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples;
 
-        for (int run = 0; run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS + LLAMA_HYBRID_COMPUTE_MEASURE_RUNS; ++run) {
-            ggml_backend_tensor_set(src, source_data.data(), 0, bytes);
+        for (int run = 0;
+                run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS +
+                    LLAMA_HYBRID_COMPUTE_MEASURE_RUNS;
+                ++run) {
+            ggml_backend_tensor_set(
+                src, source_data.data(), 0, bytes);
             ggml_backend_synchronize(gpu_backend);
 
             const int64_t begin_us = ggml_time_us();
@@ -5407,16 +5428,191 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
             const int64_t end_us = ggml_time_us();
 
             if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
-                samples[run - LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] = (end_us - begin_us) / 1000.0;
+                samples[run -
+                    LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] =
+                    (end_us - begin_us) / 1000.0;
             }
         }
 
         const double ms = llama_hybrid_rpc_median(samples);
         profile.gpu_to_pc.push_back({ bytes, ms, ms });
-        LLAMA_LOG_INFO("[HYBRID_PROFILE_TRANSFER] kind=gpu_to_pc tokens=%d bytes=%zu ms=%.3f\n",
-                       token_sizes[i], bytes, ms);
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_TRANSFER] kind=gpu_to_pc "
+            "tokens=%d bytes=%zu ms=%.3f\n",
+            token_sizes[i], bytes, ms);
     }
 
+    const char * stream_env =
+        std::getenv(
+            "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM");
+    const char * exec_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+    const bool measure_weight_h2d =
+        stream_env != nullptr &&
+        std::atoi(stream_env) != 0 &&
+        exec_env != nullptr &&
+        std::strcmp(exec_env, "fifo-pc-phone") == 0;
+    if (!measure_weight_h2d) {
+        return true;
+    }
+
+    ggml_backend_dev_t gpu_dev =
+        ggml_backend_get_device(gpu_backend);
+    if (gpu_dev == nullptr) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_WEIGHT_H2D] status=FAIL "
+            "reason=NO_GPU_DEVICE\n");
+        return false;
+    }
+
+    ggml_backend_ptr transfer_backend(
+        ggml_backend_dev_init(gpu_dev, nullptr));
+    if (!transfer_backend) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_WEIGHT_H2D] status=FAIL "
+            "reason=TRANSFER_BACKEND_INIT\n");
+        return false;
+    }
+
+    static constexpr std::array<size_t, 5>
+        WEIGHT_H2D_PROBE_MIB = {
+            256, 512, 1024, 1536, 2048
+        };
+
+    LLAMA_LOG_ERROR(
+        "[HYBRID_PROFILE_WEIGHT_H2D] phase=BEGIN "
+        "backend=%s device=%s stream=INDEPENDENT "
+        "points=%zu\n",
+        ggml_backend_name(transfer_backend.get()),
+        ggml_backend_dev_name(gpu_dev),
+        WEIGHT_H2D_PROBE_MIB.size());
+
+    for (size_t mib : WEIGHT_H2D_PROBE_MIB) {
+        const size_t bytes = mib * 1024ull * 1024ull;
+
+        // Leave enough headroom for the profiling/model CUDA allocations.
+        if (profile.gpu_free_mem > 0 &&
+                (long double) bytes >
+                    (long double) profile.gpu_free_mem * 0.45L) {
+            LLAMA_LOG_WARN(
+                "[HYBRID_PROFILE_WEIGHT_H2D] "
+                "bytes=%zu mib=%zu status=SKIP "
+                "reason=GPU_HEADROOM free_mib=%.1f\n",
+                bytes, mib,
+                profile.gpu_free_mem / 1048576.0);
+            break;
+        }
+
+        const size_t probe_ctx_size =
+            ggml_tensor_overhead();
+        const ggml_init_params probe_params = {
+            /*.mem_size   =*/probe_ctx_size,
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ggml_context_ptr probe_pc_ctx(
+            ggml_init(probe_params));
+        ggml_context_ptr probe_gpu_ctx(
+            ggml_init(probe_params));
+        if (!probe_pc_ctx || !probe_gpu_ctx) {
+            LLAMA_LOG_WARN(
+                "[HYBRID_PROFILE_WEIGHT_H2D] "
+                "mib=%zu status=SKIP reason=CTX_ALLOC\n",
+                mib);
+            break;
+        }
+
+        const int64_t n_f32 =
+            (int64_t) (bytes / sizeof(float));
+        ggml_tensor * src =
+            ggml_new_tensor_1d(
+                probe_pc_ctx.get(), GGML_TYPE_F32, n_f32);
+        ggml_tensor * dst =
+            ggml_new_tensor_1d(
+                probe_gpu_ctx.get(), GGML_TYPE_F32, n_f32);
+
+        ggml_backend_buffer_ptr probe_pc_buffer(
+            ggml_backend_alloc_ctx_tensors(
+                probe_pc_ctx.get(), pc_backend));
+        ggml_backend_buffer_ptr probe_gpu_buffer(
+            ggml_backend_alloc_ctx_tensors(
+                probe_gpu_ctx.get(), gpu_backend));
+        if (!probe_pc_buffer || !probe_gpu_buffer ||
+                src->data == nullptr || dst->data == nullptr) {
+            LLAMA_LOG_WARN(
+                "[HYBRID_PROFILE_WEIGHT_H2D] "
+                "mib=%zu status=SKIP "
+                "reason=BUFFER_ALLOC\n",
+                mib);
+            break;
+        }
+
+        // Commit/touch the complete host source before timing so page faults
+        // are not charged to the DMA measurement.
+        ggml_backend_buffer_clear(
+            probe_pc_buffer.get(), 0x5a);
+        ggml_backend_synchronize(pc_backend);
+        ggml_backend_synchronize(
+            transfer_backend.get());
+
+        std::array<double,
+            LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples {};
+        for (int run = 0;
+                run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS +
+                    LLAMA_HYBRID_COMPUTE_MEASURE_RUNS;
+                ++run) {
+            ggml_backend_synchronize(
+                transfer_backend.get());
+            const int64_t begin_us = ggml_time_us();
+            ggml_backend_tensor_set_async(
+                transfer_backend.get(), dst,
+                src->data, 0, bytes);
+            ggml_backend_synchronize(
+                transfer_backend.get());
+            const int64_t end_us = ggml_time_us();
+
+            if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
+                samples[run -
+                    LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] =
+                    (end_us - begin_us) / 1000.0;
+            }
+        }
+
+        const double ms =
+            llama_hybrid_rpc_median(samples);
+        if (!std::isfinite(ms) || ms <= 0.0) {
+            LLAMA_LOG_WARN(
+                "[HYBRID_PROFILE_WEIGHT_H2D] "
+                "mib=%zu status=SKIP reason=INVALID_TIME\n",
+                mib);
+            break;
+        }
+
+        profile.gpu_weight_h2d.push_back(
+            { bytes, ms, ms });
+        const double gib_s =
+            ((double) bytes / (1024.0 * 1024.0 * 1024.0)) /
+            (ms / 1000.0);
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_WEIGHT_H2D] "
+            "mib=%zu bytes=%zu ms=%.3f gib_s=%.3f "
+            "status=MEASURED\n",
+            mib, bytes, ms, gib_s);
+    }
+
+    if (profile.gpu_weight_h2d.size() < 2) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_WEIGHT_H2D] phase=END "
+            "points=%zu status=FAIL reason=INSUFFICIENT_POINTS\n",
+            profile.gpu_weight_h2d.size());
+        return false;
+    }
+
+    LLAMA_LOG_ERROR(
+        "[HYBRID_PROFILE_WEIGHT_H2D] phase=END "
+        "points=%zu max_mib=%.1f status=READY\n",
+        profile.gpu_weight_h2d.size(),
+        profile.gpu_weight_h2d.back().bytes / 1048576.0);
     return true;
 }
 
