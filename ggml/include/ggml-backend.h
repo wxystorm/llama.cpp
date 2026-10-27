@@ -357,6 +357,10 @@ extern "C" {
     GGML_API bool           ggml_backend_sched_get_weight_cache(ggml_backend_sched_t sched);
     GGML_API size_t         ggml_backend_sched_get_last_weight_upload_bytes(ggml_backend_sched_t sched);
     GGML_API size_t         ggml_backend_sched_get_last_weight_cache_hit_bytes(ggml_backend_sched_t sched);
+    GGML_API int64_t        ggml_backend_sched_get_last_weight_stage_cpu_copy_us(ggml_backend_sched_t sched);
+    GGML_API size_t         ggml_backend_sched_get_last_weight_stage_chunks(ggml_backend_sched_t sched);
+    GGML_API size_t         ggml_backend_sched_get_weight_stage_slot_size(ggml_backend_sched_t sched);
+    GGML_API bool           ggml_backend_sched_weight_stage_is_pinned(ggml_backend_sched_t sched);
     GGML_API size_t         ggml_backend_sched_get_weight_cache_buffer_size(ggml_backend_sched_t sched);
     GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
