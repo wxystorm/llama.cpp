@@ -61,6 +61,9 @@ struct candidate {
     double phone_link_ms_per_token = 0.0;
     double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
+    // Single CPU-owned CUDA transfer lane used by rolling two-Bank weight
+    // streaming. This is one load per logical GPU Region, not per Chunk.
+    double weight_h2d_busy_ms = 0.0;
     int tasks = 0;
     int edges = 0;
     int max_live_slots = 0;
@@ -77,10 +80,18 @@ struct model {
     // Current Region Ring runtime has independent CPU and CUDA compute lanes.
     // Keep this switch only so tests can compare the historical gated model.
     bool pc_compute_gate = false;
+    // Runtime contract: logical CUDA layer count may exceed VRAM because
+    // weights are rolled through two persistent Banks. GPU Regions still
+    // execute strictly in model order.
+    bool gpu_weight_streaming = false;
     double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
     std::function<bool(device, device, size_t, double &)> transfer_ms;
+    // Exact weight bytes for one contiguous logical GPU Region and the
+    // measured/proxied host->CUDA transfer time for those bytes.
+    std::function<bool(int, int, size_t &)> gpu_region_weight_bytes;
+    std::function<bool(size_t, double &)> gpu_weight_h2d_ms;
     std::function<bool(const candidate &)> memory_feasible;
     // Unlike memory_feasible(candidate), this callback accepts per-cycle
     // C/G boundaries. It is used ONLY by the real APPLY-safe search.
@@ -120,6 +131,74 @@ inline bool make_regions(const candidate & c, int total_layers,
     return layer == total_layers;
 }
 
+inline bool gpu_weight_bank_peaks(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        std::array<size_t, 2> & peaks,
+        size_t * total_bytes = nullptr) {
+    peaks = {};
+    if (total_bytes) {
+        *total_bytes = 0;
+    }
+    if (!m.gpu_weight_streaming) {
+        return true;
+    }
+    if (!m.gpu_region_weight_bytes) {
+        return false;
+    }
+
+    size_t gpu_ordinal = 0;
+    for (const auto & region : regions) {
+        if (region.device != device::GPU) {
+            continue;
+        }
+        size_t bytes = 0;
+        if (!m.gpu_region_weight_bytes(
+                region.layer_begin, region.layer_end, bytes) ||
+                bytes == 0) {
+            return false;
+        }
+        peaks[gpu_ordinal & 1] =
+            std::max(peaks[gpu_ordinal & 1], bytes);
+        if (total_bytes) {
+            if (bytes > std::numeric_limits<size_t>::max() - *total_bytes) {
+                return false;
+            }
+            *total_bytes += bytes;
+        }
+        ++gpu_ordinal;
+    }
+    return true;
+}
+
+inline bool gpu_weight_h2d_total(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        double & total_ms) {
+    total_ms = 0.0;
+    if (!m.gpu_weight_streaming) {
+        return true;
+    }
+    if (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms) {
+        return false;
+    }
+    for (const auto & region : regions) {
+        if (region.device != device::GPU) {
+            continue;
+        }
+        size_t bytes = 0;
+        double ms = 0.0;
+        if (!m.gpu_region_weight_bytes(
+                region.layer_begin, region.layer_end, bytes) ||
+                !m.gpu_weight_h2d_ms(bytes, ms) ||
+                !std::isfinite(ms) || ms < 0.0) {
+            return false;
+        }
+        total_ms += ms;
+    }
+    return std::isfinite(total_ms);
+}
+
 struct task {
     int region = 0;
     int begin = 0;
@@ -142,13 +221,21 @@ struct edge {
     double duration = 0.0;
     bool started = false;
 };
+enum class event_kind : uint8_t {
+    TASK = 0,
+    EDGE = 1,
+    WEIGHT = 2,
+};
+
 struct event {
     double at = 0.0;
     int id = -1;
-    bool is_edge = false;
+    event_kind kind = event_kind::TASK;
     bool operator<(const event & rhs) const {
         if (at != rhs.at) { return at > rhs.at; }
-        if (is_edge != rhs.is_edge) { return !is_edge; }
+        if (kind != rhs.kind) {
+            return (int) kind > (int) rhs.kind;
+        }
         return id > rhs.id;
     }
 };
@@ -168,6 +255,10 @@ inline bool simulate(const model & m,
     if (regions.empty() || m.tokens <= 0 || m.hidden <= 0 ||
         m.slot_pool < 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
+    }
+    if (m.gpu_weight_streaming &&
+            (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms)) {
+        return reject("WEIGHT_PROFILE_MISSING");
     }
 
     std::vector<task> tasks;
@@ -238,13 +329,42 @@ inline bool simulate(const model & m,
         t.remaining_outputs = t.outputs;
     }
 
+    std::vector<int> gpu_regions;
+    std::vector<int> gpu_rank(regions.size(), -1);
+    std::vector<double> gpu_weight_load_ms(regions.size(), 0.0);
+    std::vector<bool> gpu_weight_ready(
+        regions.size(), !m.gpu_weight_streaming);
+    std::vector<bool> gpu_weight_enqueued(regions.size(), false);
+    for (size_t r = 0; r < regions.size(); ++r) {
+        if (regions[r].device != device::GPU) {
+            continue;
+        }
+        gpu_rank[r] = (int) gpu_regions.size();
+        gpu_regions.push_back((int) r);
+        if (m.gpu_weight_streaming) {
+            size_t bytes = 0;
+            double ms = 0.0;
+            if (!m.gpu_region_weight_bytes(
+                    regions[r].layer_begin, regions[r].layer_end, bytes) ||
+                    !m.gpu_weight_h2d_ms(bytes, ms) ||
+                    !std::isfinite(ms) || ms < 0.0) {
+                return reject("WEIGHT_PROFILE_MISSING");
+            }
+            gpu_weight_load_ms[r] = ms;
+        }
+    }
+
     std::priority_queue<event> events;
     std::array<std::deque<int>, 3> ready_queues;
     std::array<bool, 3> device_busy {}, link_busy {};
     bool pc_compute_gate_busy = false;
     int next_pc_device = 0;
     std::vector<int> live_slots(regions.size(), 0);
+    std::vector<bool> region_done(regions.size(), false);
     std::array<double, 3> busy_ms {}, transfer_busy_ms {};
+    std::deque<int> weight_queue;
+    bool weight_busy = false;
+    double weight_h2d_busy_ms = 0.0;
 
     auto task_ready = [&](int id) -> bool {
         if (id < 0 || id >= (int) tasks.size()) {
@@ -263,11 +383,30 @@ inline bool simulate(const model & m,
         ready_queues[(size_t) regions[(size_t) t.region].device].push_back(id);
     };
     auto claimable = [&](int id) -> bool {
+        const auto & t = tasks[(size_t) id];
+        const int r = t.region;
+
+        if (regions[(size_t) r].device == device::GPU) {
+            // Match the runtime's single CUDA execution lane: later GPU
+            // Regions cannot overtake an earlier GPU Region even when their
+            // token dependency becomes READY first.
+            for (int prior : gpu_regions) {
+                if (prior >= r) {
+                    break;
+                }
+                if (!region_done[(size_t) prior]) {
+                    return false;
+                }
+            }
+            if (m.gpu_weight_streaming &&
+                    !gpu_weight_ready[(size_t) r]) {
+                return false;
+            }
+        }
+
         if (m.slot_pool == 0) {
             return true;
         }
-        const auto & t = tasks[(size_t) id];
-        const int r = t.region;
         return !(r + 1 < (int) regions.size() &&
                  live_slots[(size_t) r] >= m.slot_pool);
     };
@@ -277,13 +416,38 @@ inline bool simulate(const model & m,
     }
     offer(by_region[0].front());
 
+    // Runtime waits for the first two GPU Banks before launching device
+    // workers. The same single CPU prefetch worker loads them sequentially.
     double now = 0.0;
+    if (m.gpu_weight_streaming) {
+        const size_t initial =
+            std::min<size_t>(2, gpu_regions.size());
+        for (size_t i = 0; i < initial; ++i) {
+            const int r = gpu_regions[i];
+            now += gpu_weight_load_ms[(size_t) r];
+            weight_h2d_busy_ms += gpu_weight_load_ms[(size_t) r];
+            gpu_weight_ready[(size_t) r] = true;
+            gpu_weight_enqueued[(size_t) r] = true;
+        }
+    }
+
     int completed = 0;
     int max_live = 0;
     const int n_tasks = (int) tasks.size();
 
     while (completed < n_tasks) {
         bool scheduled = false;
+
+        if (m.gpu_weight_streaming &&
+                !weight_busy && !weight_queue.empty()) {
+            const int r = weight_queue.front();
+            weight_queue.pop_front();
+            weight_busy = true;
+            const double ms = gpu_weight_load_ms[(size_t) r];
+            weight_h2d_busy_ms += ms;
+            events.push({now + ms, r, event_kind::WEIGHT});
+            scheduled = true;
+        }
 
         // Producer completion makes its output transferable immediately.
         // Phone directions share one conservative Wi-Fi lane.
@@ -296,7 +460,7 @@ inline bool simulate(const model & m,
             it.started = true;
             link_busy[(size_t) it.lane] = true;
             transfer_busy_ms[(size_t) it.lane] += it.duration;
-            events.push({now + it.duration, (int) e, true});
+            events.push({now + it.duration, (int) e, event_kind::EDGE});
             scheduled = true;
         }
 
@@ -342,7 +506,7 @@ inline bool simulate(const model & m,
             }
 
             busy_ms[(size_t) dev] += t.duration;
-            events.push({now + t.duration, selected, false});
+            events.push({now + t.duration, selected, event_kind::TASK});
             scheduled = true;
         }
 
@@ -361,7 +525,7 @@ inline bool simulate(const model & m,
             const event current = events.top();
             events.pop();
 
-            if (current.is_edge) {
+            if (current.kind == event_kind::EDGE) {
                 const auto & e = edges[(size_t) current.id];
                 link_busy[(size_t) e.lane] = false;
                 auto & consumer = tasks[(size_t) e.consumer];
@@ -369,6 +533,17 @@ inline bool simulate(const model & m,
                     return reject("EDGE_COUNT_UNDERFLOW");
                 }
                 offer(e.consumer);
+                continue;
+            }
+
+            if (current.kind == event_kind::WEIGHT) {
+                const int r = current.id;
+                if (r < 0 || r >= (int) regions.size() ||
+                        regions[(size_t) r].device != device::GPU) {
+                    return reject("WEIGHT_EVENT_INVALID");
+                }
+                gpu_weight_ready[(size_t) r] = true;
+                weight_busy = false;
                 continue;
             }
 
@@ -385,6 +560,28 @@ inline bool simulate(const model & m,
                 pc_compute_gate_busy = false;
             }
             ++completed;
+
+            if (t.next < 0) {
+                region_done[(size_t) t.region] = true;
+                if (m.gpu_weight_streaming &&
+                        regions[(size_t) t.region].device == device::GPU) {
+                    const int rank = gpu_rank[(size_t) t.region];
+                    if (rank < 0) {
+                        return reject("GPU_RANK_MISSING");
+                    }
+                    const int next_rank = rank + 2;
+                    if (next_rank < (int) gpu_regions.size()) {
+                        const int next_region =
+                            gpu_regions[(size_t) next_rank];
+                        if (!gpu_weight_enqueued[
+                                (size_t) next_region]) {
+                            gpu_weight_enqueued[
+                                (size_t) next_region] = true;
+                            weight_queue.push_back(next_region);
+                        }
+                    }
+                }
+            }
 
             // Bounded-slot accounting remains only for regression tests.
             // Production Region Ring uses slot_pool=0 and full per-boundary
@@ -433,6 +630,7 @@ inline bool simulate(const model & m,
                  busy_ms[(int) device::GPU]);
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
+    c.weight_h2d_busy_ms = weight_h2d_busy_ms;
     for (size_t i = 0; i < c.service_ms_per_token.size(); ++i) {
         c.service_ms_per_token[i] =
             busy_ms[i] / std::max(1, m.tokens);
@@ -533,6 +731,9 @@ inline bool estimate_region_ring_balance(
     c.ring_error_max = std::max({e1, e2, e3});
     c.ring_error_mean = (e1 + e2 + e3) / 3.0;
     c.balance = c.ring_error_max;
+    if (!gpu_weight_h2d_total(m, regions, c.weight_h2d_busy_ms)) {
+        return false;
+    }
     return true;
 }
 
@@ -622,21 +823,32 @@ inline bool estimate_balance(const model & m, candidate & c) {
     c.phone_link_ms_per_token = phone_link_total;
     c.pc_local_link_ms_per_token = local_link_total;
 
+    std::vector<llama_region_ring_region> coarse_regions;
+    if (!make_regions(c, m.layers, coarse_regions) ||
+            !gpu_weight_h2d_total(
+                m, coarse_regions, c.weight_h2d_busy_ms)) {
+        return false;
+    }
+
     if (m.pc_compute_gate) {
         // Historical compatibility path only. The current runtime does not
         // serialize CPU and CUDA compute, but retain a meaningful lower bound
         // for gated-regression tests.
         const double pc_total = cpu_total + gpu_total;
-        c.coarse_ms = m.tokens *
-            std::max({pc_total, phone_total,
-                      phone_link_total, local_link_total});
+        c.coarse_ms = std::max(
+            m.tokens *
+                std::max({pc_total, phone_total,
+                          phone_link_total, local_link_total}),
+            c.weight_h2d_busy_ms);
     } else {
         // Coarse time is only a throughput lower bound. Candidate ordering for
         // large searches is driven first by the user's minimax ring mismatch
         // E=max(e1,e2,e3); exact FIFO simulation remains the final objective.
-        c.coarse_ms = m.tokens *
-            std::max({cpu_total, gpu_total, phone_total,
-                      phone_link_total, local_link_total});
+        c.coarse_ms = std::max(
+            m.tokens *
+                std::max({cpu_total, gpu_total, phone_total,
+                          phone_link_total, local_link_total}),
+            c.weight_h2d_busy_ms);
     }
 
     return std::isfinite(c.coarse_ms) &&
@@ -845,7 +1057,7 @@ inline result search_runtime_applicable(
         }
         const int width = m.layers / cycles;
         for (int p = 2; p <= std::min(8, width - 2); ++p) {
-            for (int g = 1; g <= std::min(8, width - p - 1); ++g) {
+            for (int g = 1; g <= width - p - 1; ++g) {
                 const int c = width - p - g;
                 if (c < 1) {
                     continue;
@@ -1260,7 +1472,7 @@ inline result search_supported_topology(
     std::vector<candidate> coarse;
     for (int cycles = 2; cycles <= 4; ++cycles) {
         for (int c = 2; c <= 12; ++c) {
-            for (int g = 1; g <= 8; ++g) {
+            for (int g = 1; g <= m.layers - c - 2; ++g) {
                 for (int p = 2; p <= 8; ++p) {
                     const int tail = m.layers - cycles * (c + g + p);
                     if (tail < 0 || tail > m.max_tail) {
