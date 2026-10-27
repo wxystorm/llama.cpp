@@ -954,7 +954,14 @@ struct ggml_backend_sched {
 
     // Optional persistent cache for offloaded immutable weights. Used by the
     // Region Ring GPU weight banks; disabled for all legacy schedulers.
+    //
+    // Weight identity must survive graph rebuilds: graph hash slots depend on
+    // transient graph insertion order, while model weight tensor pointers are
+    // stable. Keep a dedicated hash set for canonical weight tensors so a
+    // token-shape rebuild can bind new tensor-copy metadata to the same
+    // persistent CUDA offsets without re-uploading the weights.
     bool weight_cache_enabled = false;
+    struct ggml_hash_set weight_hash_set;
     uint8_t * weight_cache_valid = nullptr;
     size_t * weight_cache_offsets = nullptr;
     ggml_backend_buffer_t weight_cache_buffers[GGML_SCHED_MAX_BACKENDS] = {};
@@ -976,11 +983,12 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+#define weight_hash_id(tensor) ggml_hash_find_or_insert(&sched->weight_hash_set, tensor)
 #define weight_cache_slot_id(id, backend_id, copy_id) ((id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id))
 #define weight_copy_valid_id(id, backend_id, copy_id) sched->weight_cache_valid[weight_cache_slot_id(id, backend_id, copy_id)]
-#define weight_copy_valid(tensor, backend_id, copy_id) weight_copy_valid_id(hash_id(tensor), backend_id, copy_id)
+#define weight_copy_valid(tensor, backend_id, copy_id) weight_copy_valid_id(weight_hash_id(tensor), backend_id, copy_id)
 #define weight_copy_offset_id(id, backend_id, copy_id) sched->weight_cache_offsets[weight_cache_slot_id(id, backend_id, copy_id)]
-#define weight_copy_offset(tensor, backend_id, copy_id) weight_copy_offset_id(hash_id(tensor), backend_id, copy_id)
+#define weight_copy_offset(tensor, backend_id, copy_id) weight_copy_offset_id(weight_hash_id(tensor), backend_id, copy_id)
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1539,9 +1547,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                     GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
                             if (cached_weight) {
                                 GGML_ASSERT(sched->n_copies == 1);
+                                const size_t weight_id =
+                                    weight_hash_id(src);
                                 size_t & cache_offset =
                                     weight_copy_offset_id(
-                                        src_id, cur_backend_id, c);
+                                        weight_id, cur_backend_id, c);
                                 if (cache_offset == SIZE_MAX) {
                                     const size_t alignment =
                                         ggml_backend_buft_get_alignment(
@@ -1634,7 +1644,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             if (cache_storage_reallocated) {
                 memset(
                     sched->weight_cache_valid, 0,
-                    sched->hash_set.size * sched->n_backends *
+                    sched->weight_hash_set.size * sched->n_backends *
                         sched->n_copies * sizeof(uint8_t));
             }
 
@@ -1662,13 +1672,14 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
 
                     const size_t input_hash = hash_id(input);
+                    const size_t weight_id = weight_hash_id(input);
                     ggml_tensor * input_cpy =
                         tensor_id_copy(
                             input_hash, backend_id, 0);
                     GGML_ASSERT(input_cpy != nullptr);
                     const size_t cache_offset =
                         weight_copy_offset_id(
-                            input_hash, backend_id, 0);
+                            weight_id, backend_id, 0);
                     GGML_ASSERT(cache_offset != SIZE_MAX);
                     GGML_ASSERT(
                         cache_offset +
@@ -2314,10 +2325,11 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
+    sched->weight_hash_set = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     const size_t weight_cache_slots =
-        sched->hash_set.size * sched->n_backends * sched->n_copies;
+        sched->weight_hash_set.size * sched->n_backends * sched->n_copies;
     sched->weight_cache_valid =
         (uint8_t *) calloc(weight_cache_slots, sizeof(uint8_t));
     sched->weight_cache_offsets =
@@ -2375,6 +2387,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
+    ggml_hash_set_free(&sched->weight_hash_set);
     free(sched->splits);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
@@ -2396,11 +2409,27 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
-void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
-    GGML_ASSERT(sched);
+static void ggml_backend_sched_reset_graph_state(
+        ggml_backend_sched_t sched) {
+    // Reset only transient graph assignments/allocation. Persistent weight
+    // storage is intentionally untouched here.
+    if (!sched->is_reset) {
+        ggml_hash_set_reset(&sched->hash_set);
+        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        sched->is_reset = true;
+    }
+    sched->is_alloc = false;
+    sched->last_weight_upload_bytes = 0;
+    sched->last_weight_cache_hit_bytes = 0;
+}
+
+static void ggml_backend_sched_clear_weight_cache(
+        ggml_backend_sched_t sched) {
     const size_t weight_cache_slots =
-        sched->hash_set.size * sched->n_backends *
+        sched->weight_hash_set.size * sched->n_backends *
             sched->n_copies;
+    ggml_hash_set_reset(&sched->weight_hash_set);
     memset(
         sched->weight_cache_valid, 0,
         weight_cache_slots * sizeof(uint8_t));
@@ -2412,14 +2441,19 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     }
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
-    // reset state for the next run
-    if (!sched->is_reset) {
-        ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-        sched->is_reset = true;
-    }
-    sched->is_alloc = false;
+}
+
+void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    ggml_backend_sched_clear_weight_cache(sched);
+    ggml_backend_sched_reset_graph_state(sched);
+}
+
+void ggml_backend_sched_reset_preserve_weight_cache(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sched->weight_cache_enabled);
+    ggml_backend_sched_reset_graph_state(sched);
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -2672,17 +2706,8 @@ void ggml_backend_sched_set_weight_cache(
     GGML_ASSERT(!enabled || sched->n_copies == 1);
     sched->weight_cache_enabled = enabled;
 
-    const size_t weight_cache_slots =
-        sched->hash_set.size * sched->n_backends *
-            sched->n_copies;
-    memset(
-        sched->weight_cache_valid, 0,
-        weight_cache_slots * sizeof(uint8_t));
-    for (size_t i = 0; i < weight_cache_slots; ++i) {
-        sched->weight_cache_offsets[i] = SIZE_MAX;
-    }
+    ggml_backend_sched_clear_weight_cache(sched);
     for (int b = 0; b < sched->n_backends; ++b) {
-        sched->weight_cache_used[b] = 0;
         if (!enabled && sched->weight_cache_buffers[b] != nullptr) {
             ggml_backend_buffer_free(sched->weight_cache_buffers[b]);
             sched->weight_cache_buffers[b] = nullptr;
