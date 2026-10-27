@@ -180,6 +180,10 @@ int main() {
     invalid_cpu_only_tail.tail_c = 3;
     REQUIRE(!make_regions(invalid_cpu_only_tail, m.layers, regions));
 
+    // make_regions() clears its output before validating a candidate, so
+    // rebuild the last valid G->C->P topology before the profile-missing test.
+    REQUIRE(make_regions(tail, m.layers, regions));
+
     // If required Profile data is absent, reject the estimate, never invent
     // a speed. This is DRY_RUN: no real Ring runtime state is changed.
     model incomplete = mock_profile();
