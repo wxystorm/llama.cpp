@@ -680,6 +680,25 @@ private:
 
     bool claimable_locked(
             const llama_region_ring_task & task) const {
+        // A single GPU lane executes GPU Regions strictly in model order.
+        // A later GPU Region is not claimable until every chunk of every
+        // earlier GPU Region has completed. This is the only Bank-lifetime
+        // ordering rule the weight prefetch path needs.
+        if (regions_[task.region].device ==
+                llama_region_ring_device::GPU) {
+            for (size_t r = 0; r < task.region; ++r) {
+                if (regions_[r].device !=
+                        llama_region_ring_device::GPU) {
+                    continue;
+                }
+                if (std::any_of(
+                        state_[r].begin(), state_[r].end(),
+                        [](uint8_t s) { return s != 3; })) {
+                    return false;
+                }
+            }
+        }
+
         if (slot_pool_size_ == 0) {
             return true;
         }
