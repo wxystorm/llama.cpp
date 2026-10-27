@@ -1537,9 +1537,32 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 src->buffer != NULL &&
                                 src->buffer->usage ==
                                     GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                            if (cached_weight) {
+                                GGML_ASSERT(sched->n_copies == 1);
+                                size_t & cache_offset =
+                                    weight_copy_offset_id(
+                                        src_id, cur_backend_id, c);
+                                if (cache_offset == SIZE_MAX) {
+                                    const size_t alignment =
+                                        ggml_backend_buft_get_alignment(
+                                            sched->bufts[cur_backend_id]);
+                                    cache_offset = GGML_PAD(
+                                        sched->weight_cache_used[
+                                            cur_backend_id],
+                                        alignment);
+                                    sched->weight_cache_used[
+                                        cur_backend_id] =
+                                        cache_offset +
+                                        ggml_backend_buft_get_alloc_size(
+                                            sched->bufts[cur_backend_id],
+                                            tensor_copy);
+                                }
+                            }
                             if (sched->n_copies > 1 || cached_weight) {
-                                // Persistent cached weights must not share
-                                // gallocr storage with later split inputs.
+                                // Cached immutable weights will be rebound to
+                                // a dedicated persistent arena after graph
+                                // splitting. They must never share transient
+                                // compute storage.
                                 ggml_set_output(tensor_copy);
                                 if (sched->n_copies > 1) {
                                     ggml_set_input(tensor_copy);
@@ -1558,6 +1581,117 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+
+        if (sched->weight_cache_enabled) {
+            GGML_ASSERT(sched->n_copies == 1);
+
+            bool cache_storage_reallocated = false;
+            for (int b = 0; b < sched->n_backends; ++b) {
+                const size_t required = sched->weight_cache_used[b];
+                if (required == 0 ||
+                        required <= sched->weight_cache_capacity[b]) {
+                    continue;
+                }
+
+                ggml_backend_synchronize(sched->backends[b]);
+                if (sched->weight_cache_buffers[b] != nullptr) {
+                    ggml_backend_buffer_free(
+                        sched->weight_cache_buffers[b]);
+                    sched->weight_cache_buffers[b] = nullptr;
+                    sched->weight_cache_capacity[b] = 0;
+                }
+
+                const size_t alignment =
+                    ggml_backend_buft_get_alignment(sched->bufts[b]);
+                const size_t alloc_size =
+                    GGML_PAD(required, alignment);
+                sched->weight_cache_buffers[b] =
+                    ggml_backend_buft_alloc_buffer(
+                        sched->bufts[b], alloc_size);
+                if (sched->weight_cache_buffers[b] == nullptr) {
+                    GGML_LOG_ERROR(
+                        "[SCHED_WEIGHT_CACHE] backend=%d required=%zu "
+                        "status=ALLOC_FAILED\n",
+                        b, alloc_size);
+                    GGML_ABORT(
+                        "failed to allocate persistent weight cache");
+                }
+                ggml_backend_buffer_set_usage(
+                    sched->weight_cache_buffers[b],
+                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                sched->weight_cache_capacity[b] =
+                    ggml_backend_buffer_get_size(
+                        sched->weight_cache_buffers[b]);
+                cache_storage_reallocated = true;
+
+                GGML_LOG_DEBUG(
+                    "[SCHED_WEIGHT_CACHE] backend=%d name=%s "
+                    "capacity_mib=%.3f status=ALLOCATED\n",
+                    b, ggml_backend_name(sched->backends[b]),
+                    sched->weight_cache_capacity[b] / 1048576.0);
+            }
+
+            if (cache_storage_reallocated) {
+                memset(
+                    sched->weight_cache_valid, 0,
+                    sched->hash_set.size * sched->n_backends *
+                        sched->n_copies * sizeof(uint8_t));
+            }
+
+            for (int si = 0; si < sched->n_splits; ++si) {
+                struct ggml_backend_sched_split * cache_split =
+                    &sched->splits[si];
+                const int backend_id = cache_split->backend_id;
+                ggml_backend_buffer_t cache_buffer =
+                    sched->weight_cache_buffers[backend_id];
+                if (cache_buffer == nullptr) {
+                    continue;
+                }
+                void * cache_base =
+                    ggml_backend_buffer_get_base(cache_buffer);
+
+                for (int input_id = 0;
+                     input_id < cache_split->n_inputs; ++input_id) {
+                    ggml_tensor * input =
+                        cache_split->inputs[input_id];
+                    if (input->buffer == nullptr ||
+                            ggml_backend_buffer_get_usage(
+                                input->buffer) !=
+                                GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                        continue;
+                    }
+
+                    const size_t input_hash = hash_id(input);
+                    ggml_tensor * input_cpy =
+                        tensor_id_copy(
+                            input_hash, backend_id, 0);
+                    GGML_ASSERT(input_cpy != nullptr);
+                    const size_t cache_offset =
+                        weight_copy_offset_id(
+                            input_hash, backend_id, 0);
+                    GGML_ASSERT(cache_offset != SIZE_MAX);
+                    GGML_ASSERT(
+                        cache_offset +
+                        ggml_backend_buft_get_alloc_size(
+                            sched->bufts[backend_id],
+                            input_cpy) <=
+                        sched->weight_cache_capacity[backend_id]);
+
+                    if (input_cpy->buffer == nullptr) {
+                        const enum ggml_status alloc_status =
+                            ggml_backend_tensor_alloc(
+                                cache_buffer, input_cpy,
+                                (char *) cache_base + cache_offset);
+                        GGML_ASSERT(
+                            alloc_status == GGML_STATUS_SUCCESS);
+                    } else {
+                        GGML_ASSERT(
+                            input_cpy->buffer == cache_buffer);
+                    }
+                }
+            }
+        }
+
         // 打印每个split分配到哪里
         
             for (int i = 0; i < sched->n_splits; i++) {
