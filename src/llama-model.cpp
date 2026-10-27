@@ -1685,16 +1685,21 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 "GPU weight streaming V1 requires "
                 "LLAMA_HYBRID_REGION_RING_EXEC=fifo-pc-phone");
         }
+        const bool ring_gpu_weight_stream_arch_ok =
+            arch == LLM_ARCH_QWEN3MOE ||
+            arch == LLM_ARCH_QWEN2 ||
+            arch == LLM_ARCH_QWEN3 ||
+            (arch == LLM_ARCH_LLAMA && hparams.n_expert == 0);
         hybrid_ring_gpu_weight_streaming =
             ring_gpu_weight_stream_requested &&
             ring_gpu_weight_stream_exec_ok &&
-            arch == LLM_ARCH_QWEN3MOE;
+            ring_gpu_weight_stream_arch_ok;
         if (ring_gpu_weight_stream_requested &&
                 !hybrid_ring_gpu_weight_streaming) {
             LLAMA_LOG_WARN(
                 "[REGION_RING_GPU_WEIGHT] phase=CONFIG enabled=0 "
-                "reason=V1_QWEN3MOE_ONLY arch=%s\n",
-                arch_name().c_str());
+                "reason=V1_UNSUPPORTED_ARCH arch=%s experts=%u\n",
+                arch_name().c_str(), hparams.n_expert);
         }
         if (hybrid_ring_gpu_weight_streaming) {
             LLAMA_LOG_ERROR(
