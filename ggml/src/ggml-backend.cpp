@@ -895,6 +895,10 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+static constexpr size_t GGML_SCHED_WEIGHT_STAGE_SLOT_SIZE =
+    size_t(64) * 1024 * 1024;
+static constexpr size_t GGML_SCHED_WEIGHT_STAGE_SLOTS = 2;
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -969,6 +973,18 @@ struct ggml_backend_sched {
     size_t weight_cache_used[GGML_SCHED_MAX_BACKENDS] = {};
     size_t last_weight_upload_bytes = 0;
     size_t last_weight_cache_hit_bytes = 0;
+
+    // Two fixed CUDA-pinned staging slots for Region Ring weight streaming.
+    // Canonical model weights remain in mmap/pageable host storage.
+    bool weight_stage_init_attempted = false;
+    bool weight_stage_pinned = false;
+    ggml_backend_dev_t weight_stage_device = nullptr;
+    ggml_backend_buffer_t weight_stage_buffers[GGML_SCHED_WEIGHT_STAGE_SLOTS] = {};
+    ggml_backend_event_t weight_stage_events[GGML_SCHED_WEIGHT_STAGE_SLOTS] = {};
+    bool weight_stage_inflight[GGML_SCHED_WEIGHT_STAGE_SLOTS] = {};
+    size_t weight_stage_next_slot = 0;
+    int64_t last_weight_stage_cpu_copy_us = 0;
+    size_t last_weight_stage_chunks = 0;
 
     int debug;
 
@@ -2006,6 +2022,120 @@ static void ggml_backend_sched_debug_tensor(
         n > 6 ? data[6] : 0.0f, n > 7 ? data[7] : 0.0f);
 }
 
+static void ggml_backend_sched_free_weight_stage(
+        ggml_backend_sched_t sched) {
+    for (size_t i = 0; i < GGML_SCHED_WEIGHT_STAGE_SLOTS; ++i) {
+        if (sched->weight_stage_events[i] != nullptr) {
+            if (sched->weight_stage_inflight[i]) {
+                ggml_backend_event_synchronize(
+                    sched->weight_stage_events[i]);
+            }
+            ggml_backend_event_free(sched->weight_stage_events[i]);
+            sched->weight_stage_events[i] = nullptr;
+        }
+        if (sched->weight_stage_buffers[i] != nullptr) {
+            ggml_backend_buffer_free(sched->weight_stage_buffers[i]);
+            sched->weight_stage_buffers[i] = nullptr;
+        }
+        sched->weight_stage_inflight[i] = false;
+    }
+    sched->weight_stage_device = nullptr;
+    sched->weight_stage_next_slot = 0;
+    sched->weight_stage_pinned = false;
+}
+
+static bool ggml_backend_sched_init_weight_stage(
+        ggml_backend_sched_t sched,
+        ggml_backend_t upload_backend) {
+    ggml_backend_dev_t dev =
+        ggml_backend_get_device(upload_backend);
+    if (sched->weight_stage_pinned &&
+            sched->weight_stage_device == dev) {
+        return true;
+    }
+    if (sched->weight_stage_init_attempted) {
+        return false;
+    }
+    sched->weight_stage_init_attempted = true;
+
+    ggml_backend_buffer_type_t host_buft =
+        ggml_backend_dev_host_buffer_type(dev);
+    if (host_buft == nullptr) {
+        return false;
+    }
+
+    sched->weight_stage_device = dev;
+    for (size_t i = 0; i < GGML_SCHED_WEIGHT_STAGE_SLOTS; ++i) {
+        sched->weight_stage_buffers[i] =
+            ggml_backend_buft_alloc_buffer(
+                host_buft, GGML_SCHED_WEIGHT_STAGE_SLOT_SIZE);
+        if (sched->weight_stage_buffers[i] == nullptr ||
+                ggml_backend_buffer_get_type(
+                    sched->weight_stage_buffers[i]) != host_buft ||
+                ggml_backend_buffer_get_base(
+                    sched->weight_stage_buffers[i]) == nullptr) {
+            ggml_backend_sched_free_weight_stage(sched);
+            return false;
+        }
+
+        sched->weight_stage_events[i] =
+            ggml_backend_event_new(dev);
+        if (sched->weight_stage_events[i] == nullptr) {
+            ggml_backend_sched_free_weight_stage(sched);
+            return false;
+        }
+    }
+
+    sched->weight_stage_pinned = true;
+    return true;
+}
+
+static void ggml_backend_sched_stage_weight_async(
+        ggml_backend_sched_t sched,
+        ggml_backend_t upload_backend,
+        ggml_tensor * dst,
+        const void * src,
+        size_t bytes) {
+    const uint8_t * src_bytes =
+        static_cast<const uint8_t *>(src);
+
+    for (size_t offset = 0; offset < bytes;
+            offset += GGML_SCHED_WEIGHT_STAGE_SLOT_SIZE) {
+        const size_t chunk_bytes =
+            std::min(
+                GGML_SCHED_WEIGHT_STAGE_SLOT_SIZE,
+                bytes - offset);
+        const size_t slot =
+            sched->weight_stage_next_slot %
+            GGML_SCHED_WEIGHT_STAGE_SLOTS;
+        sched->weight_stage_next_slot =
+            (slot + 1) % GGML_SCHED_WEIGHT_STAGE_SLOTS;
+
+        if (sched->weight_stage_inflight[slot]) {
+            ggml_backend_event_synchronize(
+                sched->weight_stage_events[slot]);
+            sched->weight_stage_inflight[slot] = false;
+        }
+
+        void * stage_ptr =
+            ggml_backend_buffer_get_base(
+                sched->weight_stage_buffers[slot]);
+        const int64_t copy_begin_us = ggml_time_us();
+        memcpy(stage_ptr, src_bytes + offset, chunk_bytes);
+        sched->last_weight_stage_cpu_copy_us +=
+            ggml_time_us() - copy_begin_us;
+
+        ggml_backend_tensor_set_async(
+            upload_backend, dst, stage_ptr,
+            offset, chunk_bytes);
+        ggml_backend_event_record(
+            sched->weight_stage_events[slot],
+            upload_backend);
+        sched->weight_stage_inflight[slot] = true;
+        ++sched->last_weight_stage_chunks;
+    }
+}
+
 enum ggml_status ggml_backend_sched_prepare_split_weights_async(
         ggml_backend_sched_t sched, int split_id,
         ggml_backend_t upload_backend) {
@@ -2028,6 +2158,11 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
 
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
+    sched->last_weight_stage_cpu_copy_us = 0;
+    sched->last_weight_stage_chunks = 0;
+    const bool pinned_stage =
+        ggml_backend_sched_init_weight_stage(
+            sched, upload_backend);
 
     for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
         ggml_tensor * input = split->inputs[input_id];
@@ -2052,12 +2187,18 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
             continue;
         }
 
-        // Canonical model weights are immutable host storage. No producer
-        // backend synchronization is needed. Enqueue H2D directly on the
-        // dedicated transfer backend stream; the Region Ring prefetch worker
-        // synchronizes that stream before publishing the Bank as loaded.
-        ggml_backend_tensor_set_async(
-            upload_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+        // Canonical weights stay in mmap/pageable host storage. Stage them
+        // through two 64 MiB CUDA-pinned slots so CPU memcpy of the next
+        // block overlaps H2D of the previous block on upload_backend.
+        if (pinned_stage) {
+            ggml_backend_sched_stage_weight_async(
+                sched, upload_backend, input_cpy,
+                input->data, ggml_nbytes(input));
+        } else {
+            ggml_backend_tensor_set_async(
+                upload_backend, input_cpy,
+                input->data, 0, ggml_nbytes(input));
+        }
 
         weight_copy_valid(
             input, split_backend_id, sched->cur_copy) = 1;
@@ -2454,6 +2595,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_copies);
     free(sched->weight_cache_valid);
     free(sched->weight_cache_offsets);
+    ggml_backend_sched_free_weight_stage(sched);
     for (int b = 0; b < sched->n_backends; ++b) {
         if (sched->weight_cache_buffers[b] != nullptr) {
             ggml_backend_buffer_free(sched->weight_cache_buffers[b]);
@@ -2483,6 +2625,8 @@ static void ggml_backend_sched_reset_graph_state(
     sched->is_alloc = false;
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
+    sched->last_weight_stage_cpu_copy_us = 0;
+    sched->last_weight_stage_chunks = 0;
 }
 
 static void ggml_backend_sched_clear_weight_cache(
@@ -2777,6 +2921,8 @@ void ggml_backend_sched_set_weight_cache(
     }
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
+    sched->last_weight_stage_cpu_copy_us = 0;
+    sched->last_weight_stage_chunks = 0;
 }
 
 bool ggml_backend_sched_get_weight_cache(
@@ -2795,6 +2941,30 @@ size_t ggml_backend_sched_get_last_weight_cache_hit_bytes(
         ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->last_weight_cache_hit_bytes;
+}
+
+int64_t ggml_backend_sched_get_last_weight_stage_cpu_copy_us(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->last_weight_stage_cpu_copy_us;
+}
+
+size_t ggml_backend_sched_get_last_weight_stage_chunks(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->last_weight_stage_chunks;
+}
+
+size_t ggml_backend_sched_get_weight_stage_slot_size(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return GGML_SCHED_WEIGHT_STAGE_SLOT_SIZE;
+}
+
+bool ggml_backend_sched_weight_stage_is_pinned(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->weight_stage_pinned;
 }
 
 size_t ggml_backend_sched_get_weight_cache_buffer_size(
