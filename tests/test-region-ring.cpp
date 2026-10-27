@@ -398,6 +398,77 @@ static void test_nonuniform_interval_ready() {
     check(next_g && next_g->region == 3 && next_g->chunk == 0 &&
               next_g->n_tokens == 16,
           "P128 did not fan out to next-cycle G16");
+
+    // Run a fresh READY_V2 instance all the way to drain and independently
+    // verify every claimed consumer sees complete upstream interval coverage.
+    llama_region_ring_ready drain(regions, 358, chunks, 0);
+    std::vector<std::vector<uint8_t>> done(regions.size());
+    size_t expected_tasks = 0;
+    for (size_t r = 0; r < regions.size(); ++r) {
+        done[r].assign(drain.n_chunks(r), 0);
+        expected_tasks += drain.n_chunks(r);
+    }
+    check(expected_tasks == drain.total_tasks(),
+          "READY_V2 total task count mismatch");
+
+    const std::array<llama_region_ring_device, 3> devices = {
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::PHONE,
+    };
+    size_t completed = 0;
+    while (!drain.all_done()) {
+        bool progressed = false;
+        for (const auto dev : devices) {
+            const auto task = drain.try_take(dev);
+            if (!task) {
+                continue;
+            }
+            check(regions[task->region].device == dev,
+                  "READY_V2 returned task to wrong device");
+            check(task->chunk < done[task->region].size(),
+                  "READY_V2 task index out of range");
+            check(task->chunk == 0 ||
+                      done[task->region][task->chunk - 1] == 1,
+                  "READY_V2 violated strict per-region KV order");
+
+            if (task->region > 0) {
+                const size_t up = task->region - 1;
+                const int db = task->token_begin;
+                const int de = db + task->n_tokens;
+                for (size_t uc = 0; uc < done[up].size(); ++uc) {
+                    const int ub = (int) uc * chunks[up];
+                    const int ue = std::min(358, ub + chunks[up]);
+                    if (std::min(ue, de) > std::max(ub, db)) {
+                        check(done[up][uc] == 1,
+                              "READY_V2 exposed incomplete upstream interval");
+                    }
+                }
+            }
+
+            check(done[task->region][task->chunk] == 0,
+                  "READY_V2 duplicate task claim");
+            done[task->region][task->chunk] = 1;
+            drain.complete(*task);
+            ++completed;
+            progressed = true;
+        }
+        check(progressed, "READY_V2 nonuniform drain deadlocked");
+    }
+    check(completed == expected_tasks &&
+              drain.finished() == expected_tasks &&
+              !drain.failed(),
+          "READY_V2 nonuniform scheduler did not drain cleanly");
+
+    bool bounded_rejected = false;
+    try {
+        llama_region_ring_ready invalid(regions, 358, chunks, 2);
+        (void) invalid;
+    } catch (const std::runtime_error &) {
+        bounded_rejected = true;
+    }
+    check(bounded_rejected,
+          "legacy bounded slots accepted nonuniform chunks");
 }
 
 static void test_dynamic_slot_pool() {
