@@ -283,8 +283,56 @@ int main() {
         REQUIRE(std::fabs(
             streamed_plan.weight_h2d_busy_ms -
             expected_h2d) < 1e-9);
+        REQUIRE(streamed_plan.weight_h2d_startup_ms > 0.0);
+        REQUIRE(streamed_plan.weight_h2d_exposed_ms + 1e-9 >=
+                streamed_plan.weight_h2d_startup_ms);
+        REQUIRE(std::fabs(
+            streamed_plan.weight_h2d_hidden_ms +
+            streamed_plan.weight_h2d_exposed_ms -
+            streamed_plan.weight_h2d_busy_ms) < 1e-9);
         REQUIRE(streamed_plan.wall_ms >=
-                streamed_plan.weight_h2d_busy_ms / 2.0);
+                streamed_plan.weight_h2d_startup_ms);
+
+        // When the measured profile makes CUDA compute much cheaper and H2D
+        // nearly free, APPLY_WIDE must be allowed to select a deep GPU Region
+        // even when its ring mismatch is not the minimum-E family.
+        model value_profile = mock_profile();
+        value_profile.gpu_weight_streaming = true;
+        value_profile.compute_ms =
+            [](device d, int layers, int tokens, int, double & ms) {
+                const double per =
+                    d == device::CPU ? 1.0 :
+                    d == device::GPU ? 0.01 : 0.05;
+                ms = per * layers * tokens;
+                return true;
+            };
+        value_profile.transfer_ms =
+            [](device, device, size_t, double & ms) {
+                ms = 0.001;
+                return true;
+            };
+        value_profile.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = (size_t) (end - begin) * 1024;
+                return true;
+            };
+        value_profile.gpu_weight_h2d_ms =
+            [](size_t bytes, double & ms) {
+                ms = (double) bytes / (1024.0 * 1024.0);
+                return true;
+            };
+        value_profile.memory_feasible =
+            [](const candidate &) { return true; };
+
+        const auto value_baseline = llama_region_ring_parse("", 48);
+        const result value_result = search_runtime_applicable(
+            value_profile, value_baseline, 64, 256, 0.0, 0);
+        REQUIRE(value_result.valid);
+        REQUIRE(value_result.simulated > 32);
+        REQUIRE(value_result.selected.g > 5);
     }
 
     // APPLY_WIDE may change cycle count and independent chunks, but every
