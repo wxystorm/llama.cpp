@@ -956,6 +956,10 @@ struct ggml_backend_sched {
     // Region Ring GPU weight banks; disabled for all legacy schedulers.
     bool weight_cache_enabled = false;
     uint8_t * weight_cache_valid = nullptr;
+    size_t * weight_cache_offsets = nullptr;
+    ggml_backend_buffer_t weight_cache_buffers[GGML_SCHED_MAX_BACKENDS] = {};
+    size_t weight_cache_capacity[GGML_SCHED_MAX_BACKENDS] = {};
+    size_t weight_cache_used[GGML_SCHED_MAX_BACKENDS] = {};
     size_t last_weight_upload_bytes = 0;
     size_t last_weight_cache_hit_bytes = 0;
 
@@ -972,8 +976,11 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
-#define weight_copy_valid_id(id, backend_id, copy_id) sched->weight_cache_valid[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
+#define weight_cache_slot_id(id, backend_id, copy_id) ((id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id))
+#define weight_copy_valid_id(id, backend_id, copy_id) sched->weight_cache_valid[weight_cache_slot_id(id, backend_id, copy_id)]
 #define weight_copy_valid(tensor, backend_id, copy_id) weight_copy_valid_id(hash_id(tensor), backend_id, copy_id)
+#define weight_copy_offset_id(id, backend_id, copy_id) sched->weight_cache_offsets[weight_cache_slot_id(id, backend_id, copy_id)]
+#define weight_copy_offset(tensor, backend_id, copy_id) weight_copy_offset_id(hash_id(tensor), backend_id, copy_id)
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -2175,9 +2182,15 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
-    sched->weight_cache_valid    = (uint8_t *) calloc(
-        sched->hash_set.size * sched->n_backends * sched->n_copies,
-        sizeof(uint8_t));
+    const size_t weight_cache_slots =
+        sched->hash_set.size * sched->n_backends * sched->n_copies;
+    sched->weight_cache_valid =
+        (uint8_t *) calloc(weight_cache_slots, sizeof(uint8_t));
+    sched->weight_cache_offsets =
+        (size_t *) malloc(weight_cache_slots * sizeof(size_t));
+    for (size_t i = 0; i < weight_cache_slots; ++i) {
+        sched->weight_cache_offsets[i] = SIZE_MAX;
+    }
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2232,6 +2245,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->weight_cache_valid);
+    free(sched->weight_cache_offsets);
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->weight_cache_buffers[b] != nullptr) {
+            ggml_backend_buffer_free(sched->weight_cache_buffers[b]);
+            sched->weight_cache_buffers[b] = nullptr;
+        }
+    }
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -2244,10 +2264,18 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const size_t weight_cache_slots =
+        sched->hash_set.size * sched->n_backends *
+            sched->n_copies;
     memset(
         sched->weight_cache_valid, 0,
-        sched->hash_set.size * sched->n_backends *
-            sched->n_copies * sizeof(uint8_t));
+        weight_cache_slots * sizeof(uint8_t));
+    for (size_t i = 0; i < weight_cache_slots; ++i) {
+        sched->weight_cache_offsets[i] = SIZE_MAX;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        sched->weight_cache_used[b] = 0;
+    }
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
     // reset state for the next run
@@ -2507,11 +2535,26 @@ void ggml_backend_sched_set_weight_cache(
     if (sched->weight_cache_enabled == enabled) {
         return;
     }
+    GGML_ASSERT(!enabled || sched->n_copies == 1);
     sched->weight_cache_enabled = enabled;
+
+    const size_t weight_cache_slots =
+        sched->hash_set.size * sched->n_backends *
+            sched->n_copies;
     memset(
         sched->weight_cache_valid, 0,
-        sched->hash_set.size * sched->n_backends *
-            sched->n_copies * sizeof(uint8_t));
+        weight_cache_slots * sizeof(uint8_t));
+    for (size_t i = 0; i < weight_cache_slots; ++i) {
+        sched->weight_cache_offsets[i] = SIZE_MAX;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        sched->weight_cache_used[b] = 0;
+        if (!enabled && sched->weight_cache_buffers[b] != nullptr) {
+            ggml_backend_buffer_free(sched->weight_cache_buffers[b]);
+            sched->weight_cache_buffers[b] = nullptr;
+            sched->weight_cache_capacity[b] = 0;
+        }
+    }
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
 }
@@ -2532,6 +2575,19 @@ size_t ggml_backend_sched_get_last_weight_cache_hit_bytes(
         ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->last_weight_cache_hit_bytes;
+}
+
+size_t ggml_backend_sched_get_weight_cache_buffer_size(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    size_t total = 0;
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->weight_cache_buffers[b] != nullptr) {
+            total += ggml_backend_buffer_get_size(
+                sched->weight_cache_buffers[b]);
+        }
+    }
+    return total;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
