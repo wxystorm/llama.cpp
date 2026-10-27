@@ -1759,6 +1759,185 @@ static bool llama_hybrid_ffn_cost(const std::vector<llama_hybrid_ffn_compute_poi
     return true;
 }
 
+
+static bool llama_hybrid_attn_prepare_cost(
+        const std::vector<llama_hybrid_attn_compute_point> & points,
+        int query_tokens,
+        double & result_ms) {
+    if (points.empty() || query_tokens <= 0) {
+        return false;
+    }
+
+    const llama_hybrid_attn_compute_point * exact = nullptr;
+    const llama_hybrid_attn_compute_point * lower = nullptr;
+    const llama_hybrid_attn_compute_point * upper = nullptr;
+    for (const auto & point : points) {
+        // Use the full-attention anchor (kv == query).  KV expansion changes
+        // compute cost but does not materially change the host prepare shape.
+        if (point.tokens <= 0 || point.kv_tokens != point.tokens) {
+            continue;
+        }
+        if (point.tokens == query_tokens) {
+            exact = &point;
+            break;
+        }
+        if (point.tokens < query_tokens &&
+                (lower == nullptr || point.tokens > lower->tokens)) {
+            lower = &point;
+        }
+        if (point.tokens > query_tokens &&
+                (upper == nullptr || point.tokens < upper->tokens)) {
+            upper = &point;
+        }
+    }
+
+    if (exact != nullptr) {
+        result_ms = std::max(0.0, exact->prepare_ms);
+        return true;
+    }
+    if (lower == nullptr && upper == nullptr) {
+        return false;
+    }
+    if (lower == nullptr) {
+        result_ms = std::max(0.0, upper->prepare_ms);
+        return true;
+    }
+    if (upper == nullptr) {
+        result_ms = std::max(0.0, lower->prepare_ms);
+        return true;
+    }
+
+    const double t =
+        (double) (query_tokens - lower->tokens) /
+        (double) (upper->tokens - lower->tokens);
+    result_ms = std::max(
+        0.0,
+        lower->prepare_ms +
+            t * (upper->prepare_ms - lower->prepare_ms));
+    return std::isfinite(result_ms);
+}
+
+static bool llama_hybrid_ffn_prepare_cost_at_ratio(
+        const std::vector<llama_hybrid_ffn_compute_point> & points,
+        int tokens,
+        float ratio,
+        double & result_ms) {
+    const llama_hybrid_ffn_compute_point * exact = nullptr;
+    const llama_hybrid_ffn_compute_point * lower = nullptr;
+    const llama_hybrid_ffn_compute_point * upper = nullptr;
+
+    for (const auto & point : points) {
+        if (std::fabs(point.local_ratio - ratio) >= 1e-4f) {
+            continue;
+        }
+        if (point.tokens == tokens) {
+            exact = &point;
+            break;
+        }
+        if (point.tokens < tokens &&
+                (lower == nullptr || point.tokens > lower->tokens)) {
+            lower = &point;
+        }
+        if (point.tokens > tokens &&
+                (upper == nullptr || point.tokens < upper->tokens)) {
+            upper = &point;
+        }
+    }
+
+    if (exact != nullptr) {
+        result_ms = std::max(0.0, exact->prepare_ms);
+        return true;
+    }
+    if (lower == nullptr && upper == nullptr) {
+        return false;
+    }
+    if (lower == nullptr) {
+        result_ms = std::max(0.0, upper->prepare_ms);
+        return true;
+    }
+    if (upper == nullptr) {
+        result_ms = std::max(0.0, lower->prepare_ms);
+        return true;
+    }
+
+    const double t =
+        (double) (tokens - lower->tokens) /
+        (double) (upper->tokens - lower->tokens);
+    result_ms = std::max(
+        0.0,
+        lower->prepare_ms +
+            t * (upper->prepare_ms - lower->prepare_ms));
+    return std::isfinite(result_ms);
+}
+
+static bool llama_hybrid_ffn_prepare_cost(
+        const std::vector<llama_hybrid_ffn_compute_point> & points,
+        int tokens,
+        float ratio,
+        double & result_ms) {
+    if (points.empty() || tokens <= 0 || ratio <= 0.0f || ratio > 1.0f) {
+        return false;
+    }
+
+    std::vector<float> ratios;
+    ratios.reserve(points.size());
+    for (const auto & point : points) {
+        if (point.local_ratio > 0.0f && point.local_ratio <= 1.0f) {
+            ratios.push_back(point.local_ratio);
+        }
+    }
+    std::sort(ratios.begin(), ratios.end());
+    ratios.erase(
+        std::unique(
+            ratios.begin(), ratios.end(),
+            [](float a, float b) {
+                return std::fabs(a - b) < 1e-4f;
+            }),
+        ratios.end());
+    if (ratios.empty()) {
+        return false;
+    }
+
+    float lower_ratio = -1.0f;
+    float upper_ratio = -1.0f;
+    for (const float r : ratios) {
+        if (std::fabs(r - ratio) < 1e-4f) {
+            return llama_hybrid_ffn_prepare_cost_at_ratio(
+                points, tokens, r, result_ms);
+        }
+        if (r < ratio) {
+            lower_ratio = r;
+        } else if (r > ratio && upper_ratio < 0.0f) {
+            upper_ratio = r;
+        }
+    }
+
+    if (lower_ratio < 0.0f) {
+        return llama_hybrid_ffn_prepare_cost_at_ratio(
+            points, tokens, ratios.front(), result_ms);
+    }
+    if (upper_ratio < 0.0f) {
+        return llama_hybrid_ffn_prepare_cost_at_ratio(
+            points, tokens, ratios.back(), result_ms);
+    }
+
+    double lower_ms = 0.0;
+    double upper_ms = 0.0;
+    if (!llama_hybrid_ffn_prepare_cost_at_ratio(
+            points, tokens, lower_ratio, lower_ms) ||
+        !llama_hybrid_ffn_prepare_cost_at_ratio(
+            points, tokens, upper_ratio, upper_ms)) {
+        return false;
+    }
+
+    const double t =
+        (double) (ratio - lower_ratio) /
+        (double) (upper_ratio - lower_ratio);
+    result_ms = std::max(
+        0.0, lower_ms + t * (upper_ms - lower_ms));
+    return std::isfinite(result_ms);
+}
+
 static bool llama_hybrid_transfer_cost(const std::vector<llama_hybrid_transfer_point> & points,
                                        size_t                                           bytes,
                                        double &                                         result_ms,
@@ -6707,10 +6886,14 @@ bool llama_hybrid_profile_moe_ffn(
 
         double cpu_router_ms = 0.0;
         double phone_router_ms = 0.0;
+        double cpu_router_prepare_ms = 0.0;
+        double phone_router_prepare_ms = 0.0;
         if (!llama_hybrid_profile_moe_router_point(
-                attn_desc, desc, cpu_backend, tokens, cpu_router_ms) ||
+                attn_desc, desc, cpu_backend, tokens,
+                cpu_router_ms, &cpu_router_prepare_ms) ||
             !llama_hybrid_profile_moe_router_point(
-                attn_desc, desc, phone_backend, tokens, phone_router_ms)) {
+                attn_desc, desc, phone_backend, tokens,
+                phone_router_ms, &phone_router_prepare_ms)) {
             return false;
         }
 
@@ -6723,17 +6906,22 @@ bool llama_hybrid_profile_moe_ffn(
                 const float cpu_ratio_eff =
                     (float) ((double) cpu_local_ff / (double) desc.n_ff_exp);
                 double cpu_ms = 0.0;
+                double cpu_prepare_ms = 0.0;
                 size_t cpu_runtime_bytes = 0;
                 if (!llama_hybrid_profile_moe_ffn_point(
                         desc, cpu_backend, 0, tokens,
                         requested_local_ratio,
-                        cpu_ms, cpu_runtime_bytes)) {
+                        cpu_ms, cpu_runtime_bytes,
+                        &cpu_prepare_ms)) {
                     return false;
                 }
                 const double cpu_branch_ms = cpu_router_ms + cpu_ms;
+                const double cpu_branch_prepare_ms =
+                    cpu_router_prepare_ms + cpu_prepare_ms;
                 profile.cpu_ffn.push_back({
                     tokens, cpu_ratio_eff, cpu_local_ff,
-                    cpu_branch_ms, cpu_runtime_bytes
+                    cpu_branch_ms, cpu_runtime_bytes,
+                    cpu_branch_prepare_ms
                 });
                 LLAMA_LOG_INFO(
                     "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_branch "
@@ -6757,17 +6945,22 @@ bool llama_hybrid_profile_moe_ffn(
                     (float) ((double) phone_local_ff /
                              (double) desc.n_ff_exp);
                 double phone_ms = 0.0;
+                double phone_prepare_ms = 0.0;
                 size_t phone_runtime_bytes = 0;
                 if (!llama_hybrid_profile_moe_ffn_point(
                         desc, phone_backend, 1, tokens,
                         requested_local_ratio,
-                        phone_ms, phone_runtime_bytes)) {
+                        phone_ms, phone_runtime_bytes,
+                        &phone_prepare_ms)) {
                     return false;
                 }
                 const double phone_branch_ms = phone_router_ms + phone_ms;
+                const double phone_branch_prepare_ms =
+                    phone_router_prepare_ms + phone_prepare_ms;
                 profile.phone_ffn.push_back({
                     tokens, phone_ratio_eff, phone_local_ff,
-                    phone_branch_ms, phone_runtime_bytes
+                    phone_branch_ms, phone_runtime_bytes,
+                    phone_branch_prepare_ms
                 });
                 LLAMA_LOG_INFO(
                     "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_branch "
@@ -7144,15 +7337,22 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
             }
 
             double full_base_ms      = 0.0;
+            double full_base_prepare_ms = 0.0;
             size_t full_base_runtime = 0;
-            if (!llama_hybrid_profile_attn_point(desc, backend, tokens, tokens, full_base_ms, full_base_runtime)) {
+            if (!llama_hybrid_profile_attn_point(
+                    desc, backend, tokens, tokens,
+                    full_base_ms, full_base_runtime,
+                    &full_base_prepare_ms)) {
                 return false;
             }
             if (legacy_ms != nullptr && tokens == profile.probe_tokens) {
                 *legacy_ms = full_base_ms;
             }
 
-            points.push_back({ tokens, tokens, full_base_ms, full_base_runtime });
+            points.push_back({
+                tokens, tokens, full_base_ms,
+                full_base_runtime, full_base_prepare_ms
+            });
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=attention tokens=%d kv_tokens=%d ms=%.3f "
                 "runtime_bytes=%zu\n",
@@ -7183,7 +7383,10 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
                     !llama_hybrid_add_bytes(attn_runtime, flash_runtime - flash_base_runtime)) {
                     return false;
                 }
-                points.push_back({ tokens, kv_tokens, attn_ms, attn_runtime });
+                points.push_back({
+                    tokens, kv_tokens, attn_ms,
+                    attn_runtime, full_base_prepare_ms
+                });
                 LLAMA_LOG_INFO(
                     "[HYBRID_PROFILE_COMPUTE] backend=%s kind=attention tokens=%d kv_tokens=%d ms=%.3f "
                     "runtime_bytes=%zu\n",
