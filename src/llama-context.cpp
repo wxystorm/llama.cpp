@@ -4148,6 +4148,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 {
                     std::lock_guard<std::mutex> lock(
                         gpu_prefetch_mutex);
+                    if (gpu_prefetch_stop) {
+                        return false;
+                    }
                     auto & bank_state =
                         gpu_bank_runtime[bank_index];
                     if (bank_state.phase ==
@@ -4245,6 +4248,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
                     "event=EXCEPTION reason=UNKNOWN status=STOPPED\n");
+                std::lock_guard<std::mutex> lock(
+                    gpu_prefetch_mutex);
+                for (auto & bank_state : gpu_bank_runtime) {
+                    if (bank_state.phase ==
+                            gpu_weight_bank_phase::LOADING) {
+                        bank_state.phase =
+                            gpu_weight_bank_phase::FAILED;
+                    }
+                }
             }
             gpu_bank_cv.notify_all();
             LLAMA_LOG_ERROR(
@@ -4283,6 +4295,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             if (!gpu_prefetch_worker_started) {
                 std::lock_guard<std::mutex> lock(
                     gpu_prefetch_mutex);
+                gpu_prefetch_stop = true;
                 gpu_prefetch_jobs.clear();
                 for (auto & bank_state : gpu_bank_runtime) {
                     bank_state.phase =
@@ -4430,8 +4443,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     task.region, task.chunk,
                                     selected_bank == 1 ? 'A' : 'B');
                                 gpu_bank_cv.wait(lock, [&]() {
-                                    return ready.failed() ||
-                                        bank_state.region !=
+                                    return bank_state.region !=
                                             task.region ||
                                         bank_state.phase !=
                                             gpu_weight_bank_phase::LOADING;
