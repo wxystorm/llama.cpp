@@ -1966,13 +1966,30 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                 }
                 copy_experts(first_id, last_id);
             } else {
-                // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
-                // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                if (!split_backend->iface.cpy_tensor_async ||
-                    !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                // Cached immutable host weights have no producer compute to
+                // synchronize. Waiting on the CPU backend here would serialize
+                // the independent CPU Region worker for no correctness reason.
+                // Wait only until the destination Bank is writable, then copy
+                // directly from canonical host storage into CUDA.
+                const bool cached_host_weight =
+                    sched->weight_cache_enabled &&
+                    immutable_weight &&
+                    ggml_backend_buffer_is_host(input->buffer);
+                if (cached_host_weight) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(
+                            sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
+                } else if (!split_backend->iface.cpy_tensor_async ||
+                    !split_backend->iface.cpy_tensor_async(
+                        input_backend, split_backend, input, input_cpy)) {
                     ggml_backend_synchronize(input_backend);
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        ggml_backend_event_synchronize(
+                            sched->events[split_backend_id][sched->cur_copy]);
                     } else {
                         ggml_backend_synchronize(split_backend);
                     }
