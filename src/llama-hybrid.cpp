@@ -8441,10 +8441,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
             }
             usage[0] += (long double) profile.non_layer_weight_bytes;
-            const int sizes[] = {candidate.xc, candidate.xg, candidate.xp};
-            for (size_t i = 0; i < 3; ++i) {
-                usage[i] += (long double) model.slot_pool * sizes[i] *
-                            model.hidden * sizeof(float) * 3;
+            if (model.slot_pool > 0) {
+                const int sizes[] = {candidate.xc, candidate.xg, candidate.xp};
+                for (size_t i = 0; i < 3; ++i) {
+                    usage[i] += (long double) model.slot_pool * sizes[i] *
+                                model.hidden * sizeof(float) * 3;
+                }
+            } else {
+                // Production Ring keeps one full activation buffer per
+                // boundary in host memory. This replaces the old per-device
+                // bounded-slot estimate and is small compared with layer
+                // weights (about 2.8 MiB per edge for 358x2048 f32).
+                const size_t boundary_count =
+                    regions.empty() ? 0 : regions.size() - 1;
+                usage[0] += (long double) boundary_count *
+                            model.tokens * model.hidden * sizeof(float);
             }
             const size_t free_bytes[] = {
                 profile.pc_free_mem,

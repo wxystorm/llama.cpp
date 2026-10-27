@@ -3303,17 +3303,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             pc_phone_overlap ? "MEASURED" : "0");
     }
     const int chunk_tokens = stages.front().macro_tokens;
-    // Dynamic activation slots: any READY producer can lease any FREE slot on
-    // its outgoing edge. Capacity is shared with the Planner model.
-    const size_t slot_pool_size = own_stage_resources ?
-        LLAMA_REGION_RING_SLOT_POOL_SIZE : 0;
+    // Production Region Ring keeps one full-ubatch activation buffer on each
+    // boundary. slot_pool_size=0 disables finite producer credits completely;
+    // explicit non-zero slot pools remain only in scheduler regression tests.
+    const size_t slot_pool_size = 0;
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens, chunk_tokens, slot_pool_size);
 
-    // Each producer edge owns a small dynamic host-slot pool. Producers take
-    // any FREE slot; consumers locate the READY slot by chunk id. A slot is
-    // released only after the downstream Region has fully consumed it.
-    const size_t host_tokens_per_edge = own_stage_resources ?
+    // With no bounded slot pool, each boundary owns storage for the complete
+    // ubatch. Producer and consumer tasks address disjoint token intervals
+    // directly by task.token_begin.
+    const size_t host_tokens_per_edge = slot_pool_size > 0 ?
         slot_pool_size * (size_t) chunk_tokens : (size_t) ubatch.n_tokens;
     std::vector<std::vector<float>> outputs(ready.n_regions() - 1);
     for (auto & hidden : outputs) {
@@ -3437,7 +3437,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const bool first = task.region == 0;
                     const bool last = task.region + 1 == stages.size();
                     const auto & stage = stages[task.region];
-                    if (own_stage_resources &&
+                    if (slot_pool_size > 0 &&
                         ((!first && task.input_slot < 0) ||
                          (!last && task.output_slot < 0))) {
                         LLAMA_LOG_ERROR(
@@ -3451,11 +3451,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
                     const size_t input_host_token_begin = first ? 0 :
-                        own_stage_resources ?
+                        slot_pool_size > 0 ?
                             (size_t) task.input_slot * (size_t) chunk_tokens :
                             (size_t) task.token_begin;
                     const size_t output_host_token_begin = last ? 0 :
-                        own_stage_resources ?
+                        slot_pool_size > 0 ?
                             (size_t) task.output_slot * (size_t) chunk_tokens :
                             (size_t) task.token_begin;
                     float * input = first ? nullptr :
@@ -3836,7 +3836,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool first = task.region == 0;
         const bool last = task.region + 1 == stages.size();
         const auto & stage = stages[task.region];
-        if (own_stage_resources &&
+        if (slot_pool_size > 0 &&
             ((!first && task.input_slot < 0) ||
              (!last && task.output_slot < 0))) {
             LLAMA_LOG_ERROR(
@@ -3848,11 +3848,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             break;
         }
         const size_t input_host_token_begin = first ? 0 :
-            own_stage_resources ?
+            slot_pool_size > 0 ?
                 (size_t) task.input_slot * (size_t) chunk_tokens :
                 (size_t) task.token_begin;
         const size_t output_host_token_begin = last ? 0 :
-            own_stage_resources ?
+            slot_pool_size > 0 ?
                 (size_t) task.output_slot * (size_t) chunk_tokens :
                 (size_t) task.token_begin;
         float * input = first ? nullptr :

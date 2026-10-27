@@ -141,6 +141,24 @@ int main() {
     REQUIRE(simulate(m, regions, larger_pc, &reason));
     REQUIRE(larger_pc.max_live_slots <= m.slot_pool);
 
+    // Production Ring uses slot_pool=0: a large downstream chunk may gather
+    // any number of smaller upstream intervals because every boundary owns a
+    // full-ubatch activation buffer. The old bounded mode is kept only as a
+    // regression check and must still expose the historical credit deadlock.
+    candidate unbounded_gather = uniform;
+    unbounded_gather.xc = 128;
+    unbounded_gather.xg = 16;
+    unbounded_gather.xp = 128;
+    REQUIRE(m.slot_pool == 0);
+    REQUIRE(simulate(m, regions, unbounded_gather, &reason));
+
+    model bounded_slots = m;
+    bounded_slots.slot_pool = 4;
+    candidate bounded_gather = unbounded_gather;
+    reason.clear();
+    REQUIRE(!simulate(bounded_slots, regions, bounded_gather, &reason));
+    REQUIRE(reason == "SLOT_OR_KV_DEADLOCK");
+
     // A non-dividing three-cycle width gives a PC-only final suffix.
     candidate tail = uniform;
     tail.p = 4;

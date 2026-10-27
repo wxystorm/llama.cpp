@@ -162,7 +162,7 @@ inline bool simulate(const model & m,
         return false;
     };
     if (regions.empty() || m.tokens <= 0 || m.hidden <= 0 ||
-        m.slot_pool <= 0 || !m.compute_ms || !m.transfer_ms) {
+        m.slot_pool < 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
     }
 
@@ -259,6 +259,9 @@ inline bool simulate(const model & m,
         ready_queues[(size_t) regions[(size_t) t.region].device].push_back(id);
     };
     auto claimable = [&](int id) -> bool {
+        if (m.slot_pool == 0) {
+            return true;
+        }
         const auto & t = tasks[(size_t) id];
         const int r = t.region;
         return !(r + 1 < (int) regions.size() &&
@@ -324,7 +327,8 @@ inline bool simulate(const model & m,
                 next_pc_device = 1 - dev;
             }
 
-            if (t.region + 1 < (int) regions.size()) {
+            if (m.slot_pool > 0 &&
+                    t.region + 1 < (int) regions.size()) {
                 ++live_slots[(size_t) t.region];
                 max_live = std::max(max_live,
                                     live_slots[(size_t) t.region]);
@@ -378,22 +382,25 @@ inline bool simulate(const model & m,
             }
             ++completed;
 
-            // Current runtime releases a producer activation Slot only after
-            // the downstream consumer has finished reading it, not merely
-            // when the boundary transfer/staging becomes ready.
-            for (const auto & e : edges) {
-                if (e.consumer != current.id) {
-                    continue;
-                }
-                auto & producer = tasks[(size_t) e.producer];
-                if (--producer.remaining_outputs < 0) {
-                    return reject("CONSUMER_COUNT_UNDERFLOW");
-                }
-                if (producer.remaining_outputs == 0) {
-                    const int r = producer.region;
-                    if (r + 1 >= (int) regions.size() ||
-                        --live_slots[(size_t) r] < 0) {
-                        return reject("SLOT_RELEASE_UNDERFLOW");
+            // Bounded-slot accounting remains only for regression tests.
+            // Production Region Ring uses slot_pool=0 and full per-boundary
+            // activation storage, so producer completion never consumes a
+            // finite output credit.
+            if (m.slot_pool > 0) {
+                for (const auto & e : edges) {
+                    if (e.consumer != current.id) {
+                        continue;
+                    }
+                    auto & producer = tasks[(size_t) e.producer];
+                    if (--producer.remaining_outputs < 0) {
+                        return reject("CONSUMER_COUNT_UNDERFLOW");
+                    }
+                    if (producer.remaining_outputs == 0) {
+                        const int r = producer.region;
+                        if (r + 1 >= (int) regions.size() ||
+                            --live_slots[(size_t) r] < 0) {
+                            return reject("SLOT_RELEASE_UNDERFLOW");
+                        }
                     }
                 }
             }
@@ -402,8 +409,9 @@ inline bool simulate(const model & m,
         }
     }
 
-    if (std::any_of(live_slots.begin(), live_slots.end(),
-                    [](int x) { return x != 0; })) {
+    if (m.slot_pool > 0 &&
+            std::any_of(live_slots.begin(), live_slots.end(),
+                [](int x) { return x != 0; })) {
         return reject("LIVE_SLOTS_NOT_DRAINED");
     }
     if (m.pc_compute_gate &&

@@ -23,10 +23,11 @@ enum class llama_region_ring_device : uint8_t {
     PHONE = 2,
 };
 
-// Per-edge activation buffers are dynamically leased from this pool.
-// Capacity is shared by runtime and Planner so scheduling predictions use
-// the same backpressure model as real execution.
-inline constexpr size_t LLAMA_REGION_RING_SLOT_POOL_SIZE = 4;
+// Region Ring production runtime uses one full-ubatch activation buffer per
+// boundary and therefore has no producer-credit/slot-count backpressure.
+// A value of 0 selects that unbounded mode. Explicit non-zero capacities are
+// retained only for deterministic bounded-slot scheduler regression tests.
+inline constexpr size_t LLAMA_REGION_RING_SLOT_POOL_SIZE = 0;
 
 struct llama_region_ring_region {
     llama_region_ring_device device;
