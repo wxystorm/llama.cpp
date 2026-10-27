@@ -9436,29 +9436,35 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        // APPLY_WIDE simulates every candidate inside the E window.
-        // The helper retains legacy max/min parameters for standalone tests,
-        // but runtime application deliberately supplies no simulation cap.
+        // APPLY_WIDE simulates every candidate inside the natural E window.
+        // If that window is too sharp to give the event simulator a useful
+        // comparison set, extend the E-ranked prefix to at least 64 candidates.
+        // There is still no simulation cap and no topology-family quota.
+        constexpr int wide_min_simulations = 64;
         const auto result =
             llama_ring_planner::search_runtime_applicable(
                 model, baseline_regions, baseline_chunk,
-                1, wide_e_margin, 0);
+                1, wide_e_margin, wide_min_simulations);
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
-            "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
+            "enumerated=%zu profiled=%zu e_window=%zu "
+            "shortlisted=%zu simulated=%zu "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
-            "E_min=%.4f E_limit=%.4f E_margin=%.4f "
-            "filter=E_WINDOW exact=FULL_PROMPT_EVENT_SIM "
+            "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
+            "E_margin=%.4f shortlist_floor=%d "
+            "filter=E_WINDOW_PLUS_FLOOR exact=FULL_PROMPT_EVENT_SIM "
             "ranking=SIM_WALL sim_cap=NONE "
             "cycles=2..4 tail=DISABLED final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
             "XP=16,32,64,128 baseline_ms=%.3f valid=%d\n",
-            result.enumerated, result.profiled, result.shortlisted,
+            result.enumerated, result.profiled,
+            result.e_window_shortlisted, result.shortlisted,
             result.simulated, result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
-            wide_e_margin,
+            result.shortlist_e_limit, wide_e_margin,
+            wide_min_simulations,
             model.gpu_weight_streaming ? 1 : 0,
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
