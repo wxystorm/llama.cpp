@@ -145,7 +145,11 @@ int main() {
     const supported_result supported =
         search_supported_fixed_phone(apply_profile,baseline_regions,64);
     REQUIRE(supported.baseline_valid && supported.valid);
-    REQUIRE(supported.enumerated > 0 && supported.simulated > 0);
+    // Three 11-layer PC windows, GPU total fixed at 11, with at least one
+    // CPU and one CUDA layer in each window:
+    // g0 + g1 + g2 = 11, gi >= 1 => C(10,2) = 45 safe layouts.
+    REQUIRE(supported.enumerated == 45);
+    REQUIRE(supported.simulated == 45);
     REQUIRE(supported.selected.estimate.wall_ms > 0.0);
     REQUIRE(supported.selected.estimate.wall_ms <=
             supported.baseline.estimate.wall_ms + 1e-6);
@@ -156,8 +160,12 @@ int main() {
             supported.selected.regions));
     REQUIRE(llama_region_ring_apply_safe_compatible(
             baseline_regions,supported.selected.regions));
-    REQUIRE(llama_region_ring_layer_counts(
-            supported.selected.regions) ==
+    const auto supported_counts =
+        llama_region_ring_layer_counts(supported.selected.regions);
+    REQUIRE(supported_counts[0] == 22);
+    REQUIRE(supported_counts[1] == 11);
+    REQUIRE(supported_counts[2] == 15);
+    REQUIRE(supported_counts ==
             llama_region_ring_layer_counts(baseline_regions));
     REQUIRE(supported.top.size() <= 5);
     for (const auto & choice : supported.top) {

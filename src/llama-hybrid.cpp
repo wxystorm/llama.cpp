@@ -8710,6 +8710,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             llama_region_ring_layout_string(best.regions);
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_SAFE "
+            "source=AUTO_FIXED_PHONE "
             "layout=%s baseline_layout=%s "
             "tokens=%d chunk=%d predicted_ms=%.3f "
             "baseline_predicted_ms=%.3f gain_pct=%.3f "
@@ -8730,7 +8731,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         *selected_layout = best_text;
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
-            "phase=PRE_MODEL_LOAD selected=1 layout=%s chunk=%d "
+            "phase=PRE_MODEL_LOAD selected=1 source=AUTO_FIXED_PHONE "
+            "layout=%s chunk=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
             selected_layout->c_str(),baseline_chunk);
         return true;
