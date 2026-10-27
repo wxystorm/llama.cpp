@@ -339,6 +339,67 @@ static void test_failure_and_wakeup() {
 }
 
 
+static void test_nonuniform_interval_ready() {
+    const auto regions = llama_region_ring_parse("", 48);
+    std::vector<int> chunks;
+    chunks.reserve(regions.size());
+    for (const auto & r : regions) {
+        chunks.push_back(
+            r.device == llama_region_ring_device::GPU ? 16 :
+            r.device == llama_region_ring_device::CPU ? 64 : 128);
+    }
+
+    llama_region_ring_ready ready(regions, 358, chunks, 0);
+    check(ready.n_chunks(0) == 23, "GPU X16 chunk count is wrong");
+    check(ready.n_chunks(1) == 6, "CPU X64 chunk count is wrong");
+    check(ready.n_chunks(2) == 3, "Phone X128 chunk count is wrong");
+
+    // C[0,64) gathers four G16 intervals.
+    for (int i = 0; i < 3; ++i) {
+        const auto g = ready.try_take(llama_region_ring_device::GPU);
+        check(g && g->region == 0 && g->chunk == (size_t) i,
+              "missing early GPU interval");
+        ready.complete(*g);
+        check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
+              "CPU gather released before four G16 intervals");
+    }
+    const auto g3 = ready.try_take(llama_region_ring_device::GPU);
+    check(g3 && g3->region == 0 && g3->chunk == 3,
+          "missing fourth GPU interval");
+    ready.complete(*g3);
+    const auto c0 = ready.try_take(llama_region_ring_device::CPU);
+    check(c0 && c0->region == 1 && c0->chunk == 0 &&
+              c0->token_begin == 0 && c0->n_tokens == 64,
+          "CPU X64 gather did not become READY");
+    ready.complete(*c0);
+
+    // P[0,128) needs two C64 intervals.
+    check(!ready.try_take(llama_region_ring_device::PHONE).has_value(),
+          "Phone gather released after only one C64 interval");
+    for (int i = 4; i < 8; ++i) {
+        const auto g = ready.try_take(llama_region_ring_device::GPU);
+        check(g && g->region == 0 && g->chunk == (size_t) i,
+              "missing GPU interval for C[64,128)");
+        ready.complete(*g);
+    }
+    const auto c1 = ready.try_take(llama_region_ring_device::CPU);
+    check(c1 && c1->region == 1 && c1->chunk == 1,
+          "second CPU X64 gather missing");
+    ready.complete(*c1);
+    const auto p0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p0 && p0->region == 2 && p0->chunk == 0 &&
+              p0->token_begin == 0 && p0->n_tokens == 128,
+          "Phone X128 gather did not become READY");
+    ready.complete(*p0);
+
+    // One P128 interval covers eight G16 intervals in the next cycle. KV order
+    // intentionally exposes only the first one until it commits.
+    const auto next_g = ready.try_take(llama_region_ring_device::GPU);
+    check(next_g && next_g->region == 3 && next_g->chunk == 0 &&
+              next_g->n_tokens == 16,
+          "P128 did not fan out to next-cycle G16");
+}
+
 static void test_dynamic_slot_pool() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 64, 2);
@@ -534,6 +595,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] parallel_scheduler=PASS\n");
         test_failure_and_wakeup();
         std::fprintf(stderr, "[REGION_RING_TEST] failure=PASS\n");
+        test_nonuniform_interval_ready();
+        std::fprintf(stderr, "[REGION_RING_TEST] nonuniform_interval_ready=PASS\n");
         test_dynamic_slot_pool();
         std::fprintf(stderr, "[REGION_RING_TEST] dynamic_slot_pool=PASS\n");
         test_window_parallel_mock_workers();

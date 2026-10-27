@@ -317,23 +317,89 @@ public:
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
             int n_tokens, int chunk_tokens, size_t slot_pool_size = 0) :
-        regions_(regions), slot_pool_size_(slot_pool_size) {
-        if (regions_.empty() || n_tokens <= 0 || chunk_tokens <= 0) {
-            throw std::runtime_error("invalid region ring scheduler dimensions");
+        llama_region_ring_ready(
+            regions, n_tokens,
+            std::vector<int>(regions.size(), chunk_tokens),
+            slot_pool_size) {
+    }
+
+    llama_region_ring_ready(
+            const std::vector<llama_region_ring_region> & regions,
+            int n_tokens,
+            const std::vector<int> & region_chunk_tokens,
+            size_t slot_pool_size = 0) :
+        regions_(regions),
+        region_chunk_tokens_(region_chunk_tokens),
+        slot_pool_size_(slot_pool_size),
+        n_tokens_(n_tokens) {
+        if (regions_.empty() || n_tokens_ <= 0 ||
+                region_chunk_tokens_.size() != regions_.size() ||
+                std::any_of(
+                    region_chunk_tokens_.begin(), region_chunk_tokens_.end(),
+                    [](int x) { return x <= 0; })) {
+            throw std::runtime_error(
+                "invalid region ring scheduler dimensions");
         }
-        for (int begin = 0; begin < n_tokens; begin += chunk_tokens) {
-            chunk_begins_.push_back(begin);
-            chunk_sizes_.push_back(std::min(chunk_tokens, n_tokens - begin));
+
+        const bool uniform_chunks =
+            std::all_of(
+                region_chunk_tokens_.begin() + 1,
+                region_chunk_tokens_.end(),
+                [&](int x) {
+                    return x == region_chunk_tokens_.front();
+                });
+        if (slot_pool_size_ > 0 && !uniform_chunks) {
+            throw std::runtime_error(
+                "bounded legacy slots require uniform region chunks");
         }
-        const size_t n_chunks = chunk_sizes_.size();
+
+        chunk_begins_.resize(regions_.size());
+        chunk_sizes_.resize(regions_.size());
+        input_pending_.resize(regions_.size());
+        state_.resize(regions_.size());
+
+        for (size_t r = 0; r < regions_.size(); ++r) {
+            const int x = region_chunk_tokens_[r];
+            for (int begin = 0; begin < n_tokens_; begin += x) {
+                chunk_begins_[r].push_back(begin);
+                chunk_sizes_[r].push_back(
+                    std::min(x, n_tokens_ - begin));
+            }
+            total_tasks_ += chunk_sizes_[r].size();
+            input_pending_[r].assign(chunk_sizes_[r].size(), 0);
+            state_[r].assign(chunk_sizes_[r].size(), 0);
+        }
+
+        // READY_V2 dependencies are token intervals, not equal chunk ids.
+        // Each consumer records the number of overlapping producer intervals
+        // that must complete before it can run.
+        for (size_t r = 1; r < regions_.size(); ++r) {
+            for (size_t dst = 0; dst < chunk_sizes_[r].size(); ++dst) {
+                const int db = chunk_begins_[r][dst];
+                const int de = db + chunk_sizes_[r][dst];
+                int pending = 0;
+                for (size_t src = 0;
+                     src < chunk_sizes_[r - 1].size(); ++src) {
+                    const int sb = chunk_begins_[r - 1][src];
+                    const int se = sb + chunk_sizes_[r - 1][src];
+                    if (std::min(se, de) > std::max(sb, db)) {
+                        ++pending;
+                    }
+                }
+                if (pending <= 0) {
+                    throw std::runtime_error(
+                        "region ring interval dependency gap");
+                }
+                input_pending_[r][dst] = pending;
+            }
+        }
+
         if (slot_pool_size_ > 0 && regions_.size() > 1) {
-            output_slots_.assign(regions_.size() - 1, std::vector<output_slot>(slot_pool_size_));
+            output_slots_.assign(
+                regions_.size() - 1,
+                std::vector<output_slot>(slot_pool_size_));
         }
-        input_ready_.assign(regions_.size(), std::vector<uint8_t>(n_chunks, 0));
-        state_.assign(regions_.size(), std::vector<uint8_t>(n_chunks, 0));
-        for (size_t chunk = 0; chunk < n_chunks; ++chunk) {
-            input_ready_[0][chunk] = 1;
-        }
+
         offer_locked(0, 0);
     }
 
@@ -360,11 +426,33 @@ public:
         return failed_;
     }
 
-    size_t n_chunks() const { return chunk_sizes_.size(); }
+    // Compatibility for existing uniform-chunk tests/callers.
+    size_t n_chunks() const {
+        return chunk_sizes_.empty() ? 0 : chunk_sizes_.front().size();
+    }
+
+    size_t n_chunks(size_t region) const {
+        if (region >= chunk_sizes_.size()) {
+            throw std::runtime_error(
+                "invalid region ring region index");
+        }
+        return chunk_sizes_[region].size();
+    }
+
+    size_t total_tasks() const {
+        return total_tasks_;
+    }
+
+    int chunk_tokens(size_t region) const {
+        if (region >= region_chunk_tokens_.size()) {
+            throw std::runtime_error(
+                "invalid region ring region index");
+        }
+        return region_chunk_tokens_[region];
+    }
+
     size_t n_regions() const { return regions_.size(); }
     size_t slot_pool_size() const { return slot_pool_size_; }
-    // Compatibility alias for older tests/callers; runtime semantics are a
-    // dynamic slot pool, not chunk-to-slot modulo mapping.
     size_t output_window() const { return slot_pool_size_; }
 
     size_t live_output_slots() const {
@@ -383,20 +471,21 @@ public:
         return finished_;
     }
 
-    size_t queue_size(llama_region_ring_device device) const {
+    size_t queue_size(
+            llama_region_ring_device device) const {
         const size_t dev = device_index(device);
         std::lock_guard<std::mutex> lock(mutex_);
         return queues_[dev].size();
     }
 
-    // Preserve the original cooperative round-robin entry point for "ready".
     std::optional<llama_region_ring_task> take() {
         std::lock_guard<std::mutex> lock(mutex_);
         if (failed_) {
             return std::nullopt;
         }
         for (size_t pass = 0; pass < queues_.size(); ++pass) {
-            const size_t dev = (next_device_ + pass) % queues_.size();
+            const size_t dev =
+                (next_device_ + pass) % queues_.size();
             if (auto task = take_device_locked(dev)) {
                 next_device_ = (dev + 1) % queues_.size();
                 return task;
@@ -405,20 +494,21 @@ public:
         return std::nullopt;
     }
 
-    // New device-owned FIFO claim. This does not block or rotate other queues.
-    std::optional<llama_region_ring_task> try_take(llama_region_ring_device device) {
+    std::optional<llama_region_ring_task> try_take(
+            llama_region_ring_device device) {
         const size_t dev = device_index(device);
         std::lock_guard<std::mutex> lock(mutex_);
-        return failed_ ? std::nullopt : take_device_locked(dev);
+        return failed_ ?
+            std::nullopt : take_device_locked(dev);
     }
 
-    // Block a device-specific host worker until its next task owns the needed
-    // input and output credits, or all work completes / a failure cancels it.
-    std::optional<llama_region_ring_task> wait_take(llama_region_ring_device device) {
+    std::optional<llama_region_ring_task> wait_take(
+            llama_region_ring_device device) {
         const size_t dev = device_index(device);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] {
-            return failed_ || all_done_locked() || has_claimable_locked(dev);
+            return failed_ || all_done_locked() ||
+                   has_claimable_locked(dev);
         });
         if (failed_ || all_done_locked()) {
             return std::nullopt;
@@ -430,46 +520,82 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!valid_running_locked(task)) {
-                throw std::runtime_error("invalid region ring completion");
+                throw std::runtime_error(
+                    "invalid region ring completion");
             }
+
             if (slot_pool_size_ > 0) {
-                // Release the exact input lease carried by this task only
-                // after the consumer has finished all required reads.
+                // Legacy bounded-slot mode remains uniform-chunk only.
                 if (task.region > 0) {
                     if (task.input_slot < 0 ||
-                        (size_t) task.input_slot >= output_slots_[task.region - 1].size()) {
-                        throw std::runtime_error("region ring task lost its input slot lease");
+                            (size_t) task.input_slot >=
+                                output_slots_[task.region - 1].size()) {
+                        throw std::runtime_error(
+                            "region ring task lost its input slot lease");
                     }
                     auto & input =
-                        output_slots_[task.region - 1][(size_t) task.input_slot];
-                    if (input.state != 3 || input.chunk != task.chunk) {
-                        throw std::runtime_error("region ring input slot released before consumption");
+                        output_slots_[task.region - 1]
+                                     [(size_t) task.input_slot];
+                    if (input.state != 3 ||
+                            input.chunk != task.chunk) {
+                        throw std::runtime_error(
+                            "region ring input slot released before consumption");
                     }
                     input = {};
                 }
                 if (task.region + 1 < regions_.size()) {
                     if (task.output_slot < 0 ||
-                        (size_t) task.output_slot >= output_slots_[task.region].size()) {
-                        throw std::runtime_error("region ring task lost its output slot lease");
+                            (size_t) task.output_slot >=
+                                output_slots_[task.region].size()) {
+                        throw std::runtime_error(
+                            "region ring task lost its output slot lease");
                     }
                     auto & output =
-                        output_slots_[task.region][(size_t) task.output_slot];
-                    if (output.state != 1 || output.chunk != task.chunk) {
-                        throw std::runtime_error("region ring output slot was overwritten");
+                        output_slots_[task.region]
+                                     [(size_t) task.output_slot];
+                    if (output.state != 1 ||
+                            output.chunk != task.chunk) {
+                        throw std::runtime_error(
+                            "region ring output slot was overwritten");
                     }
                     output.state = 2;
                 }
             }
+
             state_[task.region][task.chunk] = 3;
             ++finished_;
 
-            // If another worker failed, drain in-flight work without publishing
-            // any new tasks. Existing READY entries become unclaimable.
             if (!failed_) {
                 if (task.region + 1 < regions_.size()) {
-                    input_ready_[task.region + 1][task.chunk] = 1;
-                    offer_locked(task.region + 1, task.chunk);
+                    const size_t next_region = task.region + 1;
+                    const int sb = task.token_begin;
+                    const int se = sb + task.n_tokens;
+                    for (size_t dst = 0;
+                         dst < chunk_sizes_[next_region].size();
+                         ++dst) {
+                        const int db =
+                            chunk_begins_[next_region][dst];
+                        const int de =
+                            db + chunk_sizes_[next_region][dst];
+                        if (std::min(se, de) <=
+                                std::max(sb, db)) {
+                            continue;
+                        }
+                        int & pending =
+                            input_pending_[next_region][dst];
+                        if (pending <= 0) {
+                            throw std::runtime_error(
+                                "region ring interval dependency underflow");
+                        }
+                        --pending;
+                        if (pending == 0) {
+                            offer_locked(next_region, dst);
+                        }
+                    }
                 }
+
+                // Strict per-Region KV commit order is independent of the
+                // upstream interval geometry.
                 offer_locked(task.region, task.chunk + 1);
             }
         }
@@ -480,7 +606,8 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!valid_running_locked(task)) {
-                throw std::runtime_error("invalid region ring failure");
+                throw std::runtime_error(
+                    "invalid region ring failure");
             }
             state_[task.region][task.chunk] = 4;
             failed_ = true;
@@ -488,7 +615,6 @@ public:
         cv_.notify_all();
     }
 
-    // Used when an executor fails outside a claimed task.
     void cancel() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -498,33 +624,32 @@ public:
     }
 
 private:
-    static size_t device_index(llama_region_ring_device device) {
+    static size_t device_index(
+            llama_region_ring_device device) {
         const size_t dev = (size_t) device;
         if (dev >= 3) {
-            throw std::runtime_error("invalid region ring device");
+            throw std::runtime_error(
+                "invalid region ring device");
         }
         return dev;
     }
 
     bool all_done_locked() const {
-        return finished_ == regions_.size() * chunk_sizes_.size();
+        return finished_ == total_tasks_;
     }
 
-    bool valid_running_locked(const llama_region_ring_task & task) const {
+    bool valid_running_locked(
+            const llama_region_ring_task & task) const {
         return task.region < regions_.size() &&
-               task.chunk < chunk_sizes_.size() &&
+               task.chunk < state_[task.region].size() &&
                state_[task.region][task.chunk] == 2;
     }
 
     struct output_slot {
         size_t  chunk = 0;
-        uint8_t state = 0; // 0=FREE 1=WRITING 2=READY 3=READING
+        uint8_t state = 0;
     };
 
-    // Activation buffers are a dynamic per-edge pool. A producer may use ANY
-    // free slot; a consumer looks up the READY slot that owns its chunk.
-    // This removes the artificial chunk % capacity binding while preserving
-    // bounded memory and explicit FREE/WRITING/READY/READING ownership.
     int find_free_slot_locked(size_t edge) const {
         if (edge >= output_slots_.size()) {
             return -1;
@@ -538,29 +663,33 @@ private:
         return -1;
     }
 
-    int find_ready_slot_locked(size_t edge, size_t chunk) const {
+    int find_ready_slot_locked(
+            size_t edge, size_t chunk) const {
         if (edge >= output_slots_.size()) {
             return -1;
         }
         const auto & slots = output_slots_[edge];
         for (size_t i = 0; i < slots.size(); ++i) {
-            if (slots[i].state == 2 && slots[i].chunk == chunk) {
+            if (slots[i].state == 2 &&
+                    slots[i].chunk == chunk) {
                 return (int) i;
             }
         }
         return -1;
     }
 
-    bool claimable_locked(const llama_region_ring_task & task) const {
+    bool claimable_locked(
+            const llama_region_ring_task & task) const {
         if (slot_pool_size_ == 0) {
             return true;
         }
         if (task.region + 1 < regions_.size() &&
-            find_free_slot_locked(task.region) < 0) {
+                find_free_slot_locked(task.region) < 0) {
             return false;
         }
         if (task.region > 0 &&
-            find_ready_slot_locked(task.region - 1, task.chunk) < 0) {
+                find_ready_slot_locked(
+                    task.region - 1, task.chunk) < 0) {
             return false;
         }
         return true;
@@ -568,76 +697,97 @@ private:
 
     bool has_claimable_locked(size_t dev) const {
         const auto & queue = queues_[dev];
-        return std::any_of(queue.begin(), queue.end(), [this](const auto & task) {
-            return claimable_locked(task);
-        });
+        return std::any_of(
+            queue.begin(), queue.end(),
+            [this](const auto & task) {
+                return claimable_locked(task);
+            });
     }
 
-    std::optional<llama_region_ring_task> take_device_locked(size_t dev) {
+    std::optional<llama_region_ring_task>
+    take_device_locked(size_t dev) {
         auto & queue = queues_[dev];
-        // Skip credit-blocked tasks; do not block unrelated READY regions.
-        // Exact per-region KV dependencies still order consecutive chunks.
-        const auto it = std::find_if(queue.begin(), queue.end(),
-            [this](const auto & task) { return claimable_locked(task); });
+        const auto it = std::find_if(
+            queue.begin(), queue.end(),
+            [this](const auto & task) {
+                return claimable_locked(task);
+            });
         if (it == queue.end()) {
             return std::nullopt;
         }
+
         auto task = *it;
         queue.erase(it);
         if (state_[task.region][task.chunk] != 1 ||
-            (size_t) regions_[task.region].device != dev) {
-            throw std::runtime_error("region ring task was claimed twice or by wrong device");
+                (size_t) regions_[task.region].device != dev) {
+            throw std::runtime_error(
+                "region ring task was claimed twice or by wrong device");
         }
+
         if (slot_pool_size_ > 0) {
             if (task.region + 1 < regions_.size()) {
-                task.output_slot = find_free_slot_locked(task.region);
+                task.output_slot =
+                    find_free_slot_locked(task.region);
                 if (task.output_slot < 0) {
-                    throw std::runtime_error("region ring output slot disappeared while claiming");
+                    throw std::runtime_error(
+                        "region ring output slot disappeared while claiming");
                 }
                 auto & output =
-                    output_slots_[task.region][(size_t) task.output_slot];
+                    output_slots_[task.region]
+                                 [(size_t) task.output_slot];
                 output = {task.chunk, 1};
             }
             if (task.region > 0) {
                 task.input_slot =
-                    find_ready_slot_locked(task.region - 1, task.chunk);
+                    find_ready_slot_locked(
+                        task.region - 1, task.chunk);
                 if (task.input_slot < 0) {
-                    throw std::runtime_error("region ring input slot disappeared while claiming");
+                    throw std::runtime_error(
+                        "region ring input slot disappeared while claiming");
                 }
                 auto & input =
-                    output_slots_[task.region - 1][(size_t) task.input_slot];
+                    output_slots_[task.region - 1]
+                                 [(size_t) task.input_slot];
                 input.state = 3;
             }
         }
+
         state_[task.region][task.chunk] = 2;
         return task;
     }
 
-    // Called only while holding mutex_, except from the constructor.
     void offer_locked(size_t region, size_t chunk) {
         if (region >= regions_.size() ||
-            chunk >= chunk_sizes_.size() ||
-            state_[region][chunk] != 0 ||
-            !input_ready_[region][chunk] ||
-            (chunk > 0 && state_[region][chunk - 1] != 3)) {
+                chunk >= chunk_sizes_[region].size() ||
+                state_[region][chunk] != 0 ||
+                input_pending_[region][chunk] != 0 ||
+                (chunk > 0 &&
+                 state_[region][chunk - 1] != 3)) {
             return;
         }
+
         state_[region][chunk] = 1;
         queues_[(size_t) regions_[region].device].push_back({
-            region, chunk, chunk_begins_[chunk], chunk_sizes_[chunk]});
+            region,
+            chunk,
+            chunk_begins_[region][chunk],
+            chunk_sizes_[region][chunk]
+        });
     }
 
     const std::vector<llama_region_ring_region> regions_;
-    const size_t slot_pool_size_ = 0; // 0: legacy full-ubatch output storage
+    const std::vector<int> region_chunk_tokens_;
+    const size_t slot_pool_size_ = 0;
+    const int n_tokens_ = 0;
     std::vector<std::vector<output_slot>> output_slots_;
-    std::vector<int> chunk_begins_;
-    std::vector<int> chunk_sizes_;
-    std::vector<std::vector<uint8_t>> input_ready_;
-    // 0=not queued, 1=ready, 2=running, 3=complete, 4=failed
+    std::vector<std::vector<int>> chunk_begins_;
+    std::vector<std::vector<int>> chunk_sizes_;
+    std::vector<std::vector<int>> input_pending_;
     std::vector<std::vector<uint8_t>> state_;
     std::array<std::deque<llama_region_ring_task>, 3> queues_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    size_t total_tasks_ = 0;
     size_t finished_ = 0;
     size_t next_device_ = 0;
     bool failed_ = false;
