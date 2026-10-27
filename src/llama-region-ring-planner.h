@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <limits>
 #include <queue>
@@ -36,7 +37,15 @@ struct candidate {
     double coarse_ms = 0.0;
     double wall_ms = 0.0;
     std::array<double, 3> busy_ms {};
+    // Non-zero only when the legacy CPU/CUDA serialization model is enabled.
     double pc_gate_busy_ms = 0.0;
+    // Lower-bound PC compute span under the selected runtime semantics:
+    // sum(CPU,GPU) when gated, max(CPU,GPU) when independent.
+    double pc_compute_bound_ms = 0.0;
+    // Per-token service demand after simulation (or coarse estimation).
+    std::array<double, 3> service_ms_per_token {};
+    double phone_link_ms_per_token = 0.0;
+    double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
     int tasks = 0;
     int edges = 0;
@@ -51,9 +60,9 @@ struct model {
     int slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     int max_tail = 12;
     bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
-    // Runtime region_ring_backend_execution_mutex serializes PC CPU/CUDA
-    // graph execution. Phone computation can overlap after READY releases it.
-    bool pc_compute_gate = true;
+    // Current Region Ring runtime has independent CPU and CUDA compute lanes.
+    // Keep this switch only so tests can compare the historical gated model.
+    bool pc_compute_gate = false;
     double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
@@ -99,10 +108,13 @@ struct task {
     int begin = 0;
     int end = 0;
     int previous = -1;
+    int next = -1;
     int inputs = 0;
     int outputs = 0;
+    // Number of downstream consumers that still retain this producer slot.
     int remaining_outputs = 0;
     double duration = 0.0;
+    bool queued = false;
     bool started = false;
     bool done = false;
 };
@@ -138,12 +150,14 @@ inline bool simulate(const model & m,
         m.slot_pool <= 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
     }
+
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
     for (size_t r = 0; r < regions.size(); ++r) {
         const auto d = regions[r].device;
         const int x = chunk_for(c, d);
         if (x <= 0) { return reject("INVALID_CHUNK"); }
+
         int previous = -1;
         for (int begin = 0; begin < m.tokens; begin += x) {
             const int end = std::min(m.tokens, begin + x);
@@ -155,18 +169,26 @@ inline bool simulate(const model & m,
                 return reject("COMPUTE_PROFILE_MISSING");
             }
             if (d == device::PHONE) {
-                // The registered graph scales with the number of Phone
-                // layers; never apply the same 314-node/P5 registration
-                // estimate unchanged to arbitrary P2/P8 candidates.
                 ms += m.phone_register_ms *
                       (double) (regions[r].layer_end - regions[r].layer_begin) / 5.0;
             }
+
+            task t;
+            t.region = (int) r;
+            t.begin = begin;
+            t.end = end;
+            t.previous = previous;
+            t.duration = ms;
             const int id = (int) tasks.size();
-            tasks.push_back({(int) r, begin, end, previous, 0, 0, 0, ms});
+            tasks.push_back(t);
+            if (previous >= 0) {
+                tasks[(size_t) previous].next = id;
+            }
             by_region[r].push_back(id);
             previous = id;
         }
     }
+
     std::vector<edge> edges;
     for (size_t r = 0; r + 1 < regions.size(); ++r) {
         const auto a = regions[r].device;
@@ -175,134 +197,224 @@ inline bool simulate(const model & m,
                          b == device::PHONE ? 1 : 0;
         for (int src : by_region[r]) {
             for (int dst : by_region[r + 1]) {
-                const int overlap = std::min(tasks[src].end, tasks[dst].end) -
-                                    std::max(tasks[src].begin, tasks[dst].begin);
+                const int overlap = std::min(tasks[(size_t) src].end,
+                                             tasks[(size_t) dst].end) -
+                                    std::max(tasks[(size_t) src].begin,
+                                             tasks[(size_t) dst].begin);
                 if (overlap <= 0) { continue; }
-                const size_t bytes = (size_t) overlap * (size_t) m.hidden * sizeof(float);
+                const size_t bytes =
+                    (size_t) overlap * (size_t) m.hidden * sizeof(float);
                 double ms = 0.0;
                 if (!m.transfer_ms(a, b, bytes, ms) ||
                     !std::isfinite(ms) || ms < 0.0) {
                     return reject("TRANSFER_PROFILE_MISSING");
                 }
                 edges.push_back({src, dst, lane, ms});
-                ++tasks[src].outputs;
-                ++tasks[dst].inputs;
+                ++tasks[(size_t) src].outputs;
+                ++tasks[(size_t) dst].inputs;
             }
         }
     }
-    for (auto & t : tasks) { t.remaining_outputs = t.outputs; }
+    for (auto & t : tasks) {
+        t.remaining_outputs = t.outputs;
+    }
+
     std::priority_queue<event> events;
+    std::array<std::deque<int>, 3> ready_queues;
     std::array<bool, 3> device_busy {}, link_busy {};
     bool pc_compute_gate_busy = false;
-    int next_pc_device = 0;  // Round-robin tie break across PC CPU/CUDA.
+    int next_pc_device = 0;
     std::vector<int> live_slots(regions.size(), 0);
     std::array<double, 3> busy_ms {}, transfer_busy_ms {};
+
+    auto task_ready = [&](int id) -> bool {
+        if (id < 0 || id >= (int) tasks.size()) {
+            return false;
+        }
+        const auto & t = tasks[(size_t) id];
+        return !t.queued && !t.started && !t.done && t.inputs == 0 &&
+               (t.previous < 0 || tasks[(size_t) t.previous].done);
+    };
+    auto offer = [&](int id) {
+        if (!task_ready(id)) {
+            return;
+        }
+        auto & t = tasks[(size_t) id];
+        t.queued = true;
+        ready_queues[(size_t) regions[(size_t) t.region].device].push_back(id);
+    };
+    auto claimable = [&](int id) -> bool {
+        const auto & t = tasks[(size_t) id];
+        const int r = t.region;
+        return !(r + 1 < (int) regions.size() &&
+                 live_slots[(size_t) r] >= m.slot_pool);
+    };
+
+    if (by_region.empty() || by_region[0].empty()) {
+        return reject("NO_INITIAL_TASK");
+    }
+    offer(by_region[0].front());
+
     double now = 0.0;
     int completed = 0;
     int max_live = 0;
     const int n_tasks = (int) tasks.size();
+
     while (completed < n_tasks) {
         bool scheduled = false;
-        // Prefer ready transfers: they release producer output-slot credits.
+
+        // Producer completion makes its output transferable immediately.
+        // Phone directions share one conservative Wi-Fi lane.
         for (size_t e = 0; e < edges.size(); ++e) {
             auto & it = edges[e];
-            if (it.started || !tasks[it.producer].done || link_busy[it.lane]) {
+            if (it.started || !tasks[(size_t) it.producer].done ||
+                link_busy[(size_t) it.lane]) {
                 continue;
             }
             it.started = true;
-            link_busy[it.lane] = true;
-            transfer_busy_ms[it.lane] += it.duration;
+            link_busy[(size_t) it.lane] = true;
+            transfer_busy_ms[(size_t) it.lane] += it.duration;
             events.push({now + it.duration, (int) e, true});
             scheduled = true;
         }
+
+        // Match llama_region_ring_ready::take_device_locked(): each device
+        // owns a FIFO, but may skip an older READY task whose output edge has
+        // no free slot. CPU and CUDA are independent unless the historical
+        // gated model is explicitly requested.
         for (int turn = 0; turn < 3; ++turn) {
             const int dev = m.pc_compute_gate && turn < 2 ?
                 (turn == 0 ? next_pc_device : 1 - next_pc_device) : turn;
-            if (device_busy[dev] ||
+            if (device_busy[(size_t) dev] ||
                 (m.pc_compute_gate && dev != (int) device::PHONE &&
                  pc_compute_gate_busy)) {
                 continue;
             }
-            // Downstream-first scheduling helps clear Window credits without
-            // overtaking the previous KV interval in a single Region.
-            for (int r = (int) regions.size() - 1; r >= 0; --r) {
-                if ((int) regions[r].device != dev) { continue; }
-                int selected = -1;
-                for (int id : by_region[r]) {
-                    const auto & t = tasks[id];
-                    if (t.started || t.inputs != 0 ||
-                        (t.previous >= 0 && !tasks[t.previous].done) ||
-                        (r + 1 < (int) regions.size() &&
-                         live_slots[r] >= m.slot_pool)) {
-                        continue;
-                    }
-                    selected = id;
-                    break;
-                }
-                if (selected < 0) { continue; }
-                auto & t = tasks[selected];
-                t.started = true;
-                device_busy[dev] = true;
-                if (m.pc_compute_gate && dev != (int) device::PHONE) {
-                    pc_compute_gate_busy = true;
-                    next_pc_device = 1 - dev;
-                }
-                if (r + 1 < (int) regions.size()) {
-                    ++live_slots[r];
-                    for (int s : live_slots) { max_live = std::max(max_live, s); }
-                }
-                busy_ms[dev] += t.duration;
-                events.push({now + t.duration, selected, false});
-                scheduled = true;
-                break;
+
+            auto & q = ready_queues[(size_t) dev];
+            auto it = std::find_if(q.begin(), q.end(),
+                [&](int id) { return claimable(id); });
+            if (it == q.end()) {
+                continue;
             }
+
+            const int selected = *it;
+            q.erase(it);
+            auto & t = tasks[(size_t) selected];
+            t.queued = false;
+            t.started = true;
+            device_busy[(size_t) dev] = true;
+            if (m.pc_compute_gate && dev != (int) device::PHONE) {
+                pc_compute_gate_busy = true;
+                next_pc_device = 1 - dev;
+            }
+
+            if (t.region + 1 < (int) regions.size()) {
+                ++live_slots[(size_t) t.region];
+                max_live = std::max(max_live,
+                                    live_slots[(size_t) t.region]);
+                if (live_slots[(size_t) t.region] > m.slot_pool) {
+                    return reject("SLOT_POOL_OVERFLOW");
+                }
+            }
+
+            busy_ms[(size_t) dev] += t.duration;
+            events.push({now + t.duration, selected, false});
+            scheduled = true;
         }
+
         if (events.empty()) {
-            return reject(scheduled ? "INTERNAL_EVENT_ERROR" : "SLOT_OR_KV_DEADLOCK");
+            return reject(scheduled ? "INTERNAL_EVENT_ERROR" :
+                                      "SLOT_OR_KV_DEADLOCK");
         }
+
         now = events.top().at;
-        if (!std::isfinite(now)) { return reject("TIME_NONFINITE"); }
-        // Handle all completions at this simulated time before scheduling.
+        if (!std::isfinite(now)) {
+            return reject("TIME_NONFINITE");
+        }
+
+        // Process every completion at this timestamp before claiming more work.
         while (!events.empty() && events.top().at <= now) {
             const event current = events.top();
             events.pop();
+
             if (current.is_edge) {
-                const auto & e = edges[current.id];
-                link_busy[e.lane] = false;
-                if (--tasks[e.consumer].inputs < 0 ||
-                    --tasks[e.producer].remaining_outputs < 0) {
+                const auto & e = edges[(size_t) current.id];
+                link_busy[(size_t) e.lane] = false;
+                auto & consumer = tasks[(size_t) e.consumer];
+                if (--consumer.inputs < 0) {
                     return reject("EDGE_COUNT_UNDERFLOW");
                 }
-                if (tasks[e.producer].remaining_outputs == 0) {
-                    --live_slots[tasks[e.producer].region];
-                }
-            } else {
-                auto & t = tasks[current.id];
-                if (t.done) { return reject("DUPLICATE_TASK_DONE"); }
-                t.done = true;
-                const int finished_device = (int) regions[t.region].device;
-                device_busy[finished_device] = false;
-                if (m.pc_compute_gate &&
-                    finished_device != (int) device::PHONE) {
-                    pc_compute_gate_busy = false;
-                }
-                ++completed;
+                offer(e.consumer);
+                continue;
             }
+
+            auto & t = tasks[(size_t) current.id];
+            if (t.done) {
+                return reject("DUPLICATE_TASK_DONE");
+            }
+            t.done = true;
+            const int finished_device =
+                (int) regions[(size_t) t.region].device;
+            device_busy[(size_t) finished_device] = false;
+            if (m.pc_compute_gate &&
+                finished_device != (int) device::PHONE) {
+                pc_compute_gate_busy = false;
+            }
+            ++completed;
+
+            // Current runtime releases a producer activation Slot only after
+            // the downstream consumer has finished reading it, not merely
+            // when the boundary transfer/staging becomes ready.
+            for (const auto & e : edges) {
+                if (e.consumer != current.id) {
+                    continue;
+                }
+                auto & producer = tasks[(size_t) e.producer];
+                if (--producer.remaining_outputs < 0) {
+                    return reject("CONSUMER_COUNT_UNDERFLOW");
+                }
+                if (producer.remaining_outputs == 0) {
+                    const int r = producer.region;
+                    if (r + 1 >= (int) regions.size() ||
+                        --live_slots[(size_t) r] < 0) {
+                        return reject("SLOT_RELEASE_UNDERFLOW");
+                    }
+                }
+            }
+
+            offer(t.next);
         }
     }
-    if (std::any_of(live_slots.begin(), live_slots.end(), [](int x){return x != 0;})) {
+
+    if (std::any_of(live_slots.begin(), live_slots.end(),
+                    [](int x) { return x != 0; })) {
         return reject("LIVE_SLOTS_NOT_DRAINED");
     }
     if (m.pc_compute_gate &&
         busy_ms[(int) device::CPU] + busy_ms[(int) device::GPU] >
-        now + std::max(1e-6, 1e-9 * now)) {
+            now + std::max(1e-6, 1e-9 * now)) {
         return reject("PC_GATE_OVERCOMMITTED");
     }
+
     c.wall_ms = now;
-    c.pc_gate_busy_ms = busy_ms[(int) device::CPU] +
-                        busy_ms[(int) device::GPU];
+    c.pc_gate_busy_ms = m.pc_compute_gate ?
+        busy_ms[(int) device::CPU] + busy_ms[(int) device::GPU] : 0.0;
+    c.pc_compute_bound_ms = m.pc_compute_gate ?
+        busy_ms[(int) device::CPU] + busy_ms[(int) device::GPU] :
+        std::max(busy_ms[(int) device::CPU],
+                 busy_ms[(int) device::GPU]);
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
+    for (size_t i = 0; i < c.service_ms_per_token.size(); ++i) {
+        c.service_ms_per_token[i] =
+            busy_ms[i] / std::max(1, m.tokens);
+    }
+    c.pc_local_link_ms_per_token =
+        transfer_busy_ms[0] / std::max(1, m.tokens);
+    c.phone_link_ms_per_token =
+        (transfer_busy_ms[1] + transfer_busy_ms[2]) /
+        std::max(1, m.tokens);
     c.tasks = n_tasks;
     c.edges = (int) edges.size();
     c.max_live_slots = max_live;
@@ -310,30 +422,96 @@ inline bool simulate(const model & m,
 }
 
 inline bool estimate_balance(const model & m, candidate & c) {
-    if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0) { return false; }
+    if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0 ||
+        c.c <= 0 || c.g <= 0 || c.p <= 0 ||
+        c.xc <= 0 || c.xg <= 0 || c.xp <= 0) {
+        return false;
+    }
+
     const int kv = m.kv_start + m.tokens / 2;
-    double tc=0, tg=0, tp=0, cp=0, pc=0, local=0;
-    if (!m.compute_ms(device::CPU,c.c,c.xc,kv,tc) ||
-        !m.compute_ms(device::GPU,c.g,c.xg,kv,tg) ||
-        !m.compute_ms(device::PHONE,c.p,c.xp,kv,tp)) { return false; }
+    double tc = 0.0, tg = 0.0, tp = 0.0;
+    double cp = 0.0, pc = 0.0, local = 0.0;
+    if (!m.compute_ms(device::CPU, c.c, c.xc, kv, tc) ||
+        !m.compute_ms(device::GPU, c.g, c.xg, kv, tg) ||
+        !m.compute_ms(device::PHONE, c.p, c.xp, kv, tp)) {
+        return false;
+    }
+    tp += m.phone_register_ms * (double) c.p / 5.0;
+
     constexpr int ref_tokens = 64;
-    const size_t bytes = (size_t) m.hidden * ref_tokens * sizeof(float);
-    if (!m.transfer_ms(device::GPU,device::PHONE,bytes,cp) ||
-        !m.transfer_ms(device::PHONE,device::CPU,bytes,pc) ||
-        !m.transfer_ms(device::CPU,device::GPU,bytes,local)) { return false; }
-    const double s_pc = tc/c.xc + tg/c.xg + (cp+local)/ref_tokens;
-    const double s_phone = tp/c.xp + pc/ref_tokens;
-    if (!(s_pc > 0.0) || !(s_phone > 0.0)) { return false; }
-    c.balance = std::abs(s_pc-s_phone) / std::max(s_pc,s_phone);
-    const double cpu_total = c.cycles*tc/c.xc + c.tail_c*(tc/c.xc/std::max(c.c,1));
-    const double gpu_total = c.cycles*tg/c.xg + c.tail_g*(tg/c.xg/std::max(c.g,1));
-    const double phone_total = c.cycles*tp/c.xp;
-    const double net_total = c.cycles*(cp+pc)/ref_tokens;
-    const double pc_gate_total = m.pc_compute_gate ?
-        cpu_total + gpu_total : std::max(cpu_total,gpu_total);
-    c.coarse_ms = m.tokens*std::max({pc_gate_total,phone_total,net_total}) +
-                  m.tokens*0.03*c.balance*std::max(s_pc,s_phone);
-    return std::isfinite(c.coarse_ms);
+    const size_t bytes =
+        (size_t) m.hidden * ref_tokens * sizeof(float);
+    if (!m.transfer_ms(device::GPU, device::PHONE, bytes, cp) ||
+        !m.transfer_ms(device::PHONE, device::CPU, bytes, pc) ||
+        !m.transfer_ms(device::CPU, device::GPU, bytes, local)) {
+        return false;
+    }
+
+    const double cpu_region_per_token = tc / c.xc;
+    const double gpu_region_per_token = tg / c.xg;
+    const double phone_region_per_token = tp / c.xp;
+    const double cpu_layer_per_token =
+        cpu_region_per_token / std::max(c.c, 1);
+    const double gpu_layer_per_token =
+        gpu_region_per_token / std::max(c.g, 1);
+
+    const double cpu_total =
+        c.cycles * cpu_region_per_token +
+        c.tail_c * cpu_layer_per_token;
+    const double gpu_total =
+        c.cycles * gpu_region_per_token +
+        c.tail_g * gpu_layer_per_token;
+    const double phone_total =
+        c.cycles * phone_region_per_token;
+
+    const bool has_tail = c.tail_c + c.tail_g > 0;
+    const int phone_to_pc_edges =
+        std::max(0, c.cycles - 1) + (has_tail ? 1 : 0);
+    const int pc_to_phone_edges = c.cycles;
+    const int pc_local_edges =
+        c.cycles + (c.tail_c > 0 && c.tail_g > 0 ? 1 : 0);
+    const double phone_link_total =
+        (pc_to_phone_edges * cp + phone_to_pc_edges * pc) /
+        ref_tokens;
+    const double local_link_total =
+        pc_local_edges * local / ref_tokens;
+
+    c.service_ms_per_token = {cpu_total, gpu_total, phone_total};
+    c.phone_link_ms_per_token = phone_link_total;
+    c.pc_local_link_ms_per_token = local_link_total;
+
+    if (m.pc_compute_gate) {
+        // Historical compatibility path: CPU and CUDA form one serialized PC
+        // station. Keep it available only for regression comparisons.
+        const double pc_total = cpu_total + gpu_total;
+        if (!(pc_total > 0.0) || !(phone_total > 0.0)) {
+            return false;
+        }
+        c.balance = std::abs(pc_total - phone_total) /
+                    std::max(pc_total, phone_total);
+        c.coarse_ms = m.tokens *
+            std::max({pc_total, phone_total,
+                      phone_link_total, local_link_total});
+    } else {
+        // Current runtime: CPU, CUDA and Phone are three independent service
+        // lanes. Coarse ranking balances their total per-token demand; network
+        // lanes remain independent bottlenecks. Exact FIFO simulation decides
+        // the final T_prefill.
+        const double hi =
+            std::max({cpu_total, gpu_total, phone_total});
+        const double lo =
+            std::min({cpu_total, gpu_total, phone_total});
+        if (!(hi > 0.0) || !(lo > 0.0)) {
+            return false;
+        }
+        c.balance = (hi - lo) / hi;
+        c.coarse_ms = m.tokens *
+            std::max({cpu_total, gpu_total, phone_total,
+                      phone_link_total, local_link_total});
+    }
+
+    return std::isfinite(c.coarse_ms) &&
+           std::isfinite(c.balance);
 }
 
 struct result {
@@ -457,7 +635,7 @@ inline supported_result search_supported_fixed_phone(
     supported_result result;
     if (!llama_region_ring_apply_safe_phone_shape(baseline) ||
             m.layers != 48 || m.tokens <= 0 || chunk_tokens != 64 ||
-            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE || !m.pc_compute_gate) {
+            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE) {
         return result;
     }
     result.baseline.regions = baseline;
@@ -537,9 +715,11 @@ inline supported_result search_supported_fixed_phone(
     return result;
 }
 
-// Executable free C/G/P search for the current three-cycle Ring. This keeps
-// Chunk64, the dynamic activation-slot pool, C->G->P ordering and a final
-// Phone owner fixed, but it does NOT preserve P5 or the old CUDA/Phone totals.
+// Executable free C/G/P search for the current three-cycle Ring. CPU, CUDA
+// and Phone are scored as independent compute lanes, then every candidate is
+// run through the exact FIFO/KV/dynamic-slot event simulation. This keeps
+// Chunk64, C->G->P ordering and final Phone ownership fixed, but does NOT
+// preserve P5 or the old CUDA/Phone totals.
 // For a 48-layer model, C+G+P=16 and the current Phone contract allows P2..P8.
 inline result search_three_cycle_cgp(
         const model & m,
@@ -549,7 +729,7 @@ inline result search_three_cycle_cgp(
     if (m.layers < 9 || m.layers % 3 != 0 || m.tokens <= 0 ||
             chunk_tokens != 64 ||
             m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE ||
-            !m.pc_compute_gate || !m.memory_feasible) {
+            !m.memory_feasible) {
         return out;
     }
 
@@ -652,7 +832,8 @@ inline result search_supported_topology(
         const model & m, int chunk_tokens, int max_simulations = 192) {
     result out;
     if (m.layers < 6 || m.tokens <= 0 || chunk_tokens != 64 ||
-            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE || !m.pc_compute_gate || max_simulations <= 0) {
+            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE ||
+            max_simulations <= 0) {
         return out;
     }
     std::vector<candidate> coarse;

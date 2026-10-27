@@ -17,6 +17,7 @@ using namespace llama_ring_planner;
 static model mock_profile() {
     model m;
     m.layers = 48;
+    m.pc_compute_gate = false;
     m.tokens = 358;
     m.hidden = 2048;
     m.slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
@@ -47,21 +48,25 @@ int main() {
     REQUIRE(make_regions(uniform, m.layers, regions));
     REQUIRE(regions.size() == 9);
     REQUIRE(simulate(m, regions, uniform, &reason));
-    REQUIRE(uniform.tasks == 54 && uniform.max_live_slots <= 2);
+    REQUIRE(uniform.tasks == 54 && uniform.max_live_slots <= m.slot_pool);
     REQUIRE(uniform.wall_ms > 0.0);
-    // PC CPU and CUDA share the real execution gate: their aggregate
-    // compute demand cannot exceed elapsed wall time in the gated model.
-    REQUIRE(uniform.pc_gate_busy_ms <= uniform.wall_ms + 1e-6);
-    REQUIRE(std::fabs(uniform.pc_gate_busy_ms -
-                     uniform.busy_ms[0] - uniform.busy_ms[1]) < 1e-6);
+    // Current runtime: CPU and CUDA are independent compute lanes.
+    REQUIRE(uniform.pc_gate_busy_ms == 0.0);
+    REQUIRE(std::fabs(uniform.pc_compute_bound_ms -
+                     std::max(uniform.busy_ms[0], uniform.busy_ms[1])) < 1e-6);
+    REQUIRE(uniform.service_ms_per_token[0] > 0.0);
+    REQUIRE(uniform.service_ms_per_token[1] > 0.0);
+    REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
-    // The counterfactual independent-device model is retained for future
-    // backend ownership experiments, but must be opt-in.
-    model independent_pc = mock_profile();
-    independent_pc.pc_compute_gate = false;
-    candidate independent_uniform = uniform;
-    REQUIRE(simulate(independent_pc, regions, independent_uniform, &reason));
-    REQUIRE(independent_uniform.wall_ms > 0.0);
+    // Keep the historical gated model only as a regression comparison.
+    model gated_pc = mock_profile();
+    gated_pc.pc_compute_gate = true;
+    candidate gated_uniform = uniform;
+    REQUIRE(simulate(gated_pc, regions, gated_uniform, &reason));
+    REQUIRE(gated_uniform.pc_gate_busy_ms <= gated_uniform.wall_ms + 1e-6);
+    REQUIRE(std::fabs(gated_uniform.pc_gate_busy_ms -
+                     gated_uniform.busy_ms[0] - gated_uniform.busy_ms[1]) < 1e-6);
+    REQUIRE(gated_uniform.wall_ms + 1e-6 >= uniform.wall_ms);
 
     // One PC Chunk splits into two or four Phone Chunks. The output Slot
     // is released when all transfers have entered downstream staging.
@@ -71,7 +76,7 @@ int main() {
     smaller_phone.xp = 16;
     REQUIRE(simulate(m, regions, smaller_phone, &reason));
     REQUIRE(smaller_phone.tasks > uniform.tasks);
-    REQUIRE(smaller_phone.max_live_slots <= 2);
+    REQUIRE(smaller_phone.max_live_slots <= m.slot_pool);
     REQUIRE(smaller_phone.pc_gate_busy_ms <= smaller_phone.wall_ms + 1e-6);
 
     // Many Phone producers feed a larger PC Chunk: test interval gather and
@@ -81,7 +86,7 @@ int main() {
     larger_pc.xg = 64;
     larger_pc.xp = 32;
     REQUIRE(simulate(m, regions, larger_pc, &reason));
-    REQUIRE(larger_pc.max_live_slots <= 2);
+    REQUIRE(larger_pc.max_live_slots <= m.slot_pool);
 
     // A non-dividing three-cycle width gives a PC-only final suffix.
     candidate tail = uniform;
@@ -135,12 +140,13 @@ int main() {
     REQUIRE(make_regions(general.selected,48,general_regions));
     REQUIRE(llama_region_ring_apply_topology_compatible(
         general_regions,48));
-    REQUIRE(general.selected.max_live_slots <= 2);
+    REQUIRE(general.selected.max_live_slots <= m.slot_pool);
     REQUIRE(!search_supported_topology(general_profile,128).valid);
 
     // APPLY_CGP frees exactly the three repeated region lengths while
     // keeping three C->G->P cycles, Chunk64, the shared dynamic slot pool and
-    // final Phone ownership. For 48 layers: C+G+P=16, P2..P8 => 70 layouts.
+    // final Phone ownership. CPU/CUDA/Phone are independent service lanes.
+    // For 48 layers: C+G+P=16, P2..P8 => 70 layouts.
     const auto baseline_regions = llama_region_ring_parse("", 48);
     model free_cgp_profile = mock_profile();
     const result free_cgp =
@@ -206,7 +212,7 @@ int main() {
                 baseline_regions,choice.regions));
         REQUIRE(llama_region_ring_apply_safe_phone_shape(choice.regions));
         REQUIRE(choice.estimate.tasks == 54);
-        REQUIRE(choice.estimate.max_live_slots <= 2);
+        REQUIRE(choice.estimate.max_live_slots <= m.slot_pool);
     }
 
     model only_baseline = mock_profile();

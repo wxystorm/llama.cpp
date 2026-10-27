@@ -8344,6 +8344,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     model.slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     model.max_tail = 12;
     model.shared_phone_link = true; // Conservative Wi-Fi contention.
+    // Runtime validation now shows CPU/CUDA compute are independently gated;
+    // GPU/Phone CPU wait is no longer the execution bottleneck.
+    model.pc_compute_gate = false;
 
     // Current READY V1 re-registers nearly every distinct Graph UID. Charge
     // each Phone task for an approximate registration until shape/slot/position
@@ -8464,13 +8467,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
         "register_ms_per_task=%.3f weights=%s "
-        "network=SHARED_CONSERVATIVE pc_gate=CPU_CUDA_SERIAL "
-        "action=%s\n",
+        "network=SHARED_CONSERVATIVE pc_compute=CPU_CUDA_INDEPENDENT "
+        "scheduler=DEVICE_FIFO slot_pool=%d action=%s\n",
         tokens, model.kv_start,
         profile.cpu_layer_blocks.size(), profile.gpu_layer_blocks.size(),
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
         profile.phone_to_pc.size(), model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
+        model.slot_pool,
         baseline_only ? "APPLY_BASELINE" :
         free_cgp ? "APPLY_CGP" :
         selected_layout != nullptr ? "APPLY_SAFE" :
@@ -8618,12 +8622,20 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_CGP_CANDIDATE] rank=%zu "
                     "layout=%s C=%d G=%d P=%d chunk=%d "
-                    "predicted_ms=%.3f pc_gate_busy_ms=%.3f "
-                    "balance=%.4f\n",
+                    "predicted_ms=%.3f pc_bound_ms=%.3f "
+                    "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
+                    "phone_service_mspt=%.6f phone_link_mspt=%.6f "
+                    "local_link_mspt=%.6f balance=%.4f\n",
                     i + 1,
                     llama_region_ring_layout_string(regions).c_str(),
                     c.c, c.g, c.p, baseline_chunk,
-                    c.wall_ms, c.pc_gate_busy_ms, c.balance);
+                    c.wall_ms, c.pc_compute_bound_ms,
+                    c.service_ms_per_token[0],
+                    c.service_ms_per_token[1],
+                    c.service_ms_per_token[2],
+                    c.phone_link_ms_per_token,
+                    c.pc_local_link_ms_per_token,
+                    c.balance);
             }
 
             const auto & best = free_result.selected;
@@ -8884,12 +8896,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         llama_ring_planner::simulate(model, baseline_regions, baseline);
     LLAMA_LOG_ERROR(
         "[REGION_RING_PLAN_BASELINE] tokens=%d chunk=%d "
-        "predicted_ms=%.3f pc_gate_busy_ms=%.3f "
+        "predicted_ms=%.3f pc_bound_ms=%.3f "
         "cpu_busy_ms=%.3f gpu_busy_ms=%.3f "
         "phone_busy_ms=%.3f status=%s\n",
         tokens, baseline_chunk,
         base_ok ? baseline.wall_ms : -1.0,
-        base_ok ? baseline.pc_gate_busy_ms : -1.0,
+        base_ok ? baseline.pc_compute_bound_ms : -1.0,
         base_ok ? baseline.busy_ms[0] : -1.0,
         base_ok ? baseline.busy_ms[1] : -1.0,
         base_ok ? baseline.busy_ms[2] : -1.0,
@@ -8916,11 +8928,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "C=%d G=%d P=%d tail_C=%d tail_G=%d "
             "XC=%d XG=%d XP=%d balance=%.4f wall_ms=%.3f "
             "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
-            "pc_gate_busy=%.3f tasks=%d edges=%d peak_per_edge_slots=%d\n",
+            "pc_bound=%.3f cpu_mspt=%.6f gpu_mspt=%.6f "
+            "phone_mspt=%.6f phone_link_mspt=%.6f "
+            "tasks=%d edges=%d peak_per_edge_slots=%d\n",
             i + 1, c.cycles, c.c, c.g, c.p, c.tail_c, c.tail_g,
             c.xc, c.xg, c.xp, c.balance, c.wall_ms,
             c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
-            c.pc_gate_busy_ms, c.tasks, c.edges, c.max_live_slots);
+            c.pc_compute_bound_ms,
+            c.service_ms_per_token[0],
+            c.service_ms_per_token[1],
+            c.service_ms_per_token[2],
+            c.phone_link_ms_per_token,
+            c.tasks, c.edges, c.max_live_slots);
     }
     const auto & best = result.selected;
     LLAMA_LOG_ERROR(
@@ -8928,11 +8947,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "C=%d G=%d P=%d tail_C=%d tail_G=%d "
         "XC=%d XG=%d XP=%d predicted_ms=%.3f "
         "baseline_predicted_ms=%.3f balance=%.4f "
-        "pc_gate_busy_ms=%.3f\n",
+        "pc_bound_ms=%.3f\n",
         best.cycles, best.c, best.g, best.p,
         best.tail_c, best.tail_g, best.xc, best.xg, best.xp,
         best.wall_ms, base_ok ? baseline.wall_ms : -1.0,
-        best.balance, best.pc_gate_busy_ms);
+        best.balance, best.pc_compute_bound_ms);
     LLAMA_LOG_ERROR(
         "[REGION_RING_PLAN_APPLY] mode=DRY_RUN applied=0 "
         "reason=INTERVAL_READY_AND_DYNAMIC_PHONE_OWNERSHIP_NOT_YET_ENABLED "
