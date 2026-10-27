@@ -1041,8 +1041,10 @@ struct result {
     size_t rejected_profile = 0;
     size_t rejected_deadlock = 0;
     size_t shortlisted = 0;
+    size_t e_window_shortlisted = 0;
     double coarse_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_limit = std::numeric_limits<double>::infinity();
+    double shortlist_e_limit = std::numeric_limits<double>::infinity();
     std::vector<candidate> top;
 };
 
@@ -1317,7 +1319,21 @@ inline result search_runtime_applicable(
         shortlist.push_back(plan);
     }
 
+    // E remains the primary physical filter, but a very sharp minimum can
+    // otherwise leave the full-prompt simulator with almost nothing to rank.
+    // If the natural E window is smaller than min_simulations, extend the
+    // already E-sorted prefix until the requested floor is reached.  This is
+    // not a topology quota and coarse_ms is only a tie-breaker within equal E.
+    out.e_window_shortlisted = shortlist.size();
+    const size_t floor_count = std::min(
+        coarse.size(), (size_t) std::max(0, min_simulations));
+    for (size_t i = shortlist.size(); i < floor_count; ++i) {
+        shortlist.push_back(coarse[i]);
+    }
+
     out.shortlisted = shortlist.size();
+    out.shortlist_e_limit = shortlist.empty() ?
+        out.coarse_e_limit : shortlist.back().ring_error_max;
     for (auto plan : shortlist) {
         std::vector<llama_region_ring_region> regions;
         if (!make_regions(plan, m.layers, regions) ||
