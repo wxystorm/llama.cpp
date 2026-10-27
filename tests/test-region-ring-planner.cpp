@@ -68,8 +68,8 @@ int main() {
                      gated_uniform.busy_ms[0] - gated_uniform.busy_ms[1]) < 1e-6);
     REQUIRE(gated_uniform.wall_ms + 1e-6 >= uniform.wall_ms);
 
-    // One PC Chunk splits into two or four Phone Chunks. The output Slot
-    // is released when all transfers have entered downstream staging.
+    // One PC Chunk splits into two or four Phone Chunks. The producer Slot
+    // remains live until all downstream consumers have finished reading it.
     candidate smaller_phone = uniform;
     smaller_phone.xc = 64;
     smaller_phone.xg = 32;

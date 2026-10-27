@@ -8595,7 +8595,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "enumerated=%zu profiled=%zu simulated=%zu "
                 "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
                 "baseline_ms=%.3f valid=%d cycles=3 chunk=%d "
-                "slot_pool=%d assignment=DYNAMIC\n",
+                "slot_pool=%d assignment=DYNAMIC "
+                "objective=MIN_PREFILL_WALL_FIFO\n",
                 free_result.enumerated, free_result.profiled,
                 free_result.simulated, free_result.rejected_memory,
                 free_result.rejected_profile, free_result.rejected_deadlock,
@@ -8603,6 +8604,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     free_result.baseline.wall_ms : -1.0,
                 free_result.valid ? 1 : 0, baseline_chunk,
                 model.slot_pool);
+            if (free_result.baseline_valid) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_CGP_BASELINE] layout=%s "
+                    "predicted_ms=%.3f pc_bound_ms=%.3f "
+                    "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
+                    "phone_service_mspt=%.6f phone_link_mspt=%.6f "
+                    "local_link_mspt=%.6f\n",
+                    llama_region_ring_layout_string(
+                        baseline_regions).c_str(),
+                    free_result.baseline.wall_ms,
+                    free_result.baseline.pc_compute_bound_ms,
+                    free_result.baseline.service_ms_per_token[0],
+                    free_result.baseline.service_ms_per_token[1],
+                    free_result.baseline.service_ms_per_token[2],
+                    free_result.baseline.phone_link_ms_per_token,
+                    free_result.baseline.pc_local_link_ms_per_token);
+            }
             if (!free_result.valid || !free_result.baseline_valid ||
                     !(free_result.baseline.wall_ms > 0.0)) {
                 LLAMA_LOG_ERROR(
@@ -8679,11 +8697,19 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "baseline_layout=%s C=%d G=%d P=%d "
                 "tokens=%d chunk=%d predicted_ms=%.3f "
                 "baseline_predicted_ms=%.3f gain_pct=%.3f "
-                "required_gain_pct=%.3f status=SUPPORTED\n",
+                "required_gain_pct=%.3f pc_bound_ms=%.3f "
+                "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
+                "phone_service_mspt=%.6f phone_link_mspt=%.6f "
+                "balance=%.4f status=SUPPORTED\n",
                 best_text.c_str(), baseline_text.c_str(),
                 best.c, best.g, best.p, tokens, baseline_chunk,
                 best.wall_ms, baseline_ms, improvement_pct,
-                min_gain_pct);
+                min_gain_pct, best.pc_compute_bound_ms,
+                best.service_ms_per_token[0],
+                best.service_ms_per_token[1],
+                best.service_ms_per_token[2],
+                best.phone_link_ms_per_token,
+                best.balance);
             if (best_text == baseline_text ||
                     improvement_pct < min_gain_pct) {
                 LLAMA_LOG_ERROR(

@@ -136,9 +136,10 @@ struct event {
     }
 };
 
-// Simulate staged input copies, so a producer Slot is released after its
-// last output transfer, not after a larger downstream Chunk finishes. The
-// future runtime must provide those staging buffers before APPLY.
+// Simulate the current runtime contract: per-device FIFO queues may skip
+// credit-blocked READY tasks, per-region KV order is strict, and a producer
+// activation Slot stays leased until every downstream consumer that reads it
+// has finished. Boundary transfers are modeled as explicit link events.
 inline bool simulate(const model & m,
                      const std::vector<llama_region_ring_region> & regions,
                      candidate & c, std::string * reason = nullptr) {
