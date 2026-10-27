@@ -64,6 +64,12 @@ struct candidate {
     // Single CPU-owned CUDA transfer lane used by rolling two-Bank weight
     // streaming. This is one load per logical GPU Region, not per Chunk.
     double weight_h2d_busy_ms = 0.0;
+    // The first two Bank loads happen before workers start and are therefore
+    // fully exposed. Later loads are only expensive when they finish after
+    // the corresponding GPU Region would otherwise become runnable.
+    double weight_h2d_startup_ms = 0.0;
+    double weight_h2d_exposed_ms = 0.0;
+    double weight_h2d_hidden_ms = 0.0;
     int tasks = 0;
     int edges = 0;
     int max_live_slots = 0;
@@ -335,6 +341,12 @@ inline bool simulate(const model & m,
     std::vector<bool> gpu_weight_ready(
         regions.size(), !m.gpu_weight_streaming);
     std::vector<bool> gpu_weight_enqueued(regions.size(), false);
+    std::vector<double> gpu_weight_release_ms(
+        regions.size(), -1.0);
+    std::vector<double> gpu_weight_ready_ms(
+        regions.size(), -1.0);
+    std::vector<double> gpu_natural_ready_ms(
+        regions.size(), -1.0);
     for (size_t r = 0; r < regions.size(); ++r) {
         if (regions[r].device != device::GPU) {
             continue;
@@ -365,6 +377,8 @@ inline bool simulate(const model & m,
     std::deque<int> weight_queue;
     bool weight_busy = false;
     double weight_h2d_busy_ms = 0.0;
+    double weight_h2d_startup_ms = 0.0;
+    double weight_h2d_exposed_ms = 0.0;
 
     auto task_ready = [&](int id) -> bool {
         if (id < 0 || id >= (int) tasks.size()) {
@@ -426,6 +440,10 @@ inline bool simulate(const model & m,
             const int r = gpu_regions[i];
             now += gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += gpu_weight_load_ms[(size_t) r];
+            weight_h2d_startup_ms += gpu_weight_load_ms[(size_t) r];
+            weight_h2d_exposed_ms += gpu_weight_load_ms[(size_t) r];
+            gpu_weight_release_ms[(size_t) r] = 0.0;
+            gpu_weight_ready_ms[(size_t) r] = now;
             gpu_weight_ready[(size_t) r] = true;
             gpu_weight_enqueued[(size_t) r] = true;
         }
@@ -462,6 +480,34 @@ inline bool simulate(const model & m,
             transfer_busy_ms[(size_t) it.lane] += it.duration;
             events.push({now + it.duration, (int) e, event_kind::EDGE});
             scheduled = true;
+        }
+
+        // Record the first instant a GPU Region would be runnable if its
+        // weights were already present. This is the profile-derived hiding
+        // window endpoint used to decide whether a larger G is actually worth
+        // its extra H2D traffic.
+        if (m.gpu_weight_streaming &&
+                !device_busy[(size_t) device::GPU]) {
+            for (int r : gpu_regions) {
+                if (gpu_natural_ready_ms[(size_t) r] >= 0.0 ||
+                        by_region[(size_t) r].empty()) {
+                    continue;
+                }
+                bool prior_done = true;
+                for (int prior : gpu_regions) {
+                    if (prior >= r) {
+                        break;
+                    }
+                    if (!region_done[(size_t) prior]) {
+                        prior_done = false;
+                        break;
+                    }
+                }
+                const int first = by_region[(size_t) r].front();
+                if (prior_done && task_ready(first)) {
+                    gpu_natural_ready_ms[(size_t) r] = now;
+                }
+            }
         }
 
         // Match llama_region_ring_ready::take_device_locked(): each device
@@ -543,6 +589,12 @@ inline bool simulate(const model & m,
                     return reject("WEIGHT_EVENT_INVALID");
                 }
                 gpu_weight_ready[(size_t) r] = true;
+                gpu_weight_ready_ms[(size_t) r] = now;
+                if (gpu_natural_ready_ms[(size_t) r] >= 0.0) {
+                    weight_h2d_exposed_ms += std::max(
+                        0.0,
+                        now - gpu_natural_ready_ms[(size_t) r]);
+                }
                 weight_busy = false;
                 continue;
             }
@@ -577,6 +629,8 @@ inline bool simulate(const model & m,
                                 (size_t) next_region]) {
                             gpu_weight_enqueued[
                                 (size_t) next_region] = true;
+                            gpu_weight_release_ms[
+                                (size_t) next_region] = now;
                             weight_queue.push_back(next_region);
                         }
                     }
@@ -631,6 +685,10 @@ inline bool simulate(const model & m,
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
     c.weight_h2d_busy_ms = weight_h2d_busy_ms;
+    c.weight_h2d_startup_ms = weight_h2d_startup_ms;
+    c.weight_h2d_exposed_ms = weight_h2d_exposed_ms;
+    c.weight_h2d_hidden_ms = std::max(
+        0.0, weight_h2d_busy_ms - weight_h2d_exposed_ms);
     for (size_t i = 0; i < c.service_ms_per_token.size(); ++i) {
         c.service_ms_per_token[i] =
             busy_ms[i] / std::max(1, m.tokens);
@@ -1111,17 +1169,26 @@ inline result search_runtime_applicable(
     std::sort(
         coarse.begin(), coarse.end(),
         [](const candidate & a, const candidate & b) {
+            // APPLY_WIDE is a performance planner. Let measured/interpolated
+            // compute, transfer and weight-H2D profiles determine which
+            // candidates deserve exact simulation. Ring mismatch remains a
+            // useful explanation/tie-breaker, but no longer vetoes a layout
+            // that may have a lower end-to-end wall time.
+            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
+                return a.coarse_ms < b.coarse_ms;
+            }
             if (std::abs(a.ring_error_max -
                          b.ring_error_max) > 1e-12) {
                 return a.ring_error_max < b.ring_error_max;
             }
-            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
-                return a.coarse_ms < b.coarse_ms;
-            }
             return a.ring_error_mean < b.ring_error_mean;
         });
 
-    out.coarse_e_min = coarse.front().ring_error_max;
+    out.coarse_e_min = std::numeric_limits<double>::infinity();
+    for (const auto & plan : coarse) {
+        out.coarse_e_min =
+            std::min(out.coarse_e_min, plan.ring_error_max);
+    }
     out.coarse_e_limit =
         std::min(1.0, out.coarse_e_min + e_margin);
 
@@ -1138,9 +1205,12 @@ inline result search_runtime_applicable(
     shortlist.reserve((size_t) max_simulations);
     std::vector<std::tuple<int,int,int,int>> families;
 
+    // First give every topology family its best profile-derived candidate.
+    // This is the important "is another GPU layer worth it?" comparison:
+    // G5/G6/G7 families all reach the exact event simulator instead of being
+    // discarded by E before H2D hiding and compute savings can be evaluated.
     for (const auto & plan : coarse) {
-        if (plan.ring_error_max >
-                out.coarse_e_limit + 1e-12) {
+        if ((int) shortlist.size() >= max_simulations) {
             break;
         }
         const auto family = family_key(plan);
@@ -1151,17 +1221,12 @@ inline result search_runtime_applicable(
         }
         families.push_back(family);
         shortlist.push_back(plan);
-        if ((int) shortlist.size() >= max_simulations / 2) {
-            break;
-        }
     }
 
+    // Then spend the remaining exact-simulation budget on the next-best
+    // chunk variants by profile lower bound.
     for (const auto & plan : coarse) {
         if ((int) shortlist.size() >= max_simulations) {
-            break;
-        }
-        if (plan.ring_error_max >
-                out.coarse_e_limit + 1e-12) {
             break;
         }
         if (std::any_of(
