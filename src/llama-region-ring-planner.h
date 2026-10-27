@@ -48,7 +48,7 @@ struct model {
     int tokens = 358;
     int kv_start = 0;
     int hidden = 2048;
-    int window = 2;
+    int slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     int max_tail = 12;
     bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
     // Runtime region_ring_backend_execution_mutex serializes PC CPU/CUDA
@@ -135,7 +135,7 @@ inline bool simulate(const model & m,
         return false;
     };
     if (regions.empty() || m.tokens <= 0 || m.hidden <= 0 ||
-        m.window <= 0 || !m.compute_ms || !m.transfer_ms) {
+        m.slot_pool <= 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
     }
     std::vector<task> tasks;
@@ -233,7 +233,7 @@ inline bool simulate(const model & m,
                     if (t.started || t.inputs != 0 ||
                         (t.previous >= 0 && !tasks[t.previous].done) ||
                         (r + 1 < (int) regions.size() &&
-                         live_slots[r] >= m.window)) {
+                         live_slots[r] >= m.slot_pool)) {
                         continue;
                     }
                     selected = id;
@@ -457,7 +457,7 @@ inline supported_result search_supported_fixed_phone(
     supported_result result;
     if (!llama_region_ring_apply_safe_phone_shape(baseline) ||
             m.layers != 48 || m.tokens <= 0 || chunk_tokens != 64 ||
-            m.window != 2 || !m.pc_compute_gate) {
+            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE || !m.pc_compute_gate) {
         return result;
     }
     result.baseline.regions = baseline;
@@ -547,7 +547,7 @@ inline result search_supported_topology(
         const model & m, int chunk_tokens, int max_simulations = 192) {
     result out;
     if (m.layers < 6 || m.tokens <= 0 || chunk_tokens != 64 ||
-            m.window != 2 || !m.pc_compute_gate || max_simulations <= 0) {
+            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE || !m.pc_compute_gate || max_simulations <= 0) {
         return out;
     }
     std::vector<candidate> coarse;

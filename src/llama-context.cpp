@@ -3104,10 +3104,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             pc_phone_overlap ? "MEASURED" : "0");
     }
     const int chunk_tokens = stages.front().macro_tokens;
-    // Keep the current capacity at two for this first semantic change. The
-    // slots themselves are now dynamically leased; no chunk % capacity binding
-    // remains. Capacity can be raised independently after this path is verified.
-    const size_t slot_pool_size = own_stage_resources ? 2 : 0;
+    // Dynamic activation slots: any READY producer can lease any FREE slot on
+    // its outgoing edge. Capacity is shared with the Planner model.
+    const size_t slot_pool_size = own_stage_resources ?
+        LLAMA_REGION_RING_SLOT_POOL_SIZE : 0;
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens, chunk_tokens, slot_pool_size);
 
@@ -4731,9 +4731,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
-            "layout=%s chunk=%d window=2 status=CONSISTENT\n",
+            "layout=%s chunk=%d slot_pool=%zu assignment=DYNAMIC "
+            "status=CONSISTENT\n",
             plan_mode,model.hybrid_ring_plan_layout.c_str(),
-            region_ring_chunk_tokens);
+            region_ring_chunk_tokens,LLAMA_REGION_RING_SLOT_POOL_SIZE);
     }
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(

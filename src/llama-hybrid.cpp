@@ -8340,7 +8340,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     model.tokens = tokens;
     model.kv_start = std::max(0, kv_start);
     model.hidden = profile.n_embd;
-    model.window = 2;
+    model.slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     model.max_tail = 12;
     model.shared_phone_link = true; // Conservative Wi-Fi contention.
 
@@ -8439,7 +8439,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             usage[0] += (long double) profile.non_layer_weight_bytes;
             const int sizes[] = {candidate.xc, candidate.xg, candidate.xp};
             for (size_t i = 0; i < 3; ++i) {
-                usage[i] += (long double) model.window * sizes[i] *
+                usage[i] += (long double) model.slot_pool * sizes[i] *
                             model.hidden * sizeof(float) * 3;
             }
             const size_t free_bytes[] = {
@@ -8664,12 +8664,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_PLAN_SUPPORTED_SEARCH] "
             "enumerated=%zu simulated=%zu reject_memory=%zu "
             "reject_profile=%zu baseline_ms=%.3f valid=%d "
-            "phone_layout=FIXED_11_27_43 chunk=%d window=2\n",
+            "phone_layout=FIXED_11_27_43 chunk=%d slot_pool=%d assignment=DYNAMIC\n",
             supported.enumerated,supported.simulated,
             supported.rejected_memory,supported.rejected_profile,
             supported.baseline_valid ?
                 supported.baseline.estimate.wall_ms : -1.0,
-            supported.valid ? 1 : 0,baseline_chunk);
+            supported.valid ? 1 : 0,baseline_chunk,model.slot_pool);
         if (!supported.valid || !supported.baseline_valid ||
                 !(supported.baseline.estimate.wall_ms > 0.0)) {
             LLAMA_LOG_ERROR(

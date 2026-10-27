@@ -19,7 +19,7 @@ static model mock_profile() {
     m.layers = 48;
     m.tokens = 358;
     m.hidden = 2048;
-    m.window = 2;
+    m.slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     m.compute_ms = [](device d, int layers, int tokens, int kv, double & ms) {
         const double per = d == device::CPU ? 0.07 :
                            d == device::GPU ? 0.025 : 0.055;
@@ -123,7 +123,7 @@ int main() {
     REQUIRE(selected.top.size() <= 5);
 
     // General topology may change Phone P5 to P8, the number of cycles,
-    // and the final logits owner; but Chunk64 and Window=2 remain fixed.
+    // and the final logits owner; Chunk64 and the shared dynamic slot pool remain fixed.
     model general_profile = mock_profile();
     const result general = search_supported_topology(general_profile,64,96);
     REQUIRE(general.valid && general.simulated > 0);
@@ -199,10 +199,11 @@ int main() {
     REQUIRE(none_supported.baseline_valid && !none_supported.valid);
     REQUIRE(none_supported.rejected_memory == none_supported.enumerated);
 
-    model unsupported_window = mock_profile();
-    unsupported_window.window = 3;
+    model unsupported_slot_pool = mock_profile();
+    unsupported_slot_pool.slot_pool =
+        (int) LLAMA_REGION_RING_SLOT_POOL_SIZE - 1;
     REQUIRE(!search_supported_fixed_phone(
-            unsupported_window,baseline_regions,64).valid);
+            unsupported_slot_pool,baseline_regions,64).valid);
     REQUIRE(!search_supported_fixed_phone(
             apply_profile,baseline_regions,128).valid);
     REQUIRE(!search_supported_fixed_phone(
