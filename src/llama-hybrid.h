@@ -585,12 +585,19 @@ LLAMA_API bool llama_hybrid_region_ring_planner_apply_safe(
     int tokens, int kv_start, int baseline_chunk,
     std::string & selected_layout);
 
-// Three-cycle executable search over C/G/P region lengths. Keeps Chunk64,
-// dynamic slot-pool semantics and final Phone ownership, while allowing the
-// Phone range and aggregate CPU/CUDA/Phone layer counts to change.
+// Three-cycle executable search over C/G/P region lengths. Keeps Chunk64
+// and final Phone ownership while allowing device layer counts to change.
 LLAMA_API bool llama_hybrid_region_ring_planner_apply_cgp(
     int tokens, int kv_start, int baseline_chunk,
     std::string & selected_layout);
+
+// Runtime-v2 Planner application: search 2-4 complete G->C->P cycles with
+// independent XC/XG/XP. No tail is allowed yet, so final ownership remains
+// Phone and the selected Plan is directly executable by READY_V2.
+LLAMA_API bool llama_hybrid_region_ring_planner_apply_wide(
+    int tokens, int kv_start, int baseline_chunk,
+    std::string & selected_layout,
+    int & selected_xc, int & selected_xg, int & selected_xp);
 
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(

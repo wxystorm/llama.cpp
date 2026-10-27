@@ -395,11 +395,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_apply_cgp =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"apply-cgp") == 0;
+        const bool ring_plan_apply_wide =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"apply-wide") == 0;
         const bool ring_plan_apply_requested =
             ring_plan_apply_safe || ring_plan_apply_baseline ||
-            ring_plan_apply_cgp;
+            ring_plan_apply_cgp || ring_plan_apply_wide;
         const char * ring_plan_apply_mode =
             ring_plan_apply_baseline ? "APPLY_BASELINE" :
+            ring_plan_apply_wide ? "APPLY_WIDE" :
             ring_plan_apply_cgp ? "APPLY_CGP" : "APPLY_SAFE";
         const bool ring_plan_topology_preview =
             ring_planner_env != nullptr &&
@@ -439,6 +443,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
                            ring_plan_apply_baseline ? "APPLY_BASELINE" :
+                           ring_plan_apply_wide ? "APPLY_WIDE" :
                            ring_plan_apply_cgp ? "APPLY_CGP" :
                            ring_plan_apply_safe ? "APPLY_SAFE" :
                            ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
@@ -534,9 +539,16 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 target_tokens = (int) n;
             }
             std::string selected_layout;
+            int selected_xc = 0;
+            int selected_xg = 0;
+            int selected_xp = 0;
             const bool selected = ring_plan_apply_baseline ?
                 llama_hybrid_region_ring_planner_apply_baseline(
                     target_tokens, 0, chunk_tokens,selected_layout) :
+                ring_plan_apply_wide ?
+                llama_hybrid_region_ring_planner_apply_wide(
+                    target_tokens, 0, chunk_tokens, selected_layout,
+                    selected_xc, selected_xg, selected_xp) :
                 ring_plan_apply_cgp ?
                 llama_hybrid_region_ring_planner_apply_cgp(
                     target_tokens, 0, chunk_tokens,selected_layout) :
@@ -549,13 +561,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 // graph execution from allocated model weight ownership.
                 model_ptr->hybrid_ring_plan_layout = selected_layout;
                 model_ptr->hybrid_ring_plan_mode = ring_plan_apply_mode;
-                model_ptr->hybrid_ring_plan_chunk_tokens = chunk_tokens;
+                if (ring_plan_apply_wide) {
+                    model_ptr->hybrid_ring_plan_chunk_tokens = 0;
+                    model_ptr->hybrid_ring_plan_cpu_chunk_tokens =
+                        selected_xc;
+                    model_ptr->hybrid_ring_plan_gpu_chunk_tokens =
+                        selected_xg;
+                    model_ptr->hybrid_ring_plan_phone_chunk_tokens =
+                        selected_xp;
+                } else {
+                    model_ptr->hybrid_ring_plan_chunk_tokens =
+                        chunk_tokens;
+                }
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_APPLY] mode=%s "
                     "phase=MODEL_LOAD applied=1 layout=%s "
-                    "chunk=%d target_tokens=%d status=MODEL_OWNED\n",
+                    "XC=%d XG=%d XP=%d target_tokens=%d "
+                    "status=MODEL_OWNED\n",
                     ring_plan_apply_mode,selected_layout.c_str(),
-                    chunk_tokens,target_tokens);
+                    ring_plan_apply_wide ? selected_xc : chunk_tokens,
+                    ring_plan_apply_wide ? selected_xg : chunk_tokens,
+                    ring_plan_apply_wide ? selected_xp : chunk_tokens,
+                    target_tokens);
             } else {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_APPLY] mode=%s "

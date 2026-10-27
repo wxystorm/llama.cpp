@@ -8016,6 +8016,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
              std::strcmp(ring_plan_env, "apply-baseline") == 0 ||
              std::strcmp(ring_plan_env, "apply-safe") == 0 ||
              std::strcmp(ring_plan_env, "apply-cgp") == 0 ||
+             std::strcmp(ring_plan_env, "apply-wide") == 0 ||
              std::strcmp(ring_plan_env, "topology-preview") == 0)) {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
         g_llama_hybrid_runtime_profile = profile;
@@ -8315,10 +8316,17 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 static bool llama_hybrid_region_ring_planner_evaluate(
         int tokens, int kv_start, int baseline_chunk,
         std::string * selected_layout, bool topology_preview = false,
-        bool baseline_only = false, bool free_cgp = false) {
+        bool baseline_only = false, bool free_cgp = false,
+        bool wide_apply = false,
+        int * selected_xc = nullptr,
+        int * selected_xg = nullptr,
+        int * selected_xp = nullptr) {
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
+    if (selected_xc != nullptr) { *selected_xc = 0; }
+    if (selected_xg != nullptr) { *selected_xg = 0; }
+    if (selected_xp != nullptr) { *selected_xp = 0; }
     llama_hybrid_profile profile;
     {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
@@ -8487,9 +8495,208 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
         model.slot_pool,
         baseline_only ? "APPLY_BASELINE" :
+        wide_apply ? "APPLY_WIDE" :
         free_cgp ? "APPLY_CGP" :
         selected_layout != nullptr ? "APPLY_SAFE" :
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
+
+    if (wide_apply && selected_layout != nullptr) {
+        if (selected_xc == nullptr || selected_xg == nullptr ||
+                selected_xp == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
+                "reason=MISSING_CHUNK_OUTPUTS status=KEEP_BASELINE\n");
+            return false;
+        }
+        if (const char * requested =
+                std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
+            if (*requested != '\0') {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
+                    "reason=PLAN_LAYOUT_OVERRIDE_FORBIDDEN "
+                    "status=KEEP_BASELINE\n");
+                return false;
+            }
+        }
+        if (!model.memory_feasible) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
+                "reason=NO_MEMORY_PROFILE status=KEEP_BASELINE\n");
+            return false;
+        }
+
+        const auto baseline_regions =
+            llama_region_ring_from_env(profile.n_layer);
+        if (baseline_regions.empty() ||
+                baseline_regions.back().device !=
+                    llama_region_ring_device::PHONE ||
+                baseline_chunk <= 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
+                "reason=INVALID_BASELINE status=KEEP_BASELINE\n");
+            return false;
+        }
+
+        int wide_max_simulations = 256;
+        int wide_min_simulations = 32;
+        double wide_e_margin = 0.08;
+        if (const char * raw = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PLAN_MAX_SIMULATIONS")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 10);
+            if (end != raw && *end == '\0' &&
+                    parsed >= 16 && parsed <= 2048) {
+                wide_max_simulations = (int) parsed;
+            }
+        }
+        if (const char * raw = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PLAN_MIN_SIMULATIONS")) {
+            char * end = nullptr;
+            const long parsed = std::strtol(raw, &end, 10);
+            if (end != raw && *end == '\0' && parsed >= 0 &&
+                    parsed <= wide_max_simulations) {
+                wide_min_simulations = (int) parsed;
+            }
+        }
+        if (const char * raw = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PLAN_E_MARGIN")) {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end != raw && *end == '\0' &&
+                    std::isfinite(parsed) &&
+                    parsed >= 0.0 && parsed <= 0.50) {
+                wide_e_margin = parsed;
+            }
+        }
+
+        const auto result =
+            llama_ring_planner::search_runtime_applicable(
+                model, baseline_regions, baseline_chunk,
+                wide_max_simulations, wide_e_margin,
+                wide_min_simulations);
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
+            "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
+            "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
+            "E_min=%.4f E_limit=%.4f "
+            "cycles=2..4 tail=DISABLED final_owner=PHONE "
+            "XC=16,32,64,128 XG=16,32,64,128 "
+            "XP=16,32,64,128 baseline_ms=%.3f valid=%d\n",
+            result.enumerated, result.profiled, result.shortlisted,
+            result.simulated, result.rejected_memory,
+            result.rejected_profile, result.rejected_deadlock,
+            result.coarse_e_min, result.coarse_e_limit,
+            result.baseline_valid ? result.baseline.wall_ms : -1.0,
+            result.valid ? 1 : 0);
+
+        if (!result.valid || !result.baseline_valid ||
+                !(result.baseline.wall_ms > 0.0)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
+                "reason=NO_SCOREABLE_RUNTIME_PLAN "
+                "status=KEEP_BASELINE\n");
+            return false;
+        }
+
+        for (size_t i = 0; i < result.top.size(); ++i) {
+            const auto & c = result.top[i];
+            std::vector<llama_region_ring_region> regions;
+            if (!llama_ring_planner::make_regions(
+                    c, model.layers, regions)) {
+                continue;
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_CANDIDATE] mode=APPLY_WIDE rank=%zu "
+                "layout=%s cycles=%d C=%d G=%d P=%d "
+                "XC=%d XG=%d XP=%d predicted_ms=%.3f "
+                "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
+                "E=%.4f tasks=%d edges=%d\n",
+                i + 1,
+                llama_region_ring_layout_string(regions).c_str(),
+                c.cycles, c.c, c.g, c.p,
+                c.xc, c.xg, c.xp, c.wall_ms,
+                c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
+                c.ring_error_max, c.tasks, c.edges);
+        }
+
+        const auto & best = result.selected;
+        std::vector<llama_region_ring_region> best_regions;
+        if (!llama_ring_planner::make_regions(
+                best, model.layers, best_regions) ||
+                !llama_region_ring_apply_topology_compatible(
+                    best_regions, model.layers) ||
+                best_regions.back().device !=
+                    llama_region_ring_device::PHONE ||
+                best.tail_c != 0 || best.tail_g != 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
+                "reason=SELECTED_RUNTIME_CONTRACT_INVALID "
+                "status=KEEP_BASELINE\n");
+            return false;
+        }
+
+        const std::string baseline_text =
+            llama_region_ring_layout_string(baseline_regions);
+        const std::string best_text =
+            llama_region_ring_layout_string(best_regions);
+        const double baseline_ms = result.baseline.wall_ms;
+        const double improvement_pct =
+            100.0 * (baseline_ms - best.wall_ms) / baseline_ms;
+        double min_gain_pct = 2.0;
+        if (const char * raw = std::getenv(
+                "LLAMA_HYBRID_REGION_RING_PLAN_MIN_GAIN_PCT")) {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end != raw && *end == '\0' &&
+                    std::isfinite(parsed) && parsed >= 0.0 &&
+                    parsed <= 50.0) {
+                min_gain_pct = parsed;
+            }
+        }
+
+        const bool identical =
+            best_text == baseline_text &&
+            best.xc == baseline_chunk &&
+            best.xg == baseline_chunk &&
+            best.xp == baseline_chunk;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
+            "source=AUTO_RUNTIME_V2 layout=%s baseline_layout=%s "
+            "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
+            "predicted_ms=%.3f baseline_predicted_ms=%.3f "
+            "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
+            "status=SUPPORTED\n",
+            best_text.c_str(), baseline_text.c_str(),
+            best.cycles, best.c, best.g, best.p,
+            best.xc, best.xg, best.xp,
+            best.wall_ms, baseline_ms,
+            improvement_pct, min_gain_pct,
+            best.ring_error_max);
+
+        if (identical || improvement_pct < min_gain_pct) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
+                "reason=%s gain_pct=%.3f status=KEEP_BASELINE\n",
+                identical ?
+                    "BASELINE_ALREADY_BEST" :
+                    "GAIN_BELOW_THRESHOLD",
+                improvement_pct);
+            return false;
+        }
+
+        *selected_layout = best_text;
+        *selected_xc = best.xc;
+        *selected_xg = best.xg;
+        *selected_xp = best.xp;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
+            "phase=PRE_MODEL_LOAD selected=1 "
+            "layout=%s XC=%d XG=%d XP=%d "
+            "status=AWAIT_MODEL_PLACEMENT\n",
+            selected_layout->c_str(),
+            *selected_xc, *selected_xg, *selected_xp);
+        return true;
+    }
 
     if (topology_preview) {
         if (baseline_chunk != 64) {
@@ -9110,4 +9317,14 @@ bool llama_hybrid_region_ring_planner_apply_cgp(
     return llama_hybrid_region_ring_planner_evaluate(
         tokens, kv_start, baseline_chunk, &selected_layout,
         false, false, true);
+}
+
+bool llama_hybrid_region_ring_planner_apply_wide(
+        int tokens, int kv_start, int baseline_chunk,
+        std::string & selected_layout,
+        int & selected_xc, int & selected_xg, int & selected_xp) {
+    return llama_hybrid_region_ring_planner_evaluate(
+        tokens, kv_start, baseline_chunk, &selected_layout,
+        false, false, false, true,
+        &selected_xc, &selected_xg, &selected_xp);
 }
