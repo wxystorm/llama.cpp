@@ -8596,6 +8596,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
                 "baseline_ms=%.3f valid=%d cycles=3 chunk=%d "
                 "slot_pool=%d assignment=DYNAMIC "
+                "coarse=MINIMAX_RING_ERROR "
                 "objective=MIN_PREFILL_WALL_FIFO\n",
                 free_result.enumerated, free_result.profiled,
                 free_result.simulated, free_result.rejected_memory,
@@ -8610,7 +8611,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "predicted_ms=%.3f pc_bound_ms=%.3f "
                     "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                     "phone_service_mspt=%.6f phone_link_mspt=%.6f "
-                    "local_link_mspt=%.6f\n",
+                    "local_link_mspt=%.6f "
+                    "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                    "e1=%.4f e2=%.4f e3=%.4f E=%.4f\n",
                     llama_region_ring_layout_string(
                         baseline_regions).c_str(),
                     free_result.baseline.wall_ms,
@@ -8619,7 +8622,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     free_result.baseline.service_ms_per_token[1],
                     free_result.baseline.service_ms_per_token[2],
                     free_result.baseline.phone_link_ms_per_token,
-                    free_result.baseline.pc_local_link_ms_per_token);
+                    free_result.baseline.pc_local_link_ms_per_token,
+                    free_result.baseline.ring_stage_ms_per_token[0],
+                    free_result.baseline.ring_stage_ms_per_token[1],
+                    free_result.baseline.ring_stage_ms_per_token[2],
+                    free_result.baseline.ring_p2c_ms_per_token,
+                    free_result.baseline.ring_c2p_ms_per_token,
+                    free_result.baseline.ring_error[0],
+                    free_result.baseline.ring_error[1],
+                    free_result.baseline.ring_error[2],
+                    free_result.baseline.ring_error_max);
             }
             if (!free_result.valid || !free_result.baseline_valid ||
                     !(free_result.baseline.wall_ms > 0.0)) {
@@ -8643,7 +8655,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "predicted_ms=%.3f pc_bound_ms=%.3f "
                     "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                     "phone_service_mspt=%.6f phone_link_mspt=%.6f "
-                    "local_link_mspt=%.6f balance=%.4f\n",
+                    "local_link_mspt=%.6f "
+                    "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                    "e1=%.4f e2=%.4f e3=%.4f E=%.4f\n",
                     i + 1,
                     llama_region_ring_layout_string(regions).c_str(),
                     c.c, c.g, c.p, baseline_chunk,
@@ -8653,7 +8667,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     c.service_ms_per_token[2],
                     c.phone_link_ms_per_token,
                     c.pc_local_link_ms_per_token,
-                    c.balance);
+                    c.ring_stage_ms_per_token[0],
+                    c.ring_stage_ms_per_token[1],
+                    c.ring_stage_ms_per_token[2],
+                    c.ring_p2c_ms_per_token,
+                    c.ring_c2p_ms_per_token,
+                    c.ring_error[0], c.ring_error[1], c.ring_error[2],
+                    c.ring_error_max);
             }
 
             const auto & best = free_result.selected;
@@ -8700,7 +8720,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "required_gain_pct=%.3f pc_bound_ms=%.3f "
                 "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                 "phone_service_mspt=%.6f phone_link_mspt=%.6f "
-                "balance=%.4f status=SUPPORTED\n",
+                "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                "e1=%.4f e2=%.4f e3=%.4f E=%.4f status=SUPPORTED\n",
                 best_text.c_str(), baseline_text.c_str(),
                 best.c, best.g, best.p, tokens, baseline_chunk,
                 best.wall_ms, baseline_ms, improvement_pct,
@@ -8709,7 +8730,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 best.service_ms_per_token[1],
                 best.service_ms_per_token[2],
                 best.phone_link_ms_per_token,
-                best.balance);
+                best.ring_stage_ms_per_token[0],
+                best.ring_stage_ms_per_token[1],
+                best.ring_stage_ms_per_token[2],
+                best.ring_p2c_ms_per_token,
+                best.ring_c2p_ms_per_token,
+                best.ring_error[0], best.ring_error[1],
+                best.ring_error[2], best.ring_error_max);
             if (best_text == baseline_text ||
                     improvement_pct < min_gain_pct) {
                 LLAMA_LOG_ERROR(

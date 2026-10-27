@@ -196,3 +196,31 @@ The first observed 358-token Dry-run proposed `N=4,C3,G3,P4,PC_tail_C8,XC/XG/XP=
 Historical note: the first simulator was corrected when `fifo-pc-phone` still serialized CPU and CUDA through `region_ring_backend_execution_mutex`. That is no longer the runtime contract. The Region Ring now uses a short PREPARE gate plus independent CPU/CUDA execution gates; measured runs show GPU CPU-lock wait falling to ~0 while READY wait dominates. The Planner therefore sets `pc_compute_gate=false` for the current runtime, balances CPU/CUDA/Phone as three independent service lanes, and keeps the gated model only for regression tests.
 
 `[REGION_RING_PLAN_BASELINE]` and the APPLY_CGP baseline/candidate logs now print the predicted wall time plus CPU/CUDA/Phone service demand in ms/token. The final objective is the exact FIFO event-simulation wall time, not the balance heuristic. The simulator still uses profiled/interpolated compute and transfer costs, so graph registration, driver overhead, Wi-Fi contention and GPU residency should be calibrated against repeated real `[REGION_RING_SUM]` runs before treating the predicted gain as measured speedup.
+
+
+### Minimax ring-balance coarse objective
+
+The current Planner now implements the three local approximate balance
+conditions from the handwritten C->G->P ring model. For one cycle:
+
+```text
+A     = C*fC(XC)/XC
+B     = G*fG(XG)/XG
+D     = P*fP(XP)/XP
+TP2C  = t_phone_to_pc(XP)/XP
+TC2P  = t_pc_to_phone(XG)/XG
+
+e1 = |A-(D+TP2C)| / max(A,D+TP2C)
+e2 = |A-B|         / max(A,B)
+e3 = |D-(B+TC2P)| / max(D,B+TC2P)
+E  = max(e1,e2,e3)
+```
+
+`E` is a normalized minimax mismatch, not the final latency objective.
+For the current APPLY_CGP space there are only 70 C/G/P geometries, so all
+70 are still exact-simulated; no candidate is discarded solely because its
+approximate balance is poor. In the larger topology/chunk searches, `E`
+is the primary coarse ordering and the exact FIFO/KV/slot event simulation
+still selects the final minimum predicted prefill wall time. This preserves
+the intended approximate-equation interpretation while preventing the
+coarse model from overruling runtime scheduling details.

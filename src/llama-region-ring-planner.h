@@ -42,8 +42,22 @@ struct candidate {
     // Lower-bound PC compute span under the selected runtime semantics:
     // sum(CPU,GPU) when gated, max(CPU,GPU) when independent.
     double pc_compute_bound_ms = 0.0;
-    // Per-token service demand after simulation (or coarse estimation).
+    // Total per-token service demand after simulation (or coarse estimation).
     std::array<double, 3> service_ms_per_token {};
+    // Local one-cycle terms for the C->G->P ring balance equations:
+    //   A = C*fC(XC)/XC
+    //   B = G*fG(XG)/XG
+    //   D = P*fP(XP)/XP
+    //   e1 = |A-(D+TP2C)| / max(A,D+TP2C)
+    //   e2 = |A-B|         / max(A,B)
+    //   e3 = |D-(B+TC2P)| / max(D,B+TC2P)
+    // balance is the minimax objective max(e1,e2,e3).
+    std::array<double, 3> ring_stage_ms_per_token {};
+    double ring_p2c_ms_per_token = 0.0;
+    double ring_c2p_ms_per_token = 0.0;
+    std::array<double, 3> ring_error {};
+    double ring_error_max = 0.0;
+    double ring_error_mean = 0.0;
     double phone_link_ms_per_token = 0.0;
     double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
@@ -422,6 +436,14 @@ inline bool simulate(const model & m,
     return true;
 }
 
+inline double relative_ring_mismatch(double lhs, double rhs) {
+    const double denom = std::max(lhs, rhs);
+    if (!(denom > 0.0) || !std::isfinite(denom)) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return std::abs(lhs - rhs) / denom;
+}
+
 inline bool estimate_balance(const model & m, candidate & c) {
     if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0 ||
         c.c <= 0 || c.g <= 0 || c.p <= 0 ||
@@ -431,7 +453,6 @@ inline bool estimate_balance(const model & m, candidate & c) {
 
     const int kv = m.kv_start + m.tokens / 2;
     double tc = 0.0, tg = 0.0, tp = 0.0;
-    double cp = 0.0, pc = 0.0, local = 0.0;
     if (!m.compute_ms(device::CPU, c.c, c.xc, kv, tc) ||
         !m.compute_ms(device::GPU, c.g, c.xg, kv, tg) ||
         !m.compute_ms(device::PHONE, c.p, c.xp, kv, tp)) {
@@ -439,31 +460,62 @@ inline bool estimate_balance(const model & m, candidate & c) {
     }
     tp += m.phone_register_ms * (double) c.p / 5.0;
 
-    constexpr int ref_tokens = 64;
-    const size_t bytes =
-        (size_t) m.hidden * ref_tokens * sizeof(float);
-    if (!m.transfer_ms(device::GPU, device::PHONE, bytes, cp) ||
-        !m.transfer_ms(device::PHONE, device::CPU, bytes, pc) ||
-        !m.transfer_ms(device::CPU, device::GPU, bytes, local)) {
+    // Match the handwritten ring model exactly: Phone->PC transfer is
+    // normalized by XP, and PC(GPU)->Phone transfer by XG. Do not force a
+    // common reference chunk here; XC/XG/XP become planner variables later.
+    double p2c_ms = 0.0;
+    double c2p_ms = 0.0;
+    double local_ms = 0.0;
+    const size_t p2c_bytes =
+        (size_t) m.hidden * (size_t) c.xp * sizeof(float);
+    const size_t c2p_bytes =
+        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
+    const size_t local_bytes =
+        (size_t) m.hidden * (size_t) c.xc * sizeof(float);
+    if (!m.transfer_ms(device::PHONE, device::CPU, p2c_bytes, p2c_ms) ||
+        !m.transfer_ms(device::GPU, device::PHONE, c2p_bytes, c2p_ms) ||
+        !m.transfer_ms(device::CPU, device::GPU, local_bytes, local_ms)) {
         return false;
     }
 
-    const double cpu_region_per_token = tc / c.xc;
-    const double gpu_region_per_token = tg / c.xg;
-    const double phone_region_per_token = tp / c.xp;
-    const double cpu_layer_per_token =
-        cpu_region_per_token / std::max(c.c, 1);
-    const double gpu_layer_per_token =
-        gpu_region_per_token / std::max(c.g, 1);
+    const double A = tc / c.xc;
+    const double B = tg / c.xg;
+    const double D = tp / c.xp;
+    const double TP2C = p2c_ms / c.xp;
+    const double TC2P = c2p_ms / c.xg;
+    const double TLOCAL = local_ms / c.xc;
+    if (!(A > 0.0) || !(B > 0.0) || !(D > 0.0) ||
+        TP2C < 0.0 || TC2P < 0.0 || TLOCAL < 0.0 ||
+        !std::isfinite(A) || !std::isfinite(B) || !std::isfinite(D) ||
+        !std::isfinite(TP2C) || !std::isfinite(TC2P) ||
+        !std::isfinite(TLOCAL)) {
+        return false;
+    }
 
+    const double e1 = relative_ring_mismatch(A, D + TP2C);
+    const double e2 = relative_ring_mismatch(A, B);
+    const double e3 = relative_ring_mismatch(D, B + TC2P);
+    if (!std::isfinite(e1) || !std::isfinite(e2) ||
+        !std::isfinite(e3)) {
+        return false;
+    }
+
+    c.ring_stage_ms_per_token = {A, B, D};
+    c.ring_p2c_ms_per_token = TP2C;
+    c.ring_c2p_ms_per_token = TC2P;
+    c.ring_error = {e1, e2, e3};
+    c.ring_error_max = std::max({e1, e2, e3});
+    c.ring_error_mean = (e1 + e2 + e3) / 3.0;
+    // Keep the existing field as the public coarse-balance key.
+    c.balance = c.ring_error_max;
+
+    const double cpu_layer_per_token = A / std::max(c.c, 1);
+    const double gpu_layer_per_token = B / std::max(c.g, 1);
     const double cpu_total =
-        c.cycles * cpu_region_per_token +
-        c.tail_c * cpu_layer_per_token;
+        c.cycles * A + c.tail_c * cpu_layer_per_token;
     const double gpu_total =
-        c.cycles * gpu_region_per_token +
-        c.tail_g * gpu_layer_per_token;
-    const double phone_total =
-        c.cycles * phone_region_per_token;
+        c.cycles * B + c.tail_g * gpu_layer_per_token;
+    const double phone_total = c.cycles * D;
 
     const bool has_tail = c.tail_c + c.tail_g > 0;
     const int phone_to_pc_edges =
@@ -472,40 +524,25 @@ inline bool estimate_balance(const model & m, candidate & c) {
     const int pc_local_edges =
         c.cycles + (c.tail_c > 0 && c.tail_g > 0 ? 1 : 0);
     const double phone_link_total =
-        (pc_to_phone_edges * cp + phone_to_pc_edges * pc) /
-        ref_tokens;
-    const double local_link_total =
-        pc_local_edges * local / ref_tokens;
+        pc_to_phone_edges * TC2P + phone_to_pc_edges * TP2C;
+    const double local_link_total = pc_local_edges * TLOCAL;
 
     c.service_ms_per_token = {cpu_total, gpu_total, phone_total};
     c.phone_link_ms_per_token = phone_link_total;
     c.pc_local_link_ms_per_token = local_link_total;
 
     if (m.pc_compute_gate) {
-        // Historical compatibility path: CPU and CUDA form one serialized PC
-        // station. Keep it available only for regression comparisons.
+        // Historical compatibility path only. The current runtime does not
+        // serialize CPU and CUDA compute, but retain a meaningful lower bound
+        // for gated-regression tests.
         const double pc_total = cpu_total + gpu_total;
-        if (!(pc_total > 0.0) || !(phone_total > 0.0)) {
-            return false;
-        }
-        c.balance = std::abs(pc_total - phone_total) /
-                    std::max(pc_total, phone_total);
         c.coarse_ms = m.tokens *
             std::max({pc_total, phone_total,
                       phone_link_total, local_link_total});
     } else {
-        // Current runtime: CPU, CUDA and Phone are three independent service
-        // lanes. Coarse ranking balances their total per-token demand; network
-        // lanes remain independent bottlenecks. Exact FIFO simulation decides
-        // the final T_prefill.
-        const double hi =
-            std::max({cpu_total, gpu_total, phone_total});
-        const double lo =
-            std::min({cpu_total, gpu_total, phone_total});
-        if (!(hi > 0.0) || !(lo > 0.0)) {
-            return false;
-        }
-        c.balance = (hi - lo) / hi;
+        // Coarse time is only a throughput lower bound. Candidate ordering for
+        // large searches is driven first by the user's minimax ring mismatch
+        // E=max(e1,e2,e3); exact FIFO simulation remains the final objective.
         c.coarse_ms = m.tokens *
             std::max({cpu_total, gpu_total, phone_total,
                       phone_link_total, local_link_total});
@@ -566,8 +603,11 @@ inline result search(const model & m, int max_simulations = 192) {
         }
     }
     std::sort(coarse.begin(),coarse.end(),[](const candidate &a,const candidate &b){
+        if (std::abs(a.ring_error_max-b.ring_error_max) > 1e-12) {
+            return a.ring_error_max < b.ring_error_max;
+        }
         if (a.coarse_ms != b.coarse_ms) return a.coarse_ms < b.coarse_ms;
-        return a.balance < b.balance;
+        return a.ring_error_mean < b.ring_error_mean;
     });
     std::vector<candidate> shortlist;
     std::vector<std::tuple<int,int,int,int>> families;
@@ -597,7 +637,7 @@ inline result search(const model & m, int max_simulations = 192) {
     }
     std::sort(out.top.begin(),out.top.end(),[](const candidate&a,const candidate&b){
         if(a.wall_ms!=b.wall_ms) return a.wall_ms<b.wall_ms;
-        return a.balance<b.balance;
+        return a.ring_error_max<b.ring_error_max;
     });
     if (!out.top.empty()) {
         out.selected=out.top.front();
@@ -716,11 +756,12 @@ inline supported_result search_supported_fixed_phone(
     return result;
 }
 
-// Executable free C/G/P search for the current three-cycle Ring. CPU, CUDA
-// and Phone are scored as independent compute lanes, then every candidate is
-// run through the exact FIFO/KV/dynamic-slot event simulation. This keeps
-// Chunk64, C->G->P ordering and final Phone ownership fixed, but does NOT
-// preserve P5 or the old CUDA/Phone totals.
+// Executable free C/G/P search for the current three-cycle Ring. Each
+// candidate first receives the handwritten minimax ring score
+// E=max(e1,e2,e3), then all 70 geometries are still run through the exact
+// FIFO/KV/dynamic-slot event simulation. This keeps Chunk64, C->G->P ordering
+// and final Phone ownership fixed, but does NOT preserve P5 or the old
+// CUDA/Phone totals.
 // For a 48-layer model, C+G+P=16 and the current Phone contract allows P2..P8.
 inline result search_three_cycle_cgp(
         const model & m,
@@ -737,7 +778,11 @@ inline result search_three_cycle_cgp(
     out.baseline.xc = chunk_tokens;
     out.baseline.xg = chunk_tokens;
     out.baseline.xp = chunk_tokens;
-    if (!simulate(m, baseline, out.baseline)) {
+    // Only 70 C/G/P geometries exist here, so compute the minimax equation
+    // score for every candidate but do not prune any of them. Exact FIFO
+    // simulation remains exhaustive in APPLY_CGP.
+    if (!estimate_balance(m, out.baseline) ||
+        !simulate(m, baseline, out.baseline)) {
         return out;
     }
     out.baseline_valid = true;
@@ -805,8 +850,8 @@ inline result search_three_cycle_cgp(
             if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
                 return a.wall_ms < b.wall_ms;
             }
-            if (std::abs(a.balance - b.balance) > 1e-9) {
-                return a.balance < b.balance;
+            if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-9) {
+                return a.ring_error_max < b.ring_error_max;
             }
             if (a.p != b.p) {
                 return a.p < b.p;
@@ -881,10 +926,13 @@ inline result search_supported_topology(
     }
     std::sort(coarse.begin(), coarse.end(), [](const candidate & a,
                                                const candidate & b) {
+        if (std::abs(a.ring_error_max-b.ring_error_max) > 1e-12) {
+            return a.ring_error_max < b.ring_error_max;
+        }
         if (a.coarse_ms != b.coarse_ms) {
             return a.coarse_ms < b.coarse_ms;
         }
-        return a.balance < b.balance;
+        return a.ring_error_mean < b.ring_error_mean;
     });
     // Sample different cycle/Phone geometries first, then use the remaining
     // budget for the best-scored layouts. This avoids concentrating all tests
@@ -933,7 +981,7 @@ inline result search_supported_topology(
         if (std::abs(a.wall_ms-b.wall_ms) > 0.05) {
             return a.wall_ms < b.wall_ms;
         }
-        return a.balance < b.balance;
+        return a.ring_error_max < b.ring_error_max;
     });
     if (!out.top.empty()) {
         out.selected = out.top.front();

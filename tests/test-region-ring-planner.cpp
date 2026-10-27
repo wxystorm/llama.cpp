@@ -58,6 +58,45 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
+    // Handwritten minimax ring equations. Construct A=4, B=4, D=3,
+    // TP2C=1, TC2P=1 ms/token, so e1=0, e2=0, e3=2/5 and E=0.4.
+    model equation_profile = mock_profile();
+    equation_profile.phone_register_ms = 0.0;
+    equation_profile.compute_ms = [](device d, int layers, int tokens,
+                                     int, double & ms) {
+        const double per_layer_mspt =
+            d == device::CPU ? 1.0 :
+            d == device::GPU ? 0.5 : 0.75;
+        ms = per_layer_mspt * layers * tokens;
+        return true;
+    };
+    equation_profile.transfer_ms = [](device a, device b, size_t bytes,
+                                      double & ms) {
+        const double tokens =
+            (double) bytes / (2048.0 * sizeof(float));
+        const double per_token =
+            (a == device::PHONE || b == device::PHONE) ? 1.0 : 0.1;
+        ms = tokens * per_token;
+        return true;
+    };
+    candidate equation;
+    equation.cycles = 3;
+    equation.c = 4;
+    equation.g = 8;
+    equation.p = 4;
+    equation.xc = equation.xg = equation.xp = 64;
+    REQUIRE(estimate_balance(equation_profile, equation));
+    REQUIRE(std::fabs(equation.ring_stage_ms_per_token[0] - 4.0) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_stage_ms_per_token[1] - 4.0) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_stage_ms_per_token[2] - 3.0) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_p2c_ms_per_token - 1.0) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_c2p_ms_per_token - 1.0) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_error[0]) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_error[1]) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_error[2] - 0.4) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_error_max - 0.4) < 1e-9);
+    REQUIRE(std::fabs(equation.balance - equation.ring_error_max) < 1e-12);
+
     // Keep the historical gated model only as a regression comparison.
     model gated_pc = mock_profile();
     gated_pc.pc_compute_gate = true;
@@ -153,7 +192,13 @@ int main() {
         search_three_cycle_cgp(free_cgp_profile, baseline_regions, 64);
     REQUIRE(free_cgp.baseline_valid && free_cgp.valid);
     REQUIRE(free_cgp.enumerated == 70);
+    // Small safe space: the minimax equation score ranks/explains candidates,
+    // but no C/G/P geometry is discarded before exact simulation.
+    REQUIRE(free_cgp.profiled == 70);
     REQUIRE(free_cgp.simulated == 70);
+    REQUIRE(std::isfinite(free_cgp.selected.ring_error_max));
+    REQUIRE(free_cgp.selected.ring_error_max >= 0.0 &&
+            free_cgp.selected.ring_error_max <= 1.0);
     REQUIRE(free_cgp.top.size() <= 5);
     REQUIRE(free_cgp.selected.cycles == 3);
     REQUIRE(free_cgp.selected.tail_c == 0 &&
