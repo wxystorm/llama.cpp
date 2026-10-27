@@ -65,6 +65,7 @@ struct llama_hybrid_stage_timing {
     int64_t prepare_us       = 0;
     int64_t compute_range_us = 0;
     int64_t sync_us          = 0;
+    int64_t weight_stage_us  = 0;
     size_t  weight_upload_bytes    = 0;
     size_t  weight_cache_hit_bytes = 0;
 };

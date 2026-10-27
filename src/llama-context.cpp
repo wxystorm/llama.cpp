@@ -2663,8 +2663,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 timing != nullptr ? ggml_time_us() : 0;
             ret = ggml_backend_sched_prepare_split(sched_use, split);
             if (timing != nullptr) {
-                timing->prepare_us +=
+                const int64_t split_prepare_us =
                     ggml_time_us() - split_prepare_begin_us;
+                timing->prepare_us += split_prepare_us;
+                if (gpu_weight_streaming) {
+                    timing->weight_stage_us += split_prepare_us;
+                }
                 timing->weight_upload_bytes +=
                     ggml_backend_sched_get_last_weight_upload_bytes(
                         sched_use);
@@ -3768,6 +3772,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t        compute_mask    = 0;
             size_t          cross_backend_tasks = 0;
             size_t          unknown_backend_tasks = 0;
+            int64_t         weight_stage_us = 0;
             size_t          weight_upload_bytes = 0;
             size_t          weight_cache_hit_bytes = 0;
             size_t          weight_bank_hits = 0;
@@ -4007,6 +4012,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
+                            state.weight_stage_us +=
+                                task_timing.weight_stage_us;
                             state.weight_upload_bytes +=
                                 task_timing.weight_upload_bytes;
                             state.weight_cache_hit_bytes +=
@@ -4017,8 +4024,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "event=TASK_DONE region=%zu chunk=%zu "
                                     "bank=%c upload_mib=%.3f "
                                     "cache_hit_mib=%.3f bank_cuda_mib=%.3f "
-                                    "prepare_ms=%.3f compute_range_ms=%.3f "
-                                    "status=%d\n",
+                                    "weight_stage_ms=%.3f prepare_ms=%.3f "
+                                    "compute_range_ms=%.3f status=%d\n",
                                     task.region, task.chunk,
                                     gpu_bank == 0 ? 'A' : 'B',
                                     task_timing.weight_upload_bytes /
@@ -4028,6 +4035,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     ggml_backend_sched_get_buffer_size(
                                         task_sched, backend_ptrs[1]) /
                                         1048576.0,
+                                    task_timing.weight_stage_us / 1000.0,
                                     task_timing.prepare_us / 1000.0,
                                     task_timing.compute_range_us / 1000.0,
                                     (int) task_status);
@@ -4185,7 +4193,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "backend_exec_ms=%.3f resource_mask=0x%016" PRIx64
                 " compute_mask=0x%016" PRIx64
                 " cross_backend_tasks=%zu unresolved_tasks=%zu "
-                "weight_upload_mib=%.3f weight_cache_hit_mib=%.3f "
+                "weight_stage_ms=%.3f weight_upload_mib=%.3f "
+                "weight_cache_hit_mib=%.3f "
                 "bank_hits=%zu bank_misses=%zu bank_evictions=%zu "
                 "status=%d\n",
                 name, state.completed,
@@ -4200,6 +4209,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 state.backend_exec_us / 1000.0, state.backend_mask,
                 state.compute_mask, state.cross_backend_tasks,
                 state.unknown_backend_tasks,
+                state.weight_stage_us / 1000.0,
                 state.weight_upload_bytes / 1048576.0,
                 state.weight_cache_hit_bytes / 1048576.0,
                 state.weight_bank_hits,
