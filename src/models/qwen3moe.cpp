@@ -185,18 +185,33 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const int  layer_end         = stage_graph ? params.hybrid_layer_end : n_layer;
     const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
     const bool build_output_head = !stage_graph || params.hybrid_output_head;
+    const bool embedding_only    = stage_graph && params.hybrid_embedding_only;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
     GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
-    GGML_ASSERT(hidden_input == (layer_begin > 0));
+    GGML_ASSERT(layer_begin == 0 || hidden_input);
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
     GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
+    GGML_ASSERT(!embedding_only || (layer_begin == 0 && !hidden_input));
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
 
     inpL = hidden_input ? build_inp_stage() : build_inp_embd(model.tok_embd);
+
+    // Region Ring GPU-first prelude: materialize only token embeddings for the
+    // full ubatch on CPU. The actual layer-0 stage is rebuilt later with
+    // hybrid_hidden_input=true and therefore contains no embedding lookup.
+    if (embedding_only) {
+        if (!ggml_is_contiguous(inpL)) {
+            inpL = ggml_cont(ctx0, inpL);
+            cb(inpL, "embedding_prelude_cont", -1);
+        }
+        res->t_stage_output = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();

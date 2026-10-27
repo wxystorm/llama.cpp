@@ -343,7 +343,9 @@ private:
                                       ggml_status &            ret,
                                       bool                     apply_mctx = true,
                                       const llama_hybrid_runtime_stage * stage = nullptr,
-                                      int32_t                  outputs_override = -1);
+                                      int32_t                  outputs_override = -1,
+                                      bool                     force_hidden_input = false,
+                                      bool                     embedding_only = false);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,

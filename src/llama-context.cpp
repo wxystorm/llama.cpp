@@ -1823,7 +1823,9 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  ggml_status &            ret,
                                                  bool                     apply_mctx,
                                                  const llama_hybrid_runtime_stage * stage,
-                                                 int32_t                  outputs_override) {
+                                                 int32_t                  outputs_override,
+                                                 bool                     force_hidden_input,
+                                                 bool                     embedding_only) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -1867,11 +1869,14 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         GGML_ASSERT(stage->layer_begin < stage->layer_end);
         GGML_ASSERT(stage->layer_end <= n_layer);
 
-        gparams.hybrid_layer_begin  = stage->layer_begin;
-        gparams.hybrid_layer_end    = stage->layer_end;
-        gparams.hybrid_hidden_input = stage->layer_begin > 0;
-        gparams.hybrid_output_head  = stage->layer_end == n_layer;
-        gparams.hybrid_wave_probe   = stage->wave_probe;
+        gparams.hybrid_layer_begin   = stage->layer_begin;
+        gparams.hybrid_layer_end     = stage->layer_end;
+        gparams.hybrid_hidden_input  =
+            stage->layer_begin > 0 || force_hidden_input;
+        gparams.hybrid_output_head   =
+            !embedding_only && stage->layer_end == n_layer;
+        gparams.hybrid_wave_probe    = stage->wave_probe;
+        gparams.hybrid_embedding_only = embedding_only;
     }
     if (log_prepare_breakdown) {
         graph_params_us = ggml_time_us() - graph_params_begin_us;
@@ -2392,7 +2397,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
     llm_graph_result * result = prepare_ubatch(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
-        &stage, task_local_graph_outputs ? block_outputs : -1);
+        &stage, task_local_graph_outputs ? block_outputs : -1,
+        stage_input != nullptr, false);
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -3423,6 +3429,116 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     size_t next_device = 0;
     const int64_t begin_us = ggml_time_us();
 
+    // GPU-first Ring precomputes the complete token embedding once. This keeps
+    // the Q4_K GET_ROWS CPU requirement outside the per-chunk GPU worker and
+    // makes stage 0 itself a normal hidden-input CUDA Region.
+    std::vector<float> ring_input_hidden;
+    bool ring_embedding_prelude = false;
+    int64_t ring_embedding_prelude_us = 0;
+    const bool gpu_first_ring =
+        !stages.empty() &&
+        stages.front().kind == llama_hybrid_runtime_stage_kind::GPU &&
+        stages.front().layer_begin == 0;
+    const bool embedding_prelude_arch =
+        model.arch == LLM_ARCH_QWEN2 ||
+        model.arch == LLM_ARCH_QWEN3MOE;
+    if (gpu_first_ring && embedding_prelude_arch &&
+            own_stage_resources && isolate_device_resources &&
+            ubatch.token != nullptr) {
+        if (!worker_kv_views[0] ||
+                !worker_kv_views[0]->set_stage_range(
+                    ubatch_id, 0, ubatch.n_tokens)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EMBED_PRELUDE] phase=BEGIN status=FAIL "
+                "reason=KV_STAGE_RANGE\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        const int64_t prelude_begin_us = ggml_time_us();
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_EMBED_PRELUDE] phase=BEGIN tokens=%u hidden=%d "
+            "backend=CPU_FULL_BATCH status=RUNNING\n",
+            ubatch.n_tokens, n_embd);
+
+        ggml_status prelude_status = GGML_STATUS_SUCCESS;
+        llm_graph_result * prelude_res = prepare_ubatch(
+            ring_res[0], ring_sched[0], ubatch, gtype,
+            worker_kv_views[0].get(), prelude_status, false,
+            &stages.front(), 0, false, true);
+        if (prelude_res == nullptr ||
+                prelude_status != GGML_STATUS_SUCCESS) {
+            worker_kv_views[0]->clear_stage_range();
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EMBED_PRELUDE] phase=PREPARE status=FAIL "
+                "reason=GRAPH_PREPARE code=%d\n",
+                (int) prelude_status);
+            ret = prelude_status == GGML_STATUS_SUCCESS ?
+                GGML_STATUS_FAILED : prelude_status;
+            return nullptr;
+        }
+
+        const int prelude_splits =
+            ggml_backend_sched_get_n_splits(ring_sched[0]);
+        const bool cpu_only =
+            prelude_splits == 1 &&
+            ggml_backend_sched_get_n_backends(ring_sched[0]) == 1 &&
+            ggml_backend_sched_get_split_backend(ring_sched[0], 0) ==
+                backend_cpu;
+        if (!cpu_only) {
+            worker_kv_views[0]->clear_stage_range();
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EMBED_PRELUDE] phase=PREPARE splits=%d "
+                "status=FAIL reason=NOT_CPU_ONLY\n",
+                prelude_splits);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        const int64_t compute_begin_us = ggml_time_us();
+        prelude_status = graph_compute_range(
+            ring_sched[0], 0, prelude_splits, ubatch.n_tokens > 1);
+        const int64_t compute_end_us = ggml_time_us();
+        if (prelude_status != GGML_STATUS_SUCCESS) {
+            worker_kv_views[0]->clear_stage_range();
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EMBED_PRELUDE] phase=COMPUTE status=FAIL "
+                "code=%d\n",
+                (int) prelude_status);
+            ret = prelude_status;
+            return nullptr;
+        }
+
+        ring_input_hidden.resize(
+            (size_t) ubatch.n_tokens * (size_t) n_embd);
+        const int64_t copy_begin_us = ggml_time_us();
+        if (!copy_hybrid_stage_output(
+                prelude_res, ring_sched[0], ring_input_hidden.data(),
+                ubatch.n_tokens, ubatch_id, 0, 0, false)) {
+            worker_kv_views[0]->clear_stage_range();
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_EMBED_PRELUDE] phase=COPY status=FAIL "
+                "reason=INVALID_EMBEDDING_OUTPUT\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        const int64_t copy_end_us = ggml_time_us();
+        worker_kv_views[0]->clear_stage_range();
+
+        ring_embedding_prelude = true;
+        ring_embedding_prelude_us =
+            ggml_time_us() - prelude_begin_us;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_EMBED_PRELUDE] phase=END tokens=%u bytes=%zu "
+            "compute_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
+            "handoff=HOST_FULL_BATCH next=CUDA status=READY\n",
+            ubatch.n_tokens,
+            ring_input_hidden.size() * sizeof(float),
+            (compute_end_us - compute_begin_us) / 1000.0,
+            (copy_end_us - copy_begin_us) / 1000.0,
+            ring_embedding_prelude_us / 1000.0);
+    }
+
     if (threaded_execution) {
         if (pc_phone_overlap) {
             // graph_compute_range() used to mutate ALL backend thread configs
@@ -3449,11 +3565,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_PLAN] workers=3 fifo=PER_DEVICE "
-            "kv_views=PER_DEVICE activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu backend=%s "
-            "graph_overlap=%s status=READY\n",
+            "kv_views=PER_DEVICE activation_buffer=FULL_BATCH_PER_EDGE "
+            "slot_limit=NONE legacy_slot_pool=%zu backend=%s "
+            "graph_overlap=%s input=%s status=READY\n",
             slot_pool_size,
             pc_phone_overlap ? "PREPARE_PLUS_CPU_CUDA_META" : "SHARED_GATED",
-            pc_phone_overlap ? "MEASURED" : "0");
+            pc_phone_overlap ? "MEASURED" : "0",
+            ring_embedding_prelude ?
+                "CPU_EMBED_FULL_BATCH_THEN_GPU" :
+                "INLINE_STAGE0");
         // The device FIFO and host slots are concurrent. Graph/scheduler
         // mutation is serialized briefly by PREPARE; long CPU and CUDA compute
         // use independent backend locks, while Phone Meta/RPC is detached after
@@ -3526,7 +3646,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         slot_pool_size > 0 ?
                             (size_t) task.output_slot * (size_t) chunk_tokens :
                             (size_t) task.token_begin;
-                    float * input = first ? nullptr :
+                    float * input = first ?
+                        (ring_embedding_prelude ?
+                            ring_input_hidden.data() +
+                                (size_t) task.token_begin * n_embd :
+                            nullptr) :
                         outputs[task.region - 1].data() +
                             input_host_token_begin * n_embd;
                     float * output = last ? nullptr :
@@ -3923,7 +4047,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             slot_pool_size > 0 ?
                 (size_t) task.output_slot * (size_t) chunk_tokens :
                 (size_t) task.token_begin;
-        float * input = first ? nullptr :
+        float * input = first ?
+            (ring_embedding_prelude ?
+                ring_input_hidden.data() +
+                    (size_t) task.token_begin * n_embd :
+                nullptr) :
             outputs[task.region - 1].data() + input_host_token_begin * n_embd;
         float * output = last ? nullptr :
             outputs[task.region].data() + output_host_token_begin * n_embd;
@@ -4020,10 +4148,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     LLAMA_LOG_ERROR(
         "[REGION_RING_SUM] tokens=%u chunk_tokens=%d regions=%zu "
         "chunks=%zu executed=%zu complete=%d wall_ms=%.3f "
-        "mode=%s status=%d\n",
+        "embedding_prelude_ms=%.3f mode=%s status=%d\n",
         ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
+        ring_embedding_prelude_us / 1000.0,
         pc_phone_overlap ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
         audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
         threaded_execution ? "DEVICE_FIFO_GATED_WORKERS" :
