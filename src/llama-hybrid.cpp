@@ -2101,6 +2101,126 @@ static bool llama_hybrid_layer_block_cost_at_depth(
     return true;
 }
 
+static bool llama_hybrid_layer_block_prepare_cost_at_depth(
+        const std::vector<llama_hybrid_layer_compute_point> & points,
+        int tokens,
+        int profile_layers,
+        double & per_layer_ms) {
+    if (points.empty() || tokens <= 0 || profile_layers <= 0) {
+        return false;
+    }
+
+    const llama_hybrid_layer_compute_point * exact = nullptr;
+    const llama_hybrid_layer_compute_point * lower = nullptr;
+    const llama_hybrid_layer_compute_point * upper = nullptr;
+    for (const auto & point : points) {
+        if (point.layers != profile_layers) {
+            continue;
+        }
+        if (point.tokens == tokens) {
+            exact = &point;
+            break;
+        }
+        if (point.tokens < tokens &&
+                (lower == nullptr || point.tokens > lower->tokens)) {
+            lower = &point;
+        }
+        if (point.tokens > tokens &&
+                (upper == nullptr || point.tokens < upper->tokens)) {
+            upper = &point;
+        }
+    }
+
+    const auto value =
+        [](const llama_hybrid_layer_compute_point * point) {
+            return std::max(0.0, point->prepare_ms) /
+                std::max(point->layers, 1);
+        };
+
+    if (exact != nullptr) {
+        per_layer_ms = value(exact);
+        return true;
+    }
+    if (lower == nullptr && upper == nullptr) {
+        return false;
+    }
+    if (lower == nullptr) {
+        per_layer_ms = value(upper);
+        return true;
+    }
+    if (upper == nullptr) {
+        per_layer_ms = value(lower);
+        return true;
+    }
+
+    const double t =
+        (double) (tokens - lower->tokens) /
+        (double) (upper->tokens - lower->tokens);
+    per_layer_ms =
+        value(lower) + t * (value(upper) - value(lower));
+    return std::isfinite(per_layer_ms);
+}
+
+static bool llama_hybrid_layer_block_prepare_total_cost(
+        const std::vector<llama_hybrid_layer_compute_point> & points,
+        int tokens,
+        int target_layers,
+        double & total_ms) {
+    total_ms = 0.0;
+    if (target_layers == 0) {
+        return true;
+    }
+    if (points.empty() || tokens <= 0 || target_layers < 0) {
+        return false;
+    }
+
+    std::vector<std::pair<int, double>> depth_costs;
+    std::set<int> seen_layers;
+    for (const auto & point : points) {
+        if (point.layers <= 0 ||
+                !seen_layers.insert(point.layers).second) {
+            continue;
+        }
+        double per_layer_ms = 0.0;
+        if (llama_hybrid_layer_block_prepare_cost_at_depth(
+                points, tokens, point.layers, per_layer_ms)) {
+            depth_costs.emplace_back(
+                point.layers, per_layer_ms);
+        }
+    }
+    if (depth_costs.empty()) {
+        return false;
+    }
+    std::sort(depth_costs.begin(), depth_costs.end());
+
+    double per_layer_ms = depth_costs.front().second;
+    if (target_layers <= depth_costs.front().first) {
+        per_layer_ms = depth_costs.front().second;
+    } else if (target_layers >= depth_costs.back().first) {
+        per_layer_ms = depth_costs.back().second;
+    } else {
+        for (size_t i = 0; i + 1 < depth_costs.size(); ++i) {
+            if (target_layers < depth_costs[i].first ||
+                    target_layers > depth_costs[i + 1].first) {
+                continue;
+            }
+            const double t =
+                (double) (target_layers - depth_costs[i].first) /
+                (double) (depth_costs[i + 1].first -
+                          depth_costs[i].first);
+            per_layer_ms =
+                depth_costs[i].second +
+                t * (depth_costs[i + 1].second -
+                     depth_costs[i].second);
+            break;
+        }
+    }
+
+    total_ms =
+        target_layers * std::max(0.0, per_layer_ms);
+    return std::isfinite(total_ms);
+}
+
 static bool llama_hybrid_layer_block_cost(
         const std::vector<llama_hybrid_layer_compute_point> & points,
         int tokens,
@@ -9031,6 +9151,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         cost = base + layers * (attn_now - attn_ref);
         return std::isfinite(cost) && cost > 0.0;
+    };
+
+    model.prepare_ms = [&profile](
+            llama_region_ring_device dev, int layers,
+            int query_tokens, int kv_tokens, double & cost) -> bool {
+        GGML_UNUSED(kv_tokens);
+        const auto & block =
+            dev == llama_region_ring_device::CPU ?
+                profile.cpu_layer_blocks :
+            dev == llama_region_ring_device::GPU ?
+                profile.gpu_layer_blocks :
+                profile.phone_layer_blocks;
+        if (!llama_hybrid_layer_block_prepare_total_cost(
+                block, query_tokens, layers, cost)) {
+            return false;
+        }
+        return std::isfinite(cost) && cost >= 0.0;
     };
 
     model.transfer_ms = [&profile](
