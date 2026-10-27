@@ -2928,8 +2928,6 @@ void ggml_backend_sched_set_weight_cache(
     }
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
-    sched->last_weight_stage_cpu_copy_us = 0;
-    sched->last_weight_stage_chunks = 0;
 }
 
 bool ggml_backend_sched_get_weight_cache(
