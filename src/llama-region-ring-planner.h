@@ -380,13 +380,17 @@ inline bool simulate(const model & m,
     double weight_h2d_startup_ms = 0.0;
     double weight_h2d_exposed_ms = 0.0;
 
-    auto task_ready = [&](int id) -> bool {
+    auto task_dependencies_ready = [&](int id) -> bool {
         if (id < 0 || id >= (int) tasks.size()) {
             return false;
         }
         const auto & t = tasks[(size_t) id];
-        return !t.queued && !t.started && !t.done && t.inputs == 0 &&
+        return !t.started && !t.done && t.inputs == 0 &&
                (t.previous < 0 || tasks[(size_t) t.previous].done);
+    };
+    auto task_ready = [&](int id) -> bool {
+        return task_dependencies_ready(id) &&
+               !tasks[(size_t) id].queued;
     };
     auto offer = [&](int id) {
         if (!task_ready(id)) {
@@ -504,7 +508,7 @@ inline bool simulate(const model & m,
                     }
                 }
                 const int first = by_region[(size_t) r].front();
-                if (prior_done && task_ready(first)) {
+                if (prior_done && task_dependencies_ready(first)) {
                     gpu_natural_ready_ms[(size_t) r] = now;
                 }
             }
