@@ -3869,16 +3869,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             llama_region_ring_device::PHONE,
         };
 
-        enum class gpu_weight_bank_phase {
-            EMPTY,
-            LOADING,
-            READY,
-            IN_USE,
-            FAILED,
-        };
         struct gpu_weight_bank_runtime {
+            enum class phase_t {
+                EMPTY,
+                LOADING,
+                READY,
+                IN_USE,
+                FAILED,
+            };
+
             size_t region = std::numeric_limits<size_t>::max();
-            gpu_weight_bank_phase phase = gpu_weight_bank_phase::EMPTY;
+            phase_t phase = phase_t::EMPTY;
         };
         struct gpu_weight_prefetch_job {
             size_t region = 0;
@@ -4154,13 +4155,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     auto & bank_state =
                         gpu_bank_runtime[bank_index];
                     if (bank_state.phase ==
-                            gpu_weight_bank_phase::LOADING &&
+                            gpu_weight_bank_runtime::phase_t::LOADING &&
                             bank_state.region == region) {
                         return true;
                     }
                     bank_state.region = region;
                     bank_state.phase =
-                        gpu_weight_bank_phase::LOADING;
+                        gpu_weight_bank_runtime::phase_t::LOADING;
                     gpu_bank_prefetched[bank_index] = false;
                     gpu_prefetch_jobs.push_back({
                         region, bank_index, source_region, reason});
@@ -4234,10 +4235,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             gpu_bank_runtime[job.bank_index];
                         if (bank_state.region == job.region &&
                                 bank_state.phase ==
-                                    gpu_weight_bank_phase::LOADING) {
+                                    gpu_weight_bank_runtime::phase_t::LOADING) {
                             bank_state.phase = ok ?
-                                gpu_weight_bank_phase::READY :
-                                gpu_weight_bank_phase::FAILED;
+                                gpu_weight_bank_runtime::phase_t::READY :
+                                gpu_weight_bank_runtime::phase_t::FAILED;
                             gpu_bank_prefetched[
                                 job.bank_index] = ok;
                         }
@@ -4252,9 +4253,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     gpu_prefetch_mutex);
                 for (auto & bank_state : gpu_bank_runtime) {
                     if (bank_state.phase ==
-                            gpu_weight_bank_phase::LOADING) {
+                            gpu_weight_bank_runtime::phase_t::LOADING) {
                         bank_state.phase =
-                            gpu_weight_bank_phase::FAILED;
+                            gpu_weight_bank_runtime::phase_t::FAILED;
                     }
                 }
             }
@@ -4299,7 +4300,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 gpu_prefetch_jobs.clear();
                 for (auto & bank_state : gpu_bank_runtime) {
                     bank_state.phase =
-                        gpu_weight_bank_phase::FAILED;
+                        gpu_weight_bank_runtime::phase_t::FAILED;
                 }
                 gpu_bank_cv.notify_all();
             } else {
@@ -4310,18 +4311,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     gpu_prefetch_mutex);
                 gpu_bank_cv.wait(lock, [&]() {
                     return gpu_bank_runtime[0].phase !=
-                               gpu_weight_bank_phase::LOADING &&
+                               gpu_weight_bank_runtime::phase_t::LOADING &&
                            gpu_bank_runtime[1].phase !=
-                               gpu_weight_bank_phase::LOADING;
+                               gpu_weight_bank_runtime::phase_t::LOADING;
                 });
             }
 
             const bool bank_a_ready =
                 gpu_bank_runtime[0].phase ==
-                    gpu_weight_bank_phase::READY;
+                    gpu_weight_bank_runtime::phase_t::READY;
             const bool bank_b_ready =
                 gpu_bank_runtime[1].phase ==
-                    gpu_weight_bank_phase::READY;
+                    gpu_weight_bank_runtime::phase_t::READY;
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT_PREFETCH] event=WINDOW_READY "
                 "worker=CPU_DEDICATED region0=%zu bankA=%d "
@@ -4435,7 +4436,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                             if (bank_state.region == task.region &&
                                     bank_state.phase ==
-                                        gpu_weight_bank_phase::LOADING) {
+                                        gpu_weight_bank_runtime::phase_t::LOADING) {
                                 LLAMA_LOG_ERROR(
                                     "[REGION_RING_GPU_WEIGHT_PREFETCH] "
                                     "event=WAIT region=%zu chunk=%zu "
@@ -4446,7 +4447,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     return bank_state.region !=
                                             task.region ||
                                         bank_state.phase !=
-                                            gpu_weight_bank_phase::LOADING;
+                                            gpu_weight_bank_runtime::phase_t::LOADING;
                                 });
                                 gpu_weight_wait_us =
                                     ggml_time_us() - wait_begin_us;
@@ -4456,20 +4457,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                             if (bank_state.region == task.region &&
                                     (bank_state.phase ==
-                                         gpu_weight_bank_phase::READY ||
+                                         gpu_weight_bank_runtime::phase_t::READY ||
                                      bank_state.phase ==
-                                         gpu_weight_bank_phase::IN_USE) &&
+                                         gpu_weight_bank_runtime::phase_t::IN_USE) &&
                                     selected.cached_region ==
                                         task.region) {
                                 gpu_bank_hit = true;
                                 gpu_prefetch_hit =
                                     task.chunk == 0 &&
                                     bank_state.phase ==
-                                        gpu_weight_bank_phase::READY &&
+                                        gpu_weight_bank_runtime::phase_t::READY &&
                                     gpu_bank_prefetched[
                                         selected_bank - 1];
                                 bank_state.phase =
-                                    gpu_weight_bank_phase::IN_USE;
+                                    gpu_weight_bank_runtime::phase_t::IN_USE;
                                 if (gpu_prefetch_hit) {
                                     ++state.weight_prefetch_hits;
                                     gpu_bank_prefetched[
@@ -4482,7 +4483,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 // cannot touch it again until REGION_DRAIN.
                                 bank_state.region = task.region;
                                 bank_state.phase =
-                                    gpu_weight_bank_phase::IN_USE;
+                                    gpu_weight_bank_runtime::phase_t::IN_USE;
                                 gpu_bank_prefetched[
                                     selected_bank - 1] = false;
                             }
