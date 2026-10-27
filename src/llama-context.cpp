@@ -4087,11 +4087,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
 
                 const int64_t h2d_begin_us = ggml_time_us();
+                // One CPU prefetch worker + one transfer stream means both
+                // Banks can share one 2x64 MiB pinned staging ring. Resource
+                // #1 (Bank A) owns that ring; Bank B only owns its CUDA cache.
+                ggml_backend_sched_t staging_owner =
+                    region_ring_worker_resources[1].sched.get();
                 for (int split = 0; split < n_splits; ++split) {
                     prefetch_status =
-                        ggml_backend_sched_prepare_split_weights_async(
+                        ggml_backend_sched_prepare_split_weights_staged_async(
                             bank.sched.get(), split,
-                            region_ring_cuda_transfer_backend.get());
+                            region_ring_cuda_transfer_backend.get(),
+                            staging_owner);
                     upload_bytes +=
                         ggml_backend_sched_get_last_weight_upload_bytes(
                             bank.sched.get());
@@ -4100,18 +4106,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             bank.sched.get());
                     stage_cpu_copy_us +=
                         ggml_backend_sched_get_last_weight_stage_cpu_copy_us(
-                            bank.sched.get());
+                            staging_owner);
                     stage_chunks +=
                         ggml_backend_sched_get_last_weight_stage_chunks(
-                            bank.sched.get());
+                            staging_owner);
                     stage_slot_size = std::max(
                         stage_slot_size,
                         ggml_backend_sched_get_weight_stage_slot_size(
-                            bank.sched.get()));
+                            staging_owner));
                     stage_pinned =
                         stage_pinned &&
                         ggml_backend_sched_weight_stage_is_pinned(
-                            bank.sched.get());
+                            staging_owner);
 
                     if (prefetch_status != GGML_STATUS_SUCCESS) {
                         return fail_prefetch(
