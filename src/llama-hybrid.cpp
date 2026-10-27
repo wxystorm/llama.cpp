@@ -8312,7 +8312,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
 static bool llama_hybrid_region_ring_planner_evaluate(
         int tokens, int kv_start, int baseline_chunk,
-        std::string * selected_layout, bool topology_preview = false) {
+        std::string * selected_layout, bool topology_preview = false,
+        bool baseline_only = false) {
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
@@ -8468,7 +8469,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
         profile.phone_to_pc.size(), model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
-        selected_layout != nullptr ? "APPLY_SAFE" : "DRY_RUN");
+        baseline_only ? "APPLY_BASELINE" :
+        selected_layout != nullptr ? "APPLY_SAFE" :
+        topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
     if (topology_preview) {
         if (baseline_chunk != 64) {
@@ -8508,11 +8511,52 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (baseline_chunk != 64 ||
                 !llama_region_ring_apply_safe_phone_shape(baseline_regions)) {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE applied=0 "
+                "[REGION_RING_PLAN_APPLY] mode=%s applied=0 "
                 "reason=UNVALIDATED_PHONE_OR_CHUNK "
                 "n_layers=%d chunk=%d status=KEEP_BASELINE\n",
+                baseline_only ? "APPLY_BASELINE" : "APPLY_SAFE",
                 profile.n_layer, baseline_chunk);
             return false;
+        }
+        if (baseline_only) {
+            if (const char * requested =
+                    std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
+                if (*requested != '\0') {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_BASELINE "
+                        "reason=PLAN_LAYOUT_OVERRIDE_FORBIDDEN "
+                        "status=KEEP_FIXED_RING\n");
+                    return false;
+                }
+            }
+            llama_ring_planner::candidate baseline_estimate;
+            baseline_estimate.xc = baseline_chunk;
+            baseline_estimate.xg = baseline_chunk;
+            baseline_estimate.xp = baseline_chunk;
+            std::string simulate_reason;
+            if (!llama_ring_planner::simulate(
+                    model,baseline_regions,baseline_estimate,
+                    &simulate_reason)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=APPLY_BASELINE "
+                    "reason=PROFILE_OR_DAG_%s status=KEEP_FIXED_RING\n",
+                    simulate_reason.c_str());
+                return false;
+            }
+            *selected_layout =
+                llama_region_ring_layout_string(baseline_regions);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_SELECTED] mode=APPLY_BASELINE "
+                "source=FIXED_RUNTIME layout=%s tokens=%d chunk=%d "
+                "predicted_ms=%.3f status=IDENTICAL_BASELINE\n",
+                selected_layout->c_str(),tokens,baseline_chunk,
+                baseline_estimate.wall_ms);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_BASELINE "
+                "phase=PRE_MODEL_LOAD selected=1 layout=%s chunk=%d "
+                "topology_change=0 status=AWAIT_MODEL_PLACEMENT\n",
+                selected_layout->c_str(),baseline_chunk);
+            return true;
         }
         const auto layer_bytes = [&profile](int il) -> size_t {
             return profile.layer_weight_bytes.size() ==
@@ -8769,6 +8813,13 @@ bool llama_hybrid_region_ring_planner_dry_run(
         int tokens, int kv_start, int baseline_chunk) {
     return llama_hybrid_region_ring_planner_evaluate(
         tokens, kv_start, baseline_chunk, nullptr);
+}
+
+bool llama_hybrid_region_ring_planner_apply_baseline(
+        int tokens, int kv_start, int baseline_chunk,
+        std::string & selected_layout) {
+    return llama_hybrid_region_ring_planner_evaluate(
+        tokens, kv_start, baseline_chunk, &selected_layout, false, true);
 }
 
 bool llama_hybrid_region_ring_planner_apply_safe(

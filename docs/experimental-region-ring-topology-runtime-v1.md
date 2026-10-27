@@ -4,8 +4,41 @@ Status: **topology parser and general search committed; not a working
 variable-Phone runtime yet**. PC/CUDA/Phone inference correctness has NOT
 been tested on hardware.
 
-Branch: `feat/region-ring-plan-runtime-v1-20261026`
-Base: `feat/region-ring-plan-apply-safe-20261026`
+Current restart branch: `feat/region-ring-plan-runtime-v2-20261027`
+Rollback point: `6a65911f0d7bfeb61e689c5f9158f4ee5194a8ed`
+
+## Stage 0: executable Planner plumbing with an identical baseline
+
+Before any variable topology is allowed, use:
+
+```powershell
+$env:LLAMA_HYBRID_REGION_RING_V1 = "1"
+$env:LLAMA_HYBRID_REGION_RING_EXEC = "fifo-pc-phone"
+$env:LLAMA_HYBRID_REGION_RING_LAYOUT = "C7,G4,P5,C7,G4,P5,C8,G3,P5"
+$env:LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS = "64"
+$env:LLAMA_HYBRID_REGION_RING_PLANNER = "apply-baseline"
+$env:LLAMA_HYBRID_REGION_RING_PLAN_TOKENS = "358"
+Remove-Item Env:LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT -ErrorAction SilentlyContinue
+```
+
+`apply-baseline` profiles and simulates the fixed runtime Ring, then stores
+that exact canonical layout on `llama_model`. Weight placement and runtime
+Stages consume the model-owned copy. Any non-empty
+`LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT` is rejected in this mode.
+
+Required evidence:
+
+```text
+[REGION_RING_PLAN_SELECTED] mode=APPLY_BASELINE source=FIXED_RUNTIME ... status=IDENTICAL_BASELINE
+[REGION_RING_PLAN_APPLY] mode=APPLY_BASELINE phase=MODEL_LOAD ... status=MODEL_OWNED
+[REGION_RING_PLAN_APPLY] mode=APPLY_BASELINE phase=WEIGHT_PLACEMENT ... status=CONSISTENT
+[REGION_RING_PLAN_APPLY] mode=APPLY_BASELINE phase=RUNTIME_STAGES ... status=CONSISTENT
+```
+
+This stage must produce the same output/token/logit results as the fixed
+Ring with Planner disabled. It does **not** permit P8, a PC tail, a changed
+CPU/CUDA boundary, dynamic final ownership, or new Meta scheduler behavior.
+Only after this A/B passes should `apply-safe` boundary movement be tested.
 
 ## Goal
 

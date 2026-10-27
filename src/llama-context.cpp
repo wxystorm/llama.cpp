@@ -4642,11 +4642,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
             }
         }
+        const char * plan_mode = model.hybrid_ring_plan_mode.empty() ?
+            "APPLY_SAFE" : model.hybrid_ring_plan_mode.c_str();
         LLAMA_LOG_ERROR(
-            "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+            "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
             "layout=%s chunk=%d window=2 status=CONSISTENT\n",
-            model.hybrid_ring_plan_layout.c_str(),
+            plan_mode,model.hybrid_ring_plan_layout.c_str(),
             region_ring_chunk_tokens);
     }
     if (region_ring_v1) {

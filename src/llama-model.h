@@ -649,6 +649,7 @@ struct llama_model {
     // context created from this model must use the SAME immutable layout.
     // Empty means use the legacy LLAMA_HYBRID_REGION_RING_LAYOUT setting.
     std::string hybrid_ring_plan_layout;
+    std::string hybrid_ring_plan_mode;
     int hybrid_ring_plan_chunk_tokens = 0;
 
     std::vector<llama_layer> layers;

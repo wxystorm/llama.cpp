@@ -1721,12 +1721,14 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     "Ring selected Plan violates fixed Phone, GPU weight "
                     "or Chunk ownership constraints");
             }
+            const char * plan_mode = hybrid_ring_plan_mode.empty() ?
+                "APPLY_SAFE" : hybrid_ring_plan_mode.c_str();
             LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                "[REGION_RING_PLAN_APPLY] mode=%s "
                 "phase=WEIGHT_PLACEMENT applied=1 "
                 "layout=%s original=%s chunk=%d "
                 "status=CONSISTENT\n",
-                hybrid_ring_plan_layout.c_str(),
+                plan_mode,hybrid_ring_plan_layout.c_str(),
                 llama_region_ring_layout_string(original).c_str(),
                 hybrid_ring_plan_chunk_tokens);
         }

@@ -320,33 +320,42 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_apply_safe =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"apply-safe") == 0;
+        const bool ring_plan_apply_baseline =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"apply-baseline") == 0;
+        const bool ring_plan_apply_requested =
+            ring_plan_apply_safe || ring_plan_apply_baseline;
+        const char * ring_plan_apply_mode =
+            ring_plan_apply_baseline ? "APPLY_BASELINE" : "APPLY_SAFE";
         const bool ring_plan_topology_preview =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"topology-preview") == 0;
-        if (ring_plan_apply_safe &&
+        if (ring_plan_apply_requested &&
                 (!llama_region_ring_enabled() ||
                  params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
                  params.hybrid_auto)) {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n");
+                "[REGION_RING_PLAN_REJECT] mode=%s "
+                "reason=REQUIRES_RING_TENSOR_WITHOUT_LEGACY_HYBRID_AUTO\n",
+                ring_plan_apply_mode);
             return {-1,nullptr};
         }
-        if (ring_plan_apply_safe) {
+        if (ring_plan_apply_requested) {
             const char * ring_exec =
                 std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
             if (ring_exec == nullptr ||
                     std::strcmp(ring_exec,"fifo-pc-phone") != 0) {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                    "reason=REQUIRES_FIFO_PC_PHONE_RUNTIME\n");
+                    "[REGION_RING_PLAN_REJECT] mode=%s "
+                    "reason=REQUIRES_FIFO_PC_PHONE_RUNTIME\n",
+                    ring_plan_apply_mode);
                 return {-1,nullptr};
             }
         }
         const bool ring_planner_profile_requested =
             params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
             llama_region_ring_enabled() &&
-            (ring_plan_dry_run || ring_plan_apply_safe ||
+            (ring_plan_dry_run || ring_plan_apply_requested ||
              ring_plan_topology_preview);
         if ((params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -355,6 +364,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            "ring_planner=%s\n",
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
+                           ring_plan_apply_baseline ? "APPLY_BASELINE" :
                            ring_plan_apply_safe ? "APPLY_SAFE" :
                            ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
                            ring_plan_dry_run ? "DRY_RUN" : "OFF");
@@ -405,7 +415,18 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             (void) llama_hybrid_region_ring_planner_topology_preview(
                 target_tokens,0,chunk_tokens);
         }
-        if (ring_plan_apply_safe) {
+        if (ring_plan_apply_requested) {
+            if (ring_plan_apply_baseline) {
+                if (const char * requested =
+                        std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
+                    if (*requested != '\0') {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PLAN_REJECT] mode=APPLY_BASELINE "
+                            "reason=PLAN_LAYOUT_OVERRIDE_FORBIDDEN\n");
+                        return {-1,nullptr};
+                    }
+                }
+            }
             int chunk_tokens = 128;
             if (const char * raw = std::getenv(
                     "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
@@ -414,8 +435,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 if (end == raw || *end != '\0' || n < 1 ||
                         n > 16384) {
                     LLAMA_LOG_ERROR(
-                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                        "reason=INVALID_RUNTIME_CHUNK\n");
+                        "[REGION_RING_PLAN_REJECT] mode=%s "
+                        "reason=INVALID_RUNTIME_CHUNK\n",
+                        ring_plan_apply_mode);
                     return {-1,nullptr};
                 }
                 chunk_tokens = (int) n;
@@ -429,14 +451,17 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 if (end == raw || *end != '\0' || n < 16 ||
                         n > 16384) {
                     LLAMA_LOG_ERROR(
-                        "[REGION_RING_PLAN_REJECT] mode=APPLY_SAFE "
-                        "reason=INVALID_TARGET_TOKENS\n");
+                        "[REGION_RING_PLAN_REJECT] mode=%s "
+                        "reason=INVALID_TARGET_TOKENS\n",
+                        ring_plan_apply_mode);
                     return {-1,nullptr};
                 }
                 target_tokens = (int) n;
             }
             std::string selected_layout;
-            const bool selected =
+            const bool selected = ring_plan_apply_baseline ?
+                llama_hybrid_region_ring_planner_apply_baseline(
+                    target_tokens, 0, chunk_tokens,selected_layout) :
                 llama_hybrid_region_ring_planner_apply_safe(
                     target_tokens, 0, chunk_tokens,selected_layout);
             if (selected && !selected_layout.empty()) {
@@ -445,17 +470,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 // changing the process environment later cannot split
                 // graph execution from allocated model weight ownership.
                 model_ptr->hybrid_ring_plan_layout = selected_layout;
+                model_ptr->hybrid_ring_plan_mode = ring_plan_apply_mode;
                 model_ptr->hybrid_ring_plan_chunk_tokens = chunk_tokens;
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                    "[REGION_RING_PLAN_APPLY] mode=%s "
                     "phase=MODEL_LOAD applied=1 layout=%s "
                     "chunk=%d target_tokens=%d status=MODEL_OWNED\n",
-                    selected_layout.c_str(),chunk_tokens,target_tokens);
+                    ring_plan_apply_mode,selected_layout.c_str(),
+                    chunk_tokens,target_tokens);
             } else {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_APPLY] mode=APPLY_SAFE "
+                    "[REGION_RING_PLAN_APPLY] mode=%s "
                     "phase=MODEL_LOAD applied=0 "
-                    "status=FIXED_BASELINE_UNCHANGED\n");
+                    "status=FIXED_BASELINE_UNCHANGED\n",
+                    ring_plan_apply_mode);
             }
         }
 

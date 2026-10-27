@@ -570,6 +570,14 @@ LLAMA_API bool llama_hybrid_region_ring_planner_dry_run(
 // can own arbitrary Phone Graphs and the final output backend.
 LLAMA_API bool llama_hybrid_region_ring_planner_topology_preview(
     int tokens, int kv_start, int baseline_chunk);
+// Stage-0 executable Planner plumbing: profile and simulate the exact fixed
+// Ring that the runtime would have used, then return that same canonical
+// layout as a model-owned Plan. No topology, Phone range, C/G boundary,
+// Chunk or final-owner change is permitted.
+LLAMA_API bool llama_hybrid_region_ring_planner_apply_baseline(
+    int tokens, int kv_start, int baseline_chunk,
+    std::string & selected_layout);
+
 // Returns true and a validated per-model layout only when the predicted gain
 // exceeds the configured threshold and the current Phone/Chunk protocol is
 // unchanged. Called before model weight loading; no live runtime mutation.
