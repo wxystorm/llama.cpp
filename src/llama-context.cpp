@@ -757,7 +757,10 @@ void llama_context::sched_reserve() {
         }
         worker.res.reset();
         worker.sched.reset();
+        worker.cached_region = std::numeric_limits<size_t>::max();
+        worker.last_use = 0;
     }
+    region_ring_gpu_weight_bank_epoch = 0;
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -3174,20 +3177,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
-        for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
-            auto & worker = region_ring_worker_resources[dev];
+        const bool gpu_weight_streaming =
+            pc_phone_overlap &&
+            model.hybrid_ring_gpu_weight_streaming;
+        const size_t ring_pc_resource_count =
+            gpu_weight_streaming ? 3 : 2;
 
-            // In overlap mode, make the Plan's C/G labels strict executable
-            // semantics rather than scheduler hints:
-            //   CPU worker -> [CPU] only
-            //   GPU worker -> [CUDA0, CPU] scheduler contract, CUDA0 compute only
-            // Phone keeps the canonical scheduler in ring_sched[2].
+        for (size_t resource_id = 0;
+             resource_id < ring_pc_resource_count; ++resource_id) {
+            auto & worker =
+                region_ring_worker_resources[resource_id];
+            const bool cpu_resource = resource_id == 0;
+            const bool gpu_resource = !cpu_resource;
+
             size_t start = 0;
             size_t count = backend_ptrs.size();
             bool scheduler_offload = cparams.op_offload;
             const char * policy = "CONTEXT_SHARED";
             if (pc_phone_overlap) {
-                if (dev == 0) {
+                if (cpu_resource) {
                     start = 2; // validated outer topology: [Meta, CUDA0, CPU]
                     count = 1;
                     scheduler_offload = false;
@@ -3195,75 +3203,130 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 } else {
                     start = 1;
                     count = 2;
-                    scheduler_offload = cparams.op_offload;
-                    policy = "CUDA_ONLY_VALIDATED";
+                    scheduler_offload = false;
+                    policy = gpu_weight_streaming ?
+                        "CUDA_WEIGHT_BANK" :
+                        "CUDA_ONLY_VALIDATED";
                 }
             }
 
-            // A reused llama_context may have cached schedulers from an A/B
-            // mode switch. Recreate only if the exact backend list changed.
             bool matches = worker.sched &&
-                ggml_backend_sched_get_n_backends(worker.sched.get()) == (int) count;
+                ggml_backend_sched_get_n_backends(
+                    worker.sched.get()) == (int) count;
             if (matches) {
                 for (size_t i = 0; i < count; ++i) {
-                    if (ggml_backend_sched_get_backend(worker.sched.get(), (int) i) !=
-                        backend_ptrs[start + i]) {
+                    if (ggml_backend_sched_get_backend(
+                            worker.sched.get(), (int) i) !=
+                            backend_ptrs[start + i]) {
                         matches = false;
                         break;
                     }
                 }
             }
             if (worker.sched && !matches) {
-                ggml_backend_sched_synchronize(worker.sched.get());
+                ggml_backend_sched_synchronize(
+                    worker.sched.get());
                 worker.res.reset();
                 worker.sched.reset();
+                worker.cached_region =
+                    std::numeric_limits<size_t>::max();
+                worker.last_use = 0;
             }
             if (!worker.sched) {
                 worker.sched.reset(ggml_backend_sched_new(
                     backend_ptrs.data() + start,
                     backend_buft.data() + start,
-                    (int) count, max_nodes, false, scheduler_offload));
+                    (int) count, max_nodes, false,
+                    scheduler_offload));
                 if (!worker.sched) {
                     LLAMA_LOG_ERROR(
-                        "[REGION_RING_RESOURCE] device=%s status=ALLOC_FAILED\n",
-                        dev == 0 ? "CPU" : "GPU");
+                        "[REGION_RING_RESOURCE] resource=%zu "
+                        "status=ALLOC_FAILED\n",
+                        resource_id);
                     ret = GGML_STATUS_ALLOC_FAILED;
                     return nullptr;
                 }
+                worker.cached_region =
+                    std::numeric_limits<size_t>::max();
+                worker.last_use = 0;
             }
+
+            ggml_backend_sched_set_weight_cache(
+                worker.sched.get(),
+                gpu_resource && gpu_weight_streaming);
+
             if (!worker.res) {
-                worker.res.reset(new llm_graph_result(max_nodes));
+                worker.res.reset(
+                    new llm_graph_result(max_nodes));
             }
-            ring_sched[dev] = worker.sched.get();
-            ring_res[dev] = worker.res.get();
+
+            if (cpu_resource) {
+                ring_sched[0] = worker.sched.get();
+                ring_res[0] = worker.res.get();
+            } else if (resource_id == 1) {
+                // Bank A is the default pointer for diagnostics. Individual
+                // GPU tasks select A/B below.
+                ring_sched[1] = worker.sched.get();
+                ring_res[1] = worker.res.get();
+            }
 
             if (pc_phone_overlap) {
                 const bool cpu_policy_ok =
-                    dev != 0 ||
-                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 1 &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_cpu);
+                    !cpu_resource ||
+                    (ggml_backend_sched_get_n_backends(
+                         worker.sched.get()) == 1 &&
+                     ggml_backend_sched_get_backend(
+                         worker.sched.get(), 0) == backend_cpu);
                 const bool gpu_policy_ok =
-                    dev != 1 ||
-                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 2 &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1] &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 1) == backend_cpu);
+                    !gpu_resource ||
+                    (ggml_backend_sched_get_n_backends(
+                         worker.sched.get()) == 2 &&
+                     ggml_backend_sched_get_backend(
+                         worker.sched.get(), 0) ==
+                         backend_ptrs[1] &&
+                     ggml_backend_sched_get_backend(
+                         worker.sched.get(), 1) ==
+                         backend_cpu);
                 if (!cpu_policy_ok || !gpu_policy_ok) {
                     LLAMA_LOG_ERROR(
-                        "[REGION_RING_PC_SCHED] worker=%s policy=%s "
-                        "status=REJECT reason=BACKEND_POLICY_MISMATCH\n",
-                        dev == 0 ? "CPU" : "GPU", policy);
+                        "[REGION_RING_PC_SCHED] resource=%zu "
+                        "policy=%s status=REJECT "
+                        "reason=BACKEND_POLICY_MISMATCH\n",
+                        resource_id, policy);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PC_SCHED] worker=%s policy=%s backends=%d "
-                    "first=%s last=%s offload=%d meta_registered=0 status=READY\n",
-                    dev == 0 ? "CPU" : "GPU", policy,
-                    ggml_backend_sched_get_n_backends(ring_sched[dev]),
-                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], 0)),
-                    ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], (int) count - 1)),
-                    scheduler_offload ? 1 : 0);
+                    "[REGION_RING_PC_SCHED] resource=%zu worker=%s "
+                    "policy=%s bank=%s backends=%d "
+                    "first=%s last=%s offload=%d "
+                    "weight_cache=%d meta_registered=0 status=READY\n",
+                    resource_id,
+                    cpu_resource ? "CPU" : "GPU",
+                    policy,
+                    cpu_resource ? "NONE" :
+                        (resource_id == 1 ? "A" : "B"),
+                    ggml_backend_sched_get_n_backends(
+                        worker.sched.get()),
+                    ggml_backend_name(
+                        ggml_backend_sched_get_backend(
+                            worker.sched.get(), 0)),
+                    ggml_backend_name(
+                        ggml_backend_sched_get_backend(
+                            worker.sched.get(),
+                            (int) count - 1)),
+                    scheduler_offload ? 1 : 0,
+                    ggml_backend_sched_get_weight_cache(
+                        worker.sched.get()) ? 1 : 0);
             }
+        }
+
+        if (gpu_weight_streaming) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT] phase=BANK_INIT banks=2 "
+                "canonical=CPU destination=CUDA "
+                "eviction=LRU load=DEMAND cache=PERSISTENT "
+                "status=READY\n");
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -3271,7 +3334,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ring_sched[1] == ring_sched[2] ||
             ring_res[0] == ring_res[1] ||
             ring_res[0] == ring_res[2] ||
-            ring_res[1] == ring_res[2]) {
+            ring_res[1] == ring_res[2] ||
+            (gpu_weight_streaming &&
+             (region_ring_worker_resources[2].sched.get() ==
+                  ring_sched[0] ||
+              region_ring_worker_resources[2].sched.get() ==
+                  ring_sched[1] ||
+              region_ring_worker_resources[2].sched.get() ==
+                  ring_sched[2] ||
+              region_ring_worker_resources[2].res.get() ==
+                  ring_res[0] ||
+              region_ring_worker_resources[2].res.get() ==
+                  ring_res[1] ||
+              region_ring_worker_resources[2].res.get() ==
+                  ring_res[2]))) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_RESOURCE] status=REJECT reason=RESOURCE_ALIAS\n");
             ret = GGML_STATUS_FAILED;
@@ -3279,11 +3355,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_RESOURCE] cpu_sched=%p cpu_res=%p "
-            "gpu_sched=%p gpu_res=%p phone_sched=%p phone_res=%p "
-            "backend=SHARED kv=SHARED threads=1 status=ISOLATED_SCHED_ONLY\n",
+            "gpu_sched=%p gpu_res=%p gpu_bank_b_sched=%p "
+            "gpu_bank_b_res=%p phone_sched=%p phone_res=%p "
+            "backend=SHARED kv=SHARED threads=1 "
+            "weight_stream=%d status=ISOLATED_SCHED_ONLY\n",
             (void *) ring_sched[0], (void *) ring_res[0],
             (void *) ring_sched[1], (void *) ring_res[1],
-            (void *) ring_sched[2], (void *) ring_res[2]);
+            gpu_weight_streaming ?
+                (void *) region_ring_worker_resources[2].sched.get() :
+                nullptr,
+            gpu_weight_streaming ?
+                (void *) region_ring_worker_resources[2].res.get() :
+                nullptr,
+            (void *) ring_sched[2], (void *) ring_res[2],
+            gpu_weight_streaming ? 1 : 0);
     }
 
     if (own_stage_resources && !isolate_device_resources) {
@@ -3629,6 +3714,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t        compute_mask    = 0;
             size_t          cross_backend_tasks = 0;
             size_t          unknown_backend_tasks = 0;
+            size_t          weight_upload_bytes = 0;
+            size_t          weight_cache_hit_bytes = 0;
+            size_t          weight_bank_hits = 0;
+            size_t          weight_bank_misses = 0;
+            size_t          weight_bank_evictions = 0;
             std::vector<std::pair<int64_t, int64_t>> compute_intervals;
         };
         std::array<ring_worker_state, 3> worker_states;
@@ -3707,6 +3797,94 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         name, task.region, task.chunk, task.n_tokens,
                         task.input_slot, task.output_slot);
 
+                    ggml_backend_sched_t task_sched =
+                        ring_sched[dev];
+                    llm_graph_result * task_res =
+                        ring_res[dev];
+                    int gpu_bank = -1;
+                    bool gpu_bank_hit = false;
+                    size_t evicted_region =
+                        std::numeric_limits<size_t>::max();
+
+                    if (dev == 1 && gpu_weight_streaming) {
+                        size_t selected_bank = 1;
+                        for (size_t bank = 1; bank <= 2; ++bank) {
+                            auto & candidate =
+                                region_ring_worker_resources[bank];
+                            if (candidate.cached_region ==
+                                    task.region) {
+                                selected_bank = bank;
+                                gpu_bank_hit = true;
+                                break;
+                            }
+                        }
+                        if (!gpu_bank_hit) {
+                            const bool a_empty =
+                                region_ring_worker_resources[1].
+                                    cached_region ==
+                                std::numeric_limits<size_t>::max();
+                            const bool b_empty =
+                                region_ring_worker_resources[2].
+                                    cached_region ==
+                                std::numeric_limits<size_t>::max();
+                            if (a_empty) {
+                                selected_bank = 1;
+                            } else if (b_empty) {
+                                selected_bank = 2;
+                            } else {
+                                selected_bank =
+                                    region_ring_worker_resources[1].
+                                        last_use <=
+                                    region_ring_worker_resources[2].
+                                        last_use ? 1 : 2;
+                                evicted_region =
+                                    region_ring_worker_resources[
+                                        selected_bank].cached_region;
+                            }
+
+                            auto & selected =
+                                region_ring_worker_resources[
+                                    selected_bank];
+                            if (evicted_region !=
+                                    std::numeric_limits<size_t>::max()) {
+                                ggml_backend_sched_synchronize(
+                                    selected.sched.get());
+                                selected.res->reset();
+                                ggml_backend_sched_reset(
+                                    selected.sched.get());
+                                ggml_backend_sched_set_weight_cache(
+                                    selected.sched.get(), true);
+                                ++state.weight_bank_evictions;
+                            }
+                            selected.cached_region = task.region;
+                            ++state.weight_bank_misses;
+                        } else {
+                            ++state.weight_bank_hits;
+                        }
+
+                        auto & selected =
+                            region_ring_worker_resources[
+                                selected_bank];
+                        selected.last_use =
+                            ++region_ring_gpu_weight_bank_epoch;
+                        task_sched = selected.sched.get();
+                        task_res = selected.res.get();
+                        gpu_bank = (int) selected_bank - 1;
+
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_GPU_WEIGHT] event=BANK_SELECT "
+                            "region=%zu chunk=%zu bank=%c cache=%s "
+                            "evicted_region=%s status=READY\n",
+                            task.region, task.chunk,
+                            gpu_bank == 0 ? 'A' : 'B',
+                            gpu_bank_hit ? "HIT" : "MISS",
+                            evicted_region ==
+                                std::numeric_limits<size_t>::max() ?
+                                "NONE" :
+                                std::to_string(
+                                    evicted_region).c_str());
+                    }
+
                     ggml_status task_status = GGML_STATUS_SUCCESS;
                     llm_graph_result * task_result = nullptr;
                     bool cancelled_before_compute = false;
@@ -3751,14 +3929,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             const int64_t compute_begin_us = ggml_time_us();
                             int64_t lane_compute_begin_us = 0;
                             int64_t lane_compute_end_us = 0;
+                            llama_hybrid_stage_timing task_timing {};
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
-                                ring_sched[dev], ring_res[dev],
+                                task_sched, task_res,
                                 ubatch_id, task.region, task.chunk,
                                 llama_hybrid_boundary_action::PASS,
                                 block_outputs, worker_apply_mctx, true,
-                                task_status, nullptr, true, pc_phone_overlap,
+                                task_status, &task_timing, true,
+                                pc_phone_overlap,
                                 pc_phone_overlap ? &prepare_gate : nullptr,
                                 &lane_compute_begin_us, &lane_compute_end_us,
                                 pc_phone_overlap && dev == 1 ?
@@ -3771,7 +3951,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 pc_phone_overlap ? &state.cpu_wait_us : nullptr,
                                 pc_phone_overlap ? &state.cuda_wait_us : nullptr);
                             const int64_t compute_end_us = ggml_time_us();
-                            state.backend_exec_us += compute_end_us - compute_begin_us;
+                            state.backend_exec_us +=
+                                compute_end_us - compute_begin_us;
+                            state.weight_upload_bytes +=
+                                task_timing.weight_upload_bytes;
+                            state.weight_cache_hit_bytes +=
+                                task_timing.weight_cache_hit_bytes;
+                            if (dev == 1 && gpu_weight_streaming) {
+                                LLAMA_LOG_ERROR(
+                                    "[REGION_RING_GPU_WEIGHT] "
+                                    "event=TASK_DONE region=%zu chunk=%zu "
+                                    "bank=%c upload_mib=%.3f "
+                                    "cache_hit_mib=%.3f "
+                                    "prepare_ms=%.3f compute_range_ms=%.3f "
+                                    "status=%d\n",
+                                    task.region, task.chunk,
+                                    gpu_bank == 0 ? 'A' : 'B',
+                                    task_timing.weight_upload_bytes /
+                                        1048576.0,
+                                    task_timing.weight_cache_hit_bytes /
+                                        1048576.0,
+                                    task_timing.prepare_us / 1000.0,
+                                    task_timing.compute_range_us / 1000.0,
+                                    (int) task_status);
+                            }
                             if (pc_phone_overlap) {
                                 // prepare/cpu/cuda counters are cumulative.
                                 // Reconstruct backend_wait from them at summary
@@ -3789,25 +3992,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 task_status == GGML_STATUS_SUCCESS &&
                                 audit_backend_resources) {
                                 const int n_splits = ggml_backend_sched_get_n_splits(
-                                    ring_sched[dev]);
+                                    task_sched);
                                 uint64_t task_mask = 0;
                                 uint64_t task_compute_mask = 0;
                                 for (int split = 0; split < n_splits; ++split) {
                                     const uint64_t local_mask =
                                         ggml_backend_sched_get_split_resource_mask(
-                                            ring_sched[dev], split);
+                                            task_sched, split);
                                     uint64_t split_mask = local_mask & (UINT64_C(1) << 63);
                                     // Convert per-Scheduler bits into original
                                     // [Meta,CUDA0,CPU] indices for consistent
                                     // A/B audit. CPU Scheduler is [CPU].
                                     // GPU Scheduler is [CUDA0,CPU] by GGML
                                     // contract, with compute validated CUDA-only.
-                                    const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
+                                    const int n_local = ggml_backend_sched_get_n_backends(task_sched);
                                     for (int b = 0; b < n_local; ++b) {
                                         if ((local_mask & (UINT64_C(1) << b)) == 0) {
                                             continue;
                                         }
-                                        ggml_backend_t handle = ggml_backend_sched_get_backend(ring_sched[dev], b);
+                                        ggml_backend_t handle = ggml_backend_sched_get_backend(task_sched, b);
                                         const auto it = std::find(backend_ptrs.begin(), backend_ptrs.end(), handle);
                                         if (it == backend_ptrs.end() ||
                                             (size_t) (it - backend_ptrs.begin()) >= 63) {
@@ -3819,7 +4022,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     task_mask |= split_mask;
                                     ggml_backend_t target =
                                         ggml_backend_sched_get_split_backend(
-                                            ring_sched[dev], split);
+                                            task_sched, split);
                                     uint64_t target_mask = 0;
                                     const auto target_it = std::find(
                                         backend_ptrs.begin(), backend_ptrs.end(), target);
@@ -3924,7 +4127,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "prepare_wait_ms=%.3f cpu_wait_ms=%.3f cuda_wait_ms=%.3f "
                 "backend_exec_ms=%.3f resource_mask=0x%016" PRIx64
                 " compute_mask=0x%016" PRIx64
-                " cross_backend_tasks=%zu unresolved_tasks=%zu status=%d\n",
+                " cross_backend_tasks=%zu unresolved_tasks=%zu "
+                "weight_upload_mib=%.3f weight_cache_hit_mib=%.3f "
+                "bank_hits=%zu bank_misses=%zu bank_evictions=%zu "
+                "status=%d\n",
                 name, state.completed,
                 state.ready_wait_us / 1000.0,
                 (pc_phone_overlap ?
@@ -3936,7 +4142,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 state.cuda_wait_us / 1000.0,
                 state.backend_exec_us / 1000.0, state.backend_mask,
                 state.compute_mask, state.cross_backend_tasks,
-                state.unknown_backend_tasks, (int) state.status);
+                state.unknown_backend_tasks,
+                state.weight_upload_bytes / 1048576.0,
+                state.weight_cache_hit_bytes / 1048576.0,
+                state.weight_bank_hits,
+                state.weight_bank_misses,
+                state.weight_bank_evictions,
+                (int) state.status);
         };
 
         std::vector<std::thread> workers;

@@ -64,6 +64,8 @@ struct llama_hybrid_stage_timing {
     int64_t prepare_us       = 0;
     int64_t compute_range_us = 0;
     int64_t sync_us          = 0;
+    size_t  weight_upload_bytes    = 0;
+    size_t  weight_cache_hit_bytes = 0;
 };
 
 struct llama_context {
@@ -526,8 +528,12 @@ private:
     struct region_ring_worker_resource {
         ggml_backend_sched_ptr sched;
         llm_graph_result_ptr   res;
+        size_t cached_region = std::numeric_limits<size_t>::max();
+        uint64_t last_use = 0;
     };
-    std::array<region_ring_worker_resource, 2> region_ring_worker_resources;
+    // [0] CPU worker, [1] GPU Bank A / legacy GPU worker, [2] GPU Bank B.
+    std::array<region_ring_worker_resource, 3> region_ring_worker_resources;
+    uint64_t region_ring_gpu_weight_bank_epoch = 0;
 
     // Threaded Region Ring lock hierarchy:
     //   phase A: PREPARE gate only for graph/scheduler mutation
