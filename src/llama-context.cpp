@@ -3726,7 +3726,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         stages.front().layer_begin == 0;
     const bool embedding_prelude_arch =
         model.arch == LLM_ARCH_QWEN2 ||
-        model.arch == LLM_ARCH_QWEN3MOE;
+        model.arch == LLM_ARCH_QWEN3 ||
+        model.arch == LLM_ARCH_QWEN3MOE ||
+        (model.arch == LLM_ARCH_LLAMA &&
+         model.hparams.n_expert == 0);
     if (gpu_first_ring && embedding_prelude_arch &&
             own_stage_resources && isolate_device_resources &&
             ubatch.token != nullptr) {
