@@ -61,6 +61,10 @@ struct candidate {
     double phone_link_ms_per_token = 0.0;
     double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
+    // Shared host-side graph/split preparation lane. This is service time,
+    // not lock wait; queueing is reconstructed by simulate().
+    double prepare_busy_ms = 0.0;
+    double weight_prepare_busy_ms = 0.0;
     // Single CPU-owned CUDA transfer lane used by rolling two-Bank weight
     // streaming. This is one load per logical GPU Region, not per Chunk.
     double weight_h2d_busy_ms = 0.0;
@@ -93,6 +97,9 @@ struct model {
     double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
+    // Optional host-side scheduler prepare cost for the same shape. Missing
+    // callbacks preserve the historical zero-prepare simulator behaviour.
+    std::function<bool(device, int, int, int, double &)> prepare_ms;
     std::function<bool(device, device, size_t, double &)> transfer_ms;
     // Exact weight bytes for one contiguous logical GPU Region and the
     // measured/proxied host->CUDA transfer time for those bytes.
@@ -215,6 +222,7 @@ struct task {
     int outputs = 0;
     // Number of downstream consumers that still retain this producer slot.
     int remaining_outputs = 0;
+    double prepare_duration = 0.0;
     double duration = 0.0;
     bool queued = false;
     bool started = false;
@@ -278,15 +286,25 @@ inline bool simulate(const model & m,
         for (int begin = 0; begin < m.tokens; begin += x) {
             const int end = std::min(m.tokens, begin + x);
             const int kv = m.kv_start + end;
+            const int layers =
+                regions[r].layer_end - regions[r].layer_begin;
             double ms = 0.0;
-            if (!m.compute_ms(d, regions[r].layer_end - regions[r].layer_begin,
-                              end - begin, kv, ms) ||
+            double prepare_ms = 0.0;
+            if (!m.compute_ms(
+                    d, layers, end - begin, kv, ms) ||
                 !std::isfinite(ms) || ms < 0.0) {
                 return reject("COMPUTE_PROFILE_MISSING");
             }
+            if (m.prepare_ms &&
+                    (!m.prepare_ms(
+                        d, layers, end - begin, kv, prepare_ms) ||
+                     !std::isfinite(prepare_ms) ||
+                     prepare_ms < 0.0)) {
+                return reject("PREPARE_PROFILE_MISSING");
+            }
             if (d == device::PHONE) {
                 ms += m.phone_register_ms *
-                      (double) (regions[r].layer_end - regions[r].layer_begin) / 5.0;
+                      (double) layers / 5.0;
             }
 
             task t;
@@ -294,6 +312,7 @@ inline bool simulate(const model & m,
             t.begin = begin;
             t.end = end;
             t.previous = previous;
+            t.prepare_duration = prepare_ms;
             t.duration = ms;
             const int id = (int) tasks.size();
             tasks.push_back(t);
@@ -338,6 +357,7 @@ inline bool simulate(const model & m,
     std::vector<int> gpu_regions;
     std::vector<int> gpu_rank(regions.size(), -1);
     std::vector<double> gpu_weight_load_ms(regions.size(), 0.0);
+    std::vector<double> gpu_weight_prepare_ms(regions.size(), 0.0);
     std::vector<bool> gpu_weight_ready(
         regions.size(), !m.gpu_weight_streaming);
     std::vector<bool> gpu_weight_enqueued(regions.size(), false);
@@ -365,6 +385,23 @@ inline bool simulate(const model & m,
                 return reject("WEIGHT_PROFILE_MISSING");
             }
             gpu_weight_load_ms[r] = ms;
+            if (m.prepare_ms) {
+                const int layers =
+                    regions[r].layer_end - regions[r].layer_begin;
+                const int prefetch_tokens =
+                    std::min(m.tokens, std::max(1, c.xg));
+                const int prefetch_kv =
+                    m.kv_start + prefetch_tokens;
+                double prepare_ms = 0.0;
+                if (!m.prepare_ms(
+                        device::GPU, layers, prefetch_tokens,
+                        prefetch_kv, prepare_ms) ||
+                    !std::isfinite(prepare_ms) ||
+                    prepare_ms < 0.0) {
+                    return reject("WEIGHT_PREPARE_PROFILE_MISSING");
+                }
+                gpu_weight_prepare_ms[r] = prepare_ms;
+            }
         }
     }
 
@@ -378,6 +415,12 @@ inline bool simulate(const model & m,
     std::array<double, 3> busy_ms {}, transfer_busy_ms {};
     std::deque<int> weight_queue;
     bool weight_busy = false;
+    // A single shared PREPARE lane approximates region graph/split setup and
+    // the dedicated weight-prefetch worker's graph preparation. The lane is
+    // independent from CPU/CUDA/Phone compute.
+    double prepare_available_ms = 0.0;
+    double prepare_busy_ms = 0.0;
+    double weight_prepare_busy_ms = 0.0;
     double weight_h2d_busy_ms = 0.0;
     double weight_h2d_startup_ms = 0.0;
 
@@ -443,12 +486,23 @@ inline bool simulate(const model & m,
             std::min<size_t>(2, gpu_regions.size());
         for (size_t i = 0; i < initial; ++i) {
             const int r = gpu_regions[i];
-            now += gpu_weight_load_ms[(size_t) r];
+            const double weight_prepare =
+                gpu_weight_prepare_ms[(size_t) r];
+            const double prepare_start =
+                std::max(now, prepare_available_ms);
+            const double prepare_end =
+                prepare_start + weight_prepare;
+            prepare_available_ms = prepare_end;
+            prepare_busy_ms += weight_prepare;
+            weight_prepare_busy_ms += weight_prepare;
+
+            // The dedicated prefetch worker waits for this upload before
+            // preparing the next Bank, so startup A/B remain sequential.
+            gpu_weight_release_ms[(size_t) r] = 0.0;
+            gpu_weight_start_ms[(size_t) r] = prepare_end;
+            now = prepare_end + gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += gpu_weight_load_ms[(size_t) r];
             weight_h2d_startup_ms += gpu_weight_load_ms[(size_t) r];
-            gpu_weight_release_ms[(size_t) r] = 0.0;
-            gpu_weight_start_ms[(size_t) r] =
-                now - gpu_weight_load_ms[(size_t) r];
             gpu_weight_ready_ms[(size_t) r] = now;
             gpu_weight_ready[(size_t) r] = true;
             gpu_weight_enqueued[(size_t) r] = true;
@@ -467,10 +521,25 @@ inline bool simulate(const model & m,
             const int r = weight_queue.front();
             weight_queue.pop_front();
             weight_busy = true;
-            gpu_weight_start_ms[(size_t) r] = now;
+
+            const double weight_prepare =
+                gpu_weight_prepare_ms[(size_t) r];
+            const double prepare_start =
+                std::max(now, prepare_available_ms);
+            const double prepare_end =
+                prepare_start + weight_prepare;
+            prepare_available_ms = prepare_end;
+            prepare_busy_ms += weight_prepare;
+            weight_prepare_busy_ms += weight_prepare;
+
+            // H2D uses its own transfer backend/stream. The single dedicated
+            // prefetch worker still serializes weight jobs end-to-end.
+            gpu_weight_start_ms[(size_t) r] = prepare_end;
             const double ms = gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += ms;
-            events.push({now + ms, r, event_kind::WEIGHT});
+            events.push({
+                prepare_end + ms, r, event_kind::WEIGHT
+            });
             scheduled = true;
         }
 
@@ -558,8 +627,22 @@ inline bool simulate(const model & m,
                 }
             }
 
+            const double prepare_start =
+                std::max(now, prepare_available_ms);
+            const double prepare_end =
+                prepare_start + t.prepare_duration;
+            prepare_available_ms = prepare_end;
+            prepare_busy_ms += t.prepare_duration;
+
+            // The worker has already claimed this task, so it cannot claim
+            // another while queued on PREPARE. CPU/CUDA/Phone compute lanes
+            // remain independent once preparation completes.
             busy_ms[(size_t) dev] += t.duration;
-            events.push({now + t.duration, selected, event_kind::TASK});
+            events.push({
+                prepare_end + t.duration,
+                selected,
+                event_kind::TASK
+            });
             scheduled = true;
         }
 
@@ -686,6 +769,8 @@ inline bool simulate(const model & m,
                  busy_ms[(int) device::GPU]);
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
+    c.prepare_busy_ms = prepare_busy_ms;
+    c.weight_prepare_busy_ms = weight_prepare_busy_ms;
     c.weight_h2d_busy_ms = weight_h2d_busy_ms;
     c.weight_h2d_startup_ms = weight_h2d_startup_ms;
     c.weight_h2d_exposed_ms = weight_h2d_startup_ms;
