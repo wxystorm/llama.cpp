@@ -343,6 +343,8 @@ inline bool simulate(const model & m,
     std::vector<bool> gpu_weight_enqueued(regions.size(), false);
     std::vector<double> gpu_weight_release_ms(
         regions.size(), -1.0);
+    std::vector<double> gpu_weight_start_ms(
+        regions.size(), -1.0);
     std::vector<double> gpu_weight_ready_ms(
         regions.size(), -1.0);
     std::vector<double> gpu_natural_ready_ms(
@@ -378,7 +380,6 @@ inline bool simulate(const model & m,
     bool weight_busy = false;
     double weight_h2d_busy_ms = 0.0;
     double weight_h2d_startup_ms = 0.0;
-    double weight_h2d_exposed_ms = 0.0;
 
     auto task_dependencies_ready = [&](int id) -> bool {
         if (id < 0 || id >= (int) tasks.size()) {
@@ -445,8 +446,9 @@ inline bool simulate(const model & m,
             now += gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += gpu_weight_load_ms[(size_t) r];
             weight_h2d_startup_ms += gpu_weight_load_ms[(size_t) r];
-            weight_h2d_exposed_ms += gpu_weight_load_ms[(size_t) r];
             gpu_weight_release_ms[(size_t) r] = 0.0;
+            gpu_weight_start_ms[(size_t) r] =
+                now - gpu_weight_load_ms[(size_t) r];
             gpu_weight_ready_ms[(size_t) r] = now;
             gpu_weight_ready[(size_t) r] = true;
             gpu_weight_enqueued[(size_t) r] = true;
@@ -465,6 +467,7 @@ inline bool simulate(const model & m,
             const int r = weight_queue.front();
             weight_queue.pop_front();
             weight_busy = true;
+            gpu_weight_start_ms[(size_t) r] = now;
             const double ms = gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += ms;
             events.push({now + ms, r, event_kind::WEIGHT});
@@ -594,11 +597,6 @@ inline bool simulate(const model & m,
                 }
                 gpu_weight_ready[(size_t) r] = true;
                 gpu_weight_ready_ms[(size_t) r] = now;
-                if (gpu_natural_ready_ms[(size_t) r] >= 0.0) {
-                    weight_h2d_exposed_ms += std::max(
-                        0.0,
-                        now - gpu_natural_ready_ms[(size_t) r]);
-                }
                 weight_busy = false;
                 continue;
             }
@@ -690,9 +688,38 @@ inline bool simulate(const model & m,
     c.transfer_busy_ms = transfer_busy_ms;
     c.weight_h2d_busy_ms = weight_h2d_busy_ms;
     c.weight_h2d_startup_ms = weight_h2d_startup_ms;
-    c.weight_h2d_exposed_ms = weight_h2d_exposed_ms;
-    c.weight_h2d_hidden_ms = std::max(
-        0.0, weight_h2d_busy_ms - weight_h2d_exposed_ms);
+    c.weight_h2d_exposed_ms = weight_h2d_startup_ms;
+    c.weight_h2d_hidden_ms = 0.0;
+    if (m.gpu_weight_streaming) {
+        const size_t initial =
+            std::min<size_t>(2, gpu_regions.size());
+        for (size_t rank = initial;
+                rank < gpu_regions.size(); ++rank) {
+            const int r = gpu_regions[rank];
+            const double start =
+                gpu_weight_start_ms[(size_t) r];
+            const double done =
+                gpu_weight_ready_ms[(size_t) r];
+            const double natural =
+                gpu_natural_ready_ms[(size_t) r];
+            const double duration =
+                gpu_weight_load_ms[(size_t) r];
+            if (start < 0.0 || done < 0.0 ||
+                    natural < 0.0 || duration < 0.0) {
+                return reject("WEIGHT_TIMELINE_INCOMPLETE");
+            }
+
+            // Actual transfer overlap, bounded by the transfer duration.
+            c.weight_h2d_hidden_ms += std::min(
+                duration,
+                std::max(0.0, natural - start));
+
+            // GPU stall due to weight availability. This may include queueing
+            // behind an earlier Bank upload on the single H2D lane.
+            c.weight_h2d_exposed_ms +=
+                std::max(0.0, done - natural);
+        }
+    }
     for (size_t i = 0; i < c.service_ms_per_token.size(); ++i) {
         c.service_ms_per_token[i] =
             busy_ms[i] / std::max(1, m.tokens);
