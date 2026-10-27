@@ -34,22 +34,22 @@ static void test_layout() {
     check(counts[0] == 22 && counts[1] == 11 && counts[2] == 15,
           "default device layer counts do not match C22/G11/P15");
     check(regions.front().layer_begin == 0 &&
-          regions.front().layer_end == 7, "default first region is incorrect");
+          regions.front().layer_end == 4, "default first region is incorrect");
     check(regions.back().layer_begin == 43 &&
           regions.back().layer_end == 48, "default last region is incorrect");
 
     check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P6");
-    check_rejected("C7,P4,G5,C7,G4,P5,C8,G3,P5");
+    check_rejected("G4,P7,C5,G4,C7,P5,G3,C8,P5");
     check_rejected("C7,G4,P5,C7,G4,P5,C8,G3");
-    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P5,");
-    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P5, ");
+    check_rejected("G4,C7,P5,G4,C7,P5,G3,C8,P5,");
+    check_rejected("G4,C7,P5,G4,C7,P5,G3,C8,P5, ");
     const auto spaced =
-        llama_region_ring_parse(" C7, G4, P5, C7, G4, P5, C8, G3, P5  ", 48);
+        llama_region_ring_parse(" G4, C7, P5, G4, C7, P5, G3, C8, P5  ", 48);
     check(spaced.size() == 9, "valid layout with spaces was rejected");
 
     // Verify the proposed two-cycle A/B layout as well.
     const auto alternative =
-        llama_region_ring_parse("C11,G6,P7,C11,G5,P8", 48);
+        llama_region_ring_parse("G6,C11,P7,G5,C11,P8", 48);
     const auto other_counts = llama_region_ring_layer_counts(alternative);
     check(alternative.size() == 6, "two-cycle layout region count");
     check(other_counts[0] == 22 && other_counts[1] == 11 &&
@@ -59,33 +59,33 @@ static void test_layout() {
 
 static void test_general_topology() {
     const auto two_cycle_tail = llama_region_ring_parse(
-        "C6,G4,P8,C6,G4,P8,C8,G4",48,true);
+        "G4,C6,P8,G4,C6,P8,G4,C8",48,true);
     check(two_cycle_tail.size() == 8,
           "two-cycle PC tail stage count");
     check(llama_region_ring_apply_topology_compatible(two_cycle_tail,48),
           "two-cycle PC tail must be supported");
-    check(two_cycle_tail.back().device == llama_region_ring_device::GPU,
-          "PC GPU tail must be final owner");
+    check(two_cycle_tail.back().device == llama_region_ring_device::CPU,
+          "GPU/CPU tail must end on CPU");
     check(llama_region_ring_layer_counts(two_cycle_tail) ==
           std::array<int,3>{20,12,16},
           "two-cycle PC tail device totals");
     check(llama_region_ring_layout_string(two_cycle_tail) ==
-          "C6,G4,P8,C6,G4,P8,C8,G4",
+          "G4,C6,P8,G4,C6,P8,G4,C8",
           "two-cycle tail Plan serialization");
-    const auto cpu_tail = llama_region_ring_parse(
-        "C6,G4,P8,C6,G4,P8,C12",48,true);
-    check(cpu_tail.back().device == llama_region_ring_device::CPU,
-          "CPU tail owner");
-    check(llama_region_ring_apply_topology_compatible(cpu_tail,48),
-          "CPU tail compatible");
+    const auto gpu_tail = llama_region_ring_parse(
+        "G4,C6,P8,G4,C6,P8,G12",48,true);
+    check(gpu_tail.back().device == llama_region_ring_device::GPU,
+          "GPU-only tail owner");
+    check(llama_region_ring_apply_topology_compatible(gpu_tail,48),
+          "GPU-only tail compatible");
     const auto phone_last = llama_region_ring_parse(
-        "C7,G4,P5,C7,G4,P5,C8,G3,P5",48,true);
+        "G4,C7,P5,G4,C7,P5,G3,C8,P5",48,true);
     check(llama_region_ring_apply_topology_compatible(phone_last,48),
           "original topology remains compatible");
     bool legacy_rejected = false;
     try {
         (void) llama_region_ring_parse(
-            "C6,G4,P8,C6,G4,P8,C8,G4",48);
+            "G4,C6,P8,G4,C6,P8,G4,C8",48);
     } catch (const std::exception &) {
         legacy_rejected = true;
     }
@@ -94,12 +94,12 @@ static void test_general_topology() {
     bool invalid_rejected = false;
     try {
         (void) llama_region_ring_parse(
-            "C6,G4,P8,C6,G4,P8,G12",48,true);
+            "G4,C6,P8,G4,C6,P8,C12",48,true);
     } catch (const std::exception &) {
         invalid_rejected = true;
     }
     check(invalid_rejected,
-          "general Ring must reject a tail without a CPU stage");
+          "general Ring must reject a CPU tail without a GPU stage");
 }
 
 static void test_apply_safe_compatibility() {
@@ -109,34 +109,34 @@ static void test_apply_safe_compatibility() {
     check(llama_region_ring_apply_safe_compatible(baseline,baseline),
           "baseline must be compatible with itself");
     check(llama_region_ring_layout_string(baseline) ==
-          "C7,G4,P5,C7,G4,P5,C8,G3,P5",
+          "G4,C7,P5,G4,C7,P5,G3,C8,P5",
           "canonical Ring encoding has changed");
 
     // Reassign exactly one CUDA layer between the first two PC windows;
     // Phone L11..15, L27..31, L43..47 and aggregate CUDA11 stay unchanged.
     const auto safe = llama_region_ring_parse(
-        "C8,G3,P5,C6,G5,P5,C8,G3,P5",48);
+        "G3,C8,P5,G5,C6,P5,G3,C8,P5",48);
     check(llama_region_ring_apply_safe_phone_shape(safe),
           "safe candidate changed the Phone regions");
     check(llama_region_ring_apply_safe_compatible(baseline,safe),
           "safe CPU/CUDA shift rejected");
     check(llama_region_ring_layout_string(safe) ==
-          "C8,G3,P5,C6,G5,P5,C8,G3,P5",
+          "G3,C8,P5,G5,C6,P5,G3,C8,P5",
           "safe candidate serialized incorrectly");
 
     const auto different_gpu_total = llama_region_ring_parse(
-        "C8,G3,P5,C7,G4,P5,C8,G3,P5",48);
+        "G3,C8,P5,G4,C7,P5,G3,C8,P5",48);
     check(!llama_region_ring_apply_safe_compatible(
             baseline,different_gpu_total),
           "candidate silently reduced CUDA weight count");
     const auto moved_phone = llama_region_ring_parse(
-        "C8,G4,P5,C6,G4,P5,C8,G3,P5",48);
+        "G4,C8,P5,G4,C6,P5,G3,C8,P5",48);
     check(!llama_region_ring_apply_safe_phone_shape(moved_phone),
           "moved Phone region passed fixed-graph check");
     check(!llama_region_ring_apply_safe_compatible(baseline,moved_phone),
           "moved Phone region passed compatibility check");
     const auto tail_or_different_cycles = llama_region_ring_parse(
-        "C11,G6,P7,C11,G5,P8",48);
+        "G6,C11,P7,G5,C11,P8",48);
     check(!llama_region_ring_apply_safe_compatible(
             baseline,tail_or_different_cycles),
           "two-cycle alternative passed safe-apply constraints");
@@ -191,10 +191,10 @@ static void test_duplicate_completion() {
           "unexpected first task");
     check(!ready.has_ready(), "another task became ready too early");
     ready.complete(*first);
-    check(ready.queue_size(llama_region_ring_device::CPU) == 1,
-          "CPU chunk 1 was not queued");
     check(ready.queue_size(llama_region_ring_device::GPU) == 1,
-          "GPU chunk 0 was not queued");
+          "GPU chunk 1 was not queued");
+    check(ready.queue_size(llama_region_ring_device::CPU) == 1,
+          "CPU chunk 0 was not queued");
     bool rejected = false;
     try {
         ready.complete(*first);
@@ -209,10 +209,10 @@ static void test_device_fifo_simulation() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 64);
     check(ready.n_chunks() == 6, "358 tokens must form 6 chunks at 64");
-    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
-          "GPU started before CPU produced an input");
+    check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
+          "CPU started before GPU produced an input");
     check(!ready.try_take(llama_region_ring_device::PHONE).has_value(),
-          "Phone started before GPU produced an input");
+          "Phone started before CPU produced an input");
 
     std::vector<std::vector<int>> done(9, std::vector<int>(6, 0));
     const std::array<llama_region_ring_device, 3> devices = {
@@ -311,8 +311,8 @@ static void test_parallel_scheduler_only() {
 static void test_failure_and_wakeup() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 128, 64);
-    const auto first = ready.try_take(llama_region_ring_device::CPU);
-    check(first.has_value(), "failed to claim initial CPU task");
+    const auto first = ready.try_take(llama_region_ring_device::GPU);
+    check(first.has_value(), "failed to claim initial GPU task");
     ready.fail(*first);
     check(ready.failed() && !ready.has_ready(),
           "failed scheduler still exposes READY tasks");
@@ -344,30 +344,30 @@ static void test_dynamic_slot_pool() {
     llama_region_ring_ready ready(regions, 358, 64, 2);
     check(ready.slot_pool_size() == 2, "dynamic slot pool not enabled");
 
-    const auto first = ready.try_take(llama_region_ring_device::CPU);
-    check(first && first->region == 0 && first->chunk == 0, "CPU R0C0 unavailable");
+    const auto first = ready.try_take(llama_region_ring_device::GPU);
+    check(first && first->region == 0 && first->chunk == 0, "GPU R0C0 unavailable");
     check(first->input_slot == -1 && first->output_slot >= 0,
           "R0C0 did not receive a dynamic output lease");
     const int first_slot = first->output_slot;
     check(ready.live_output_slots() == 1, "R0C0 output lease not reserved");
     ready.complete(*first);
-    const auto second = ready.try_take(llama_region_ring_device::CPU);
+    const auto second = ready.try_take(llama_region_ring_device::GPU);
     check(second && second->region == 0 && second->chunk == 1, "CPU R0C1 unavailable");
     check(second->output_slot >= 0 && second->output_slot != first_slot,
           "R0C1 reused a live output slot");
     ready.complete(*second);
     check(ready.live_output_slots() == 2, "expected two R0 output slots in use");
-    check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
           "R0C2 overwrote R0C0 before R1 consumed it");
 
-    const auto gpu = ready.try_take(llama_region_ring_device::GPU);
-    check(gpu && gpu->region == 1 && gpu->chunk == 0, "GPU R1C0 unavailable");
-    check(gpu->input_slot == first_slot && gpu->output_slot >= 0,
-          "GPU did not inherit the producer's dynamic slot lease");
+    const auto cpu = ready.try_take(llama_region_ring_device::CPU);
+    check(cpu && cpu->region == 1 && cpu->chunk == 0, "CPU R1C0 unavailable");
+    check(cpu->input_slot == first_slot && cpu->output_slot >= 0,
+          "CPU did not inherit the producer's dynamic slot lease");
     check(ready.live_output_slots() == 3,
-          "GPU must retain the reading upstream slot while producing its own output");
-    ready.complete(*gpu);
-    const auto resumed = ready.try_take(llama_region_ring_device::CPU);
+          "CPU must retain the reading upstream slot while producing its own output");
+    ready.complete(*cpu);
+    const auto resumed = ready.try_take(llama_region_ring_device::GPU);
     check(resumed && resumed->region == 0 && resumed->chunk == 2,
           "R0C2 did not resume after downstream released the credit");
     check(resumed->output_slot >= 0,
@@ -467,7 +467,7 @@ static void test_window_failure_wakes_workers() {
                 try {
                     while (const auto task = ready.wait_take(device)) {
                         if (device == llama_region_ring_device::GPU &&
-                            task->region == 1 && task->chunk == 0) {
+                            task->region == 0 && task->chunk == 0) {
                             ++injected;
                             ready.fail(*task);
                             return;

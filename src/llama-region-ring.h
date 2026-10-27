@@ -1,6 +1,6 @@
 #pragma once
 
-// Experimental CPU -> CUDA -> Phone region ring.  This header is intentionally
+// Experimental CUDA -> CPU -> Phone region ring.  This header is intentionally
 // independent of GGML so its task dependencies can be tested in isolation.
 #include <algorithm>
 #include <array>
@@ -21,6 +21,13 @@ enum class llama_region_ring_device : uint8_t {
     CPU = 0,
     GPU = 1,
     PHONE = 2,
+};
+
+inline constexpr std::array<llama_region_ring_device, 3>
+LLAMA_REGION_RING_CYCLE_ORDER = {
+    llama_region_ring_device::GPU,
+    llama_region_ring_device::CPU,
+    llama_region_ring_device::PHONE,
 };
 
 // Region Ring production runtime uses one full-ubatch activation buffer per
@@ -70,10 +77,11 @@ inline bool llama_region_ring_enabled() {
 
 inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         const std::string & spec, int n_layer, bool allow_pc_tail = false) {
-    // L0..L47: CPU7 / GPU4 / Phone5 / CPU7 / GPU4 / Phone5 /
-    //          CPU8 / GPU3 / Phone5.  Counts: CPU22, GPU11, Phone15.
+    // L0..L47: GPU4 / CPU7 / Phone5 / GPU4 / CPU7 / Phone5 /
+    //          GPU3 / CPU8 / Phone5. Counts: GPU11, CPU22, Phone15.
+    // Phone boundaries remain [11,16), [27,32), [43,48).
     const std::string layout = spec.empty() ?
-        "C7,G4,P5,C7,G4,P5,C8,G3,P5" : spec;
+        "G4,C7,P5,G4,C7,P5,G3,C8,P5" : spec;
     if (n_layer <= 0) {
         throw std::runtime_error("region ring requires a positive layer count");
     }
@@ -113,10 +121,10 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
             throw std::runtime_error("invalid region ring layer count");
         }
         const auto expected =
-            static_cast<llama_region_ring_device>(regions.size() % 3);
+            LLAMA_REGION_RING_CYCLE_ORDER[regions.size() % 3];
         if (device != expected) {
             throw std::runtime_error(
-                "region ring must repeat CPU -> GPU -> Phone");
+                "region ring must repeat GPU -> CPU -> Phone");
         }
         regions.push_back({device, layer, layer + count});
         layer += count;
@@ -149,9 +157,9 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
             (allow_pc_tail && full_cycles > 4)) {
         throw std::runtime_error(
             allow_pc_tail ?
-                "region topology requires 2-4 CPU/GPU/Phone cycles and "
+                "region topology requires 2-4 GPU/CPU/Phone cycles and "
                 "an optional CPU/GPU tail covering every layer" :
-                "region ring requires at least two CPU/GPU/Phone cycles "
+                "region ring requires at least two GPU/CPU/Phone cycles "
                 "covering every layer exactly once");
     }
     return regions;
@@ -174,7 +182,7 @@ inline bool llama_region_ring_apply_topology_compatible(
     int next_layer = 0;
     for (size_t i = 0; i < regions.size(); ++i) {
         const auto & r = regions[i];
-        const auto expected = static_cast<llama_region_ring_device>(i % 3);
+        const auto expected = LLAMA_REGION_RING_CYCLE_ORDER[i % 3];
         if (r.device != expected || r.layer_begin != next_layer ||
                 r.layer_end <= r.layer_begin || r.layer_end > n_layer) {
             return false;
@@ -222,29 +230,29 @@ inline bool llama_region_ring_apply_safe_compatible(
     int baseline_gpu_layers = 0;
     int proposed_gpu_layers = 0;
     for (size_t i = 0; i < baseline.size(); i += 3) {
-        const auto & bc = baseline[i];
-        const auto & bg = baseline[i + 1];
+        const auto & bg = baseline[i];
+        const auto & bc = baseline[i + 1];
         const auto & bp = baseline[i + 2];
-        const auto & c = proposed[i];
-        const auto & g = proposed[i + 1];
+        const auto & g = proposed[i];
+        const auto & c = proposed[i + 1];
         const auto & p = proposed[i + 2];
-        if (bc.device != llama_region_ring_device::CPU ||
-            bg.device != llama_region_ring_device::GPU ||
+        if (bg.device != llama_region_ring_device::GPU ||
+            bc.device != llama_region_ring_device::CPU ||
             bp.device != llama_region_ring_device::PHONE ||
-            c.device != bc.device || g.device != bg.device ||
+            g.device != bg.device || c.device != bc.device ||
             p.device != bp.device ||
-            bc.layer_end != bg.layer_begin ||
-            bg.layer_end != bp.layer_begin ||
-            c.layer_begin != bc.layer_begin ||
-            c.layer_begin >= c.layer_end ||
-            c.layer_end != g.layer_begin ||
+            bg.layer_end != bc.layer_begin ||
+            bc.layer_end != bp.layer_begin ||
+            g.layer_begin != bg.layer_begin ||
             g.layer_begin >= g.layer_end ||
-            g.layer_end != bp.layer_begin ||
+            g.layer_end != c.layer_begin ||
+            c.layer_begin >= c.layer_end ||
+            c.layer_end != bp.layer_begin ||
             p.layer_begin != bp.layer_begin ||
             p.layer_end != bp.layer_end ||
             p.layer_begin >= p.layer_end ||
-            (i > 0 && baseline[i - 1].layer_end != bc.layer_begin) ||
-            (i > 0 && proposed[i - 1].layer_end != c.layer_begin)) {
+            (i > 0 && baseline[i - 1].layer_end != bg.layer_begin) ||
+            (i > 0 && proposed[i - 1].layer_end != g.layer_begin)) {
             return false;
         }
         baseline_gpu_layers += bg.layer_end - bg.layer_begin;

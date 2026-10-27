@@ -8520,7 +8520,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     }
     if (selected_layout != nullptr) {
         // APPLY_SAFE preserves the previously validated P5 placement.
-        // APPLY_CGP keeps the same three-cycle C->G->P execution contract but
+        // APPLY_CGP keeps the same three-cycle G->C->P execution contract but
         // deliberately frees C/G/P lengths before model weight allocation.
         const auto baseline_regions =
             llama_region_ring_from_env(profile.n_layer);
@@ -8623,7 +8623,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                     "phone_service_mspt=%.6f phone_link_mspt=%.6f "
                     "local_link_mspt=%.6f "
-                    "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                    "A=%.6f B=%.6f D=%.6f TP2G=%.6f TC2P=%.6f "
                     "e1=%.4f e2=%.4f e3=%.4f E=%.4f\n",
                     llama_region_ring_layout_string(
                         baseline_regions).c_str(),
@@ -8667,7 +8667,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                     "phone_service_mspt=%.6f phone_link_mspt=%.6f "
                     "local_link_mspt=%.6f "
-                    "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                    "A=%.6f B=%.6f D=%.6f TP2G=%.6f TC2P=%.6f "
                     "e1=%.4f e2=%.4f e3=%.4f E=%.4f\n",
                     i + 1,
                     llama_region_ring_layout_string(regions).c_str(),
@@ -8731,7 +8731,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "required_gain_pct=%.3f pc_bound_ms=%.3f "
                 "cpu_service_mspt=%.6f gpu_service_mspt=%.6f "
                 "phone_service_mspt=%.6f phone_link_mspt=%.6f "
-                "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+                "A=%.6f B=%.6f D=%.6f TP2G=%.6f TC2P=%.6f "
                 "e1=%.4f e2=%.4f e3=%.4f E=%.4f status=SUPPORTED\n",
                 best_text.c_str(), baseline_text.c_str(),
                 best.c, best.g, best.p, tokens, baseline_chunk,
@@ -9036,7 +9036,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
             "pc_bound=%.3f cpu_mspt=%.6f gpu_mspt=%.6f "
             "phone_mspt=%.6f phone_link_mspt=%.6f "
-            "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+            "A=%.6f B=%.6f D=%.6f TP2G=%.6f TC2P=%.6f "
             "e1=%.4f e2=%.4f e3=%.4f E=%.4f "
             "tasks=%d edges=%d peak_per_edge_slots=%d\n",
             i + 1, c.cycles, c.c, c.g, c.p, c.tail_c, c.tail_g,

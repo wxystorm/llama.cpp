@@ -58,8 +58,9 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
-    // Handwritten minimax ring equations. Construct A=4, B=4, D=3,
-    // TP2C=1, TC2P=1 ms/token, so e1=0, e2=0, e3=2/5 and E=0.4.
+    // Handwritten G->C->P minimax equations. Construct A=4, B=4, D=3,
+    // TP2G=1, TC2P=1 and TG2C=0.1 ms/token. Then e1=0,
+    // e2=0.1/4.1, e3=2/5 and E=0.4.
     model equation_profile = mock_profile();
     equation_profile.phone_register_ms = 0.0;
     equation_profile.compute_ms = [](device d, int layers, int tokens,
@@ -92,7 +93,7 @@ int main() {
     REQUIRE(std::fabs(equation.ring_p2c_ms_per_token - 1.0) < 1e-9);
     REQUIRE(std::fabs(equation.ring_c2p_ms_per_token - 1.0) < 1e-9);
     REQUIRE(std::fabs(equation.ring_error[0]) < 1e-9);
-    REQUIRE(std::fabs(equation.ring_error[1]) < 1e-9);
+    REQUIRE(std::fabs(equation.ring_error[1] - (0.1 / 4.1)) < 1e-9);
     REQUIRE(std::fabs(equation.ring_error[2] - 0.4) < 1e-9);
     REQUIRE(std::fabs(equation.ring_error_max - 0.4) < 1e-9);
     REQUIRE(std::fabs(equation.balance - equation.ring_error_max) < 1e-12);
@@ -159,20 +160,25 @@ int main() {
     REQUIRE(!simulate(bounded_slots, regions, bounded_gather, &reason));
     REQUIRE(reason == "SLOT_OR_KV_DEADLOCK");
 
-    // A non-dividing three-cycle width gives a PC-only final suffix.
+    // A non-dividing three-cycle width may end with a GPU-only tail.
     candidate tail = uniform;
     tail.p = 4;
-    tail.tail_c = 3;
+    tail.tail_g = 3;
     REQUIRE(make_regions(tail, m.layers, regions));
-    REQUIRE(regions.size() == 10 && regions.back().device == device::CPU);
+    REQUIRE(regions.size() == 10 && regions.back().device == device::GPU);
     REQUIRE(simulate(m, regions, tail, &reason));
 
-    // A suffix may end on CUDA instead of CPU.
-    tail.tail_c = 1;
-    tail.tail_g = 2;
+    // Or continue the partial tail GPU -> CPU.
+    tail.tail_g = 1;
+    tail.tail_c = 2;
     REQUIRE(make_regions(tail, m.layers, regions));
-    REQUIRE(regions.back().device == device::GPU);
+    REQUIRE(regions.back().device == device::CPU);
     REQUIRE(simulate(m, regions, tail, &reason));
+
+    candidate invalid_cpu_only_tail = tail;
+    invalid_cpu_only_tail.tail_g = 0;
+    invalid_cpu_only_tail.tail_c = 3;
+    REQUIRE(!make_regions(invalid_cpu_only_tail, m.layers, regions));
 
     // If required Profile data is absent, reject the estimate, never invent
     // a speed. This is DRY_RUN: no real Ring runtime state is changed.
@@ -204,7 +210,7 @@ int main() {
     REQUIRE(selected.top.size() <= 10);
 
     // General topology may change Phone P5 to P8, the number of cycles,
-    // and the final logits owner; Chunk64 and the shared dynamic slot pool remain fixed.
+    // and the final logits owner; Chunk64 and the full-batch boundary buffer remain fixed.
     model general_profile = mock_profile();
     const result general = search_supported_topology(general_profile,64,96);
     REQUIRE(general.valid && general.simulated > 0);
@@ -219,7 +225,7 @@ int main() {
     REQUIRE(!search_supported_topology(general_profile,128).valid);
 
     // APPLY_CGP frees exactly the three repeated region lengths while
-    // keeping three C->G->P cycles, Chunk64, the shared dynamic slot pool and
+    // keeping three G->C->P cycles, Chunk64, the full-batch boundary buffer and
     // final Phone ownership. CPU/CUDA/Phone are independent service lanes.
     // For 48 layers: C+G+P=16, P2..P8 => 70 layouts.
     const auto baseline_regions = llama_region_ring_parse("", 48);
@@ -328,7 +334,7 @@ int main() {
             apply_profile,baseline_regions,128).valid);
     REQUIRE(!search_supported_fixed_phone(
             apply_profile,llama_region_ring_parse(
-                "C11,G6,P7,C11,G5,P8",48),64).valid);
+                "G6,C11,P7,G5,C11,P8",48),64).valid);
 
     std::printf("REGION_RING_PLANNER_TEST status=PASS baseline_ms=%.3f "
                 "hetero_ms=%.3f selected_ms=%.3f "

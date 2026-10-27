@@ -1,6 +1,6 @@
 #pragma once
 
-// Read-only Region Ring Planner: search C/G/P cycles and independent Chunk
+// Read-only Region Ring Planner: search G/C/P cycles and independent Chunk
 // sizes, then simulate token-interval dependencies. It never modifies the
 // live Ring scheduler, buffers, KV cache, or Phone RPC state.
 #include "llama-region-ring.h"
@@ -44,7 +44,7 @@ struct candidate {
     double pc_compute_bound_ms = 0.0;
     // Total per-token service demand after simulation (or coarse estimation).
     std::array<double, 3> service_ms_per_token {};
-    // Local one-cycle terms for the C->G->P ring balance equations:
+    // Local one-cycle terms for the G->C->P ring balance equations:
     //   A = C*fC(XC)/XC
     //   B = G*fG(XG)/XG
     //   D = P*fP(XP)/XP
@@ -107,13 +107,16 @@ inline bool make_regions(const candidate & c, int total_layers,
             layer += n;
         }
     };
+    if (c.tail_c > 0 && c.tail_g <= 0) {
+        return false;
+    }
     for (int i = 0; i < c.cycles; ++i) {
-        append(device::CPU, c.c);
         append(device::GPU, c.g);
+        append(device::CPU, c.c);
         append(device::PHONE, c.p);
     }
-    append(device::CPU, c.tail_c);
     append(device::GPU, c.tail_g);
+    append(device::CPU, c.tail_c);
     return layer == total_layers;
 }
 
@@ -497,29 +500,34 @@ inline bool estimate_region_ring_balance(
     const double B = stage_sum[1] / stage_count[1];
     const double D = stage_sum[2] / stage_count[2];
 
-    double p2c_ms = 0.0;
+    double p2g_ms = 0.0;
     double c2p_ms = 0.0;
-    const size_t p2c_bytes =
+    double g2c_ms = 0.0;
+    const size_t p2g_bytes =
         (size_t) m.hidden * (size_t) c.xp * sizeof(float);
     const size_t c2p_bytes =
+        (size_t) m.hidden * (size_t) c.xc * sizeof(float);
+    const size_t g2c_bytes =
         (size_t) m.hidden * (size_t) c.xg * sizeof(float);
-    if (!m.transfer_ms(device::PHONE, device::CPU, p2c_bytes, p2c_ms) ||
-        !m.transfer_ms(device::GPU, device::PHONE, c2p_bytes, c2p_ms)) {
+    if (!m.transfer_ms(device::PHONE, device::GPU, p2g_bytes, p2g_ms) ||
+        !m.transfer_ms(device::CPU, device::PHONE, c2p_bytes, c2p_ms) ||
+        !m.transfer_ms(device::GPU, device::CPU, g2c_bytes, g2c_ms)) {
         return false;
     }
-    const double TP2C = p2c_ms / c.xp;
-    const double TC2P = c2p_ms / c.xg;
+    const double TP2G = p2g_ms / c.xp;
+    const double TC2P = c2p_ms / c.xc;
+    const double TG2C = g2c_ms / c.xg;
 
-    const double e1 = relative_ring_mismatch(A, D + TP2C);
-    const double e2 = relative_ring_mismatch(A, B);
-    const double e3 = relative_ring_mismatch(D, B + TC2P);
+    const double e1 = relative_ring_mismatch(B, D + TP2G);
+    const double e2 = relative_ring_mismatch(A, B + TG2C);
+    const double e3 = relative_ring_mismatch(D, A + TC2P);
     if (!std::isfinite(e1) || !std::isfinite(e2) ||
         !std::isfinite(e3)) {
         return false;
     }
 
     c.ring_stage_ms_per_token = {A, B, D};
-    c.ring_p2c_ms_per_token = TP2C;
+    c.ring_p2c_ms_per_token = TP2G;
     c.ring_c2p_ms_per_token = TC2P;
     c.ring_error = {e1, e2, e3};
     c.ring_error_max = std::max({e1, e2, e3});
@@ -544,48 +552,47 @@ inline bool estimate_balance(const model & m, candidate & c) {
     }
     tp += m.phone_register_ms * (double) c.p / 5.0;
 
-    // Match the handwritten ring model exactly: Phone->PC transfer is
-    // normalized by XP, and PC(GPU)->Phone transfer by XG. Do not force a
-    // common reference chunk here; XC/XG/XP become planner variables later.
-    double p2c_ms = 0.0;
+    // G -> C -> P -> G handoff model. Normalize each transfer by the
+    // producer's chunk size; XC/XG/XP are independent planner variables.
+    double p2g_ms = 0.0;
     double c2p_ms = 0.0;
     double local_ms = 0.0;
-    const size_t p2c_bytes =
+    const size_t p2g_bytes =
         (size_t) m.hidden * (size_t) c.xp * sizeof(float);
     const size_t c2p_bytes =
-        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
-    const size_t local_bytes =
         (size_t) m.hidden * (size_t) c.xc * sizeof(float);
-    if (!m.transfer_ms(device::PHONE, device::CPU, p2c_bytes, p2c_ms) ||
-        !m.transfer_ms(device::GPU, device::PHONE, c2p_bytes, c2p_ms) ||
-        !m.transfer_ms(device::CPU, device::GPU, local_bytes, local_ms)) {
+    const size_t local_bytes =
+        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
+    if (!m.transfer_ms(device::PHONE, device::GPU, p2g_bytes, p2g_ms) ||
+        !m.transfer_ms(device::CPU, device::PHONE, c2p_bytes, c2p_ms) ||
+        !m.transfer_ms(device::GPU, device::CPU, local_bytes, local_ms)) {
         return false;
     }
 
     const double A = tc / c.xc;
     const double B = tg / c.xg;
     const double D = tp / c.xp;
-    const double TP2C = p2c_ms / c.xp;
-    const double TC2P = c2p_ms / c.xg;
-    const double TLOCAL = local_ms / c.xc;
+    const double TP2G = p2g_ms / c.xp;
+    const double TC2P = c2p_ms / c.xc;
+    const double TLOCAL = local_ms / c.xg;
     if (!(A > 0.0) || !(B > 0.0) || !(D > 0.0) ||
-        TP2C < 0.0 || TC2P < 0.0 || TLOCAL < 0.0 ||
+        TP2G < 0.0 || TC2P < 0.0 || TLOCAL < 0.0 ||
         !std::isfinite(A) || !std::isfinite(B) || !std::isfinite(D) ||
-        !std::isfinite(TP2C) || !std::isfinite(TC2P) ||
+        !std::isfinite(TP2G) || !std::isfinite(TC2P) ||
         !std::isfinite(TLOCAL)) {
         return false;
     }
 
-    const double e1 = relative_ring_mismatch(A, D + TP2C);
-    const double e2 = relative_ring_mismatch(A, B);
-    const double e3 = relative_ring_mismatch(D, B + TC2P);
+    const double e1 = relative_ring_mismatch(B, D + TP2G);
+    const double e2 = relative_ring_mismatch(A, B + TLOCAL);
+    const double e3 = relative_ring_mismatch(D, A + TC2P);
     if (!std::isfinite(e1) || !std::isfinite(e2) ||
         !std::isfinite(e3)) {
         return false;
     }
 
     c.ring_stage_ms_per_token = {A, B, D};
-    c.ring_p2c_ms_per_token = TP2C;
+    c.ring_p2c_ms_per_token = TP2G;
     c.ring_c2p_ms_per_token = TC2P;
     c.ring_error = {e1, e2, e3};
     c.ring_error_max = std::max({e1, e2, e3});
@@ -608,7 +615,7 @@ inline bool estimate_balance(const model & m, candidate & c) {
     const int pc_local_edges =
         c.cycles + (c.tail_c > 0 && c.tail_g > 0 ? 1 : 0);
     const double phone_link_total =
-        pc_to_phone_edges * TC2P + phone_to_pc_edges * TP2C;
+        pc_to_phone_edges * TC2P + phone_to_pc_edges * TP2G;
     const double local_link_total = pc_local_edges * TLOCAL;
 
     c.service_ms_per_token = {cpu_total, gpu_total, phone_total};
@@ -681,6 +688,9 @@ inline result search(
                     }
                     for (int tg = 0; tg <= tail; ++tg) {
                         const int tc = tail - tg;
+                        if (tc > 0 && tg == 0) {
+                            continue;
+                        }
                         for (int xc : x_cpu) for (int xg : x_gpu) for (int xp : x_phone) {
                             candidate plan;
                             plan.cycles = n;
@@ -797,7 +807,7 @@ inline result search(
 }
 
 // Phase-1 supported search: keep the model's exact Phone regions and
-// original CUDA weight count, adjust only CPU/CUDA boundaries inside the
+// original CUDA weight count, adjust only CUDA/CPU boundaries inside the
 // three 11-layer PC windows. No changes to Chunk, KV, Phone graph UID
 // location, final logits ownership, or live output-slot protocol.
 struct supported_choice {
@@ -845,8 +855,8 @@ inline supported_result search_supported_fixed_phone(
         const int j = i * 3;
         pc_starts[i] = baseline[j].layer_begin;
         pc_widths[i] = baseline[j + 2].layer_begin - pc_starts[i];
-        baseline_g[i] = baseline[j + 1].layer_end -
-                        baseline[j + 1].layer_begin;
+        baseline_g[i] = baseline[j].layer_end -
+                        baseline[j].layer_begin;
         gpu_total += baseline_g[i];
     }
 
@@ -861,10 +871,10 @@ inline supported_result search_supported_fixed_phone(
             choice.regions.reserve(baseline.size());
             for (int i = 0; i < 3; ++i) {
                 const int begin = pc_starts[i];
-                const int middle = begin + pc_widths[i] - gs[i];
+                const int middle = begin + gs[i];
                 const int end = begin + pc_widths[i];
-                choice.regions.push_back({device::CPU, begin,middle});
-                choice.regions.push_back({device::GPU,middle,end});
+                choice.regions.push_back({device::GPU, begin,middle});
+                choice.regions.push_back({device::CPU,middle,end});
                 choice.regions.push_back(baseline[i*3+2]);
                 choice.gpu_shift += std::abs(gs[i]-baseline_g[i]);
             }
@@ -908,7 +918,7 @@ inline supported_result search_supported_fixed_phone(
 // Executable free C/G/P search for the current three-cycle Ring. Each
 // candidate first receives the handwritten minimax ring score
 // E=max(e1,e2,e3), then all 70 geometries are still run through the exact
-// FIFO/KV/dynamic-slot event simulation. This keeps Chunk64, C->G->P ordering
+// FIFO/KV/dynamic-slot event simulation. This keeps Chunk64, G->C->P ordering
 // and final Phone ownership fixed, but does NOT preserve P5 or the old
 // CUDA/Phone totals.
 // For a 48-layer model, C+G+P=16 and the current Phone contract allows P2..P8.
