@@ -405,7 +405,10 @@ private:
                                       ggml_backend_t                       strict_compute_backend = nullptr,
                                       int                                  ring_lane = -1,
                                       std::unique_lock<std::mutex> *       ring_cpu_gate = nullptr,
-                                      std::unique_lock<std::mutex> *       ring_cuda_gate = nullptr);
+                                      std::unique_lock<std::mutex> *       ring_cuda_gate = nullptr,
+                                      int64_t *                            ring_prepare_wait_us = nullptr,
+                                      int64_t *                            ring_cpu_wait_us = nullptr,
+                                      int64_t *                            ring_cuda_wait_us = nullptr);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
@@ -514,8 +517,9 @@ private:
     // scheduler/graph allocation state. The CPU worker is strictly CPU-only.
     // GGML requires the GPU Scheduler to retain CPU as its final backend, so
     // GPU compute ownership is enforced by rejecting every non-CUDA split.
-    // A short PREPARE gate protects graph/scheduler mutation; CPU and CUDA
-    // compute are protected independently. Phone detaches after input prepare.
+    // A short PREPARE gate protects graph/scheduler mutation; CPU source
+    // synchronization during split staging is locked only when required.
+    // CPU/CUDA compute are protected independently; Phone then detaches.
     // Backend objects and KV storage remain shared.
     struct region_ring_worker_resource {
         ggml_backend_sched_ptr sched;
@@ -524,13 +528,15 @@ private:
     std::array<region_ring_worker_resource, 2> region_ring_worker_resources;
 
     // Threaded Region Ring lock hierarchy:
-    //   CPU lane   : CPU gate -> PREPARE gate -> CPU compute/sync
-    //   GPU lane   : CPU gate -> CUDA gate -> PREPARE gate; release CPU/PREPARE
-    //                before CUDA compute/sync
-    //   Phone lane : CPU gate -> PREPARE gate; release both before Meta/RPC
-    // The short PREPARE gate protects graph/scheduler mutation. CPU and CUDA
-    // compute then run under disjoint backend locks. The legacy broad gate is
-    // retained for non-overlap/serial ownership paths.
+    //   phase A: PREPARE gate only for graph/scheduler mutation
+    //   phase B: if prepare_split() may synchronize a non-INPUT CPU producer,
+    //            acquire CPU gate briefly, then reacquire PREPARE for staging
+    //   CPU lane: CPU gate remains held through CPU compute/sync
+    //   GPU lane: CUDA gate remains held through CUDA compute/sync
+    //   Phone:    releases staging locks before detached Meta/RPC compute
+    // This prevents immutable host INPUT copies from waiting behind long CPU
+    // compute while preserving a conservative lock around real CPU-backend
+    // synchronization. The legacy broad gate remains for serial paths.
     std::mutex region_ring_prepare_mutex;
     std::mutex region_ring_cpu_execution_mutex;
     std::mutex region_ring_cuda_execution_mutex;

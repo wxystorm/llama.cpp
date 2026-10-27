@@ -337,6 +337,11 @@ extern "C" {
     // for ownership diagnostics, NOT proof of safe concurrent execution:
     // internal Meta/RPC resources and graph allocator state are not covered.
     GGML_API uint64_t       ggml_backend_sched_get_split_resource_mask(ggml_backend_sched_t sched, int split_id);
+    // Source-backend mask for inputs whose prepare_split() path may explicitly
+    // synchronize/read producer backend state. User INPUT tensors are omitted:
+    // prepare_split() only waits on the destination backend before copying
+    // those immutable inputs. Bit 63 means the source backend is unresolved.
+    GGML_API uint64_t       ggml_backend_sched_get_split_prepare_sync_mask(ggml_backend_sched_t sched, int split_id);
     GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,

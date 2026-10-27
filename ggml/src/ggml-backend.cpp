@@ -2322,6 +2322,42 @@ uint64_t ggml_backend_sched_get_split_resource_mask(ggml_backend_sched_t sched, 
     return mask;
 }
 
+uint64_t ggml_backend_sched_get_split_prepare_sync_mask(
+        ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    GGML_ASSERT(sched->n_backends > 0 && sched->n_backends < 64);
+
+    const ggml_backend_sched_split & split = sched->splits[split_id];
+    uint64_t mask = 0;
+
+    // GGML_TENSOR_FLAG_INPUT follows the first branch in prepare_split():
+    // destination availability is synchronized, then the immutable user input
+    // is copied. It does not synchronize the producer backend. Non-input
+    // cross-backend tensors can enter the expert-staging or fallback-copy
+    // paths, both of which may synchronize/read the producer backend.
+    for (int i = 0; i < split.n_inputs; ++i) {
+        ggml_tensor * input = split.inputs[i];
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+            continue;
+        }
+
+        ggml_backend_t src =
+            ggml_backend_sched_get_tensor_backend(sched, input);
+        if (src == nullptr) {
+            mask |= UINT64_C(1) << 63;
+            continue;
+        }
+        const int src_id = ggml_backend_sched_backend_id(sched, src);
+        if (src_id < 0 || src_id >= sched->n_backends) {
+            mask |= UINT64_C(1) << 63;
+        } else {
+            mask |= UINT64_C(1) << src_id;
+        }
+    }
+    return mask;
+}
+
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;

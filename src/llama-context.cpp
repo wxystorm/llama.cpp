@@ -2326,7 +2326,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ggml_backend_t                     strict_compute_backend,
         int                                ring_lane,
         std::unique_lock<std::mutex> *     ring_cpu_gate,
-        std::unique_lock<std::mutex> *     ring_cuda_gate) {
+        std::unique_lock<std::mutex> *     ring_cuda_gate,
+        int64_t *                          ring_prepare_wait_us,
+        int64_t *                          ring_cpu_wait_us,
+        int64_t *                          ring_cuda_wait_us) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2359,22 +2362,28 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     if (split_backend_gates) {
         const bool lane_valid = ring_lane >= 0 && ring_lane <= 2;
         const bool prepare_owned = ring_prepare_gate->owns_lock();
+        const bool cpu_associated =
+            ring_cpu_gate != nullptr && ring_cpu_gate->mutex() != nullptr;
+        const bool cuda_associated =
+            ring_cuda_gate != nullptr && ring_cuda_gate->mutex() != nullptr;
         const bool cpu_owned =
             ring_cpu_gate != nullptr && ring_cpu_gate->owns_lock();
         const bool cuda_owned =
             ring_cuda_gate != nullptr && ring_cuda_gate->owns_lock();
         const bool resources_ok =
-            ring_lane == 0 ? (cpu_owned && !cuda_owned) :
-            ring_lane == 1 ? (cpu_owned && cuda_owned) :
-                             (cpu_owned && !cuda_owned);
+            cpu_associated &&
+            (ring_lane != 1 || cuda_associated) &&
+            !cpu_owned && !cuda_owned;
         if (!lane_valid || !prepare_owned || !resources_ok) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-                "prepare=%d cpu=%d cuda=%d status=REJECT "
+                "prepare=%d cpu_assoc=%d cpu_owned=%d "
+                "cuda_assoc=%d cuda_owned=%d status=REJECT "
                 "reason=LOCK_CONTRACT\n",
                 stage_index, block_index, ring_lane,
-                prepare_owned ? 1 : 0, cpu_owned ? 1 : 0,
-                cuda_owned ? 1 : 0);
+                prepare_owned ? 1 : 0,
+                cpu_associated ? 1 : 0, cpu_owned ? 1 : 0,
+                cuda_associated ? 1 : 0, cuda_owned ? 1 : 0);
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -2480,6 +2489,86 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
         }
 
+        const int n_backends =
+            ggml_backend_sched_get_n_backends(sched_use);
+        if (n_backends <= 0 || n_backends >= 64) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
+                "backends=%d status=REJECT reason=INVALID_BACKEND_COUNT\n",
+                stage_index, block_index, ring_lane, n_backends);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        const uint64_t prepare_sync_mask =
+            ggml_backend_sched_get_split_prepare_sync_mask(sched_use, 0);
+        if ((prepare_sync_mask >> 63) != 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
+                "sync_mask=0x%016" PRIx64 " status=REJECT "
+                "reason=UNRESOLVED_SOURCE_BACKEND\n",
+                stage_index, block_index, ring_lane, prepare_sync_mask);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        const int cpu_backend_index = n_backends - 1;
+        ggml_backend_t local_cpu =
+            ggml_backend_sched_get_backend(sched_use, cpu_backend_index);
+        const bool cpu_is_last =
+            ggml_backend_dev_type(
+                ggml_backend_get_device(local_cpu)) ==
+                GGML_BACKEND_DEVICE_TYPE_CPU;
+        const uint64_t cpu_bit =
+            UINT64_C(1) << cpu_backend_index;
+        const bool prepare_needs_cpu =
+            (prepare_sync_mask & cpu_bit) != 0;
+        if (!cpu_is_last) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
+                "status=REJECT reason=CPU_SENTINEL_MISSING\n",
+                stage_index, block_index, ring_lane);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        // Phase A (prepare_ubatch above) ran with PREPARE only. Drop PREPARE
+        // before acquiring backend locks so every path that needs CPU follows
+        // CPU -> CUDA -> PREPARE and cannot deadlock with the CPU worker.
+        ring_prepare_gate->unlock();
+
+        if (ring_lane == 0 || prepare_needs_cpu) {
+            const int64_t wait_begin_us = ggml_time_us();
+            ring_cpu_gate->lock();
+            if (ring_cpu_wait_us != nullptr) {
+                *ring_cpu_wait_us += ggml_time_us() - wait_begin_us;
+            }
+        }
+        if (ring_lane == 1) {
+            const int64_t wait_begin_us = ggml_time_us();
+            ring_cuda_gate->lock();
+            if (ring_cuda_wait_us != nullptr) {
+                *ring_cuda_wait_us += ggml_time_us() - wait_begin_us;
+            }
+        }
+
+        {
+            const int64_t wait_begin_us = ggml_time_us();
+            ring_prepare_gate->lock();
+            if (ring_prepare_wait_us != nullptr) {
+                *ring_prepare_wait_us += ggml_time_us() - wait_begin_us;
+            }
+        }
+
+        if (block_index == 0 || prepare_needs_cpu) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
+                "sync_mask=0x%016" PRIx64 " cpu_required=%d "
+                "status=READY\n",
+                stage_index, block_index, ring_lane,
+                prepare_sync_mask, prepare_needs_cpu ? 1 : 0);
+        }
+
         ret = ggml_backend_sched_prepare_split(sched_use, 0);
         if (ret != GGML_STATUS_SUCCESS) {
             LLAMA_LOG_ERROR(
@@ -2489,12 +2578,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             return nullptr;
         }
 
-        // Graph construction/splitting/input handoff is complete. From this
-        // point on CPU and CUDA use independent execution locks. GPU and Phone
-        // no longer need the outer CPU handle after prepare.
+        // Split staging is finished. PREPARE is always short-lived. GPU/Phone
+        // release a temporary CPU staging lock immediately; CPU keeps its own
+        // execution gate through compute+sync.
         ring_prepare_gate->unlock();
-        if (ring_lane != 0 && ring_cpu_gate != nullptr &&
-                ring_cpu_gate->owns_lock()) {
+        if (ring_lane != 0 && ring_cpu_gate->owns_lock()) {
             ring_cpu_gate->unlock();
         }
 
@@ -3401,28 +3489,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         std::unique_lock<std::mutex> prepare_gate;
 
                         if (pc_phone_overlap) {
-                            // Lock order is fixed: CPU -> CUDA (GPU only) ->
-                            // PREPARE. GPU releases CPU/PREPARE after split
-                            // preparation and keeps CUDA through compute+sync.
-                            int64_t wait_begin_us = ggml_time_us();
+                            // Phase A starts with PREPARE only. CPU/CUDA locks
+                            // are associated but deferred; run_hybrid_stage_block
+                            // acquires them only after the graph is split and the
+                            // precise prepare-sync sources are known.
                             cpu_gate = std::unique_lock<std::mutex>(
-                                region_ring_cpu_execution_mutex);
-                            const int64_t cpu_wait =
-                                ggml_time_us() - wait_begin_us;
-                            state.cpu_wait_us += cpu_wait;
-                            state.backend_wait_us += cpu_wait;
-
+                                region_ring_cpu_execution_mutex,
+                                std::defer_lock);
                             if (dev == 1) {
-                                wait_begin_us = ggml_time_us();
                                 cuda_gate = std::unique_lock<std::mutex>(
-                                    region_ring_cuda_execution_mutex);
-                                const int64_t cuda_wait =
-                                    ggml_time_us() - wait_begin_us;
-                                state.cuda_wait_us += cuda_wait;
-                                state.backend_wait_us += cuda_wait;
+                                    region_ring_cuda_execution_mutex,
+                                    std::defer_lock);
                             }
 
-                            wait_begin_us = ggml_time_us();
+                            const int64_t wait_begin_us = ggml_time_us();
                             prepare_gate = std::unique_lock<std::mutex>(
                                 region_ring_prepare_mutex);
                             const int64_t prepare_wait =
@@ -3457,9 +3537,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 pc_phone_overlap ? (int) dev : -1,
                                 pc_phone_overlap ? &cpu_gate : nullptr,
                                 pc_phone_overlap && dev == 1 ?
-                                    &cuda_gate : nullptr);
+                                    &cuda_gate : nullptr,
+                                pc_phone_overlap ? &state.prepare_wait_us : nullptr,
+                                pc_phone_overlap ? &state.cpu_wait_us : nullptr,
+                                pc_phone_overlap ? &state.cuda_wait_us : nullptr);
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us += compute_end_us - compute_begin_us;
+                            if (pc_phone_overlap) {
+                                // prepare/cpu/cuda counters are cumulative.
+                                // Reconstruct backend_wait from them at summary
+                                // time to avoid double-counting per-call deltas.
+                                state.backend_wait_us = 0;
+                            }
                             if (pc_phone_overlap && task_result != nullptr &&
                                 task_status == GGML_STATUS_SUCCESS &&
                                 lane_compute_begin_us > 0 &&
@@ -3609,7 +3698,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 " cross_backend_tasks=%zu unresolved_tasks=%zu status=%d\n",
                 name, state.completed,
                 state.ready_wait_us / 1000.0,
-                state.backend_wait_us / 1000.0,
+                (pc_phone_overlap ?
+                    state.prepare_wait_us + state.cpu_wait_us +
+                        state.cuda_wait_us :
+                    state.backend_wait_us) / 1000.0,
                 state.prepare_wait_us / 1000.0,
                 state.cpu_wait_us / 1000.0,
                 state.cuda_wait_us / 1000.0,
@@ -3681,7 +3773,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[REGION_RING_PC_PHONE_SUM] cpu_intervals=%zu gpu_intervals=%zu "
                 "phone_intervals=%zu overlap_ms=%.3f "
                 "pc_gate=SPLIT cpu_compute=CPU_GATE cuda_compute=CUDA_GATE "
-                "phone_compute=DETACHED phone_prepare=CPU_PLUS_PREPARE "
+                "phone_compute=DETACHED phone_prepare=PREPARE_PLUS_CONDITIONAL_CPU "
                 "slot_pool=%zu status=%s\n",
                 worker_states[0].compute_intervals.size(),
                 worker_states[1].compute_intervals.size(),
