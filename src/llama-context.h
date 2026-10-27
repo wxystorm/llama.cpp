@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <vector>

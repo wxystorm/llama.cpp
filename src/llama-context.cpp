@@ -3255,7 +3255,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 } else {
                     start = 1;
                     count = 2;
-                    scheduler_offload = false;
+                    scheduler_offload =
+                        gpu_weight_streaming ?
+                            false : cparams.op_offload;
                     policy = gpu_weight_streaming ?
                         "CUDA_WEIGHT_BANK" :
                         "CUDA_ONLY_VALIDATED";

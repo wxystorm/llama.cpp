@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cinttypes>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
