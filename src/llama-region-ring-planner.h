@@ -638,86 +638,151 @@ struct result {
     size_t rejected_memory = 0;
     size_t rejected_profile = 0;
     size_t rejected_deadlock = 0;
+    size_t shortlisted = 0;
+    double coarse_e_min = std::numeric_limits<double>::infinity();
+    double coarse_e_limit = std::numeric_limits<double>::infinity();
     std::vector<candidate> top;
 };
 
-inline result search(const model & m, int max_simulations = 192) {
+inline result search(
+        const model & m,
+        int max_simulations = 256,
+        double e_margin = 0.08,
+        int min_simulations = 32) {
     result out;
-    if (m.layers < 6 || m.tokens <= 0 || max_simulations <= 0) { return out; }
-    const std::array<int,3> x_pc {32,64,128};
+    if (m.layers < 6 || m.tokens <= 0 || max_simulations <= 0 ||
+        min_simulations < 0 || !std::isfinite(e_margin) ||
+        e_margin < 0.0) {
+        return out;
+    }
+
+    const std::array<int,4> x_cpu {16,32,64,128};
+    const std::array<int,4> x_gpu {16,32,64,128};
     const std::array<int,4> x_phone {16,32,64,128};
     std::vector<candidate> coarse;
+
     for (int n = 2; n <= 4; ++n) {
-        for (int c = 2; c <= 12; ++c) {
-            for (int g = 1; g <= 8; ++g) {
-                for (int p = 2; p <= 8; ++p) {
-                    const int tail = m.layers - n*(c+g+p);
-                    if (tail < 0 || tail > m.max_tail) { continue; }
+        const int max_region_width = m.layers / n;
+        for (int p = 2; p <= std::min(8, max_region_width - 2); ++p) {
+            for (int c = 1; c <= max_region_width - p - 1; ++c) {
+                for (int g = 1; g <= max_region_width - p - c; ++g) {
+                    const int tail = m.layers - n * (c + g + p);
+                    if (tail < 0 || tail > m.max_tail) {
+                        continue;
+                    }
                     for (int tg = 0; tg <= tail; ++tg) {
-                        const int tc = tail-tg;
-                        for (int xc : x_pc) for (int xg : x_pc) for (int xp : x_phone) {
+                        const int tc = tail - tg;
+                        for (int xc : x_cpu) for (int xg : x_gpu) for (int xp : x_phone) {
                             candidate plan;
-                            plan.cycles=n; plan.c=c; plan.g=g; plan.p=p;
-                            plan.tail_c=tc; plan.tail_g=tg;
-                            plan.xc=xc; plan.xg=xg; plan.xp=xp;
+                            plan.cycles = n;
+                            plan.c = c;
+                            plan.g = g;
+                            plan.p = p;
+                            plan.tail_c = tc;
+                            plan.tail_g = tg;
+                            plan.xc = xc;
+                            plan.xg = xg;
+                            plan.xp = xp;
                             ++out.enumerated;
                             if (m.memory_feasible && !m.memory_feasible(plan)) {
                                 ++out.rejected_memory;
                                 continue;
                             }
-                            if (!estimate_balance(m,plan)) {
+                            if (!estimate_balance(m, plan)) {
                                 ++out.rejected_profile;
                                 continue;
                             }
                             ++out.profiled;
-                            coarse.push_back(plan);
+                            coarse.push_back(std::move(plan));
                         }
                     }
                 }
             }
         }
     }
-    std::sort(coarse.begin(),coarse.end(),[](const candidate &a,const candidate &b){
-        if (std::abs(a.ring_error_max-b.ring_error_max) > 1e-12) {
-            return a.ring_error_max < b.ring_error_max;
-        }
-        if (a.coarse_ms != b.coarse_ms) return a.coarse_ms < b.coarse_ms;
-        return a.ring_error_mean < b.ring_error_mean;
-    });
+
+    if (coarse.empty()) {
+        return out;
+    }
+
+    std::sort(coarse.begin(), coarse.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-12) {
+                return a.ring_error_max < b.ring_error_max;
+            }
+            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
+                return a.coarse_ms < b.coarse_ms;
+            }
+            return a.ring_error_mean < b.ring_error_mean;
+        });
+
+    out.coarse_e_min = coarse.front().ring_error_max;
+    out.coarse_e_limit = std::min(1.0, out.coarse_e_min + e_margin);
+
     std::vector<candidate> shortlist;
-    std::vector<std::tuple<int,int,int,int>> families;
+    shortlist.reserve((size_t) max_simulations);
+    const auto exact_key = [](const candidate & c) {
+        return std::make_tuple(c.cycles, c.c, c.g, c.p,
+                               c.tail_c, c.tail_g, c.xc, c.xg, c.xp);
+    };
+    const auto family_key = [](const candidate & c) {
+        return std::make_tuple(c.cycles, c.c, c.g, c.p,
+                               c.tail_c, c.tail_g);
+    };
+
+    std::vector<std::tuple<int,int,int,int,int,int>> families;
     for (const auto & plan : coarse) {
-        const auto family=std::make_tuple(plan.cycles,plan.c,plan.g,plan.p);
-        if (std::find(families.begin(),families.end(),family)!=families.end()) continue;
+        if (plan.ring_error_max > out.coarse_e_limit + 1e-12) break;
+        const auto family = family_key(plan);
+        if (std::find(families.begin(), families.end(), family) != families.end()) continue;
         families.push_back(family);
         shortlist.push_back(plan);
         if ((int) shortlist.size() >= max_simulations / 2) break;
     }
+
     for (const auto & plan : coarse) {
         if ((int) shortlist.size() >= max_simulations) break;
-        auto key=[](const candidate &c){return std::make_tuple(c.cycles,c.c,c.g,c.p,c.tail_c,c.tail_g,c.xc,c.xg,c.xp);};
-        if (std::any_of(shortlist.begin(),shortlist.end(),[&](const candidate &x){return key(x)==key(plan);})) continue;
+        if (plan.ring_error_max > out.coarse_e_limit + 1e-12) break;
+        if (std::any_of(shortlist.begin(), shortlist.end(),
+                [&](const candidate & x) { return exact_key(x) == exact_key(plan); })) continue;
         shortlist.push_back(plan);
     }
+
+    const int floor_count = std::min(max_simulations, std::max(0, min_simulations));
+    if ((int) shortlist.size() < floor_count) {
+        for (const auto & plan : coarse) {
+            if ((int) shortlist.size() >= floor_count) break;
+            if (std::any_of(shortlist.begin(), shortlist.end(),
+                    [&](const candidate & x) { return exact_key(x) == exact_key(plan); })) continue;
+            shortlist.push_back(plan);
+        }
+    }
+
+    out.shortlisted = shortlist.size();
     for (auto plan : shortlist) {
         std::vector<llama_region_ring_region> regions;
-        if (!make_regions(plan,m.layers,regions)) continue;
+        if (!make_regions(plan, m.layers, regions)) continue;
         std::string reason;
-        if (!simulate(m,regions,plan,&reason)) {
+        if (!simulate(m, regions, plan, &reason)) {
             ++out.rejected_deadlock;
             continue;
         }
         ++out.simulated;
-        out.top.push_back(plan);
+        out.top.push_back(std::move(plan));
     }
-    std::sort(out.top.begin(),out.top.end(),[](const candidate&a,const candidate&b){
-        if(a.wall_ms!=b.wall_ms) return a.wall_ms<b.wall_ms;
-        return a.ring_error_max<b.ring_error_max;
-    });
+
+    std::sort(out.top.begin(), out.top.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.wall_ms - b.wall_ms) > 0.05) return a.wall_ms < b.wall_ms;
+            if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-9) {
+                return a.ring_error_max < b.ring_error_max;
+            }
+            return a.ring_error_mean < b.ring_error_mean;
+        });
     if (!out.top.empty()) {
-        out.selected=out.top.front();
-        out.valid=true;
-        if(out.top.size()>5) out.top.resize(5);
+        out.selected = out.top.front();
+        out.valid = true;
+        if (out.top.size() > 10) out.top.resize(10);
     }
     return out;
 }

@@ -8939,13 +8939,47 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         return true;
     }
 
-    const auto result = llama_ring_planner::search(model, 192);
+    int wide_max_simulations = 256;
+    int wide_min_simulations = 32;
+    double wide_e_margin = 0.08;
+    if (const char * raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_MAX_SIMULATIONS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && parsed >= 16 && parsed <= 2048) {
+            wide_max_simulations = (int) parsed;
+        }
+    }
+    if (const char * raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_MIN_SIMULATIONS")) {
+        char * end = nullptr;
+        const long parsed = std::strtol(raw, &end, 10);
+        if (end != raw && *end == '\0' && parsed >= 0 &&
+            parsed <= wide_max_simulations) {
+            wide_min_simulations = (int) parsed;
+        }
+    }
+    if (const char * raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_E_MARGIN")) {
+        char * end = nullptr;
+        const double parsed = std::strtod(raw, &end);
+        if (end != raw && *end == '\0' && std::isfinite(parsed) &&
+            parsed >= 0.0 && parsed <= 0.50) {
+            wide_e_margin = parsed;
+        }
+    }
+
+    const auto result = llama_ring_planner::search(
+        model, wide_max_simulations, wide_e_margin,
+        wide_min_simulations);
     // Measure the same reference on the SAME interpolation model, rather
     // than comparing two predictions from different profile parameters.
     auto baseline_regions = llama_region_ring_from_env(profile.n_layer);
     llama_ring_planner::candidate baseline;
     baseline.xc = baseline.xg = baseline.xp = baseline_chunk;
     const bool base_ok =
+        llama_ring_planner::estimate_region_ring_balance(
+            model, baseline_regions, baseline) &&
         llama_ring_planner::simulate(model, baseline_regions, baseline);
     LLAMA_LOG_ERROR(
         "[REGION_RING_PLAN_BASELINE] tokens=%d chunk=%d "
@@ -8961,12 +8995,20 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         base_ok ? "OK" : "NO_PROFILE");
 
     LLAMA_LOG_ERROR(
-        "[REGION_RING_PLAN_SEARCH] enumerated=%zu profiled=%zu "
-        "simulated=%zu reject_memory=%zu reject_profile=%zu "
-        "reject_dag=%zu baseline_profile=%s\n",
-        result.enumerated, result.profiled, result.simulated,
-        result.rejected_memory, result.rejected_profile,
-        result.rejected_deadlock, base_ok ? "OK" : "MISSING");
+        "[REGION_RING_PLAN_SEARCH] mode=WIDE_PREVIEW "
+        "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
+        "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
+        "E_min=%.4f E_limit=%.4f E_margin=%.4f "
+        "max_sim=%d min_sim=%d cycles=2..4 "
+        "C=OPEN G=OPEN P=2..8 "
+        "XC=16,32,64,128 XG=16,32,64,128 XP=16,32,64,128 "
+        "tail_max=%d baseline_profile=%s\n",
+        result.enumerated, result.profiled, result.shortlisted,
+        result.simulated, result.rejected_memory,
+        result.rejected_profile, result.rejected_deadlock,
+        result.coarse_e_min, result.coarse_e_limit, wide_e_margin,
+        wide_max_simulations, wide_min_simulations,
+        model.max_tail, base_ok ? "OK" : "MISSING");
 
     if (!result.valid) {
         LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=NO_VALID_CANDIDATE "
@@ -8983,6 +9025,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
             "pc_bound=%.3f cpu_mspt=%.6f gpu_mspt=%.6f "
             "phone_mspt=%.6f phone_link_mspt=%.6f "
+            "A=%.6f B=%.6f D=%.6f TP2C=%.6f TC2P=%.6f "
+            "e1=%.4f e2=%.4f e3=%.4f E=%.4f "
             "tasks=%d edges=%d peak_per_edge_slots=%d\n",
             i + 1, c.cycles, c.c, c.g, c.p, c.tail_c, c.tail_g,
             c.xc, c.xg, c.xp, c.balance, c.wall_ms,
@@ -8992,6 +9036,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             c.service_ms_per_token[1],
             c.service_ms_per_token[2],
             c.phone_link_ms_per_token,
+            c.ring_stage_ms_per_token[0],
+            c.ring_stage_ms_per_token[1],
+            c.ring_stage_ms_per_token[2],
+            c.ring_p2c_ms_per_token,
+            c.ring_c2p_ms_per_token,
+            c.ring_error[0], c.ring_error[1], c.ring_error[2],
+            c.ring_error_max,
             c.tasks, c.edges, c.max_live_slots);
     }
     const auto & best = result.selected;
@@ -8999,15 +9050,17 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "[REGION_RING_PLAN_SELECTED] mode=DRY_RUN cycles=%d "
         "C=%d G=%d P=%d tail_C=%d tail_G=%d "
         "XC=%d XG=%d XP=%d predicted_ms=%.3f "
-        "baseline_predicted_ms=%.3f balance=%.4f "
-        "pc_bound_ms=%.3f\n",
+        "baseline_predicted_ms=%.3f E=%.4f "
+        "e1=%.4f e2=%.4f e3=%.4f pc_bound_ms=%.3f\n",
         best.cycles, best.c, best.g, best.p,
         best.tail_c, best.tail_g, best.xc, best.xg, best.xp,
         best.wall_ms, base_ok ? baseline.wall_ms : -1.0,
-        best.balance, best.pc_compute_bound_ms);
+        best.ring_error_max,
+        best.ring_error[0], best.ring_error[1], best.ring_error[2],
+        best.pc_compute_bound_ms);
     LLAMA_LOG_ERROR(
         "[REGION_RING_PLAN_APPLY] mode=DRY_RUN applied=0 "
-        "reason=INTERVAL_READY_AND_DYNAMIC_PHONE_OWNERSHIP_NOT_YET_ENABLED "
+        "reason=WIDE_TOPOLOGY_AND_PER_DEVICE_CHUNKS_PREVIEW_ONLY "
         "runtime_layout=UNCHANGED runtime_chunk=%d status=SAFE\n",
         baseline_chunk);
     return true;
