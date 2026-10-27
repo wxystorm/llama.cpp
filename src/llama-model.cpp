@@ -2119,9 +2119,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // GPU-first Region Ring needs the token-embedding/input graph on CUDA as
+    // well. Otherwise the first Region is split CPU(input embedding)->CUDA,
+    // violating the strict one-compute-backend Ring contract.
+    const bool region_ring_gpu_first =
+        llama_region_ring_enabled() &&
+        !pc_layer_backends.empty() &&
+        pc_layer_backends.front() == llama_pc_layer_backend::CUDA;
+    if (region_ring_gpu_first) {
+        if (cuda_dev == nullptr) {
+            throw std::runtime_error(
+                "GPU-first Region Ring requires CUDA0 for the input layer");
+        }
+        pimpl->dev_input = {
+            cuda_dev,
+            &pimpl->gpu_buft_list.at(cuda_dev)
+        };
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_INPUT_PLACEMENT] backend=CUDA "
+            "reason=GPU_FIRST_SINGLE_SPLIT status=READY\n");
+    } else {
+        // Upstream llama.cpp default: input embedding stays on CPU.
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);

@@ -38,9 +38,9 @@ static void test_layout() {
     check(regions.back().layer_begin == 43 &&
           regions.back().layer_end == 48, "default last region is incorrect");
 
-    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3,P6");
+    check_rejected("G4,C7,P5,G4,C7,P5,G3,C8,P6");
     check_rejected("G4,P7,C5,G4,C7,P5,G3,C8,P5");
-    check_rejected("C7,G4,P5,C7,G4,P5,C8,G3");
+    check_rejected("G4,C7,P5,G4,C7,P5,G3,C8");
     check_rejected("G4,C7,P5,G4,C7,P5,G3,C8,P5,");
     check_rejected("G4,C7,P5,G4,C7,P5,G3,C8,P5, ");
     const auto spaced =
@@ -352,7 +352,7 @@ static void test_dynamic_slot_pool() {
     check(ready.live_output_slots() == 1, "R0C0 output lease not reserved");
     ready.complete(*first);
     const auto second = ready.try_take(llama_region_ring_device::GPU);
-    check(second && second->region == 0 && second->chunk == 1, "CPU R0C1 unavailable");
+    check(second && second->region == 0 && second->chunk == 1, "GPU R0C1 unavailable");
     check(second->output_slot >= 0 && second->output_slot != first_slot,
           "R0C1 reused a live output slot");
     ready.complete(*second);

@@ -458,7 +458,7 @@ inline double relative_ring_mismatch(double lhs, double rhs) {
 
 // Evaluate the same local ring equations for a concrete runtime layout whose
 // three cycles need not have identical C/G widths (the fixed baseline ends in
-// C8,G3,P5 rather than C7,G4,P5). A/B/D are the mean per-cycle station
+// G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
 // service rates; aggregate service demand is kept separately.
 inline bool estimate_region_ring_balance(
         const model & m,
