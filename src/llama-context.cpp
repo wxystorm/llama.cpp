@@ -4016,7 +4016,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "[REGION_RING_GPU_WEIGHT] "
                                     "event=TASK_DONE region=%zu chunk=%zu "
                                     "bank=%c upload_mib=%.3f "
-                                    "cache_hit_mib=%.3f "
+                                    "cache_hit_mib=%.3f bank_cuda_mib=%.3f "
                                     "prepare_ms=%.3f compute_range_ms=%.3f "
                                     "status=%d\n",
                                     task.region, task.chunk,
@@ -4024,6 +4024,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     task_timing.weight_upload_bytes /
                                         1048576.0,
                                     task_timing.weight_cache_hit_bytes /
+                                        1048576.0,
+                                    ggml_backend_sched_get_buffer_size(
+                                        task_sched, backend_ptrs[1]) /
                                         1048576.0,
                                     task_timing.prepare_us / 1000.0,
                                     task_timing.compute_range_us / 1000.0,

@@ -1670,11 +1670,24 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const bool region_ring = llama_region_ring_enabled();
         const bool ring_gpu_weight_stream_requested =
             region_ring &&
-            std::getenv("LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM") != nullptr &&
+            std::getenv(
+                "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM") != nullptr &&
             std::atoi(std::getenv(
                 "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM")) != 0;
+        const char * ring_exec_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+        const bool ring_gpu_weight_stream_exec_ok =
+            ring_exec_env != nullptr &&
+            std::strcmp(ring_exec_env, "fifo-pc-phone") == 0;
+        if (ring_gpu_weight_stream_requested &&
+                !ring_gpu_weight_stream_exec_ok) {
+            throw std::runtime_error(
+                "GPU weight streaming V1 requires "
+                "LLAMA_HYBRID_REGION_RING_EXEC=fifo-pc-phone");
+        }
         hybrid_ring_gpu_weight_streaming =
             ring_gpu_weight_stream_requested &&
+            ring_gpu_weight_stream_exec_ok &&
             arch == LLM_ARCH_QWEN3MOE;
         if (ring_gpu_weight_stream_requested &&
                 !hybrid_ring_gpu_weight_streaming) {
