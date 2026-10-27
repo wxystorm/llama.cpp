@@ -1704,8 +1704,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (hybrid_ring_gpu_weight_streaming) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT] phase=CONFIG enabled=1 "
-                "canonical=CPU exec=CUDA banks=2 "
-                "policy=DEMAND_CACHE_V1 status=READY\n");
+                "arch=%s experts=%u canonical=CPU exec=CUDA banks=2 "
+                "policy=DEMAND_CACHE_V1 status=READY\n",
+                arch_name().c_str(), hparams.n_expert);
         }
         const std::vector<llama_region_ring_region> ring_regions =
             region_ring ?
