@@ -650,7 +650,12 @@ struct llama_model {
     // Empty means use the legacy LLAMA_HYBRID_REGION_RING_LAYOUT setting.
     std::string hybrid_ring_plan_layout;
     std::string hybrid_ring_plan_mode;
+    // Legacy APPLY modes use one common chunk. APPLY_WIDE owns independent
+    // per-device chunks and never re-reads environment values at runtime.
     int hybrid_ring_plan_chunk_tokens = 0;
+    int hybrid_ring_plan_cpu_chunk_tokens = 0;
+    int hybrid_ring_plan_gpu_chunk_tokens = 0;
+    int hybrid_ring_plan_phone_chunk_tokens = 0;
 
     std::vector<llama_layer> layers;
 

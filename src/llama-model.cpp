@@ -1715,8 +1715,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             const auto original = llama_region_ring_from_env(n_layer);
             const bool apply_cgp =
                 hybrid_ring_plan_mode == "APPLY_CGP";
-            const bool ownership_ok = apply_cgp ?
-                (ring_regions.size() == 9 &&
+            const bool apply_wide =
+                hybrid_ring_plan_mode == "APPLY_WIDE";
+            const bool ownership_ok = (apply_cgp || apply_wide) ?
+                ((apply_wide || ring_regions.size() == 9) &&
                  llama_region_ring_apply_topology_compatible(
                      ring_regions, n_layer) &&
                  ring_regions.back().device ==
@@ -1724,7 +1726,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 (llama_region_ring_apply_safe_phone_shape(original) &&
                  llama_region_ring_apply_safe_compatible(
                      original, ring_regions));
-            if (!ownership_ok || hybrid_ring_plan_chunk_tokens != 64) {
+            const bool chunks_ok = apply_wide ?
+                (hybrid_ring_plan_cpu_chunk_tokens > 0 &&
+                 hybrid_ring_plan_gpu_chunk_tokens > 0 &&
+                 hybrid_ring_plan_phone_chunk_tokens > 0) :
+                hybrid_ring_plan_chunk_tokens == 64;
+            if (!ownership_ok || !chunks_ok) {
                 throw std::runtime_error(
                     "Ring selected Plan violates executable topology, "
                     "final-owner or Chunk constraints");
@@ -1734,11 +1741,19 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=%s "
                 "phase=WEIGHT_PLACEMENT applied=1 "
-                "layout=%s original=%s chunk=%d "
+                "layout=%s original=%s XC=%d XG=%d XP=%d "
                 "status=CONSISTENT\n",
                 plan_mode,hybrid_ring_plan_layout.c_str(),
                 llama_region_ring_layout_string(original).c_str(),
-                hybrid_ring_plan_chunk_tokens);
+                apply_wide ?
+                    hybrid_ring_plan_cpu_chunk_tokens :
+                    hybrid_ring_plan_chunk_tokens,
+                apply_wide ?
+                    hybrid_ring_plan_gpu_chunk_tokens :
+                    hybrid_ring_plan_chunk_tokens,
+                apply_wide ?
+                    hybrid_ring_plan_phone_chunk_tokens :
+                    hybrid_ring_plan_chunk_tokens);
         }
         if (region_ring && runtime_plan.tensor_layers != 0) {
             throw std::runtime_error("region ring needs T=0; set LLAMA_HYBRID_FIXED_TENSOR_LAYERS=0");

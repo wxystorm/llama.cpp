@@ -186,7 +186,14 @@ static std::vector<llama_hybrid_runtime_stage> llama_hybrid_build_runtime_stages
 
 static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
         const std::vector<llama_region_ring_region> & regions,
-        int chunk_tokens) {
+        int cpu_chunk_tokens,
+        int gpu_chunk_tokens,
+        int phone_chunk_tokens) {
+    if (cpu_chunk_tokens <= 0 || gpu_chunk_tokens <= 0 ||
+            phone_chunk_tokens <= 0) {
+        throw std::runtime_error(
+            "region ring per-device chunks must be positive");
+    }
     std::vector<llama_hybrid_runtime_stage> stages;
     stages.reserve(regions.size());
     for (const auto & region : regions) {
@@ -196,6 +203,11 @@ static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
             region.device == llama_region_ring_device::GPU ?
                 llama_hybrid_runtime_stage_kind::GPU :
                 llama_hybrid_runtime_stage_kind::PHONE;
+        const int chunk_tokens =
+            region.device == llama_region_ring_device::CPU ?
+                cpu_chunk_tokens :
+            region.device == llama_region_ring_device::GPU ?
+                gpu_chunk_tokens : phone_chunk_tokens;
         stages.push_back({
             kind, region.layer_begin, region.layer_end, chunk_tokens, 0});
     }
@@ -3377,12 +3389,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             pc_phone_overlap ? "MEASURED" : "0");
     }
     const int chunk_tokens = stages.front().macro_tokens;
+    std::vector<int> region_chunk_tokens;
+    region_chunk_tokens.reserve(stages.size());
+    int runtime_xc = 0;
+    int runtime_xg = 0;
+    int runtime_xp = 0;
+    for (const auto & stage : stages) {
+        region_chunk_tokens.push_back(stage.macro_tokens);
+        int * slot =
+            stage.kind == llama_hybrid_runtime_stage_kind::CPU ? &runtime_xc :
+            stage.kind == llama_hybrid_runtime_stage_kind::GPU ? &runtime_xg :
+                                                                  &runtime_xp;
+        if (*slot == 0) {
+            *slot = stage.macro_tokens;
+        } else if (*slot != stage.macro_tokens) {
+            throw std::runtime_error(
+                "region ring requires one chunk size per device");
+        }
+    }
     // Production Region Ring keeps one full-ubatch activation buffer on each
-    // boundary. slot_pool_size=0 disables finite producer credits completely;
-    // explicit non-zero slot pools remain only in scheduler regression tests.
+    // boundary. slot_pool_size=0 disables finite producer credits completely.
     const size_t slot_pool_size = 0;
     llama_region_ring_ready ready(
-        regions, (int) ubatch.n_tokens, chunk_tokens, slot_pool_size);
+        regions, (int) ubatch.n_tokens,
+        region_chunk_tokens, slot_pool_size);
 
     // With no bounded slot pool, each boundary owns storage for the complete
     // ubatch. Producer and consumer tasks address disjoint token intervals
@@ -4146,10 +4176,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
     }
     LLAMA_LOG_ERROR(
-        "[REGION_RING_SUM] tokens=%u chunk_tokens=%d regions=%zu "
-        "chunks=%zu executed=%zu complete=%d wall_ms=%.3f "
-        "embedding_prelude_ms=%.3f mode=%s status=%d\n",
-        ubatch.n_tokens, chunk_tokens, stages.size(), ready.n_chunks(),
+        "[REGION_RING_SUM] tokens=%u XC=%d XG=%d XP=%d regions=%zu "
+        "first_region_chunks=%zu tasks=%zu executed=%zu complete=%d "
+        "wall_ms=%.3f embedding_prelude_ms=%.3f mode=%s status=%d\n",
+        ubatch.n_tokens, runtime_xc, runtime_xg, runtime_xp,
+        stages.size(), ready.n_chunks(), ready.total_tasks(),
         executed, ready.all_done() ? 1 : 0,
         (ggml_time_us() - begin_us) / 1000.0,
         ring_embedding_prelude_us / 1000.0,
@@ -5148,18 +5179,40 @@ int llama_context::decode(const llama_batch & batch_inp) {
             "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, fifo-pc-phone, serial or full");
     }
     int region_ring_chunk_tokens = 128;
+    int region_ring_xc = 0;
+    int region_ring_xg = 0;
+    int region_ring_xp = 0;
     if (region_ring_v1) {
-        if (model.hybrid_ring_plan_chunk_tokens > 0) {
-            // A model loaded with Planner-selected CUDA/CPU weights must not
-            // reinterpret its Stage shape after environment variables change.
-            region_ring_chunk_tokens =
-                model.hybrid_ring_plan_chunk_tokens;
-        } else if (const char * env =
-                std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
-            region_ring_chunk_tokens = std::atoi(env);
-        }
-        if (region_ring_chunk_tokens <= 0) {
-            throw std::runtime_error("region ring chunk tokens must be positive");
+        if (model.hybrid_ring_plan_cpu_chunk_tokens > 0 ||
+                model.hybrid_ring_plan_gpu_chunk_tokens > 0 ||
+                model.hybrid_ring_plan_phone_chunk_tokens > 0) {
+            if (model.hybrid_ring_plan_cpu_chunk_tokens <= 0 ||
+                    model.hybrid_ring_plan_gpu_chunk_tokens <= 0 ||
+                    model.hybrid_ring_plan_phone_chunk_tokens <= 0) {
+                throw std::runtime_error(
+                    "Planner Ring per-device chunks are incomplete");
+            }
+            region_ring_xc =
+                model.hybrid_ring_plan_cpu_chunk_tokens;
+            region_ring_xg =
+                model.hybrid_ring_plan_gpu_chunk_tokens;
+            region_ring_xp =
+                model.hybrid_ring_plan_phone_chunk_tokens;
+        } else {
+            if (model.hybrid_ring_plan_chunk_tokens > 0) {
+                region_ring_chunk_tokens =
+                    model.hybrid_ring_plan_chunk_tokens;
+            } else if (const char * env =
+                    std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+                region_ring_chunk_tokens = std::atoi(env);
+            }
+            if (region_ring_chunk_tokens <= 0) {
+                throw std::runtime_error(
+                    "region ring chunk tokens must be positive");
+            }
+            region_ring_xc = region_ring_chunk_tokens;
+            region_ring_xg = region_ring_chunk_tokens;
+            region_ring_xp = region_ring_chunk_tokens;
         }
     }
     const std::vector<llama_region_ring_region> ring_runtime_regions =
@@ -5172,7 +5225,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
             llama_region_ring_runtime_stages(
-                ring_runtime_regions,region_ring_chunk_tokens) :
+                ring_runtime_regions,
+                region_ring_xc, region_ring_xg, region_ring_xp) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
     if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
@@ -5180,15 +5234,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // KV owner; a split between placement and task routing is fatal.
         const bool apply_cgp =
             model.hybrid_ring_plan_mode == "APPLY_CGP";
-        const bool runtime_shape_ok = apply_cgp ?
-            (ring_runtime_regions.size() == 9 &&
+        const bool apply_wide =
+            model.hybrid_ring_plan_mode == "APPLY_WIDE";
+        const bool runtime_shape_ok = (apply_cgp || apply_wide) ?
+            ((apply_wide || ring_runtime_regions.size() == 9) &&
              llama_region_ring_apply_topology_compatible(
                  ring_runtime_regions, model.hparams.n_layer()) &&
              ring_runtime_regions.back().device ==
                  llama_region_ring_device::PHONE) :
             llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
-        if (!runtime_shape_ok ||
-                region_ring_chunk_tokens != 64 ||
+        const bool chunk_shape_ok = apply_wide ?
+            (region_ring_xc > 0 && region_ring_xg > 0 &&
+             region_ring_xp > 0) :
+            (region_ring_xc == 64 && region_ring_xg == 64 &&
+             region_ring_xp == 64);
+        if (!runtime_shape_ok || !chunk_shape_ok ||
                 model.pc_layer_backends.size() <
                     (size_t) model.hparams.n_layer()) {
             throw std::runtime_error(
@@ -5218,16 +5278,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
-            "layout=%s chunk=%d activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu "
-            "status=CONSISTENT\n",
+            "layout=%s XC=%d XG=%d XP=%d "
+            "activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE "
+            "legacy_slot_pool=%zu status=CONSISTENT\n",
             plan_mode,model.hybrid_ring_plan_layout.c_str(),
-            region_ring_chunk_tokens,LLAMA_REGION_RING_SLOT_POOL_SIZE);
+            region_ring_xc, region_ring_xg, region_ring_xp,
+            LLAMA_REGION_RING_SLOT_POOL_SIZE);
     }
     if (region_ring_v1) {
         LLAMA_LOG_ERROR(
-            "[REGION_RING_PLAN] regions=%zu chunk_tokens=%d "
+            "[REGION_RING_PLAN] regions=%zu XC=%d XG=%d XP=%d "
             "execution=%s status=READY\n",
-            runtime_stages.size(), region_ring_chunk_tokens,
+            runtime_stages.size(),
+            region_ring_xc, region_ring_xg, region_ring_xp,
             ring_exec == "ready" ? "COOPERATIVE_READY_QUEUE" :
             ring_exec == "fifo" ? "DEVICE_FIFO_SIMULATION" :
             ring_exec == "fifo-isolated" ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
