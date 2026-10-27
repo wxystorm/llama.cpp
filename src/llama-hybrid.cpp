@@ -8798,7 +8798,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         g_llama_hybrid_runtime_profile = profile;
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_PROFILE] phase=MEASURED status=CACHED "
-            "cpu=%zu gpu=%zu phone=%zu applied=0\n",
+            "arch=%s is_moe=%d cpu=%zu gpu=%zu phone=%zu applied=0\n",
+            ml.get_arch_name().c_str(), profile.is_moe ? 1 : 0,
             profile.cpu_layer_blocks.size(),
             profile.gpu_layer_blocks.size(),
             profile.phone_layer_blocks.size());
