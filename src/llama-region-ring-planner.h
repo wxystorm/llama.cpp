@@ -537,10 +537,115 @@ inline supported_result search_supported_fixed_phone(
     return result;
 }
 
+// Executable free C/G/P search for the current three-cycle Ring. This keeps
+// Chunk64, the dynamic activation-slot pool, C->G->P ordering and a final
+// Phone owner fixed, but it does NOT preserve P5 or the old CUDA/Phone totals.
+// For a 48-layer model, C+G+P=16 and the current Phone contract allows P2..P8.
+inline result search_three_cycle_cgp(
+        const model & m,
+        const std::vector<llama_region_ring_region> & baseline,
+        int chunk_tokens) {
+    result out;
+    if (m.layers < 9 || m.layers % 3 != 0 || m.tokens <= 0 ||
+            chunk_tokens != 64 ||
+            m.slot_pool != (int) LLAMA_REGION_RING_SLOT_POOL_SIZE ||
+            !m.pc_compute_gate || !m.memory_feasible) {
+        return out;
+    }
+
+    out.baseline.xc = chunk_tokens;
+    out.baseline.xg = chunk_tokens;
+    out.baseline.xp = chunk_tokens;
+    if (!simulate(m, baseline, out.baseline)) {
+        return out;
+    }
+    out.baseline_valid = true;
+
+    const int cycle_width = m.layers / 3;
+    const int max_phone = std::min(8, cycle_width - 2);
+    for (int p = 2; p <= max_phone; ++p) {
+        for (int g = 1; g < cycle_width - p; ++g) {
+            const int c = cycle_width - g - p;
+            if (c < 1) {
+                continue;
+            }
+
+            candidate choice;
+            choice.cycles = 3;
+            choice.c = c;
+            choice.g = g;
+            choice.p = p;
+            choice.tail_c = 0;
+            choice.tail_g = 0;
+            choice.xc = chunk_tokens;
+            choice.xg = chunk_tokens;
+            choice.xp = chunk_tokens;
+            ++out.enumerated;
+
+            if (!m.memory_feasible(choice)) {
+                ++out.rejected_memory;
+                continue;
+            }
+
+            std::vector<llama_region_ring_region> regions;
+            if (!make_regions(choice, m.layers, regions) ||
+                    regions.size() != 9 ||
+                    !llama_region_ring_apply_topology_compatible(
+                        regions, m.layers)) {
+                ++out.rejected_profile;
+                continue;
+            }
+
+            if (!estimate_balance(m, choice)) {
+                ++out.rejected_profile;
+                continue;
+            }
+            ++out.profiled;
+
+            std::string reason;
+            if (!simulate(m, regions, choice, &reason)) {
+                if (reason == "COMPUTE_PROFILE_MISSING" ||
+                        reason == "TRANSFER_PROFILE_MISSING" ||
+                        reason == "INVALID_MODEL" ||
+                        reason == "INVALID_CHUNK") {
+                    ++out.rejected_profile;
+                } else {
+                    ++out.rejected_deadlock;
+                }
+                continue;
+            }
+            ++out.simulated;
+            out.top.push_back(std::move(choice));
+        }
+    }
+
+    std::sort(out.top.begin(), out.top.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
+                return a.wall_ms < b.wall_ms;
+            }
+            if (std::abs(a.balance - b.balance) > 1e-9) {
+                return a.balance < b.balance;
+            }
+            if (a.p != b.p) {
+                return a.p < b.p;
+            }
+            return a.g < b.g;
+        });
+    if (!out.top.empty()) {
+        out.selected = out.top.front();
+        out.valid = true;
+        if (out.top.size() > 5) {
+            out.top.resize(5);
+        }
+    }
+    return out;
+}
+
     
 // Executable general-topology search. Unlike the research-only search(),
-// every candidate uses the same fixed 64-token chunk and 2-slot protocol
-// as the runtime. Different CPU/CUDA/Phone counts and a PC tail are legal.
+// every candidate uses the same fixed 64-token chunk and shared dynamic
+// activation-slot pool as the runtime. Different CPU/CUDA/Phone counts and a PC tail are legal.
 // Coarse filtering keeps measured profiling work bounded; selected candidates
 // must also survive the exact FIFO/KV/slot event simulation.
 inline result search_supported_topology(

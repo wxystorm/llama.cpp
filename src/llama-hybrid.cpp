@@ -8015,6 +8015,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             (std::strcmp(ring_plan_env, "dry-run") == 0 ||
              std::strcmp(ring_plan_env, "apply-baseline") == 0 ||
              std::strcmp(ring_plan_env, "apply-safe") == 0 ||
+             std::strcmp(ring_plan_env, "apply-cgp") == 0 ||
              std::strcmp(ring_plan_env, "topology-preview") == 0)) {
         std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
         g_llama_hybrid_runtime_profile = profile;
@@ -8314,7 +8315,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 static bool llama_hybrid_region_ring_planner_evaluate(
         int tokens, int kv_start, int baseline_chunk,
         std::string * selected_layout, bool topology_preview = false,
-        bool baseline_only = false) {
+        bool baseline_only = false, bool free_cgp = false) {
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
@@ -8471,6 +8472,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.phone_to_pc.size(), model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
         baseline_only ? "APPLY_BASELINE" :
+        free_cgp ? "APPLY_CGP" :
         selected_layout != nullptr ? "APPLY_SAFE" :
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
@@ -8502,20 +8504,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         return result.valid;
     }
     if (selected_layout != nullptr) {
-        // Real APPLY is deliberately narrower than research-mode search:
-        // keep three previously validated Phone P5 windows and the exact
-        // original 64-token Chunk/2-slot protocol, with the same number of
-        // GPU weights. This is a pre-load placement decision, not a runtime
-        // mutation of CUDA allocations or already-registered Phone Graphs.
+        // APPLY_SAFE preserves the previously validated P5 placement.
+        // APPLY_CGP keeps the same three-cycle C->G->P execution contract but
+        // deliberately frees C/G/P lengths before model weight allocation.
         const auto baseline_regions =
             llama_region_ring_from_env(profile.n_layer);
-        if (baseline_chunk != 64 ||
-                !llama_region_ring_apply_safe_phone_shape(baseline_regions)) {
+        const bool baseline_shape_ok = free_cgp ?
+            (baseline_regions.size() == 9 &&
+             llama_region_ring_apply_topology_compatible(
+                 baseline_regions, profile.n_layer)) :
+            llama_region_ring_apply_safe_phone_shape(baseline_regions);
+        if (baseline_chunk != 64 || !baseline_shape_ok) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=%s applied=0 "
-                "reason=UNVALIDATED_PHONE_OR_CHUNK "
+                "reason=UNVALIDATED_TOPOLOGY_OR_CHUNK "
                 "n_layers=%d chunk=%d status=KEEP_BASELINE\n",
-                baseline_only ? "APPLY_BASELINE" : "APPLY_SAFE",
+                baseline_only ? "APPLY_BASELINE" :
+                free_cgp ? "APPLY_CGP" : "APPLY_SAFE",
                 profile.n_layer, baseline_chunk);
             return false;
         }
@@ -8559,6 +8564,137 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 selected_layout->c_str(),baseline_chunk);
             return true;
         }
+
+        if (free_cgp) {
+            if (const char * requested =
+                    std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
+                if (*requested != '\0') {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_REJECT] mode=APPLY_CGP "
+                        "reason=PLAN_LAYOUT_OVERRIDE_FORBIDDEN "
+                        "status=KEEP_BASELINE\n");
+                    return false;
+                }
+            }
+            if (!model.memory_feasible) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=APPLY_CGP "
+                    "reason=NO_MEMORY_PROFILE status=KEEP_BASELINE\n");
+                return false;
+            }
+
+            const auto free_result =
+                llama_ring_planner::search_three_cycle_cgp(
+                    model, baseline_regions, baseline_chunk);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_CGP_SEARCH] "
+                "enumerated=%zu profiled=%zu simulated=%zu "
+                "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
+                "baseline_ms=%.3f valid=%d cycles=3 chunk=%d "
+                "slot_pool=%d assignment=DYNAMIC\n",
+                free_result.enumerated, free_result.profiled,
+                free_result.simulated, free_result.rejected_memory,
+                free_result.rejected_profile, free_result.rejected_deadlock,
+                free_result.baseline_valid ?
+                    free_result.baseline.wall_ms : -1.0,
+                free_result.valid ? 1 : 0, baseline_chunk,
+                model.slot_pool);
+            if (!free_result.valid || !free_result.baseline_valid ||
+                    !(free_result.baseline.wall_ms > 0.0)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_CGP applied=0 "
+                    "reason=NO_SCOREABLE_CGP_LAYOUT "
+                    "status=KEEP_BASELINE\n");
+                return false;
+            }
+
+            for (size_t i = 0; i < free_result.top.size(); ++i) {
+                const auto & c = free_result.top[i];
+                std::vector<llama_region_ring_region> regions;
+                if (!llama_ring_planner::make_regions(
+                        c, model.layers, regions)) {
+                    continue;
+                }
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_CGP_CANDIDATE] rank=%zu "
+                    "layout=%s C=%d G=%d P=%d chunk=%d "
+                    "predicted_ms=%.3f pc_gate_busy_ms=%.3f "
+                    "balance=%.4f\n",
+                    i + 1,
+                    llama_region_ring_layout_string(regions).c_str(),
+                    c.c, c.g, c.p, baseline_chunk,
+                    c.wall_ms, c.pc_gate_busy_ms, c.balance);
+            }
+
+            const auto & best = free_result.selected;
+            std::vector<llama_region_ring_region> best_regions;
+            if (!llama_ring_planner::make_regions(
+                    best, model.layers, best_regions) ||
+                    best_regions.size() != 9 ||
+                    !llama_region_ring_apply_topology_compatible(
+                        best_regions, model.layers) ||
+                    best_regions.back().device !=
+                        llama_region_ring_device::PHONE) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_CGP applied=0 "
+                    "reason=SELECTED_TOPOLOGY_INVALID "
+                    "status=KEEP_BASELINE\n");
+                return false;
+            }
+
+            const double baseline_ms = free_result.baseline.wall_ms;
+            const double improvement_pct =
+                100.0 * (baseline_ms - best.wall_ms) / baseline_ms;
+            double min_gain_pct = 2.0;
+            if (const char * raw = std::getenv(
+                    "LLAMA_HYBRID_REGION_RING_PLAN_MIN_GAIN_PCT")) {
+                char * end = nullptr;
+                const double parsed = std::strtod(raw, &end);
+                if (end != raw && *end == '\0' &&
+                        std::isfinite(parsed) && parsed >= 0.0 &&
+                        parsed <= 50.0) {
+                    min_gain_pct = parsed;
+                }
+            }
+
+            const std::string baseline_text =
+                llama_region_ring_layout_string(baseline_regions);
+            const std::string best_text =
+                llama_region_ring_layout_string(best_regions);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_SELECTED] mode=APPLY_CGP "
+                "source=AUTO_FREE_CGP layout=%s "
+                "baseline_layout=%s C=%d G=%d P=%d "
+                "tokens=%d chunk=%d predicted_ms=%.3f "
+                "baseline_predicted_ms=%.3f gain_pct=%.3f "
+                "required_gain_pct=%.3f status=SUPPORTED\n",
+                best_text.c_str(), baseline_text.c_str(),
+                best.c, best.g, best.p, tokens, baseline_chunk,
+                best.wall_ms, baseline_ms, improvement_pct,
+                min_gain_pct);
+            if (best_text == baseline_text ||
+                    improvement_pct < min_gain_pct) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_APPLY] mode=APPLY_CGP applied=0 "
+                    "reason=%s gain_pct=%.3f status=KEEP_BASELINE\n",
+                    best_text == baseline_text ?
+                        "BASELINE_ALREADY_BEST" :
+                        "GAIN_BELOW_THRESHOLD",
+                    improvement_pct);
+                return false;
+            }
+
+            *selected_layout = best_text;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_CGP "
+                "phase=PRE_MODEL_LOAD selected=1 source=AUTO_FREE_CGP "
+                "layout=%s C=%d G=%d P=%d chunk=%d "
+                "status=AWAIT_MODEL_PLACEMENT\n",
+                selected_layout->c_str(),
+                best.c, best.g, best.p, baseline_chunk);
+            return true;
+        }
+
         const auto layer_bytes = [&profile](int il) -> size_t {
             return profile.layer_weight_bytes.size() ==
                    (size_t) profile.n_layer ?
@@ -8830,4 +8966,12 @@ bool llama_hybrid_region_ring_planner_apply_safe(
         std::string & selected_layout) {
     return llama_hybrid_region_ring_planner_evaluate(
         tokens, kv_start, baseline_chunk, &selected_layout);
+}
+
+bool llama_hybrid_region_ring_planner_apply_cgp(
+        int tokens, int kv_start, int baseline_chunk,
+        std::string & selected_layout) {
+    return llama_hybrid_region_ring_planner_evaluate(
+        tokens, kv_start, baseline_chunk, &selected_layout,
+        false, false, true);
 }

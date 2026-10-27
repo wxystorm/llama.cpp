@@ -1713,13 +1713,21 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
         if (region_ring && !hybrid_ring_plan_layout.empty()) {
             const auto original = llama_region_ring_from_env(n_layer);
-            if (!llama_region_ring_apply_safe_phone_shape(original) ||
-                    !llama_region_ring_apply_safe_compatible(
-                        original,ring_regions) ||
-                    hybrid_ring_plan_chunk_tokens != 64) {
+            const bool apply_cgp =
+                hybrid_ring_plan_mode == "APPLY_CGP";
+            const bool ownership_ok = apply_cgp ?
+                (ring_regions.size() == 9 &&
+                 llama_region_ring_apply_topology_compatible(
+                     ring_regions, n_layer) &&
+                 ring_regions.back().device ==
+                     llama_region_ring_device::PHONE) :
+                (llama_region_ring_apply_safe_phone_shape(original) &&
+                 llama_region_ring_apply_safe_compatible(
+                     original, ring_regions));
+            if (!ownership_ok || hybrid_ring_plan_chunk_tokens != 64) {
                 throw std::runtime_error(
-                    "Ring selected Plan violates fixed Phone, GPU weight "
-                    "or Chunk ownership constraints");
+                    "Ring selected Plan violates executable topology, "
+                    "final-owner or Chunk constraints");
             }
             const char * plan_mode = hybrid_ring_plan_mode.empty() ?
                 "APPLY_SAFE" : hybrid_ring_plan_mode.c_str();

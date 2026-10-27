@@ -4700,7 +4700,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
         // Every executable Stage must match the model's actual weight and
         // KV owner; a split between placement and task routing is fatal.
-        if (!llama_region_ring_apply_safe_phone_shape(ring_runtime_regions) ||
+        const bool apply_cgp =
+            model.hybrid_ring_plan_mode == "APPLY_CGP";
+        const bool runtime_shape_ok = apply_cgp ?
+            (ring_runtime_regions.size() == 9 &&
+             llama_region_ring_apply_topology_compatible(
+                 ring_runtime_regions, model.hparams.n_layer()) &&
+             ring_runtime_regions.back().device ==
+                 llama_region_ring_device::PHONE) :
+            llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
+        if (!runtime_shape_ok ||
                 region_ring_chunk_tokens != 64 ||
                 model.pc_layer_backends.size() <
                     (size_t) model.hparams.n_layer()) {

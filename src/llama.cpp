@@ -392,10 +392,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_apply_baseline =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"apply-baseline") == 0;
+        const bool ring_plan_apply_cgp =
+            ring_planner_env != nullptr &&
+            std::strcmp(ring_planner_env,"apply-cgp") == 0;
         const bool ring_plan_apply_requested =
-            ring_plan_apply_safe || ring_plan_apply_baseline;
+            ring_plan_apply_safe || ring_plan_apply_baseline ||
+            ring_plan_apply_cgp;
         const char * ring_plan_apply_mode =
-            ring_plan_apply_baseline ? "APPLY_BASELINE" : "APPLY_SAFE";
+            ring_plan_apply_baseline ? "APPLY_BASELINE" :
+            ring_plan_apply_cgp ? "APPLY_CGP" : "APPLY_SAFE";
         const bool ring_plan_topology_preview =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"topology-preview") == 0;
@@ -434,6 +439,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                            params.hybrid_target_ctx,
                            params.hybrid_target_ubatch_tokens,
                            ring_plan_apply_baseline ? "APPLY_BASELINE" :
+                           ring_plan_apply_cgp ? "APPLY_CGP" :
                            ring_plan_apply_safe ? "APPLY_SAFE" :
                            ring_plan_topology_preview ? "TOPOLOGY_PREVIEW" :
                            ring_plan_dry_run ? "DRY_RUN" : "OFF");
@@ -530,6 +536,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             std::string selected_layout;
             const bool selected = ring_plan_apply_baseline ?
                 llama_hybrid_region_ring_planner_apply_baseline(
+                    target_tokens, 0, chunk_tokens,selected_layout) :
+                ring_plan_apply_cgp ?
+                llama_hybrid_region_ring_planner_apply_cgp(
                     target_tokens, 0, chunk_tokens,selected_layout) :
                 llama_hybrid_region_ring_planner_apply_safe(
                     target_tokens, 0, chunk_tokens,selected_layout);

@@ -585,6 +585,13 @@ LLAMA_API bool llama_hybrid_region_ring_planner_apply_safe(
     int tokens, int kv_start, int baseline_chunk,
     std::string & selected_layout);
 
+// Three-cycle executable search over C/G/P region lengths. Keeps Chunk64,
+// dynamic slot-pool semantics and final Phone ownership, while allowing the
+// Phone range and aggregate CPU/CUDA/Phone layer counts to change.
+LLAMA_API bool llama_hybrid_region_ring_planner_apply_cgp(
+    int tokens, int kv_start, int baseline_chunk,
+    std::string & selected_layout);
+
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(
     int tokens, int chunk_tokens);

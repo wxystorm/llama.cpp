@@ -31,6 +31,7 @@ static model mock_profile() {
              (double) bytes / (60 * 1024 * 1024) * 1000.0;
         return true;
     };
+    m.memory_feasible = [](const candidate &) { return true; };
     return m;
 }
 
@@ -137,10 +138,42 @@ int main() {
     REQUIRE(general.selected.max_live_slots <= 2);
     REQUIRE(!search_supported_topology(general_profile,128).valid);
 
+    // APPLY_CGP frees exactly the three repeated region lengths while
+    // keeping three C->G->P cycles, Chunk64, the shared dynamic slot pool and
+    // final Phone ownership. For 48 layers: C+G+P=16, P2..P8 => 70 layouts.
+    const auto baseline_regions = llama_region_ring_parse("", 48);
+    model free_cgp_profile = mock_profile();
+    const result free_cgp =
+        search_three_cycle_cgp(free_cgp_profile, baseline_regions, 64);
+    REQUIRE(free_cgp.baseline_valid && free_cgp.valid);
+    REQUIRE(free_cgp.enumerated == 70);
+    REQUIRE(free_cgp.simulated == 70);
+    REQUIRE(free_cgp.top.size() <= 5);
+    REQUIRE(free_cgp.selected.cycles == 3);
+    REQUIRE(free_cgp.selected.tail_c == 0 &&
+            free_cgp.selected.tail_g == 0);
+    REQUIRE(free_cgp.selected.c + free_cgp.selected.g +
+            free_cgp.selected.p == 16);
+    REQUIRE(free_cgp.selected.c >= 1 &&
+            free_cgp.selected.g >= 1 &&
+            free_cgp.selected.p >= 2 &&
+            free_cgp.selected.p <= 8);
+    std::vector<llama_region_ring_region> free_cgp_regions;
+    REQUIRE(make_regions(free_cgp.selected,48,free_cgp_regions));
+    REQUIRE(free_cgp_regions.size() == 9);
+    REQUIRE(free_cgp_regions.back().device == device::PHONE);
+    REQUIRE(llama_region_ring_apply_topology_compatible(
+        free_cgp_regions,48));
+    REQUIRE(!search_three_cycle_cgp(
+        free_cgp_profile, baseline_regions, 128).valid);
+    model cgp_no_memory = mock_profile();
+    cgp_no_memory.memory_feasible = {};
+    REQUIRE(!search_three_cycle_cgp(
+        cgp_no_memory, baseline_regions, 64).valid);
+
     // Runtime APPLY-safe uses a separate constrained search. It may ONLY
     // move the C/G boundaries within the three existing 11-layer PC windows;
     // it must preserve all three Phone P5 regions, CUDA11 total and Chunk64.
-    const auto baseline_regions = llama_region_ring_parse("", 48);
     model apply_profile = mock_profile();
     const supported_result supported =
         search_supported_fixed_phone(apply_profile,baseline_regions,64);
