@@ -378,6 +378,11 @@ extern "C" {
                                                              struct ggml_cgraph * graph);  // returns success
     // Prepare or compute one split of the currently allocated graph. Split ranges are [first_split, last_split).
     GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
+    // Weight-prefetch helper: enqueue only immutable host weights for one split
+    // onto a separate destination backend stream. The caller synchronizes
+    // upload_backend before publishing the Bank as ready.
+    GGML_API enum ggml_status ggml_backend_sched_prepare_split_weights_async(
+        ggml_backend_sched_t sched, int split_id, ggml_backend_t upload_backend);
     GGML_API enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id);
     GGML_API enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched,
                                                                int                  first_split,
