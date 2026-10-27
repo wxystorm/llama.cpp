@@ -1840,7 +1840,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  const llama_hybrid_runtime_stage * stage,
                                                  int32_t                  outputs_override,
                                                  bool                     force_hidden_input,
-                                                 bool                     embedding_only) {
+                                                 bool                     embedding_only,
+                                                 bool                     preserve_weight_cache_on_reset) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -1921,7 +1922,20 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         const int64_t graph_reset_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
         res->reset();
 
-        ggml_backend_sched_reset(sched_use);
+        if (preserve_weight_cache_on_reset &&
+                ggml_backend_sched_get_weight_cache(sched_use)) {
+            ggml_backend_sched_reset_preserve_weight_cache(
+                sched_use);
+            if (stage != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT] event=GRAPH_REBUILD_KEEP_CACHE "
+                    "layers=[%d,%d) tokens=%u status=PRESERVED\n",
+                    stage->layer_begin, stage->layer_end,
+                    ubatch.n_tokens);
+            }
+        } else {
+            ggml_backend_sched_reset(sched_use);
+        }
         ggml_backend_sched_set_eval_callback(sched_use, cparams.cb_eval, cparams.cb_eval_user_data);
         if (log_prepare_breakdown) {
             graph_reset_us = ggml_time_us() - graph_reset_begin_us;
@@ -2349,7 +2363,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         std::unique_lock<std::mutex> *     ring_cuda_gate,
         int64_t *                          ring_prepare_wait_us,
         int64_t *                          ring_cpu_wait_us,
-        int64_t *                          ring_cuda_wait_us) {
+        int64_t *                          ring_cuda_wait_us,
+        bool                               preserve_weight_cache_on_graph_reset) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2413,7 +2428,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     llm_graph_result * result = prepare_ubatch(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
         &stage, task_local_graph_outputs ? block_outputs : -1,
-        stage_input != nullptr, false);
+        stage_input != nullptr, false,
+        preserve_weight_cache_on_graph_reset);
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -3227,9 +3243,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order.push_back(region);
         }
     }
+    const int gpu_prefetch_chunk_tokens =
+        !gpu_region_order.empty() ?
+            stages[gpu_region_order.front()].macro_tokens : 0;
+    const int gpu_prefetch_min_tokens =
+        gpu_prefetch_chunk_tokens > 0 ?
+            2 * gpu_prefetch_chunk_tokens :
+            std::numeric_limits<int>::max();
     const bool gpu_weight_prefetch =
-        gpu_weight_streaming && ubatch.n_tokens > 1 &&
-        gpu_region_order.size() >= 2;
+        gpu_weight_streaming &&
+        gpu_region_order.size() >= 2 &&
+        (int) ubatch.n_tokens >= gpu_prefetch_min_tokens;
     std::array<bool, 2> gpu_bank_prefetched = {false, false};
 
     if (gpu_weight_streaming) {
@@ -3243,8 +3267,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
             "reason=NEW_UBATCH graph_cache=PRESERVED "
-            "region_metadata=CLEARED prefetch_window=%d status=READY\n",
-            gpu_weight_prefetch ? 2 : 0);
+            "region_metadata=CLEARED prefetch_window=%d "
+            "prefetch_min_tokens=%d ubatch_tokens=%u status=READY\n",
+            gpu_weight_prefetch ? 2 : 0,
+            gpu_prefetch_min_tokens,
+            ubatch.n_tokens);
     }
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
@@ -3430,10 +3457,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT] phase=BANK_INIT banks=2 "
                 "canonical=CPU destination=CUDA "
-                "eviction=%s load=%s cache=PERSISTENT "
-                "demand_fallback=1 status=READY\n",
-                gpu_weight_prefetch ? "ROLLING_PARITY" : "LRU",
-                gpu_weight_prefetch ? "LOOKAHEAD_2" : "DEMAND");
+                "eviction=ROLLING_PARITY load=%s cache=PERSISTENT "
+                "prefetch_min_tokens=%d demand_fallback=1 status=READY\n",
+                gpu_weight_prefetch ? "LOOKAHEAD_2" : "DEMAND",
+                gpu_prefetch_min_tokens);
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -4306,7 +4333,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     &cuda_gate : nullptr,
                                 pc_phone_overlap ? &state.prepare_wait_us : nullptr,
                                 pc_phone_overlap ? &state.cpu_wait_us : nullptr,
-                                pc_phone_overlap ? &state.cuda_wait_us : nullptr);
+                                pc_phone_overlap ? &state.cuda_wait_us : nullptr,
+                                dev == 1 && gpu_weight_streaming &&
+                                    gpu_bank_hit);
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
