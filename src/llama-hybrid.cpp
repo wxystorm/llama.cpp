@@ -6343,7 +6343,8 @@ static bool llama_hybrid_profile_moe_ffn_point(
         int                           tokens,
         float                         local_ratio,
         double &                      result_ms,
-        size_t &                      runtime_bytes) {
+        size_t &                      runtime_bytes,
+        double *                      result_prepare_ms = nullptr) {
     if (backend == nullptr || tokens <= 0 || desc.n_embd <= 0 || desc.n_ff_exp <= 0 ||
         desc.n_expert <= 0 || desc.n_expert_used <= 0 || desc.n_expert_used > desc.n_expert) {
         return false;
@@ -6483,6 +6484,9 @@ static bool llama_hybrid_profile_moe_ffn_point(
         llama_hybrid_rpc_get_proc_address(
             backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
     result_ms = is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    if (result_prepare_ms != nullptr) {
+        *result_prepare_ms = timing.prepare_ms;
+    }
     return true;
 }
 
@@ -6653,7 +6657,8 @@ static bool llama_hybrid_profile_moe_router_point(
         const llama_hybrid_moe_desc &  moe_desc,
         ggml_backend_t                 backend,
         int                            tokens,
-        double &                       result_ms);
+        double &                       result_ms,
+        double *                       result_prepare_ms = nullptr);
 
 bool llama_hybrid_profile_moe_ffn(
         llama_hybrid_profile &         profile,
@@ -6853,7 +6858,8 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
                                             int                            tokens,
                                             int                            kv_tokens,
                                             double &                       result_ms,
-                                            size_t &                       runtime_bytes) {
+                                            size_t &                       runtime_bytes,
+                                            double *                       result_prepare_ms = nullptr) {
     if (backend == nullptr || tokens <= 0 || kv_tokens <= 0) {
         return false;
     }
@@ -6997,6 +7003,9 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
 
     const bool is_rpc = llama_hybrid_rpc_get_proc_address(backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
     result_ms         = is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    if (result_prepare_ms != nullptr) {
+        *result_prepare_ms = timing.prepare_ms;
+    }
     return true;
 }
 
@@ -7208,7 +7217,8 @@ static bool llama_hybrid_profile_moe_router_point(
         const llama_hybrid_moe_desc &  moe_desc,
         ggml_backend_t                 backend,
         int                            tokens,
-        double &                       result_ms) {
+        double &                       result_ms,
+        double *                       result_prepare_ms) {
     if (backend == nullptr || tokens <= 0 ||
         moe_desc.n_embd <= 0 || moe_desc.n_expert <= 0 ||
         moe_desc.n_expert_used <= 0 ||
@@ -7300,6 +7310,9 @@ static bool llama_hybrid_profile_moe_router_point(
             backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
     result_ms =
         is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    if (result_prepare_ms != nullptr) {
+        *result_prepare_ms = timing.prepare_ms;
+    }
     return true;
 }
 
@@ -7308,7 +7321,8 @@ static bool llama_hybrid_profile_moe_misc_point(
         const llama_hybrid_moe_desc &  moe_desc,
         ggml_backend_t                 backend,
         int                            tokens,
-        double &                       result_ms) {
+        double &                       result_ms,
+        double *                       result_prepare_ms = nullptr) {
     if (backend == nullptr || tokens <= 0 ||
         moe_desc.n_embd <= 0 ||
         moe_desc.ffn_norm_type < 0 ||
@@ -7371,6 +7385,9 @@ static bool llama_hybrid_profile_moe_misc_point(
             backend, GGML_BACKEND_RPC_FENCE_PROC) != nullptr;
     result_ms =
         is_rpc ? timing.compute_est_ms : timing.wall_ms;
+    if (result_prepare_ms != nullptr) {
+        *result_prepare_ms = timing.prepare_ms;
+    }
     return true;
 }
 
