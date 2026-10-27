@@ -387,6 +387,12 @@ extern "C" {
     // upload_backend before publishing the Bank as ready.
     GGML_API enum ggml_status ggml_backend_sched_prepare_split_weights_async(
         ggml_backend_sched_t sched, int split_id, ggml_backend_t upload_backend);
+    // Same upload, but use staging_owner's pinned ring. Region Ring passes one
+    // shared owner for both GPU Banks because there is one dedicated prefetch
+    // worker and one transfer stream.
+    GGML_API enum ggml_status ggml_backend_sched_prepare_split_weights_staged_async(
+        ggml_backend_sched_t sched, int split_id, ggml_backend_t upload_backend,
+        ggml_backend_sched_t staging_owner);
     GGML_API enum ggml_status ggml_backend_sched_compute_split(ggml_backend_sched_t sched, int split_id);
     GGML_API enum ggml_status ggml_backend_sched_compute_range(ggml_backend_sched_t sched,
                                                                int                  first_split,
