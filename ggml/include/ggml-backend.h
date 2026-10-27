@@ -342,6 +342,18 @@ extern "C" {
     // prepare_split() only waits on the destination backend before copying
     // those immutable inputs. Bit 63 means the source backend is unresolved.
     GGML_API uint64_t       ggml_backend_sched_get_split_prepare_sync_mask(ggml_backend_sched_t sched, int split_id);
+    // Same as prepare_sync_mask, but immutable weight inputs are omitted.
+    // Region Ring uses this to avoid taking the CPU compute gate merely to
+    // read CPU-canonical model weights for CUDA staging.
+    GGML_API uint64_t       ggml_backend_sched_get_split_mutable_sync_mask(ggml_backend_sched_t sched, int split_id);
+
+    // Cache cross-backend weight copies in the Scheduler's destination
+    // allocation. When enabled, weight copies are marked persistent and a
+    // successful first upload is reused until sched_reset() or graph change.
+    GGML_API void           ggml_backend_sched_set_weight_cache(ggml_backend_sched_t sched, bool enabled);
+    GGML_API bool           ggml_backend_sched_get_weight_cache(ggml_backend_sched_t sched);
+    GGML_API size_t         ggml_backend_sched_get_last_weight_upload_bytes(ggml_backend_sched_t sched);
+    GGML_API size_t         ggml_backend_sched_get_last_weight_cache_hit_bytes(ggml_backend_sched_t sched);
     GGML_API int            ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched,

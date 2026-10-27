@@ -952,6 +952,13 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // Optional persistent cache for offloaded immutable weights. Used by the
+    // Region Ring GPU weight banks; disabled for all legacy schedulers.
+    bool weight_cache_enabled = false;
+    std::unordered_set<ggml_tensor *> weight_cache_valid;
+    size_t last_weight_upload_bytes = 0;
+    size_t last_weight_cache_hit_bytes = 0;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1490,9 +1497,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
-                            if (sched->n_copies > 1) {
-                                ggml_set_input(tensor_copy);
-                                ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                            const bool cached_weight =
+                                sched->weight_cache_enabled &&
+                                src->buffer != NULL &&
+                                src->buffer->usage ==
+                                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+                            if (sched->n_copies > 1 || cached_weight) {
+                                // Persistent cached weights must not share
+                                // gallocr storage with later split inputs.
+                                ggml_set_output(tensor_copy);
+                                if (sched->n_copies > 1) {
+                                    ggml_set_input(tensor_copy);
+                                }
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
@@ -1822,11 +1838,24 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     int                               split_backend_id = split->backend_id;
     ggml_backend_t                    split_backend    = sched->backends[split_backend_id];
 
+    sched->last_weight_upload_bytes = 0;
+    sched->last_weight_cache_hit_bytes = 0;
+
     // copy the input tensors to the split backend
     for (int input_id = 0; input_id < split->n_inputs; input_id++) {
         ggml_backend_t       input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
         struct ggml_tensor * input         = split->inputs[input_id];
         struct ggml_tensor * input_cpy     = tensor_copy(input, split_backend_id, sched->cur_copy);
+        const bool immutable_weight =
+            input->buffer != NULL &&
+            ggml_backend_buffer_get_usage(input->buffer) ==
+                GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+        if (sched->weight_cache_enabled && immutable_weight &&
+                sched->weight_cache_valid.find(input_cpy) !=
+                    sched->weight_cache_valid.end()) {
+            sched->last_weight_cache_hit_bytes += ggml_nbytes(input);
+            continue;
+        }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1846,7 +1875,8 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
 
             // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
             ggml_tensor * node = split->graph.nodes[0];
-            if (split->graph.n_nodes > 0 &&
+            if (!sched->weight_cache_enabled &&
+                split->graph.n_nodes > 0 &&
                 ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                 ggml_backend_buffer_is_host(input->buffer) &&
                 ((node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
@@ -1941,6 +1971,11 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                     }
                     ggml_backend_tensor_copy(input, input_cpy);
                 }
+            }
+
+            if (sched->weight_cache_enabled && immutable_weight) {
+                sched->weight_cache_valid.insert(input_cpy);
+                sched->last_weight_upload_bytes += ggml_nbytes(input);
             }
         }
     }
@@ -2159,6 +2194,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    sched->weight_cache_valid.clear();
+    sched->last_weight_upload_bytes = 0;
+    sched->last_weight_cache_hit_bytes = 0;
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -2356,6 +2394,70 @@ uint64_t ggml_backend_sched_get_split_prepare_sync_mask(
         }
     }
     return mask;
+}
+
+uint64_t ggml_backend_sched_get_split_mutable_sync_mask(
+        ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    GGML_ASSERT(sched->n_backends > 0 && sched->n_backends < 64);
+
+    const ggml_backend_sched_split & split = sched->splits[split_id];
+    uint64_t mask = 0;
+    for (int i = 0; i < split.n_inputs; ++i) {
+        ggml_tensor * input = split.inputs[i];
+        if ((input->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+            continue;
+        }
+        if (input->buffer != NULL &&
+                ggml_backend_buffer_get_usage(input->buffer) ==
+                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+        ggml_backend_t src =
+            ggml_backend_sched_get_tensor_backend(sched, input);
+        if (src == nullptr) {
+            mask |= UINT64_C(1) << 63;
+            continue;
+        }
+        const int src_id = ggml_backend_sched_backend_id(sched, src);
+        if (src_id < 0 || src_id >= sched->n_backends) {
+            mask |= UINT64_C(1) << 63;
+        } else {
+            mask |= UINT64_C(1) << src_id;
+        }
+    }
+    return mask;
+}
+
+void ggml_backend_sched_set_weight_cache(
+        ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched);
+    if (sched->weight_cache_enabled == enabled) {
+        return;
+    }
+    sched->weight_cache_enabled = enabled;
+    sched->weight_cache_valid.clear();
+    sched->last_weight_upload_bytes = 0;
+    sched->last_weight_cache_hit_bytes = 0;
+}
+
+bool ggml_backend_sched_get_weight_cache(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->weight_cache_enabled;
+}
+
+size_t ggml_backend_sched_get_last_weight_upload_bytes(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->last_weight_upload_bytes;
+}
+
+size_t ggml_backend_sched_get_last_weight_cache_hit_bytes(
+        ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->last_weight_cache_hit_bytes;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
