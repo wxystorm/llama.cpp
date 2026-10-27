@@ -3925,6 +3925,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         task_res = selected.res.get();
                         gpu_bank = (int) selected_bank - 1;
 
+                        const std::string evicted_region_text =
+                            evicted_region ==
+                                std::numeric_limits<size_t>::max() ?
+                                "NONE" : std::to_string(evicted_region);
                         LLAMA_LOG_ERROR(
                             "[REGION_RING_GPU_WEIGHT] event=BANK_SELECT "
                             "region=%zu chunk=%zu bank=%c cache=%s "
@@ -3932,11 +3936,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             task.region, task.chunk,
                             gpu_bank == 0 ? 'A' : 'B',
                             gpu_bank_hit ? "HIT" : "MISS",
-                            evicted_region ==
-                                std::numeric_limits<size_t>::max() ?
-                                "NONE" :
-                                std::to_string(
-                                    evicted_region).c_str());
+                            evicted_region_text.c_str());
                     }
 
                     ggml_status task_status = GGML_STATUS_SUCCESS;
@@ -8274,6 +8274,7 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
         // backend; unsupported ops are caught by the strict-backend guard.
         if (il >= 0 &&
             model.hybrid_ring_gpu_weight_streaming &&
+            ggml_backend_sched_get_weight_cache(sched_use) &&
             model.hybrid_layer_mode(il) ==
                 llama_hybrid_layer_mode::PC_ONLY &&
             il < (int) model.pc_layer_backends.size() &&
