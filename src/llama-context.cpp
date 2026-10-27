@@ -2403,72 +2403,131 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
 
-    // A GPU Scheduler must retain CPU as its final backend because that is a
-    // hard ggml_backend_sched_new() contract. For strict GPU Regions, reject
-    // any graph whose actual compute split targets that CPU fallback. This is
-    // checked after graph allocation/splitting but BEFORE compute.
+    // A GPU Scheduler retains CPU as its final fallback backend. GPU-first
+    // Region Ring has one intentional exception to CUDA-only compute: stage 0
+    // may start with a CPU embedding split because Q4_K GET_ROWS is not
+    // supported by CUDA. Only the exact CPU-prefix -> CUDA pattern is legal.
+    int split_backend_count = 0;
+    ggml_backend_t local_cpu = nullptr;
+    if (split_backend_gates) {
+        split_backend_count = ggml_backend_sched_get_n_backends(sched_use);
+        if (split_backend_count <= 0 || split_backend_count >= 64) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
+                "backends=%d status=REJECT reason=INVALID_BACKEND_COUNT\n",
+                stage_index, block_index, ring_lane, split_backend_count);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        local_cpu = ggml_backend_sched_get_backend(
+            sched_use, split_backend_count - 1);
+        if (ggml_backend_dev_type(ggml_backend_get_device(local_cpu)) !=
+                GGML_BACKEND_DEVICE_TYPE_CPU) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
+                "status=REJECT reason=CPU_SENTINEL_MISSING\n",
+                stage_index, block_index, ring_lane);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+
+    bool gpu_cpu_embedding_prefix = false;
     if (strict_compute_backend != nullptr) {
+        bool strict_ok = true;
         for (int split = 0; split < n_splits; ++split) {
             ggml_backend_t target =
                 ggml_backend_sched_get_split_backend(sched_use, split);
-            if (target != strict_compute_backend) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
-                    "split=%d/%d expected=%s actual=%s "
-                    "status=REJECT reason=COMPUTE_BACKEND_FALLBACK\n",
-                    stage_index, block_index, split, n_splits,
-                    ggml_backend_name(strict_compute_backend),
-                    target ? ggml_backend_name(target) : "NULL");
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
+            if (target == strict_compute_backend) {
+                continue;
             }
+
+            const bool allowed_embedding_prefix =
+                split_backend_gates &&
+                ring_lane == 1 &&
+                stage_index == 0 &&
+                stage.layer_begin == 0 &&
+                n_splits == 2 &&
+                split == 0 &&
+                target == local_cpu &&
+                ggml_backend_sched_get_split_backend(sched_use, 1) ==
+                    strict_compute_backend;
+            if (allowed_embedding_prefix) {
+                gpu_cpu_embedding_prefix = true;
+                continue;
+            }
+
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
+                "split=%d/%d expected=%s actual=%s "
+                "status=REJECT reason=COMPUTE_BACKEND_FALLBACK\n",
+                stage_index, block_index, split, n_splits,
+                ggml_backend_name(strict_compute_backend),
+                target ? ggml_backend_name(target) : "NULL");
+            strict_ok = false;
+            break;
         }
-        LLAMA_LOG_ERROR(
-            "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
-            "splits=%d compute=%s status=PASS\n",
-            stage_index, block_index, n_splits,
-            ggml_backend_name(strict_compute_backend));
+        if (!strict_ok) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (gpu_cpu_embedding_prefix) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_PREFIX] stage=%zu block=%zu "
+                "splits=2 prefix=CPU_EMBEDDING main=CUDA "
+                "status=ALLOWED\n",
+                stage_index, block_index);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
+                "splits=%d compute=%s status=PASS\n",
+                stage_index, block_index, n_splits,
+                ggml_backend_name(strict_compute_backend));
+        }
     }
 
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     bool graph_already_synchronized = false;
     if (split_backend_gates) {
-        // Current Region Ring contract has one compute split per Region task.
-        // Keeping that invariant lets us prepare the split while shared
-        // scheduler/input state is protected, then release the short prepare
-        // gate before the long backend compute.
-        if (n_splits != 1) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-                "splits=%d status=REJECT reason=MULTI_SPLIT_UNVALIDATED\n",
-                stage_index, block_index, ring_lane, n_splits);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        ggml_backend_t target =
-            ggml_backend_sched_get_split_backend(sched_use, 0);
-        if (ring_lane == 0 &&
-                target != ggml_backend_sched_get_backend(sched_use, 0)) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GATE] stage=%zu block=%zu lane=CPU "
-                "actual=%s status=REJECT reason=CPU_TARGET_MISMATCH\n",
-                stage_index, block_index,
-                target ? ggml_backend_name(target) : "NULL");
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        if (ring_lane == 2) {
-            const int n_backends =
-                ggml_backend_sched_get_n_backends(sched_use);
-            if (n_backends != 3 || !ggml_backend_is_meta(target) ||
+        if (ring_lane == 0) {
+            if (n_splits != 1 ||
+                    ggml_backend_sched_get_split_backend(sched_use, 0) !=
+                        ggml_backend_sched_get_backend(sched_use, 0)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GATE] stage=%zu block=%zu lane=CPU "
+                    "splits=%d status=REJECT reason=CPU_TARGET_MISMATCH\n",
+                    stage_index, block_index, n_splits);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        } else if (ring_lane == 1) {
+            if (n_splits != 1 && !gpu_cpu_embedding_prefix) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GATE] stage=%zu block=%zu lane=GPU "
+                    "splits=%d status=REJECT reason=MULTI_SPLIT_UNVALIDATED\n",
+                    stage_index, block_index, n_splits);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        } else if (ring_lane == 2) {
+            if (n_splits != 1) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
+                    "event=REJECT reason=UNSUPPORTED_PHONE_SPLIT "
+                    "splits=%d\n",
+                    stage_index, block_index, n_splits);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_t target =
+                ggml_backend_sched_get_split_backend(sched_use, 0);
+            if (split_backend_count != 3 || !ggml_backend_is_meta(target) ||
                     target != ggml_backend_sched_get_backend(sched_use, 0)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
                     "event=REJECT reason=UNSUPPORTED_PHONE_SPLIT "
                     "backends=%d target=%s\n",
-                    stage_index, block_index, n_backends,
+                    stage_index, block_index, split_backend_count,
                     target ? ggml_backend_name(target) : "NULL");
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
@@ -2477,7 +2536,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 ggml_backend_sched_get_split_resource_mask(sched_use, 0);
             const uint64_t permitted =
                 (UINT64_C(1) << 0) |
-                (UINT64_C(1) << (n_backends - 1));
+                (UINT64_C(1) << (split_backend_count - 1));
             if ((mask & ~permitted) != 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
@@ -2489,131 +2548,140 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
         }
 
-        const int n_backends =
-            ggml_backend_sched_get_n_backends(sched_use);
-        if (n_backends <= 0 || n_backends >= 64) {
-            LLAMA_LOG_ERROR(
+        const int cpu_backend_index = split_backend_count - 1;
+        const uint64_t cpu_bit = UINT64_C(1) << cpu_backend_index;
+
+        // prepare_ubatch() above entered with PREPARE held. Every split below
+        // follows CPU -> CUDA -> PREPARE lock order. Stage-0 GPU work may use
+        // CPU only for the embedding prefix; later CPU and CUDA Region work can
+        // still overlap once that short prefix/staging section has drained.
+        if (ring_prepare_gate->owns_lock()) {
+            ring_prepare_gate->unlock();
+        }
+
+        bool all_splits_synchronized = true;
+        for (int split = 0; split < n_splits; ++split) {
+            ggml_backend_t target =
+                ggml_backend_sched_get_split_backend(sched_use, split);
+            const bool target_is_cpu = target == local_cpu;
+            const bool target_is_cuda =
+                ring_lane == 1 && target == strict_compute_backend;
+
+            const uint64_t prepare_sync_mask =
+                ggml_backend_sched_get_split_prepare_sync_mask(
+                    sched_use, split);
+            if ((prepare_sync_mask >> 63) != 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
+                    "lane=%d split=%d/%d sync_mask=0x%016" PRIx64
+                    " status=REJECT reason=UNRESOLVED_SOURCE_BACKEND\n",
+                    stage_index, block_index, ring_lane, split, n_splits,
+                    prepare_sync_mask);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            const bool prepare_needs_cpu =
+                (prepare_sync_mask & cpu_bit) != 0;
+
+            if (target_is_cpu || prepare_needs_cpu) {
+                const int64_t wait_begin_us = ggml_time_us();
+                ring_cpu_gate->lock();
+                if (ring_cpu_wait_us != nullptr) {
+                    *ring_cpu_wait_us += ggml_time_us() - wait_begin_us;
+                }
+            }
+            if (target_is_cuda) {
+                const int64_t wait_begin_us = ggml_time_us();
+                ring_cuda_gate->lock();
+                if (ring_cuda_wait_us != nullptr) {
+                    *ring_cuda_wait_us += ggml_time_us() - wait_begin_us;
+                }
+            }
+
+            {
+                const int64_t wait_begin_us = ggml_time_us();
+                ring_prepare_gate->lock();
+                if (ring_prepare_wait_us != nullptr) {
+                    *ring_prepare_wait_us += ggml_time_us() - wait_begin_us;
+                }
+            }
+
+            if (block_index == 0 || prepare_needs_cpu ||
+                    gpu_cpu_embedding_prefix) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
+                    "lane=%d split=%d/%d backend=%s "
+                    "sync_mask=0x%016" PRIx64 " cpu_required=%d "
+                    "status=READY\n",
+                    stage_index, block_index, ring_lane, split, n_splits,
+                    target ? ggml_backend_name(target) : "NULL",
+                    prepare_sync_mask, prepare_needs_cpu ? 1 : 0);
+            }
+
+            ret = ggml_backend_sched_prepare_split(sched_use, split);
+            if (ret != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
+                    "split=%d/%d event=FAIL reason=SPLIT_PREPARE "
+                    "status=%d\n",
+                    stage_index, block_index, ring_lane, split, n_splits,
+                    (int) ret);
+                return nullptr;
+            }
+
+            ring_prepare_gate->unlock();
+            if (!target_is_cpu && ring_cpu_gate->owns_lock()) {
+                ring_cpu_gate->unlock();
+            }
+
+            const bool main_lane_split =
+                ring_lane == 0 ? target_is_cpu :
+                ring_lane == 1 ? target_is_cuda :
+                true;
+            const int64_t lane_begin_us = ggml_time_us();
+            if (main_lane_split && lane_compute_begin_us != nullptr &&
+                    *lane_compute_begin_us == 0) {
+                *lane_compute_begin_us = lane_begin_us;
+            }
+
+            LLAMA_LOG_DEBUG(
                 "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-                "backends=%d status=REJECT reason=INVALID_BACKEND_COUNT\n",
-                stage_index, block_index, ring_lane, n_backends);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
+                "split=%d/%d event=COMPUTE_BEGIN backend=%s\n",
+                stage_index, block_index, ring_lane, split, n_splits,
+                target ? ggml_backend_name(target) : "NULL");
 
-        const uint64_t prepare_sync_mask =
-            ggml_backend_sched_get_split_prepare_sync_mask(sched_use, 0);
-        if ((prepare_sync_mask >> 63) != 0) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
-                "sync_mask=0x%016" PRIx64 " status=REJECT "
-                "reason=UNRESOLVED_SOURCE_BACKEND\n",
-                stage_index, block_index, ring_lane, prepare_sync_mask);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        const int cpu_backend_index = n_backends - 1;
-        ggml_backend_t local_cpu =
-            ggml_backend_sched_get_backend(sched_use, cpu_backend_index);
-        const bool cpu_is_last =
-            ggml_backend_dev_type(
-                ggml_backend_get_device(local_cpu)) ==
-                GGML_BACKEND_DEVICE_TYPE_CPU;
-        const uint64_t cpu_bit =
-            UINT64_C(1) << cpu_backend_index;
-        const bool prepare_needs_cpu =
-            (prepare_sync_mask & cpu_bit) != 0;
-        if (!cpu_is_last) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
-                "status=REJECT reason=CPU_SENTINEL_MISSING\n",
-                stage_index, block_index, ring_lane);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        // Phase A (prepare_ubatch above) ran with PREPARE only. Drop PREPARE
-        // before acquiring backend locks so every path that needs CPU follows
-        // CPU -> CUDA -> PREPARE and cannot deadlock with the CPU worker.
-        ring_prepare_gate->unlock();
-
-        if (ring_lane == 0 || prepare_needs_cpu) {
-            const int64_t wait_begin_us = ggml_time_us();
-            ring_cpu_gate->lock();
-            if (ring_cpu_wait_us != nullptr) {
-                *ring_cpu_wait_us += ggml_time_us() - wait_begin_us;
+            ret = ggml_backend_sched_compute_split(sched_use, split);
+            if (ret == GGML_STATUS_SUCCESS) {
+                ggml_backend_synchronize(target);
+            } else {
+                all_splits_synchronized = false;
             }
-        }
-        if (ring_lane == 1) {
-            const int64_t wait_begin_us = ggml_time_us();
-            ring_cuda_gate->lock();
-            if (ring_cuda_wait_us != nullptr) {
-                *ring_cuda_wait_us += ggml_time_us() - wait_begin_us;
+
+            const int64_t lane_end_us = ggml_time_us();
+            if (main_lane_split && lane_compute_end_us != nullptr) {
+                *lane_compute_end_us = lane_end_us;
             }
-        }
 
-        {
-            const int64_t wait_begin_us = ggml_time_us();
-            ring_prepare_gate->lock();
-            if (ring_prepare_wait_us != nullptr) {
-                *ring_prepare_wait_us += ggml_time_us() - wait_begin_us;
-            }
-        }
-
-        if (block_index == 0 || prepare_needs_cpu) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu lane=%d "
-                "sync_mask=0x%016" PRIx64 " cpu_required=%d "
-                "status=READY\n",
-                stage_index, block_index, ring_lane,
-                prepare_sync_mask, prepare_needs_cpu ? 1 : 0);
-        }
-
-        ret = ggml_backend_sched_prepare_split(sched_use, 0);
-        if (ret != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-                "event=FAIL reason=SPLIT_PREPARE status=%d\n",
-                stage_index, block_index, ring_lane, (int) ret);
-            return nullptr;
-        }
+                "split=%d/%d event=COMPUTE_END backend=%s "
+                "dur_ms=%.3f status=%d\n",
+                stage_index, block_index, ring_lane, split, n_splits,
+                target ? ggml_backend_name(target) : "NULL",
+                (lane_end_us - lane_begin_us) / 1000.0, (int) ret);
 
-        // Split staging is finished. PREPARE is always short-lived. GPU/Phone
-        // release a temporary CPU staging lock immediately; CPU keeps its own
-        // execution gate through compute+sync.
-        ring_prepare_gate->unlock();
-        if (ring_lane != 0 && ring_cpu_gate->owns_lock()) {
-            ring_cpu_gate->unlock();
-        }
+            if (target_is_cuda && ring_cuda_gate->owns_lock()) {
+                ring_cuda_gate->unlock();
+            }
+            if (target_is_cpu && ring_cpu_gate->owns_lock()) {
+                ring_cpu_gate->unlock();
+            }
 
-        const int64_t lane_begin_us = ggml_time_us();
-        if (lane_compute_begin_us != nullptr) {
-            *lane_compute_begin_us = lane_begin_us;
+            if (ret != GGML_STATUS_SUCCESS) {
+                return nullptr;
+            }
         }
-        LLAMA_LOG_DEBUG(
-            "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-            "event=COMPUTE_BEGIN backend=%s\n",
-            stage_index, block_index, ring_lane,
-            target ? ggml_backend_name(target) : "NULL");
-
-        ret = ggml_backend_sched_compute_split(sched_use, 0);
-        if (ret == GGML_STATUS_SUCCESS) {
-            // Synchronize only the backend that actually computed this split.
-            // Never synchronize the full GPU Scheduler here: its CPU sentinel
-            // may be busy executing the independent CPU lane.
-            ggml_backend_synchronize(target);
-            graph_already_synchronized = true;
-        }
-        const int64_t lane_end_us = ggml_time_us();
-        if (lane_compute_end_us != nullptr) {
-            *lane_compute_end_us = lane_end_us;
-        }
-        LLAMA_LOG_DEBUG(
-            "[REGION_RING_GATE] stage=%zu block=%zu lane=%d "
-            "event=COMPUTE_END backend=%s dur_ms=%.3f status=%d\n",
-            stage_index, block_index, ring_lane,
-            target ? ggml_backend_name(target) : "NULL",
-            (lane_end_us - lane_begin_us) / 1000.0, (int) ret);
+        graph_already_synchronized = all_splits_synchronized;
     } else if (pc_phone_overlap) {
         // Compatibility fallback for callers not yet using split backend gates.
         ret = ggml_backend_sched_compute_range(sched_use, 0, n_splits);

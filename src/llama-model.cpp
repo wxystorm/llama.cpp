@@ -2119,28 +2119,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // GPU-first Region Ring needs the token-embedding/input graph on CUDA as
-    // well. Otherwise the first Region is split CPU(input embedding)->CUDA,
-    // violating the strict one-compute-backend Ring contract.
-    const bool region_ring_gpu_first =
-        llama_region_ring_enabled() &&
-        !pc_layer_backends.empty() &&
-        pc_layer_backends.front() == llama_pc_layer_backend::CUDA;
-    if (region_ring_gpu_first) {
-        if (cuda_dev == nullptr) {
-            throw std::runtime_error(
-                "GPU-first Region Ring requires CUDA0 for the input layer");
-        }
-        pimpl->dev_input = {
-            cuda_dev,
-            &pimpl->gpu_buft_list.at(cuda_dev)
-        };
+    // Keep token embeddings on CPU. Q4_K token_embd.weight requires
+    // GGML_OP_GET_ROWS, which CUDA does not support for Q4_K. GPU-first Ring
+    // therefore uses a short CPU embedding prelude and transfers only the
+    // resulting hidden activation into the first CUDA Region.
+    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    if (llama_region_ring_enabled() &&
+            !pc_layer_backends.empty() &&
+            pc_layer_backends.front() == llama_pc_layer_backend::CUDA) {
         LLAMA_LOG_ERROR(
-            "[REGION_RING_INPUT_PLACEMENT] backend=CUDA "
-            "reason=GPU_FIRST_SINGLE_SPLIT status=READY\n");
-    } else {
-        // Upstream llama.cpp default: input embedding stays on CPU.
-        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+            "[REGION_RING_INPUT_PLACEMENT] backend=CPU "
+            "reason=Q4K_GET_ROWS_CPU_PREFIX next=CUDA status=READY\n");
     }
 
     // assign the repeating layers to the devices according to the splits
