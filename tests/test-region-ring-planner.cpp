@@ -359,10 +359,33 @@ int main() {
         REQUIRE(value_result.shortlisted == value_result.simulated);
         REQUIRE(value_result.simulated > 16);
         REQUIRE(value_result.selected.ring_error_max <=
-                value_result.coarse_e_limit + 1e-12);
+                value_result.shortlist_e_limit + 1e-12);
         REQUIRE(std::fabs(
             value_result.coarse_e_limit -
             std::min(1.0, value_result.coarse_e_min + 0.50)) < 1e-12);
+
+        // A narrow E window must not starve the full-prompt simulator.
+        // Keep all natural E-window candidates, then extend the E-sorted
+        // prefix to the requested floor without reintroducing a hard cap.
+        const result floor_result = search_runtime_applicable(
+            value_profile, value_baseline, 64, 1, 0.0, 64);
+        REQUIRE(floor_result.valid);
+        REQUIRE(floor_result.shortlisted == floor_result.simulated);
+        const size_t expected_floor =
+            std::min<size_t>(floor_result.profiled, 64);
+        REQUIRE(floor_result.shortlisted >= expected_floor);
+        REQUIRE(floor_result.shortlisted >=
+                floor_result.e_window_shortlisted);
+        if (floor_result.e_window_shortlisted < expected_floor) {
+            REQUIRE(floor_result.shortlisted == expected_floor);
+            REQUIRE(floor_result.shortlist_e_limit + 1e-12 >=
+                    floor_result.coarse_e_limit);
+        } else {
+            REQUIRE(floor_result.shortlisted ==
+                    floor_result.e_window_shortlisted);
+        }
+        REQUIRE(floor_result.selected.ring_error_max <=
+                floor_result.shortlist_e_limit + 1e-12);
     }
 
     // APPLY_WIDE may change cycle count and independent chunks, but every
