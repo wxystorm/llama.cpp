@@ -350,8 +350,9 @@ extern "C" {
     GGML_API uint64_t       ggml_backend_sched_get_split_mutable_sync_mask(ggml_backend_sched_t sched, int split_id);
 
     // Cache cross-backend weight copies in the Scheduler's destination
-    // allocation. When enabled, weight copies are marked persistent and a
-    // successful first upload is reused until sched_reset() or graph change.
+    // allocation. When enabled, weight copies are marked persistent. A normal
+    // sched_reset() clears the cache; reset_preserve_weight_cache() rebuilds
+    // transient graph state while retaining canonical-weight -> Bank offsets.
     GGML_API void           ggml_backend_sched_set_weight_cache(ggml_backend_sched_t sched, bool enabled);
     GGML_API bool           ggml_backend_sched_get_weight_cache(ggml_backend_sched_t sched);
     GGML_API size_t         ggml_backend_sched_get_last_weight_upload_bytes(ggml_backend_sched_t sched);
@@ -390,6 +391,9 @@ extern "C" {
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
+    // Weight-cache schedulers may rebuild graph metadata for a new token shape
+    // while retaining already uploaded immutable weights in persistent arenas.
+    GGML_API void                 ggml_backend_sched_reset_preserve_weight_cache(ggml_backend_sched_t sched);
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
