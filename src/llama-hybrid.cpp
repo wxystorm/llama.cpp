@@ -574,41 +574,81 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
     // this synthetic graph through the scheduler, keep prepare_ms at zero
     // rather than breaking the existing compute profile.
     {
-        ggml_backend_t prepare_backends[] = { backend };
-        ggml_backend_buffer_type_t prepare_bufts[] = {
-            ggml_backend_get_default_buffer_type(backend)
+        // ggml_backend_sched_new() requires the final backend to be CPU.
+        // Synthetic profile graphs are allocated on the target backend, so
+        // non-CPU probes only need a CPU fallback to satisfy the scheduler
+        // invariant; scheduler construction stays outside the timed interval.
+        ggml_backend_ptr prepare_cpu_backend;
+        std::array<ggml_backend_t, 2> prepare_backends = {
+            backend, nullptr
         };
-        const size_t graph_capacity = std::max<size_t>(
-            64, (size_t) graph->n_nodes + (size_t) graph->n_leafs + 32);
-        ggml_backend_sched_ptr prepare_sched(
-            ggml_backend_sched_new(
-                prepare_backends, prepare_bufts, 1,
-                graph_capacity, false, false));
-        if (prepare_sched) {
-            const int64_t prepare_begin_us = ggml_time_us();
-            bool prepare_ok =
-                ggml_backend_sched_alloc_graph(prepare_sched.get(), graph);
-            if (prepare_ok) {
-                const int n_splits =
-                    ggml_backend_sched_get_n_splits(prepare_sched.get());
-                for (int split = 0; split < n_splits; ++split) {
-                    if (ggml_backend_sched_prepare_split(
-                            prepare_sched.get(), split) !=
-                            GGML_STATUS_SUCCESS) {
-                        prepare_ok = false;
-                        break;
-                    }
-                }
-            }
-            ggml_backend_sched_synchronize(prepare_sched.get());
-            const int64_t prepare_end_us = ggml_time_us();
-            if (prepare_ok) {
-                result.prepare_ms =
-                    (prepare_end_us - prepare_begin_us) / 1000.0;
+        std::array<ggml_backend_buffer_type_t, 2> prepare_bufts = {
+            ggml_backend_get_default_buffer_type(backend), nullptr
+        };
+        int prepare_n_backends = 1;
+
+        const bool prepare_target_is_cpu =
+            ggml_backend_dev_type(
+                ggml_backend_get_device(backend)) ==
+            GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (!prepare_target_is_cpu) {
+            prepare_cpu_backend.reset(
+                ggml_backend_init_by_type(
+                    GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+            if (prepare_cpu_backend) {
+                prepare_backends[1] = prepare_cpu_backend.get();
+                prepare_bufts[1] =
+                    ggml_backend_get_default_buffer_type(
+                        prepare_cpu_backend.get());
+                prepare_n_backends = 2;
             } else {
                 LLAMA_LOG_DEBUG(
-                    "[HYBRID_PROFILE_PREPARE] backend=%s status=SKIP\n",
+                    "[HYBRID_PROFILE_PREPARE] backend=%s "
+                    "status=SKIP reason=CPU_FALLBACK_INIT_FAILED\n",
                     ggml_backend_name(backend));
+            }
+        }
+
+        if (prepare_target_is_cpu || prepare_n_backends == 2) {
+            const size_t graph_capacity = std::max<size_t>(
+                64,
+                (size_t) graph->n_nodes +
+                    (size_t) graph->n_leafs + 32);
+            ggml_backend_sched_ptr prepare_sched(
+                ggml_backend_sched_new(
+                    prepare_backends.data(),
+                    prepare_bufts.data(),
+                    prepare_n_backends,
+                    graph_capacity, false, false));
+            if (prepare_sched) {
+                const int64_t prepare_begin_us = ggml_time_us();
+                bool prepare_ok =
+                    ggml_backend_sched_alloc_graph(
+                        prepare_sched.get(), graph);
+                if (prepare_ok) {
+                    const int n_splits =
+                        ggml_backend_sched_get_n_splits(
+                            prepare_sched.get());
+                    for (int split = 0; split < n_splits; ++split) {
+                        if (ggml_backend_sched_prepare_split(
+                                prepare_sched.get(), split) !=
+                                GGML_STATUS_SUCCESS) {
+                            prepare_ok = false;
+                            break;
+                        }
+                    }
+                }
+                ggml_backend_sched_synchronize(prepare_sched.get());
+                const int64_t prepare_end_us = ggml_time_us();
+                if (prepare_ok) {
+                    result.prepare_ms =
+                        (prepare_end_us - prepare_begin_us) / 1000.0;
+                } else {
+                    LLAMA_LOG_DEBUG(
+                        "[HYBRID_PROFILE_PREPARE] backend=%s "
+                        "status=SKIP\n",
+                        ggml_backend_name(backend));
+                }
             }
         }
     }
