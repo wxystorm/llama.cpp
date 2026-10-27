@@ -539,6 +539,11 @@ private:
     std::array<region_ring_worker_resource, 3> region_ring_worker_resources;
     uint64_t region_ring_gpu_weight_bank_epoch = 0;
 
+    // Same physical CUDA device as the Region Ring GPU compute backend, but a
+    // separate backend context/stream owned only by the CPU weight-prefetch
+    // worker. It never participates in graph scheduling.
+    ggml_backend_ptr region_ring_cuda_transfer_backend;
+
     // Threaded Region Ring lock hierarchy:
     //   phase A: PREPARE gate only for graph/scheduler mutation
     //   phase B: if prepare_split() may synchronize a non-INPUT CPU producer,
