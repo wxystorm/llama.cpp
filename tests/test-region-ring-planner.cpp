@@ -58,6 +58,22 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
+    // Simplified full-prompt prepare model: every claimed task queues on one
+    // shared PREPARE lane before entering its independent device compute lane.
+    model prepared = mock_profile();
+    prepared.prepare_ms =
+        [](device, int, int, int, double & ms) {
+            ms = 1.0;
+            return true;
+        };
+    candidate prepared_uniform = uniform;
+    REQUIRE(simulate(
+        prepared, regions, prepared_uniform, &reason));
+    REQUIRE(std::fabs(
+        prepared_uniform.prepare_busy_ms -
+        (double) prepared_uniform.tasks) < 1e-9);
+    REQUIRE(prepared_uniform.wall_ms + 1e-9 >= uniform.wall_ms);
+
     // Handwritten G->C->P minimax equations. Construct A=4, B=4, D=3,
     // TP2G=1, TC2P=1 and TG2C=0.1 ms/token. Then e1=0,
     // e2=0.1/4.1, e3=2/5 and E=0.4.
@@ -249,6 +265,11 @@ int main() {
                 ms = (double) bytes / 1000.0;
                 return true;
             };
+        streamed.prepare_ms =
+            [](device d, int, int, int, double & ms) {
+                ms = d == device::GPU ? 2.0 : 0.5;
+                return true;
+            };
 
         candidate streamed_plan;
         streamed_plan.cycles = 4;
@@ -284,6 +305,11 @@ int main() {
             streamed_plan.weight_h2d_busy_ms -
             expected_h2d) < 1e-9);
         REQUIRE(streamed_plan.weight_h2d_startup_ms > 0.0);
+        // Four logical GPU Regions each pay one 2 ms prefetch prepare.
+        REQUIRE(std::fabs(
+            streamed_plan.weight_prepare_busy_ms - 8.0) < 1e-9);
+        REQUIRE(streamed_plan.prepare_busy_ms + 1e-9 >=
+                streamed_plan.weight_prepare_busy_ms);
         REQUIRE(streamed_plan.weight_h2d_exposed_ms + 1e-9 >=
                 streamed_plan.weight_h2d_startup_ms);
         REQUIRE(streamed_plan.weight_h2d_hidden_ms >= 0.0);
@@ -292,9 +318,9 @@ int main() {
         REQUIRE(streamed_plan.wall_ms >=
                 streamed_plan.weight_h2d_startup_ms);
 
-        // When the measured profile makes CUDA compute much cheaper and H2D
-        // nearly free, APPLY_WIDE must be allowed to select a deep GPU Region
-        // even when its ring mismatch is not the minimum-E family.
+        // APPLY_WIDE now uses E as the first-stage physical filter. Every
+        // profile-feasible candidate in E_min + margin is simulated; there is
+        // no topology-family quota and no max_simulations truncation.
         model value_profile = mock_profile();
         value_profile.gpu_weight_streaming = true;
         value_profile.compute_ms =
@@ -328,10 +354,15 @@ int main() {
 
         const auto value_baseline = llama_region_ring_parse("", 48);
         const result value_result = search_runtime_applicable(
-            value_profile, value_baseline, 64, 256, 0.0, 0);
+            value_profile, value_baseline, 64, 16, 0.50, 0);
         REQUIRE(value_result.valid);
-        REQUIRE(value_result.simulated > 32);
-        REQUIRE(value_result.selected.g > 5);
+        REQUIRE(value_result.shortlisted == value_result.simulated);
+        REQUIRE(value_result.simulated > 16);
+        REQUIRE(value_result.selected.ring_error_max <=
+                value_result.coarse_e_limit + 1e-12);
+        REQUIRE(std::fabs(
+            value_result.coarse_e_limit -
+            std::min(1.0, value_result.coarse_e_min + 0.50)) < 1e-12);
     }
 
     // APPLY_WIDE may change cycle count and independent chunks, but every
