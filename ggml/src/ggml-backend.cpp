@@ -2136,11 +2136,13 @@ static void ggml_backend_sched_stage_weight_async(
     }
 }
 
-enum ggml_status ggml_backend_sched_prepare_split_weights_async(
+enum ggml_status ggml_backend_sched_prepare_split_weights_staged_async(
         ggml_backend_sched_t sched, int split_id,
-        ggml_backend_t upload_backend) {
+        ggml_backend_t upload_backend,
+        ggml_backend_sched_t staging_owner) {
     GGML_ASSERT(sched);
     GGML_ASSERT(upload_backend);
+    GGML_ASSERT(staging_owner);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
     GGML_ASSERT(sched->weight_cache_enabled);
 
@@ -2158,11 +2160,11 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
 
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
-    sched->last_weight_stage_cpu_copy_us = 0;
-    sched->last_weight_stage_chunks = 0;
+    staging_owner->last_weight_stage_cpu_copy_us = 0;
+    staging_owner->last_weight_stage_chunks = 0;
     const bool pinned_stage =
         ggml_backend_sched_init_weight_stage(
-            sched, upload_backend);
+            staging_owner, upload_backend);
 
     for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
         ggml_tensor * input = split->inputs[input_id];
@@ -2192,7 +2194,7 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
         // block overlaps H2D of the previous block on upload_backend.
         if (pinned_stage) {
             ggml_backend_sched_stage_weight_async(
-                sched, upload_backend, input_cpy,
+                staging_owner, upload_backend, input_cpy,
                 input->data, ggml_nbytes(input));
         } else {
             ggml_backend_tensor_set_async(
@@ -2206,6 +2208,13 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+enum ggml_status ggml_backend_sched_prepare_split_weights_async(
+        ggml_backend_sched_t sched, int split_id,
+        ggml_backend_t upload_backend) {
+    return ggml_backend_sched_prepare_split_weights_staged_async(
+        sched, split_id, upload_backend, sched);
 }
 
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
@@ -2625,8 +2634,6 @@ static void ggml_backend_sched_reset_graph_state(
     sched->is_alloc = false;
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
-    sched->last_weight_stage_cpu_copy_us = 0;
-    sched->last_weight_stage_chunks = 0;
 }
 
 static void ggml_backend_sched_clear_weight_cache(
