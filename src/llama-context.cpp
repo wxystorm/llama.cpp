@@ -3201,6 +3201,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool gpu_weight_streaming =
         isolate_device_resources && pc_phone_overlap &&
         model.hybrid_ring_gpu_weight_streaming;
+    if (gpu_weight_streaming) {
+        for (size_t bank = 1; bank <= 2; ++bank) {
+            region_ring_worker_resources[bank].cached_region =
+                std::numeric_limits<size_t>::max();
+            region_ring_worker_resources[bank].last_use = 0;
+        }
+        region_ring_gpu_weight_bank_epoch = 0;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
+            "reason=NEW_UBATCH graph_cache=PRESERVED "
+            "region_metadata=CLEARED status=READY\n");
+    }
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
         // after this function returns. The last Phone Region must still write
@@ -3938,7 +3950,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 "NONE" : std::to_string(evicted_region);
                         LLAMA_LOG_ERROR(
                             "[REGION_RING_GPU_WEIGHT] event=BANK_SELECT "
-                            "region=%zu chunk=%zu bank=%c cache=%s "
+                            "region=%zu chunk=%zu bank=%c region_map=%s "
                             "evicted_region=%s status=READY\n",
                             task.region, task.chunk,
                             gpu_bank == 0 ? 'A' : 'B',
@@ -4024,12 +4036,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 LLAMA_LOG_ERROR(
                                     "[REGION_RING_GPU_WEIGHT] "
                                     "event=TASK_DONE region=%zu chunk=%zu "
-                                    "bank=%c upload_mib=%.3f "
+                                    "bank=%c weight_cache=%s upload_mib=%.3f "
                                     "cache_hit_mib=%.3f bank_cuda_mib=%.3f "
                                     "weight_stage_ms=%.3f prepare_ms=%.3f "
                                     "compute_range_ms=%.3f status=%d\n",
                                     task.region, task.chunk,
                                     gpu_bank == 0 ? 'A' : 'B',
+                                    task_timing.weight_upload_bytes > 0 ?
+                                        "MISS_LOAD" :
+                                    task_timing.weight_cache_hit_bytes > 0 ?
+                                        "HIT" : "NO_WEIGHT_INPUT",
                                     task_timing.weight_upload_bytes /
                                         1048576.0,
                                     task_timing.weight_cache_hit_bytes /

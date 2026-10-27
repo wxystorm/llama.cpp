@@ -1058,10 +1058,31 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         // not an ideal solution
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-            // check if a backend with higher prio wants to offload the op
-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+            // Weight-cache schedulers intentionally decouple execution from
+            // residency. CPU-host weights are canonical storage only; choose
+            // the highest-priority backend that can execute the op and let the
+            // scheduler create/cache a staged copy of the immutable weight.
+            if (sched->weight_cache_enabled &&
+                    src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer)) {
+                for (int b = 0; b < src_backend_id; ++b) {
+                    if (ggml_backend_supports_op(
+                            sched->backends[b], tensor)) {
+                        SET_CAUSE(tensor, "1.wcache");
+                        return b;
+                    }
+                }
+            }
+
+            // Generic schedulers keep the original heuristic offload policy.
+            if (sched->op_offload &&
+                    src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                    if (ggml_backend_supports_op(
+                            sched->backends[b], tensor) &&
+                            ggml_backend_offload_op(
+                                sched->backends[b], tensor)) {
                         SET_CAUSE(tensor, "1.off");
                         return b;
                     }
