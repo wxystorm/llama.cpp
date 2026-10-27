@@ -393,11 +393,21 @@ static void test_nonuniform_interval_ready() {
     ready.complete(*p0);
 
     // One P128 interval covers eight G16 intervals in the next cycle. KV order
-    // intentionally exposes only the first one until it commits.
+    // makes only region-3 chunk 0 eligible, but the per-device GPU FIFO still
+    // contains region-0 chunk 8, which was queued earlier. Fan-out therefore
+    // adds a second READY GPU task; it must not jump ahead of older FIFO work.
+    check(ready.queue_size(llama_region_ring_device::GPU) == 2,
+          "P128 fan-out did not enqueue next-cycle G16 behind existing GPU work");
+
+    const auto older_g = ready.try_take(llama_region_ring_device::GPU);
+    check(older_g && older_g->region == 0 && older_g->chunk == 8,
+          "GPU FIFO did not preserve older same-cycle work");
+    ready.complete(*older_g);
+
     const auto next_g = ready.try_take(llama_region_ring_device::GPU);
     check(next_g && next_g->region == 3 && next_g->chunk == 0 &&
               next_g->n_tokens == 16,
-          "P128 did not fan out to next-cycle G16");
+          "P128 fan-out task was not reachable after older GPU FIFO work");
 
     // Run a fresh READY_V2 instance all the way to drain and independently
     // verify every claimed consumer sees complete upstream interval coverage.
