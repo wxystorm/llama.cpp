@@ -9384,27 +9384,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
-        int wide_max_simulations = 256;
-        int wide_min_simulations = 32;
         double wide_e_margin = 0.08;
-        if (const char * raw = std::getenv(
-                "LLAMA_HYBRID_REGION_RING_PLAN_MAX_SIMULATIONS")) {
-            char * end = nullptr;
-            const long parsed = std::strtol(raw, &end, 10);
-            if (end != raw && *end == '\0' &&
-                    parsed >= 16 && parsed <= 2048) {
-                wide_max_simulations = (int) parsed;
-            }
-        }
-        if (const char * raw = std::getenv(
-                "LLAMA_HYBRID_REGION_RING_PLAN_MIN_SIMULATIONS")) {
-            char * end = nullptr;
-            const long parsed = std::strtol(raw, &end, 10);
-            if (end != raw && *end == '\0' && parsed >= 0 &&
-                    parsed <= wide_max_simulations) {
-                wide_min_simulations = (int) parsed;
-            }
-        }
         if (const char * raw = std::getenv(
                 "LLAMA_HYBRID_REGION_RING_PLAN_E_MARGIN")) {
             char * end = nullptr;
@@ -9416,11 +9396,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
+        // APPLY_WIDE simulates every candidate inside the E window.
+        // The helper retains legacy max/min parameters for standalone tests,
+        // but runtime application deliberately supplies no simulation cap.
         const auto result =
             llama_ring_planner::search_runtime_applicable(
                 model, baseline_regions, baseline_chunk,
-                wide_max_simulations, wide_e_margin,
-                wide_min_simulations);
+                1, wide_e_margin, 0);
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
