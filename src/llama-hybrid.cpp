@@ -9425,9 +9425,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
-            "E_min=%.4f E_limit=%.4f "
-            "ranking=PROFILE_WALL_LOWER_BOUND "
-            "exact=TOPOLOGY_FAMILY_COVERAGE E=DIAGNOSTIC "
+            "E_min=%.4f E_limit=%.4f E_margin=%.4f "
+            "filter=E_WINDOW exact=FULL_PROMPT_EVENT_SIM "
+            "ranking=SIM_WALL sim_cap=NONE "
             "cycles=2..4 tail=DISABLED final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
@@ -9436,6 +9436,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.simulated, result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
+            wide_e_margin,
             model.gpu_weight_streaming ? 1 : 0,
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
@@ -9461,6 +9462,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "layout=%s cycles=%d C=%d G=%d P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
+                "prepare_busy=%.3f weight_prepare=%.3f "
                 "weight_h2d_total=%.3f weight_h2d_startup=%.3f "
                 "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
                 "E=%.4f tasks=%d edges=%d\n",
@@ -9469,6 +9471,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 c.cycles, c.c, c.g, c.p,
                 c.xc, c.xg, c.xp, c.wall_ms,
                 c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
+                c.prepare_busy_ms,
+                c.weight_prepare_busy_ms,
                 c.weight_h2d_busy_ms,
                 c.weight_h2d_startup_ms,
                 c.weight_h2d_exposed_ms,
@@ -9521,6 +9525,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "source=AUTO_RUNTIME_V2 layout=%s baseline_layout=%s "
             "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
             "predicted_ms=%.3f baseline_predicted_ms=%.3f "
+            "prepare_busy=%.3f weight_prepare=%.3f "
             "weight_h2d_total=%.3f weight_h2d_startup=%.3f "
             "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
@@ -9529,6 +9534,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.cycles, best.c, best.g, best.p,
             best.xc, best.xg, best.xp,
             best.wall_ms, baseline_ms,
+            best.prepare_busy_ms,
+            best.weight_prepare_busy_ms,
             best.weight_h2d_busy_ms,
             best.weight_h2d_startup_ms,
             best.weight_h2d_exposed_ms,
