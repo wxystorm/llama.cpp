@@ -2385,6 +2385,24 @@ ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, 
     return sched->backends[sched->splits[split_id].backend_id];
 }
 
+const char * ggml_backend_sched_get_split_first_node_name(
+        ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    const auto & graph = sched->splits[split_id].graph;
+    return graph.n_nodes > 0 && graph.nodes[0] != nullptr ?
+        graph.nodes[0]->name : "<empty>";
+}
+
+enum ggml_op ggml_backend_sched_get_split_first_node_op(
+        ggml_backend_sched_t sched, int split_id) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    const auto & graph = sched->splits[split_id].graph;
+    return graph.n_nodes > 0 && graph.nodes[0] != nullptr ?
+        graph.nodes[0]->op : GGML_OP_NONE;
+}
+
 uint64_t ggml_backend_sched_get_split_resource_mask(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);

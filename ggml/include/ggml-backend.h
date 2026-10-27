@@ -330,6 +330,8 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int            ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t ggml_backend_sched_get_split_backend(ggml_backend_sched_t sched, int split_id);
+    GGML_API const char *   ggml_backend_sched_get_split_first_node_name(ggml_backend_sched_t sched, int split_id);
+    GGML_API enum ggml_op   ggml_backend_sched_get_split_first_node_op(ggml_backend_sched_t sched, int split_id);
     // Advisory resource mask for one Scheduler split. Bit i corresponds to
     // ggml_backend_sched_get_backend(sched, i). The mask includes the split
     // compute Backend and all source Backends for cross-backend inputs.

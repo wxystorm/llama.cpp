@@ -2485,10 +2485,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
                 "split=%d/%d expected=%s actual=%s "
+                "first_node=%s first_op=%s "
                 "status=REJECT reason=COMPUTE_BACKEND_FALLBACK\n",
                 stage_index, block_index, split, n_splits,
                 ggml_backend_name(strict_compute_backend),
-                target ? ggml_backend_name(target) : "NULL");
+                target ? ggml_backend_name(target) : "NULL",
+                ggml_backend_sched_get_split_first_node_name(
+                    sched_use, split),
+                ggml_op_name(
+                    ggml_backend_sched_get_split_first_node_op(
+                        sched_use, split)));
             strict_ok = false;
             break;
         }
