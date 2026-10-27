@@ -224,3 +224,23 @@ is the primary coarse ordering and the exact FIFO/KV/slot event simulation
 still selects the final minimum predicted prefill wall time. This preserves
 the intended approximate-equation interpretation while preventing the
 coarse model from overruling runtime scheduling details.
+
+
+### Wide Planner preview
+
+The read-only `dry-run` search now opens the research variables before
+runtime APPLY support: cycles 2..4, geometry-driven C/G widths, P2..P8,
+XC/XG/XP in {16,32,64,128}, and a CPU/GPU tail up to the configured
+`max_tail` (12 by default).
+
+Memory feasibility remains a hard constraint. Feasible candidates are ranked
+by the minimax ring mismatch `E=max(e1,e2,e3)`. Exact FIFO simulation runs
+inside an `E_min + margin` neighborhood, with a minimum exploration floor
+and maximum simulation budget. Defaults are E margin 0.08, minimum 32 and
+maximum 256. They can be adjusted with
+`LLAMA_HYBRID_REGION_RING_PLAN_E_MARGIN`,
+`LLAMA_HYBRID_REGION_RING_PLAN_MIN_SIMULATIONS`, and
+`LLAMA_HYBRID_REGION_RING_PLAN_MAX_SIMULATIONS`.
+
+Wide search is preview-only. Independent per-device Chunk sizes and arbitrary
+cycle/tail topologies are not automatically applied to the current runtime.

@@ -171,15 +171,19 @@ int main() {
     limited.memory_feasible = [](const candidate & p) {
         return p.cycles * p.p <= 15 && p.cycles * p.g <= 12;
     };
-    const result selected = search(limited, 80);
+    const result selected = search(limited, 80, 0.08, 16);
     REQUIRE(selected.valid && selected.simulated > 0);
+    REQUIRE(selected.shortlisted == selected.simulated);
+    REQUIRE(selected.shortlisted <= 80);
+    REQUIRE(std::isfinite(selected.coarse_e_min));
+    REQUIRE(selected.coarse_e_limit + 1e-12 >= selected.coarse_e_min);
     REQUIRE(selected.selected.wall_ms > 0.0);
     REQUIRE(selected.selected.cycles * selected.selected.p <= 15);
     REQUIRE(selected.selected.cycles * selected.selected.g <= 12);
     REQUIRE(selected.selected.cycles *
                (selected.selected.c + selected.selected.g + selected.selected.p) +
            selected.selected.tail_c + selected.selected.tail_g == m.layers);
-    REQUIRE(selected.top.size() <= 5);
+    REQUIRE(selected.top.size() <= 10);
 
     // General topology may change Phone P5 to P8, the number of cycles,
     // and the final logits owner; Chunk64 and the shared dynamic slot pool remain fixed.
