@@ -3196,6 +3196,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Do not run the three execution paths on separate threads yet.
     std::array<ggml_backend_sched_t, 3> ring_sched = {sched_use, sched_use, sched_use};
     std::array<llm_graph_result *, 3> ring_res = {res_use, res_use, res_use};
+    // Shared by Bank resource setup and the per-device GPU worker lambda.
+    // This must not be scoped only to isolate_device_resources.
+    const bool gpu_weight_streaming =
+        isolate_device_resources && pc_phone_overlap &&
+        model.hybrid_ring_gpu_weight_streaming;
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
         // after this function returns. The last Phone Region must still write
@@ -3233,9 +3238,6 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
-        const bool gpu_weight_streaming =
-            pc_phone_overlap &&
-            model.hybrid_ring_gpu_weight_streaming;
         const size_t ring_pc_resource_count =
             gpu_weight_streaming ? 3 : 2;
 
