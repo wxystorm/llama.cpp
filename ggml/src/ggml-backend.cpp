@@ -22,7 +22,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cinttypes>
-#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -956,7 +955,7 @@ struct ggml_backend_sched {
     // Optional persistent cache for offloaded immutable weights. Used by the
     // Region Ring GPU weight banks; disabled for all legacy schedulers.
     bool weight_cache_enabled = false;
-    std::unordered_set<ggml_tensor *> weight_cache_valid;
+    uint8_t * weight_cache_valid = nullptr;
     size_t last_weight_upload_bytes = 0;
     size_t last_weight_cache_hit_bytes = 0;
 
@@ -973,6 +972,8 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+#define weight_copy_valid_id(id, backend_id, copy_id) sched->weight_cache_valid[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
+#define weight_copy_valid(tensor, backend_id, copy_id) weight_copy_valid_id(hash_id(tensor), backend_id, copy_id)
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1857,8 +1858,8 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             ggml_backend_buffer_get_usage(input->buffer) ==
                 GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
         if (sched->weight_cache_enabled && immutable_weight &&
-                sched->weight_cache_valid.find(input_cpy) !=
-                    sched->weight_cache_valid.end()) {
+                weight_copy_valid(
+                    input, split_backend_id, sched->cur_copy) != 0) {
             sched->last_weight_cache_hit_bytes += ggml_nbytes(input);
             continue;
         }
@@ -1980,7 +1981,8 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
             }
 
             if (sched->weight_cache_enabled && immutable_weight) {
-                sched->weight_cache_valid.insert(input_cpy);
+                weight_copy_valid(
+                    input, split_backend_id, sched->cur_copy) = 1;
                 sched->last_weight_upload_bytes += ggml_nbytes(input);
             }
         }
@@ -2135,6 +2137,9 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->weight_cache_valid    = (uint8_t *) calloc(
+        sched->hash_set.size * sched->n_backends * sched->n_copies,
+        sizeof(uint8_t));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2188,6 +2193,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->splits);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->weight_cache_valid);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
@@ -2200,7 +2206,10 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    sched->weight_cache_valid.clear();
+    memset(
+        sched->weight_cache_valid, 0,
+        sched->hash_set.size * sched->n_backends *
+            sched->n_copies * sizeof(uint8_t));
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
     // reset state for the next run
@@ -2443,7 +2452,10 @@ void ggml_backend_sched_set_weight_cache(
         return;
     }
     sched->weight_cache_enabled = enabled;
-    sched->weight_cache_valid.clear();
+    memset(
+        sched->weight_cache_valid, 0,
+        sched->hash_set.size * sched->n_backends *
+            sched->n_copies * sizeof(uint8_t));
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
 }
