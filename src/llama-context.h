@@ -401,7 +401,8 @@ private:
                                       bool                                 pc_phone_overlap = false,
                                       std::unique_lock<std::mutex> *       phone_pc_gate = nullptr,
                                       int64_t *                            phone_remote_begin_us = nullptr,
-                                      int64_t *                            phone_remote_end_us = nullptr);
+                                      int64_t *                            phone_remote_end_us = nullptr,
+                                      ggml_backend_t                       strict_compute_backend = nullptr);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
