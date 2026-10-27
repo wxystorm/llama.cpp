@@ -8659,6 +8659,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f "
+            "ranking=PROFILE_WALL_LOWER_BOUND "
+            "exact=TOPOLOGY_FAMILY_COVERAGE E=DIAGNOSTIC "
             "cycles=2..4 tail=DISABLED final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
@@ -8692,13 +8694,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "layout=%s cycles=%d C=%d G=%d P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
-                "weight_h2d_busy=%.3f E=%.4f tasks=%d edges=%d\n",
+                "weight_h2d_total=%.3f weight_h2d_startup=%.3f "
+                "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
+                "E=%.4f tasks=%d edges=%d\n",
                 i + 1,
                 llama_region_ring_layout_string(regions).c_str(),
                 c.cycles, c.c, c.g, c.p,
                 c.xc, c.xg, c.xp, c.wall_ms,
                 c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
                 c.weight_h2d_busy_ms,
+                c.weight_h2d_startup_ms,
+                c.weight_h2d_exposed_ms,
+                c.weight_h2d_hidden_ms,
                 c.ring_error_max, c.tasks, c.edges);
         }
 
@@ -8747,7 +8754,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "source=AUTO_RUNTIME_V2 layout=%s baseline_layout=%s "
             "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
             "predicted_ms=%.3f baseline_predicted_ms=%.3f "
-            "weight_h2d_busy=%.3f "
+            "weight_h2d_total=%.3f weight_h2d_startup=%.3f "
+            "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
             best_text.c_str(), baseline_text.c_str(),
@@ -8755,6 +8763,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.xc, best.xg, best.xp,
             best.wall_ms, baseline_ms,
             best.weight_h2d_busy_ms,
+            best.weight_h2d_startup_ms,
+            best.weight_h2d_exposed_ms,
+            best.weight_h2d_hidden_ms,
             improvement_pct, min_gain_pct,
             best.ring_error_max);
 
