@@ -1668,6 +1668,27 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         const bool region_ring = llama_region_ring_enabled();
+        const bool ring_gpu_weight_stream_requested =
+            region_ring &&
+            std::getenv("LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM") != nullptr &&
+            std::atoi(std::getenv(
+                "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM")) != 0;
+        hybrid_ring_gpu_weight_streaming =
+            ring_gpu_weight_stream_requested &&
+            arch == LLM_ARCH_QWEN3MOE;
+        if (ring_gpu_weight_stream_requested &&
+                !hybrid_ring_gpu_weight_streaming) {
+            LLAMA_LOG_WARN(
+                "[REGION_RING_GPU_WEIGHT] phase=CONFIG enabled=0 "
+                "reason=V1_QWEN3MOE_ONLY arch=%s\n",
+                arch_name().c_str());
+        }
+        if (hybrid_ring_gpu_weight_streaming) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT] phase=CONFIG enabled=1 "
+                "canonical=CPU exec=CUDA banks=2 "
+                "policy=DEMAND_CACHE_V1 status=READY\n");
+        }
         const std::vector<llama_region_ring_region> ring_regions =
             region_ring ?
                 (hybrid_ring_plan_layout.empty() ?
@@ -2091,6 +2112,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pc_layer_backends[il];
 
     if (pc_backend == llama_pc_layer_backend::CUDA) {
+        if (hybrid_ring_gpu_weight_streaming) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT] phase=WEIGHT_PLACEMENT layer=%d "
+                "exec=CUDA canonical=CPU status=STREAMABLE\n",
+                il);
+            return {
+                cpu_dev,
+                &pimpl->cpu_buft_list
+            };
+        }
+
         LLAMA_LOG_DEBUG(
             "[PC_PLACE] layer=%d hybrid=PC_ONLY backend=CUDA device=%s\n",
             il, ggml_backend_dev_name(cuda_dev));

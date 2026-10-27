@@ -657,6 +657,11 @@ struct llama_model {
     int hybrid_ring_plan_gpu_chunk_tokens = 0;
     int hybrid_ring_plan_phone_chunk_tokens = 0;
 
+    // Region Ring GPU weight streaming V1: layer execution remains CUDA while
+    // canonical model weights live in host/CPU buffers and are staged into
+    // two context-owned CUDA weight banks on demand.
+    bool hybrid_ring_gpu_weight_streaming = false;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma

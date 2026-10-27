@@ -7998,6 +7998,32 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             }
         }
 
+        // GPU weight streaming decouples execution from residency:
+        // model.dev_layer(il) is CPU because the canonical weights live there,
+        // while pc_layer_backends[il] remains CUDA. Pin every supported op in
+        // those layers to the outer CUDA backend; unsupported ops are left
+        // unpinned and will be caught by the Ring strict-backend guard.
+        if (il >= 0 &&
+            model.hybrid_ring_gpu_weight_streaming &&
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::PC_ONLY &&
+            il < (int) model.pc_layer_backends.size() &&
+            model.pc_layer_backends[(size_t) il] ==
+                llama_pc_layer_backend::CUDA) {
+            for (const auto & backend : backends) {
+                ggml_backend_dev_t dev =
+                    ggml_backend_get_device(backend.get());
+                if (dev != nullptr &&
+                    ggml_backend_dev_type(dev) ==
+                        GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    ggml_backend_supports_op(backend.get(), cur)) {
+                    ggml_backend_sched_set_tensor_backend(
+                        sched_use, cur, backend.get());
+                    return;
+                }
+            }
+        }
+
         // PC_ONLY layers placed on CPU_DIRECT must stay as one CPU region.
         // The generic scheduler deliberately expands higher-priority GPU
         // assignments across unassigned ops while not expanding CPU, which
