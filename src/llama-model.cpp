@@ -2838,6 +2838,26 @@ void llama_model::print_info() const {
 }
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
+    // In GPU weight-streaming mode pimpl->dev_layer is intentionally the
+    // canonical WEIGHT residency (CPU), while KV placement, graph scheduling
+    // and fused-op ownership must continue to follow the execution backend.
+    if (hybrid_ring_gpu_weight_streaming &&
+            il >= 0 &&
+            il < (int) pc_layer_backends.size() &&
+            pc_layer_backends[(size_t) il] ==
+                llama_pc_layer_backend::CUDA) {
+        for (const auto & device : devices) {
+            if (device.is_meta || device.dev == nullptr) {
+                continue;
+            }
+            if (ggml_backend_dev_type(device.dev) ==
+                    GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return device.dev;
+            }
+        }
+        throw std::runtime_error(
+            "GPU weight-streaming layer has no CUDA execution device");
+    }
     return pimpl->dev_layer.at(il).dev;
 }
 

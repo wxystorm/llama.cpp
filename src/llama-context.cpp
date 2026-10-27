@@ -8265,10 +8265,10 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
         }
 
         // GPU weight streaming decouples execution from residency:
-        // model.dev_layer(il) is CPU because the canonical weights live there,
-        // while pc_layer_backends[il] remains CUDA. Pin every supported op in
-        // those layers to the outer CUDA backend; unsupported ops are left
-        // unpinned and will be caught by the Ring strict-backend guard.
+        // pimpl weight storage is CPU-canonical, while model.dev_layer(il)
+        // intentionally reports the CUDA execution owner for KV/fused-op
+        // placement. Pin every supported op in those layers to the outer CUDA
+        // backend; unsupported ops are caught by the strict-backend guard.
         if (il >= 0 &&
             model.hybrid_ring_gpu_weight_streaming &&
             model.hybrid_layer_mode(il) ==
