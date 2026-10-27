@@ -228,6 +228,29 @@ int main() {
     REQUIRE(general.selected.max_live_slots <= m.slot_pool);
     REQUIRE(!search_supported_topology(general_profile,128).valid);
 
+    // APPLY_WIDE may change cycle count and independent chunks, but every
+    // selected candidate must end on Phone with no tail so the current final
+    // output owner remains canonical.
+    {
+        const auto baseline = llama_region_ring_parse("", 48);
+        const result applicable =
+            search_runtime_applicable(m, baseline, 64, 64, 0.20, 16);
+        REQUIRE(applicable.valid);
+        REQUIRE(applicable.simulated > 0);
+        REQUIRE(applicable.selected.tail_c == 0);
+        REQUIRE(applicable.selected.tail_g == 0);
+        REQUIRE(applicable.selected.xc > 0);
+        REQUIRE(applicable.selected.xg > 0);
+        REQUIRE(applicable.selected.xp > 0);
+        std::vector<llama_region_ring_region> applied_regions;
+        REQUIRE(make_regions(
+            applicable.selected, m.layers, applied_regions));
+        REQUIRE(!applied_regions.empty());
+        REQUIRE(applied_regions.back().device == device::PHONE);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            applied_regions, m.layers));
+    }
+
     // APPLY_CGP frees exactly the three repeated region lengths while
     // keeping three G->C->P cycles, Chunk64, the full-batch boundary buffer and
     // final Phone ownership. CPU/CUDA/Phone are independent service lanes.

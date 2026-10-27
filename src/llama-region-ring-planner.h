@@ -806,6 +806,220 @@ inline result search(
     return out;
 }
 
+// Runtime-applicable wide search. Unlike WIDE_PREVIEW, every candidate
+// ends on Phone and has no tail, so the selected topology can be loaded and
+// executed by the current canonical final-output path. C/G/P and XC/XG/XP
+// remain free planner variables.
+inline result search_runtime_applicable(
+        const model & m,
+        const std::vector<llama_region_ring_region> & baseline_regions,
+        int baseline_chunk,
+        int max_simulations = 256,
+        double e_margin = 0.08,
+        int min_simulations = 32) {
+    result out;
+    if (m.layers < 6 || m.tokens <= 0 || baseline_chunk <= 0 ||
+            max_simulations <= 0 || min_simulations < 0 ||
+            !std::isfinite(e_margin) || e_margin < 0.0 ||
+            baseline_regions.empty() ||
+            baseline_regions.back().device != device::PHONE) {
+        return out;
+    }
+
+    out.baseline.xc = baseline_chunk;
+    out.baseline.xg = baseline_chunk;
+    out.baseline.xp = baseline_chunk;
+    out.baseline_valid =
+        estimate_region_ring_balance(
+            m, baseline_regions, out.baseline) &&
+        simulate(m, baseline_regions, out.baseline);
+
+    const std::array<int,4> x_cpu {16,32,64,128};
+    const std::array<int,4> x_gpu {16,32,64,128};
+    const std::array<int,4> x_phone {16,32,64,128};
+    std::vector<candidate> coarse;
+
+    for (int cycles = 2; cycles <= 4; ++cycles) {
+        if (m.layers % cycles != 0) {
+            continue;
+        }
+        const int width = m.layers / cycles;
+        for (int p = 2; p <= std::min(8, width - 2); ++p) {
+            for (int g = 1; g <= std::min(8, width - p - 1); ++g) {
+                const int c = width - p - g;
+                if (c < 1) {
+                    continue;
+                }
+                for (int xc : x_cpu) {
+                    for (int xg : x_gpu) {
+                        for (int xp : x_phone) {
+                            candidate plan;
+                            plan.cycles = cycles;
+                            plan.c = c;
+                            plan.g = g;
+                            plan.p = p;
+                            plan.tail_c = 0;
+                            plan.tail_g = 0;
+                            plan.xc = xc;
+                            plan.xg = xg;
+                            plan.xp = xp;
+                            ++out.enumerated;
+
+                            std::vector<llama_region_ring_region> regions;
+                            if (!make_regions(plan, m.layers, regions) ||
+                                    !llama_region_ring_apply_topology_compatible(
+                                        regions, m.layers) ||
+                                    regions.back().device != device::PHONE) {
+                                continue;
+                            }
+                            if ((m.memory_feasible &&
+                                    !m.memory_feasible(plan)) ||
+                                    (m.region_memory_feasible &&
+                                     !m.region_memory_feasible(regions))) {
+                                ++out.rejected_memory;
+                                continue;
+                            }
+                            if (!estimate_balance(m, plan)) {
+                                ++out.rejected_profile;
+                                continue;
+                            }
+                            ++out.profiled;
+                            coarse.push_back(std::move(plan));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (coarse.empty()) {
+        return out;
+    }
+
+    std::sort(
+        coarse.begin(), coarse.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.ring_error_max -
+                         b.ring_error_max) > 1e-12) {
+                return a.ring_error_max < b.ring_error_max;
+            }
+            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
+                return a.coarse_ms < b.coarse_ms;
+            }
+            return a.ring_error_mean < b.ring_error_mean;
+        });
+
+    out.coarse_e_min = coarse.front().ring_error_max;
+    out.coarse_e_limit =
+        std::min(1.0, out.coarse_e_min + e_margin);
+
+    const auto exact_key = [](const candidate & c) {
+        return std::make_tuple(
+            c.cycles, c.c, c.g, c.p,
+            c.xc, c.xg, c.xp);
+    };
+    const auto family_key = [](const candidate & c) {
+        return std::make_tuple(c.cycles, c.c, c.g, c.p);
+    };
+
+    std::vector<candidate> shortlist;
+    shortlist.reserve((size_t) max_simulations);
+    std::vector<std::tuple<int,int,int,int>> families;
+
+    for (const auto & plan : coarse) {
+        if (plan.ring_error_max >
+                out.coarse_e_limit + 1e-12) {
+            break;
+        }
+        const auto family = family_key(plan);
+        if (std::find(
+                families.begin(), families.end(),
+                family) != families.end()) {
+            continue;
+        }
+        families.push_back(family);
+        shortlist.push_back(plan);
+        if ((int) shortlist.size() >= max_simulations / 2) {
+            break;
+        }
+    }
+
+    for (const auto & plan : coarse) {
+        if ((int) shortlist.size() >= max_simulations) {
+            break;
+        }
+        if (plan.ring_error_max >
+                out.coarse_e_limit + 1e-12) {
+            break;
+        }
+        if (std::any_of(
+                shortlist.begin(), shortlist.end(),
+                [&](const candidate & x) {
+                    return exact_key(x) == exact_key(plan);
+                })) {
+            continue;
+        }
+        shortlist.push_back(plan);
+    }
+
+    const int floor_count =
+        std::min(max_simulations, std::max(0, min_simulations));
+    if ((int) shortlist.size() < floor_count) {
+        for (const auto & plan : coarse) {
+            if ((int) shortlist.size() >= floor_count) {
+                break;
+            }
+            if (std::any_of(
+                    shortlist.begin(), shortlist.end(),
+                    [&](const candidate & x) {
+                        return exact_key(x) == exact_key(plan);
+                    })) {
+                continue;
+            }
+            shortlist.push_back(plan);
+        }
+    }
+
+    out.shortlisted = shortlist.size();
+    for (auto plan : shortlist) {
+        std::vector<llama_region_ring_region> regions;
+        if (!make_regions(plan, m.layers, regions) ||
+                regions.empty() ||
+                regions.back().device != device::PHONE) {
+            continue;
+        }
+        std::string reason;
+        if (!simulate(m, regions, plan, &reason)) {
+            ++out.rejected_deadlock;
+            continue;
+        }
+        ++out.simulated;
+        out.top.push_back(std::move(plan));
+    }
+
+    std::sort(
+        out.top.begin(), out.top.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
+                return a.wall_ms < b.wall_ms;
+            }
+            if (std::abs(a.ring_error_max -
+                         b.ring_error_max) > 1e-9) {
+                return a.ring_error_max < b.ring_error_max;
+            }
+            return a.ring_error_mean < b.ring_error_mean;
+        });
+
+    if (!out.top.empty()) {
+        out.selected = out.top.front();
+        out.valid = true;
+        if (out.top.size() > 10) {
+            out.top.resize(10);
+        }
+    }
+    return out;
+}
+
 // Phase-1 supported search: keep the model's exact Phone regions and
 // original CUDA weight count, adjust only CUDA/CPU boundaries inside the
 // three 11-layer PC windows. No changes to Chunk, KV, Phone graph UID
