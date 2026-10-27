@@ -8661,14 +8661,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return bytes > 0;
             };
 
-        // Until the profile owns a dedicated host->CUDA weight-upload curve,
-        // use the measured local PCIe GPU<->PC transfer curve as the explicit
-        // proxy. The simulator still models this as its own transfer lane.
-        model.gpu_weight_h2d_ms =
-            [&profile](size_t bytes, double & cost) -> bool {
-                return llama_hybrid_transfer_cost(
-                    profile.gpu_to_pc, bytes, cost);
-            };
+        if (!profile.gpu_weight_h2d.empty()) {
+            model.gpu_weight_h2d_ms =
+                [&profile](size_t bytes, double & cost) -> bool {
+                    return llama_hybrid_transfer_cost(
+                        profile.gpu_weight_h2d, bytes, cost);
+                };
+        }
 
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes](
@@ -8758,6 +8757,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
+        "weight_h2d_points=%zu "
         "register_ms_per_task=%.3f weights=%s "
         "gpu_weight_stream=%s weight_h2d_profile=%s "
         "network=SHARED_CONSERVATIVE pc_compute=CPU_CUDA_INDEPENDENT "
@@ -8765,10 +8765,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         tokens, model.kv_start,
         profile.cpu_layer_blocks.size(), profile.gpu_layer_blocks.size(),
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
-        profile.phone_to_pc.size(), model.phone_register_ms,
+        profile.phone_to_pc.size(), profile.gpu_weight_h2d.size(),
+        model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
         model.gpu_weight_streaming ? "TWO_BANK" : "OFF",
-        model.gpu_weight_streaming ? "GPU_TO_PC_PROXY" : "OFF",
+        model.gpu_weight_streaming ?
+            (profile.gpu_weight_h2d.size() >= 2 ?
+                "ASYNC_WEIGHT_H2D_MEASURED" :
+                "MISSING") :
+            "OFF",
         model.slot_pool,
         baseline_only ? "APPLY_BASELINE" :
         wide_apply ? "APPLY_WIDE" :
@@ -8777,6 +8782,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
     if (wide_apply && selected_layout != nullptr) {
+        if (model.gpu_weight_streaming &&
+                profile.gpu_weight_h2d.size() < 2) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
+                "reason=NO_WEIGHT_H2D_PROFILE points=%zu "
+                "status=KEEP_BASELINE\n",
+                profile.gpu_weight_h2d.size());
+            return false;
+        }
         if (selected_xc == nullptr || selected_xg == nullptr ||
                 selected_xp == nullptr) {
             LLAMA_LOG_ERROR(
