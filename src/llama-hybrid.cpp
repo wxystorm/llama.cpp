@@ -8355,6 +8355,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     // Runtime validation now shows CPU/CUDA compute are independently gated;
     // GPU/Phone CPU wait is no longer the execution bottleneck.
     model.pc_compute_gate = false;
+    const char * planner_gpu_stream_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM");
+    const char * planner_ring_exec_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+    model.gpu_weight_streaming =
+        planner_gpu_stream_env != nullptr &&
+        std::atoi(planner_gpu_stream_env) != 0 &&
+        planner_ring_exec_env != nullptr &&
+        std::strcmp(planner_ring_exec_env, "fifo-pc-phone") == 0;
 
     // Current READY V1 re-registers nearly every distinct Graph UID. Charge
     // each Phone task for an approximate registration until shape/slot/position
@@ -8429,56 +8438,124 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
         weight_fallback != 0;
     if (have_layer_weights) {
-        model.memory_feasible = [&profile, &model, weight_fallback](
-                const llama_ring_planner::candidate & candidate) -> bool {
-            std::vector<llama_region_ring_region> regions;
-            if (!llama_ring_planner::make_regions(
-                    candidate, model.layers, regions)) {
-                return false;
-            }
-            std::array<long double, 3> usage {};
-            for (const auto & region : regions) {
-                const auto idx = (size_t) region.device;
-                for (int l = region.layer_begin; l < region.layer_end; ++l) {
-                    const size_t weight = profile.layer_weight_bytes.size() ==
-                        (size_t) profile.n_layer ?
-                        profile.layer_weight_bytes[(size_t) l] : weight_fallback;
-                    usage[idx] += (long double) weight;
-                    usage[idx] += (long double) profile.kv_bytes_per_token_per_layer *
-                                  (model.kv_start + model.tokens);
-                }
-            }
-            usage[0] += (long double) profile.non_layer_weight_bytes;
-            if (model.slot_pool > 0) {
-                const int sizes[] = {candidate.xc, candidate.xg, candidate.xp};
-                for (size_t i = 0; i < 3; ++i) {
-                    usage[i] += (long double) model.slot_pool * sizes[i] *
-                                model.hidden * sizeof(float) * 3;
-                }
-            } else {
-                // Production Ring keeps one full activation buffer per
-                // boundary in host memory. This replaces the old per-device
-                // bounded-slot estimate and is small compared with layer
-                // weights (about 2.8 MiB per edge for 358x2048 f32).
-                const size_t boundary_count =
-                    regions.empty() ? 0 : regions.size() - 1;
-                usage[0] += (long double) boundary_count *
-                            model.tokens * model.hidden * sizeof(float);
-            }
-            const size_t free_bytes[] = {
-                profile.pc_free_mem,
-                profile.gpu_free_mem,
-                profile.phone_free_mem
+        const auto planner_layer_bytes =
+            [&profile, weight_fallback](int l) -> size_t {
+                return profile.layer_weight_bytes.size() ==
+                    (size_t) profile.n_layer ?
+                    profile.layer_weight_bytes[(size_t) l] :
+                    weight_fallback;
             };
-            const long double fraction[] = {0.85L, 0.90L, 0.90L};
-            for (size_t i = 0; i < 3; ++i) {
-                if (free_bytes[i] != 0 &&
-                    usage[i] > (long double) free_bytes[i] * fraction[i]) {
+
+        model.gpu_region_weight_bytes =
+            [planner_layer_bytes](
+                    int layer_begin, int layer_end,
+                    size_t & bytes) -> bool {
+                if (layer_begin < 0 || layer_end <= layer_begin) {
                     return false;
                 }
-            }
-            return true;
-        };
+                bytes = 0;
+                for (int l = layer_begin; l < layer_end; ++l) {
+                    const size_t w = planner_layer_bytes(l);
+                    if (w == 0 ||
+                            w > std::numeric_limits<size_t>::max() - bytes) {
+                        return false;
+                    }
+                    bytes += w;
+                }
+                return bytes > 0;
+            };
+
+        // Until the profile owns a dedicated host->CUDA weight-upload curve,
+        // use the measured local PCIe GPU<->PC transfer curve as the explicit
+        // proxy. The simulator still models this as its own transfer lane.
+        model.gpu_weight_h2d_ms =
+            [&profile](size_t bytes, double & cost) -> bool {
+                return llama_hybrid_transfer_cost(
+                    profile.gpu_to_pc, bytes, cost);
+            };
+
+        model.memory_feasible =
+            [&profile, &model, planner_layer_bytes](
+                    const llama_ring_planner::candidate & candidate) -> bool {
+                std::vector<llama_region_ring_region> regions;
+                if (!llama_ring_planner::make_regions(
+                        candidate, model.layers, regions)) {
+                    return false;
+                }
+
+                std::array<long double, 3> usage {};
+                for (const auto & region : regions) {
+                    long double region_weight = 0.0L;
+                    for (int l = region.layer_begin;
+                            l < region.layer_end; ++l) {
+                        region_weight +=
+                            (long double) planner_layer_bytes(l);
+                        usage[(size_t) region.device] +=
+                            (long double)
+                                profile.kv_bytes_per_token_per_layer *
+                            (model.kv_start + model.tokens);
+                    }
+
+                    if (model.gpu_weight_streaming &&
+                            region.device ==
+                                llama_region_ring_device::GPU) {
+                        // Streamed CUDA weights stay canonical on host.
+                        // Do not count all logical GPU Region weights as
+                        // simultaneously resident in VRAM.
+                        usage[(size_t) llama_region_ring_device::CPU] +=
+                            region_weight;
+                    } else {
+                        usage[(size_t) region.device] += region_weight;
+                    }
+                }
+
+                if (model.gpu_weight_streaming) {
+                    std::array<size_t, 2> bank_peaks {};
+                    if (!llama_ring_planner::gpu_weight_bank_peaks(
+                            model, regions, bank_peaks)) {
+                        return false;
+                    }
+                    usage[(size_t) llama_region_ring_device::GPU] +=
+                        (long double) bank_peaks[0] +
+                        (long double) bank_peaks[1];
+                }
+
+                usage[(size_t) llama_region_ring_device::CPU] +=
+                    (long double) profile.non_layer_weight_bytes;
+
+                if (model.slot_pool > 0) {
+                    const int sizes[] = {
+                        candidate.xc, candidate.xg, candidate.xp};
+                    for (size_t i = 0; i < 3; ++i) {
+                        usage[i] +=
+                            (long double) model.slot_pool * sizes[i] *
+                            model.hidden * sizeof(float) * 3;
+                    }
+                } else {
+                    const size_t boundary_count =
+                        regions.empty() ? 0 : regions.size() - 1;
+                    usage[(size_t) llama_region_ring_device::CPU] +=
+                        (long double) boundary_count *
+                        model.tokens * model.hidden * sizeof(float);
+                }
+
+                const size_t free_bytes[] = {
+                    profile.pc_free_mem,
+                    profile.gpu_free_mem,
+                    profile.phone_free_mem
+                };
+                const long double fraction[] = {
+                    0.85L, 0.90L, 0.90L};
+                for (size_t i = 0; i < 3; ++i) {
+                    if (free_bytes[i] != 0 &&
+                            usage[i] >
+                                (long double) free_bytes[i] *
+                                fraction[i]) {
+                        return false;
+                    }
+                }
+                return true;
+            };
     }
 
     LLAMA_LOG_ERROR(
@@ -8486,6 +8563,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
         "register_ms_per_task=%.3f weights=%s "
+        "gpu_weight_stream=%s weight_h2d_profile=%s "
         "network=SHARED_CONSERVATIVE pc_compute=CPU_CUDA_INDEPENDENT "
         "scheduler=DEVICE_FIFO slot_pool=%d action=%s\n",
         tokens, model.kv_start,
@@ -8493,6 +8571,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
         profile.phone_to_pc.size(), model.phone_register_ms,
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
+        model.gpu_weight_streaming ? "TWO_BANK" : "OFF",
+        model.gpu_weight_streaming ? "GPU_TO_PC_PROXY" : "OFF",
         model.slot_pool,
         baseline_only ? "APPLY_BASELINE" :
         wide_apply ? "APPLY_WIDE" :
@@ -8580,12 +8660,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f "
             "cycles=2..4 tail=DISABLED final_owner=PHONE "
+            "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
             "XP=16,32,64,128 baseline_ms=%.3f valid=%d\n",
             result.enumerated, result.profiled, result.shortlisted,
             result.simulated, result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
+            model.gpu_weight_streaming ? 1 : 0,
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
 
@@ -8610,12 +8692,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "layout=%s cycles=%d C=%d G=%d P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
-                "E=%.4f tasks=%d edges=%d\n",
+                "weight_h2d_busy=%.3f E=%.4f tasks=%d edges=%d\n",
                 i + 1,
                 llama_region_ring_layout_string(regions).c_str(),
                 c.cycles, c.c, c.g, c.p,
                 c.xc, c.xg, c.xp, c.wall_ms,
                 c.busy_ms[0], c.busy_ms[1], c.busy_ms[2],
+                c.weight_h2d_busy_ms,
                 c.ring_error_max, c.tasks, c.edges);
         }
 
@@ -8664,12 +8747,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "source=AUTO_RUNTIME_V2 layout=%s baseline_layout=%s "
             "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
             "predicted_ms=%.3f baseline_predicted_ms=%.3f "
+            "weight_h2d_busy=%.3f "
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
             best_text.c_str(), baseline_text.c_str(),
             best.cycles, best.c, best.g, best.p,
             best.xc, best.xg, best.xp,
             best.wall_ms, baseline_ms,
+            best.weight_h2d_busy_ms,
             improvement_pct, min_gain_pct,
             best.ring_error_max);
 
@@ -9243,6 +9328,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
             "pc_bound=%.3f cpu_mspt=%.6f gpu_mspt=%.6f "
             "phone_mspt=%.6f phone_link_mspt=%.6f "
+            "weight_h2d_busy=%.3f "
             "A=%.6f B=%.6f D=%.6f TP2G=%.6f TC2P=%.6f "
             "e1=%.4f e2=%.4f e3=%.4f E=%.4f "
             "tasks=%d edges=%d peak_per_edge_slots=%d\n",
@@ -9254,6 +9340,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             c.service_ms_per_token[1],
             c.service_ms_per_token[2],
             c.phone_link_ms_per_token,
+            c.weight_h2d_busy_ms,
             c.ring_stage_ms_per_token[0],
             c.ring_stage_ms_per_token[1],
             c.ring_stage_ms_per_token[2],
