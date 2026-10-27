@@ -7791,15 +7791,22 @@ bool llama_hybrid_profile_moe_full_layer(
                                  const std::vector<llama_hybrid_ffn_compute_point> * expert_points,
                                  int backend_index,
                                  int tokens,
-                                 double & total_ms) {
+                                 double & total_ms,
+                                 double & total_prepare_ms) {
         double attn_ms = 0.0;
         double branch_ms = 0.0;
         double misc_ms = 0.0;
+        double attn_prepare_ms = 0.0;
+        double branch_prepare_ms = 0.0;
+        double misc_prepare_ms = 0.0;
 
         if (!llama_hybrid_attn_cost(
                 attn_points, tokens, tokens, attn_ms) ||
+            !llama_hybrid_attn_prepare_cost(
+                attn_points, tokens, attn_prepare_ms) ||
             !llama_hybrid_profile_moe_misc_point(
-                attn_desc, moe_desc, backend, tokens, misc_ms)) {
+                attn_desc, moe_desc, backend, tokens,
+                misc_ms, &misc_prepare_ms)) {
             return false;
         }
 
@@ -7807,30 +7814,42 @@ bool llama_hybrid_profile_moe_full_layer(
             // cpu_ffn/phone_ffn are MoE branch points here:
             // Router + Top-K + expert compute + combine.
             if (!llama_hybrid_ffn_cost(
-                    *expert_points, tokens, 1.0f, branch_ms)) {
+                    *expert_points, tokens, 1.0f, branch_ms) ||
+                !llama_hybrid_ffn_prepare_cost(
+                    *expert_points, tokens, 1.0f,
+                    branch_prepare_ms)) {
                 return false;
             }
         } else {
             double router_ms = 0.0;
             double expert_ms = 0.0;
+            double router_prepare_ms = 0.0;
+            double expert_prepare_ms = 0.0;
             size_t expert_runtime_bytes = 0;
             if (!llama_hybrid_profile_moe_router_point(
-                    attn_desc, moe_desc, backend, tokens, router_ms) ||
+                    attn_desc, moe_desc, backend, tokens,
+                    router_ms, &router_prepare_ms) ||
                 !llama_hybrid_profile_moe_ffn_point(
                     moe_desc, backend, backend_index, tokens, 1.0f,
-                    expert_ms, expert_runtime_bytes)) {
+                    expert_ms, expert_runtime_bytes,
+                    &expert_prepare_ms)) {
                 return false;
             }
             branch_ms = router_ms + expert_ms;
+            branch_prepare_ms =
+                router_prepare_ms + expert_prepare_ms;
         }
 
         total_ms = attn_ms + misc_ms + branch_ms;
+        total_prepare_ms =
+            attn_prepare_ms + misc_prepare_ms + branch_prepare_ms;
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=moe_layer "
             "tokens=%d attn_ms=%.3f misc_ms=%.3f branch_ms=%.3f "
-            "total_ms=%.3f\n",
+            "prepare_ms=%.3f total_ms=%.3f\n",
             ggml_backend_name(backend), tokens,
-            attn_ms, misc_ms, branch_ms, total_ms);
+            attn_ms, misc_ms, branch_ms,
+            total_prepare_ms, total_ms);
         return true;
     };
 
@@ -7844,13 +7863,14 @@ bool llama_hybrid_profile_moe_full_layer(
         }
 
         double cpu_ms = 0.0;
+        double cpu_prepare_ms = 0.0;
         if (!profile_one(
                 cpu_backend, profile.cpu_attn, nullptr, 0,
-                tokens, cpu_ms)) {
+                tokens, cpu_ms, cpu_prepare_ms)) {
             return false;
         }
         profile.cpu_layer_blocks.push_back({
-            tokens, 1, cpu_ms, cpu_ms
+            tokens, 1, cpu_ms, cpu_ms, cpu_prepare_ms
         });
         if (tokens == profile.probe_tokens) {
             profile.cpu_full_layer_ms = cpu_ms;
@@ -7876,28 +7896,36 @@ bool llama_hybrid_profile_moe_full_layer(
         }
 
         double attn_ms = 0.0;
+        double attn_prepare_ms = 0.0;
         if (!llama_hybrid_attn_cost(
-                profile.cpu_attn, tokens, tokens, attn_ms)) {
+                profile.cpu_attn, tokens, tokens, attn_ms) ||
+            !llama_hybrid_attn_prepare_cost(
+                profile.cpu_attn, tokens, attn_prepare_ms)) {
             return false;
         }
 
         const double total_ms =
             branch_timing.wall_ms +
             LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS * attn_ms;
+        const double total_prepare_ms =
+            branch_timing.prepare_ms +
+            LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS * attn_prepare_ms;
         profile.cpu_layer_blocks.push_back({
             tokens,
             LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
             total_ms,
-            total_ms
+            total_ms,
+            total_prepare_ms
         });
         LLAMA_LOG_DEBUG(
             "[HYBRID_PROFILE_CPU_DEPTH] kind=cpu_direct_region layers=%d "
             "tokens=%d branch_ms=%.3f attn_ms_per_layer=%.3f "
-            "total_ms=%.3f per_layer_ms=%.3f\n",
+            "prepare_ms=%.3f total_ms=%.3f per_layer_ms=%.3f\n",
             LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS,
             tokens,
             branch_timing.wall_ms,
             attn_ms,
+            total_prepare_ms,
             total_ms,
             total_ms / LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS);
     }
@@ -7910,13 +7938,14 @@ bool llama_hybrid_profile_moe_full_layer(
         }
 
         double phone_ms = 0.0;
+        double phone_prepare_ms = 0.0;
         if (!profile_one(
                 phone_backend, profile.phone_attn, &profile.phone_ffn, 1,
-                tokens, phone_ms)) {
+                tokens, phone_ms, phone_prepare_ms)) {
             return false;
         }
         profile.phone_layer_blocks.push_back({
-            tokens, 1, phone_ms, phone_ms
+            tokens, 1, phone_ms, phone_ms, phone_prepare_ms
         });
         if (tokens == profile.probe_tokens) {
             profile.phone_full_layer_ms = phone_ms;
@@ -7930,13 +7959,14 @@ bool llama_hybrid_profile_moe_full_layer(
                 continue;
             }
             double gpu_ms = 0.0;
+            double gpu_prepare_ms = 0.0;
             if (!profile_one(
                     gpu_backend, profile.gpu_attn, nullptr, 0,
-                    tokens, gpu_ms)) {
+                    tokens, gpu_ms, gpu_prepare_ms)) {
                 return false;
             }
             profile.gpu_layer_blocks.push_back({
-                tokens, 1, gpu_ms, gpu_ms
+                tokens, 1, gpu_ms, gpu_ms, gpu_prepare_ms
             });
             if (tokens == profile.probe_tokens) {
                 profile.gpu_full_layer_ms = gpu_ms;
@@ -8325,11 +8355,15 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                                     cpu_timing)) {
             return false;
         }
-        profile.cpu_layer_blocks.push_back({ tokens, block_layers, cpu_timing.wall_ms, cpu_timing.compute_est_ms });
+        profile.cpu_layer_blocks.push_back({
+            tokens, block_layers, cpu_timing.wall_ms,
+            cpu_timing.compute_est_ms, cpu_timing.prepare_ms
+        });
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-            "per_layer_ms=%.3f\n",
-            ggml_backend_name(cpu_backend), block_layers, tokens, cpu_timing.wall_ms,
+            "prepare_ms=%.3f per_layer_ms=%.3f\n",
+            ggml_backend_name(cpu_backend), block_layers, tokens,
+            cpu_timing.wall_ms, cpu_timing.prepare_ms,
             cpu_timing.wall_ms / block_layers);
     }
 
@@ -8343,13 +8377,17 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                                     phone_timing)) {
             return false;
         }
-        profile.phone_layer_blocks.push_back({ tokens, block_layers, phone_timing.wall_ms,
-                                               phone_timing.compute_est_ms });
+        profile.phone_layer_blocks.push_back({
+            tokens, block_layers, phone_timing.wall_ms,
+            phone_timing.compute_est_ms, phone_timing.prepare_ms
+        });
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d wall_ms=%.3f "
-            "compute_est_ms=%.3f per_layer_est_ms=%.3f\n",
-            ggml_backend_name(phone_backend), block_layers, tokens, phone_timing.wall_ms,
-            phone_timing.compute_est_ms, phone_timing.compute_est_ms / block_layers);
+            "compute_est_ms=%.3f prepare_ms=%.3f per_layer_est_ms=%.3f\n",
+            ggml_backend_name(phone_backend), block_layers, tokens,
+            phone_timing.wall_ms, phone_timing.compute_est_ms,
+            phone_timing.prepare_ms,
+            phone_timing.compute_est_ms / block_layers);
     }
 
     if (gpu_backend != nullptr) {
@@ -8363,11 +8401,15 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                                         gpu_timing)) {
                 return false;
             }
-            profile.gpu_layer_blocks.push_back({ tokens, block_layers, gpu_timing.wall_ms, gpu_timing.compute_est_ms });
+            profile.gpu_layer_blocks.push_back({
+                tokens, block_layers, gpu_timing.wall_ms,
+                gpu_timing.compute_est_ms, gpu_timing.prepare_ms
+            });
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-                "per_layer_ms=%.3f\n",
-                ggml_backend_name(gpu_backend), block_layers, tokens, gpu_timing.wall_ms,
+                "prepare_ms=%.3f per_layer_ms=%.3f\n",
+                ggml_backend_name(gpu_backend), block_layers, tokens,
+                gpu_timing.wall_ms, gpu_timing.prepare_ms,
                 gpu_timing.wall_ms / block_layers);
         }
     }
