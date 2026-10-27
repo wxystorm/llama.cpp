@@ -399,10 +399,13 @@ private:
                                       llama_hybrid_stage_timing *          timing = nullptr,
                                       bool                                 task_local_graph_outputs = false,
                                       bool                                 pc_phone_overlap = false,
-                                      std::unique_lock<std::mutex> *       phone_pc_gate = nullptr,
-                                      int64_t *                            phone_remote_begin_us = nullptr,
-                                      int64_t *                            phone_remote_end_us = nullptr,
-                                      ggml_backend_t                       strict_compute_backend = nullptr);
+                                      std::unique_lock<std::mutex> *       ring_prepare_gate = nullptr,
+                                      int64_t *                            lane_compute_begin_us = nullptr,
+                                      int64_t *                            lane_compute_end_us = nullptr,
+                                      ggml_backend_t                       strict_compute_backend = nullptr,
+                                      int                                  ring_lane = -1,
+                                      std::unique_lock<std::mutex> *       ring_cpu_gate = nullptr,
+                                      std::unique_lock<std::mutex> *       ring_cuda_gate = nullptr);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
@@ -510,19 +513,27 @@ private:
     // Region Ring opt-in resource isolation. CPU and CUDA get independent
     // scheduler/graph allocation state. The CPU worker is strictly CPU-only.
     // GGML requires the GPU Scheduler to retain CPU as its final backend, so
-    // GPU compute ownership is enforced by rejecting every non-CUDA split
-    // before execution. The Phone stage retains sched/gf_res_prev for final
-    // logits extraction. Backend objects and KV ctx remain shared.
+    // GPU compute ownership is enforced by rejecting every non-CUDA split.
+    // A short PREPARE gate protects graph/scheduler mutation; CPU and CUDA
+    // compute are protected independently. Phone detaches after input prepare.
+    // Backend objects and KV storage remain shared.
     struct region_ring_worker_resource {
         ggml_backend_sched_ptr sched;
         llm_graph_result_ptr   res;
     };
     std::array<region_ring_worker_resource, 2> region_ring_worker_resources;
 
-    // Both auxiliary schedulers and the canonical Phone scheduler still hold
-    // the same backend_ptrs. During the ownership experiment, serialize the
-    // entire graph prepare/compute/sync until backend-specific contexts and
-    // safe per-backend locks exist. This is NOT parallel GGML execution.
+    // Threaded Region Ring lock hierarchy:
+    //   CPU lane   : CPU gate -> PREPARE gate -> CPU compute/sync
+    //   GPU lane   : CPU gate -> CUDA gate -> PREPARE gate; release CPU/PREPARE
+    //                before CUDA compute/sync
+    //   Phone lane : CPU gate -> PREPARE gate; release both before Meta/RPC
+    // The short PREPARE gate protects graph/scheduler mutation. CPU and CUDA
+    // compute then run under disjoint backend locks. The legacy broad gate is
+    // retained for non-overlap/serial ownership paths.
+    std::mutex region_ring_prepare_mutex;
+    std::mutex region_ring_cpu_execution_mutex;
+    std::mutex region_ring_cuda_execution_mutex;
     std::mutex region_ring_backend_execution_mutex;
 
     bool sched_need_reserve = true;
