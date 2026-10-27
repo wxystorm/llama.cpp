@@ -3912,6 +3912,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             size_t completed = 0;
             size_t failures = 0;
             int64_t wall_us = 0;
+            int64_t prepare_us = 0;
+            int64_t h2d_us = 0;
             size_t upload_bytes = 0;
             size_t cache_hit_bytes = 0;
         };
@@ -4036,6 +4038,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 ggml_status prefetch_status = GGML_STATUS_SUCCESS;
                 llm_graph_result * prefetch_result = nullptr;
+                const int64_t prepare_begin_us = ggml_time_us();
                 {
                     std::unique_lock<std::mutex> prepare_gate(
                         region_ring_prepare_mutex);
@@ -4046,6 +4049,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         prefetch_status, false,
                         &prefetch_stage, 0, true, false);
                 }
+                const int64_t prepare_us =
+                    ggml_time_us() - prepare_begin_us;
                 if (prefetch_result == nullptr ||
                         prefetch_status != GGML_STATUS_SUCCESS) {
                     return fail_prefetch(
@@ -4075,6 +4080,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         "TRANSFER_BACKEND", GGML_STATUS_FAILED);
                 }
 
+                const int64_t h2d_begin_us = ggml_time_us();
                 for (int split = 0; split < n_splits; ++split) {
                     prefetch_status =
                         ggml_backend_sched_prepare_split_weights_async(
@@ -4095,6 +4101,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 ggml_backend_synchronize(
                     region_ring_cuda_transfer_backend.get());
+                const int64_t h2d_us =
+                    ggml_time_us() - h2d_begin_us;
                 gpu_prefetch_kv_view->clear_stage_range();
 
                 // Publication to the GPU worker happens only after the caller
@@ -4107,6 +4115,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 const int64_t prefetch_us =
                     ggml_time_us() - prefetch_begin_us;
                 gpu_prefetch_stats.wall_us += prefetch_us;
+                gpu_prefetch_stats.prepare_us += prepare_us;
+                gpu_prefetch_stats.h2d_us += h2d_us;
                 gpu_prefetch_stats.upload_bytes += upload_bytes;
                 gpu_prefetch_stats.cache_hit_bytes += cache_hit_bytes;
                 ++gpu_prefetch_stats.completed;
@@ -4116,11 +4126,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "worker=CPU_DEDICATED region=%zu bank=%c "
                     "source_region=%s reason=%s splits=%d "
                     "upload_mib=%.3f cache_hit_mib=%.3f "
+                    "prepare_ms=%.3f h2d_ms=%.3f "
                     "wall_ms=%.3f status=READY\n",
                     region, bank_index == 0 ? 'A' : 'B',
                     source_text.c_str(), reason, n_splits,
                     upload_bytes / 1048576.0,
                     cache_hit_bytes / 1048576.0,
+                    prepare_us / 1000.0,
+                    h2d_us / 1000.0,
                     prefetch_us / 1000.0);
                 return true;
             };
@@ -4880,13 +4893,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[REGION_RING_GPU_WEIGHT_PREFETCH_SUM] "
                 "worker=CPU_DEDICATED started=%zu completed=%zu "
                 "failures=%zu upload_mib=%.3f cache_hit_mib=%.3f "
-                "copy_wall_ms=%.3f gpu_wait_ms=%.3f "
+                "prepare_ms=%.3f h2d_ms=%.3f "
+                "other_ms=%.3f copy_wall_ms=%.3f gpu_wait_ms=%.3f "
                 "thread_started=%d thread_joined=%d status=%s\n",
                 gpu_prefetch_stats.started,
                 gpu_prefetch_stats.completed,
                 gpu_prefetch_stats.failures,
                 gpu_prefetch_stats.upload_bytes / 1048576.0,
                 gpu_prefetch_stats.cache_hit_bytes / 1048576.0,
+                gpu_prefetch_stats.prepare_us / 1000.0,
+                gpu_prefetch_stats.h2d_us / 1000.0,
+                std::max<int64_t>(
+                    0,
+                    gpu_prefetch_stats.wall_us -
+                        gpu_prefetch_stats.prepare_us -
+                        gpu_prefetch_stats.h2d_us) / 1000.0,
                 gpu_prefetch_stats.wall_us / 1000.0,
                 worker_states[1].weight_prefetch_wait_us / 1000.0,
                 gpu_prefetch_worker_started ? 1 : 0,
