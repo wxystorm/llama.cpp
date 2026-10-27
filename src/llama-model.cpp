@@ -2129,7 +2129,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pc_layer_backends.front() == llama_pc_layer_backend::CUDA) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_INPUT_PLACEMENT] backend=CPU "
-            "reason=Q4K_GET_ROWS_CPU_PREFIX next=CUDA status=READY\n");
+            "reason=Q4K_GET_ROWS_FULL_BATCH_PRELUDE next=CUDA "
+            "status=READY\n");
     }
 
     // assign the repeating layers to the devices according to the splits
