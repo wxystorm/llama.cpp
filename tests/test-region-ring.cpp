@@ -339,17 +339,22 @@ static void test_failure_and_wakeup() {
 }
 
 
-static void test_output_window_credits() {
+static void test_dynamic_slot_pool() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 64, 2);
-    check(ready.output_window() == 2, "window credit mode not enabled");
+    check(ready.slot_pool_size() == 2, "dynamic slot pool not enabled");
 
     const auto first = ready.try_take(llama_region_ring_device::CPU);
     check(first && first->region == 0 && first->chunk == 0, "CPU R0C0 unavailable");
+    check(first->input_slot == -1 && first->output_slot >= 0,
+          "R0C0 did not receive a dynamic output lease");
+    const int first_slot = first->output_slot;
     check(ready.live_output_slots() == 1, "R0C0 output lease not reserved");
     ready.complete(*first);
     const auto second = ready.try_take(llama_region_ring_device::CPU);
     check(second && second->region == 0 && second->chunk == 1, "CPU R0C1 unavailable");
+    check(second->output_slot >= 0 && second->output_slot != first_slot,
+          "R0C1 reused a live output slot");
     ready.complete(*second);
     check(ready.live_output_slots() == 2, "expected two R0 output slots in use");
     check(!ready.try_take(llama_region_ring_device::CPU).has_value(),
@@ -357,12 +362,16 @@ static void test_output_window_credits() {
 
     const auto gpu = ready.try_take(llama_region_ring_device::GPU);
     check(gpu && gpu->region == 1 && gpu->chunk == 0, "GPU R1C0 unavailable");
+    check(gpu->input_slot == first_slot && gpu->output_slot >= 0,
+          "GPU did not inherit the producer's dynamic slot lease");
     check(ready.live_output_slots() == 3,
           "GPU must retain the reading upstream slot while producing its own output");
     ready.complete(*gpu);
     const auto resumed = ready.try_take(llama_region_ring_device::CPU);
     check(resumed && resumed->region == 0 && resumed->chunk == 2,
           "R0C2 did not resume after downstream released the credit");
+    check(resumed->output_slot >= 0,
+          "R0C2 did not acquire a freed slot dynamically");
     ready.complete(*resumed);
 
     // In single-thread execution a blocked queue head must not block
@@ -384,12 +393,12 @@ static void test_output_window_credits() {
         }
         check(progress, "credit blocked all devices without a running task");
     }
-    check(completed == 54 && !ready.failed(), "window credits lost tasks");
+    check(completed == 54 && !ready.failed(), "dynamic slot pool lost tasks");
     check(ready.live_output_slots() == 0, "credits remained after full drain");
 }
 
 static void test_window_parallel_mock_workers() {
-    // Tests READY, WRITING, READING, FREE and wakeups concurrently.
+    // Tests dynamic slot leases plus READY/WRITING/READING/FREE wakeups.
     // NO concurrent llama.cpp or GGML graphs are executed here.
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 358, 64, 2);
@@ -433,7 +442,7 @@ static void test_window_parallel_mock_workers() {
     for (auto & worker : workers) {
         worker.join();
     }
-    check(failures.load() == 0, "concurrent window credit mock failed");
+    check(failures.load() == 0, "concurrent slot-pool credit mock failed");
     check(ready.all_done() && ready.finished() == 54, "window mock did not finish");
     check(ready.live_output_slots() == 0, "window mock leaked output credits");
 }
@@ -525,8 +534,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] parallel_scheduler=PASS\n");
         test_failure_and_wakeup();
         std::fprintf(stderr, "[REGION_RING_TEST] failure=PASS\n");
-        test_output_window_credits();
-        std::fprintf(stderr, "[REGION_RING_TEST] window_credits=PASS\n");
+        test_dynamic_slot_pool();
+        std::fprintf(stderr, "[REGION_RING_TEST] dynamic_slot_pool=PASS\n");
         test_window_parallel_mock_workers();
         std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
         test_window_failure_wakes_workers();

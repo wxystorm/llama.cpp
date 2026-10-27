@@ -3104,15 +3104,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             pc_phone_overlap ? "MEASURED" : "0");
     }
     const int chunk_tokens = stages.front().macro_tokens;
-    const size_t output_window = own_stage_resources ? 2 : 0;
+    // Keep the current capacity at two for this first semantic change. The
+    // slots themselves are now dynamically leased; no chunk % capacity binding
+    // remains. Capacity can be raised independently after this path is verified.
+    const size_t slot_pool_size = own_stage_resources ? 2 : 0;
     llama_region_ring_ready ready(
-        regions, (int) ubatch.n_tokens, chunk_tokens, output_window);
+        regions, (int) ubatch.n_tokens, chunk_tokens, slot_pool_size);
 
-    // In ownership mode each producer edge has exactly two fixed host slots.
-    // The ready queue owns the corresponding FREE/WRITING/READY/READING credit.
-    // A slot is not released until the downstream Region has fully consumed it.
+    // Each producer edge owns a small dynamic host-slot pool. Producers take
+    // any FREE slot; consumers locate the READY slot by chunk id. A slot is
+    // released only after the downstream Region has fully consumed it.
     const size_t host_tokens_per_edge = own_stage_resources ?
-        output_window * (size_t) chunk_tokens : (size_t) ubatch.n_tokens;
+        slot_pool_size * (size_t) chunk_tokens : (size_t) ubatch.n_tokens;
     std::vector<std::vector<float>> outputs(ready.n_regions() - 1);
     for (auto & hidden : outputs) {
         hidden.resize((size_t) n_embd * host_tokens_per_edge);
@@ -3141,9 +3144,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
         LLAMA_LOG_ERROR(
-            "[REGION_RING_OWNERSHIP] window=%zu slots_per_edge=%zu "
-            "kv_views=3 kv_storage=SHARED backend=%s "
-            "graph_threads=%s status=READY\n", output_window, output_window,
+            "[REGION_RING_OWNERSHIP] slot_pool=%zu assignment=DYNAMIC "
+            "slots_per_edge=%zu kv_views=3 kv_storage=SHARED backend=%s "
+            "graph_threads=%s status=READY\n", slot_pool_size, slot_pool_size,
             pc_phone_overlap ? "PC_GATE_PLUS_META" : "SHARED_GATED",
             pc_phone_overlap ? "PC_PLUS_PHONE" : "1");
     }
@@ -3179,9 +3182,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_PLAN] workers=3 fifo=PER_DEVICE "
-            "kv_views=PER_DEVICE window=%zu backend=%s "
+            "kv_views=PER_DEVICE slot_pool=%zu assignment=DYNAMIC backend=%s "
             "graph_overlap=%s status=READY\n",
-            output_window,
+            slot_pool_size,
             pc_phone_overlap ? "PC_GATE_PLUS_META" : "SHARED_GATED",
             pc_phone_overlap ? "MEASURED" : "0");
         // The device FIFO and the host slots are concurrent; the actual
@@ -3231,12 +3234,33 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const bool first = task.region == 0;
                     const bool last = task.region + 1 == stages.size();
                     const auto & stage = stages[task.region];
-                    const size_t host_token_begin =
-                        (task.chunk % output_window) * (size_t) chunk_tokens;
+                    if (own_stage_resources &&
+                        ((!first && task.input_slot < 0) ||
+                         (!last && task.output_slot < 0))) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_SLOT] event=REJECT region=%zu chunk=%zu "
+                            "input_slot=%d output_slot=%d reason=MISSING_LEASE\n",
+                            task.region, task.chunk,
+                            task.input_slot, task.output_slot);
+                        ready.fail(task);
+                        state.status = GGML_STATUS_FAILED;
+                        active_task.reset();
+                        break;
+                    }
+                    const size_t input_host_token_begin = first ? 0 :
+                        own_stage_resources ?
+                            (size_t) task.input_slot * (size_t) chunk_tokens :
+                            (size_t) task.token_begin;
+                    const size_t output_host_token_begin = last ? 0 :
+                        own_stage_resources ?
+                            (size_t) task.output_slot * (size_t) chunk_tokens :
+                            (size_t) task.token_begin;
                     float * input = first ? nullptr :
-                        outputs[task.region - 1].data() + host_token_begin * n_embd;
+                        outputs[task.region - 1].data() +
+                            input_host_token_begin * n_embd;
                     float * output = last ? nullptr :
-                        outputs[task.region].data() + host_token_begin * n_embd;
+                        outputs[task.region].data() +
+                            output_host_token_begin * n_embd;
 
                     int32_t block_outputs = 0;
                     if (last) {
@@ -3247,8 +3271,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                     LLAMA_LOG_DEBUG(
                         "[REGION_RING_WORKER] device=%s event=CLAIM "
-                        "region=%zu chunk=%zu tokens=%d\n",
-                        name, task.region, task.chunk, task.n_tokens);
+                        "region=%zu chunk=%zu tokens=%d input_slot=%d output_slot=%d\n",
+                        name, task.region, task.chunk, task.n_tokens,
+                        task.input_slot, task.output_slot);
 
                     ggml_status task_status = GGML_STATUS_SUCCESS;
                     llm_graph_result * task_result = nullptr;
@@ -3475,11 +3500,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[REGION_RING_PC_PHONE_SUM] cpu_intervals=%zu gpu_intervals=%zu "
                 "phone_intervals=%zu overlap_ms=%.3f pc_gate=CPU_CUDA "
                 "phone_compute=DETACHED phone_prepare=PC_GATE "
-                "window=%zu status=%s\n",
+                "slot_pool=%zu status=%s\n",
                 worker_states[0].compute_intervals.size(),
                 worker_states[1].compute_intervals.size(),
                 worker_states[2].compute_intervals.size(),
-                pc_phone_overlap_us / 1000.0, output_window,
+                pc_phone_overlap_us / 1000.0, slot_pool_size,
                 ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
         }
         if (audit_backend_resources) {
@@ -3530,13 +3555,29 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool first = task.region == 0;
         const bool last = task.region + 1 == stages.size();
         const auto & stage = stages[task.region];
-        const size_t host_token_begin = own_stage_resources ?
-            (task.chunk % output_window) * (size_t) chunk_tokens :
-            (size_t) task.token_begin;
+        if (own_stage_resources &&
+            ((!first && task.input_slot < 0) ||
+             (!last && task.output_slot < 0))) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_SLOT] event=REJECT region=%zu chunk=%zu "
+                "input_slot=%d output_slot=%d reason=MISSING_LEASE\n",
+                task.region, task.chunk, task.input_slot, task.output_slot);
+            ready.fail(task);
+            ret = GGML_STATUS_FAILED;
+            break;
+        }
+        const size_t input_host_token_begin = first ? 0 :
+            own_stage_resources ?
+                (size_t) task.input_slot * (size_t) chunk_tokens :
+                (size_t) task.token_begin;
+        const size_t output_host_token_begin = last ? 0 :
+            own_stage_resources ?
+                (size_t) task.output_slot * (size_t) chunk_tokens :
+                (size_t) task.token_begin;
         float * input = first ? nullptr :
-            outputs[task.region - 1].data() + host_token_begin * n_embd;
+            outputs[task.region - 1].data() + input_host_token_begin * n_embd;
         float * output = last ? nullptr :
-            outputs[task.region].data() + host_token_begin * n_embd;
+            outputs[task.region].data() + output_host_token_begin * n_embd;
         int32_t block_outputs = 0;
         if (last) {
             for (int i = 0; i < task.n_tokens; ++i) {
@@ -3619,9 +3660,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (own_stage_resources) {
         const size_t live = ready.live_output_slots();
         LLAMA_LOG_ERROR(
-            "[REGION_RING_OWNERSHIP_SUM] window=%zu live_slots=%zu "
-            "finished=%zu status=%s\n",
-            output_window, live, ready.finished(),
+            "[REGION_RING_OWNERSHIP_SUM] slot_pool=%zu assignment=DYNAMIC "
+            "live_slots=%zu finished=%zu status=%s\n",
+            slot_pool_size, live, ready.finished(),
             live == 0 && ready.all_done() ? "DRAINED" : "INCOMPLETE");
         if (ret == GGML_STATUS_SUCCESS && live != 0) {
             ret = GGML_STATUS_FAILED;

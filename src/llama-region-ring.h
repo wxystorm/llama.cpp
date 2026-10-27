@@ -288,6 +288,10 @@ struct llama_region_ring_task {
     size_t chunk = 0;
     int token_begin = 0;
     int n_tokens = 0;
+    // Dynamic activation-slot leases. They are assigned only when the task is
+    // claimed; READY queue entries are not tied to chunk % capacity.
+    int input_slot = -1;
+    int output_slot = -1;
 };
 
 // Cooperative, dependency-driven per-device FIFOs.  A region's (L,C) task
@@ -298,8 +302,8 @@ class llama_region_ring_ready {
 public:
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
-            int n_tokens, int chunk_tokens, size_t output_window = 0) :
-        regions_(regions), slot_window_(output_window) {
+            int n_tokens, int chunk_tokens, size_t slot_pool_size = 0) :
+        regions_(regions), slot_pool_size_(slot_pool_size) {
         if (regions_.empty() || n_tokens <= 0 || chunk_tokens <= 0) {
             throw std::runtime_error("invalid region ring scheduler dimensions");
         }
@@ -308,8 +312,8 @@ public:
             chunk_sizes_.push_back(std::min(chunk_tokens, n_tokens - begin));
         }
         const size_t n_chunks = chunk_sizes_.size();
-        if (slot_window_ > 0 && regions_.size() > 1) {
-            output_slots_.assign(regions_.size() - 1, std::vector<output_slot>(slot_window_));
+        if (slot_pool_size_ > 0 && regions_.size() > 1) {
+            output_slots_.assign(regions_.size() - 1, std::vector<output_slot>(slot_pool_size_));
         }
         input_ready_.assign(regions_.size(), std::vector<uint8_t>(n_chunks, 0));
         state_.assign(regions_.size(), std::vector<uint8_t>(n_chunks, 0));
@@ -344,7 +348,10 @@ public:
 
     size_t n_chunks() const { return chunk_sizes_.size(); }
     size_t n_regions() const { return regions_.size(); }
-    size_t output_window() const { return slot_window_; }
+    size_t slot_pool_size() const { return slot_pool_size_; }
+    // Compatibility alias for older tests/callers; runtime semantics are a
+    // dynamic slot pool, not chunk-to-slot modulo mapping.
+    size_t output_window() const { return slot_pool_size_; }
 
     size_t live_output_slots() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -411,18 +418,28 @@ public:
             if (!valid_running_locked(task)) {
                 throw std::runtime_error("invalid region ring completion");
             }
-            if (slot_window_ > 0) {
-                // Release input credit only after this consumer has finished
-                // computation and its necessary input transfers.
+            if (slot_pool_size_ > 0) {
+                // Release the exact input lease carried by this task only
+                // after the consumer has finished all required reads.
                 if (task.region > 0) {
-                    auto & input = output_slots_[task.region - 1][task.chunk % slot_window_];
+                    if (task.input_slot < 0 ||
+                        (size_t) task.input_slot >= output_slots_[task.region - 1].size()) {
+                        throw std::runtime_error("region ring task lost its input slot lease");
+                    }
+                    auto & input =
+                        output_slots_[task.region - 1][(size_t) task.input_slot];
                     if (input.state != 3 || input.chunk != task.chunk) {
                         throw std::runtime_error("region ring input slot released before consumption");
                     }
                     input = {};
                 }
                 if (task.region + 1 < regions_.size()) {
-                    auto & output = output_slots_[task.region][task.chunk % slot_window_];
+                    if (task.output_slot < 0 ||
+                        (size_t) task.output_slot >= output_slots_[task.region].size()) {
+                        throw std::runtime_error("region ring task lost its output slot lease");
+                    }
+                    auto & output =
+                        output_slots_[task.region][(size_t) task.output_slot];
                     if (output.state != 1 || output.chunk != task.chunk) {
                         throw std::runtime_error("region ring output slot was overwritten");
                     }
@@ -490,23 +507,47 @@ private:
         uint8_t state = 0; // 0=FREE 1=WRITING 2=READY 3=READING
     };
 
-    // An output credit is owned by the producing edge (region, slot).
-    // Reusing it before the next region completes would corrupt live input.
+    // Activation buffers are a dynamic per-edge pool. A producer may use ANY
+    // free slot; a consumer looks up the READY slot that owns its chunk.
+    // This removes the artificial chunk % capacity binding while preserving
+    // bounded memory and explicit FREE/WRITING/READY/READING ownership.
+    int find_free_slot_locked(size_t edge) const {
+        if (edge >= output_slots_.size()) {
+            return -1;
+        }
+        const auto & slots = output_slots_[edge];
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].state == 0) {
+                return (int) i;
+            }
+        }
+        return -1;
+    }
+
+    int find_ready_slot_locked(size_t edge, size_t chunk) const {
+        if (edge >= output_slots_.size()) {
+            return -1;
+        }
+        const auto & slots = output_slots_[edge];
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].state == 2 && slots[i].chunk == chunk) {
+                return (int) i;
+            }
+        }
+        return -1;
+    }
+
     bool claimable_locked(const llama_region_ring_task & task) const {
-        if (slot_window_ == 0) {
+        if (slot_pool_size_ == 0) {
             return true;
         }
-        if (task.region + 1 < regions_.size()) {
-            const auto & output = output_slots_[task.region][task.chunk % slot_window_];
-            if (output.state != 0) {
-                return false;
-            }
+        if (task.region + 1 < regions_.size() &&
+            find_free_slot_locked(task.region) < 0) {
+            return false;
         }
-        if (task.region > 0) {
-            const auto & input = output_slots_[task.region - 1][task.chunk % slot_window_];
-            if (input.state != 2 || input.chunk != task.chunk) {
-                return false;
-            }
+        if (task.region > 0 &&
+            find_ready_slot_locked(task.region - 1, task.chunk) < 0) {
+            return false;
         }
         return true;
     }
@@ -527,19 +568,30 @@ private:
         if (it == queue.end()) {
             return std::nullopt;
         }
-        const auto task = *it;
+        auto task = *it;
         queue.erase(it);
         if (state_[task.region][task.chunk] != 1 ||
             (size_t) regions_[task.region].device != dev) {
             throw std::runtime_error("region ring task was claimed twice or by wrong device");
         }
-        if (slot_window_ > 0) {
+        if (slot_pool_size_ > 0) {
             if (task.region + 1 < regions_.size()) {
-                auto & output = output_slots_[task.region][task.chunk % slot_window_];
+                task.output_slot = find_free_slot_locked(task.region);
+                if (task.output_slot < 0) {
+                    throw std::runtime_error("region ring output slot disappeared while claiming");
+                }
+                auto & output =
+                    output_slots_[task.region][(size_t) task.output_slot];
                 output = {task.chunk, 1};
             }
             if (task.region > 0) {
-                auto & input = output_slots_[task.region - 1][task.chunk % slot_window_];
+                task.input_slot =
+                    find_ready_slot_locked(task.region - 1, task.chunk);
+                if (task.input_slot < 0) {
+                    throw std::runtime_error("region ring input slot disappeared while claiming");
+                }
+                auto & input =
+                    output_slots_[task.region - 1][(size_t) task.input_slot];
                 input.state = 3;
             }
         }
@@ -562,7 +614,7 @@ private:
     }
 
     const std::vector<llama_region_ring_region> regions_;
-    const size_t slot_window_ = 0; // 0: legacy unlimited output storage
+    const size_t slot_pool_size_ = 0; // 0: legacy full-ubatch output storage
     std::vector<std::vector<output_slot>> output_slots_;
     std::vector<int> chunk_begins_;
     std::vector<int> chunk_sizes_;
