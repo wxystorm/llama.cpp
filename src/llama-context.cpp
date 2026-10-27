@@ -2322,7 +2322,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool                               pc_phone_overlap,
         std::unique_lock<std::mutex> *     phone_pc_gate,
         int64_t *                          phone_remote_begin_us,
-        int64_t *                          phone_remote_end_us) {
+        int64_t *                          phone_remote_end_us,
+        ggml_backend_t                     strict_compute_backend) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2363,6 +2364,34 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
+
+    // A GPU Scheduler must retain CPU as its final backend because that is a
+    // hard ggml_backend_sched_new() contract. For strict GPU Regions, reject
+    // any graph whose actual compute split targets that CPU fallback. This is
+    // checked after graph allocation/splitting but BEFORE compute.
+    if (strict_compute_backend != nullptr) {
+        for (int split = 0; split < n_splits; ++split) {
+            ggml_backend_t target =
+                ggml_backend_sched_get_split_backend(sched_use, split);
+            if (target != strict_compute_backend) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
+                    "split=%d/%d expected=%s actual=%s "
+                    "status=REJECT reason=COMPUTE_BACKEND_FALLBACK\n",
+                    stage_index, block_index, split, n_splits,
+                    ggml_backend_name(strict_compute_backend),
+                    target ? ggml_backend_name(target) : "NULL");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_STRICT_BACKEND] stage=%zu block=%zu "
+            "splits=%d compute=%s status=PASS\n",
+            stage_index, block_index, n_splits,
+            ggml_backend_name(strict_compute_backend));
+    }
+
     const int64_t compute_begin_us = timing != nullptr ? ggml_time_us() : 0;
     const bool detached_phone = pc_phone_overlap && phone_pc_gate != nullptr;
     if (detached_phone) {
@@ -2881,9 +2910,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // This first concurrent mode is supported only for the validated
             // outer topology Meta(CPU,RPC0), CUDA0, CPU. No replacement of
             // GGML model weights and no new Meta instance. CPU Regions use a
-            // CPU-only auxiliary Scheduler and GPU Regions use a CUDA0-only
-            // auxiliary Scheduler. Any unsupported CUDA op must fail closed
-            // here instead of silently falling back to the host.
+            // CPU-only auxiliary Scheduler. GGML requires every Scheduler to
+            // end in a CPU backend, so the GPU Scheduler is [CUDA0,CPU], but
+            // GPU Region compute is validated to target CUDA0 only before any
+            // split is executed. CPU is a scheduler sentinel, not a compute
+            // fallback in this validation mode.
             const bool topology_ok = backend_ptrs.size() == 3 &&
                 ggml_backend_is_meta(backend_ptrs[0]) &&
                 backend_ptrs[1] != nullptr &&
@@ -2905,7 +2936,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // In overlap mode, make the Plan's C/G labels strict executable
             // semantics rather than scheduler hints:
             //   CPU worker -> [CPU] only
-            //   GPU worker -> [CUDA0] only
+            //   GPU worker -> [CUDA0, CPU] scheduler contract, CUDA0 compute only
             // Phone keeps the canonical scheduler in ring_sched[2].
             size_t start = 0;
             size_t count = backend_ptrs.size();
@@ -2919,9 +2950,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     policy = "CPU_ONLY";
                 } else {
                     start = 1;
-                    count = 1;
-                    scheduler_offload = false;
-                    policy = "CUDA_ONLY";
+                    count = 2;
+                    scheduler_offload = cparams.op_offload;
+                    policy = "CUDA_ONLY_VALIDATED";
                 }
             }
 
@@ -2969,8 +3000,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                      ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_cpu);
                 const bool gpu_policy_ok =
                     dev != 1 ||
-                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 1 &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1]);
+                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 2 &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1] &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 1) == backend_cpu);
                 if (!cpu_policy_ok || !gpu_policy_ok) {
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_PC_SCHED] worker=%s policy=%s "
@@ -3043,11 +3075,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
     if (task_local_graph_outputs) {
-        // CPU and GPU auxiliary schedulers are now disjoint ([CPU] vs
-        // [CUDA0]), but the canonical Phone scheduler still references the
-        // outer Meta/CUDA0/CPU handles. Keep the existing global execution
-        // gate for this CUDA-only validation step; gate splitting is a
-        // separate change after backend ownership is proven.
+        // CPU auxiliary Scheduler is [CPU]. GPU Scheduler must be
+        // [CUDA0,CPU] because GGML requires CPU as the final backend, but GPU
+        // Region compute is rejected before execution if any split targets
+        // CPU. Keep the existing global execution gate for this validation;
+        // gate splitting is a separate change after compute ownership is proven.
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t backend = backend_ptrs[i];
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -3302,7 +3334,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 block_outputs, worker_apply_mctx, true,
                                 task_status, nullptr, true, pc_phone_overlap,
                                 pc_phone_overlap && dev == 2 ? &backend_lock : nullptr,
-                                &phone_remote_begin_us, &phone_remote_end_us);
+                                &phone_remote_begin_us, &phone_remote_end_us,
+                                pc_phone_overlap && dev == 1 ?
+                                    backend_ptrs[1] : nullptr);
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us += compute_end_us - compute_begin_us;
                             if (pc_phone_overlap && task_result != nullptr &&
@@ -3329,8 +3363,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     uint64_t split_mask = local_mask & (UINT64_C(1) << 63);
                                     // Convert per-Scheduler bits into original
                                     // [Meta,CUDA0,CPU] indices for consistent
-                                    // A/B audit. CPU Scheduler is [CPU];
-                                    // GPU Scheduler is [CUDA0].
+                                    // A/B audit. CPU Scheduler is [CPU].
+                                    // GPU Scheduler is [CUDA0,CPU] by GGML
+                                    // contract, with compute validated CUDA-only.
                                     const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
                                     for (int b = 0; b < n_local; ++b) {
                                         if ((local_mask & (UINT64_C(1) << b)) == 0) {
