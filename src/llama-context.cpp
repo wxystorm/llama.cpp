@@ -3343,7 +3343,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
         LLAMA_LOG_ERROR(
-            "[REGION_RING_OWNERSHIP] slot_pool=%zu assignment=DYNAMIC "
+            "[REGION_RING_OWNERSHIP] activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu "
             "slots_per_edge=%zu kv_views=3 kv_storage=SHARED backend=%s "
             "graph_threads=%s status=READY\n", slot_pool_size, slot_pool_size,
             pc_phone_overlap ? "PREPARE_PLUS_CPU_CUDA_META" : "SHARED_GATED",
@@ -3381,7 +3381,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_PLAN] workers=3 fifo=PER_DEVICE "
-            "kv_views=PER_DEVICE slot_pool=%zu assignment=DYNAMIC backend=%s "
+            "kv_views=PER_DEVICE activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu backend=%s "
             "graph_overlap=%s status=READY\n",
             slot_pool_size,
             pc_phone_overlap ? "PREPARE_PLUS_CPU_CUDA_META" : "SHARED_GATED",
@@ -3941,7 +3941,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (own_stage_resources) {
         const size_t live = ready.live_output_slots();
         LLAMA_LOG_ERROR(
-            "[REGION_RING_OWNERSHIP_SUM] slot_pool=%zu assignment=DYNAMIC "
+            "[REGION_RING_OWNERSHIP_SUM] activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu "
             "live_slots=%zu finished=%zu status=%s\n",
             slot_pool_size, live, ready.finished(),
             live == 0 && ready.all_done() ? "DRAINED" : "INCOMPLETE");
@@ -5021,7 +5021,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
-            "layout=%s chunk=%d slot_pool=%zu assignment=DYNAMIC "
+            "layout=%s chunk=%d activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%zu "
             "status=CONSISTENT\n",
             plan_mode,model.hybrid_ring_plan_layout.c_str(),
             region_ring_chunk_tokens,LLAMA_REGION_RING_SLOT_POOL_SIZE);

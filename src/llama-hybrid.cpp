@@ -8606,7 +8606,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "enumerated=%zu profiled=%zu simulated=%zu "
                 "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
                 "baseline_ms=%.3f valid=%d cycles=3 chunk=%d "
-                "slot_pool=%d assignment=DYNAMIC "
+                "activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%d "
                 "coarse=MINIMAX_RING_ERROR "
                 "objective=MIN_PREFILL_WALL_FIFO\n",
                 free_result.enumerated, free_result.profiled,
@@ -8876,7 +8876,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_PLAN_SUPPORTED_SEARCH] "
             "enumerated=%zu simulated=%zu reject_memory=%zu "
             "reject_profile=%zu baseline_ms=%.3f valid=%d "
-            "phone_layout=FIXED_11_27_43 chunk=%d slot_pool=%d assignment=DYNAMIC\n",
+            "phone_layout=FIXED_11_27_43 chunk=%d activation_buffer=FULL_BATCH_PER_EDGE slot_limit=NONE legacy_slot_pool=%d\n",
             supported.enumerated,supported.simulated,
             supported.rejected_memory,supported.rejected_profile,
             supported.baseline_valid ?

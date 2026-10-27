@@ -150,10 +150,11 @@ struct event {
     }
 };
 
-// Simulate the current runtime contract: per-device FIFO queues may skip
-// credit-blocked READY tasks, per-region KV order is strict, and a producer
-// activation Slot stays leased until every downstream consumer that reads it
-// has finished. Boundary transfers are modeled as explicit link events.
+// Simulate the current runtime contract: per-device FIFO queues preserve
+// strict per-region KV order while boundary activations live in full-ubatch
+// storage with no producer-credit limit. A non-zero slot_pool is retained
+// only for bounded-slot regression tests. Boundary transfers are explicit
+// link events.
 inline bool simulate(const model & m,
                      const std::vector<llama_region_ring_region> & regions,
                      candidate & c, std::string * reason = nullptr) {
