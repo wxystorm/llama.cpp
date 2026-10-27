@@ -2006,6 +2006,67 @@ static void ggml_backend_sched_debug_tensor(
         n > 6 ? data[6] : 0.0f, n > 7 ? data[7] : 0.0f);
 }
 
+enum ggml_status ggml_backend_sched_prepare_split_weights_async(
+        ggml_backend_sched_t sched, int split_id,
+        ggml_backend_t upload_backend) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(upload_backend);
+    GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
+    GGML_ASSERT(sched->weight_cache_enabled);
+
+    struct ggml_backend_sched_split * split = &sched->splits[split_id];
+    const int split_backend_id = split->backend_id;
+    ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+    // The transfer backend is a second backend instance for the same device.
+    // Its independent stream may upload Bank weights while the normal backend
+    // computes from the other Bank.
+    if (ggml_backend_get_device(upload_backend) !=
+            ggml_backend_get_device(split_backend)) {
+        return GGML_STATUS_FAILED;
+    }
+
+    sched->last_weight_upload_bytes = 0;
+    sched->last_weight_cache_hit_bytes = 0;
+
+    for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
+        ggml_tensor * input = split->inputs[input_id];
+        const bool immutable_host_weight =
+            input->buffer != NULL &&
+            ggml_backend_buffer_get_usage(input->buffer) ==
+                GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+            ggml_backend_buffer_is_host(input->buffer);
+        if (!immutable_host_weight) {
+            continue;
+        }
+
+        ggml_tensor * input_cpy =
+            tensor_copy(input, split_backend_id, sched->cur_copy);
+        if (input_cpy == nullptr) {
+            return GGML_STATUS_FAILED;
+        }
+
+        if (weight_copy_valid(
+                input, split_backend_id, sched->cur_copy) != 0) {
+            sched->last_weight_cache_hit_bytes += ggml_nbytes(input);
+            continue;
+        }
+
+        // Canonical model weights are immutable host storage. No producer
+        // backend synchronization is needed. Enqueue H2D directly on the
+        // dedicated transfer backend stream; the Region Ring prefetch worker
+        // synchronizes that stream before publishing the Bank as loaded.
+        ggml_backend_tensor_set_async(
+            upload_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+
+        weight_copy_valid(
+            input, split_backend_id, sched->cur_copy) = 1;
+        sched->last_weight_upload_bytes += ggml_nbytes(input);
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
