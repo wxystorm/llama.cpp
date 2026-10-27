@@ -349,7 +349,8 @@ private:
                                       const llama_hybrid_runtime_stage * stage = nullptr,
                                       int32_t                  outputs_override = -1,
                                       bool                     force_hidden_input = false,
-                                      bool                     embedding_only = false);
+                                      bool                     embedding_only = false,
+                                      bool                     preserve_weight_cache_on_reset = false);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,
@@ -414,7 +415,8 @@ private:
                                       std::unique_lock<std::mutex> *       ring_cuda_gate = nullptr,
                                       int64_t *                            ring_prepare_wait_us = nullptr,
                                       int64_t *                            ring_cpu_wait_us = nullptr,
-                                      int64_t *                            ring_cuda_wait_us = nullptr);
+                                      int64_t *                            ring_cuda_wait_us = nullptr,
+                                      bool                                 preserve_weight_cache_on_graph_reset = false);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
