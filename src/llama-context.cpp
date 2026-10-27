@@ -3484,10 +3484,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_WEIGHT] phase=BANK_INIT banks=2 "
                 "canonical=CPU destination=CUDA "
-                "eviction=ROLLING_PARITY load=%s cache=PERSISTENT "
-                "prefetch_min_tokens=%d demand_fallback=1 status=READY\n",
+                "eviction=%s load=%s cache=PERSISTENT "
+                "prefetch_min_tokens=%d demand_fallback=%d status=READY\n",
+                gpu_weight_prefetch ? "NONE" : "LRU",
                 gpu_weight_prefetch ? "LOOKAHEAD_2" : "DEMAND",
-                gpu_prefetch_min_tokens);
+                gpu_prefetch_min_tokens,
+                gpu_weight_prefetch ? 0 : 1);
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -4263,13 +4265,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             } catch (const std::exception & e) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                    "event=LAUNCH_FAIL reason=%s fallback=DEMAND_LOAD\n",
+                    "event=LAUNCH_FAIL reason=%s action=FAIL_PREFETCH\n",
                     e.what());
             } catch (...) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
                     "event=LAUNCH_FAIL reason=UNKNOWN "
-                    "fallback=DEMAND_LOAD\n");
+                    "action=FAIL_PREFETCH\n");
             }
 
             if (!gpu_prefetch_worker_started) {
