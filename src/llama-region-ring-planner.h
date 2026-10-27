@@ -1282,24 +1282,10 @@ inline result search_runtime_applicable(
         return out;
     }
 
-    std::sort(
-        coarse.begin(), coarse.end(),
-        [](const candidate & a, const candidate & b) {
-            // APPLY_WIDE is a performance planner. Let measured/interpolated
-            // compute, transfer and weight-H2D profiles determine which
-            // candidates deserve exact simulation. Ring mismatch remains a
-            // useful explanation/tie-breaker, but no longer vetoes a layout
-            // that may have a lower end-to-end wall time.
-            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
-                return a.coarse_ms < b.coarse_ms;
-            }
-            if (std::abs(a.ring_error_max -
-                         b.ring_error_max) > 1e-12) {
-                return a.ring_error_max < b.ring_error_max;
-            }
-            return a.ring_error_mean < b.ring_error_mean;
-        });
-
+    // The minimax ring error is the first-stage physical filter.  Do not
+    // let a lower-bound wall estimate or topology-family quota override it:
+    // every profile-feasible candidate inside the E window is cheap enough to
+    // run through the full prompt event simulator.
     out.coarse_e_min = std::numeric_limits<double>::infinity();
     for (const auto & plan : coarse) {
         out.coarse_e_min =
@@ -1308,69 +1294,27 @@ inline result search_runtime_applicable(
     out.coarse_e_limit =
         std::min(1.0, out.coarse_e_min + e_margin);
 
-    const auto exact_key = [](const candidate & c) {
-        return std::make_tuple(
-            c.cycles, c.c, c.g, c.p,
-            c.xc, c.xg, c.xp);
-    };
-    const auto family_key = [](const candidate & c) {
-        return std::make_tuple(c.cycles, c.c, c.g, c.p);
-    };
+    std::sort(
+        coarse.begin(), coarse.end(),
+        [](const candidate & a, const candidate & b) {
+            if (std::abs(a.ring_error_max -
+                         b.ring_error_max) > 1e-12) {
+                return a.ring_error_max < b.ring_error_max;
+            }
+            if (std::abs(a.coarse_ms - b.coarse_ms) > 1e-9) {
+                return a.coarse_ms < b.coarse_ms;
+            }
+            return a.ring_error_mean < b.ring_error_mean;
+        });
 
     std::vector<candidate> shortlist;
-    shortlist.reserve((size_t) max_simulations);
-    std::vector<std::tuple<int,int,int,int>> families;
-
-    // First give every topology family its best profile-derived candidate.
-    // This is the important "is another GPU layer worth it?" comparison:
-    // G5/G6/G7 families all reach the exact event simulator instead of being
-    // discarded by E before H2D hiding and compute savings can be evaluated.
+    shortlist.reserve(coarse.size());
     for (const auto & plan : coarse) {
-        if ((int) shortlist.size() >= max_simulations) {
+        if (plan.ring_error_max >
+                out.coarse_e_limit + 1e-12) {
             break;
         }
-        const auto family = family_key(plan);
-        if (std::find(
-                families.begin(), families.end(),
-                family) != families.end()) {
-            continue;
-        }
-        families.push_back(family);
         shortlist.push_back(plan);
-    }
-
-    // Then spend the remaining exact-simulation budget on the next-best
-    // chunk variants by profile lower bound.
-    for (const auto & plan : coarse) {
-        if ((int) shortlist.size() >= max_simulations) {
-            break;
-        }
-        if (std::any_of(
-                shortlist.begin(), shortlist.end(),
-                [&](const candidate & x) {
-                    return exact_key(x) == exact_key(plan);
-                })) {
-            continue;
-        }
-        shortlist.push_back(plan);
-    }
-
-    const int floor_count =
-        std::min(max_simulations, std::max(0, min_simulations));
-    if ((int) shortlist.size() < floor_count) {
-        for (const auto & plan : coarse) {
-            if ((int) shortlist.size() >= floor_count) {
-                break;
-            }
-            if (std::any_of(
-                    shortlist.begin(), shortlist.end(),
-                    [&](const candidate & x) {
-                        return exact_key(x) == exact_key(plan);
-                    })) {
-                continue;
-            }
-            shortlist.push_back(plan);
-        }
     }
 
     out.shortlisted = shortlist.size();
