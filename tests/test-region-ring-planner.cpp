@@ -228,6 +228,65 @@ int main() {
     REQUIRE(general.selected.max_live_slots <= m.slot_pool);
     REQUIRE(!search_supported_topology(general_profile,128).valid);
 
+    // Two-Bank GPU weight streaming: logical GPU ownership is not a
+    // residency limit. Four GPU Regions may own far more total weight than
+    // either Bank while only the largest even/odd GPU Region must coexist.
+    {
+        model streamed = mock_profile();
+        streamed.gpu_weight_streaming = true;
+        streamed.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                // Deliberately make later Regions larger so parity matters.
+                bytes = (size_t) (end - begin) * 1000 +
+                        (size_t) begin * 10;
+                return true;
+            };
+        streamed.gpu_weight_h2d_ms =
+            [](size_t bytes, double & ms) {
+                ms = (double) bytes / 1000.0;
+                return true;
+            };
+
+        candidate streamed_plan;
+        streamed_plan.cycles = 4;
+        streamed_plan.c = 4;
+        streamed_plan.g = 4;
+        streamed_plan.p = 4;
+        streamed_plan.xc = 64;
+        streamed_plan.xg = 16;
+        streamed_plan.xp = 128;
+
+        std::vector<llama_region_ring_region> streamed_regions;
+        REQUIRE(make_regions(
+            streamed_plan, streamed.layers, streamed_regions));
+        std::array<size_t, 2> bank_peaks {};
+        size_t total_gpu_weight = 0;
+        REQUIRE(gpu_weight_bank_peaks(
+            streamed, streamed_regions, bank_peaks,
+            &total_gpu_weight));
+        REQUIRE(bank_peaks[0] > 0 && bank_peaks[1] > 0);
+        REQUIRE(total_gpu_weight >
+                bank_peaks[0] + bank_peaks[1]);
+
+        double expected_h2d = 0.0;
+        REQUIRE(gpu_weight_h2d_total(
+            streamed, streamed_regions, expected_h2d));
+        REQUIRE(expected_h2d > 0.0);
+
+        std::string streamed_reason;
+        REQUIRE(simulate(
+            streamed, streamed_regions, streamed_plan,
+            &streamed_reason));
+        REQUIRE(std::fabs(
+            streamed_plan.weight_h2d_busy_ms -
+            expected_h2d) < 1e-9);
+        REQUIRE(streamed_plan.wall_ms >=
+                streamed_plan.weight_h2d_busy_ms / 2.0);
+    }
+
     // APPLY_WIDE may change cycle count and independent chunks, but every
     // selected candidate must end on Phone with no tail so the current final
     // output owner remains canonical.
