@@ -2880,7 +2880,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (pc_phone_overlap) {
             // This first concurrent mode is supported only for the validated
             // outer topology Meta(CPU,RPC0), CUDA0, CPU. No replacement of
-            // GGML model weights, no new Meta instance and no CPU-only path.
+            // GGML model weights and no new Meta instance. CPU Regions use a
+            // CPU-only auxiliary Scheduler; GPU Regions keep CUDA0+CPU so
+            // unsupported CUDA ops may still fall back to the host.
             const bool topology_ok = backend_ptrs.size() == 3 &&
                 ggml_backend_is_meta(backend_ptrs[0]) &&
                 backend_ptrs[1] != nullptr &&
@@ -2898,8 +2900,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
             auto & worker = region_ring_worker_resources[dev];
-            const size_t start = pc_phone_overlap ? 1 : 0;
-            const size_t count = backend_ptrs.size() - start;
+
+            // In overlap mode, make the Plan's C/G labels executable
+            // semantics rather than scheduler hints:
+            //   CPU worker -> [CPU] only
+            //   GPU worker -> [CUDA0, CPU] (CUDA primary, host fallback)
+            // Phone keeps the canonical scheduler in ring_sched[2].
+            size_t start = 0;
+            size_t count = backend_ptrs.size();
+            bool scheduler_offload = cparams.op_offload;
+            const char * policy = "CONTEXT_SHARED";
+            if (pc_phone_overlap) {
+                if (dev == 0) {
+                    start = 2; // validated outer topology: [Meta, CUDA0, CPU]
+                    count = 1;
+                    scheduler_offload = false;
+                    policy = "CPU_ONLY";
+                } else {
+                    start = 1;
+                    count = 2;
+                    scheduler_offload = cparams.op_offload;
+                    policy = "CUDA_PRIMARY_CPU_FALLBACK";
+                }
+            }
+
             // A reused llama_context may have cached schedulers from an A/B
             // mode switch. Recreate only if the exact backend list changed.
             bool matches = worker.sched &&
@@ -2922,7 +2946,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker.sched.reset(ggml_backend_sched_new(
                     backend_ptrs.data() + start,
                     backend_buft.data() + start,
-                    (int) count, max_nodes, false, cparams.op_offload));
+                    (int) count, max_nodes, false, scheduler_offload));
                 if (!worker.sched) {
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_RESOURCE] device=%s status=ALLOC_FAILED\n",
@@ -2936,15 +2960,33 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             ring_sched[dev] = worker.sched.get();
             ring_res[dev] = worker.res.get();
+
             if (pc_phone_overlap) {
+                const bool cpu_policy_ok =
+                    dev != 0 ||
+                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 1 &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_cpu);
+                const bool gpu_policy_ok =
+                    dev != 1 ||
+                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 2 &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1] &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 1) == backend_cpu);
+                if (!cpu_policy_ok || !gpu_policy_ok) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PC_SCHED] worker=%s policy=%s "
+                        "status=REJECT reason=BACKEND_POLICY_MISMATCH\n",
+                        dev == 0 ? "CPU" : "GPU", policy);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PC_SCHED] worker=%s backends=%d "
+                    "[REGION_RING_PC_SCHED] worker=%s policy=%s backends=%d "
                     "first=%s last=%s offload=%d meta_registered=0 status=READY\n",
-                    dev == 0 ? "CPU" : "GPU",
+                    dev == 0 ? "CPU" : "GPU", policy,
                     ggml_backend_sched_get_n_backends(ring_sched[dev]),
                     ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], 0)),
                     ggml_backend_name(ggml_backend_sched_get_backend(ring_sched[dev], (int) count - 1)),
-                    cparams.op_offload ? 1 : 0);
+                    scheduler_offload ? 1 : 0);
             }
         }
 
@@ -3260,7 +3302,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     uint64_t split_mask = local_mask & (UINT64_C(1) << 63);
                                     // Convert per-Scheduler bits into original
                                     // [Meta,CUDA0,CPU] indices for consistent
-                                    // A/B audit (PC Scheduler omits Meta).
+                                    // A/B audit. CPU Scheduler is [CPU];
+                                    // GPU Scheduler is [CUDA0,CPU].
                                     const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
                                     for (int b = 0; b < n_local; ++b) {
                                         if ((local_mask & (UINT64_C(1) << b)) == 0) {

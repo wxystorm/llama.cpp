@@ -506,10 +506,11 @@ private:
     ggml_backend_sched_ptr sched;
     ggml_backend_sched_ptr sched_pipe;
 
-    // Region Ring opt-in resource isolation (no concurrent GGML execution yet).
-    // CPU and CUDA get independent scheduler/graph allocation state; the Phone
-    // stage intentionally retains sched/gf_res_prev for final logits extraction.
-    // All three schedulers still reference the same backend objects and KV ctx.
+    // Region Ring opt-in resource isolation. CPU and CUDA get independent
+    // scheduler/graph allocation state; in PC/Phone overlap mode the CPU worker
+    // is strictly CPU-only, while the GPU worker keeps CUDA-primary + CPU
+    // fallback. The Phone stage intentionally retains sched/gf_res_prev for
+    // final logits extraction. Backend objects and KV ctx remain shared.
     struct region_ring_worker_resource {
         ggml_backend_sched_ptr sched;
         llm_graph_result_ptr   res;
