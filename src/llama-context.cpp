@@ -2881,8 +2881,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // This first concurrent mode is supported only for the validated
             // outer topology Meta(CPU,RPC0), CUDA0, CPU. No replacement of
             // GGML model weights and no new Meta instance. CPU Regions use a
-            // CPU-only auxiliary Scheduler; GPU Regions keep CUDA0+CPU so
-            // unsupported CUDA ops may still fall back to the host.
+            // CPU-only auxiliary Scheduler and GPU Regions use a CUDA0-only
+            // auxiliary Scheduler. Any unsupported CUDA op must fail closed
+            // here instead of silently falling back to the host.
             const bool topology_ok = backend_ptrs.size() == 3 &&
                 ggml_backend_is_meta(backend_ptrs[0]) &&
                 backend_ptrs[1] != nullptr &&
@@ -2901,10 +2902,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         for (size_t dev = 0; dev < region_ring_worker_resources.size(); ++dev) {
             auto & worker = region_ring_worker_resources[dev];
 
-            // In overlap mode, make the Plan's C/G labels executable
+            // In overlap mode, make the Plan's C/G labels strict executable
             // semantics rather than scheduler hints:
             //   CPU worker -> [CPU] only
-            //   GPU worker -> [CUDA0, CPU] (CUDA primary, host fallback)
+            //   GPU worker -> [CUDA0] only
             // Phone keeps the canonical scheduler in ring_sched[2].
             size_t start = 0;
             size_t count = backend_ptrs.size();
@@ -2918,9 +2919,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     policy = "CPU_ONLY";
                 } else {
                     start = 1;
-                    count = 2;
-                    scheduler_offload = cparams.op_offload;
-                    policy = "CUDA_PRIMARY_CPU_FALLBACK";
+                    count = 1;
+                    scheduler_offload = false;
+                    policy = "CUDA_ONLY";
                 }
             }
 
@@ -2968,9 +2969,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                      ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_cpu);
                 const bool gpu_policy_ok =
                     dev != 1 ||
-                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 2 &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1] &&
-                     ggml_backend_sched_get_backend(ring_sched[dev], 1) == backend_cpu);
+                    (ggml_backend_sched_get_n_backends(ring_sched[dev]) == 1 &&
+                     ggml_backend_sched_get_backend(ring_sched[dev], 0) == backend_ptrs[1]);
                 if (!cpu_policy_ok || !gpu_policy_ok) {
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_PC_SCHED] worker=%s policy=%s "
@@ -3043,9 +3043,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
     if (task_local_graph_outputs) {
-        // The schedulers still share the exact same backend instances.
-        // Graph execution and threadpool selection must remain under
-        // region_ring_backend_execution_mutex until backend ownership changes.
+        // CPU and GPU auxiliary schedulers are now disjoint ([CPU] vs
+        // [CUDA0]), but the canonical Phone scheduler still references the
+        // outer Meta/CUDA0/CPU handles. Keep the existing global execution
+        // gate for this CUDA-only validation step; gate splitting is a
+        // separate change after backend ownership is proven.
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t backend = backend_ptrs[i];
             ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -3328,7 +3330,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     // Convert per-Scheduler bits into original
                                     // [Meta,CUDA0,CPU] indices for consistent
                                     // A/B audit. CPU Scheduler is [CPU];
-                                    // GPU Scheduler is [CUDA0,CPU].
+                                    // GPU Scheduler is [CUDA0].
                                     const int n_local = ggml_backend_sched_get_n_backends(ring_sched[dev]);
                                     for (int b = 0; b < n_local; ++b) {
                                         if ((local_mask & (UINT64_C(1) << b)) == 0) {
