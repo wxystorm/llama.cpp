@@ -160,15 +160,40 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
+    // Dense LLaMA uses the same Region-stage contract as Qwen2/Qwen3:
+    // a Region can consume a hidden-state slice and return the hidden state
+    // before the output head. Keep this generic for decoder/embedding graphs.
+    const bool stage_graph       = params.hybrid_layer_end >= 0;
+    const int  layer_begin       = stage_graph ? params.hybrid_layer_begin : 0;
+    const int  layer_end         = stage_graph ? params.hybrid_layer_end : n_layer;
+    const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
+    const bool build_output_head = !stage_graph || params.hybrid_output_head;
+    const bool embedding_only    = stage_graph && params.hybrid_embedding_only;
+
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
+    GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
+    GGML_ASSERT(layer_begin == 0 || hidden_input);
+    GGML_ASSERT(!build_output_head || layer_end == n_layer);
+    GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
+    GGML_ASSERT(!embedding_only || (layer_begin == 0 && !hidden_input));
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
     ggml_tensor * inpL_attn_norm = nullptr;
     llm_graph_qkv inpL_qkv       = { nullptr, nullptr, nullptr };
 
-    inpL = build_inp_embd(model.tok_embd);
+    inpL = hidden_input ? build_inp_stage() : build_inp_embd(model.tok_embd);
+
+    if (embedding_only) {
+        if (!ggml_is_contiguous(inpL)) {
+            inpL = ggml_cont(ctx0, inpL);
+            cb(inpL, "embedding_prelude_cont", -1);
+        }
+        res->t_stage_output = inpL;
+        ggml_build_forward_expand(gf, inpL);
+        return;
+    }
 
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
@@ -185,9 +210,10 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const float kq_scale =
         hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_out_ids =
+        build_output_head ? build_inp_out_ids() : nullptr;
     // transformer layers
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = layer_begin; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
         // 把当前层的输入保存到结果中，方便后续使用
         // inpl是当前的输入hidden states
@@ -244,7 +270,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                              Vcur, nullptr, nullptr, nullptr, kq_scale, il);
             cb(cur, "attn_out", il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && build_output_head && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             // 如果是最后一层，并且有输出id，那么就把当前的输出和输入都取出对应的行
@@ -291,7 +317,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 ggml_tensor * k_acc  = nullptr;
                 ggml_tensor * v_acc  = nullptr;
 
-                const llama_layer * next_layer = il + 1 < n_layer ? &model.layers[il + 1] : nullptr;
+                const llama_layer * next_layer = il + 1 < layer_end ? &model.layers[il + 1] : nullptr;
                 const bool          prepare_next_layer =
                     next_layer != nullptr && model.hybrid_layer_mode(il + 1) != llama_hybrid_layer_mode::PHONE_ONLY;
                 auto can_slice_input = [&](const ggml_tensor * weight) {
@@ -498,6 +524,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         inpL = cur;
     }
     cur = inpL;
+
+    if (!build_output_head) {
+        res->t_stage_output = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
 
