@@ -726,28 +726,11 @@ private:
     std::optional<llama_region_ring_task>
     take_device_locked(size_t dev) {
         auto & queue = queues_[dev];
-
-        // GPU execution is strictly region ordered. A later GPU Region may
-        // become dependency-ready before the current GPU Region drains, but
-        // there is still only one GPU execution lane. Always prefer the
-        // earliest claimable GPU Region; CPU/Phone keep normal FIFO order.
-        auto it = queue.end();
-        for (auto cur = queue.begin(); cur != queue.end(); ++cur) {
-            if (!claimable_locked(*cur)) {
-                continue;
-            }
-            if (it == queue.end()) {
-                it = cur;
-                if (dev != (size_t) llama_region_ring_device::GPU) {
-                    break;
-                }
-                continue;
-            }
-            if (dev == (size_t) llama_region_ring_device::GPU &&
-                    cur->region < it->region) {
-                it = cur;
-            }
-        }
+        const auto it = std::find_if(
+            queue.begin(), queue.end(),
+            [this](const auto & task) {
+                return claimable_locked(task);
+            });
         if (it == queue.end()) {
             return std::nullopt;
         }
