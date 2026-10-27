@@ -550,6 +550,7 @@ static bool llama_hybrid_profile_rpc_fence(ggml_backend_t backend, double & resu
 struct llama_hybrid_graph_timing {
     double wall_ms        = 0.0;
     double compute_est_ms = 0.0;
+    double prepare_ms     = 0.0;
 };
 
 static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backend,
@@ -559,9 +560,57 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
         return false;
     }
 
+    result = {};
+
     if (!llama_hybrid_profile_init_rpc_quantized_leafs(
             backend, graph)) {
         return false;
+    }
+
+    // Measure the same scheduler-side preparation that Region Ring serializes
+    // through its PREPARE gate.  Scheduler creation itself is intentionally
+    // outside the timed interval, and lock wait does not exist in this
+    // isolated profile.  The probe is advisory: if a backend cannot prepare
+    // this synthetic graph through the scheduler, keep prepare_ms at zero
+    // rather than breaking the existing compute profile.
+    {
+        ggml_backend_t prepare_backends[] = { backend };
+        ggml_backend_buffer_type_t prepare_bufts[] = {
+            ggml_backend_get_default_buffer_type(backend)
+        };
+        const size_t graph_capacity = std::max<size_t>(
+            64, (size_t) graph->n_nodes + (size_t) graph->n_leafs + 32);
+        ggml_backend_sched_ptr prepare_sched(
+            ggml_backend_sched_new(
+                prepare_backends, prepare_bufts, 1,
+                graph_capacity, false, false));
+        if (prepare_sched) {
+            const int64_t prepare_begin_us = ggml_time_us();
+            bool prepare_ok =
+                ggml_backend_sched_alloc_graph(prepare_sched.get(), graph);
+            if (prepare_ok) {
+                const int n_splits =
+                    ggml_backend_sched_get_n_splits(prepare_sched.get());
+                for (int split = 0; split < n_splits; ++split) {
+                    if (ggml_backend_sched_prepare_split(
+                            prepare_sched.get(), split) !=
+                            GGML_STATUS_SUCCESS) {
+                        prepare_ok = false;
+                        break;
+                    }
+                }
+            }
+            ggml_backend_sched_synchronize(prepare_sched.get());
+            const int64_t prepare_end_us = ggml_time_us();
+            if (prepare_ok) {
+                result.prepare_ms =
+                    (prepare_end_us - prepare_begin_us) / 1000.0;
+            } else {
+                LLAMA_LOG_DEBUG(
+                    "[HYBRID_PROFILE_PREPARE] backend=%s status=SKIP\n",
+                    ggml_backend_name(backend));
+            }
+        }
     }
 
     const auto rpc_fence = reinterpret_cast<ggml_backend_rpc_fence_t>(
