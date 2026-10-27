@@ -5474,6 +5474,62 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
         return false;
     }
 
+    static constexpr size_t WEIGHT_H2D_STAGE_SLOT_SIZE =
+        size_t(64) * 1024 * 1024;
+    static constexpr size_t WEIGHT_H2D_STAGE_SLOTS = 2;
+
+    struct weight_h2d_probe_stage {
+        std::array<ggml_backend_buffer_ptr,
+            WEIGHT_H2D_STAGE_SLOTS> buffers;
+        std::array<ggml_backend_event_t,
+            WEIGHT_H2D_STAGE_SLOTS> events {};
+
+        ~weight_h2d_probe_stage() {
+            for (ggml_backend_event_t event : events) {
+                if (event != nullptr) {
+                    ggml_backend_event_free(event);
+                }
+            }
+        }
+    } stage;
+
+    ggml_backend_buffer_type_t host_buft =
+        ggml_backend_dev_host_buffer_type(gpu_dev);
+    if (host_buft == nullptr) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_WEIGHT_H2D] status=FAIL "
+            "reason=NO_PINNED_HOST_BUFFER\n");
+        return false;
+    }
+
+    for (size_t slot = 0;
+            slot < WEIGHT_H2D_STAGE_SLOTS; ++slot) {
+        stage.buffers[slot].reset(
+            ggml_backend_buft_alloc_buffer(
+                host_buft, WEIGHT_H2D_STAGE_SLOT_SIZE));
+        if (!stage.buffers[slot] ||
+                ggml_backend_buffer_get_type(
+                    stage.buffers[slot].get()) != host_buft ||
+                ggml_backend_buffer_get_base(
+                    stage.buffers[slot].get()) == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PROFILE_WEIGHT_H2D] status=FAIL "
+                "reason=PINNED_STAGE_ALLOC slot=%zu\n",
+                slot);
+            return false;
+        }
+
+        stage.events[slot] =
+            ggml_backend_event_new(gpu_dev);
+        if (stage.events[slot] == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[HYBRID_PROFILE_WEIGHT_H2D] status=FAIL "
+                "reason=STAGE_EVENT slot=%zu\n",
+                slot);
+            return false;
+        }
+    }
+
     static constexpr std::array<size_t, 5>
         WEIGHT_H2D_PROBE_MIB = {
             256, 512, 1024, 1536, 2048
@@ -5482,9 +5538,11 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
     LLAMA_LOG_ERROR(
         "[HYBRID_PROFILE_WEIGHT_H2D] phase=BEGIN "
         "backend=%s device=%s stream=INDEPENDENT "
+        "stage=PINNED_DOUBLE slot_mib=%.1f "
         "points=%zu\n",
         ggml_backend_name(transfer_backend.get()),
         ggml_backend_dev_name(gpu_dev),
+        WEIGHT_H2D_STAGE_SLOT_SIZE / 1048576.0,
         WEIGHT_H2D_PROBE_MIB.size());
 
     for (size_t mib : WEIGHT_H2D_PROBE_MIB) {
@@ -5557,29 +5615,79 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
 
         std::array<double,
             LLAMA_HYBRID_COMPUTE_MEASURE_RUNS> samples {};
+        std::array<double,
+            LLAMA_HYBRID_COMPUTE_MEASURE_RUNS>
+                cpu_copy_samples {};
         for (int run = 0;
                 run < LLAMA_HYBRID_COMPUTE_WARMUP_RUNS +
                     LLAMA_HYBRID_COMPUTE_MEASURE_RUNS;
                 ++run) {
             ggml_backend_synchronize(
                 transfer_backend.get());
+
+            std::array<bool,
+                WEIGHT_H2D_STAGE_SLOTS> inflight {};
+            size_t next_slot = 0;
+            int64_t cpu_copy_us = 0;
             const int64_t begin_us = ggml_time_us();
-            ggml_backend_tensor_set_async(
-                transfer_backend.get(), dst,
-                src->data, 0, bytes);
+
+            for (size_t offset = 0; offset < bytes;
+                    offset += WEIGHT_H2D_STAGE_SLOT_SIZE) {
+                const size_t chunk_bytes =
+                    std::min(
+                        WEIGHT_H2D_STAGE_SLOT_SIZE,
+                        bytes - offset);
+                const size_t slot =
+                    next_slot % WEIGHT_H2D_STAGE_SLOTS;
+                next_slot =
+                    (slot + 1) % WEIGHT_H2D_STAGE_SLOTS;
+
+                if (inflight[slot]) {
+                    ggml_backend_event_synchronize(
+                        stage.events[slot]);
+                    inflight[slot] = false;
+                }
+
+                void * stage_ptr =
+                    ggml_backend_buffer_get_base(
+                        stage.buffers[slot].get());
+                const int64_t copy_begin_us =
+                    ggml_time_us();
+                memcpy(
+                    stage_ptr,
+                    static_cast<const uint8_t *>(
+                        src->data) + offset,
+                    chunk_bytes);
+                cpu_copy_us +=
+                    ggml_time_us() - copy_begin_us;
+
+                ggml_backend_tensor_set_async(
+                    transfer_backend.get(), dst,
+                    stage_ptr, offset, chunk_bytes);
+                ggml_backend_event_record(
+                    stage.events[slot],
+                    transfer_backend.get());
+                inflight[slot] = true;
+            }
+
             ggml_backend_synchronize(
                 transfer_backend.get());
             const int64_t end_us = ggml_time_us();
 
             if (run >= LLAMA_HYBRID_COMPUTE_WARMUP_RUNS) {
-                samples[run -
-                    LLAMA_HYBRID_COMPUTE_WARMUP_RUNS] =
+                const int sample =
+                    run - LLAMA_HYBRID_COMPUTE_WARMUP_RUNS;
+                samples[sample] =
                     (end_us - begin_us) / 1000.0;
+                cpu_copy_samples[sample] =
+                    cpu_copy_us / 1000.0;
             }
         }
 
         const double ms =
             llama_hybrid_rpc_median(samples);
+        const double cpu_copy_ms =
+            llama_hybrid_rpc_median(cpu_copy_samples);
         if (!std::isfinite(ms) || ms <= 0.0) {
             LLAMA_LOG_WARN(
                 "[HYBRID_PROFILE_WEIGHT_H2D] "
@@ -5595,9 +5703,10 @@ bool llama_hybrid_profile_gpu_transfer(llama_hybrid_profile & profile,
             (ms / 1000.0);
         LLAMA_LOG_ERROR(
             "[HYBRID_PROFILE_WEIGHT_H2D] "
-            "mib=%zu bytes=%zu ms=%.3f gib_s=%.3f "
-            "status=MEASURED\n",
-            mib, bytes, ms, gib_s);
+            "mib=%zu bytes=%zu ms=%.3f "
+            "cpu_stage_copy_ms=%.3f gib_s=%.3f "
+            "stage=PINNED_DOUBLE status=MEASURED\n",
+            mib, bytes, ms, cpu_copy_ms, gib_s);
     }
 
     if (profile.gpu_weight_h2d.size() < 2) {
