@@ -24,6 +24,15 @@ struct ggml_compute_config {
     bool log_events = false;
 };
 
+struct stream_precompute_result {
+    double prefix_full_ms = 0.0;
+    double qkv_full_ms = 0.0;
+    double combine_ms = 0.0;
+    double qkv_rel_rms = 0.0;
+    double qkv_max_abs = 0.0;
+    std::vector<double> qkv_slice_ms;
+};
+
 class ggml_compute final : public compute {
 public:
     static std::shared_ptr<ggml_compute> create(
@@ -50,6 +59,13 @@ public:
     // complete MoE FFN against two complementary hidden-dimension shards in
     // the same graph. This isolates quantized weight-view slicing from TCP,
     // Phone/OpenCL, REDUCE, and cross-graph continuation.
+    bool stream_precompute_bench(
+        const key & task,
+        const std::vector<float> & input,
+        int repeats,
+        stream_precompute_result & result,
+        std::string & error);
+
     bool ffn_split_selfcheck(
         const key & task,
         const std::vector<float> & input,
