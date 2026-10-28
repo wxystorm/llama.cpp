@@ -17881,11 +17881,34 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
+            const bool wave_p2c_trace =
+                return_wavefront_graph &&
+                n_backends == 2 &&
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, prefill_down_layer);
+            if (wave_p2c_trace && pipeline_debug) {
+                printf(
+                    "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                    "event=PC_SUBMIT_BEGIN\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i);
+            }
+
             if (c2p_parallel_ready) {
                 compute_workers.start_graph(
                     0, c2p_pc_prefix_graph);
             } else {
                 compute_workers.start(0, i);
+            }
+
+            if (wave_p2c_trace && pipeline_debug) {
+                printf(
+                    "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                    "event=PC_SUBMITTED\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i);
             }
 
             if (has_async_prefill_input) {
@@ -18189,9 +18212,53 @@ auto prefill_norm_sg_has_prework =
                         }
                     }
                 } else {
+                    if (wave_p2c_trace && pipeline_debug) {
+                        printf(
+                            "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                            "event=PHONE_SUBMIT_BEGIN\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i);
+                    }
                     compute_workers.start(1, i);
+
+                    if (wave_p2c_trace && pipeline_debug) {
+                        printf(
+                            "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                            "event=WAIT_PC\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i);
+                    }
                     pc_status = compute_workers.wait(0);
+
+                    if (wave_p2c_trace && pipeline_debug) {
+                        printf(
+                            "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                            "event=PC_DONE status=%d\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i,
+                            (int) pc_status);
+                        printf(
+                            "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                            "event=WAIT_PHONE\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i);
+                    }
+
                     phone_status = compute_workers.wait(1);
+
+                    if (wave_p2c_trace && pipeline_debug) {
+                        printf(
+                            "[WAVE_P2C_STEP] layer=%d chunk=%d sg=%zu "
+                            "event=PHONE_DONE status=%d\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i,
+                            (int) phone_status);
+                    }
                 }
             }
 
