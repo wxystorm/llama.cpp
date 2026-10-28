@@ -6570,6 +6570,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 region_ring_xc, region_ring_xg, region_ring_xp) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+    const bool sequence_ffn_runtime =
+        std::any_of(
+            runtime_stages.begin(),
+            runtime_stages.end(),
+            [](const llama_hybrid_runtime_stage & stage) {
+                return stage.kind ==
+                    llama_hybrid_runtime_stage_kind::SEQUENCE_FFN;
+            });
+    if (sequence_ffn_runtime && ring_exec != "serial") {
+        throw std::runtime_error(
+            "Sequence-FFN V1 is an independent runtime stage and currently "
+            "requires LLAMA_HYBRID_REGION_RING_EXEC=serial");
+    }
+    if (sequence_ffn_runtime &&
+            !model.hybrid_ring_plan_layout.empty()) {
+        throw std::runtime_error(
+            "Sequence-FFN V1 does not yet support a model-owned Ring Plan; "
+            "disable Planner apply while validating the independent stage");
+    }
+
     if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
         // Every executable Stage must match the model's actual weight and
         // KV owner; a split between placement and task routing is fatal.
@@ -6601,13 +6621,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     r.device == llama_region_ring_device::PHONE;
                 const bool gpu =
                     r.device == llama_region_ring_device::GPU;
+                const llama_hybrid_layer_mode layer_mode =
+                    model.hybrid_layer_mode(il);
                 const bool owner_ok = phone ?
-                    model.hybrid_layer_mode(il) ==
+                    layer_mode ==
                         llama_hybrid_layer_mode::PHONE_ONLY :
-                    model.hybrid_layer_mode(il) ==
-                        llama_hybrid_layer_mode::PC_ONLY &&
-                    (model.pc_layer_backends[(size_t) il] ==
-                        llama_pc_layer_backend::CUDA) == gpu;
+                    gpu ?
+                        layer_mode ==
+                            llama_hybrid_layer_mode::PC_ONLY &&
+                        model.pc_layer_backends[(size_t) il] ==
+                            llama_pc_layer_backend::CUDA :
+                        (layer_mode ==
+                             llama_hybrid_layer_mode::PC_ONLY ||
+                         layer_mode ==
+                             llama_hybrid_layer_mode::SEQUENCE_FFN) &&
+                        model.pc_layer_backends[(size_t) il] ==
+                            llama_pc_layer_backend::CPU;
                 if (!owner_ok) {
                     throw std::runtime_error(
                         "Planner Ring runtime/model backend ownership mismatch");
