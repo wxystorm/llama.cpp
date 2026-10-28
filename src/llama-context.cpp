@@ -1925,6 +1925,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             !embedding_only && stage->layer_end == n_layer;
         gparams.hybrid_wave_probe    = stage->wave_probe;
         gparams.hybrid_embedding_only = embedding_only;
+        gparams.hybrid_sequence_ffn_attention_only =
+            stage->kind == llama_hybrid_runtime_stage_kind::SEQUENCE_FFN;
     }
     if (log_prepare_breakdown) {
         graph_params_us = ggml_time_us() - graph_params_begin_us;
