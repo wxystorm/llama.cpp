@@ -42,6 +42,22 @@ struct llama_hybrid_ffn_desc {
     ggml_type up_type   = GGML_TYPE_COUNT;
     ggml_type down_type = GGML_TYPE_COUNT;
 
+    // Optional dense FFN bias/scale tensors.  The real graph applies bias
+    // before the per-tensor scale for each projection.
+    bool has_gate_bias = false;
+    bool has_up_bias   = false;
+    bool has_down_bias = false;
+    bool has_gate_scale = false;
+    bool has_up_scale   = false;
+    bool has_down_scale = false;
+
+    ggml_type gate_bias_type = GGML_TYPE_COUNT;
+    ggml_type up_bias_type   = GGML_TYPE_COUNT;
+    ggml_type down_bias_type = GGML_TYPE_COUNT;
+    ggml_type gate_scale_type = GGML_TYPE_COUNT;
+    ggml_type up_scale_type   = GGML_TYPE_COUNT;
+    ggml_type down_scale_type = GGML_TYPE_COUNT;
+
     size_t weight_bytes = 0;
 };
 
@@ -129,6 +145,9 @@ struct llama_hybrid_attn_desc {
 
     float freq_base  = 10000.0f;
     float freq_scale = 1.0f;
+    // Final attention scale used by the real graph.  A zero metadata value
+    // is normalized by the loader to 1/sqrt(head_dim).
+    float kq_scale = 0.0f;
 
     ggml_type attn_norm_type = GGML_TYPE_COUNT;
 
@@ -142,6 +161,30 @@ struct llama_hybrid_attn_desc {
 
     ggml_type q_norm_type = GGML_TYPE_COUNT;
     ggml_type k_norm_type = GGML_TYPE_COUNT;
+
+    bool has_q_bias = false;
+    bool has_k_bias = false;
+    bool has_v_bias = false;
+    bool has_o_bias = false;
+    bool has_q_scale = false;
+    bool has_k_scale = false;
+    bool has_v_scale = false;
+    bool has_o_scale = false;
+
+    ggml_type q_bias_type = GGML_TYPE_COUNT;
+    ggml_type k_bias_type = GGML_TYPE_COUNT;
+    ggml_type v_bias_type = GGML_TYPE_COUNT;
+    ggml_type o_bias_type = GGML_TYPE_COUNT;
+    ggml_type q_scale_type = GGML_TYPE_COUNT;
+    ggml_type k_scale_type = GGML_TYPE_COUNT;
+    ggml_type v_scale_type = GGML_TYPE_COUNT;
+    ggml_type o_scale_type = GGML_TYPE_COUNT;
+
+    // LLaMA-family RoPE factor tensors change the real graph shape even
+    // though their values do not affect synthetic timing fidelity.
+    bool has_rope_factors = false;
+    ggml_type rope_factors_type = GGML_TYPE_COUNT;
+    int64_t rope_factors_ne0 = 0;
 
     size_t weight_bytes = 0;
 };
