@@ -1353,6 +1353,59 @@ struct ggml_compute::impl {
         return true;
     }
 
+    void log_values_fingerprint(
+            const char * phase,
+            const char * source,
+            const key & task,
+            const std::vector<float> & values) {
+        if (!config.log_events) {
+            return;
+        }
+
+        double sum = 0.0;
+        double l2_sq = 0.0;
+        double max_abs = 0.0;
+        size_t nonfinite = 0;
+
+        for (float value : values) {
+            const double x =
+                static_cast<double>(value);
+            if (!std::isfinite(x)) {
+                ++nonfinite;
+                continue;
+            }
+            sum += x;
+            l2_sq += x * x;
+            max_abs =
+                std::max(
+                    max_abs,
+                    std::fabs(x));
+        }
+
+        std::fprintf(
+            stderr,
+            "[LT_NUMERIC] side=%s phase=%s source=%s "
+            "layer=%d chunk=%d tokens=%d "
+            "checksum=%.12f sum=%.12f l2=%.12f "
+            "max_abs=%.9g nonfinite=%zu "
+            "v0=%.9g v1=%.9g v2=%.9g v3=%.9g\n",
+            side_name(config.local_side),
+            phase,
+            source,
+            task.layer,
+            task.chunk,
+            chunk_tokens(task),
+            checksum(values),
+            sum,
+            std::sqrt(l2_sq),
+            max_abs,
+            nonfinite,
+            values.size() > 0 ? values[0] : 0.0f,
+            values.size() > 1 ? values[1] : 0.0f,
+            values.size() > 2 ? values[2] : 0.0f,
+            values.size() > 3 ? values[3] : 0.0f);
+    }
+
     bool make_input(
             const key & task,
             const std::vector<float> & host_input,
@@ -1377,6 +1430,12 @@ struct ggml_compute::impl {
                     error)) {
                 return false;
             }
+
+            log_values_fingerprint(
+                "LAYER_INPUT",
+                "HOST",
+                task,
+                host_input);
 
             host_input_tensor =
                 ggml_new_tensor_2d(
@@ -1407,6 +1466,26 @@ struct ggml_compute::impl {
                 << " tensor=" << input;
             error = oss.str();
             return false;
+        }
+
+        if (config.log_events) {
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(tokens);
+            std::vector<float> arena_values(count);
+
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_get(
+                input,
+                arena_values.data(),
+                0,
+                count * sizeof(float));
+
+            log_values_fingerprint(
+                "LAYER_INPUT",
+                "ARENA",
+                task,
+                arena_values);
         }
 
         return true;
