@@ -48,6 +48,7 @@ using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_b
 enum class llama_hybrid_runtime_stage_kind {
     GPU,
     CPU,
+    SEQUENCE_FFN,
     TENSOR,
     PHONE,
 };
@@ -388,6 +389,24 @@ private:
                                       uint32_t                          probe_tokens,
                                       int                               probe_layers,
                                       const llama_hybrid_plan &         runtime_plan);
+
+    llm_graph_result * run_sequence_ffn_stage(
+                                      const llama_ubatch &                 ubatch,
+                                      const llama_hybrid_runtime_stage &   stage,
+                                      uint32_t                             token_begin,
+                                      uint32_t                             block_tokens,
+                                      float *                              stage_input,
+                                      float *                              stage_output,
+                                      llm_graph_type                       gtype,
+                                      llama_memory_context_i *            mctx,
+                                      ggml_backend_sched_t                 sched_use,
+                                      llm_graph_result *                   res_use,
+                                      int                                  ubatch_id,
+                                      size_t                               stage_index,
+                                      size_t                               block_index,
+                                      int32_t                              block_outputs,
+                                      bool &                               apply_mctx,
+                                      ggml_status &                        ret);
 
     llm_graph_result * run_hybrid_stage_block(
                                       const llama_ubatch &                 ubatch,
