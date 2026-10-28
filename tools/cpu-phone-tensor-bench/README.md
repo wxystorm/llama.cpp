@@ -137,7 +137,14 @@ Reduce(L, c) -> OUT(L, c) -> Attention(L+1, c)
 so a later layer no longer requires the whole previous layer to finish before
 its own chunk can become ready. The runtime prints
 `[HYBRID_EXPERIMENT_WAVEFRONT] enabled=1` when this graph is actually built.
-A Tensor run that does not emit that marker is rejected by the benchmark.
+Directional C2P/P2C reductions are submitted through the existing bounded
+prefill reduce slots, so the main Meta thread does not serialize every reduce.
+
+The benchmark also parses `[RETURN_WAVEFRONT_SUM]`. For Tensor depths above
+one layer, merely building the graph is not enough: at least one real
+cross-layer overlap signal (`overlap_boundaries` or `ahead_attn`) must be
+observed. Otherwise the candidate is rejected as
+`WAVEFRONT_NO_CROSS_LAYER_OVERLAP`.
 
 For every `x`, the Tensor planner searches:
 
