@@ -344,6 +344,121 @@ int run_session(
         }
 
         if (incoming.kind ==
+            lt::message_kind::bench_pull) {
+            size_t count = 0;
+            if (!incoming.partial.empty() &&
+                incoming.partial[0] > 0.0f) {
+                count =
+                    static_cast<size_t>(
+                        incoming.partial[0]);
+            }
+
+            lt::message response;
+            response.kind =
+                lt::message_kind::bench_pull_result;
+            response.task =
+                incoming.task;
+            response.seq =
+                incoming.seq;
+            response.hidden.assign(
+                count,
+                0.0f);
+
+            if (!channel->send_message(
+                    response)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=BENCH_PULL "
+                    "status=FAIL\n");
+                break;
+            }
+
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
+            lt::message_kind::sequence_ffn_request) {
+            if (incoming.partial.size() < 2) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=REQUEST "
+                    "status=FAIL reason=MISSING_PARAMS\n");
+                break;
+            }
+
+            const int tokens =
+                std::max(
+                    1,
+                    static_cast<int>(
+                        incoming.partial[0]));
+            const int repeats =
+                std::max(
+                    1,
+                    static_cast<int>(
+                        incoming.partial[1]));
+
+            lt::sequence_ffn_bench_result result;
+            std::string bench_error;
+
+            if (!compute->sequence_ffn_bench(
+                    incoming.task.layer,
+                    tokens,
+                    incoming.hidden,
+                    repeats,
+                    result,
+                    nullptr,
+                    bench_error)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=FFN "
+                    "status=FAIL reason=%s\n",
+                    bench_error.c_str());
+                break;
+            }
+
+            lt::message response;
+            response.kind =
+                lt::message_kind::sequence_ffn_result;
+            response.task =
+                incoming.task;
+            response.seq =
+                incoming.seq;
+            response.partial = {
+                static_cast<float>(
+                    result.ffn_ms),
+                static_cast<float>(
+                    result.output_checksum),
+                static_cast<float>(
+                    result.output_l2),
+            };
+
+            if (!channel->send_message(
+                    response)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=RESULT "
+                    "status=FAIL\n");
+                break;
+            }
+
+            std::fprintf(
+                stderr,
+                "[LT_SEQUENCE_PHONE] layer=%d tokens=%d "
+                "repeats=%d ffn_ms=%.3f checksum=%.6f "
+                "l2=%.6f status=PASS\n",
+                incoming.task.layer,
+                tokens,
+                repeats,
+                result.ffn_ms,
+                result.output_checksum,
+                result.output_l2);
+
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
             lt::message_kind::model_ready) {
             std::fprintf(
                 stderr,
