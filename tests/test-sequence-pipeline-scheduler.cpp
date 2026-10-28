@@ -16,6 +16,53 @@ static void complete_all_gpu(llama_sequence_pipe_ready & ready) {
     }
 }
 
+static void test_mismatched_chunks_complete() {
+    std::vector<llama_sequence_pipe_stage> stages = {
+        { llama_sequence_pipe_stage_kind::GPU,          0,  4,  80 },
+        { llama_sequence_pipe_stage_kind::SEQUENCE_FFN, 4,  5,  64 },
+        { llama_sequence_pipe_stage_kind::CPU,          5, 11,  96 },
+        { llama_sequence_pipe_stage_kind::PHONE,       11, 16, 128 },
+    };
+
+    llama_sequence_pipe_ready ready(
+        std::move(stages),
+        358,
+        1,
+        310,
+        16,
+        32);
+
+    size_t steps = 0;
+    while (!ready.all_done()) {
+        bool progressed = false;
+        for (auto resource : {
+                llama_sequence_pipe_resource::GPU,
+                llama_sequence_pipe_resource::CPU,
+                llama_sequence_pipe_resource::PHONE }) {
+            if (ready.queue_size(resource) == 0) {
+                continue;
+            }
+            auto task = ready.wait_take(resource);
+            assert(task.has_value());
+            ready.complete(*task);
+            progressed = true;
+            ++steps;
+        }
+
+        // A locally pending Phone fragment below the aggregation threshold is
+        // allowed only while additional Sequence Attention can still produce
+        // the contiguous suffix.  The deterministic single-thread simulation
+        // must therefore never reach a permanent no-progress state.
+        assert(progressed);
+        assert(steps < 256);
+    }
+
+    assert(ready.finished_output_tokens() == 358);
+    std::printf(
+        "[SEQ_PIPE_INTERVAL_TEST] G=80 S=64 C=96 P=128 "
+        "split=310 dependency=TOKEN_INTERVAL status=PASS\n");
+}
+
 int main() {
     // Minimal prefix of the real runtime layout:
     //   G[0,4) -> S4 -> C[5,11) -> P[11,16)
@@ -87,5 +134,7 @@ int main() {
     std::printf(
         "[SEQ_PIPE_SCHED_TEST] split=310 phone=[310,358) "
         "aggregation=10+38->48 priority=FEED_THEN_OLDEST status=PASS\n");
+
+    test_mismatched_chunks_complete();
     return 0;
 }
