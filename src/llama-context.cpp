@@ -3906,17 +3906,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             llama_region_ring_device::PHONE,
         };
 
-        struct gpu_weight_bank_runtime {
-            size_t loaded_region = std::numeric_limits<size_t>::max();
-            bool loading = false;
-        };
-        struct gpu_weight_prefetch_job {
+        // The Bank mover has exactly one job type:
+        //   (target GPU Region, fixed Bank, source/drained Region).
+        // It does not select Banks, inspect cache state, or synthesize an
+        // initial window. Rank parity is decided by the GPU worker.
+        struct gpu_bank_refill_job {
             size_t region = 0;
             size_t bank_index = 0;
             size_t source_region = std::numeric_limits<size_t>::max();
-            const char * reason = "UNKNOWN";
         };
-        struct gpu_weight_prefetch_stats {
+        struct gpu_bank_mover_stats {
             size_t started = 0;
             size_t completed = 0;
             size_t failures = 0;
@@ -3926,51 +3925,45 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             int64_t stage_cpu_copy_us = 0;
             size_t stage_chunks = 0;
             size_t upload_bytes = 0;
-            size_t cache_hit_bytes = 0;
         };
 
-        std::array<gpu_weight_bank_runtime, 2> gpu_bank_runtime;
-        if (load_primed_window) {
-            gpu_bank_runtime[0].loaded_region = gpu_region_order[0];
-            gpu_bank_runtime[1].loaded_region = gpu_region_order[1];
-        }
-        std::mutex gpu_prefetch_mutex;
-        std::condition_variable gpu_prefetch_cv;
-        std::condition_variable gpu_bank_cv;
-        std::deque<gpu_weight_prefetch_job> gpu_prefetch_jobs;
-        bool gpu_prefetch_stop = false;
-        bool gpu_prefetch_failed = false;
-        gpu_weight_prefetch_stats gpu_prefetch_stats;
-        std::unique_ptr<llama_kv_cache_context> gpu_prefetch_kv_view;
+        std::mutex gpu_bank_mover_mutex;
+        std::condition_variable gpu_bank_mover_cv;
+        std::condition_variable gpu_bank_ready_cv;
+        std::deque<gpu_bank_refill_job> gpu_bank_mover_jobs;
+        bool gpu_bank_mover_stop = false;
+        bool gpu_bank_mover_failed = false;
+        gpu_bank_mover_stats gpu_bank_mover_stats_v;
+        std::unique_ptr<llama_kv_cache_context> gpu_bank_mover_kv_view;
 
-        int gpu_prefetch_tokens_max = 0;
-        if (gpu_weight_prefetch) {
+        int gpu_bank_mover_tokens_max = 0;
+        if (gpu_bank_streaming) {
             for (size_t region : gpu_region_order) {
-                gpu_prefetch_tokens_max =
-                    std::max(gpu_prefetch_tokens_max,
+                gpu_bank_mover_tokens_max =
+                    std::max(gpu_bank_mover_tokens_max,
                              stages[region].macro_tokens);
             }
-            gpu_prefetch_kv_view = kv_mctx->make_stage_view();
-            if (!gpu_prefetch_kv_view) {
+            gpu_bank_mover_kv_view = kv_mctx->make_stage_view();
+            if (!gpu_bank_mover_kv_view) {
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                    "event=INIT status=FAIL reason=KV_STAGE_VIEW\n");
+                    "[REGION_RING_GPU_BANK_MOVER] event=INIT "
+                    "status=FAIL reason=KV_STAGE_VIEW\n");
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
         }
-        std::vector<float> gpu_prefetch_hidden(
-            (size_t) std::max(0, gpu_prefetch_tokens_max) *
+        std::vector<float> gpu_bank_mover_hidden(
+            (size_t) std::max(0, gpu_bank_mover_tokens_max) *
                 (size_t) n_embd,
             0.0f);
 
-        // Only the dedicated host worker calls this function. Graph construction
-        // holds the short PREPARE gate; weight H2D then runs on a second CUDA
-        // backend instance/stream without CPU or CUDA compute gates.
-        auto prefetch_gpu_region =
+        // Rebind one drained physical Bank to the next same-parity Region and
+        // upload its immutable weights. The Bank scheduler is reset in-place:
+        // its CUDA arena remains allocated, but old Region bindings are gone.
+        auto refill_gpu_bank =
             [&](size_t region, size_t bank_index,
-                const char * reason, size_t source_region) -> bool {
-                if (!gpu_weight_prefetch || bank_index >= 2 ||
+                size_t source_region) -> bool {
+                if (!gpu_bank_streaming || bank_index >= 2 ||
                         region >= stages.size() ||
                         stages[region].kind !=
                             llama_hybrid_runtime_stage_kind::GPU) {
@@ -3979,134 +3972,120 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 auto & bank =
                     region_ring_worker_resources[bank_index + 1];
-                const auto & prefetch_stage = stages[region];
-                const int prefetch_tokens = std::min(
+                const auto & refill_stage = stages[region];
+                const int refill_tokens = std::min(
                     (int) ubatch.n_tokens,
-                    prefetch_stage.macro_tokens);
-                if (prefetch_tokens <= 0 ||
-                        gpu_prefetch_hidden.size() <
-                            (size_t) prefetch_tokens *
+                    refill_stage.macro_tokens);
+                if (refill_tokens <= 0 ||
+                        gpu_bank_mover_hidden.size() <
+                            (size_t) refill_tokens *
                                 (size_t) n_embd) {
                     return false;
                 }
 
-                const std::string source_text =
-                    source_region ==
-                        std::numeric_limits<size_t>::max() ?
-                        "INIT" : std::to_string(source_region);
-                const int64_t prefetch_begin_us = ggml_time_us();
-                ++gpu_prefetch_stats.started;
-
+                const int64_t refill_begin_us = ggml_time_us();
+                ++gpu_bank_mover_stats_v.started;
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH] event=START "
-                    "worker=CPU_DEDICATED region=%zu bank=%c "
-                    "source_region=%s reason=%s tokens=%d status=RUNNING\n",
+                    "[REGION_RING_GPU_BANK_MOVER] event=REFILL_START "
+                    "region=%zu bank=%c source_region=%zu tokens=%d "
+                    "status=RUNNING\n",
                     region, bank_index == 0 ? 'A' : 'B',
-                    source_text.c_str(), reason, prefetch_tokens);
+                    source_region, refill_tokens);
 
-                auto fail_prefetch =
-                    [&](const char * fail_reason,
+                auto fail_refill =
+                    [&](const char * reason,
                         ggml_status status) -> bool {
-                        if (gpu_prefetch_kv_view) {
-                            gpu_prefetch_kv_view->clear_stage_range();
+                        if (gpu_bank_mover_kv_view) {
+                            gpu_bank_mover_kv_view->clear_stage_range();
                         }
                         if (region_ring_cuda_transfer_backend) {
                             ggml_backend_synchronize(
                                 region_ring_cuda_transfer_backend.get());
                         }
-                        {
-                            std::unique_lock<std::mutex> prepare_gate(
-                                region_ring_prepare_mutex);
-                            bank.res->reset();
-                            ggml_backend_sched_reset(bank.sched.get());
-                            ggml_backend_sched_set_weight_cache(
-                                bank.sched.get(), true);
-                        }
-                        bank.bank_region =
-                            std::numeric_limits<size_t>::max();
-                        bank.bank_generation = 0;
-                        ++gpu_prefetch_stats.failures;
-                        gpu_prefetch_stats.wall_us +=
-                            ggml_time_us() - prefetch_begin_us;
+                        ++gpu_bank_mover_stats_v.failures;
+                        gpu_bank_mover_stats_v.wall_us +=
+                            ggml_time_us() - refill_begin_us;
                         LLAMA_LOG_ERROR(
-                            "[REGION_RING_GPU_WEIGHT_PREFETCH] event=FAIL "
-                            "worker=CPU_DEDICATED region=%zu bank=%c "
-                            "source_region=%s reason=%s status=%d "
-                            "action=FAIL_PREFETCH\n",
+                            "[REGION_RING_GPU_BANK_MOVER] event=REFILL_FAIL "
+                            "region=%zu bank=%c source_region=%zu "
+                            "reason=%s status=%d\n",
                             region, bank_index == 0 ? 'A' : 'B',
-                            source_text.c_str(), fail_reason,
-                            (int) status);
+                            source_region, reason, (int) status);
                         return false;
                     };
 
-                if (!gpu_prefetch_kv_view ||
-                        !gpu_prefetch_kv_view->set_stage_range(
-                            ubatch_id, 0, prefetch_tokens)) {
-                    return fail_prefetch(
+                if (!gpu_bank_mover_kv_view ||
+                        !gpu_bank_mover_kv_view->set_stage_range(
+                            ubatch_id, 0, refill_tokens)) {
+                    return fail_refill(
                         "KV_STAGE_RANGE", GGML_STATUS_FAILED);
                 }
 
-                llama_ubatch prefetch_ubatch =
+                llama_ubatch refill_ubatch =
                     llama_hybrid_slice_ubatch(
-                        ubatch, 0, prefetch_tokens,
-                        gpu_prefetch_hidden.data());
+                        ubatch, 0, refill_tokens,
+                        gpu_bank_mover_hidden.data());
 
-                ggml_status prefetch_status = GGML_STATUS_SUCCESS;
-                llm_graph_result * prefetch_result = nullptr;
+                ggml_status refill_status = GGML_STATUS_SUCCESS;
+                llm_graph_result * refill_result = nullptr;
                 const int64_t prepare_begin_us = ggml_time_us();
                 {
                     std::unique_lock<std::mutex> prepare_gate(
                         region_ring_prepare_mutex);
-                    prefetch_result = prepare_ubatch(
+
+                    // The old Region has drained before this job is enqueued.
+                    // Reuse the same physical Bank allocation for the new
+                    // Region instead of retaining multiple cache entries.
+                    ggml_backend_sched_synchronize(bank.sched.get());
+                    bank.res->reset();
+                    ggml_backend_sched_reset(bank.sched.get());
+                    ggml_backend_sched_set_weight_cache(
+                        bank.sched.get(), true);
+
+                    refill_result = prepare_ubatch(
                         bank.res.get(), bank.sched.get(),
-                        prefetch_ubatch, gtype,
-                        gpu_prefetch_kv_view.get(),
-                        prefetch_status, false,
-                        &prefetch_stage, 0, true, false);
+                        refill_ubatch, gtype,
+                        gpu_bank_mover_kv_view.get(),
+                        refill_status, false,
+                        &refill_stage, 0, true, false);
                 }
                 const int64_t prepare_us =
                     ggml_time_us() - prepare_begin_us;
-                if (prefetch_result == nullptr ||
-                        prefetch_status != GGML_STATUS_SUCCESS) {
-                    return fail_prefetch(
-                        "GRAPH_PREPARE", prefetch_status);
+                if (refill_result == nullptr ||
+                        refill_status != GGML_STATUS_SUCCESS) {
+                    return fail_refill(
+                        "GRAPH_BIND", refill_status);
                 }
 
                 const int n_splits =
                     ggml_backend_sched_get_n_splits(
                         bank.sched.get());
                 if (n_splits <= 0) {
-                    return fail_prefetch(
+                    return fail_refill(
                         "NO_SPLITS", GGML_STATUS_FAILED);
                 }
                 for (int split = 0; split < n_splits; ++split) {
                     if (ggml_backend_sched_get_split_backend(
                             bank.sched.get(), split) !=
                             backend_ptrs[1]) {
-                        return fail_prefetch(
+                        return fail_refill(
                             "NON_CUDA_SPLIT", GGML_STATUS_FAILED);
                     }
                 }
 
-                size_t upload_bytes = 0;
-                size_t cache_hit_bytes = 0;
-                int64_t stage_cpu_copy_us = 0;
-                size_t stage_chunks = 0;
-                bool stage_pinned = true;
-                size_t stage_slot_size = 0;
                 if (!region_ring_cuda_transfer_backend) {
-                    return fail_prefetch(
+                    return fail_refill(
                         "TRANSFER_BACKEND", GGML_STATUS_FAILED);
                 }
 
+                size_t upload_bytes = 0;
+                int64_t stage_cpu_copy_us = 0;
+                size_t stage_chunks = 0;
                 const int64_t h2d_begin_us = ggml_time_us();
-                // One CPU prefetch worker + one transfer stream means both
-                // Banks can share one 2x64 MiB pinned staging ring. Resource
-                // #1 (Bank A) owns that ring; Bank B only owns its CUDA cache.
                 ggml_backend_sched_t staging_owner =
                     region_ring_worker_resources[1].sched.get();
                 for (int split = 0; split < n_splits; ++split) {
-                    prefetch_status =
+                    refill_status =
                         ggml_backend_sched_prepare_split_weights_staged_async(
                             bank.sched.get(), split,
                             region_ring_cuda_transfer_backend.get(),
@@ -4114,271 +4093,153 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     upload_bytes +=
                         ggml_backend_sched_get_last_weight_upload_bytes(
                             bank.sched.get());
-                    cache_hit_bytes +=
-                        ggml_backend_sched_get_last_weight_cache_hit_bytes(
-                            bank.sched.get());
                     stage_cpu_copy_us +=
                         ggml_backend_sched_get_last_weight_stage_cpu_copy_us(
                             staging_owner);
                     stage_chunks +=
                         ggml_backend_sched_get_last_weight_stage_chunks(
                             staging_owner);
-                    stage_slot_size = std::max(
-                        stage_slot_size,
-                        ggml_backend_sched_get_weight_stage_slot_size(
-                            staging_owner));
-                    stage_pinned =
-                        stage_pinned &&
-                        ggml_backend_sched_weight_stage_is_pinned(
-                            staging_owner);
-
-                    if (prefetch_status != GGML_STATUS_SUCCESS) {
-                        return fail_prefetch(
-                            "WEIGHT_STAGE", prefetch_status);
+                    if (refill_status != GGML_STATUS_SUCCESS) {
+                        return fail_refill(
+                            "WEIGHT_COPY", refill_status);
                     }
                 }
-
                 ggml_backend_synchronize(
                     region_ring_cuda_transfer_backend.get());
                 const int64_t h2d_us =
                     ggml_time_us() - h2d_begin_us;
-                gpu_prefetch_kv_view->clear_stage_range();
+                gpu_bank_mover_kv_view->clear_stage_range();
 
-                // Publication to the GPU worker happens only after the caller
-                // transitions the Bank from LOADING to READY under
-                // gpu_prefetch_mutex. These writes are therefore visible when
-                // that worker wakes on gpu_bank_cv.
-                bank.bank_region = region;
-                bank.bank_generation = 0;
-
-                const int64_t prefetch_us =
-                    ggml_time_us() - prefetch_begin_us;
-                gpu_prefetch_stats.wall_us += prefetch_us;
-                gpu_prefetch_stats.prepare_us += prepare_us;
-                gpu_prefetch_stats.h2d_us += h2d_us;
-                gpu_prefetch_stats.stage_cpu_copy_us +=
+                gpu_bank_mover_stats_v.wall_us +=
+                    ggml_time_us() - refill_begin_us;
+                gpu_bank_mover_stats_v.prepare_us += prepare_us;
+                gpu_bank_mover_stats_v.h2d_us += h2d_us;
+                gpu_bank_mover_stats_v.stage_cpu_copy_us +=
                     stage_cpu_copy_us;
-                gpu_prefetch_stats.stage_chunks += stage_chunks;
-                gpu_prefetch_stats.upload_bytes += upload_bytes;
-                gpu_prefetch_stats.cache_hit_bytes += cache_hit_bytes;
-                ++gpu_prefetch_stats.completed;
+                gpu_bank_mover_stats_v.stage_chunks += stage_chunks;
+                gpu_bank_mover_stats_v.upload_bytes += upload_bytes;
+                ++gpu_bank_mover_stats_v.completed;
 
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH] event=DONE "
-                    "worker=CPU_DEDICATED region=%zu bank=%c "
-                    "source_region=%s reason=%s splits=%d "
-                    "upload_mib=%.3f cache_hit_mib=%.3f "
-                    "stage=%s slot_mib=%.1f chunks=%zu "
-                    "cpu_stage_copy_ms=%.3f h2d_pipeline_ms=%.3f "
-                    "prepare_ms=%.3f wall_ms=%.3f status=READY\n",
+                    "[REGION_RING_GPU_BANK_MOVER] event=REFILL_DONE "
+                    "region=%zu bank=%c source_region=%zu "
+                    "upload_mib=%.3f cpu_stage_copy_ms=%.3f "
+                    "h2d_ms=%.3f prepare_ms=%.3f wall_ms=%.3f "
+                    "status=READY\n",
                     region, bank_index == 0 ? 'A' : 'B',
-                    source_text.c_str(), reason, n_splits,
-                    upload_bytes / 1048576.0,
-                    cache_hit_bytes / 1048576.0,
-                    stage_pinned ? "PINNED_DOUBLE" : "DIRECT_PAGEABLE",
-                    stage_slot_size / 1048576.0,
-                    stage_chunks,
+                    source_region, upload_bytes / 1048576.0,
                     stage_cpu_copy_us / 1000.0,
                     h2d_us / 1000.0,
                     prepare_us / 1000.0,
-                    prefetch_us / 1000.0);
+                    (ggml_time_us() - refill_begin_us) / 1000.0);
                 return true;
             };
 
-        auto enqueue_gpu_prefetch =
+        auto enqueue_gpu_bank_refill =
             [&](size_t region, size_t bank_index,
-                const char * reason, size_t source_region) -> bool {
-                if (!gpu_weight_prefetch ||
-                        bank_index >= gpu_bank_runtime.size()) {
+                size_t source_region) -> bool {
+                if (!gpu_bank_streaming || bank_index >= 2) {
                     return false;
                 }
                 {
                     std::lock_guard<std::mutex> lock(
-                        gpu_prefetch_mutex);
-                    if (gpu_prefetch_stop || gpu_prefetch_failed) {
+                        gpu_bank_mover_mutex);
+                    if (gpu_bank_mover_stop ||
+                            gpu_bank_mover_failed) {
                         return false;
                     }
-                    auto & bank_state =
-                        gpu_bank_runtime[bank_index];
-                    bank_state.loading = true;
-                    bank_state.loaded_region =
-                        std::numeric_limits<size_t>::max();
-                    gpu_bank_prefetched[bank_index] = false;
-                    gpu_prefetch_jobs.push_back({
-                        region, bank_index, source_region, reason});
+                    auto & bank =
+                        region_ring_worker_resources[bank_index + 1];
+                    bank.bank_ready = false;
+                    gpu_bank_mover_jobs.push_back({
+                        region, bank_index, source_region});
                 }
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH] event=ENQUEUE "
-                    "worker=CPU_DEDICATED region=%zu bank=%c "
-                    "source_region=%s reason=%s status=QUEUED\n",
+                    "[REGION_RING_GPU_BANK_MOVER] event=ENQUEUE "
+                    "region=%zu bank=%c source_region=%zu "
+                    "status=QUEUED\n",
                     region, bank_index == 0 ? 'A' : 'B',
-                    source_region ==
-                        std::numeric_limits<size_t>::max() ?
-                        "INIT" : std::to_string(source_region).c_str(),
-                    reason);
-                gpu_prefetch_cv.notify_one();
+                    source_region);
+                gpu_bank_mover_cv.notify_one();
                 return true;
             };
 
-        auto run_gpu_prefetch_worker = [&]() {
+        auto run_gpu_bank_mover = [&]() {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                "event=START role=CPU_DEDICATED "
-                "banks=2 transfer_stream=INDEPENDENT "
-                "cuda_gate=NONE prepare_gate=GRAPH_ONLY status=READY\n");
-            try {
-                while (true) {
-                    gpu_weight_prefetch_job job;
-                    {
-                        std::unique_lock<std::mutex> lock(
-                            gpu_prefetch_mutex);
-                        gpu_prefetch_cv.wait(
-                            lock, [&]() {
-                                return gpu_prefetch_stop ||
-                                    !gpu_prefetch_jobs.empty();
-                            });
-                        if (gpu_prefetch_stop) {
-                            gpu_prefetch_jobs.clear();
-                            break;
-                        }
-                        job = gpu_prefetch_jobs.front();
-                        gpu_prefetch_jobs.pop_front();
+                "[REGION_RING_GPU_BANK_MOVER] event=START "
+                "role=CPU_SINGLE banks=2 mapping=FIXED_PARITY "
+                "transfer_stream=INDEPENDENT status=READY\n");
+            while (true) {
+                gpu_bank_refill_job job;
+                {
+                    std::unique_lock<std::mutex> lock(
+                        gpu_bank_mover_mutex);
+                    gpu_bank_mover_cv.wait(
+                        lock, [&]() {
+                            return gpu_bank_mover_stop ||
+                                !gpu_bank_mover_jobs.empty();
+                        });
+                    if (gpu_bank_mover_stop) {
+                        break;
                     }
-
-                    bool ok = false;
-                    try {
-                        ok = prefetch_gpu_region(
-                            job.region, job.bank_index,
-                            job.reason, job.source_region);
-                    } catch (const std::exception & e) {
-                        ++gpu_prefetch_stats.failures;
-                        LLAMA_LOG_ERROR(
-                            "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                            "event=JOB_EXCEPTION region=%zu bank=%c "
-                            "reason=%s status=FALLBACK\n",
-                            job.region,
-                            job.bank_index == 0 ? 'A' : 'B',
-                            e.what());
-                    } catch (...) {
-                        ++gpu_prefetch_stats.failures;
-                        LLAMA_LOG_ERROR(
-                            "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                            "event=JOB_EXCEPTION region=%zu bank=%c "
-                            "reason=UNKNOWN status=FALLBACK\n",
-                            job.region,
-                            job.bank_index == 0 ? 'A' : 'B');
-                    }
-
-                    {
-                        std::lock_guard<std::mutex> lock(
-                            gpu_prefetch_mutex);
-                        auto & bank_state =
-                            gpu_bank_runtime[job.bank_index];
-                        bank_state.loading = false;
-                        if (ok) {
-                            bank_state.loaded_region = job.region;
-                            gpu_bank_prefetched[job.bank_index] = true;
-                        } else {
-                            bank_state.loaded_region =
-                                std::numeric_limits<size_t>::max();
-                            gpu_prefetch_failed = true;
-                            gpu_bank_prefetched[job.bank_index] = false;
-                        }
-                    }
-                    gpu_bank_cv.notify_all();
+                    job = gpu_bank_mover_jobs.front();
+                    gpu_bank_mover_jobs.pop_front();
                 }
-            } catch (...) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                    "event=EXCEPTION reason=UNKNOWN status=STOPPED\n");
-                std::lock_guard<std::mutex> lock(
-                    gpu_prefetch_mutex);
-                gpu_prefetch_failed = true;
-                for (auto & bank_state : gpu_bank_runtime) {
-                    bank_state.loading = false;
-                    bank_state.loaded_region =
-                        std::numeric_limits<size_t>::max();
+
+                bool ok = false;
+                try {
+                    ok = refill_gpu_bank(
+                        job.region, job.bank_index,
+                        job.source_region);
+                } catch (...) {
+                    ok = false;
+                }
+
+                {
+                    std::lock_guard<std::mutex> lock(
+                        gpu_bank_mover_mutex);
+                    auto & bank =
+                        region_ring_worker_resources[
+                            job.bank_index + 1];
+                    if (ok) {
+                        bank.bank_region = job.region;
+                        ++bank.bank_generation;
+                        bank.bank_ready = true;
+                    } else {
+                        bank.bank_region =
+                            std::numeric_limits<size_t>::max();
+                        bank.bank_ready = false;
+                        gpu_bank_mover_failed = true;
+                    }
+                }
+                gpu_bank_ready_cv.notify_all();
+                if (!ok) {
+                    break;
                 }
             }
-            gpu_bank_cv.notify_all();
+            gpu_bank_ready_cv.notify_all();
             LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                "event=END status=JOINABLE_DONE\n");
+                "[REGION_RING_GPU_BANK_MOVER] event=END status=DONE\n");
         };
 
-        std::thread gpu_prefetch_worker;
-        bool gpu_prefetch_worker_started = false;
-        bool gpu_prefetch_worker_joined = false;
-        if (gpu_weight_prefetch) {
-            if (!load_primed_window) {
-                const size_t init_source =
-                    std::numeric_limits<size_t>::max();
-                (void) enqueue_gpu_prefetch(
-                    gpu_region_order[0],
-                    llama_region_ring_gpu_weight_bank_for_rank(0),
-                    "INITIAL_WINDOW", init_source);
-                (void) enqueue_gpu_prefetch(
-                    gpu_region_order[1],
-                    llama_region_ring_gpu_weight_bank_for_rank(1),
-                    "INITIAL_WINDOW", init_source);
-            }
+        std::thread gpu_bank_mover_thread;
+        bool gpu_bank_mover_started = false;
+        bool gpu_bank_mover_joined = false;
+        if (gpu_bank_streaming) {
             try {
-                gpu_prefetch_worker =
-                    std::thread(run_gpu_prefetch_worker);
-                gpu_prefetch_worker_started = true;
-            } catch (const std::exception & e) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                    "event=LAUNCH_FAIL reason=%s action=FAIL_PREFETCH\n",
-                    e.what());
+                gpu_bank_mover_thread =
+                    std::thread(run_gpu_bank_mover);
+                gpu_bank_mover_started = true;
             } catch (...) {
+                gpu_bank_mover_failed = true;
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_WEIGHT_PREFETCH_WORKER] "
-                    "event=LAUNCH_FAIL reason=UNKNOWN "
-                    "action=FAIL_PREFETCH\n");
+                    "[REGION_RING_GPU_BANK_MOVER] event=LAUNCH_FAIL "
+                    "status=FAIL\n");
             }
-
-            if (!gpu_prefetch_worker_started) {
-                std::lock_guard<std::mutex> lock(
-                    gpu_prefetch_mutex);
-                gpu_prefetch_stop = true;
-                gpu_prefetch_failed = true;
-                gpu_prefetch_jobs.clear();
-                for (auto & bank_state : gpu_bank_runtime) {
-                    bank_state.loading = false;
-                    bank_state.loaded_region =
-                        std::numeric_limits<size_t>::max();
-                }
-                gpu_bank_cv.notify_all();
-            } else if (!load_primed_window) {
-                // Fallback for contexts that were not load-primed. Normal
-                // server startup primes A/B before prompt timing, so this path
-                // should not be on the first-prompt critical path.
-                std::unique_lock<std::mutex> lock(
-                    gpu_prefetch_mutex);
-                gpu_bank_cv.wait(lock, [&]() {
-                    return gpu_prefetch_failed ||
-                           (!gpu_bank_runtime[0].loading &&
-                            !gpu_bank_runtime[1].loading);
-                });
+            if (!gpu_bank_mover_started) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
             }
-
-            const bool bank_a_ready =
-                !gpu_prefetch_failed &&
-                gpu_bank_runtime[0].loaded_region ==
-                    gpu_region_order[0];
-            const bool bank_b_ready =
-                !gpu_prefetch_failed &&
-                gpu_bank_runtime[1].loaded_region ==
-                    gpu_region_order[1];
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT_PREFETCH] event=WINDOW_READY "
-                "worker=CPU_DEDICATED region0=%zu bankA=%d "
-                "region1=%zu bankB=%d window=2 status=%s\n",
-                gpu_region_order[0], bank_a_ready ? 1 : 0,
-                gpu_region_order[1], bank_b_ready ? 1 : 0,
-                bank_a_ready && bank_b_ready ?
-                    "READY" : "PARTIAL_FALLBACK");
         }
 
         auto run_worker = [&](size_t dev) {
