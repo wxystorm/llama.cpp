@@ -661,6 +661,9 @@ private:
     // owned by Meta and are borrowed by the cached graph.
     std::map<uint64_t, std::unique_ptr<llama_sequence_ffn_branch_graph>>
         sequence_ffn_branch_cache;
+    // Metadata-only lock. It protects the cache map/build lifetime; it is not
+    // an execution gate and is never held across FFN compute or RPC transfer.
+    std::mutex sequence_ffn_branch_cache_mutex;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
