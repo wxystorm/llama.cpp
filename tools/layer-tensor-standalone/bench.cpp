@@ -4,12 +4,15 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,6 +21,7 @@ namespace {
 struct options {
     bool self_test = false;
     bool ffn_split_selfcheck = false;
+    bool debug_phone_partial = false;
     bool trace = false;
 
     std::string connect_endpoint;
@@ -67,6 +71,7 @@ void usage(const char * argv0) {
         "  --owner-burst N          OWNER burst before waiting REMOTE_FFN (default 1)\n"
         "  --max-owner-ahead N      Tensor frontier lead over downstream READY (default 1)\n"
         "  --threads N              PC CPU GGML threads (default 8)\n"
+        "  --debug-phone-partial    diagnostic: compare Phone FFN shard with PC CPU reference\n"
         "  --trace                  print task transitions\n\n"
         "reference self-test options:\n"
         "  --chunks N               synthetic chunk count\n"
@@ -179,6 +184,8 @@ bool parse_options(
             opts.self_test = true;
         } else if (arg == "--ffn-split-selfcheck") {
             opts.ffn_split_selfcheck = true;
+        } else if (arg == "--debug-phone-partial") {
+            opts.debug_phone_partial = true;
         } else if (arg == "--trace") {
             opts.trace = true;
         } else if (arg == "--connect") {
@@ -376,6 +383,8 @@ lt::plan make_plan(
         opts.owner_burst;
     runtime_plan.max_owner_ahead =
         opts.max_owner_ahead;
+    runtime_plan.debug_phone_partial =
+        opts.debug_phone_partial;
     runtime_plan.c2p_pc_ratio =
         opts.c2p_pc_ratio;
     runtime_plan.p2c_pc_ratio =
