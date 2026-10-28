@@ -241,6 +241,24 @@ rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
                    best == rpc_phone_tensor_queue_kind::NONE) {
             best = node_kind;
         }
+
+        // Meta's directional reduce graph writes through an auxiliary ADD
+        // tensor whose own name may be empty. The durable owner tensor is its
+        // view source, so classify that descriptor as well.
+        if (node->view_src != nullptr) {
+            const rpc_phone_tensor_queue_kind view_kind =
+                classify_name(node->view_src->name);
+            if (view_kind == rpc_phone_tensor_queue_kind::REDUCE) {
+                return view_kind;
+            }
+            if (view_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
+                best = view_kind;
+            } else if (view_kind == rpc_phone_tensor_queue_kind::OWNER &&
+                       best == rpc_phone_tensor_queue_kind::NONE) {
+                best = view_kind;
+            }
+        }
+
         for (int src = 0; src < GGML_MAX_SRC; ++src) {
             if (node->src[src] == nullptr) {
                 continue;
