@@ -674,6 +674,47 @@ static void test_dense_stage_contract() {
           "empty dense stage accepted");
 }
 
+static void test_gpu_same_bank_lifetime_scheduler() {
+    // Three synthetic GPU Regions are enough to validate the Bank lifetime
+    // rule independently of G/C/P topology. rank0(A) and rank1(B) may
+    // interleave; rank2(A) must wait until rank0 has fully drained.
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::GPU, 0, 1},
+        {llama_region_ring_device::GPU, 1, 2},
+        {llama_region_ring_device::GPU, 2, 3},
+    };
+    llama_region_ring_ready ready(regions, 32, 16, 0);
+
+    const auto r0c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r0c0 && r0c0->region == 0 && r0c0->chunk == 0,
+          "rank0 chunk0 missing");
+    ready.complete(*r0c0);
+
+    // Opposite Bank B may start before rank0/A has drained.
+    const auto r1c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r1c0 && r1c0->region == 1 && r1c0->chunk == 0,
+          "rank1/B was incorrectly blocked by rank0/A");
+    ready.complete(*r1c0);
+
+    // rank2/A is upstream-ready now, but Bank A is still owned by rank0
+    // because rank0 chunk1 remains incomplete. The scheduler must therefore
+    // skip rank2 and continue rank0.
+    const auto r0c1 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r0c1 && r0c1->region == 0 && r0c1->chunk == 1,
+          "rank2/A reused Bank A before rank0 drained");
+    ready.complete(*r0c1);
+
+    // Once rank0 drains, rank2/A becomes claimable immediately even while
+    // rank1/B still has later chunk work queued.
+    const auto r2c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r2c0 && r2c0->region == 2 && r2c0->chunk == 0,
+          "rank2/A did not become claimable after rank0 drained");
+}
+
 static void test_gpu_weight_two_bank_policy() {
     // Runtime scans GPU Regions in model order.  For the canonical G/C/P
     // sequence the physical stage ids are 0,3,6,9 while the GPU ranks are
@@ -757,6 +798,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
         test_dense_stage_contract();
         std::fprintf(stderr, "[REGION_RING_TEST] dense_stage_contract=PASS\n");
+        test_gpu_same_bank_lifetime_scheduler();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_same_bank_lifetime_scheduler=PASS\n");
         test_gpu_weight_two_bank_policy();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_pc_phone_overlap_intervals();
