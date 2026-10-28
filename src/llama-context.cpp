@@ -9657,6 +9657,21 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false;
     }
 
+    // Idempotent ensure: repeated perf resets do not move weights when the
+    // fixed initial pair is already resident.
+    if (bank_a.bank_ready && bank_b.bank_ready &&
+            bank_a.bank_region == gpu_regions[0] &&
+            bank_b.bank_region == gpu_regions[1]) {
+        region_ring_initial_banks_loaded = true;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
+            "region0=%zu region1=%zu bankA=1 bankB=1 "
+            "upload_mib=0.000 prepare_ms=0.000 h2d_ms=0.000 "
+            "wall_ms=0.000 status=ALREADY_READY\n",
+            gpu_regions[0], gpu_regions[1]);
+        return true;
+    }
+
     ggml_backend_dev_t cuda_dev =
         ggml_backend_get_device(backend_ptrs[1]);
     if (region_ring_cuda_transfer_backend &&
@@ -9743,7 +9758,6 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 
     const int64_t prime_begin_us = ggml_time_us();
     size_t total_upload_bytes = 0;
-    size_t total_cache_hit_bytes = 0;
     int64_t total_prepare_us = 0;
     int64_t total_h2d_us = 0;
 
@@ -9769,6 +9783,12 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             {
                 std::unique_lock<std::mutex> prepare_gate(
                     region_ring_prepare_mutex);
+                ggml_backend_sched_synchronize(bank.sched.get());
+                bank.res->reset();
+                ggml_backend_sched_reset(bank.sched.get());
+                ggml_backend_sched_set_weight_cache(
+                    bank.sched.get(), true);
+                bank.bank_ready = false;
                 result = prepare_ubatch(
                     bank.res.get(), bank.sched.get(),
                     prime_ubatch,
@@ -9810,7 +9830,6 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             }
 
             size_t upload_bytes = 0;
-            size_t cache_hit_bytes = 0;
             const int64_t h2d_begin_us = ggml_time_us();
             ggml_backend_sched_t staging_owner =
                 region_ring_worker_resources[1].sched.get();
@@ -9822,9 +9841,6 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
                         staging_owner);
                 upload_bytes +=
                     ggml_backend_sched_get_last_weight_upload_bytes(
-                        bank.sched.get());
-                cache_hit_bytes +=
-                    ggml_backend_sched_get_last_weight_cache_hit_bytes(
                         bank.sched.get());
                 if (status != GGML_STATUS_SUCCESS) {
                     break;
@@ -9846,17 +9862,16 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             }
 
             bank.bank_region = region;
-            bank.bank_generation = 0;
+            ++bank.bank_generation;
+            bank.bank_ready = true;
             total_upload_bytes += upload_bytes;
-            total_cache_hit_bytes += cache_hit_bytes;
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
                 "rank=%zu region=%zu bank=%c tokens=%d "
-                "upload_mib=%.3f cache_hit_mib=%.3f status=READY\n",
+                "generation=%" PRIu64 " upload_mib=%.3f status=READY\n",
                 gpu_rank, region, bank_index == 0 ? 'A' : 'B',
-                prime_tokens,
-                upload_bytes / 1048576.0,
-                cache_hit_bytes / 1048576.0);
+                prime_tokens, bank.bank_generation,
+                upload_bytes / 1048576.0);
             return true;
         };
 
@@ -9865,19 +9880,19 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
     const bool ok_b = ok_a && prime_one(1, bank_b);
     region_ring_initial_banks_loaded =
         ok_a && ok_b &&
+        bank_a.bank_ready && bank_b.bank_ready &&
         bank_a.bank_region == gpu_regions[0] &&
         bank_b.bank_region == gpu_regions[1];
 
     LLAMA_LOG_ERROR(
         "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
         "region0=%zu region1=%zu bankA=%d bankB=%d "
-        "upload_mib=%.3f cache_hit_mib=%.3f "
-        "prepare_ms=%.3f h2d_ms=%.3f wall_ms=%.3f status=%s\n",
+        "upload_mib=%.3f prepare_ms=%.3f h2d_ms=%.3f "
+        "wall_ms=%.3f status=%s\n",
         gpu_regions[0], gpu_regions[1],
         bank_a.bank_region == gpu_regions[0] ? 1 : 0,
         bank_b.bank_region == gpu_regions[1] ? 1 : 0,
         total_upload_bytes / 1048576.0,
-        total_cache_hit_bytes / 1048576.0,
         total_prepare_us / 1000.0,
         total_h2d_us / 1000.0,
         (ggml_time_us() - prime_begin_us) / 1000.0,
@@ -9887,11 +9902,10 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 }
 
 void llama_context::perf_reset() {
-    // The standard llama.cpp load path calls perf_reset() after its warmup,
-    // memory clear and synchronize. Prime the first two streamed GPU Regions
-    // here so their H2D cost belongs to model/context load, not prompt eval.
+    // The standard load/server initialization path calls perf_reset() after
+    // warmup/probes. Ensure the fixed initial pair G0/G1 is resident here.
+    // The ensure is idempotent, so an already-correct pair costs nothing.
     if (has_evaluated_once &&
-            !region_ring_initial_banks_loaded &&
             model.hybrid_ring_gpu_weight_streaming &&
             model.hybrid_ring_plan_mode == "APPLY_WIDE") {
         (void) region_ring_load_initial_gpu_banks();
