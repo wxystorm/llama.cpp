@@ -43,7 +43,7 @@ struct llama_region_ring_region {
     int layer_end; // exclusive
 };
 
-// Weight Streaming V1.5 uses a fixed two-Bank rolling window. Keep Bank
+// GPU weight streaming uses two fixed physical Banks. Keep Bank
 // parity and rank+2 lookahead in one shared policy so runtime, planner and
 // regression tests cannot silently drift.
 inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
