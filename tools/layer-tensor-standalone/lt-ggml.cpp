@@ -2499,6 +2499,118 @@ struct ggml_compute::impl {
         return output;
     }
 
+    ggml_tensor * build_full_moe_for_tokens(
+            ggml_context * ctx,
+            int32_t layer_index,
+            int32_t tokens,
+            ggml_tensor * hidden,
+            ggml_tensor * ids,
+            ggml_tensor * mix_weights,
+            std::string & error) {
+        if (layer_index < 0 ||
+            layer_index >= config.runtime_plan.layers ||
+            tokens <= 0) {
+            error =
+                "invalid full FFN benchmark layer/tokens";
+            return nullptr;
+        }
+
+        llama_layer & layer =
+            model->layers[
+                static_cast<size_t>(
+                    layer_index)];
+
+        ggml_tensor * input3 =
+            ggml_reshape_3d(
+                ctx,
+                hidden,
+                n_embd,
+                1,
+                tokens);
+
+        ggml_tensor * gate =
+            ggml_mul_mat_id(
+                ctx,
+                layer.ffn_gate_exps,
+                input3,
+                ids);
+        ggml_tensor * up =
+            ggml_mul_mat_id(
+                ctx,
+                layer.ffn_up_exps,
+                input3,
+                ids);
+
+        ggml_tensor * activated =
+            ggml_swiglu_split(
+                ctx,
+                gate,
+                up);
+
+        ggml_tensor * experts =
+            ggml_mul_mat_id(
+                ctx,
+                layer.ffn_down_exps,
+                activated,
+                ids);
+
+        experts =
+            ggml_mul(
+                ctx,
+                experts,
+                mix_weights);
+
+        std::vector<ggml_tensor *> expert_views;
+        expert_views.reserve(
+            static_cast<size_t>(
+                n_expert_used));
+
+        for (int ie = 0;
+             ie < n_expert_used;
+             ++ie) {
+            expert_views.push_back(
+                ggml_view_2d(
+                    ctx,
+                    experts,
+                    n_embd,
+                    tokens,
+                    experts->nb[2],
+                    static_cast<size_t>(
+                        ie) *
+                        experts->nb[1]));
+        }
+
+        if (expert_views.empty()) {
+            error =
+                "full FFN benchmark has no selected experts";
+            return nullptr;
+        }
+
+        ggml_tensor * output =
+            expert_views.front();
+
+        for (int ie = 1;
+             ie < n_expert_used;
+             ++ie) {
+            output =
+                ggml_add(
+                    ctx,
+                    output,
+                    expert_views[
+                        static_cast<size_t>(
+                            ie)]);
+        }
+
+        if (n_expert_used == 1) {
+            output =
+                ggml_cont(
+                    ctx,
+                    output);
+        }
+
+        return output;
+    }
+
     bool shard_for_side(
             const key & task,
             side shard_side,
