@@ -9508,12 +9508,193 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 c.ring_error_max, c.tasks, c.edges);
         }
 
-        const auto & best = result.selected;
+        llama_ring_planner::candidate best = result.selected;
         std::vector<llama_region_ring_region> best_regions;
-        if (!llama_ring_planner::make_regions(
-                best, model.layers, best_regions) ||
-                !llama_region_ring_apply_topology_compatible(
-                    best_regions, model.layers) ||
+        bool forced_ab = false;
+
+        const char * force_layout = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+        const char * force_xc_raw = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_FORCE_XC");
+        const char * force_xg_raw = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_FORCE_XG");
+        const char * force_xp_raw = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_FORCE_XP");
+        const bool any_force =
+            (force_layout != nullptr && *force_layout != '\0') ||
+            (force_xc_raw != nullptr && *force_xc_raw != '\0') ||
+            (force_xg_raw != nullptr && *force_xg_raw != '\0') ||
+            (force_xp_raw != nullptr && *force_xp_raw != '\0');
+
+        if (any_force) {
+            const bool complete_force =
+                force_layout != nullptr && *force_layout != '\0' &&
+                force_xc_raw != nullptr && *force_xc_raw != '\0' &&
+                force_xg_raw != nullptr && *force_xg_raw != '\0' &&
+                force_xp_raw != nullptr && *force_xp_raw != '\0';
+            if (!complete_force) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=INCOMPLETE_OVERRIDE "
+                    "required=LAYOUT,XC,XG,XP\n");
+                return false;
+            }
+
+            auto parse_force_chunk =
+                [](const char * raw, int & out) -> bool {
+                    char * end = nullptr;
+                    const long value = std::strtol(raw, &end, 10);
+                    if (end == raw || *end != '\0' ||
+                            value < 1 || value > 1024) {
+                        return false;
+                    }
+                    const int chunk = (int) value;
+                    if (chunk != 16 && chunk != 32 &&
+                            chunk != 64 && chunk != 128) {
+                        return false;
+                    }
+                    out = chunk;
+                    return true;
+                };
+
+            int force_xc = 0;
+            int force_xg = 0;
+            int force_xp = 0;
+            if (!parse_force_chunk(force_xc_raw, force_xc) ||
+                    !parse_force_chunk(force_xg_raw, force_xg) ||
+                    !parse_force_chunk(force_xp_raw, force_xp)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=INVALID_CHUNK "
+                    "allowed=16,32,64,128\n");
+                return false;
+            }
+
+            std::vector<llama_region_ring_region> forced_regions;
+            try {
+                forced_regions =
+                    llama_region_ring_parse(force_layout, model.layers);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=INVALID_LAYOUT detail=%s\n",
+                    e.what());
+                return false;
+            }
+
+            if (!llama_region_ring_apply_topology_compatible(
+                    forced_regions, model.layers) ||
+                    forced_regions.empty() ||
+                    forced_regions.back().device !=
+                        llama_region_ring_device::PHONE ||
+                    forced_regions.size() % 3 != 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=TOPOLOGY_CONTRACT "
+                    "layout=%s\n",
+                    force_layout);
+                return false;
+            }
+
+            const int cycles = (int) forced_regions.size() / 3;
+            const int g =
+                forced_regions[0].layer_end -
+                forced_regions[0].layer_begin;
+            const int c =
+                forced_regions[1].layer_end -
+                forced_regions[1].layer_begin;
+            const int p =
+                forced_regions[2].layer_end -
+                forced_regions[2].layer_begin;
+            bool uniform = cycles >= 2 && cycles <= 4;
+            for (int cycle = 0; uniform && cycle < cycles; ++cycle) {
+                const size_t base = (size_t) cycle * 3;
+                uniform =
+                    forced_regions[base + 0].device ==
+                        llama_region_ring_device::GPU &&
+                    forced_regions[base + 1].device ==
+                        llama_region_ring_device::CPU &&
+                    forced_regions[base + 2].device ==
+                        llama_region_ring_device::PHONE &&
+                    forced_regions[base + 0].layer_end -
+                        forced_regions[base + 0].layer_begin == g &&
+                    forced_regions[base + 1].layer_end -
+                        forced_regions[base + 1].layer_begin == c &&
+                    forced_regions[base + 2].layer_end -
+                        forced_regions[base + 2].layer_begin == p;
+            }
+            if (!uniform) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=NONUNIFORM_CYCLE "
+                    "layout=%s\n",
+                    force_layout);
+                return false;
+            }
+
+            llama_ring_planner::candidate forced;
+            forced.cycles = cycles;
+            forced.c = c;
+            forced.g = g;
+            forced.p = p;
+            forced.tail_c = 0;
+            forced.tail_g = 0;
+            forced.xc = force_xc;
+            forced.xg = force_xg;
+            forced.xp = force_xp;
+
+            if ((model.memory_feasible &&
+                    !model.memory_feasible(forced)) ||
+                    (model.region_memory_feasible &&
+                     !model.region_memory_feasible(forced_regions))) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=MEMORY_BUDGET "
+                    "layout=%s XC=%d XG=%d XP=%d\n",
+                    force_layout, force_xc, force_xg, force_xp);
+                return false;
+            }
+
+            std::string force_reason;
+            if (!llama_ring_planner::estimate_region_ring_balance(
+                    model, forced_regions, forced) ||
+                    !llama_ring_planner::simulate(
+                        model, forced_regions, forced, &force_reason)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                    "status=REJECT reason=PROFILE_OR_DAG_%s "
+                    "layout=%s XC=%d XG=%d XP=%d\n",
+                    force_reason.empty() ? "BALANCE" :
+                        force_reason.c_str(),
+                    force_layout, force_xc, force_xg, force_xp);
+                return false;
+            }
+
+            best = forced;
+            best_regions = forced_regions;
+            forced_ab = true;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
+                "status=ACCEPT source=ENV_AB "
+                "layout=%s cycles=%d C=%d G=%d P=%d "
+                "XC=%d XG=%d XP=%d predicted_ms=%.3f "
+                "prepare_busy=%.3f weight_prepare=%.3f "
+                "weight_h2d_exposed=%.3f E=%.4f\n",
+                force_layout, best.cycles, best.c, best.g, best.p,
+                best.xc, best.xg, best.xp, best.wall_ms,
+                best.prepare_busy_ms, best.weight_prepare_busy_ms,
+                best.weight_h2d_exposed_ms, best.ring_error_max);
+        } else if (!llama_ring_planner::make_regions(
+                best, model.layers, best_regions)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
+                "reason=SELECTED_RUNTIME_LAYOUT_BUILD_FAILED "
+                "status=KEEP_BASELINE\n");
+            return false;
+        }
+
+        if (!llama_region_ring_apply_topology_compatible(
+                best_regions, model.layers) ||
                 best_regions.back().device !=
                     llama_region_ring_device::PHONE ||
                 best.tail_c != 0 || best.tail_g != 0) {
@@ -9550,7 +9731,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.xp == baseline_chunk;
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
-            "source=AUTO_RUNTIME_V2 layout=%s baseline_layout=%s "
+            "source=%s layout=%s baseline_layout=%s "
             "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
             "predicted_ms=%.3f baseline_predicted_ms=%.3f "
             "prepare_busy=%.3f weight_prepare=%.3f "
@@ -9558,6 +9739,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
+            forced_ab ? "FORCED_AB" : "AUTO_RUNTIME_V2",
             best_text.c_str(), baseline_text.c_str(),
             best.cycles, best.c, best.g, best.p,
             best.xc, best.xg, best.xp,
@@ -9571,7 +9753,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             improvement_pct, min_gain_pct,
             best.ring_error_max);
 
-        if (identical || improvement_pct < min_gain_pct) {
+        if (!forced_ab &&
+                (identical || improvement_pct < min_gain_pct)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
                 "reason=%s gain_pct=%.3f status=KEEP_BASELINE\n",
@@ -9588,9 +9771,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         *selected_xp = best.xp;
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
-            "phase=PRE_MODEL_LOAD selected=1 "
+            "phase=PRE_MODEL_LOAD selected=1 source=%s "
             "layout=%s XC=%d XG=%d XP=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
+            forced_ab ? "FORCED_AB" : "AUTO_RUNTIME_V2",
             selected_layout->c_str(),
             *selected_xc, *selected_xg, *selected_xp);
         return true;
