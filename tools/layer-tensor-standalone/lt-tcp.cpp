@@ -18,7 +18,7 @@ namespace lt {
 namespace {
 
 constexpr uint32_t k_magic = 0x3156544cU; // LTV1
-constexpr uint32_t k_version = 5;
+constexpr uint32_t k_version = 6;
 constexpr uint32_t k_frame_plan = 1;
 constexpr uint32_t k_frame_message = 2;
 constexpr uint32_t k_max_frame = 256U * 1024U * 1024U;
@@ -491,7 +491,7 @@ bool tcp_channel::recv_message(message & value) {
                 message_kind::ready) ||
         header.kind >
             static_cast<uint32_t>(
-                message_kind::stream_bench_result)) {
+                message_kind::bench_pull_result)) {
         return false;
     }
 
