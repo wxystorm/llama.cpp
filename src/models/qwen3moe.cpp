@@ -223,9 +223,12 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool pc_phone_exec_v1_requested =
         pc_phone_exec_v1_env != nullptr &&
         std::atoi(pc_phone_exec_v1_env) != 0;
+    const bool experiment_directional_wavefront =
+        std::getenv("LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT") != nullptr;
     const bool return_wavefront_requested =
         pc_phone_exec_v1_requested ||
-        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+        std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr ||
+        experiment_directional_wavefront;
 
     bool moe_stage_wavefront =
         return_wavefront_requested &&
@@ -240,10 +243,31 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         loras->empty();
 
     for (int il = layer_begin; moe_stage_wavefront && il < layer_end; ++il) {
+        const llama_hybrid_layer_mode mode =
+            model.hybrid_layer_mode(il);
+        const bool supported_mode =
+            mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+            (experiment_directional_wavefront &&
+             llama_hybrid_layer_mode_directional_tensor(mode));
         moe_stage_wavefront =
-            model.hybrid_layer_mode(il) ==
-                llama_hybrid_layer_mode::TENSOR_SPLIT &&
+            supported_mode &&
             cvec->tensor_for(il) == nullptr;
+
+        // The standalone crossover experiment deliberately alternates
+        // ownership C2P -> P2C -> C2P ... . Reject an accidental repeated
+        // directional owner rather than silently benchmarking a different
+        // topology.
+        if (moe_stage_wavefront &&
+                experiment_directional_wavefront &&
+                il > layer_begin &&
+                llama_hybrid_layer_mode_directional_tensor(mode)) {
+            const llama_hybrid_layer_mode prev =
+                model.hybrid_layer_mode(il - 1);
+            if (llama_hybrid_layer_mode_directional_tensor(prev) &&
+                    prev == mode) {
+                moe_stage_wavefront = false;
+            }
+        }
     }
 
     std::vector<int> wave_chunk_sizes;
@@ -306,9 +330,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 wave_attn_target_tokens),
             wave_chunk_sizes.size(),
             wave_attn_group_counts.size(),
-            pc_phone_exec_v1_requested ?
-                "PC_PHONE_EXEC_V1" :
-                "LEGACY_RETURN_WAVEFRONT");
+            experiment_directional_wavefront ?
+                "EXPERIMENT_DIRECTIONAL" :
+                (pc_phone_exec_v1_requested ?
+                    "PC_PHONE_EXEC_V1" :
+                    "LEGACY_RETURN_WAVEFRONT"));
     }
 
     llm_graph_input_attn_kv * inp_attn =
@@ -658,6 +684,50 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         norm_name.c_str(),
                         wave_layer);
 
+                    const llama_hybrid_layer_mode wave_mode =
+                        model.hybrid_layer_mode(wave_layer);
+                    const bool wave_phone_router =
+                        llama_hybrid_layer_mode_tensor_attention_on_phone(
+                            wave_mode);
+                    const bool wave_c2p_router =
+                        wave_mode == llama_hybrid_layer_mode::TENSOR_C2P;
+                    const bool wave_explicit_router =
+                        wave_phone_router || wave_c2p_router;
+
+                    llm_graph_moe_routing explicit_routing;
+                    if (wave_explicit_router) {
+                        explicit_routing =
+                            build_moe_routing(
+                                ffn_norm,
+                                model.layers[wave_layer].ffn_gate_inp,
+                                nullptr,
+                                nullptr,
+                                n_expert, n_expert_used,
+                                true,
+                                hparams.expert_weights_scale,
+                                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                                wave_layer);
+
+                        const std::string route_prefix =
+                            wave_phone_router ?
+                                "phone_prefill_route_" :
+                                "c2p_prefill_route_";
+                        const std::string route_topk_name =
+                            route_prefix + "topk_chunk_" +
+                            std::to_string(ci);
+                        const std::string route_weights_name =
+                            route_prefix + "weights_chunk_" +
+                            std::to_string(ci);
+                        cb(
+                            explicit_routing.selected_experts,
+                            route_topk_name.c_str(),
+                            wave_layer);
+                        cb(
+                            explicit_routing.weights,
+                            route_weights_name.c_str(),
+                            wave_layer);
+                    }
+
                     ggml_tensor * down =
                         build_moe_ffn(
                             ffn_norm,
@@ -674,7 +744,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                             nullptr, nullptr,
                             model.layers[wave_layer].ffn_up_exps_s,
                             model.layers[wave_layer].ffn_gate_exps_s,
-                            model.layers[wave_layer].ffn_down_exps_s);
+                            model.layers[wave_layer].ffn_down_exps_s,
+                            explicit_routing.selected_experts,
+                            1,
+                            nullptr,
+                            explicit_routing.weights);
                     const std::string down_name =
                         "prefill_ffn_down_chunk_" +
                         std::to_string(ci);
