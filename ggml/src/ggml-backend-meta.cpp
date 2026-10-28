@@ -6144,6 +6144,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
     }
 
+    const char * experiment_tensor_wavefront_env =
+        std::getenv("LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT");
+    const bool experiment_tensor_wavefront =
+        experiment_tensor_wavefront_env != nullptr &&
+        std::atoi(experiment_tensor_wavefront_env) != 0;
+
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
     int64_t return_wave_dependency_wait_max_us = 0;
@@ -10850,6 +10856,29 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     prefill_down_chunk_0;
                 const size_t wave_sg = i;
 
+                // P2C Reduce must consume the exact PC REMOTE_FFN result for
+                // this (layer,chunk). Do not make the Meta/main thread join it;
+                // the lightweight reduce worker owns that dependency.
+                uint64_t wave_pc_remote_task = 0;
+                ggml_backend_meta_priority_worker * wave_pc_worker =
+                    backend_ctx->prefill_pc_worker;
+                const auto wave_pc_branch =
+                    std::find_if(
+                        pending_phone_prefill_pc_branches.begin(),
+                        pending_phone_prefill_pc_branches.end(),
+                        [&](const phone_prefill_pc_branch & branch) {
+                            return branch.layer == wave_layer &&
+                                branch.chunk == wave_chunk;
+                        });
+                if (experiment_tensor_wavefront) {
+                    GGML_ASSERT(
+                        wave_pc_branch !=
+                        pending_phone_prefill_pc_branches.end());
+                    wave_pc_remote_task = wave_pc_branch->pc_task;
+                    GGML_ASSERT(wave_pc_worker != nullptr);
+                    GGML_ASSERT(wave_pc_remote_task != 0);
+                }
+
                 const uint64_t reduce_task =
                     wave_reduce_worker->enqueue(
                         [&, phone_partial, pc_partial,
@@ -10858,10 +10887,38 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             phone_backend, pc_backend,
                             wave_layer, wave_chunk,
                             wave_sg, wave_return_slot,
-                            wave_return_lane]
+                            wave_return_lane,
+                            wave_pc_worker,
+                            wave_pc_remote_task,
+                            experiment_tensor_wavefront]
                         (uint64_t task_id) -> ggml_status {
                             const int64_t begin_us =
                                 ggml_time_us();
+
+                            if (experiment_tensor_wavefront) {
+                                const int64_t pc_wait_begin_us =
+                                    ggml_time_us();
+                                const ggml_status pc_ready_status =
+                                    wave_pc_worker->wait(
+                                        wave_pc_remote_task);
+                                const int64_t pc_wait_us =
+                                    ggml_time_us() -
+                                    pc_wait_begin_us;
+                                printf(
+                                    "[TENSOR_READY_REDUCE_DEP] "
+                                    "direction=P2C layer=%d chunk=%d "
+                                    "remote_task=%" PRIu64
+                                    " wait_ms=%.3f status=%d\n",
+                                    wave_layer,
+                                    wave_chunk,
+                                    wave_pc_remote_task,
+                                    pc_wait_us / 1000.0,
+                                    (int) pc_ready_status);
+                                if (pc_ready_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                    return pc_ready_status;
+                                }
+                            }
 
                             ggml_backend_synchronize(
                                 phone_backend);
@@ -17150,7 +17207,10 @@ auto prefill_norm_sg_has_prework =
             return GGML_STATUS_FAILED;
         }
 
-        if (return_wavefront_graph) {
+        if (return_wavefront_graph && !experiment_tensor_wavefront) {
+            // Legacy return-wavefront producer credit. The experiment
+            // ready-task scheduler intentionally has no producer window;
+            // buffer-slot reuse below remains the only safety backpressure.
             // Dense graphs normally arrive here with an async PC->Phone input
             // task. MoE can insert Router/Top-K/expert subgraphs between the
             // norm and down boundaries, so Meta may legitimately fall back to
@@ -17206,7 +17266,16 @@ auto prefill_norm_sg_has_prework =
 
         const auto route_it = pending_phone_prefill_routes.find(
             { prefill_down_layer, prefill_down_chunk });
-        const bool pipeline_phone_prefill_down =
+        const bool directional_wave_p2c_ready_task =
+            experiment_tensor_wavefront &&
+            return_wavefront_graph &&
+            !has_async_prefill_input &&
+            ggml_backend_meta_tensor_p2c_layer(
+                backend_ctx, prefill_down_layer) &&
+            layer_attention_phone_owned(prefill_down_layer) &&
+            route_it != pending_phone_prefill_routes.end();
+
+        const bool legacy_phone_prefill_down =
             phone_prefill_chunk_pipeline &&
             !return_wavefront_graph &&
             !has_async_prefill_input &&
@@ -17214,6 +17283,10 @@ auto prefill_norm_sg_has_prework =
             route_it != pending_phone_prefill_routes.end() &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
+
+        const bool pipeline_phone_prefill_down =
+            directional_wave_p2c_ready_task ||
+            legacy_phone_prefill_down;
 
         const auto local_main_it =
             phone_region_local_main_chunks.find(
@@ -17307,6 +17380,14 @@ auto prefill_norm_sg_has_prework =
             }
         } else if (pipeline_phone_prefill_down) {
             const phone_prefill_route_task route = route_it->second;
+            if (pipeline_debug && directional_wave_p2c_ready_task) {
+                printf(
+                    "[TENSOR_READY_P2C] layer=%d chunk=%d sg=%zu "
+                    "action=REMOTE_FFN_QUEUE owner=PHONE\n",
+                    prefill_down_layer,
+                    prefill_down_chunk,
+                    i);
+            }
             GGML_ASSERT(route.worker != nullptr);
             GGML_ASSERT(route.task != 0);
 
@@ -18411,7 +18492,9 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
+            if (return_wavefront_graph &&
+                    !experiment_tensor_wavefront &&
+                    phone_status == GGML_STATUS_SUCCESS) {
                 if (snapshot_prepares[i].prepared) {
                     return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
                 } else if (pipeline_debug) {
@@ -20641,7 +20724,9 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    if (return_wavefront_graph && return_wave_snapshot_ready_waiter != nullptr) {
+    if (return_wavefront_graph &&
+            !experiment_tensor_wavefront &&
+            return_wave_snapshot_ready_waiter != nullptr) {
         // Full returns are drained now, so any remaining producer credits are
         // already READY. Consume their notifications to avoid carrying stale
         // seq entries into a later graph execution.
