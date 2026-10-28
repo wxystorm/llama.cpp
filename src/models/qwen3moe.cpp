@@ -1181,13 +1181,21 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         if (sequence_attention_direct) {
             direct_attn_layer = model.layers[il];
 
-            auto pc_static = [](ggml_tensor * tensor) -> ggml_tensor * {
+            auto pc_static = [this](ggml_tensor * tensor) -> ggml_tensor * {
                 if (tensor == nullptr) {
                     return nullptr;
                 }
                 ggml_tensor * physical =
                     ggml_backend_meta_simple_tensor(tensor, 0);
-                GGML_ASSERT(physical != nullptr);
+                GGML_ASSERT(
+                    physical != nullptr &&
+                    physical->buffer != nullptr &&
+                    backend_cpu != nullptr);
+                GGML_ASSERT(
+                    ggml_backend_supports_buft(
+                        backend_cpu,
+                        ggml_backend_buffer_get_type(
+                            physical->buffer)));
                 return physical;
             };
 
