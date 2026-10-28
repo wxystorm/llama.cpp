@@ -5762,9 +5762,13 @@ llm_graph_result * llama_context::process_ubatch_staged(
             stage.kind == llama_hybrid_runtime_stage_kind::CPU;
         const bool profile_tensor =
             stage.kind == llama_hybrid_runtime_stage_kind::TENSOR;
+        const bool profile_sequence =
+            stage.kind == llama_hybrid_runtime_stage_kind::SEQUENCE_FFN;
         llama_hybrid_stage_timing stage_timing {};
+        llama_sequence_ffn_timing sequence_stage_timing {};
         const int64_t stage_wall_begin_us =
-            (profile_cpu || profile_tensor) ? ggml_time_us() : 0;
+            (profile_cpu || profile_tensor || profile_sequence) ?
+                ggml_time_us() : 0;
 
         if (profile_tensor) {
             const int n_backends =
@@ -5816,13 +5820,62 @@ llm_graph_result * llama_context::process_ubatch_staged(
 
             if (stage.kind ==
                     llama_hybrid_runtime_stage_kind::SEQUENCE_FFN) {
+                llama_sequence_ffn_timing block_timing {};
                 result = run_sequence_ffn_stage(
                     ubatch, stage,
                     token_begin, block_tokens,
                     stage_input, stage_output,
                     gtype, mctx, sched_use, res_use,
                     ubatch_id, stage_index, block_index,
-                    block_outputs, apply_mctx, ret);
+                    block_outputs, apply_mctx, ret,
+                    &block_timing);
+
+                sequence_stage_timing.total_us +=
+                    block_timing.total_us;
+                sequence_stage_timing.attn_us +=
+                    block_timing.attn_us;
+                sequence_stage_timing.cache_lookup_us +=
+                    block_timing.cache_lookup_us;
+                sequence_stage_timing.pc_build_us +=
+                    block_timing.pc_build_us;
+                sequence_stage_timing.phone_build_us +=
+                    block_timing.phone_build_us;
+                sequence_stage_timing.pc_alloc_us +=
+                    block_timing.pc_alloc_us;
+                sequence_stage_timing.phone_alloc_us +=
+                    block_timing.phone_alloc_us;
+                sequence_stage_timing.pc_stage_us +=
+                    block_timing.pc_stage_us;
+                sequence_stage_timing.c2p_us +=
+                    block_timing.c2p_us;
+                sequence_stage_timing.pc_ffn_us +=
+                    block_timing.pc_ffn_us;
+                sequence_stage_timing.phone_ffn_us +=
+                    block_timing.phone_ffn_us;
+                sequence_stage_timing.ffn_overlap_us +=
+                    block_timing.ffn_overlap_us;
+                sequence_stage_timing.pc_get_us +=
+                    block_timing.pc_get_us;
+                sequence_stage_timing.p2c_us +=
+                    block_timing.p2c_us;
+                sequence_stage_timing.join_wall_us +=
+                    block_timing.join_wall_us;
+                sequence_stage_timing.c2p_bytes +=
+                    block_timing.c2p_bytes;
+                sequence_stage_timing.p2c_bytes +=
+                    block_timing.p2c_bytes;
+                sequence_stage_timing.pc_tokens +=
+                    block_timing.pc_tokens;
+                sequence_stage_timing.phone_tokens +=
+                    block_timing.phone_tokens;
+                sequence_stage_timing.pc_cache_hits +=
+                    block_timing.pc_cache_hits;
+                sequence_stage_timing.pc_cache_misses +=
+                    block_timing.pc_cache_misses;
+                sequence_stage_timing.phone_cache_hits +=
+                    block_timing.phone_cache_hits;
+                sequence_stage_timing.phone_cache_misses +=
+                    block_timing.phone_cache_misses;
             } else {
                 result = run_hybrid_stage_block(
                     ubatch, stage,
@@ -5837,6 +5890,71 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 finish(ret);
                 return nullptr;
             }
+        }
+
+        if (profile_sequence) {
+            const int64_t stage_wall_us =
+                ggml_time_us() - stage_wall_begin_us;
+            const int64_t overlap_saved_us =
+                std::max<int64_t>(
+                    0,
+                    sequence_stage_timing.pc_ffn_us +
+                    sequence_stage_timing.phone_ffn_us -
+                    sequence_stage_timing.ffn_overlap_us);
+            const int64_t branch_remote_us =
+                sequence_stage_timing.c2p_us +
+                sequence_stage_timing.phone_ffn_us +
+                sequence_stage_timing.p2c_us;
+            const int64_t branch_pc_us =
+                sequence_stage_timing.pc_stage_us +
+                sequence_stage_timing.pc_ffn_us +
+                sequence_stage_timing.pc_get_us;
+
+            LLAMA_LOG_ERROR(
+                "[SEQ_FFN_STAGE_SUM] layer=%d ub=%d tokens=%u blocks=%zu "
+                "pc_tokens=%d phone_tokens=%d "
+                "pc_cache_hit=%d pc_cache_miss=%d "
+                "phone_cache_hit=%d phone_cache_miss=%d "
+                "cache_entries=%zu cache_lookup_ms=%.3f "
+                "pc_build_ms=%.3f pc_alloc_ms=%.3f "
+                "phone_build_ms=%.3f phone_alloc_ms=%.3f "
+                "attn_ms=%.3f pc_stage_ms=%.3f c2p_ms=%.3f "
+                "pc_ffn_ms=%.3f phone_ffn_ms=%.3f "
+                "ffn_overlap_wall_ms=%.3f overlap_saved_ms=%.3f "
+                "pc_get_ms=%.3f p2c_ms=%.3f join_wall_ms=%.3f "
+                "pc_branch_ms=%.3f remote_branch_ms=%.3f "
+                "block_total_ms=%.3f stage_wall_ms=%.3f "
+                "c2p_bytes=%zu p2c_bytes=%zu "
+                "reduce=0 causal_wavefront=0 status=OK\n",
+                stage.layer_begin, ubatch_id, ubatch.n_tokens, blocks.size(),
+                sequence_stage_timing.pc_tokens,
+                sequence_stage_timing.phone_tokens,
+                sequence_stage_timing.pc_cache_hits,
+                sequence_stage_timing.pc_cache_misses,
+                sequence_stage_timing.phone_cache_hits,
+                sequence_stage_timing.phone_cache_misses,
+                sequence_ffn_branch_cache.size(),
+                sequence_stage_timing.cache_lookup_us / 1000.0,
+                sequence_stage_timing.pc_build_us / 1000.0,
+                sequence_stage_timing.pc_alloc_us / 1000.0,
+                sequence_stage_timing.phone_build_us / 1000.0,
+                sequence_stage_timing.phone_alloc_us / 1000.0,
+                sequence_stage_timing.attn_us / 1000.0,
+                sequence_stage_timing.pc_stage_us / 1000.0,
+                sequence_stage_timing.c2p_us / 1000.0,
+                sequence_stage_timing.pc_ffn_us / 1000.0,
+                sequence_stage_timing.phone_ffn_us / 1000.0,
+                sequence_stage_timing.ffn_overlap_us / 1000.0,
+                overlap_saved_us / 1000.0,
+                sequence_stage_timing.pc_get_us / 1000.0,
+                sequence_stage_timing.p2c_us / 1000.0,
+                sequence_stage_timing.join_wall_us / 1000.0,
+                branch_pc_us / 1000.0,
+                branch_remote_us / 1000.0,
+                sequence_stage_timing.total_us / 1000.0,
+                stage_wall_us / 1000.0,
+                sequence_stage_timing.c2p_bytes,
+                sequence_stage_timing.p2c_bytes);
         }
 
         if (profile_cpu) {
