@@ -507,7 +507,11 @@ def run_candidate(
                 f"TOP1_MISMATCH_expected_{reference_top1}"
                 f"_got_{rep_top1_token}"
             )
-        elif candidate.family == "tensor" and not rep_wavefront_seen:
+        elif (
+            candidate.family == "tensor"
+            and candidate.x_layers > 1
+            and not rep_wavefront_seen
+        ):
             rep_correct = False
             rep_reason = "WAVEFRONT_NOT_BUILT"
 
