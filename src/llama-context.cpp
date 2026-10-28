@@ -4124,13 +4124,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring_sequence(
     }
 
     ggml_backend_t meta_backend = backend_ptrs[0];
-    ggml_backend_t seq_pc_backend =
-        ggml_backend_meta_simple_backend(
-            meta_backend, 0);
+    // PC FFN borrows immutable child0 physical weights, but executes on the
+    // one outer CPU backend.  This keeps the CPU executor single-owner even
+    // while a normal Phone Region is using Meta internally.
+    ggml_backend_t seq_pc_backend = backend_cpu;
     ggml_backend_t seq_phone_backend =
         ggml_backend_meta_simple_backend(
             meta_backend, 1);
     if (seq_pc_backend == nullptr ||
+            ggml_backend_meta_simple_backend(
+                meta_backend, 0) == nullptr ||
             seq_phone_backend == nullptr) {
         ret = GGML_STATUS_FAILED;
         return nullptr;
