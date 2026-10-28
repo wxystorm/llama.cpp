@@ -5853,6 +5853,42 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
         return nullptr;
     };
+    auto disable_exact_named_producer =
+        [&](size_t backend, size_t start_sg,
+            const char * expected) -> ggml_tensor * {
+            if (backend >= n_backends || expected == nullptr) {
+                return nullptr;
+            }
+            for (size_t sg = start_sg;
+                    sg < backend_ctx->n_subgraphs; ++sg) {
+                ggml_cgraph * graph =
+                    backend_ctx->backend_configs[backend].
+                        cgraphs[sg].cgraph_main;
+                if (graph == nullptr) {
+                    continue;
+                }
+                for (int k = 0; k < graph->n_nodes; ++k) {
+                    ggml_tensor * tensor = graph->nodes[k];
+                    if (tensor == nullptr ||
+                            std::strcmp(
+                                tensor->name, expected) != 0) {
+                        continue;
+                    }
+                    tensor->flags &=
+                        ~GGML_TENSOR_FLAG_COMPUTE;
+                    if (pipeline_debug) {
+                        printf(
+                            "[DISABLE_EXACT_PRODUCER] "
+                            "sg=%zu backend=%zu tensor=%s "
+                            "status=DISABLED\n",
+                            sg, backend, tensor->name);
+                    }
+                    return tensor;
+                }
+            }
+            return nullptr;
+        };
+
     auto has_layer_output_producer = [&](size_t backend, size_t start_sg, int layer) -> bool {
         if (backend >= n_backends || layer < 0) {
             return false;
@@ -10460,18 +10496,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 prefill_is_last_down_chunk(
                     i, prefill_down_layer_0);
 
-            // Chunk-local L46 Attention now produces a chunk-local residual:
-            //
-            //   phone_tensor_ffn_inp_chunk_N-46
-            //
-            // The legacy path instead exposes one full-batch ffn_inp-46.
-            // Prefer the exact chunk tensor when present. Its logical offset
-            // is zero; only the legacy full-batch tensor uses chunk_offset.
+            // Directional wavefront owns one explicit OUT(L,C)
+            // tensor per chunk.  The legacy Region path instead writes
+            // slices into a full-batch l_out.  Select the exact dependency
+            // object here so Reduce(L,C) can directly unlock Attn(L+1,C).
+            const bool wave_chunk_output =
+                return_wavefront_graph;
             char chunk_residual_name[96];
             std::snprintf(
                 chunk_residual_name,
                 sizeof(chunk_residual_name),
-                "phone_tensor_ffn_inp_chunk_%d-%d",
+                wave_chunk_output ?
+                    "prefill_wave_ffn_inp_chunk_%d-%d" :
+                    "phone_tensor_ffn_inp_chunk_%d-%d",
                 prefill_down_chunk_0,
                 prefill_down_layer_0);
             ggml_tensor * phone_residual =
@@ -10485,17 +10522,33 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         1, i, prefill_down_layer_0);
             }
 
-            ggml_tensor * pc_l_out =
-                find_layer_output(
-                    0, prefill_down_layer_0);
+            char wave_output_name[96] = {};
+            ggml_tensor * pc_l_out = nullptr;
+            if (wave_chunk_output) {
+                std::snprintf(
+                    wave_output_name,
+                    sizeof(wave_output_name),
+                    "prefill_wave_l_out_chunk_%d-%d",
+                    prefill_down_chunk_0,
+                    prefill_down_layer_0);
+                pc_l_out =
+                    find_exact_named_tensor(
+                        0, wave_output_name);
+            } else {
+                pc_l_out =
+                    find_layer_output(
+                        0, prefill_down_layer_0);
+            }
             GGML_ASSERT(phone_residual != nullptr);
             GGML_ASSERT(pc_l_out != nullptr);
 
             const size_t chunk_offset =
-                down_chunk_offset(
-                    1, true,
-                    prefill_down_layer_0,
-                    prefill_down_chunk_0);
+                wave_chunk_output ?
+                    0 :
+                    down_chunk_offset(
+                        1, true,
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0);
             const size_t residual_offset =
                 chunk_local_residual ? 0 : chunk_offset;
 
@@ -10563,7 +10616,16 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pc_reduce_graph->nodes[0] = pc_out_chunk;
             pc_reduce_graph->n_nodes = 1;
 
-            if (last_chunk) {
+            if (wave_chunk_output) {
+                ggml_tensor * disabled_pc =
+                    disable_exact_named_producer(
+                        0, i + 1, wave_output_name);
+                ggml_tensor * disabled_phone =
+                    disable_exact_named_producer(
+                        1, i + 1, wave_output_name);
+                GGML_ASSERT(disabled_pc == pc_l_out);
+                GGML_ASSERT(disabled_phone != nullptr);
+            } else if (last_chunk) {
                 ggml_tensor * disabled_pc =
                     disable_layer_output_producers(
                         0, i + 1, prefill_down_layer_0);
@@ -10829,7 +10891,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     "[REGION_P2C_PREFILL] layer=%d chunk=%d "
                     "last=%d bytes=%zu phone_fold_ms=%.3f "
                     "copy_ms=%.3f pc_reduce_ms=%.3f "
-                    "owner=PC source=%s status=OK\n",
+                    "owner=PC source=%s wave=%d status=OK\n",
                     prefill_down_layer_0,
                     prefill_down_chunk_0,
                     last_chunk ? 1 : 0,
@@ -10839,7 +10901,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     pc_reduce_us / 1000.0,
                     local_main_partial ?
                         "PHONE_MAIN_PARTIAL" :
-                        "LEGACY_LIVE");
+                        "LEGACY_LIVE",
+                    wave_chunk_output ? 1 : 0);
             }
 
             return GGML_STATUS_SUCCESS;
@@ -11094,15 +11157,49 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_backend_meta_tensor_c2p_layer(
                     backend_ctx, prefill_down_layer_0);
             if (c2p_prefill) {
-                GGML_ASSERT(prefill_layer_hands_off_to_phone(
-                    i, prefill_down_layer_0));
+                const bool wave_chunk_output =
+                    return_wavefront_graph;
+                if (!wave_chunk_output) {
+                    GGML_ASSERT(
+                        prefill_layer_hands_off_to_phone(
+                            i, prefill_down_layer_0));
+                }
 
                 const bool last_chunk =
-                    prefill_is_last_down_chunk(i, prefill_down_layer_0);
-                ggml_tensor * pc_residual =
-                    find_recent_ffn_inp(0, i, prefill_down_layer_0);
-                ggml_tensor * phone_l_out =
-                    find_layer_output(1, prefill_down_layer_0);
+                    prefill_is_last_down_chunk(
+                        i, prefill_down_layer_0);
+
+                char wave_residual_name[96] = {};
+                char wave_output_name[96] = {};
+                ggml_tensor * pc_residual = nullptr;
+                ggml_tensor * phone_l_out = nullptr;
+                if (wave_chunk_output) {
+                    std::snprintf(
+                        wave_residual_name,
+                        sizeof(wave_residual_name),
+                        "prefill_wave_ffn_inp_chunk_%d-%d",
+                        prefill_down_chunk_0,
+                        prefill_down_layer_0);
+                    std::snprintf(
+                        wave_output_name,
+                        sizeof(wave_output_name),
+                        "prefill_wave_l_out_chunk_%d-%d",
+                        prefill_down_chunk_0,
+                        prefill_down_layer_0);
+                    pc_residual =
+                        find_exact_named_tensor(
+                            0, wave_residual_name);
+                    phone_l_out =
+                        find_exact_named_tensor(
+                            1, wave_output_name);
+                } else {
+                    pc_residual =
+                        find_recent_ffn_inp(
+                            0, i, prefill_down_layer_0);
+                    phone_l_out =
+                        find_layer_output(
+                            1, prefill_down_layer_0);
+                }
 
                 GGML_ASSERT(pc_residual != nullptr);
                 GGML_ASSERT(phone_l_out != nullptr);
@@ -11110,8 +11207,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_nbytes(pc_residual) ==
                     ggml_nbytes(phone_l_out));
 
-                const size_t chunk_offset = down_chunk_offset(
-                    0, true, prefill_down_layer_0, prefill_down_chunk_0);
+                const size_t chunk_offset =
+                    wave_chunk_output ?
+                        0 :
+                        down_chunk_offset(
+                            0, true,
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0);
 
                 // At this boundary both FFN shard outputs are live and are the
                 // exact tensors consumed by the C2P reduction. Capture them
@@ -11202,8 +11304,20 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 // chunk before suppressing the old full-batch l_out producer.
                 // Suppress that producer at chunk 0 in pipeline mode, or it
                 // would overwrite the already Phone-owned partial l_out.
-                if ((!region_pipeline_active && last_chunk) ||
-                    (region_pipeline_active && prefill_down_chunk_0 == 0)) {
+                if (wave_chunk_output) {
+                    ggml_tensor * disabled_phone_l_out =
+                        disable_exact_named_producer(
+                            1, i + 1, wave_output_name);
+                    ggml_tensor * disabled_pc_l_out =
+                        disable_exact_named_producer(
+                            0, i + 1, wave_output_name);
+                    GGML_ASSERT(
+                        disabled_phone_l_out == phone_l_out);
+                    GGML_ASSERT(disabled_pc_l_out != nullptr);
+                } else if (
+                        (!region_pipeline_active && last_chunk) ||
+                        (region_pipeline_active &&
+                         prefill_down_chunk_0 == 0)) {
                     ggml_tensor * disabled_phone_l_out =
                         disable_layer_output_producers(
                             1, i + 1, prefill_down_layer_0);
@@ -11443,7 +11557,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         "[REGION_C2P_PREFILL] layer=%d chunk=%d last=%d "
                         "bytes=%zu pc_fold_ms=%.3f copy_ms=%.3f "
                         "partial_prefetch=%d prefetch_wait_ms=%.3f "
-                        "phone_reduce_ms=%.3f owner=PHONE status=OK\n",
+                        "phone_reduce_ms=%.3f owner=PHONE wave=%d status=OK\n",
                         prefill_down_layer_0,
                         prefill_down_chunk_0,
                         last_chunk ? 1 : 0,
@@ -11452,7 +11566,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         copy_us / 1000.0,
                         c2p_partial_prefetched ? 1 : 0,
                         partial_prefetch_wait_us / 1000.0,
-                        phone_reduce_us / 1000.0);
+                        phone_reduce_us / 1000.0,
+                        wave_chunk_output ? 1 : 0);
                 }
 
                 return GGML_STATUS_SUCCESS;
