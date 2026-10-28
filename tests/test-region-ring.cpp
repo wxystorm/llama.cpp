@@ -706,7 +706,7 @@ static void test_gpu_weight_two_bank_policy() {
     check(next0 && *next0 == 2,
           "rank0 drain must refill rank2");
     check(next1 && *next1 == 3,
-          "rank1 drain must prefetch rank3");
+          "rank1 drain must refill rank3");
     check(!next2 && !next3,
           "last two GPU ranks must not prefetch past the window");
 }
