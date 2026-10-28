@@ -4450,6 +4450,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring_sequence(
                     "ggml_backend_cpu_set_threadpool");
         if (set_threadpool_fn) {
             set_threadpool_fn(backend_cpu, tp);
+            if (region_ring_gpu_aux_cpu_backend) {
+                set_threadpool_fn(
+                    region_ring_gpu_aux_cpu_backend.get(),
+                    tp);
+            }
         }
     }
     for (const auto & entry : set_n_threads_fns) {
