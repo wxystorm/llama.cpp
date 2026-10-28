@@ -2634,6 +2634,9 @@ llama_sequence_ffn_branch_graph * llama_context::get_sequence_ffn_branch(
         return nullptr;
     }
 
+    std::lock_guard<std::mutex> cache_lock(
+        sequence_ffn_branch_cache_mutex);
+
     const uint64_t key =
         (uint64_t(uint32_t(layer_index)) << 40) |
         (uint64_t(child_index & 0xffu) << 32) |
