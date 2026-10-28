@@ -7,6 +7,7 @@
 #include "llama-model.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -257,6 +258,13 @@ struct ggml_compute::impl {
     std::vector<ggml_tensor *> kv_k;
     std::vector<ggml_tensor *> kv_v;
 
+    // Persistent activation slots live for the whole benchmark run. Two
+    // slots per chunk ping-pong by layer parity, so a graph never consumes
+    // and overwrites the same backend tensor in one step.
+    ggml_context * activation_ctx = nullptr;
+    ggml_backend_buffer_t activation_buffer = nullptr;
+    std::vector<std::array<ggml_tensor *, 2>> activation_slots;
+
     int32_t total_tokens = 0;
     int32_t n_embd = 0;
     int32_t n_expert = 0;
@@ -274,6 +282,15 @@ struct ggml_compute::impl {
     ~impl() {
         owner_cache.clear();
         remote_cache.clear();
+
+        if (activation_buffer != nullptr) {
+            ggml_backend_buffer_free(activation_buffer);
+            activation_buffer = nullptr;
+        }
+        if (activation_ctx != nullptr) {
+            ggml_free(activation_ctx);
+            activation_ctx = nullptr;
+        }
 
         if (kv_buffer != nullptr) {
             ggml_backend_buffer_free(kv_buffer);
@@ -609,6 +626,9 @@ struct ggml_compute::impl {
         }
 
         if (!initialize_kv(error)) {
+            return false;
+        }
+        if (!initialize_activation_slots(error)) {
             return false;
         }
 
