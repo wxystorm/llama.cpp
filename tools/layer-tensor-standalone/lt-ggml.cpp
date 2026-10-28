@@ -480,13 +480,16 @@ struct ggml_compute::impl {
                     std::fprintf(
                         stderr,
                         "[LT_GGML_SHARD] side=%s layer=%d owner=%s "
-                        "requested_pc_ratio=%.6f pc_width=%lld "
-                        "phone_width=%lld effective_pc_ratio=%.6f\n",
+                        "requested_pc_ratio=%.6f "
+                        "pc_begin=%lld pc_width=%lld "
+                        "phone_begin=0 phone_width=%lld "
+                        "effective_pc_ratio=%.6f\n",
                         side_name(config.local_side),
                         il,
                         side_name(
                             config.runtime_plan.owner_for_layer(il)),
                         requested,
+                        static_cast<long long>(phone_width),
                         static_cast<long long>(pc_width),
                         static_cast<long long>(phone_width),
                         static_cast<double>(pc_width) /
@@ -1607,11 +1610,20 @@ struct ggml_compute::impl {
             return false;
         }
 
+        // Keep the OpenCL/Phone shard at offset zero. Qualcomm's
+        // quantized OpenCL path repacks Q4_K/Q6_K weights into an internal
+        // SOA representation; a non-zero GGML view offset on those repacked
+        // weights is not equivalent to a plain byte offset in the original
+        // GGUF tensor. The CPU side can safely own the tail shard instead.
+        //
+        // This does not change the requested physical ratio:
+        //   Phone: [0, phone_width)
+        //   PC:    [phone_width, n_ff_exp)
         if (config.local_side == side::pc) {
-            begin = 0;
+            begin = phone_width;
             width = pc_width;
         } else {
-            begin = pc_width;
+            begin = 0;
             width = phone_width;
         }
 
