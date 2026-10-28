@@ -1,43 +1,109 @@
-# CPU / Phone Layer vs Directional Tensor benchmark
+# CPU / Phone x-layer Layer-vs-Tensor benchmark
 
-This experiment is intentionally independent from Region Ring and local CUDA.
+This experiment is independent from Region Ring and local CUDA.
 
 It asks one narrow question:
 
-> Given an `x`-layer window that would otherwise run on PC CPU, is it faster
-> to move whole layers to the Phone GPU, or to turn all `x` layers into
-> alternating directional Tensor layers (`C2P, P2C, C2P, ...`)?
+> If we load exactly `x` transformer layers, is the fastest full-layer
+> CPU/Phone placement still better than making those same `x` layers
+> directional Tensor layers?
 
-The program uses real `llama-cli` prompt evaluation for every candidate.
+The benchmark uses real `llama-cli` prompt evaluation for every candidate.
 There is no analytical performance model in v1.
 
-## Experiment families
+## Real truncated loading
 
-For a requested window `[start, start+x)`, all layers outside the window are
-kept `PC_ONLY`.
-
-### Layer planner
-
-The Layer planner enumerates one contiguous `PHONE_ONLY` block anywhere
-inside the window:
+For every tested `x`, the runner sets:
 
 ```
-CCCC
-PCCC
-PPCC
-CPPC
-CPPP
-PPPP
+LLAMA_HYBRID_EXPERIMENT_N_LAYERS=x
+```
+
+The model first reads the original GGUF metadata so Qwen3-MoE shapes and model
+type are initialized normally.  Before tensor creation, the effective block
+count is truncated to `x`.
+
+Therefore:
+
+```
+x = 4
+```
+
+creates and loads only:
+
+```
+blk.0.*
+blk.1.*
+blk.2.*
+blk.3.*
+```
+
+and does **not** create/materialize `blk.4.* ... blk.47.*`.
+
+The tokenizer/embedding/output tensors are still loaded so the normal llama
+runtime can execute a real prompt through the truncated model.  The runner
+uses `--no-mmap` so the PC path does not mmap the entire GGUF as a shortcut.
+
+A successful run must contain:
+
+```
+[HYBRID_EXPERIMENT_TRUNCATE] original_layers=48 active_layers=x ...
+```
+
+The Python runner rejects a candidate if that line does not report the
+requested `x`.
+
+## Backends
+
+The benchmark deliberately uses only:
+
+```
+PC CPU
+Phone RPC GPU
+```
+
+The command registers the phone with `--rpc`, then passes:
+
+```
+--device RPC0
+```
+
+so the local CUDA GPU is excluded from the offload device list.  If the phone
+registers under another device name, use `--phone-device`.
+
+## Layer planner
+
+For the `x` loaded layers, the Layer planner searches full-layer placement.
+
+V1 enumerates one contiguous Phone block, including the two endpoints:
+
+```
+x=4
+
+C C C C
+P C C C
+P P C C
+C P P C
+C P P P
+P P P P
 ...
 ```
 
-This allows the planner to choose how many slow CPU layers to replace with
-Phone Full layers and where the ownership handoff occurs, without introducing
-gratuitous repeated PC/Phone handoffs.
+where:
 
-### Tensor planner
+- `C` = PC CPU Full layer
+- `P` = Phone Full layer
 
-All `x` layers are Tensor layers with alternating ownership:
+A single Phone block is sufficient for this first full-layer baseline: multiple
+disconnected Phone blocks add extra ownership transfers to an otherwise
+sequential full-layer execution.
+
+If a candidate does not fit Phone memory or fails to execute, it is simply not
+eligible to win.
+
+## Tensor planner
+
+All `x` loaded layers are Tensor layers with alternating ownership:
 
 ```
 x=1: C2P
@@ -47,41 +113,49 @@ x=4: C2P P2C C2P P2C
 ...
 ```
 
-C2P and P2C can use different physical PC FFN shares.  The default coarse
-grid is:
+This is the intended ownership cycle:
 
 ```
-0.20, 0.33, 0.50
+PC
+  --C2P--> Phone
+  --P2C--> PC
+  --C2P--> Phone
+  ...
 ```
 
-so v1 evaluates the 3x3 C2P/P2C ratio combinations.
+For every `x`, the Tensor planner searches:
 
-The winner in each family is selected by measured `prompt eval time`.
-The two winners are then re-run and compared directly.
+- C2P physical PC FFN share;
+- P2C physical PC FFN share;
+- Tensor prefill chunk size `XT`.
+
+The defaults are:
+
+```
+R = 0.20, 0.33, 0.50
+XT = 32, 64, 128
+```
+
+so the first coarse search can find both compute balance and communication /
+chunking crossover.
+
+Use `--same-ratio` to force C2P and P2C to share the same R candidate.
 
 ## Explicit per-layer policy
 
-This branch adds the experimental environment variable:
+This experiment branch adds:
 
 ```
 LLAMA_HYBRID_EXPERIMENT_POLICY
 ```
 
-It contains exactly one comma-separated mode per model layer:
+with exactly one entry per **active/truncated** layer:
 
 ```
 C,P,C2P,P2C,...
 ```
 
-where:
-
-- `C` = PC CPU Full layer
-- `P` = Phone Full layer
-- `C2P` = PC-attention directional Tensor layer, output owned by Phone
-- `P2C` = Phone-attention directional Tensor layer, output owned by PC
-
-The experiment policy has priority over the legacy Hybrid policy builder and
-must not be combined with Region Ring.
+The experiment policy cannot be combined with Region Ring.
 
 ## Example
 
@@ -92,77 +166,53 @@ python .\tools\cpu-phone-tensor-bench\cpu_phone_tensor_bench.py `
   --exe .\build-tensor-bench\bin\Debug\llama-cli.exe `
   --model E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf `
   --rpc 192.168.1.123:50052 `
-  --model-layers 48 `
-  --start-layer 0 `
-  --layers 1:8 `
+  --phone-device RPC0 `
+  --layers 2,4,6,8 `
   --ratios 0.20,0.33,0.50 `
+  --tensor-chunks 32,64,128 `
+  --same-ratio `
   --prompt-file .\prompt.txt `
   --ctx 512 --batch 512 --ubatch 512 --threads 8
 ```
 
-To test only a few depths:
+For one exact depth:
 
 ```powershell
---layers 2,4,6,8
+--layers 6
 ```
 
-To force the same FFN ratio in both directions:
-
-```powershell
---same-ratio
-```
-
-To cap the Layer planner's Phone Full block for memory experiments:
+To cap the full-layer planner's Phone residency:
 
 ```powershell
 --max-phone-layers 4
 ```
 
-Extra llama-cli arguments can be appended after `--extra`:
-
-```powershell
---extra --no-warmup
-```
-
-Extra environment values can be supplied with repeated `--extra-env`:
-
-```powershell
---extra-env NAME=value
-```
-
 ## Output
 
-The output directory contains:
+For each `x`, both planners choose a measured winner and the runner then
+re-runs the two winners.
 
-- one full log per real candidate run;
-- `all-results.csv` with every candidate;
-- `summary.json` with the best Layer and Tensor configuration for every `x`.
-
-The console summary reports:
+The console summary is:
 
 ```
 x= 2 layer=...ms tensor=...ms speedup=... winner=...
-x= 3 layer=...ms tensor=...ms speedup=... winner=...
-...
+x= 4 layer=...ms tensor=...ms speedup=... winner=...
+x= 6 layer=...ms tensor=...ms speedup=... winner=...
 ```
 
-A speedup greater than 1 means alternating directional Tensor is faster than
-the best full-layer placement found for the same `x`.
+A speedup greater than 1 means:
 
-## Important interpretation
+```
+best Layer placement time / best Tensor placement time > 1
+```
 
-v1 still loads the complete GGUF and executes the complete transformer.  The
-`x` value is an **experiment window**, not a truncated GGUF.  All layers
-outside the window remain PC Full and therefore contribute the same constant
-background to both planner families.
+so alternating directional Tensor is faster for that actual x-layer model.
 
-This is deliberate for the first experiment: it avoids introducing a second
-custom graph executor while keeping the A/B comparison on the exact production
-C2P/P2C implementation.  The sign of the Layer-vs-Tensor comparison is still
-meaningful because the unchanged outer layers are common to both candidates.
-The logs also parse `META_LAYER_SUM` when available so the window-local layer
-time is recorded separately.
+The output directory also contains:
 
-If the first experiment shows a clear Tensor crossover, the next step is to
-move this same search into a dedicated x-layer graph executor so the constant
-outer-model cost disappears.
+- one complete log per candidate run;
+- `all-results.csv`;
+- `summary.json`.
+
+The crossover we care about is the smallest `x` for which the Tensor winner
+consistently beats the Layer winner.
