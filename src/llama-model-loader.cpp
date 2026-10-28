@@ -11,6 +11,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <future>
 #include <regex>
