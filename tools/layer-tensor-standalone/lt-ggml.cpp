@@ -1840,35 +1840,16 @@ struct ggml_compute::impl {
                 return false;
             }
 
-            if (task.layer + 1 ==
-                config.runtime_plan.layers) {
-                const size_t count =
-                    static_cast<size_t>(n_embd) *
-                    static_cast<size_t>(tokens);
-                output.resize(count);
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(tokens);
+            output.resize(count);
 
-                ggml_backend_tensor_get(
-                    reduced,
-                    output.data(),
-                    0,
-                    count * sizeof(float));
-            }
-        }
-
-        if (task.layer + 1 <
-            config.runtime_plan.layers) {
-            state->primary = reduced;
-
-            const key next {
-                task.layer + 1,
-                task.chunk
-            };
-            put_cache(
-                input_cache,
-                next,
-                state);
-
-            output.clear();
+            ggml_backend_tensor_get(
+                reduced,
+                output.data(),
+                0,
+                count * sizeof(float));
         }
 
         return true;
@@ -1957,27 +1938,16 @@ struct ggml_compute::impl {
             return false;
         }
 
-        const bool final_layer =
-            task.layer + 1 ==
-                config.runtime_plan.layers;
-        const bool next_local =
-            !final_layer &&
-            config.runtime_plan.owner_for_layer(
-                task.layer + 1) ==
-                config.local_side;
-
         {
             std::lock_guard<std::mutex> lock(
                 backend_mutex);
 
-            if (host_input_tensor != nullptr) {
-                ggml_backend_tensor_set(
-                    host_input_tensor,
-                    host_input.data(),
-                    0,
-                    host_input.size() *
-                        sizeof(float));
-            }
+            ggml_backend_tensor_set(
+                host_input_tensor,
+                host_input.data(),
+                0,
+                host_input.size() *
+                    sizeof(float));
             ggml_backend_tensor_set(
                 prefix.pos,
                 pos_data.data(),
@@ -2003,28 +1973,17 @@ struct ggml_compute::impl {
                 return false;
             }
 
-            if (!next_local) {
-                const size_t count =
-                    static_cast<size_t>(n_embd) *
-                    static_cast<size_t>(
-                        chunk_tokens(task));
-                output.resize(count);
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(
+                    chunk_tokens(task));
+            output.resize(count);
 
-                ggml_backend_tensor_get(
-                    layer_out,
-                    output.data(),
-                    0,
-                    count * sizeof(float));
-            }
-        }
-
-        if (next_local) {
-            state->primary = layer_out;
-            put_cache(
-                input_cache,
-                { task.layer + 1, task.chunk },
-                state);
-            output.clear();
+            ggml_backend_tensor_get(
+                layer_out,
+                output.data(),
+                0,
+                count * sizeof(float));
         }
 
         return true;
