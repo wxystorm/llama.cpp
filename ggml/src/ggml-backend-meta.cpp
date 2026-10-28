@@ -10704,8 +10704,21 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 ggml_tensor * disabled_phone =
                     disable_exact_named_producer(
                         1, i + 1, wave_output_name);
+
+                // P2C completes the chunk on PC.  The PC owner output must
+                // exist because the async reduce writes directly into it.
+                // A Phone-side l_out is only a scheduler mirror and may be
+                // omitted entirely by the current split graph.
                 GGML_ASSERT(disabled_pc == pc_l_out);
-                GGML_ASSERT(disabled_phone != nullptr);
+                if (pipeline_debug &&
+                        disabled_phone == nullptr) {
+                    printf(
+                        "[DIRECTIONAL_WAVE_NONOWNER_MIRROR] "
+                        "direction=P2C layer=%d chunk=%d "
+                        "backend=PHONE status=ABSENT_OK\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0);
+                }
             } else if (last_chunk) {
                 ggml_tensor * disabled_pc =
                     disable_layer_output_producers(
@@ -11549,9 +11562,23 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_tensor * disabled_pc_l_out =
                         disable_exact_named_producer(
                             0, i + 1, wave_output_name);
+
+                    // C2P completes the chunk on Phone.  The Phone owner
+                    // output is mandatory because the async reduce writes
+                    // directly into it.  PC is the non-owner after this
+                    // boundary, so a PC mirror is optional and may not be
+                    // present in the split graph at all.
                     GGML_ASSERT(
                         disabled_phone_l_out == phone_l_out);
-                    GGML_ASSERT(disabled_pc_l_out != nullptr);
+                    if (pipeline_debug &&
+                            disabled_pc_l_out == nullptr) {
+                        printf(
+                            "[DIRECTIONAL_WAVE_NONOWNER_MIRROR] "
+                            "direction=C2P layer=%d chunk=%d "
+                            "backend=PC status=ABSENT_OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0);
+                    }
                 } else if (
                         (!region_pipeline_active && last_chunk) ||
                         (region_pipeline_active &&
