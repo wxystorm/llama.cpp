@@ -3217,14 +3217,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         isolate_device_resources && pc_phone_overlap &&
         model.hybrid_ring_gpu_weight_streaming;
 
-    // Weight Streaming V1.5 uses the two persistent CUDA banks as a rolling
-    // two-Region lookahead window. With the canonical G/C/P Ring, GPU Regions
-    // are ordered R0,R1,R2,... regardless of their absolute stage indices.
-    // Bank A owns even GPU-region ranks, Bank B owns odd ranks:
-    //   INIT: A=R0, B=R1
-    //   drain R0 -> A=R2
-    //   drain R1 -> B=R3
-    // and so on. The old demand-load path remains the correctness fallback.
+    // Fixed two-Bank weight streaming. This is not a cache:
+    // GPU rank parity chooses the physical Bank permanently.
+    //   rank0 -> A, rank1 -> B
+    //   drain rank k -> CPU mover refills rank k+2 into the same Bank.
+    // For large prefill the initial pair MUST already be resident from load
+    // time; there is no runtime INITIAL_WINDOW fallback.
     std::vector<size_t> gpu_region_order;
     std::vector<int> gpu_region_rank(stages.size(), -1);
     if (gpu_weight_streaming) {
@@ -3236,58 +3234,51 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order.push_back(region);
         }
     }
-    const int gpu_prefetch_chunk_tokens =
+
+    const int gpu_bank_chunk_tokens =
         !gpu_region_order.empty() ?
             stages[gpu_region_order.front()].macro_tokens : 0;
-    const int gpu_prefetch_min_tokens =
-        gpu_prefetch_chunk_tokens > 0 ?
-            2 * gpu_prefetch_chunk_tokens :
+    const int gpu_bank_min_tokens =
+        gpu_bank_chunk_tokens > 0 ?
+            2 * gpu_bank_chunk_tokens :
             std::numeric_limits<int>::max();
-    const bool gpu_weight_prefetch =
+    const bool gpu_bank_streaming =
         gpu_weight_streaming &&
         gpu_region_order.size() >= 2 &&
-        (int) ubatch.n_tokens >= gpu_prefetch_min_tokens;
-    std::array<bool, 2> gpu_bank_prefetched = {false, false};
+        (int) ubatch.n_tokens >= gpu_bank_min_tokens;
 
-    const bool load_primed_window =
-        gpu_weight_streaming &&
-        gpu_region_order.size() >= 2 &&
+    const bool initial_banks_ready =
+        gpu_bank_streaming &&
         region_ring_initial_banks_loaded &&
+        region_ring_worker_resources[1].bank_ready &&
+        region_ring_worker_resources[2].bank_ready &&
         region_ring_worker_resources[1].bank_region ==
             gpu_region_order[0] &&
         region_ring_worker_resources[2].bank_region ==
             gpu_region_order[1];
 
-    if (gpu_weight_streaming) {
-        if (!load_primed_window) {
-            for (size_t bank = 1; bank <= 2; ++bank) {
-                region_ring_worker_resources[bank].bank_region =
-                    std::numeric_limits<size_t>::max();
-                region_ring_worker_resources[bank].bank_generation = 0;
-            }
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
-                "reason=NEW_UBATCH graph_cache=PRESERVED "
-                "region_metadata=CLEARED prefetch_window=%d "
-                "prefetch_min_tokens=%d ubatch_tokens=%u status=READY\n",
-                gpu_weight_prefetch ? 2 : 0,
-                gpu_prefetch_min_tokens,
-                ubatch.n_tokens);
-        } else {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_REUSE "
-                "source=LOAD_PRIME region0=%zu bankA=1 "
-                "region1=%zu bankB=1 prefetch_window=%d "
-                "ubatch_tokens=%u status=READY\n",
-                gpu_region_order[0], gpu_region_order[1],
-                gpu_weight_prefetch ? 2 : 0,
-                ubatch.n_tokens);
-        }
-        region_ring_gpu_weight_bank_generation = 0;
-        // The load-time prime is a one-shot initial window. Once this ubatch
-        // starts, rolling replacements may overwrite A/B, so a later ubatch
-        // must not assume the original pair is still resident.
-        region_ring_initial_banks_loaded = false;
+    if (gpu_bank_streaming && !initial_banks_ready) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_BANK] phase=PREFILL_START status=REJECT "
+            "reason=INITIAL_BANKS_NOT_LOADED "
+            "bankA_ready=%d bankA_region=%zu expectedA=%zu "
+            "bankB_ready=%d bankB_region=%zu expectedB=%zu\n",
+            region_ring_worker_resources[1].bank_ready ? 1 : 0,
+            region_ring_worker_resources[1].bank_region,
+            gpu_region_order[0],
+            region_ring_worker_resources[2].bank_ready ? 1 : 0,
+            region_ring_worker_resources[2].bank_region,
+            gpu_region_order[1]);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    if (gpu_bank_streaming) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_BANK] phase=PREFILL_START banks=2 "
+            "bankA_region=%zu bankB_region=%zu "
+            "policy=FIXED_PARITY mover=CPU_SINGLE status=READY\n",
+            gpu_region_order[0], gpu_region_order[1]);
     }
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
