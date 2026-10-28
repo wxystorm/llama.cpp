@@ -40,6 +40,9 @@ enum class message_kind : uint8_t {
     sequence_ffn_result = 14,
     bench_pull = 15,
     bench_pull_result = 16,
+    bench_push_data = 17,
+    bench_push_done = 18,
+    bench_pull_batch = 19,
 };
 
 struct key {
