@@ -493,6 +493,17 @@ public:
         return finished_;
     }
 
+    bool region_done(size_t region) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (region >= state_.size()) {
+            throw std::runtime_error(
+                "invalid region ring region index");
+        }
+        return std::all_of(
+            state_[region].begin(), state_[region].end(),
+            [](uint8_t state) { return state == 3; });
+    }
+
     size_t queue_size(
             llama_region_ring_device device) const {
         const size_t dev = device_index(device);
