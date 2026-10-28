@@ -10405,139 +10405,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             pc_reduce_graph->nodes[0] = pc_out;
             pc_reduce_graph->n_nodes = 1;
 
-            if (wave_chunk_output &&
-                    !local_main_partial &&
-                    !c2p_self_check) {
-                GGML_ASSERT(wave_reduce_worker != nullptr);
-                ggml_backend_t phone_backend =
-                    phone_cfg.backend;
-                ggml_backend_t pc_backend =
-                    pc_cfg.backend;
-                const int wave_layer =
-                    prefill_down_layer_0;
-                const int wave_chunk =
-                    prefill_down_chunk_0;
-                const size_t wave_sg = i;
-
-                const uint64_t reduce_task =
-                    wave_reduce_worker->enqueue(
-                        [&, phone_partial, pc_partial,
-                            phone_fold_graph, pc_tmp,
-                            pc_reduce_graph,
-                            phone_backend, pc_backend,
-                            wave_layer, wave_chunk,
-                            wave_sg, wave_return_slot,
-                            wave_return_lane]
-                        (uint64_t task_id) -> ggml_status {
-                            const int64_t begin_us =
-                                ggml_time_us();
-
-                            ggml_backend_synchronize(
-                                phone_backend);
-                            const int64_t phone_fold_begin_us =
-                                ggml_time_us();
-                            ggml_status status =
-                                ggml_backend_graph_compute_async(
-                                    phone_backend,
-                                    phone_fold_graph);
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
-                            }
-                            ggml_backend_synchronize(
-                                phone_backend);
-                            const int64_t phone_fold_us =
-                                ggml_time_us() -
-                                phone_fold_begin_us;
-
-                            const int64_t copy_begin_us =
-                                ggml_time_us();
-                            ggml_backend_tensor_copy_async(
-                                phone_backend,
-                                pc_backend,
-                                phone_partial,
-                                pc_tmp);
-                            ggml_backend_synchronize(
-                                pc_backend);
-                            const int64_t copy_us =
-                                ggml_time_us() -
-                                copy_begin_us;
-                            record_copy_wait(copy_us);
-                            record_meta_copy(
-                                wave_sg, 1, 0,
-                                phone_partial, copy_us);
-                            record_direct_copy();
-
-                            directional_wire_parity(
-                                "P2C",
-                                wave_layer,
-                                wave_chunk,
-                                "PHONE_PARTIAL_PLUS_RESIDUAL",
-                                1, 0,
-                                phone_partial,
-                                pc_tmp);
-
-                            const int64_t reduce_begin_us =
-                                ggml_time_us();
-                            status =
-                                ggml_backend_graph_compute_async(
-                                    pc_backend,
-                                    pc_reduce_graph);
-                            if (status != GGML_STATUS_SUCCESS) {
-                                return status;
-                            }
-                            ggml_backend_synchronize(
-                                pc_backend);
-                            const int64_t reduce_us =
-                                ggml_time_us() -
-                                reduce_begin_us;
-
-                            record_reduce_add(
-                                phone_fold_us + reduce_us,
-                                true);
-
-                            printf(
-                                "[DIRECTIONAL_WAVE_REDUCE_READY] "
-                                "direction=P2C layer=%d chunk=%d "
-                                "slot=%zu lane=%zu task=%" PRIu64
-                                " phone_fold_ms=%.3f copy_ms=%.3f "
-                                "reduce_ms=%.3f total_ms=%.3f "
-                                "status=OK\n",
-                                wave_layer,
-                                wave_chunk,
-                                wave_return_slot,
-                                wave_return_lane,
-                                task_id,
-                                phone_fold_us / 1000.0,
-                                copy_us / 1000.0,
-                                reduce_us / 1000.0,
-                                (ggml_time_us() -
-                                    begin_us) / 1000.0);
-                            return GGML_STATUS_SUCCESS;
-                        });
-
-                pending_prefill_reduce_task[
-                    wave_return_slot] = reduce_task;
-                pending_prefill_reduce_layer[
-                    wave_return_slot] = wave_layer;
-                pending_prefill_reduce_chunk[
-                    wave_return_slot] = wave_chunk;
-                pending_prefill_reduce_worker[
-                    wave_return_slot] =
-                        wave_reduce_worker;
-
-                printf(
-                    "[DIRECTIONAL_WAVE_REDUCE_ENQUEUE] "
-                    "direction=P2C layer=%d chunk=%d "
-                    "slot=%zu lane=%zu task=%" PRIu64
-                    " owner=PC\n",
-                    wave_layer,
-                    wave_chunk,
-                    wave_return_slot,
-                    wave_return_lane,
-                    reduce_task);
-                return GGML_STATUS_SUCCESS;
-            }
-
             std::vector<float> pc_before;
             std::vector<float> phone_before;
             std::vector<float> residual_before;
@@ -10848,6 +10715,139 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     disable_layer_output_producers(
                         1, i + 1, prefill_down_layer_0);
                 GGML_ASSERT(disabled_phone != nullptr);
+            }
+
+            if (wave_chunk_output &&
+                    !local_main_partial &&
+                    !c2p_self_check) {
+                GGML_ASSERT(wave_reduce_worker != nullptr);
+                ggml_backend_t phone_backend =
+                    phone_cfg.backend;
+                ggml_backend_t pc_backend =
+                    pc_cfg.backend;
+                const int wave_layer =
+                    prefill_down_layer_0;
+                const int wave_chunk =
+                    prefill_down_chunk_0;
+                const size_t wave_sg = i;
+
+                const uint64_t reduce_task =
+                    wave_reduce_worker->enqueue(
+                        [&, phone_partial, pc_partial,
+                            phone_fold_graph, pc_tmp,
+                            pc_reduce_graph,
+                            phone_backend, pc_backend,
+                            wave_layer, wave_chunk,
+                            wave_sg, wave_return_slot,
+                            wave_return_lane]
+                        (uint64_t task_id) -> ggml_status {
+                            const int64_t begin_us =
+                                ggml_time_us();
+
+                            ggml_backend_synchronize(
+                                phone_backend);
+                            const int64_t phone_fold_begin_us =
+                                ggml_time_us();
+                            ggml_status status =
+                                ggml_backend_graph_compute_async(
+                                    phone_backend,
+                                    phone_fold_graph);
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
+                            }
+                            ggml_backend_synchronize(
+                                phone_backend);
+                            const int64_t phone_fold_us =
+                                ggml_time_us() -
+                                phone_fold_begin_us;
+
+                            const int64_t copy_begin_us =
+                                ggml_time_us();
+                            ggml_backend_tensor_copy_async(
+                                phone_backend,
+                                pc_backend,
+                                phone_partial,
+                                pc_tmp);
+                            ggml_backend_synchronize(
+                                pc_backend);
+                            const int64_t copy_us =
+                                ggml_time_us() -
+                                copy_begin_us;
+                            record_copy_wait(copy_us);
+                            record_meta_copy(
+                                wave_sg, 1, 0,
+                                phone_partial, copy_us);
+                            record_direct_copy();
+
+                            directional_wire_parity(
+                                "P2C",
+                                wave_layer,
+                                wave_chunk,
+                                "PHONE_PARTIAL_PLUS_RESIDUAL",
+                                1, 0,
+                                phone_partial,
+                                pc_tmp);
+
+                            const int64_t reduce_begin_us =
+                                ggml_time_us();
+                            status =
+                                ggml_backend_graph_compute_async(
+                                    pc_backend,
+                                    pc_reduce_graph);
+                            if (status != GGML_STATUS_SUCCESS) {
+                                return status;
+                            }
+                            ggml_backend_synchronize(
+                                pc_backend);
+                            const int64_t reduce_us =
+                                ggml_time_us() -
+                                reduce_begin_us;
+
+                            record_reduce_add(
+                                phone_fold_us + reduce_us,
+                                true);
+
+                            printf(
+                                "[DIRECTIONAL_WAVE_REDUCE_READY] "
+                                "direction=P2C layer=%d chunk=%d "
+                                "slot=%zu lane=%zu task=%" PRIu64
+                                " phone_fold_ms=%.3f copy_ms=%.3f "
+                                "reduce_ms=%.3f total_ms=%.3f "
+                                "status=OK\n",
+                                wave_layer,
+                                wave_chunk,
+                                wave_return_slot,
+                                wave_return_lane,
+                                task_id,
+                                phone_fold_us / 1000.0,
+                                copy_us / 1000.0,
+                                reduce_us / 1000.0,
+                                (ggml_time_us() -
+                                    begin_us) / 1000.0);
+                            return GGML_STATUS_SUCCESS;
+                        });
+
+                pending_prefill_reduce_task[
+                    wave_return_slot] = reduce_task;
+                pending_prefill_reduce_layer[
+                    wave_return_slot] = wave_layer;
+                pending_prefill_reduce_chunk[
+                    wave_return_slot] = wave_chunk;
+                pending_prefill_reduce_worker[
+                    wave_return_slot] =
+                        wave_reduce_worker;
+
+                printf(
+                    "[DIRECTIONAL_WAVE_REDUCE_ENQUEUE] "
+                    "direction=P2C layer=%d chunk=%d "
+                    "slot=%zu lane=%zu task=%" PRIu64
+                    " owner=PC\n",
+                    wave_layer,
+                    wave_chunk,
+                    wave_return_slot,
+                    wave_return_lane,
+                    reduce_task);
+                return GGML_STATUS_SUCCESS;
             }
 
             std::vector<float> pc_before;
