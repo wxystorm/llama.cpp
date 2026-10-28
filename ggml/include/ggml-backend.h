@@ -555,8 +555,10 @@ extern "C" {
         int64_t return_rpc_total_us;
     };
 
-    // Read-only inspection of Meta's separately instantiated inner Backends.
-    // The returned handles belong to Meta; callers must never free them.
+    // Borrowed access to Meta's separately instantiated child Backends.
+    // The returned handles/tensors remain owned by Meta and must never be freed
+    // by callers. Dedicated executors may submit work to a child only after the
+    // enclosing Meta graph has synchronized.
     GGML_API bool           ggml_backend_is_meta(ggml_backend_t backend);
     GGML_API size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
