@@ -45,6 +45,9 @@ bool plan::valid(std::string * reason) const {
     if (owner_burst_limit <= 0) {
         return fail("owner_burst_limit must be > 0");
     }
+    if (max_owner_ahead < 0) {
+        return fail("max_owner_ahead must be >= 0");
+    }
     if (execution_mode == mode::layer &&
         layer_owners.size() != static_cast<size_t>(layers)) {
         return fail("layer mode requires one owner per layer");
@@ -89,6 +92,9 @@ runtime::runtime(
       transport_(std::move(transport_impl)),
       log_events_(log_events) {
     next_owner_chunk_.assign(
+        static_cast<size_t>(std::max(0, plan_.layers)),
+        0);
+    remote_owner_started_.assign(
         static_cast<size_t>(std::max(0, plan_.layers)),
         0);
 }
@@ -267,6 +273,14 @@ bool runtime::on_message(message value) {
             state.ready = std::move(value.ready);
             state.ready_received = true;
             ++stats_.ready_received;
+
+            int32_t & started =
+                remote_owner_started_[
+                    static_cast<size_t>(task.layer)];
+            started = std::max(
+                started,
+                task.chunk + 1);
+
             remote_queue_.push_back(task);
             maybe_queue_reduce_locked(task, state);
         }
@@ -341,10 +355,30 @@ void runtime::compute_loop() {
                                 work.task.layer >= plan_.layers) {
                                 return false;
                             }
-                            return work.task.chunk ==
-                                next_owner_chunk_[
+                            const size_t layer_index =
+                                static_cast<size_t>(
+                                    work.task.layer);
+
+                            if (work.task.chunk !=
+                                next_owner_chunk_[layer_index]) {
+                                return false;
+                            }
+
+                            if (plan_.execution_mode == mode::tensor &&
+                                work.task.layer + 1 < plan_.layers) {
+                                const size_t next_layer_index =
                                     static_cast<size_t>(
-                                        work.task.layer)];
+                                        work.task.layer + 1);
+
+                                if (next_owner_chunk_[layer_index] >
+                                    remote_owner_started_[
+                                        next_layer_index] +
+                                    plan_.max_owner_ahead) {
+                                    return false;
+                                }
+                            }
+
+                            return true;
                         });
                 };
 
