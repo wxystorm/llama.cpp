@@ -388,6 +388,52 @@ int main() {
                 floor_result.shortlist_e_limit + 1e-12);
     }
 
+    // The manual A/B override uses the same candidate contract as
+    // APPLY_WIDE. Keep the concrete G5/C3/P4 x4 experiment scoreable with
+    // independent XC/XG/XP so runtime forcing cannot drift from the planner.
+    {
+        model forced_profile = mock_profile();
+        forced_profile.gpu_weight_streaming = true;
+        forced_profile.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = (size_t) (end - begin) * 1024;
+                return true;
+            };
+        forced_profile.gpu_weight_h2d_ms =
+            [](size_t bytes, double & ms) {
+                ms = (double) bytes / (1024.0 * 1024.0);
+                return true;
+            };
+        forced_profile.memory_feasible =
+            [](const candidate &) { return true; };
+
+        const auto forced_regions = llama_region_ring_parse(
+            "G5,C3,P4,G5,C3,P4,G5,C3,P4,G5,C3,P4", 48);
+        candidate forced;
+        forced.cycles = 4;
+        forced.c = 3;
+        forced.g = 5;
+        forced.p = 4;
+        forced.xc = 64;
+        forced.xg = 16;
+        forced.xp = 128;
+
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            forced_regions, forced_profile.layers));
+        REQUIRE(estimate_region_ring_balance(
+            forced_profile, forced_regions, forced));
+        std::string forced_reason;
+        REQUIRE(simulate(
+            forced_profile, forced_regions, forced, &forced_reason));
+        REQUIRE(forced.tasks > 0);
+        REQUIRE(forced.edges > 0);
+        REQUIRE(std::isfinite(forced.wall_ms));
+        REQUIRE(forced.wall_ms > 0.0);
+    }
+
     // APPLY_WIDE may change cycle count and independent chunks, but every
     // selected candidate must end on Phone with no tail so the current final
     // output owner remains canonical.
