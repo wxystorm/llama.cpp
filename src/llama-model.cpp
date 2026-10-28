@@ -1826,6 +1826,71 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
+        const bool sequence_ffn_v1 =
+            region_ring &&
+            std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_V1") != nullptr &&
+            std::atoi(std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_V1")) != 0;
+        if (sequence_ffn_v1) {
+            const char * begin_env =
+                std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_LAYER_BEGIN");
+            const char * end_env =
+                std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_LAYER_END");
+            if (begin_env == nullptr || begin_env[0] == '\0') {
+                throw std::runtime_error(
+                    "LLAMA_HYBRID_SEQUENCE_FFN_V1 requires "
+                    "LLAMA_HYBRID_SEQUENCE_FFN_LAYER_BEGIN");
+            }
+
+            const int seq_begin =
+                std::atoi(begin_env);
+            const int seq_end =
+                end_env != nullptr && end_env[0] != '\0' ?
+                    std::atoi(end_env) :
+                    seq_begin + 1;
+
+            if (seq_begin < 0 || seq_end <= seq_begin ||
+                    seq_end > n_layer) {
+                throw std::runtime_error(
+                    "invalid sequence-FFN layer range");
+            }
+
+            for (int il = seq_begin; il < seq_end; ++il) {
+                const auto it = std::find_if(
+                    ring_regions.begin(),
+                    ring_regions.end(),
+                    [il](const llama_region_ring_region & region) {
+                        return il >= region.layer_begin &&
+                               il < region.layer_end;
+                    });
+                if (it == ring_regions.end() ||
+                        it->device != llama_region_ring_device::CPU) {
+                    throw std::runtime_error(
+                        "sequence-FFN V1 layers must be inside CPU Regions");
+                }
+                hybrid_layer_modes[il] =
+                    llama_hybrid_layer_mode::SEQUENCE_FFN;
+            }
+
+            const char * phone_tokens_env =
+                std::getenv(
+                    "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOKENS");
+            const int phone_tokens =
+                phone_tokens_env != nullptr &&
+                        phone_tokens_env[0] != '\0' ?
+                    std::atoi(phone_tokens_env) : 8;
+            if (phone_tokens <= 0) {
+                throw std::runtime_error(
+                    "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOKENS must be positive");
+            }
+
+            LLAMA_LOG_ERROR(
+                "[SEQ_FFN_POLICY] layers=[%d,%d) "
+                "attention=PC_CPU ffn=TOKEN_SPLIT "
+                "phone_tokens=%d weights=MIRRORED "
+                "causal_wavefront=0 status=READY\n",
+                seq_begin, seq_end, phone_tokens);
+        }
+
         hybrid_tensor_pc_ratios.assign(
             n_layer,
             has_runtime_plan ?
