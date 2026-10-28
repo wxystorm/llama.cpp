@@ -3734,7 +3734,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const size_t slot_pool_size = 0;
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens,
-        region_chunk_tokens, slot_pool_size);
+        region_chunk_tokens, slot_pool_size,
+        gpu_weight_streaming);
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
         "XC=%d XG=%d XP=%d dependency=TOKEN_INTERVAL "
