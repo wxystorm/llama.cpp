@@ -1577,8 +1577,9 @@ struct ggml_compute::impl {
         return output;
     }
 
-    bool shard_for_task(
+    bool shard_for_side(
             const key & task,
+            side shard_side,
             int64_t & begin,
             int64_t & width,
             std::string & error) {
@@ -1611,16 +1612,7 @@ struct ggml_compute::impl {
             return false;
         }
 
-        // Keep the OpenCL/Phone shard at offset zero. Qualcomm's
-        // quantized OpenCL path repacks Q4_K/Q6_K weights into an internal
-        // SOA representation; a non-zero GGML view offset on those repacked
-        // weights is not equivalent to a plain byte offset in the original
-        // GGUF tensor. The CPU side can safely own the tail shard instead.
-        //
-        // This does not change the requested physical ratio:
-        //   Phone: [0, phone_width)
-        //   PC:    [phone_width, n_ff_exp)
-        if (config.local_side == side::pc) {
+        if (shard_side == side::pc) {
             begin = phone_width;
             width = pc_width;
         } else {
@@ -1629,6 +1621,19 @@ struct ggml_compute::impl {
         }
 
         return true;
+    }
+
+    bool shard_for_task(
+            const key & task,
+            int64_t & begin,
+            int64_t & width,
+            std::string & error) {
+        return shard_for_side(
+            task,
+            config.local_side,
+            begin,
+            width,
+            error);
     }
 
     bool allocate_state(
