@@ -722,20 +722,64 @@ private:
 
     bool claimable_locked(
             const llama_region_ring_task & task) const {
-        // A single GPU lane executes GPU Regions strictly in model order.
-        // A later GPU Region is not claimable until every chunk of every
-        // earlier GPU Region has completed. This is the only Bank-lifetime
-        // ordering rule the weight prefetch path needs.
+        // Weight Streaming V1.5 has two persistent Banks. Adjacent GPU
+        // Regions intentionally live in different Banks and may therefore
+        // interleave chunk work as soon as READY dependencies permit:
+        //
+        //   rank0 -> A, rank1 -> B, rank2 -> A, rank3 -> B, ...
+        //
+        // Reusing a Bank is the only extra lifetime constraint. A GPU Region
+        // of rank k>=2 must wait until rank k-2 has fully drained, but it must
+        // NOT wait for the immediately preceding opposite-Bank Region. The
+        // previous "all earlier GPU Regions must finish" rule serialized the
+        // Ring and broke nonuniform READY_V2 fan-out.
         if (regions_[task.region].device ==
                 llama_region_ring_device::GPU) {
-            for (size_t r = 0; r < task.region; ++r) {
+            size_t gpu_rank = 0;
+            size_t previous_same_bank_region = regions_.size();
+
+            for (size_t r = 0; r <= task.region; ++r) {
                 if (regions_[r].device !=
                         llama_region_ring_device::GPU) {
                     continue;
                 }
-                if (std::any_of(
-                        state_[r].begin(), state_[r].end(),
-                        [](uint8_t s) { return s != 3; })) {
+                if (r == task.region) {
+                    break;
+                }
+
+                if (llama_region_ring_gpu_weight_bank_for_rank(gpu_rank) ==
+                        llama_region_ring_gpu_weight_bank_for_rank(
+                            gpu_rank + 2)) {
+                    previous_same_bank_region = r;
+                }
+                ++gpu_rank;
+            }
+
+            if (gpu_rank >= 2) {
+                // The scan above leaves the most recent earlier GPU Region,
+                // but the Bank predecessor is exactly rank-2 rather than
+                // rank-1. Locate it explicitly so opposite-Bank work remains
+                // overlap-capable.
+                const size_t predecessor_rank = gpu_rank - 2;
+                size_t seen_rank = 0;
+                previous_same_bank_region = regions_.size();
+                for (size_t r = 0; r < task.region; ++r) {
+                    if (regions_[r].device !=
+                            llama_region_ring_device::GPU) {
+                        continue;
+                    }
+                    if (seen_rank == predecessor_rank) {
+                        previous_same_bank_region = r;
+                        break;
+                    }
+                    ++seen_rank;
+                }
+
+                if (previous_same_bank_region >= regions_.size() ||
+                        std::any_of(
+                            state_[previous_same_bank_region].begin(),
+                            state_[previous_same_bank_region].end(),
+                            [](uint8_t state) { return state != 3; })) {
                     return false;
                 }
             }
