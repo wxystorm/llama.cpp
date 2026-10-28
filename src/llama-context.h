@@ -215,6 +215,11 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
+    // Load-time Region Ring residency: after the standard llama.cpp warmup,
+    // prime the first two streamed GPU Regions into Bank A/B so prompt
+    // execution starts with both initial Banks resident.
+    bool region_ring_prime_initial_gpu_banks();
+
     llama_memory_breakdown memory_breakdown() const;
 
     //
@@ -538,6 +543,7 @@ private:
     // [0] CPU worker, [1] GPU Bank A / legacy GPU worker, [2] GPU Bank B.
     std::array<region_ring_worker_resource, 3> region_ring_worker_resources;
     uint64_t region_ring_gpu_weight_bank_epoch = 0;
+    bool region_ring_initial_banks_primed = false;
 
     // Same physical CUDA device as the Region Ring GPU compute backend, but a
     // separate backend context/stream owned only by the CPU weight-prefetch
