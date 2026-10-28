@@ -1,9 +1,12 @@
 #include "llama-hybrid.h"
 #include "models.h"
 
+#include "ggml-backend.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 
 static int qwen3moe_ffn_chunk_count() {
     constexpr int default_chunks = 1;
@@ -1157,19 +1160,120 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         ggml_tensor * inpSA = inpL;
 
+        // In the causal Sequence pipeline the layer container remains Meta so
+        // its FFN expert weights can be fully mirrored to RPC.  Attention,
+        // however, is a PC-only task.  Borrow Meta child0's physical static
+        // tensors directly so a CPU-only scheduler can execute Attention
+        // without involving Meta/RPC at all.  The serial correctness path
+        // keeps the existing Meta graph unchanged.
+        const char * ring_exec_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+        const bool sequence_attention_direct =
+            sequence_ffn_attention_only &&
+            ring_exec_env != nullptr &&
+            std::strcmp(
+                ring_exec_env,
+                "fifo-pc-phone-seq") == 0;
+
+        llama_layer direct_attn_layer;
+        const llama_layer * attn_layer =
+            &model.layers[il];
+        if (sequence_attention_direct) {
+            direct_attn_layer = model.layers[il];
+
+            auto pc_static = [](ggml_tensor * tensor) -> ggml_tensor * {
+                if (tensor == nullptr) {
+                    return nullptr;
+                }
+                ggml_tensor * physical =
+                    ggml_backend_meta_simple_tensor(tensor, 0);
+                GGML_ASSERT(physical != nullptr);
+                return physical;
+            };
+
+            direct_attn_layer.attn_norm =
+                pc_static(direct_attn_layer.attn_norm);
+            direct_attn_layer.attn_norm_b =
+                pc_static(direct_attn_layer.attn_norm_b);
+            direct_attn_layer.attn_q_norm =
+                pc_static(direct_attn_layer.attn_q_norm);
+            direct_attn_layer.attn_q_norm_b =
+                pc_static(direct_attn_layer.attn_q_norm_b);
+            direct_attn_layer.attn_k_norm =
+                pc_static(direct_attn_layer.attn_k_norm);
+            direct_attn_layer.attn_k_norm_b =
+                pc_static(direct_attn_layer.attn_k_norm_b);
+
+            direct_attn_layer.wq =
+                pc_static(direct_attn_layer.wq);
+            direct_attn_layer.wq_b =
+                pc_static(direct_attn_layer.wq_b);
+            direct_attn_layer.wq_s =
+                pc_static(direct_attn_layer.wq_s);
+            direct_attn_layer.wq_in_s =
+                pc_static(direct_attn_layer.wq_in_s);
+
+            direct_attn_layer.wk =
+                pc_static(direct_attn_layer.wk);
+            direct_attn_layer.wk_b =
+                pc_static(direct_attn_layer.wk_b);
+            direct_attn_layer.wk_s =
+                pc_static(direct_attn_layer.wk_s);
+            direct_attn_layer.wk_in_s =
+                pc_static(direct_attn_layer.wk_in_s);
+
+            direct_attn_layer.wv =
+                pc_static(direct_attn_layer.wv);
+            direct_attn_layer.wv_b =
+                pc_static(direct_attn_layer.wv_b);
+            direct_attn_layer.wv_s =
+                pc_static(direct_attn_layer.wv_s);
+            direct_attn_layer.wv_in_s =
+                pc_static(direct_attn_layer.wv_in_s);
+
+            direct_attn_layer.wo =
+                pc_static(direct_attn_layer.wo);
+            direct_attn_layer.wo_b =
+                pc_static(direct_attn_layer.wo_b);
+            direct_attn_layer.wo_s =
+                pc_static(direct_attn_layer.wo_s);
+            direct_attn_layer.wo_in_s =
+                pc_static(direct_attn_layer.wo_in_s);
+
+            direct_attn_layer.wqkv =
+                pc_static(direct_attn_layer.wqkv);
+            direct_attn_layer.wqkv_b =
+                pc_static(direct_attn_layer.wqkv_b);
+            direct_attn_layer.wqkv_s =
+                pc_static(direct_attn_layer.wqkv_s);
+            direct_attn_layer.wqkv_in_s =
+                pc_static(direct_attn_layer.wqkv_in_s);
+
+            attn_layer = &direct_attn_layer;
+
+            if (std::getenv(
+                    "LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[SEQ_FFN_ATTN_OWNER] layer=%d "
+                    "weights=PC_CHILD0 kv=CPU_DIRECT "
+                    "scheduler=CPU_ONLY status=READY\n",
+                    il);
+            }
+        }
+
         // norm
         cur = build_norm(inpL,
-                model.layers[il].attn_norm, NULL,
+                attn_layer->attn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
         // self_attention
         {
             // compute Q and K and RoPE them
-            auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
+            auto [Qcur, Kcur, Vcur] = build_qkv(*attn_layer, cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
+            Qcur = build_norm(Qcur, attn_layer->attn_q_norm, NULL, LLM_NORM_RMS, il);
             cb(Qcur, "Qcur_normed", il);
 
             Qcur = ggml_rope_ext(
@@ -1178,7 +1282,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ext_factor, attn_factor, beta_fast, beta_slow
                     );
 
-            Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
+            Kcur = build_norm(Kcur, attn_layer->attn_k_norm, NULL, LLM_NORM_RMS, il);
             cb(Kcur, "Kcur_normed", il);
 
             Kcur = ggml_rope_ext(
@@ -1192,7 +1296,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             cb(Vcur, "Vcur", il);
 
             cur = build_attn(inp_attn,
-                    model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s,
+                    attn_layer->wo, attn_layer->wo_b, attn_layer->wo_s,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
         const llama_hybrid_layer_mode hybrid_mode =
