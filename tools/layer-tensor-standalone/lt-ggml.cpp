@@ -2792,6 +2792,78 @@ struct ggml_compute::impl {
         ggml_backend_synchronize(backend);
 
         if (config.log_events) {
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(
+                    chunk_tokens(task));
+            std::vector<float> src_values(count);
+            std::vector<float> dst_values(count);
+
+            ggml_backend_tensor_get(
+                src,
+                src_values.data(),
+                0,
+                count * sizeof(float));
+            ggml_backend_tensor_get(
+                dst,
+                dst_values.data(),
+                0,
+                count * sizeof(float));
+
+            double diff_sq = 0.0;
+            double src_sq = 0.0;
+            double max_abs = 0.0;
+            for (size_t i = 0; i < count; ++i) {
+                const double a =
+                    static_cast<double>(
+                        src_values[i]);
+                const double b =
+                    static_cast<double>(
+                        dst_values[i]);
+                const double d =
+                    std::fabs(a - b);
+                diff_sq += d * d;
+                src_sq += a * a;
+                max_abs =
+                    std::max(
+                        max_abs,
+                        d);
+            }
+
+            const double rms =
+                std::sqrt(
+                    diff_sq /
+                    std::max<size_t>(1, count));
+            const double src_rms =
+                std::sqrt(
+                    src_sq /
+                    std::max<size_t>(1, count));
+            const double rel_rms =
+                rms /
+                std::max(
+                    1e-12,
+                    src_rms);
+
+            std::fprintf(
+                stderr,
+                "[LT_CONT_COPY_CHECK] side=%s mode=%s "
+                "from_layer=%d to_layer=%d chunk=%d "
+                "src_checksum=%.12f dst_checksum=%.12f "
+                "max_abs=%.9g rms=%.9g rel_rms=%.9g "
+                "status=%s\n",
+                side_name(config.local_side),
+                mode_name_value,
+                task.layer,
+                task.layer + 1,
+                task.chunk,
+                checksum(src_values),
+                checksum(dst_values),
+                max_abs,
+                rms,
+                rel_rms,
+                rel_rms <= 1e-7 ?
+                    "PASS" : "FAIL");
+
             std::fprintf(
                 stderr,
                 "[LT_GGML_LOCAL_COPY] side=%s mode=%s "
