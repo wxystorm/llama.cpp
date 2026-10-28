@@ -53,6 +53,29 @@ static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_k
     return "UNKNOWN";
 }
 
+struct llama_sequence_ffn_branch_graph {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+
+    ~llama_sequence_ffn_branch_graph() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+
+    llama_sequence_ffn_branch_graph() = default;
+    llama_sequence_ffn_branch_graph(
+        const llama_sequence_ffn_branch_graph &) = delete;
+    llama_sequence_ffn_branch_graph & operator=(
+        const llama_sequence_ffn_branch_graph &) = delete;
+};
+
 static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_action action) {
     switch (action) {
         case llama_hybrid_boundary_action::PASS:       return "PASS";
@@ -2366,29 +2389,6 @@ bool llama_context::copy_hybrid_stage_output(
     return true;
 }
 
-
-struct llama_sequence_ffn_branch_graph {
-    ggml_context * ctx = nullptr;
-    ggml_backend_buffer_t buffer = nullptr;
-    ggml_cgraph * graph = nullptr;
-    ggml_tensor * input = nullptr;
-    ggml_tensor * output = nullptr;
-
-    ~llama_sequence_ffn_branch_graph() {
-        if (buffer != nullptr) {
-            ggml_backend_buffer_free(buffer);
-        }
-        if (ctx != nullptr) {
-            ggml_free(ctx);
-        }
-    }
-
-    llama_sequence_ffn_branch_graph() = default;
-    llama_sequence_ffn_branch_graph(
-        const llama_sequence_ffn_branch_graph &) = delete;
-    llama_sequence_ffn_branch_graph & operator=(
-        const llama_sequence_ffn_branch_graph &) = delete;
-};
 
 static bool llama_sequence_ffn_build_branch(
         const llama_model & model,
