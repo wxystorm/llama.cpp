@@ -36,6 +36,7 @@ import shlex
 import statistics
 import subprocess
 import sys
+import threading
 from dataclasses import asdict, dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -237,13 +238,13 @@ def candidate_key(candidate: Candidate, args: argparse.Namespace) -> str:
 
 
 def build_command(args: argparse.Namespace) -> List[str]:
-    # --rpc must appear before --device so RPC0 is registered before the device
-    # list is parsed.  Supplying only RPC0 excludes the local CUDA device.
+    # Experiment mode itself constructs Meta=[CPU, Phone RPC] and filters
+    # local CUDA from the Tensor device set. Do not pass --device RPC0 here:
+    # doing so would build a one-child RPC-only Meta device.
     cmd = [
         args.exe,
         "-m", args.model,
         "--rpc", args.rpc,
-        "--device", args.phone_device,
         "--split-mode", "tensor",
         "-fit", "off",
         "--no-mmap",
@@ -345,7 +346,7 @@ def run_candidate(
             loaded_layers = candidate.x_layers
             continue
 
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             env=env,
             stdout=subprocess.PIPE,
@@ -353,11 +354,29 @@ def run_candidate(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=args.timeout,
+            bufsize=1,
         )
-        text = proc.stdout
-        log_path.write_text(text, encoding="utf-8", errors="replace")
-        final_rc = proc.returncode
+        output_lines: List[str] = []
+
+        def _tee_child() -> None:
+            assert proc.stdout is not None
+            with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+                for line in proc.stdout:
+                    output_lines.append(line)
+                    log_file.write(line)
+                    log_file.flush()
+                    print(line, end="", flush=True)
+
+        reader = threading.Thread(target=_tee_child, daemon=True)
+        reader.start()
+        try:
+            final_rc = proc.wait(timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            reader.join(timeout=5)
+            raise
+        reader.join(timeout=5)
+        text = "".join(output_lines)
 
         (
             prompt_ms,
@@ -452,7 +471,7 @@ def main() -> int:
     p.add_argument("--rpc", required=True, help="phone RPC endpoint")
     p.add_argument(
         "--phone-device", default="RPC0",
-        help="registered Phone device name; default RPC0",
+        help="registered Phone RPC device name used only by preflight; default RPC0",
     )
     p.add_argument(
         "--layers", default="1:8",
