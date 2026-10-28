@@ -8837,6 +8837,35 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
+    if (!is_qwen3_moe) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_DENSE_PROFILE_DESC] arch=%s layer=%d "
+            "qkv_bias=%d/%d/%d o_bias=%d "
+            "qkv_scale=%d/%d/%d o_scale=%d "
+            "ffn_bias=%d/%d/%d ffn_scale=%d/%d/%d "
+            "q_norm=%d k_norm=%d rope_factors=%d "
+            "kq_scale=%.9g status=READY\n",
+            ml.get_arch_name().c_str(), probe_layer,
+            attn_desc.has_q_bias ? 1 : 0,
+            attn_desc.has_k_bias ? 1 : 0,
+            attn_desc.has_v_bias ? 1 : 0,
+            attn_desc.has_o_bias ? 1 : 0,
+            attn_desc.has_q_scale ? 1 : 0,
+            attn_desc.has_k_scale ? 1 : 0,
+            attn_desc.has_v_scale ? 1 : 0,
+            attn_desc.has_o_scale ? 1 : 0,
+            ffn_desc.has_gate_bias ? 1 : 0,
+            ffn_desc.has_up_bias ? 1 : 0,
+            ffn_desc.has_down_bias ? 1 : 0,
+            ffn_desc.has_gate_scale ? 1 : 0,
+            ffn_desc.has_up_scale ? 1 : 0,
+            ffn_desc.has_down_scale ? 1 : 0,
+            attn_desc.has_q_norm ? 1 : 0,
+            attn_desc.has_k_norm ? 1 : 0,
+            attn_desc.has_rope_factors ? 1 : 0,
+            attn_desc.kq_scale);
+    }
+
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
     profile.n_layer = n_layer;
