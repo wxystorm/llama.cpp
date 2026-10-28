@@ -1700,6 +1700,38 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // Experimental truncated-model mode used only by the CPU/Phone
+    // Layer-vs-Tensor crossover benchmark.  The original GGUF metadata is
+    // consumed first so architecture-specific shapes/type detection remain
+    // unchanged; before tensor creation we reduce the effective block count.
+    // Consequently load_arch_tensors() only creates blk.0..blk.(x-1), and
+    // neither the PC nor RPC backend materializes the remaining layer weights.
+    if (const char * raw =
+            std::getenv("LLAMA_HYBRID_EXPERIMENT_N_LAYERS")) {
+        char * end = nullptr;
+        const long requested = std::strtol(raw, &end, 10);
+        const uint32_t original = hparams.n_layer_all;
+        if (end == raw || *end != '\0' ||
+                requested <= 0 ||
+                requested > (long) original) {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_EXPERIMENT_N_LAYERS must be in [1, "
+                + std::to_string(original) + "]");
+        }
+        if (hparams.n_layer_nextn != 0) {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_EXPERIMENT_N_LAYERS does not support "
+                "next-token auxiliary layers");
+        }
+
+        hparams.n_layer_all = (uint32_t) requested;
+        LLAMA_LOG_ERROR(
+            "[HYBRID_EXPERIMENT_TRUNCATE] original_layers=%u "
+            "active_layers=%u loaded_blocks=[0,%u) "
+            "status=READY\n",
+            original, hparams.n_layer_all, hparams.n_layer_all);
+    }
+
     const bool hybrid_arch =
         arch == LLM_ARCH_LLAMA ||
         arch == LLM_ARCH_QWEN2 ||
