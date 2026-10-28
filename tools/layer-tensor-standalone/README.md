@@ -142,3 +142,49 @@ A successful performance run ends with:
 The real adapter is intentionally Qwen3-MoE-only and rejects fused/scaled expert tensor variants it does not yet implement. The first target is `Qwen3-30B-A3B-Q4_K_M.gguf`.
 
 Graphs currently use the standalone direct GGML backend and real model weights. Scheduler/protocol remain independent of Meta/RPC; no runtime graph is serialized from PC to Phone.
+
+
+## Automated Layer-vs-Tensor search
+
+For search runs, start the Phone worker once with `--serve`:
+
+```bash
+./build-region-v1/bin/llama-layer-tensor-worker \
+  --listen 0.0.0.0:18061 \
+  --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf \
+  --device auto \
+  --threads 8 \
+  --serve
+```
+
+Then run the PC-side search harness:
+
+```powershell
+python .\tools\layer-tensor-standalone\search.py `
+  --bench .\build-tensor-bench\bin\Release\llama-layer-tensor-bench.exe `
+  --endpoint 10.39.52.114:18061 `
+  --model E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf `
+  --prompt-file .\prompt.txt `
+  --layers 2,4,6,8 `
+  --chunk-tokens 64,128 `
+  --tensor-ratios 0.20,0.33,0.50,0.67,0.80 `
+  --layer-max-switches 1 `
+  --repeats 1 `
+  --top-k 2 `
+  --final-repeats 3
+```
+
+The default Layer search is the canonical one-boundary pipeline: both PC->Phone and Phone->PC ownership layouts are enumerated for every cut position. Layer scheduling is depth-prioritized within the local contiguous region, so a chunk is pushed to the next ownership boundary early (for example `L0C0 -> L1C0 -> send`) instead of draining all `L0` chunks first.
+
+Set `--layer-max-switches 2` for a wider second-stage Layer search after the coarse crossover is known.
+
+Tensor search uses the same physical PC ratio in C2P and P2C by default. The current harness searches `--first-owner pc`; pass `--tensor-first-owners pc,phone` to include both starting directions.
+
+The script writes:
+
+- `layer-tensor-search-runs.csv`: every raw real-model run;
+- `layer-tensor-search-candidates.csv`: per-candidate medians;
+- `layer-tensor-search-summary.csv`: best Layer vs best Tensor for every layer count;
+- `layer-tensor-search-failures.log`: failed candidate logs, if any.
+
+The final summary reports the winning mode, speedup, Layer ownership layout, Tensor ratio/chunk size, and a checksum-relative-difference warning.
