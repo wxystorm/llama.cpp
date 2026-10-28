@@ -4453,7 +4453,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 gpu_region_rank[task.region] : -1;
                         size_t selected_bank =
                             rank >= 0 ?
-                                1 + (size_t) (rank & 1) : 1;
+                                1 + llama_region_ring_gpu_weight_bank_for_rank(
+                                        (size_t) rank) :
+                                1;
                         int64_t gpu_weight_wait_us = 0;
 
                         if (gpu_weight_prefetch) {
@@ -4829,7 +4831,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 "event=WINDOW_DRAIN region=%zu "
                                 "bank=%c next=NONE status=DONE\n",
                                 task.region,
-                                rank >= 0 && (rank & 1) ?
+                                rank >= 0 &&
+                                llama_region_ring_gpu_weight_bank_for_rank(
+                                    (size_t) rank) == 1 ?
                                     'B' : 'A');
                         }
                     }
