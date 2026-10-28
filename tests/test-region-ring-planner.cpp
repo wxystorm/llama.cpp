@@ -304,19 +304,18 @@ int main() {
         REQUIRE(std::fabs(
             streamed_plan.weight_h2d_busy_ms -
             expected_h2d) < 1e-9);
-        REQUIRE(streamed_plan.weight_h2d_startup_ms > 0.0);
-        // Four logical GPU Regions each pay one 2 ms prefetch prepare.
+        // rank0/rank1 are load-time resident; prompt simulation begins
+        // with Bank A/B ready and pays only rank2/rank3 rolling costs.
         REQUIRE(std::fabs(
-            streamed_plan.weight_prepare_busy_ms - 8.0) < 1e-9);
+            streamed_plan.weight_h2d_startup_ms) < 1e-9);
+        REQUIRE(std::fabs(
+            streamed_plan.weight_prepare_busy_ms - 4.0) < 1e-9);
         REQUIRE(streamed_plan.prepare_busy_ms + 1e-9 >=
                 streamed_plan.weight_prepare_busy_ms);
-        REQUIRE(streamed_plan.weight_h2d_exposed_ms + 1e-9 >=
-                streamed_plan.weight_h2d_startup_ms);
+        REQUIRE(streamed_plan.weight_h2d_exposed_ms >= 0.0);
         REQUIRE(streamed_plan.weight_h2d_hidden_ms >= 0.0);
         REQUIRE(streamed_plan.weight_h2d_hidden_ms <=
                 streamed_plan.weight_h2d_busy_ms + 1e-9);
-        REQUIRE(streamed_plan.wall_ms >=
-                streamed_plan.weight_h2d_startup_ms);
 
         // APPLY_WIDE now uses E as the first-stage physical filter. Every
         // profile-feasible candidate in E_min + margin is simulated; there is
