@@ -1314,6 +1314,608 @@ int run_stream_precompute_bench(
     return 0;
 }
 
+int run_sequence_ffn_bench(
+        const options & opts) {
+    if (opts.connect_endpoint.empty() ||
+        opts.model_path.empty() ||
+        opts.prompt_file.empty()) {
+        std::fprintf(
+            stderr,
+            "--connect, --model and --prompt-file are required "
+            "for --sequence-ffn-bench\n");
+        return 2;
+    }
+
+    std::string error;
+    std::string prompt;
+
+    if (!lt::read_text_file(
+            opts.prompt_file,
+            prompt,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PROMPT status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    std::vector<int32_t> tokens;
+    if (!lt::tokenize_prompt(
+            opts.model_path,
+            prompt,
+            tokens,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=TOKENIZE status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    if (tokens.empty()) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=TOKENIZE status=FAIL "
+            "reason=EMPTY_PROMPT\n");
+        return 2;
+    }
+
+    const int32_t bench_tokens =
+        static_cast<int32_t>(
+            std::min<size_t>(
+                tokens.size(),
+                static_cast<size_t>(
+                    opts.chunk_tokens)));
+
+    if (bench_tokens < 16) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=CHUNK status=FAIL "
+            "reason=NEED_AT_LEAST_16_TOKENS\n");
+        return 2;
+    }
+
+    options diag = opts;
+    diag.execution_mode =
+        lt::mode::layer;
+    diag.layers = 1;
+    diag.layer_owners = {
+        lt::side::pc
+    };
+    diag.debug_phone_partial = false;
+
+    const std::vector<int32_t> chunk_sizes {
+        bench_tokens
+    };
+
+    const lt::plan runtime_plan =
+        make_plan(
+            diag,
+            &chunk_sizes);
+
+    std::string reason;
+    if (!runtime_plan.valid(&reason)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PLAN status=FAIL reason=%s\n",
+            reason.c_str());
+        return 2;
+    }
+
+    auto channel =
+        std::make_shared<lt::tcp_channel>();
+
+    if (!channel->connect_to(
+            opts.connect_endpoint,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=CONNECT status=FAIL reason=%s\n",
+            error.c_str());
+        return 3;
+    }
+
+    if (!channel->send_plan(
+            runtime_plan)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PLAN_TX status=FAIL\n");
+        return 3;
+    }
+
+    lt::ggml_compute_config compute_config;
+    compute_config.local_side =
+        lt::side::pc;
+    compute_config.runtime_plan =
+        runtime_plan;
+    compute_config.model_path =
+        opts.model_path;
+    compute_config.device =
+        opts.device;
+    compute_config.threads =
+        opts.threads;
+    compute_config.log_events = false;
+
+    auto compute =
+        lt::ggml_compute::create(
+            std::move(compute_config),
+            error);
+
+    if (compute == nullptr) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PC_MODEL status=FAIL reason=%s\n",
+            error.c_str());
+        return 4;
+    }
+
+    std::vector<int32_t> bench_token_ids(
+        tokens.begin(),
+        tokens.begin() +
+            static_cast<std::ptrdiff_t>(
+                bench_tokens));
+
+    std::vector<float> embedded;
+    if (!compute->embed_tokens(
+            bench_token_ids,
+            embedded,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=EMBED status=FAIL reason=%s\n",
+            error.c_str());
+        return 4;
+    }
+
+    lt::message worker_ready;
+    if (!channel->recv_message(
+            worker_ready) ||
+        worker_ready.kind !=
+            lt::message_kind::model_ready) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PHONE_MODEL_READY status=FAIL\n");
+        return 4;
+    }
+
+    // Run the real Attention prefix on PC once, outside all timed FFN paths.
+    // The returned residual is exactly the tensor that the proposed sequence
+    // split would divide between PC-prefix tokens and Phone-suffix tokens.
+    lt::ready_payload prefix_ready;
+    const lt::key task { 0, 0 };
+
+    if (!compute->owner_prefix(
+            task,
+            embedded,
+            prefix_ready)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=ATTENTION_PREFIX status=FAIL\n");
+        return 5;
+    }
+
+    const int hidden =
+        compute->n_embd();
+    const size_t expected =
+        static_cast<size_t>(hidden) *
+        static_cast<size_t>(bench_tokens);
+
+    if (prefix_ready.residual.size() !=
+            expected) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=ATTENTION_PREFIX status=FAIL "
+            "reason=RESIDUAL_SIZE got=%zu expected=%zu\n",
+            prefix_ready.residual.size(),
+            expected);
+        return 5;
+    }
+
+    auto token_slice =
+        [&](int32_t begin_token,
+            int32_t count) {
+            std::vector<float> out(
+                static_cast<size_t>(hidden) *
+                static_cast<size_t>(count));
+
+            std::memcpy(
+                out.data(),
+                prefix_ready.residual.data() +
+                    static_cast<size_t>(
+                        begin_token) *
+                    static_cast<size_t>(
+                        hidden),
+                out.size() *
+                    sizeof(float));
+            return out;
+        };
+
+    lt::sequence_ffn_bench_result pc_full;
+    if (!compute->sequence_ffn_bench(
+            0,
+            bench_tokens,
+            prefix_ready.residual,
+            opts.stream_repeats,
+            pc_full,
+            nullptr,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PC_FULL_FFN status=FAIL reason=%s\n",
+            error.c_str());
+        return 5;
+    }
+
+    auto request_phone_ffn =
+        [&](const std::vector<float> & residual,
+            int32_t count,
+            lt::sequence_ffn_bench_result & result) -> bool {
+            lt::message request;
+            request.kind =
+                lt::message_kind::sequence_ffn_request;
+            request.task = { 0, 0 };
+            request.hidden =
+                residual;
+            request.partial = {
+                static_cast<float>(count),
+                static_cast<float>(
+                    opts.stream_repeats),
+            };
+
+            if (!channel->send_message(
+                    request)) {
+                return false;
+            }
+
+            lt::message response;
+            if (!channel->recv_message(
+                    response) ||
+                response.kind !=
+                    lt::message_kind::sequence_ffn_result ||
+                response.partial.size() < 3) {
+                return false;
+            }
+
+            result.ffn_ms =
+                response.partial[0];
+            result.output_checksum =
+                response.partial[1];
+            result.output_l2 =
+                response.partial[2];
+            return true;
+        };
+
+    lt::sequence_ffn_bench_result phone_full;
+    if (!request_phone_ffn(
+            prefix_ready.residual,
+            bench_tokens,
+            phone_full)) {
+        std::fprintf(
+            stderr,
+            "[LT_SEQUENCE] phase=PHONE_FULL_FFN status=FAIL\n");
+        return 5;
+    }
+
+    const double full_l2_rel =
+        std::fabs(
+            phone_full.output_l2 -
+            pc_full.output_l2) /
+        std::max(
+            1e-12,
+            std::fabs(
+                pc_full.output_l2));
+
+    std::printf(
+        "[LT_SEQUENCE_FFN_BASELINE] tokens=%d hidden=%d repeats=%d "
+        "pc_full_ms=%.3f phone_full_ms=%.3f "
+        "pc_l2=%.6f phone_l2=%.6f l2_rel=%.6g "
+        "status=%s\n",
+        bench_tokens,
+        hidden,
+        opts.stream_repeats,
+        pc_full.ffn_ms,
+        phone_full.ffn_ms,
+        pc_full.output_l2,
+        phone_full.output_l2,
+        full_l2_rel,
+        full_l2_rel <= 0.03 ?
+            "PASS" :
+            "NUMERIC_WARN");
+
+    const int warmup =
+        std::min(
+            2,
+            opts.stream_repeats);
+
+    auto measure_c2p =
+        [&](const std::vector<float> & payload,
+            double & ms) -> bool {
+            double total = 0.0;
+
+            auto once =
+                [&](bool measured) -> bool {
+                    lt::message ping;
+                    ping.kind =
+                        lt::message_kind::bench_ping;
+                    ping.task = { 0, 0 };
+                    ping.hidden =
+                        payload;
+
+                    const auto begin =
+                        std::chrono::steady_clock::now();
+
+                    if (!channel->send_message(
+                            ping)) {
+                        return false;
+                    }
+
+                    lt::message pong;
+                    if (!channel->recv_message(
+                            pong) ||
+                        pong.kind !=
+                            lt::message_kind::bench_pong) {
+                        return false;
+                    }
+
+                    const auto end =
+                        std::chrono::steady_clock::now();
+
+                    if (measured) {
+                        total +=
+                            std::chrono::duration<
+                                double,
+                                std::milli>(
+                                end - begin).count();
+                    }
+                    return true;
+                };
+
+            for (int i = 0;
+                 i < warmup;
+                 ++i) {
+                if (!once(false)) {
+                    return false;
+                }
+            }
+            for (int i = 0;
+                 i < opts.stream_repeats;
+                 ++i) {
+                if (!once(true)) {
+                    return false;
+                }
+            }
+
+            ms =
+                total /
+                static_cast<double>(
+                    opts.stream_repeats);
+            return true;
+        };
+
+    auto measure_p2c =
+        [&](size_t float_count,
+            double & ms) -> bool {
+            double total = 0.0;
+
+            auto once =
+                [&](bool measured) -> bool {
+                    lt::message request;
+                    request.kind =
+                        lt::message_kind::bench_pull;
+                    request.task = { 0, 0 };
+                    request.partial = {
+                        static_cast<float>(
+                            float_count)
+                    };
+
+                    const auto begin =
+                        std::chrono::steady_clock::now();
+
+                    if (!channel->send_message(
+                            request)) {
+                        return false;
+                    }
+
+                    lt::message response;
+                    if (!channel->recv_message(
+                            response) ||
+                        response.kind !=
+                            lt::message_kind::bench_pull_result ||
+                        response.hidden.size() !=
+                            float_count) {
+                        return false;
+                    }
+
+                    const auto end =
+                        std::chrono::steady_clock::now();
+
+                    if (measured) {
+                        total +=
+                            std::chrono::duration<
+                                double,
+                                std::milli>(
+                                end - begin).count();
+                    }
+                    return true;
+                };
+
+            for (int i = 0;
+                 i < warmup;
+                 ++i) {
+                if (!once(false)) {
+                    return false;
+                }
+            }
+            for (int i = 0;
+                 i < opts.stream_repeats;
+                 ++i) {
+                if (!once(true)) {
+                    return false;
+                }
+            }
+
+            ms =
+                total /
+                static_cast<double>(
+                    opts.stream_repeats);
+            return true;
+        };
+
+    double best_ms =
+        std::numeric_limits<double>::infinity();
+    int32_t best_pc_tokens = -1;
+    int32_t best_phone_tokens = -1;
+    double best_speedup = 0.0;
+
+    for (int32_t pc_tokens = 8;
+         pc_tokens <= bench_tokens - 8;
+         pc_tokens += 8) {
+        const int32_t phone_tokens =
+            bench_tokens -
+            pc_tokens;
+
+        std::vector<float> pc_residual =
+            token_slice(
+                0,
+                pc_tokens);
+        std::vector<float> phone_residual =
+            token_slice(
+                pc_tokens,
+                phone_tokens);
+
+        lt::sequence_ffn_bench_result pc_result;
+        if (!compute->sequence_ffn_bench(
+                0,
+                pc_tokens,
+                pc_residual,
+                opts.stream_repeats,
+                pc_result,
+                nullptr,
+                error)) {
+            std::fprintf(
+                stderr,
+                "[LT_SEQUENCE] phase=PC_SPLIT_FFN "
+                "pc_tokens=%d status=FAIL reason=%s\n",
+                pc_tokens,
+                error.c_str());
+            return 6;
+        }
+
+        double c2p_ms = 0.0;
+        if (!measure_c2p(
+                phone_residual,
+                c2p_ms)) {
+            std::fprintf(
+                stderr,
+                "[LT_SEQUENCE] phase=C2P phone_tokens=%d "
+                "status=FAIL\n",
+                phone_tokens);
+            return 6;
+        }
+
+        lt::sequence_ffn_bench_result phone_result;
+        if (!request_phone_ffn(
+                phone_residual,
+                phone_tokens,
+                phone_result)) {
+            std::fprintf(
+                stderr,
+                "[LT_SEQUENCE] phase=PHONE_SPLIT_FFN "
+                "phone_tokens=%d status=FAIL\n",
+                phone_tokens);
+            return 6;
+        }
+
+        double p2c_ms = 0.0;
+        if (!measure_p2c(
+                phone_residual.size(),
+                p2c_ms)) {
+            std::fprintf(
+                stderr,
+                "[LT_SEQUENCE] phase=P2C phone_tokens=%d "
+                "status=FAIL\n",
+                phone_tokens);
+            return 6;
+        }
+
+        const double remote_branch_ms =
+            c2p_ms +
+            phone_result.ffn_ms +
+            p2c_ms;
+
+        const double critical_ms =
+            std::max(
+                pc_result.ffn_ms,
+                remote_branch_ms);
+
+        const double speedup =
+            critical_ms > 0.0 ?
+                pc_full.ffn_ms /
+                    critical_ms :
+                0.0;
+
+        const double ideal_compute_ms =
+            std::max(
+                pc_result.ffn_ms,
+                phone_result.ffn_ms);
+
+        std::printf(
+            "[LT_SEQUENCE_FFN] pc_tokens=%d phone_tokens=%d "
+            "pc_ffn_ms=%.3f c2p_ms=%.3f "
+            "phone_ffn_ms=%.3f p2c_ms=%.3f "
+            "remote_branch_ms=%.3f ideal_compute_ms=%.3f "
+            "critical_ms=%.3f speedup_vs_pc_full=%.3fx "
+            "phone_checksum=%.6f phone_l2=%.6f\n",
+            pc_tokens,
+            phone_tokens,
+            pc_result.ffn_ms,
+            c2p_ms,
+            phone_result.ffn_ms,
+            p2c_ms,
+            remote_branch_ms,
+            ideal_compute_ms,
+            critical_ms,
+            speedup,
+            phone_result.output_checksum,
+            phone_result.output_l2);
+
+        if (critical_ms < best_ms) {
+            best_ms =
+                critical_ms;
+            best_pc_tokens =
+                pc_tokens;
+            best_phone_tokens =
+                phone_tokens;
+            best_speedup =
+                speedup;
+        }
+    }
+
+    std::printf(
+        "[LT_SEQUENCE_FFN_SUM] tokens=%d pc_full_ms=%.3f "
+        "phone_full_ms=%.3f best_pc_tokens=%d "
+        "best_phone_tokens=%d best_critical_ms=%.3f "
+        "best_speedup=%.3fx model=NO_CAUSAL_CROSS_LAYER_OVERLAP "
+        "status=PASS\n",
+        bench_tokens,
+        pc_full.ffn_ms,
+        phone_full.ffn_ms,
+        best_pc_tokens,
+        best_phone_tokens,
+        best_ms,
+        best_speedup);
+
+    lt::message stop;
+    stop.kind =
+        lt::message_kind::stop;
+    (void) channel->send_message(
+        stop);
+    channel->close();
+
+    return 0;
+}
+
 int run_real(
         const options & opts) {
     if (opts.connect_endpoint.empty() ||
