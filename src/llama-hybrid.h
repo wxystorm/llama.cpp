@@ -42,8 +42,8 @@ struct llama_hybrid_ffn_desc {
     ggml_type up_type   = GGML_TYPE_COUNT;
     ggml_type down_type = GGML_TYPE_COUNT;
 
-    // Optional dense FFN bias/scale tensors.  The real graph applies bias
-    // before the per-tensor scale for each projection.
+    // Optional dense FFN bias/scale tensors.  build_ffn() applies the
+    // projection bias before its per-tensor scale.
     bool has_gate_bias = false;
     bool has_up_bias   = false;
     bool has_down_bias = false;
