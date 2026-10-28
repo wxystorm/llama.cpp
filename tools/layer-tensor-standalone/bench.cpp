@@ -981,14 +981,15 @@ int run_stream_precompute_bench(
             opts.stream_repeats);
 
     auto network_roundtrip =
-        [&](bool measured,
+        [&](const std::vector<float> & payload,
+            bool measured,
             double & total_ms) -> bool {
             lt::message ping;
             ping.kind =
                 lt::message_kind::bench_ping;
             ping.task = { 0, 0 };
             ping.hidden =
-                embedded;
+                payload;
 
             const auto begin =
                 std::chrono::steady_clock::now();
@@ -1025,6 +1026,7 @@ int run_stream_precompute_bench(
          i < warmup;
          ++i) {
         if (!network_roundtrip(
+                embedded,
                 false,
                 net_total_ms)) {
             std::fprintf(
@@ -1038,12 +1040,97 @@ int run_stream_precompute_bench(
          i < opts.stream_repeats;
          ++i) {
         if (!network_roundtrip(
+                embedded,
                 true,
                 net_total_ms)) {
             std::fprintf(
                 stderr,
                 "[LT_STREAM] phase=NET status=FAIL\n");
             return 5;
+        }
+    }
+
+    const int hidden_width =
+        compute->n_embd();
+    if (hidden_width % 4 != 0) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=NET_SLICE status=FAIL "
+            "reason=HIDDEN_NOT_DIVISIBLE_BY_4\n");
+        return 5;
+    }
+
+    const int slice_width =
+        hidden_width / 4;
+    std::vector<std::vector<float>> net_slices(4);
+
+    for (int slice = 0;
+         slice < 4;
+         ++slice) {
+        std::vector<float> & payload =
+            net_slices[
+                static_cast<size_t>(slice)];
+        payload.resize(
+            static_cast<size_t>(slice_width) *
+            static_cast<size_t>(bench_tokens));
+
+        for (int32_t t = 0;
+             t < bench_tokens;
+             ++t) {
+            std::memcpy(
+                payload.data() +
+                    static_cast<size_t>(t) *
+                        static_cast<size_t>(
+                            slice_width),
+                embedded.data() +
+                    static_cast<size_t>(t) *
+                        static_cast<size_t>(
+                            hidden_width) +
+                    static_cast<size_t>(
+                        slice * slice_width),
+                static_cast<size_t>(
+                    slice_width) *
+                    sizeof(float));
+        }
+    }
+
+    double net_slice_total_ms = 0.0;
+    int net_slice_samples = 0;
+
+    for (int i = 0;
+         i < warmup;
+         ++i) {
+        if (!network_roundtrip(
+                net_slices[
+                    static_cast<size_t>(
+                        i % 4)],
+                false,
+                net_slice_total_ms)) {
+            std::fprintf(
+                stderr,
+                "[LT_STREAM] phase=NET_SLICE_WARMUP status=FAIL\n");
+            return 5;
+        }
+    }
+
+    for (int repeat = 0;
+         repeat < opts.stream_repeats;
+         ++repeat) {
+        for (int slice = 0;
+             slice < 4;
+             ++slice) {
+            if (!network_roundtrip(
+                    net_slices[
+                        static_cast<size_t>(
+                            slice)],
+                    true,
+                    net_slice_total_ms)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_STREAM] phase=NET_SLICE status=FAIL\n");
+                return 5;
+            }
+            ++net_slice_samples;
         }
     }
 
@@ -1107,11 +1194,16 @@ int run_stream_precompute_bench(
         static_cast<double>(
             opts.stream_repeats);
 
-    // bench_ping sends the full hidden payload and receives only a tiny ACK,
-    // so this elapsed time is a practical PC->Phone transfer estimate rather
-    // than RTT/2.
+    // bench_ping sends the payload and receives only a tiny ACK, so elapsed
+    // time is a practical PC->Phone transfer estimate rather than RTT/2.
+    // Measure the actual quarter-sized frame separately because four stream
+    // frames have more per-frame overhead than one full-hidden transfer.
     const double net_slice_ms =
-        net_hidden_ms / 4.0;
+        net_slice_total_ms /
+        static_cast<double>(
+            std::max(
+                1,
+                net_slice_samples));
 
     double slice_sum_ms = 0.0;
     for (double value :
@@ -1169,6 +1261,7 @@ int run_stream_precompute_bench(
         "[LT_STREAM_PRECOMPUTE] tokens=%d hidden=%d "
         "hidden_mib=%.3f repeats=%d "
         "net_hidden_ms=%.3f net_slice_ms=%.3f "
+        "net_4slice_serial_ms=%.3f "
         "prefix_full_ms=%.3f qkv_full_ms=%.3f "
         "slice0_ms=%.3f slice1_ms=%.3f "
         "slice2_ms=%.3f slice3_ms=%.3f "
@@ -1184,6 +1277,7 @@ int run_stream_precompute_bench(
         opts.stream_repeats,
         net_hidden_ms,
         net_slice_ms,
+        net_slice_ms * 4.0,
         prefix_full_ms,
         qkv_full_ms,
         slice_ms[0],
