@@ -171,8 +171,9 @@ inline bool gpu_weight_bank_peaks(
                 bytes == 0) {
             return false;
         }
-        peaks[gpu_ordinal & 1] =
-            std::max(peaks[gpu_ordinal & 1], bytes);
+        const size_t bank =
+            llama_region_ring_gpu_weight_bank_for_rank(gpu_ordinal);
+        peaks[bank] = std::max(peaks[bank], bytes);
         if (total_bytes) {
             if (bytes > std::numeric_limits<size_t>::max() - *total_bytes) {
                 return false;
@@ -448,20 +449,20 @@ inline bool simulate(const model & m,
         const auto & t = tasks[(size_t) id];
         const int r = t.region;
 
-        if (regions[(size_t) r].device == device::GPU) {
-            // Match the runtime's single CUDA execution lane: later GPU
-            // Regions cannot overtake an earlier GPU Region even when their
-            // token dependency becomes READY first.
-            for (int prior : gpu_regions) {
-                if (prior >= r) {
-                    break;
-                }
-                if (!region_done[(size_t) prior]) {
+        if (regions[(size_t) r].device == device::GPU &&
+                m.gpu_weight_streaming) {
+            const int rank = gpu_rank[(size_t) r];
+            if (rank < 0) {
+                return false;
+            }
+            if (rank >= 2) {
+                const int predecessor =
+                    gpu_regions[(size_t) rank - 2];
+                if (!region_done[(size_t) predecessor]) {
                     return false;
                 }
             }
-            if (m.gpu_weight_streaming &&
-                    !gpu_weight_ready[(size_t) r]) {
+            if (!gpu_weight_ready[(size_t) r]) {
                 return false;
             }
         }
@@ -569,18 +570,17 @@ inline bool simulate(const model & m,
                         by_region[(size_t) r].empty()) {
                     continue;
                 }
-                bool prior_done = true;
-                for (int prior : gpu_regions) {
-                    if (prior >= r) {
-                        break;
-                    }
-                    if (!region_done[(size_t) prior]) {
-                        prior_done = false;
-                        break;
-                    }
+                const int rank = gpu_rank[(size_t) r];
+                bool bank_reusable = rank >= 0;
+                if (bank_reusable && rank >= 2) {
+                    const int predecessor =
+                        gpu_regions[(size_t) rank - 2];
+                    bank_reusable =
+                        region_done[(size_t) predecessor];
                 }
                 const int first = by_region[(size_t) r].front();
-                if (prior_done && task_dependencies_ready(first)) {
+                if (bank_reusable &&
+                        task_dependencies_ready(first)) {
                     gpu_natural_ready_ms[(size_t) r] = now;
                 }
             }
@@ -706,10 +706,12 @@ inline bool simulate(const model & m,
                     if (rank < 0) {
                         return reject("GPU_RANK_MISSING");
                     }
-                    const int next_rank = rank + 2;
-                    if (next_rank < (int) gpu_regions.size()) {
+                    const auto next_rank =
+                        llama_region_ring_gpu_weight_next_rank(
+                            (size_t) rank, gpu_regions.size());
+                    if (next_rank.has_value()) {
                         const int next_region =
-                            gpu_regions[(size_t) next_rank];
+                            gpu_regions[*next_rank];
                         if (!gpu_weight_enqueued[
                                 (size_t) next_region]) {
                             gpu_weight_enqueued[
