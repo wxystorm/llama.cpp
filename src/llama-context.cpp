@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hybrid.h"
 #include "llama-region-ring.h"
+#include "llama-sequence-pipeline.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
