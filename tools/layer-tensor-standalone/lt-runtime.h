@@ -36,6 +36,10 @@ enum class message_kind : uint8_t {
     bench_pong = 10,
     stream_bench_request = 11,
     stream_bench_result = 12,
+    sequence_ffn_request = 13,
+    sequence_ffn_result = 14,
+    bench_pull = 15,
+    bench_pull_result = 16,
 };
 
 struct key {
