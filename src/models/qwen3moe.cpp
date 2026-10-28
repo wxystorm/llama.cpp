@@ -556,6 +556,32 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 "DIAGONAL_EXACT_CHUNK" : "LEGACY_LAYER_MAJOR",
             wave_schedule.size());
 
+        if (experiment_directional_wavefront) {
+            std::string preview;
+            const size_t preview_count =
+                std::min<size_t>(wave_schedule.size(), 16);
+            for (size_t wi = 0; wi < preview_count; ++wi) {
+                if (!preview.empty()) {
+                    preview += ",";
+                }
+                const auto & item = wave_schedule[wi];
+                preview += "L" +
+                    std::to_string(layer_begin + item.layer_offset) +
+                    "C" + std::to_string(item.group_begin);
+            }
+            if (preview_count < wave_schedule.size()) {
+                preview += ",...";
+            }
+            LLAMA_LOG_ERROR(
+                "[HYBRID_EXPERIMENT_WAVE_SCHEDULE] "
+                "mode=DIAGONAL_EXACT_CHUNK layers=%d chunks=%zu "
+                "items=%zu prefix=%s\n",
+                wave_layer_count,
+                wave_chunk_count,
+                wave_schedule.size(),
+                preview.c_str());
+        }
+
         ggml_tensor * wave_entry = ggml_cont(ctx0, inpL);
         cb(wave_entry, "prefill_wave_entry", layer_begin);
 
