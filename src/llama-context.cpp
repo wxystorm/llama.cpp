@@ -9898,8 +9898,10 @@ bool llama_context::region_ring_prime_initial_gpu_banks() {
         return false;
     }
 
-    llama_memory_context_ptr full_mctx =
-        memory ? memory->init_full() : nullptr;
+    llama_memory_context_ptr full_mctx;
+    if (memory) {
+        full_mctx = memory->init_full();
+    }
     auto * kv_full =
         dynamic_cast<llama_kv_cache_context *>(full_mctx.get());
     if (!kv_full) {
@@ -10112,6 +10114,7 @@ void llama_context::perf_reset() {
     // memory clear and synchronize. Prime the first two streamed GPU Regions
     // here so their H2D cost belongs to model/context load, not prompt eval.
     if (has_evaluated_once &&
+            !region_ring_initial_banks_primed &&
             model.hybrid_ring_gpu_weight_streaming &&
             model.hybrid_ring_plan_mode == "APPLY_WIDE") {
         (void) region_ring_prime_initial_gpu_banks();
