@@ -8166,15 +8166,33 @@ struct llama_hybrid_probe_layer_weights {
     ggml_tensor * wo        = nullptr;
     ggml_tensor * q_norm    = nullptr;
     ggml_tensor * k_norm    = nullptr;
-    ggml_tensor * ffn_norm  = nullptr;
-    ggml_tensor * gate      = nullptr;
-    ggml_tensor * up        = nullptr;
-    ggml_tensor * down      = nullptr;
+
+    ggml_tensor * wq_b = nullptr;
+    ggml_tensor * wk_b = nullptr;
+    ggml_tensor * wv_b = nullptr;
+    ggml_tensor * wo_b = nullptr;
+    ggml_tensor * wq_s = nullptr;
+    ggml_tensor * wk_s = nullptr;
+    ggml_tensor * wv_s = nullptr;
+    ggml_tensor * wo_s = nullptr;
+    ggml_tensor * rope_factors = nullptr;
+
+    ggml_tensor * ffn_norm = nullptr;
+    ggml_tensor * gate     = nullptr;
+    ggml_tensor * up       = nullptr;
+    ggml_tensor * down     = nullptr;
+    ggml_tensor * gate_b   = nullptr;
+    ggml_tensor * up_b     = nullptr;
+    ggml_tensor * down_b   = nullptr;
+    ggml_tensor * gate_s   = nullptr;
+    ggml_tensor * up_s     = nullptr;
+    ggml_tensor * down_s   = nullptr;
 };
 
-static llama_hybrid_probe_layer_weights llama_hybrid_make_probe_layer_weights(ggml_context *                 ctx,
-                                                                              const llama_hybrid_attn_desc & attn,
-                                                                              const llama_hybrid_ffn_desc &  ffn) {
+static llama_hybrid_probe_layer_weights llama_hybrid_make_probe_layer_weights(
+        ggml_context * ctx,
+        const llama_hybrid_attn_desc & attn,
+        const llama_hybrid_ffn_desc & ffn) {
     llama_hybrid_probe_layer_weights weights;
 
     weights.attn_norm = ggml_new_tensor_1d(ctx, attn.attn_norm_type, attn.n_embd);
@@ -8185,11 +8203,24 @@ static llama_hybrid_probe_layer_weights llama_hybrid_make_probe_layer_weights(gg
 
     if (attn.has_q_norm) {
         const int64_t head_dim = attn.q_dim / attn.n_head;
-        weights.q_norm         = ggml_new_tensor_1d(ctx, attn.q_norm_type, head_dim);
+        weights.q_norm = ggml_new_tensor_1d(ctx, attn.q_norm_type, head_dim);
     }
     if (attn.has_k_norm) {
         const int64_t head_dim = attn.k_dim / attn.n_head_kv;
-        weights.k_norm         = ggml_new_tensor_1d(ctx, attn.k_norm_type, head_dim);
+        weights.k_norm = ggml_new_tensor_1d(ctx, attn.k_norm_type, head_dim);
+    }
+
+    if (attn.has_q_bias)  weights.wq_b = ggml_new_tensor_1d(ctx, attn.q_bias_type, attn.q_dim);
+    if (attn.has_k_bias)  weights.wk_b = ggml_new_tensor_1d(ctx, attn.k_bias_type, attn.k_dim);
+    if (attn.has_v_bias)  weights.wv_b = ggml_new_tensor_1d(ctx, attn.v_bias_type, attn.v_dim);
+    if (attn.has_o_bias)  weights.wo_b = ggml_new_tensor_1d(ctx, attn.o_bias_type, attn.n_embd);
+    if (attn.has_q_scale) weights.wq_s = ggml_new_tensor_1d(ctx, attn.q_scale_type, 1);
+    if (attn.has_k_scale) weights.wk_s = ggml_new_tensor_1d(ctx, attn.k_scale_type, 1);
+    if (attn.has_v_scale) weights.wv_s = ggml_new_tensor_1d(ctx, attn.v_scale_type, 1);
+    if (attn.has_o_scale) weights.wo_s = ggml_new_tensor_1d(ctx, attn.o_scale_type, 1);
+    if (attn.has_rope_factors) {
+        weights.rope_factors = ggml_new_tensor_1d(
+            ctx, attn.rope_factors_type, attn.rope_factors_ne0);
     }
 
     weights.ffn_norm = ggml_new_tensor_1d(ctx, ffn.ffn_norm_type, ffn.n_embd);
@@ -8197,29 +8228,42 @@ static llama_hybrid_probe_layer_weights llama_hybrid_make_probe_layer_weights(gg
     weights.up       = ggml_new_tensor_2d(ctx, ffn.up_type, ffn.n_embd, ffn.n_ff);
     weights.down     = ggml_new_tensor_2d(ctx, ffn.down_type, ffn.n_ff, ffn.n_embd);
 
+    if (ffn.has_gate_bias)  weights.gate_b = ggml_new_tensor_1d(ctx, ffn.gate_bias_type, ffn.n_ff);
+    if (ffn.has_up_bias)    weights.up_b   = ggml_new_tensor_1d(ctx, ffn.up_bias_type, ffn.n_ff);
+    if (ffn.has_down_bias)  weights.down_b = ggml_new_tensor_1d(ctx, ffn.down_bias_type, ffn.n_embd);
+    if (ffn.has_gate_scale) weights.gate_s = ggml_new_tensor_1d(ctx, ffn.gate_scale_type, 1);
+    if (ffn.has_up_scale)   weights.up_s   = ggml_new_tensor_1d(ctx, ffn.up_scale_type, 1);
+    if (ffn.has_down_scale) weights.down_s = ggml_new_tensor_1d(ctx, ffn.down_scale_type, 1);
+
     return weights;
 }
 
-static ggml_tensor * llama_hybrid_build_probe_layer(ggml_context *                           ctx,
-                                                    ggml_tensor *                            input,
-                                                    ggml_tensor *                            pos,
-                                                    ggml_tensor *                            mask,
-                                                    const llama_hybrid_attn_desc &           attn_desc,
-                                                    const llama_hybrid_ffn_desc &            ffn_desc,
-                                                    const llama_hybrid_probe_layer_weights & weights,
-                                                    int                                      tokens) {
-    (void) ffn_desc;
-
+static ggml_tensor * llama_hybrid_build_probe_layer(
+        ggml_context * ctx,
+        ggml_tensor * input,
+        ggml_tensor * pos,
+        ggml_tensor * mask,
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_ffn_desc & ffn_desc,
+        const llama_hybrid_probe_layer_weights & weights,
+        int tokens) {
     const int64_t head_dim_q = attn_desc.q_dim / attn_desc.n_head;
     const int64_t head_dim_k = attn_desc.k_dim / attn_desc.n_head_kv;
     const int64_t head_dim_v = attn_desc.v_dim / attn_desc.n_head_kv;
 
     ggml_tensor * norm = ggml_rms_norm(ctx, input, attn_desc.rms_eps);
-    norm               = ggml_mul(ctx, norm, weights.attn_norm);
+    norm = ggml_mul(ctx, norm, weights.attn_norm);
 
+    // Match build_lora_mm(..., weight_scale) + optional projection bias.
     ggml_tensor * q = ggml_mul_mat(ctx, weights.wq, norm);
     ggml_tensor * k = ggml_mul_mat(ctx, weights.wk, norm);
     ggml_tensor * v = ggml_mul_mat(ctx, weights.wv, norm);
+    if (weights.wq_s) q = ggml_mul(ctx, q, weights.wq_s);
+    if (weights.wk_s) k = ggml_mul(ctx, k, weights.wk_s);
+    if (weights.wv_s) v = ggml_mul(ctx, v, weights.wv_s);
+    if (weights.wq_b) q = ggml_add(ctx, q, weights.wq_b);
+    if (weights.wk_b) k = ggml_add(ctx, k, weights.wk_b);
+    if (weights.wv_b) v = ggml_add(ctx, v, weights.wv_b);
 
     q = ggml_reshape_3d(ctx, q, head_dim_q, attn_desc.n_head, tokens);
     k = ggml_reshape_3d(ctx, k, head_dim_k, attn_desc.n_head_kv, tokens);
@@ -8234,10 +8278,16 @@ static ggml_tensor * llama_hybrid_build_probe_layer(ggml_context *              
         k = ggml_mul(ctx, k, weights.k_norm);
     }
 
-    q = ggml_rope_ext(ctx, q, pos, nullptr, attn_desc.n_rot, (int) attn_desc.rope_type, attn_desc.n_ctx_orig,
-                      attn_desc.freq_base, attn_desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(ctx, k, pos, nullptr, attn_desc.n_rot, (int) attn_desc.rope_type, attn_desc.n_ctx_orig,
-                      attn_desc.freq_base, attn_desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+    q = ggml_rope_ext(
+        ctx, q, pos, weights.rope_factors,
+        attn_desc.n_rot, (int) attn_desc.rope_type,
+        attn_desc.n_ctx_orig, attn_desc.freq_base,
+        attn_desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
+    k = ggml_rope_ext(
+        ctx, k, pos, weights.rope_factors,
+        attn_desc.n_rot, (int) attn_desc.rope_type,
+        attn_desc.n_ctx_orig, attn_desc.freq_base,
+        attn_desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
 
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
@@ -8245,21 +8295,36 @@ static ggml_tensor * llama_hybrid_build_probe_layer(ggml_context *              
     k = ggml_cast(ctx, k, GGML_TYPE_F16);
     v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
-    const float   kq_scale = 1.0f / std::sqrt((float) head_dim_q);
-    ggml_tensor * attn     = ggml_flash_attn_ext(ctx, q, k, v, mask, kq_scale, 0.0f, 0.0f);
+    const float kq_scale = attn_desc.kq_scale > 0.0f ?
+        attn_desc.kq_scale :
+        1.0f / std::sqrt((float) head_dim_q);
+    ggml_tensor * attn =
+        ggml_flash_attn_ext(ctx, q, k, v, mask, kq_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(ctx, attn, attn_desc.o_in_dim, tokens);
 
     ggml_tensor * attn_out = ggml_mul_mat(ctx, weights.wo, attn);
-    ggml_tensor * ffn_inp  = ggml_add(ctx, attn_out, input);
+    if (weights.wo_s) attn_out = ggml_mul(ctx, attn_out, weights.wo_s);
+    if (weights.wo_b) attn_out = ggml_add(ctx, attn_out, weights.wo_b);
+    ggml_tensor * ffn_inp = ggml_add(ctx, attn_out, input);
 
     ggml_tensor * ffn_norm = ggml_rms_norm(ctx, ffn_inp, attn_desc.rms_eps);
-    ffn_norm               = ggml_mul(ctx, ffn_norm, weights.ffn_norm);
+    ffn_norm = ggml_mul(ctx, ffn_norm, weights.ffn_norm);
 
-    ggml_tensor * gate    = ggml_silu(ctx, ggml_mul_mat(ctx, weights.gate, ffn_norm));
-    ggml_tensor * up      = ggml_mul_mat(ctx, weights.up, ffn_norm);
-    ggml_tensor * hidden  = ggml_mul(ctx, gate, up);
+    // Match build_ffn(): dense FFN bias is applied before per-tensor scale.
+    ggml_tensor * gate = ggml_mul_mat(ctx, weights.gate, ffn_norm);
+    if (weights.gate_b) gate = ggml_add(ctx, gate, weights.gate_b);
+    if (weights.gate_s) gate = ggml_mul(ctx, gate, weights.gate_s);
+    gate = ggml_silu(ctx, gate);
+
+    ggml_tensor * up = ggml_mul_mat(ctx, weights.up, ffn_norm);
+    if (weights.up_b) up = ggml_add(ctx, up, weights.up_b);
+    if (weights.up_s) up = ggml_mul(ctx, up, weights.up_s);
+
+    ggml_tensor * hidden = ggml_mul(ctx, gate, up);
     ggml_tensor * ffn_out = ggml_mul_mat(ctx, weights.down, hidden);
+    if (weights.down_b) ffn_out = ggml_add(ctx, ffn_out, weights.down_b);
+    if (weights.down_s) ffn_out = ggml_mul(ctx, ffn_out, weights.down_s);
 
     return ggml_add(ctx, ffn_out, ffn_inp);
 }
@@ -8306,9 +8371,9 @@ static bool llama_hybrid_profile_full_layer_point(const llama_hybrid_attn_desc &
         return false;
     }
 
-    static constexpr size_t graph_size = 128;
+    static constexpr size_t graph_size = 192;
     const ggml_init_params  params     = {
-        /*.mem_size   =*/256 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_size   =*/384 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
@@ -8392,8 +8457,8 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
         return false;
     }
 
-    const size_t           graph_size    = (size_t) n_layers * 32 + 32;
-    const size_t           tensor_budget = 192 + (size_t) n_layers * 96;
+    const size_t           graph_size    = (size_t) n_layers * 48 + 48;
+    const size_t           tensor_budget = 224 + (size_t) n_layers * 128;
     const ggml_init_params params        = {
         /*.mem_size   =*/tensor_budget * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
         /*.mem_buffer =*/nullptr,
