@@ -41,30 +41,6 @@ struct rpc_tensor_phone_graph_stage {
     int chunk = -1;
 };
 
-enum class rpc_phone_tensor_queue_kind : uint8_t {
-    NONE,
-    OWNER,
-    REMOTE_FFN,
-    REDUCE,
-};
-
-static thread_local bool rpc_phone_tensor_scheduler_active = false;
-
-static const char * rpc_phone_tensor_queue_name(
-        rpc_phone_tensor_queue_kind kind) {
-    switch (kind) {
-        case rpc_phone_tensor_queue_kind::OWNER:
-            return "OWNER";
-        case rpc_phone_tensor_queue_kind::REMOTE_FFN:
-            return "REMOTE_FFN";
-        case rpc_phone_tensor_queue_kind::REDUCE:
-            return "REDUCE";
-        case rpc_phone_tensor_queue_kind::NONE:
-        default:
-            return "NONE";
-    }
-}
-
 static rpc_tensor_phone_graph_stage rpc_tensor_phone_graph_stage_identity(
         const ggml_cgraph * graph) {
     rpc_tensor_phone_graph_stage result;
@@ -182,105 +158,6 @@ static rpc_tensor_phone_graph_stage rpc_tensor_phone_graph_stage_identity(
     }
 
     return result;
-}
-
-static rpc_phone_tensor_queue_kind
-rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
-    if (graph == nullptr) {
-        return rpc_phone_tensor_queue_kind::NONE;
-    }
-
-    auto classify_name = [](const char * name) {
-        if (name == nullptr || name[0] == '\0') {
-            return rpc_phone_tensor_queue_kind::NONE;
-        }
-        if (std::strncmp(
-                name,
-                "prefill_wave_l_out_chunk_",
-                std::strlen("prefill_wave_l_out_chunk_")) == 0) {
-            return rpc_phone_tensor_queue_kind::REDUCE;
-        }
-        if (std::strncmp(
-                name,
-                "c2p_prefill_route_",
-                std::strlen("c2p_prefill_route_")) == 0) {
-            return rpc_phone_tensor_queue_kind::REMOTE_FFN;
-        }
-        if (std::strncmp(
-                name,
-                "phone_prefill_route_",
-                std::strlen("phone_prefill_route_")) == 0 ||
-            std::strncmp(
-                name,
-                "phone_tensor_attn",
-                std::strlen("phone_tensor_attn")) == 0 ||
-            std::strncmp(
-                name,
-                "prefill_wave_attn_",
-                std::strlen("prefill_wave_attn_")) == 0) {
-            return rpc_phone_tensor_queue_kind::OWNER;
-        }
-        return rpc_phone_tensor_queue_kind::NONE;
-    };
-
-    rpc_phone_tensor_queue_kind best =
-        rpc_phone_tensor_queue_kind::NONE;
-    const bool reduce_shape = graph->n_nodes == 1;
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
-        if (node == nullptr) {
-            continue;
-        }
-        const rpc_phone_tensor_queue_kind node_kind =
-            classify_name(node->name);
-        if (node_kind == rpc_phone_tensor_queue_kind::REDUCE &&
-                reduce_shape) {
-            return node_kind;
-        }
-        if (node_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
-            best = node_kind;
-        } else if (node_kind == rpc_phone_tensor_queue_kind::OWNER &&
-                   best == rpc_phone_tensor_queue_kind::NONE) {
-            best = node_kind;
-        }
-
-        // Meta's directional reduce graph writes through an auxiliary ADD
-        // tensor whose own name may be empty. The durable owner tensor is its
-        // view source, so classify that descriptor as well.
-        if (node->view_src != nullptr) {
-            const rpc_phone_tensor_queue_kind view_kind =
-                classify_name(node->view_src->name);
-            if (view_kind == rpc_phone_tensor_queue_kind::REDUCE &&
-                    reduce_shape) {
-                return view_kind;
-            }
-            if (view_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
-                best = view_kind;
-            } else if (view_kind == rpc_phone_tensor_queue_kind::OWNER &&
-                       best == rpc_phone_tensor_queue_kind::NONE) {
-                best = view_kind;
-            }
-        }
-
-        for (int src = 0; src < GGML_MAX_SRC; ++src) {
-            if (node->src[src] == nullptr) {
-                continue;
-            }
-            const rpc_phone_tensor_queue_kind src_kind =
-                classify_name(node->src[src]->name);
-            if (src_kind == rpc_phone_tensor_queue_kind::REDUCE &&
-                    reduce_shape) {
-                return src_kind;
-            }
-            if (src_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
-                best = src_kind;
-            } else if (src_kind == rpc_phone_tensor_queue_kind::OWNER &&
-                       best == rpc_phone_tensor_queue_kind::NONE) {
-                best = src_kind;
-            }
-        }
-    }
-    return best;
 }
 
 static void rpc_tensor_phone_log_graph_compute(
@@ -4371,21 +4248,6 @@ struct rpc_phone_region_local_task {
     uint64_t scratch_reuse_seq = 0;
 };
 
-struct rpc_phone_tensor_task_completion {
-    std::mutex mutex;
-    std::condition_variable cv;
-    bool done = false;
-    bool result = false;
-};
-
-struct rpc_phone_tensor_ready_task {
-    uint64_t id = 0;
-    rpc_phone_tensor_queue_kind kind =
-        rpc_phone_tensor_queue_kind::NONE;
-    std::function<bool()> run;
-    std::shared_ptr<rpc_phone_tensor_task_completion> completion;
-};
-
 class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
@@ -4405,9 +4267,7 @@ public:
             local_tensor_source = *tensor_source;
         }
         phone_region_main_thread =
-            std::thread([this]() { phone_tensor_compute_loop(); });
-        phone_tensor_reduce_thread =
-            std::thread([this]() { phone_tensor_reduce_loop(); });
+            std::thread([this]() { phone_region_main_loop(); });
     }
     ~rpc_server();
 
@@ -4477,19 +4337,7 @@ public:
         ggml_cgraph          * graph;
     };
 private:
-    uint64_t enqueue_phone_tensor_task(
-        rpc_phone_tensor_queue_kind kind,
-        std::function<bool()> run,
-        std::shared_ptr<rpc_phone_tensor_task_completion> completion = nullptr);
-    bool wait_phone_tensor_task(
-        const std::shared_ptr<rpc_phone_tensor_task_completion> & completion);
-    void phone_tensor_compute_loop();
-    void phone_tensor_reduce_loop();
-    bool run_phone_tensor_graph(
-        uint32_t device,
-        uint64_t graph_uid,
-        ggml_cgraph * graph,
-        const char * compute_kind);
+    void phone_region_main_loop();
     bool run_phone_region_local_task(
         const rpc_phone_region_local_task & task);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
@@ -4514,12 +4362,8 @@ private:
 
     std::mutex phone_region_main_mutex;
     std::condition_variable phone_region_main_cv;
-    std::deque<rpc_phone_tensor_ready_task> phone_tensor_owner_queue;
-    std::deque<rpc_phone_tensor_ready_task> phone_tensor_remote_ffn_queue;
-    std::deque<rpc_phone_tensor_ready_task> phone_tensor_reduce_queue;
+    std::deque<rpc_phone_region_local_task> phone_region_main_queue;
     std::thread phone_region_main_thread;
-    std::thread phone_tensor_reduce_thread;
-    uint64_t phone_tensor_next_task_id = 1;
     bool phone_region_main_stop = false;
 
     // Completion status is separate from the FFN ready-credit map, so
@@ -5844,26 +5688,15 @@ bool rpc_server::phone_region_local_submit(
         src += graph_size;
     }
 
-    rpc_phone_region_local_task queued_task = std::move(task);
-    const uint64_t queue_task =
-        enqueue_phone_tensor_task(
-            rpc_phone_tensor_queue_kind::OWNER,
-            [this, queued_task]() {
-                const bool ok =
-                    run_phone_region_local_task(queued_task);
-                std::fprintf(
-                    stderr,
-                    "[PHONE_REGION_MAIN_DONE] chunk=%d "
-                    "ready_seq=%" PRIu64 " partial_seq=%" PRIu64
-                    " status=%s\n",
-                    queued_task.chunk,
-                    queued_task.ready.seq,
-                    queued_task.partial.seq,
-                    ok ? "OK" : "FAIL");
-                std::fflush(stderr);
-                return ok;
-            });
-    response.accepted = queue_task != 0 ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        if (phone_region_main_stop) {
+            return true;
+        }
+        phone_region_main_queue.emplace_back(std::move(task));
+    }
+    phone_region_main_cv.notify_one();
+    response.accepted = 1;
 
     if (RPC_DEBUG ||
             rpc_tensor_phone_stage_profile_enabled()) {
@@ -5922,46 +5755,15 @@ bool rpc_server::phone_ring_input_ready(
     task.ring_first_layer = request.first_layer;
     task.ring_graph_uid = request.graph_uid;
     task.ring_seq = request.seq;
-    const uint64_t queue_task =
-        enqueue_phone_tensor_task(
-            rpc_phone_tensor_queue_kind::OWNER,
-            [this, task]() {
-                const int64_t begin_us = ggml_time_us();
-                bool ok = false;
-                {
-                    std::lock_guard<std::recursive_mutex> graph_lock(
-                        graph_compute_mutex);
-                    rpc_msg_graph_recompute_req req {};
-                    req.device = task.ring_device;
-                    req.graph_uid = task.ring_graph_uid;
-                    const bool old_active =
-                        rpc_phone_tensor_scheduler_active;
-                    rpc_phone_tensor_scheduler_active = true;
-                    ok = graph_recompute(req);
-                    rpc_phone_tensor_scheduler_active = old_active;
-                    if (ok) {
-                        ggml_backend_synchronize(
-                            backends[task.ring_device]);
-                    }
-                }
-                {
-                    std::lock_guard<std::mutex> lock(
-                        phone_ring_completion_mutex);
-                    phone_ring_completions[task.ring_seq] = ok;
-                }
-                phone_ring_completion_cv.notify_all();
-                std::fprintf(stderr,
-                    "[PHONE_RING_AUTO] side=phone event=EXECUTE_DONE "
-                    "layer=%u uid=%" PRIu64 " seq=%" PRIu64 " "
-                    "compute_ms=%.3f status=%s\n",
-                    task.ring_first_layer,
-                    task.ring_graph_uid,
-                    task.ring_seq,
-                    (ggml_time_us() - begin_us) / 1000.0,
-                    ok ? "OK" : "FAIL");
-                return ok;
-            });
-    response.accepted = queue_task != 0 ? 1 : 0;
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        if (phone_region_main_stop) {
+            return true;
+        }
+        phone_region_main_queue.emplace_back(std::move(task));
+    }
+    phone_region_main_cv.notify_one();
+    response.accepted = 1;
     std::fprintf(stderr,
         "[PHONE_RING_AUTO] side=phone event=READY_ENQUEUED "
         "layer=%u uid=%" PRIu64 " seq=%" PRIu64 "\n",
@@ -5987,206 +5789,68 @@ bool rpc_server::phone_ring_wait(
     return true;
 }
 
-uint64_t rpc_server::enqueue_phone_tensor_task(
-        rpc_phone_tensor_queue_kind kind,
-        std::function<bool()> run,
-        std::shared_ptr<rpc_phone_tensor_task_completion> completion) {
-    if (kind == rpc_phone_tensor_queue_kind::NONE || !run) {
-        return 0;
-    }
-
-    std::lock_guard<std::mutex> lock(phone_region_main_mutex);
-    if (phone_region_main_stop) {
-        return 0;
-    }
-
-    const uint64_t id = phone_tensor_next_task_id++;
-    rpc_phone_tensor_ready_task task;
-    task.id = id;
-    task.kind = kind;
-    task.run = std::move(run);
-    task.completion = std::move(completion);
-
-    if (kind == rpc_phone_tensor_queue_kind::OWNER) {
-        phone_tensor_owner_queue.emplace_back(std::move(task));
-    } else if (kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
-        phone_tensor_remote_ffn_queue.emplace_back(std::move(task));
-    } else {
-        phone_tensor_reduce_queue.emplace_back(std::move(task));
-    }
-    phone_region_main_cv.notify_all();
-
-    std::fprintf(
-        stderr,
-        "[TENSOR_READY_QUEUE] side=PHONE queue=%s "
-        "event=ENQUEUE task=%" PRIu64 "\n",
-        rpc_phone_tensor_queue_name(kind), id);
-    std::fflush(stderr);
-    return id;
-}
-
-bool rpc_server::wait_phone_tensor_task(
-        const std::shared_ptr<rpc_phone_tensor_task_completion> & completion) {
-    if (completion == nullptr) {
-        return false;
-    }
-    std::unique_lock<std::mutex> lock(completion->mutex);
-    completion->cv.wait(lock, [&]() { return completion->done; });
-    return completion->result;
-}
-
-void rpc_server::phone_tensor_compute_loop() {
+void rpc_server::phone_region_main_loop() {
     while (true) {
-        rpc_phone_tensor_ready_task task;
+        rpc_phone_region_local_task task;
         {
             std::unique_lock<std::mutex> lock(phone_region_main_mutex);
             phone_region_main_cv.wait(
                 lock,
                 [&]() {
                     return phone_region_main_stop ||
-                        !phone_tensor_owner_queue.empty() ||
-                        !phone_tensor_remote_ffn_queue.empty();
+                        !phone_region_main_queue.empty();
                 });
             if (phone_region_main_stop &&
-                    phone_tensor_owner_queue.empty() &&
-                    phone_tensor_remote_ffn_queue.empty()) {
+                    phone_region_main_queue.empty()) {
                 return;
             }
-
-            // Strict priority, intentionally without a window/fairness rule.
-            if (!phone_tensor_owner_queue.empty()) {
-                task = std::move(phone_tensor_owner_queue.front());
-                phone_tensor_owner_queue.pop_front();
-            } else {
-                task = std::move(phone_tensor_remote_ffn_queue.front());
-                phone_tensor_remote_ffn_queue.pop_front();
-            }
+            task = std::move(phone_region_main_queue.front());
+            phone_region_main_queue.pop_front();
         }
 
-        std::fprintf(
-            stderr,
-            "[TENSOR_READY_QUEUE] side=PHONE queue=%s "
-            "event=BEGIN task=%" PRIu64 "\n",
-            rpc_phone_tensor_queue_name(task.kind), task.id);
-        std::fflush(stderr);
-
-        const bool old_active = rpc_phone_tensor_scheduler_active;
-        rpc_phone_tensor_scheduler_active = true;
-        const bool ok = task.run();
-        rpc_phone_tensor_scheduler_active = old_active;
-
-        if (task.completion != nullptr) {
+        if (task.ring_auto) {
+            const int64_t begin_us = ggml_time_us();
+            bool ok = false;
             {
-                std::lock_guard<std::mutex> lock(task.completion->mutex);
-                task.completion->result = ok;
-                task.completion->done = true;
+                // The Phone MAIN graph gate excludes unrelated GPU submits
+                // while this Region modifies KV and its output buffers.
+                std::lock_guard<std::recursive_mutex> graph_lock(
+                    graph_compute_mutex);
+                rpc_msg_graph_recompute_req req {};
+                req.device = task.ring_device;
+                req.graph_uid = task.ring_graph_uid;
+                ok = graph_recompute(req);
+                if (ok) {
+                    ggml_backend_synchronize(backends[task.ring_device]);
+                }
             }
-            task.completion->cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(phone_ring_completion_mutex);
+                phone_ring_completions[task.ring_seq] = ok;
+            }
+            phone_ring_completion_cv.notify_all();
+            std::fprintf(stderr,
+                "[PHONE_RING_AUTO] side=phone event=EXECUTE_DONE "
+                "layer=%u uid=%" PRIu64 " seq=%" PRIu64 " "
+                "compute_ms=%.3f status=%s\n",
+                task.ring_first_layer, task.ring_graph_uid, task.ring_seq,
+                (ggml_time_us() - begin_us) / 1000.0,
+                ok ? "OK" : "FAIL");
+            continue;
         }
 
+        const bool ok = run_phone_region_local_task(task);
         std::fprintf(
             stderr,
-            "[TENSOR_READY_QUEUE] side=PHONE queue=%s "
-            "event=END task=%" PRIu64 " status=%s\n",
-            rpc_phone_tensor_queue_name(task.kind), task.id,
+            "[PHONE_REGION_MAIN_DONE] chunk=%d "
+            "ready_seq=%" PRIu64 " partial_seq=%" PRIu64
+            " status=%s\n",
+            task.chunk,
+            task.ready.seq,
+            task.partial.seq,
             ok ? "OK" : "FAIL");
         std::fflush(stderr);
     }
-}
-
-void rpc_server::phone_tensor_reduce_loop() {
-    while (true) {
-        rpc_phone_tensor_ready_task task;
-        {
-            std::unique_lock<std::mutex> lock(phone_region_main_mutex);
-            phone_region_main_cv.wait(
-                lock,
-                [&]() {
-                    return phone_region_main_stop ||
-                        !phone_tensor_reduce_queue.empty();
-                });
-            if (phone_region_main_stop &&
-                    phone_tensor_reduce_queue.empty()) {
-                return;
-            }
-            task = std::move(phone_tensor_reduce_queue.front());
-            phone_tensor_reduce_queue.pop_front();
-        }
-
-        std::fprintf(
-            stderr,
-            "[TENSOR_READY_QUEUE] side=PHONE queue=REDUCE "
-            "event=BEGIN task=%" PRIu64 "\n",
-            task.id);
-        std::fflush(stderr);
-
-        const bool old_active = rpc_phone_tensor_scheduler_active;
-        rpc_phone_tensor_scheduler_active = true;
-        const bool ok = task.run();
-        rpc_phone_tensor_scheduler_active = old_active;
-
-        if (task.completion != nullptr) {
-            {
-                std::lock_guard<std::mutex> lock(task.completion->mutex);
-                task.completion->result = ok;
-                task.completion->done = true;
-            }
-            task.completion->cv.notify_all();
-        }
-
-        std::fprintf(
-            stderr,
-            "[TENSOR_READY_QUEUE] side=PHONE queue=REDUCE "
-            "event=END task=%" PRIu64 " status=%s\n",
-            task.id, ok ? "OK" : "FAIL");
-        std::fflush(stderr);
-    }
-}
-
-bool rpc_server::run_phone_tensor_graph(
-        uint32_t device,
-        uint64_t graph_uid,
-        ggml_cgraph * graph,
-        const char * compute_kind) {
-    if (device >= backends.size() || graph == nullptr) {
-        return false;
-    }
-
-    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
-    if (rpc_phone_tensor_scheduler_active &&
-            (RPC_DEBUG || rpc_tensor_phone_stage_profile_enabled())) {
-        std::fprintf(
-            stderr,
-            "[TENSOR_READY_GRAPH] side=PHONE event=EXECUTE_LOCKED "
-            "uid=%" PRIu64 " nodes=%d kind=%s\n",
-            graph_uid,
-            graph->n_nodes,
-            compute_kind);
-        std::fflush(stderr);
-    }
-    const int64_t t0 = ggml_time_us();
-    const ggml_status status =
-        ggml_backend_graph_compute(backends[device], graph);
-    const int64_t t1 = ggml_time_us();
-
-    rpc_tensor_phone_log_graph_compute(
-        compute_kind,
-        graph_uid,
-        graph,
-        t1 - t0,
-        0);
-
-    if (RPC_DEBUG ||
-            std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
-        printf(
-            "[RPC_GRAPH_SERVER] uid=%" PRIu64
-            " nodes=%d compute=%.3f ms\n",
-            graph_uid,
-            graph->n_nodes,
-            (t1 - t0) / 1000.0);
-        fflush(stdout);
-    }
-    return status == GGML_STATUS_SUCCESS;
 }
 
 bool rpc_server::run_phone_region_local_task(
@@ -7287,7 +6951,7 @@ bool rpc_server::set_tensor_graph_compute(
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
-    std::unique_lock<std::recursive_mutex> graph_lock(graph_compute_mutex);
+    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -7365,83 +7029,75 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             device, graph_uid, n_nodes);
         return true;
     }
-    graph_entry.graph = graph;
-    const rpc_phone_tensor_queue_kind queue_kind =
-        rpc_tensor_phone_graph_queue_kind(graph);
-    if (!rpc_phone_tensor_scheduler_active &&
-            queue_kind != rpc_phone_tensor_queue_kind::NONE) {
-        auto completion =
-            std::make_shared<rpc_phone_tensor_task_completion>();
+    const int64_t t0 = ggml_time_us();
 
-        // Never enqueue a raw ggml_cgraph pointer. The graph lives inside
-        // stored_graphs[device][graph_uid].buffer, which another RPC lane can
-        // rebuild before this task reaches the worker. Queue the serialized
-        // request instead, then reconstruct and execute only after the local
-        // scheduler owns the Phone compute slot.
-        std::vector<uint8_t> queued_input = input;
-        graph_lock.unlock();
-        const uint64_t task_id =
-            enqueue_phone_tensor_task(
-                queue_kind,
-                [this, queued_input = std::move(queued_input)]() {
-                    return graph_compute(
-                        queued_input,
-                        /* register_only = */ false);
-                },
-                completion);
-        if (task_id == 0) {
-            return false;
-        }
-        return wait_phone_tensor_task(completion);
+    ggml_status status =
+        ggml_backend_graph_compute(
+            backends[device],
+            graph);
+
+    const int64_t t1 = ggml_time_us();
+
+    rpc_tensor_phone_log_graph_compute(
+        "compute",
+        graph_uid,
+        graph,
+        t1 - t0,
+        0);
+
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+        printf(
+            "[RPC_GRAPH_SERVER] uid=%" PRIu64
+            " nodes=%d compute=%.3f ms\n",
+            graph_uid,
+            graph->n_nodes,
+            (t1 - t0) / 1000.0);
+        fflush(stdout);
     }
-
-    // Scheduler-owned execution must keep graph_compute_mutex held from graph
-    // reconstruction through backend submission. That makes the backing
-    // stored_graph buffer immutable for the complete graph lifetime.
-    return run_phone_tensor_graph(
-        device, graph_uid, graph, "compute");
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    graph_entry.graph = graph;
+    return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    std::unique_lock<std::recursive_mutex> graph_lock(graph_compute_mutex);
-    const uint32_t device = request.device;
+    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
+    uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
     }
     auto it = stored_graphs[device].find(request.graph_uid);
-    if (it == stored_graphs[device].end() ||
-            it->second.graph == nullptr) {
+    if (it == stored_graphs[device].end() || it->second.graph == nullptr) {
         return false;
     }
     ggml_cgraph * graph = it->second.graph;
-    LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n",
-        __func__, device, request.graph_uid);
+    LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
+    const int64_t t0 = ggml_time_us();
 
-    const rpc_phone_tensor_queue_kind queue_kind =
-        rpc_tensor_phone_graph_queue_kind(graph);
-    if (!rpc_phone_tensor_scheduler_active &&
-            queue_kind != rpc_phone_tensor_queue_kind::NONE) {
-        auto completion =
-            std::make_shared<rpc_phone_tensor_task_completion>();
-        const rpc_msg_graph_recompute_req queued_request = request;
-        graph_lock.unlock();
-        const uint64_t task_id =
-            enqueue_phone_tensor_task(
-                queue_kind,
-                [this, queued_request]() {
-                    return graph_recompute(queued_request);
-                },
-                completion);
-        if (task_id == 0) {
-            return false;
-        }
-        return wait_phone_tensor_task(completion);
+    ggml_status status =
+        ggml_backend_graph_compute(
+            backends[device],
+            graph);
+
+    const int64_t t1 = ggml_time_us();
+
+    rpc_tensor_phone_log_graph_compute(
+        "recompute",
+        request.graph_uid,
+        graph,
+        t1 - t0,
+        0);
+
+    if (RPC_DEBUG || std::getenv("GGML_RETURN_PATH_DEBUG") != nullptr) {
+        printf(
+            "[RPC_GRAPH_SERVER] uid=%" PRIu64
+            " nodes=%d compute=%.3f ms\n",
+            request.graph_uid,
+            graph->n_nodes,
+            (t1 - t0) / 1000.0);
+        fflush(stdout);
     }
-
-    // Keep the cache lock held while a scheduler-owned recompute executes, so
-    // the stored graph cannot be replaced by a concurrent RPC lane.
-    return run_phone_tensor_graph(
-        device, request.graph_uid, graph, "recompute");
+    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    return true;
 }
 
 bool rpc_server::graph_recompute_snapshot(
@@ -7576,9 +7232,6 @@ rpc_server::~rpc_server() {
     phone_region_main_cv.notify_all();
     if (phone_region_main_thread.joinable()) {
         phone_region_main_thread.join();
-    }
-    if (phone_tensor_reduce_thread.joinable()) {
-        phone_tensor_reduce_thread.join();
     }
 
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {
