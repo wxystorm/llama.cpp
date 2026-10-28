@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -41,6 +42,23 @@ struct llama_region_ring_region {
     int layer_begin;
     int layer_end; // exclusive
 };
+
+// Weight Streaming V1.5 uses a fixed two-Bank rolling window. Keep Bank
+// parity and rank+2 lookahead in one shared policy so runtime, planner and
+// regression tests cannot silently drift.
+inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
+    return rank & 1u;
+}
+
+inline std::optional<size_t> llama_region_ring_gpu_weight_next_rank(
+        size_t rank, size_t gpu_region_count) {
+    if (rank > std::numeric_limits<size_t>::max() - 2) {
+        return std::nullopt;
+    }
+    const size_t next = rank + 2;
+    return next < gpu_region_count ?
+        std::optional<size_t>(next) : std::nullopt;
+}
 
 // Exact intersection of disjoint PC execution intervals with disjoint
 // Phone-compute intervals. Both vectors are written by their owner threads
@@ -316,22 +334,26 @@ class llama_region_ring_ready {
 public:
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
-            int n_tokens, int chunk_tokens, size_t slot_pool_size = 0) :
+            int n_tokens, int chunk_tokens,
+            size_t slot_pool_size = 0,
+            bool gpu_two_bank_lifetime = false) :
         llama_region_ring_ready(
             regions, n_tokens,
             std::vector<int>(regions.size(), chunk_tokens),
-            slot_pool_size) {
+            slot_pool_size, gpu_two_bank_lifetime) {
     }
 
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
             int n_tokens,
             const std::vector<int> & region_chunk_tokens,
-            size_t slot_pool_size = 0) :
+            size_t slot_pool_size = 0,
+            bool gpu_two_bank_lifetime = false) :
         regions_(regions),
         region_chunk_tokens_(region_chunk_tokens),
         slot_pool_size_(slot_pool_size),
-        n_tokens_(n_tokens) {
+        n_tokens_(n_tokens),
+        gpu_two_bank_lifetime_(gpu_two_bank_lifetime) {
         if (regions_.empty() || n_tokens_ <= 0 ||
                 region_chunk_tokens_.size() != regions_.size() ||
                 std::any_of(
@@ -680,20 +702,45 @@ private:
 
     bool claimable_locked(
             const llama_region_ring_task & task) const {
-        // A single GPU lane executes GPU Regions strictly in model order.
-        // A later GPU Region is not claimable until every chunk of every
-        // earlier GPU Region has completed. This is the only Bank-lifetime
-        // ordering rule the weight prefetch path needs.
-        if (regions_[task.region].device ==
-                llama_region_ring_device::GPU) {
+        // Adjacent streamed GPU Regions live in different Banks and may
+        // interleave as soon as their token-interval dependencies become
+        // READY. Only same-Bank reuse needs an extra lifetime constraint:
+        //
+        //   rank0 -> A, rank1 -> B, rank2 -> A, rank3 -> B, ...
+        //
+        // Therefore rank k>=2 waits only for rank k-2 to drain. The previous
+        // "all earlier GPU Regions must finish" rule serialized the Ring.
+        if (gpu_two_bank_lifetime_ &&
+                regions_[task.region].device ==
+                    llama_region_ring_device::GPU) {
+            size_t gpu_rank = 0;
             for (size_t r = 0; r < task.region; ++r) {
-                if (regions_[r].device !=
-                        llama_region_ring_device::GPU) {
-                    continue;
+                gpu_rank +=
+                    regions_[r].device ==
+                    llama_region_ring_device::GPU;
+            }
+
+            if (gpu_rank >= 2) {
+                const size_t predecessor_rank = gpu_rank - 2;
+                size_t seen_rank = 0;
+                size_t predecessor_region = regions_.size();
+                for (size_t r = 0; r < task.region; ++r) {
+                    if (regions_[r].device !=
+                            llama_region_ring_device::GPU) {
+                        continue;
+                    }
+                    if (seen_rank == predecessor_rank) {
+                        predecessor_region = r;
+                        break;
+                    }
+                    ++seen_rank;
                 }
-                if (std::any_of(
-                        state_[r].begin(), state_[r].end(),
-                        [](uint8_t s) { return s != 3; })) {
+
+                if (predecessor_region >= regions_.size() ||
+                        std::any_of(
+                            state_[predecessor_region].begin(),
+                            state_[predecessor_region].end(),
+                            [](uint8_t state) { return state != 3; })) {
                     return false;
                 }
             }
@@ -798,6 +845,7 @@ private:
     const std::vector<int> region_chunk_tokens_;
     const size_t slot_pool_size_ = 0;
     const int n_tokens_ = 0;
+    const bool gpu_two_bank_lifetime_ = false;
     std::vector<std::vector<output_slot>> output_slots_;
     std::vector<std::vector<int>> chunk_begins_;
     std::vector<std::vector<int>> chunk_sizes_;
