@@ -1261,6 +1261,12 @@ private:
         slots.clear();
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        // common_context_can_seq_rm() deliberately evaluates two probe tokens.
+        // Reset those initialization-only perf counters after the probe. In
+        // Region Ring APPLY_WIDE this is also the final load-time hook that
+        // restores GPU rank0/rank1 into Bank A/B, so the first real prompt
+        // starts from resident initial Banks.
+        llama_perf_context_reset(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -1289,6 +1295,7 @@ private:
 
         if (ctx_dft) {
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            llama_perf_context_reset(ctx_dft);
         }
 
         if (spec) {
