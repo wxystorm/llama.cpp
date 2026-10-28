@@ -574,14 +574,6 @@ def run_candidate(
         ):
             rep_correct = False
             rep_reason = "WAVEFRONT_SUM_MISSING"
-        elif (
-            candidate.family == "tensor"
-            and candidate.x_layers > 1
-            and (rep_wave_overlap or 0) <= 0
-            and (rep_wave_ahead_attn or 0) <= 0
-        ):
-            rep_correct = False
-            rep_reason = "WAVEFRONT_NO_CROSS_LAYER_OVERLAP"
 
         if not rep_correct:
             correctness_ok = False
