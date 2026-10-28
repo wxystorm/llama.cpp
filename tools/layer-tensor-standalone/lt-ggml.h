@@ -33,6 +33,12 @@ struct stream_precompute_result {
     std::vector<double> qkv_slice_ms;
 };
 
+struct sequence_ffn_bench_result {
+    double ffn_ms = 0.0;
+    double output_checksum = 0.0;
+    double output_l2 = 0.0;
+};
+
 class ggml_compute final : public compute {
 public:
     static std::shared_ptr<ggml_compute> create(
@@ -64,6 +70,15 @@ public:
         const std::vector<float> & input,
         int repeats,
         stream_precompute_result & result,
+        std::string & error);
+
+    bool sequence_ffn_bench(
+        int32_t layer,
+        int32_t tokens,
+        const std::vector<float> & residual,
+        int repeats,
+        sequence_ffn_bench_result & result,
+        std::vector<float> * output,
         std::string & error);
 
     bool ffn_split_selfcheck(
