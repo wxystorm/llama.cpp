@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -2366,6 +2367,307 @@ struct ggml_compute::impl {
 
         return true;
     }
+
+    bool run_ffn_split_selfcheck(
+            const key & task,
+            const std::vector<float> & host_input,
+            float pc_ratio,
+            std::string & report,
+            std::string & error) {
+        if (config.local_side != side::pc ||
+            ggml_backend_dev_type(device) !=
+                GGML_BACKEND_DEVICE_TYPE_CPU) {
+            error = "FFN split selfcheck requires PC CPU backend";
+            return false;
+        }
+
+        if (!validate_hidden_size(
+                task,
+                host_input,
+                error)) {
+            return false;
+        }
+
+        llama_layer & layer =
+            model->layers[
+                static_cast<size_t>(task.layer)];
+
+        const int64_t pc_width =
+            llama_hybrid_ffn_shard_size(
+                n_ff_exp,
+                layer.ffn_down_exps->type,
+                pc_ratio,
+                0);
+        const int64_t phone_width =
+            llama_hybrid_ffn_shard_size(
+                n_ff_exp,
+                layer.ffn_down_exps->type,
+                pc_ratio,
+                1);
+
+        if (pc_width <= 0 ||
+            phone_width <= 0 ||
+            pc_width + phone_width != n_ff_exp) {
+            error = "FFN split selfcheck ratio produces invalid shard";
+            return false;
+        }
+
+        auto state = new_graph_hold();
+        if (state == nullptr) {
+            error = "failed to create FFN split selfcheck context";
+            return false;
+        }
+
+        ggml_tensor * input = nullptr;
+        ggml_tensor * host_input_tensor = nullptr;
+        std::shared_ptr<graph_hold> cached_input;
+
+        if (!make_input(
+                task,
+                host_input,
+                state,
+                input,
+                host_input_tensor,
+                cached_input,
+                error)) {
+            return false;
+        }
+
+        prefix_nodes prefix;
+        std::vector<int32_t> pos_data;
+        std::vector<ggml_fp16_t> mask_data;
+
+        if (!build_prefix(
+                task,
+                state->ctx,
+                input,
+                prefix,
+                pos_data,
+                mask_data,
+                error)) {
+            return false;
+        }
+
+        // Mirror the current physical mapping exactly:
+        //   Phone/head = [0, phone_width)
+        //   PC/tail    = [phone_width, n_ff_exp)
+        ggml_tensor * full =
+            build_moe_partial(
+                state->ctx,
+                task,
+                prefix.hidden,
+                prefix.topk,
+                prefix.weights,
+                0,
+                n_ff_exp,
+                error);
+        if (full == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * head =
+            build_moe_partial(
+                state->ctx,
+                task,
+                prefix.hidden,
+                prefix.topk,
+                prefix.weights,
+                0,
+                phone_width,
+                error);
+        if (head == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * tail =
+            build_moe_partial(
+                state->ctx,
+                task,
+                prefix.hidden,
+                prefix.topk,
+                prefix.weights,
+                phone_width,
+                pc_width,
+                error);
+        if (tail == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * split =
+            ggml_add(
+                state->ctx,
+                head,
+                tail);
+
+        ggml_cgraph * graph =
+            ggml_new_graph_custom(
+                state->ctx,
+                4096,
+                false);
+        ggml_build_forward_expand(
+            graph,
+            prefix.k_write);
+        ggml_build_forward_expand(
+            graph,
+            prefix.v_write);
+        ggml_build_forward_expand(
+            graph,
+            full);
+        ggml_build_forward_expand(
+            graph,
+            head);
+        ggml_build_forward_expand(
+            graph,
+            tail);
+        ggml_build_forward_expand(
+            graph,
+            split);
+
+        if (!allocate_state(
+                state,
+                error)) {
+            return false;
+        }
+
+        const size_t count =
+            static_cast<size_t>(n_embd) *
+            static_cast<size_t>(
+                chunk_tokens(task));
+
+        std::vector<float> full_host(count);
+        std::vector<float> head_host(count);
+        std::vector<float> tail_host(count);
+        std::vector<float> split_host(count);
+
+        {
+            std::lock_guard<std::mutex> lock(
+                backend_mutex);
+
+            GGML_ASSERT(
+                host_input_tensor != nullptr);
+            ggml_backend_tensor_set(
+                host_input_tensor,
+                host_input.data(),
+                0,
+                host_input.size() *
+                    sizeof(float));
+            ggml_backend_tensor_set(
+                prefix.pos,
+                pos_data.data(),
+                0,
+                pos_data.size() *
+                    sizeof(int32_t));
+            ggml_backend_tensor_set(
+                prefix.mask,
+                mask_data.data(),
+                0,
+                mask_data.size() *
+                    sizeof(ggml_fp16_t));
+
+            const ggml_status status =
+                ggml_backend_graph_compute(
+                    backend,
+                    graph);
+            ggml_backend_synchronize(
+                backend);
+
+            if (status != GGML_STATUS_SUCCESS) {
+                error = "FFN split selfcheck GGML compute failed";
+                return false;
+            }
+
+            ggml_backend_tensor_get(
+                full,
+                full_host.data(),
+                0,
+                count * sizeof(float));
+            ggml_backend_tensor_get(
+                head,
+                head_host.data(),
+                0,
+                count * sizeof(float));
+            ggml_backend_tensor_get(
+                tail,
+                tail_host.data(),
+                0,
+                count * sizeof(float));
+            ggml_backend_tensor_get(
+                split,
+                split_host.data(),
+                0,
+                count * sizeof(float));
+        }
+
+        double diff_sq = 0.0;
+        double full_sq = 0.0;
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+
+        for (size_t i = 0; i < count; ++i) {
+            const double a =
+                static_cast<double>(
+                    full_host[i]);
+            const double b =
+                static_cast<double>(
+                    split_host[i]);
+            const double d =
+                std::fabs(a - b);
+
+            diff_sq += d * d;
+            full_sq += a * a;
+            max_abs =
+                std::max(
+                    max_abs,
+                    d);
+            max_rel =
+                std::max(
+                    max_rel,
+                    d /
+                        std::max(
+                            1e-12,
+                            std::fabs(a)));
+        }
+
+        const double rms =
+            std::sqrt(
+                diff_sq /
+                std::max<size_t>(1, count));
+        const double full_rms =
+            std::sqrt(
+                full_sq /
+                std::max<size_t>(1, count));
+        const double rel_rms =
+            rms /
+            std::max(
+                1e-12,
+                full_rms);
+
+        std::ostringstream oss;
+        oss << std::setprecision(12)
+            << "layer=" << task.layer
+            << " chunk=" << task.chunk
+            << " pc_ratio=" << pc_ratio
+            << " phone_begin=0"
+            << " phone_width=" << phone_width
+            << " pc_begin=" << phone_width
+            << " pc_width=" << pc_width
+            << " full_checksum="
+            << checksum(full_host)
+            << " head_checksum="
+            << checksum(head_host)
+            << " tail_checksum="
+            << checksum(tail_host)
+            << " split_checksum="
+            << checksum(split_host)
+            << " max_abs=" << max_abs
+            << " rms=" << rms
+            << " rel_rms=" << rel_rms
+            << " max_rel=" << max_rel;
+
+        report = oss.str();
+        return true;
+    }
+
 };
 
 ggml_compute::ggml_compute(
