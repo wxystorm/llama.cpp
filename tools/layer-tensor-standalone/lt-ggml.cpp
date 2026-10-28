@@ -2242,16 +2242,28 @@ struct ggml_compute::impl {
             return false;
         }
 
+        const bool final_layer =
+            task.layer + 1 ==
+                config.runtime_plan.layers;
+        const bool next_local =
+            !final_layer &&
+            config.runtime_plan.owner_for_layer(
+                task.layer + 1) ==
+                config.local_side;
+
         {
             std::lock_guard<std::mutex> lock(
                 backend_mutex);
 
-            ggml_backend_tensor_set(
-                host_input_tensor,
-                host_input.data(),
-                0,
-                host_input.size() *
-                    sizeof(float));
+            if (host_input_tensor != nullptr) {
+                ggml_backend_tensor_set(
+                    host_input_tensor,
+                    host_input.data(),
+                    0,
+                    host_input.size() *
+                        sizeof(float));
+            }
+
             ggml_backend_tensor_set(
                 prefix.pos,
                 pos_data.data(),
@@ -2277,17 +2289,54 @@ struct ggml_compute::impl {
                 return false;
             }
 
-            const size_t count =
-                static_cast<size_t>(n_embd) *
-                static_cast<size_t>(
-                    chunk_tokens(task));
-            output.resize(count);
+            if (next_local) {
+                ggml_tensor * slot =
+                    activation_output_slot(task);
 
-            ggml_backend_tensor_get(
-                layer_out,
-                output.data(),
-                0,
-                count * sizeof(float));
+                if (slot == nullptr ||
+                    slot->buffer == nullptr ||
+                    (ggml_backend_dev_type(device) !=
+                         GGML_BACKEND_DEVICE_TYPE_CPU &&
+                     slot->extra == nullptr)) {
+                    error =
+                        "FULL_LAYER activation output slot is not backend-ready";
+                    return false;
+                }
+
+                ggml_backend_tensor_copy_async(
+                    backend,
+                    backend,
+                    layer_out,
+                    slot);
+                ggml_backend_synchronize(
+                    backend);
+                output.clear();
+
+                if (config.log_events) {
+                    std::fprintf(
+                        stderr,
+                        "[LT_GGML_LOCAL_CONT] side=%s "
+                        "from_layer=%d to_layer=%d chunk=%d "
+                        "slot=%d mode=FULL status=READY\n",
+                        side_name(config.local_side),
+                        task.layer,
+                        task.layer + 1,
+                        task.chunk,
+                        (task.layer + 1) & 1);
+                }
+            } else {
+                const size_t count =
+                    static_cast<size_t>(n_embd) *
+                    static_cast<size_t>(
+                        chunk_tokens(task));
+                output.resize(count);
+
+                ggml_backend_tensor_get(
+                    layer_out,
+                    output.data(),
+                    0,
+                    count * sizeof(float));
+            }
         }
 
         return true;
