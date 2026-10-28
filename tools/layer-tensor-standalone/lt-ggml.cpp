@@ -2793,6 +2793,20 @@ bool ggml_compute::embed_tokens(
     return true;
 }
 
+bool ggml_compute::ffn_split_selfcheck(
+        const key & task,
+        const std::vector<float> & input,
+        float pc_ratio,
+        std::string & report,
+        std::string & error) {
+    return impl_->run_ffn_split_selfcheck(
+        task,
+        input,
+        pc_ratio,
+        report,
+        error);
+}
+
 bool ggml_compute::owner_prefix(
         const key & task,
         const std::vector<float> & input,
