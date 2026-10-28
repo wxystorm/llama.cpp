@@ -2634,30 +2634,33 @@ llama_sequence_ffn_branch_graph * llama_context::get_sequence_ffn_branch(
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> cache_lock(
-        sequence_ffn_branch_cache_mutex);
-
     const uint64_t key =
         (uint64_t(uint32_t(layer_index)) << 40) |
         (uint64_t(child_index & 0xffu) << 32) |
         uint64_t(uint32_t(tokens));
 
-    auto it = sequence_ffn_branch_cache.find(key);
-    if (it != sequence_ffn_branch_cache.end()) {
-        llama_sequence_ffn_branch_graph * cached =
-            it->second.get();
-        if (cached != nullptr &&
-                cached->backend == backend &&
-                cached->layer_index == layer_index &&
-                cached->tokens == tokens &&
-                cached->child_index == child_index) {
-            cache_hit = 1;
-            return cached;
+    {
+        std::lock_guard<std::mutex> lock(
+            sequence_ffn_branch_cache_mutex);
+        auto it = sequence_ffn_branch_cache.find(key);
+        if (it != sequence_ffn_branch_cache.end()) {
+            llama_sequence_ffn_branch_graph * cached =
+                it->second.get();
+            if (cached != nullptr &&
+                    cached->backend == backend &&
+                    cached->layer_index == layer_index &&
+                    cached->tokens == tokens &&
+                    cached->child_index == child_index) {
+                cache_hit = 1;
+                return cached;
+            }
+            sequence_ffn_branch_cache.erase(it);
         }
-        sequence_ffn_branch_cache.erase(it);
     }
 
-    cache_miss = 1;
+    // Building/allocating may include an RPC allocation on the Phone and can
+    // take tens of milliseconds.  Keep it outside the metadata lock so PC and
+    // Phone first-use graphs can be built concurrently.
     auto entry =
         std::make_unique<llama_sequence_ffn_branch_graph>();
     if (!llama_sequence_ffn_build_branch(
@@ -2668,7 +2671,30 @@ llama_sequence_ffn_branch_graph * llama_context::get_sequence_ffn_branch(
     }
 
     llama_sequence_ffn_branch_graph * raw = entry.get();
-    sequence_ffn_branch_cache.emplace(key, std::move(entry));
+    {
+        std::lock_guard<std::mutex> lock(
+            sequence_ffn_branch_cache_mutex);
+        auto [it, inserted] =
+            sequence_ffn_branch_cache.emplace(
+                key, std::move(entry));
+        if (!inserted) {
+            llama_sequence_ffn_branch_graph * existing =
+                it->second.get();
+            if (existing == nullptr ||
+                    existing->backend != backend ||
+                    existing->layer_index != layer_index ||
+                    existing->tokens != tokens ||
+                    existing->child_index != child_index) {
+                return nullptr;
+            }
+            raw = existing;
+            cache_hit = 1;
+            cache_miss = 0;
+            return raw;
+        }
+    }
+
+    cache_miss = 1;
     return raw;
 }
 
