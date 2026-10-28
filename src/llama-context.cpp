@@ -44,10 +44,11 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
 
 static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_kind kind) {
     switch (kind) {
-        case llama_hybrid_runtime_stage_kind::GPU:    return "GPU";
-        case llama_hybrid_runtime_stage_kind::CPU:    return "CPU";
-        case llama_hybrid_runtime_stage_kind::TENSOR: return "TENSOR";
-        case llama_hybrid_runtime_stage_kind::PHONE:  return "PHONE";
+        case llama_hybrid_runtime_stage_kind::GPU:          return "GPU";
+        case llama_hybrid_runtime_stage_kind::CPU:          return "CPU";
+        case llama_hybrid_runtime_stage_kind::SEQUENCE_FFN: return "SEQUENCE_FFN";
+        case llama_hybrid_runtime_stage_kind::TENSOR:       return "TENSOR";
+        case llama_hybrid_runtime_stage_kind::PHONE:        return "PHONE";
     }
     return "UNKNOWN";
 }
@@ -186,6 +187,7 @@ static std::vector<llama_hybrid_runtime_stage> llama_hybrid_build_runtime_stages
 }
 
 static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
+        const llama_model & model,
         const std::vector<llama_region_ring_region> & regions,
         int cpu_chunk_tokens,
         int gpu_chunk_tokens,
@@ -195,23 +197,60 @@ static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
         throw std::runtime_error(
             "region ring per-device chunks must be positive");
     }
+
     std::vector<llama_hybrid_runtime_stage> stages;
-    stages.reserve(regions.size());
+    stages.reserve(regions.size() + 8);
+
     for (const auto & region : regions) {
-        const auto kind =
-            region.device == llama_region_ring_device::CPU ?
-                llama_hybrid_runtime_stage_kind::CPU :
-            region.device == llama_region_ring_device::GPU ?
-                llama_hybrid_runtime_stage_kind::GPU :
-                llama_hybrid_runtime_stage_kind::PHONE;
-        const int chunk_tokens =
-            region.device == llama_region_ring_device::CPU ?
-                cpu_chunk_tokens :
-            region.device == llama_region_ring_device::GPU ?
-                gpu_chunk_tokens : phone_chunk_tokens;
-        stages.push_back({
-            kind, region.layer_begin, region.layer_end, chunk_tokens, 0});
+        if (region.device != llama_region_ring_device::CPU) {
+            const auto kind =
+                region.device == llama_region_ring_device::GPU ?
+                    llama_hybrid_runtime_stage_kind::GPU :
+                    llama_hybrid_runtime_stage_kind::PHONE;
+            const int chunk_tokens =
+                region.device == llama_region_ring_device::GPU ?
+                    gpu_chunk_tokens : phone_chunk_tokens;
+            stages.push_back({
+                kind, region.layer_begin, region.layer_end,
+                chunk_tokens, 0});
+            continue;
+        }
+
+        // The base Ring topology still uses G/C/P for placement/planning, but
+        // a Sequence-FFN layer is an independent runtime stage.  Split it out
+        // of the surrounding CPU interval instead of hiding PC+Phone work
+        // under CPU ownership.
+        int cpu_begin = region.layer_begin;
+        for (int il = region.layer_begin; il < region.layer_end; ++il) {
+            if (model.hybrid_layer_mode(il) !=
+                    llama_hybrid_layer_mode::SEQUENCE_FFN) {
+                continue;
+            }
+
+            if (cpu_begin < il) {
+                stages.push_back({
+                    llama_hybrid_runtime_stage_kind::CPU,
+                    cpu_begin, il, cpu_chunk_tokens, 0});
+            }
+
+            stages.push_back({
+                llama_hybrid_runtime_stage_kind::SEQUENCE_FFN,
+                il, il + 1, cpu_chunk_tokens, 0});
+            LLAMA_LOG_ERROR(
+                "[SEQ_FFN_STAGE_PLAN] layer=%d base_region=CPU "
+                "runtime_stage=SEQUENCE_FFN chunk=%d status=READY\n",
+                il, cpu_chunk_tokens);
+            cpu_begin = il + 1;
+        }
+
+        if (cpu_begin < region.layer_end) {
+            stages.push_back({
+                llama_hybrid_runtime_stage_kind::CPU,
+                cpu_begin, region.layer_end,
+                cpu_chunk_tokens, 0});
+        }
     }
+
     return stages;
 }
 
@@ -6062,7 +6101,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
             llama_region_ring_runtime_stages(
-                ring_runtime_regions,
+                model, ring_runtime_regions,
                 region_ring_xc, region_ring_xg, region_ring_xp) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
@@ -9646,7 +9685,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
     }
 
     const auto stages =
-        llama_region_ring_runtime_stages(regions, xc, xg, xp);
+        llama_region_ring_runtime_stages(model, regions, xc, xg, xp);
     std::vector<size_t> gpu_regions;
     for (size_t r = 0; r < stages.size(); ++r) {
         if (stages[r].kind == llama_hybrid_runtime_stage_kind::GPU) {
