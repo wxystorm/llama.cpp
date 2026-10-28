@@ -659,6 +659,8 @@ static void test_gpu_same_bank_lifetime_scheduler() {
     check(r0c0 && r0c0->region == 0 && r0c0->chunk == 0,
           "rank0 chunk0 missing");
     ready.complete(*r0c0);
+    check(!ready.region_done(0),
+          "rank0 reported drained before all chunks completed");
 
     const auto r1c0 =
         ready.try_take(llama_region_ring_device::GPU);
@@ -673,6 +675,8 @@ static void test_gpu_same_bank_lifetime_scheduler() {
     check(r0c1 && r0c1->region == 0 && r0c1->chunk == 1,
           "rank2/A reused Bank A before rank0 drained");
     ready.complete(*r0c1);
+    check(ready.region_done(0),
+          "rank0 did not report drained after all chunks completed");
 
     // Bank A is now free. rank2 may start even though rank1/B still has its
     // second chunk queued.
