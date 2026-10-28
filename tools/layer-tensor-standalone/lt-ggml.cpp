@@ -717,6 +717,104 @@ struct ggml_compute::impl {
         return true;
     }
 
+    bool initialize_activation_slots(std::string & error) {
+        const size_t chunk_count =
+            config.runtime_plan.chunk_tokens.size();
+
+        ggml_init_params params {};
+        params.mem_size =
+            (chunk_count * 2 + 32) *
+            ggml_tensor_overhead();
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+
+        activation_ctx = ggml_init(params);
+        if (activation_ctx == nullptr) {
+            error =
+                "failed to create activation slot metadata context";
+            return false;
+        }
+
+        activation_slots.resize(chunk_count);
+
+        for (size_t chunk = 0;
+             chunk < chunk_count;
+             ++chunk) {
+            const int32_t tokens =
+                config.runtime_plan.chunk_tokens[chunk];
+
+            for (int slot = 0; slot < 2; ++slot) {
+                activation_slots[chunk][slot] =
+                    ggml_new_tensor_2d(
+                        activation_ctx,
+                        GGML_TYPE_F32,
+                        n_embd,
+                        tokens);
+
+                if (activation_slots[chunk][slot] == nullptr) {
+                    error =
+                        "failed to create persistent activation slot";
+                    return false;
+                }
+            }
+        }
+
+        activation_buffer =
+            ggml_backend_alloc_ctx_tensors(
+                activation_ctx,
+                backend);
+        if (activation_buffer == nullptr) {
+            error =
+                "failed to allocate persistent activation buffer";
+            return false;
+        }
+
+        ggml_backend_buffer_clear(
+            activation_buffer,
+            0);
+
+        for (size_t chunk = 0;
+             chunk < chunk_count;
+             ++chunk) {
+            for (int slot = 0; slot < 2; ++slot) {
+                ggml_tensor * tensor =
+                    activation_slots[chunk][slot];
+
+                if (tensor->buffer == nullptr ||
+                    (ggml_backend_dev_type(device) !=
+                         GGML_BACKEND_DEVICE_TYPE_CPU &&
+                     tensor->extra == nullptr)) {
+                    std::ostringstream oss;
+                    oss << "persistent activation slot is not backend-ready"
+                        << ": chunk=" << chunk
+                        << " slot=" << slot
+                        << " buffer="
+                        << (tensor->buffer != nullptr ?
+                            ggml_backend_buffer_name(tensor->buffer) :
+                            "NULL")
+                        << " extra=" << tensor->extra;
+                    error = oss.str();
+                    return false;
+                }
+            }
+        }
+
+        std::fprintf(
+            stderr,
+            "[LT_GGML_ACTIVATION_SLOTS] side=%s chunks=%zu "
+            "slots_per_chunk=2 bytes=%.3f MiB buffer=%s status=READY\n",
+            side_name(config.local_side),
+            chunk_count,
+            static_cast<double>(
+                ggml_backend_buffer_get_size(
+                    activation_buffer)) /
+                (1024.0 * 1024.0),
+            ggml_backend_buffer_name(
+                activation_buffer));
+
+        return true;
+    }
+
     int32_t chunk_tokens(const key & task) const {
         if (task.chunk < 0 ||
             static_cast<size_t>(task.chunk) >=
@@ -734,6 +832,37 @@ struct ggml_compute::impl {
                 static_cast<size_t>(i)];
         }
         return begin;
+    }
+
+
+    ggml_tensor * activation_input_slot(
+            const key & task) const {
+        if (task.chunk < 0 ||
+            static_cast<size_t>(task.chunk) >=
+                activation_slots.size()) {
+            return nullptr;
+        }
+
+        const int slot =
+            task.layer & 1;
+
+        return activation_slots[
+            static_cast<size_t>(task.chunk)][slot];
+    }
+
+    ggml_tensor * activation_output_slot(
+            const key & task) const {
+        if (task.chunk < 0 ||
+            static_cast<size_t>(task.chunk) >=
+                activation_slots.size()) {
+            return nullptr;
+        }
+
+        const int slot =
+            (task.layer + 1) & 1;
+
+        return activation_slots[
+            static_cast<size_t>(task.chunk)][slot];
     }
 
     std::shared_ptr<graph_hold> take_cache(
