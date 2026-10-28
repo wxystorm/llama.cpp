@@ -4753,6 +4753,20 @@ bool ggml_compute::embed_tokens(
     return true;
 }
 
+bool ggml_compute::stream_precompute_bench(
+        const key & task,
+        const std::vector<float> & input,
+        int repeats,
+        stream_precompute_result & result,
+        std::string & error) {
+    return impl_->run_stream_precompute_bench(
+        task,
+        input,
+        repeats,
+        result,
+        error);
+}
+
 bool ggml_compute::ffn_split_selfcheck(
         const key & task,
         const std::vector<float> & input,
