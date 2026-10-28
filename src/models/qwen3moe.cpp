@@ -186,6 +186,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
     const bool build_output_head = !stage_graph || params.hybrid_output_head;
     const bool embedding_only    = stage_graph && params.hybrid_embedding_only;
+    const bool sequence_ffn_attention_only =
+        stage_graph && params.hybrid_sequence_ffn_attention_only;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
@@ -194,6 +196,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
     GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
     GGML_ASSERT(!embedding_only || (layer_begin == 0 && !hidden_input));
+    GGML_ASSERT(!sequence_ffn_attention_only ||
+        (layer_end == layer_begin + 1 &&
+         model.hybrid_layer_mode(layer_begin) ==
+            llama_hybrid_layer_mode::SEQUENCE_FFN &&
+         !build_output_head));
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -1206,6 +1213,23 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+
+        if (sequence_ffn_attention_only) {
+            GGML_ASSERT(il == layer_begin);
+            cb(ffn_inp, "seq_ffn_attn_out", il);
+            res->t_stage_output = ffn_inp;
+            ggml_build_forward_expand(gf, ffn_inp);
+
+            if (std::getenv(
+                    "LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[SEQ_FFN_ATTN_GRAPH] layer=%d tokens=%" PRId64
+                    " attention=PC kv=PC output=FFN_RESIDUAL status=BUILT\n",
+                    il, n_tokens);
+            }
+            return;
+        }
+
         cb(ffn_inp, "ffn_inp", il);
 
         // MoE branch
