@@ -4623,11 +4623,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
 
+                    ready.complete(task);
                     const bool gpu_region_drained =
                         dev == 1 && gpu_bank_streaming &&
-                        task.chunk + 1 ==
-                            ready.n_chunks(task.region);
-                    ready.complete(task);
+                        ready.region_done(task.region);
                     ++state.completed;
                     if (last) {
                         state.final_result = task_result;
