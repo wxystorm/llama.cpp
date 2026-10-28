@@ -134,11 +134,27 @@ The graph exposes chunk-local outputs and exact dependencies:
 Reduce(L, c) -> OUT(L, c) -> Attention(L+1, c)
 ```
 
+The experiment uses an exact XT-granular diagonal ready frontier:
+
+```
+L0C0
+L0C1 -> L1C0
+L0C2 -> L1C1 -> L2C0
+...
+```
+
 so a later layer no longer requires the whole previous layer to finish before
-its own chunk can become ready. The runtime prints
-`[HYBRID_EXPERIMENT_WAVEFRONT] enabled=1` when this graph is actually built.
-Directional C2P/P2C reductions are submitted through the existing bounded
-prefill reduce slots, so the main Meta thread does not serialize every reduce.
+its own chunk can become ready. The one-chunk predecessor lookahead is
+intentional: when `L1C0` consumes `OUT(L0,C0)`, `L0C1` may remain in
+flight rather than being hidden behind a whole-layer barrier.
+
+The runtime prints `[HYBRID_EXPERIMENT_WAVEFRONT] enabled=1` when this graph
+is actually built and `[MOE_WAVEFRONT_LAYOUT] ... schedule=DIAGONAL_EXACT_CHUNK`
+for the experimental schedule. Directional C2P/P2C reductions are submitted
+through the existing bounded prefill reduce slots, so the main Meta thread
+does not serialize every reduce. Before the final full-batch `l_out` /
+output head consumes the last layer, Meta drains only the remaining terminal
+chunk reductions and logs `[DIRECTIONAL_WAVE_TERMINAL_WAIT]`.
 
 The benchmark also parses `[RETURN_WAVEFRONT_SUM]`. For Tensor depths above
 one layer, merely building the graph is not enough: at least one real
@@ -155,12 +171,14 @@ For every `x`, the Tensor planner searches:
 The defaults are:
 
 ```
-R = 0.20, 0.33, 0.50
+R = 0.34, 0.67
 XT = 32, 64, 128
 ```
 
-so the first coarse search can find both compute balance and communication /
-chunking crossover.
+For the current Q4_K Qwen3-MoE expert tensors, these requests land on the two
+non-empty physical shard points near 1/3 and 2/3 after quantization alignment.
+This avoids candidates such as 0.20 that collapse to an empty shard before the
+benchmark can run.
 
 Use `--same-ratio` to force C2P and P2C to share the same R candidate.
 
@@ -186,12 +204,12 @@ PowerShell:
 
 ```powershell
 python .\tools\cpu-phone-tensor-bench\cpu_phone_tensor_bench.py `
-  --exe .\build-tensor-bench\bin\Debug\llama-cli.exe `
+  --exe .\build-tensor-bench\bin\Release\llama-cli.exe `
   --model E:\llama\models\Qwen3-30B-A3B-Q4_K_M.gguf `
   --rpc 192.168.1.123:50052 `
   --phone-device RPC0 `
   --layers 2,4,6,8 `
-  --ratios 0.20,0.33,0.50 `
+  --ratios 0.34,0.67 `
   --tensor-chunks 32,64,128 `
   --same-ratio `
   --prompt-file .\prompt.txt `
