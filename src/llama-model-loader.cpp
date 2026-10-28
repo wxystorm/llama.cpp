@@ -893,13 +893,48 @@ bool llama_model_loader::get_hybrid_ffn_desc(int layer, llama_hybrid_ffn_desc & 
         return false;
     }
 
+    const ggml_tensor * gate_b =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_GATE, "bias", layer).str().c_str());
+    const ggml_tensor * up_b =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_UP, "bias", layer).str().c_str());
+    const ggml_tensor * down_b =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "bias", layer).str().c_str());
+    const ggml_tensor * gate_s =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_GATE, "scale", layer).str().c_str());
+    const ggml_tensor * up_s =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_UP, "scale", layer).str().c_str());
+    const ggml_tensor * down_s =
+        get_tensor_meta(tn(LLM_TENSOR_FFN_DOWN, "scale", layer).str().c_str());
+
     desc.n_embd = gate->ne[0];
     desc.n_ff   = gate->ne[1];
     desc.ffn_norm_type = ffn_norm->type;
     desc.gate_type = gate->type;
     desc.up_type   = up->type;
     desc.down_type = down->type;
-    desc.weight_bytes = ggml_nbytes(ffn_norm) + ggml_nbytes(gate) + ggml_nbytes(up) + ggml_nbytes(down);
+
+    auto describe_optional = [](const ggml_tensor * tensor,
+                                bool & present,
+                                ggml_type & type) {
+        present = tensor != nullptr;
+        type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+    };
+    describe_optional(gate_b, desc.has_gate_bias, desc.gate_bias_type);
+    describe_optional(up_b, desc.has_up_bias, desc.up_bias_type);
+    describe_optional(down_b, desc.has_down_bias, desc.down_bias_type);
+    describe_optional(gate_s, desc.has_gate_scale, desc.gate_scale_type);
+    describe_optional(up_s, desc.has_up_scale, desc.up_scale_type);
+    describe_optional(down_s, desc.has_down_scale, desc.down_scale_type);
+
+    desc.weight_bytes =
+        ggml_nbytes(ffn_norm) + ggml_nbytes(gate) +
+        ggml_nbytes(up) + ggml_nbytes(down);
+    for (const ggml_tensor * optional :
+            {gate_b, up_b, down_b, gate_s, up_s, down_s}) {
+        if (optional != nullptr) {
+            desc.weight_bytes += ggml_nbytes(optional);
+        }
+    }
     return true;
 }
 bool llama_model_loader::get_hybrid_moe_desc(int layer, llama_hybrid_moe_desc & desc) {
@@ -1009,6 +1044,23 @@ bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc 
     const ggml_tensor * wv        = get_tensor_meta(tn(LLM_TENSOR_ATTN_V,    "weight", layer).str().c_str());
     const ggml_tensor * wo        = get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT,  "weight", layer).str().c_str());
 
+    const ggml_tensor * wq_b =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_Q, "bias", layer).str().c_str());
+    const ggml_tensor * wk_b =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_K, "bias", layer).str().c_str());
+    const ggml_tensor * wv_b =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_V, "bias", layer).str().c_str());
+    const ggml_tensor * wo_b =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT, "bias", layer).str().c_str());
+    const ggml_tensor * wq_s =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_Q, "scale", layer).str().c_str());
+    const ggml_tensor * wk_s =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_K, "scale", layer).str().c_str());
+    const ggml_tensor * wv_s =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_V, "scale", layer).str().c_str());
+    const ggml_tensor * wo_s =
+        get_tensor_meta(tn(LLM_TENSOR_ATTN_OUT, "scale", layer).str().c_str());
+
     if (attn_norm == nullptr || wq == nullptr || wk == nullptr || wv == nullptr || wo == nullptr) {
         return false;
     }
@@ -1091,6 +1143,22 @@ bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc 
         get_key(arch + ".attention.layer_norm_epsilon", rms_eps, false);
     }
 
+    float kq_scale = 0.0f;
+    get_key(LLM_KV_ATTENTION_SCALE, kq_scale, false);
+    if (!(kq_scale > 0.0f)) {
+        kq_scale = 1.0f / std::sqrt((float) head_dim_q);
+    }
+
+    const ggml_tensor * rope_freqs =
+        get_tensor_meta(tn(LLM_TENSOR_ROPE_FREQS, "weight", layer).str().c_str());
+    const ggml_tensor * rope_short =
+        get_tensor_meta(tn(LLM_TENSOR_ROPE_FACTORS_SHORT, "weight", layer).str().c_str());
+    const ggml_tensor * rope_long =
+        get_tensor_meta(tn(LLM_TENSOR_ROPE_FACTORS_LONG, "weight", layer).str().c_str());
+    const ggml_tensor * rope_factors =
+        rope_freqs != nullptr ? rope_freqs :
+        rope_short != nullptr ? rope_short : rope_long;
+
     const ggml_tensor * q_norm =
         get_tensor_meta(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", layer).str().c_str());
     const ggml_tensor * k_norm =
@@ -1115,6 +1183,7 @@ bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc 
     desc.n_ctx_orig = (int32_t) n_ctx_orig;
     desc.freq_base  = freq_base;
     desc.freq_scale = freq_scale;
+    desc.kq_scale   = kq_scale;
 
     desc.attn_norm_type = attn_norm->type;
     desc.q_type          = wq->type;
@@ -1131,13 +1200,36 @@ bool llama_model_loader::get_hybrid_attn_desc(int layer, llama_hybrid_attn_desc 
         desc.k_norm_type = k_norm->type;
     }
 
-    desc.weight_bytes = ggml_nbytes(attn_norm) + ggml_nbytes(wq) + ggml_nbytes(wk) + ggml_nbytes(wv) +
-                        ggml_nbytes(wo);
-    if (q_norm != nullptr) {
-        desc.weight_bytes += ggml_nbytes(q_norm);
+    auto describe_optional = [](const ggml_tensor * tensor,
+                                bool & present,
+                                ggml_type & type) {
+        present = tensor != nullptr;
+        type = tensor != nullptr ? tensor->type : GGML_TYPE_COUNT;
+    };
+    describe_optional(wq_b, desc.has_q_bias, desc.q_bias_type);
+    describe_optional(wk_b, desc.has_k_bias, desc.k_bias_type);
+    describe_optional(wv_b, desc.has_v_bias, desc.v_bias_type);
+    describe_optional(wo_b, desc.has_o_bias, desc.o_bias_type);
+    describe_optional(wq_s, desc.has_q_scale, desc.q_scale_type);
+    describe_optional(wk_s, desc.has_k_scale, desc.k_scale_type);
+    describe_optional(wv_s, desc.has_v_scale, desc.v_scale_type);
+    describe_optional(wo_s, desc.has_o_scale, desc.o_scale_type);
+
+    desc.has_rope_factors = rope_factors != nullptr;
+    if (rope_factors != nullptr) {
+        desc.rope_factors_type = rope_factors->type;
+        desc.rope_factors_ne0 = rope_factors->ne[0];
     }
-    if (k_norm != nullptr) {
-        desc.weight_bytes += ggml_nbytes(k_norm);
+
+    desc.weight_bytes = ggml_nbytes(attn_norm) + ggml_nbytes(wq) +
+                        ggml_nbytes(wk) + ggml_nbytes(wv) +
+                        ggml_nbytes(wo);
+    for (const ggml_tensor * optional :
+            {q_norm, k_norm, wq_b, wk_b, wv_b, wo_b,
+             wq_s, wk_s, wv_s, wo_s, rope_factors}) {
+        if (optional != nullptr) {
+            desc.weight_bytes += ggml_nbytes(optional);
+        }
     }
 
     return true;
