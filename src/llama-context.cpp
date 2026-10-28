@@ -2630,7 +2630,14 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
         size_t                             block_index,
         int32_t                            block_outputs,
         bool &                             apply_mctx,
-        ggml_status &                      ret) {
+        ggml_status &                      ret,
+        llama_sequence_ffn_timing *        timing) {
+    const int64_t total_begin_us = ggml_time_us();
+
+    if (timing != nullptr) {
+        *timing = {};
+    }
+
     if (model.arch != LLM_ARCH_QWEN3MOE ||
             stage.kind != llama_hybrid_runtime_stage_kind::SEQUENCE_FFN ||
             stage.layer_end != stage.layer_begin + 1 ||
@@ -2639,13 +2646,14 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
             stage_input == nullptr ||
             stage_output == nullptr ||
             block_tokens <= 1 ||
-            block_outputs != 0) {
+            block_outputs != 0 ||
+            !loras->empty()) {
         LLAMA_LOG_ERROR(
             "[SEQ_FFN_EXEC] stage=%zu block=%zu layers=[%d,%d) "
-            "tokens=%u status=REJECT reason=V1_CONTRACT\n",
+            "tokens=%u status=REJECT reason=V1_CONTRACT lora=%d\n",
             stage_index, block_index,
             stage.layer_begin, stage.layer_end,
-            block_tokens);
+            block_tokens, loras->empty() ? 0 : 1);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
@@ -2701,11 +2709,18 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
     const size_t pc_bytes =
         (size_t) pc_tokens * token_bytes;
 
+    if (timing != nullptr) {
+        timing->pc_tokens = pc_tokens;
+        timing->phone_tokens = phone_tokens;
+        timing->c2p_bytes = phone_bytes;
+        timing->p2c_bytes = phone_bytes;
+    }
+
     std::vector<float> residual(
         n_embd * (size_t) block_tokens);
 
-    // S_ATTN: one normal staged Qwen3-MoE graph, but the graph builder stops
-    // at Attention + residual. KV writes remain owned by the PC path.
+    // S_ATTN: the normal staged Qwen3-MoE graph stops at Attention + residual.
+    // KV writes remain PC-owned.
     const int64_t attn_begin_us = ggml_time_us();
     llm_graph_result * result =
         run_hybrid_stage_block(
@@ -2718,6 +2733,9 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
             0, apply_mctx, true, ret);
     const int64_t attn_us =
         ggml_time_us() - attn_begin_us;
+    if (timing != nullptr) {
+        timing->attn_us = attn_us;
+    }
     if (result == nullptr ||
             ret != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR(
@@ -2727,18 +2745,123 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
         return nullptr;
     }
 
-    llama_sequence_ffn_branch_graph pc_branch;
-    llama_sequence_ffn_branch_graph phone_branch;
-    if (!llama_sequence_ffn_build_branch(
-            model, stage.layer_begin, pc_tokens,
-            0, pc_backend, pc_branch) ||
-        !llama_sequence_ffn_build_branch(
-            model, stage.layer_begin, phone_tokens,
-            1, phone_backend, phone_branch)) {
+    auto cache_key = [](int layer, size_t child, int tokens) -> uint64_t {
+        return
+            (uint64_t(uint32_t(layer)) << 40) |
+            (uint64_t(child & 0xffu) << 32) |
+            uint64_t(uint32_t(tokens));
+    };
+
+    auto get_cached_branch =
+        [&](size_t child,
+            int tokens,
+            ggml_backend_t backend,
+            int & hits,
+            int & misses,
+            int64_t & build_us,
+            int64_t & alloc_us)
+            -> llama_sequence_ffn_branch_graph * {
+            const uint64_t key =
+                cache_key(stage.layer_begin, child, tokens);
+            const int64_t lookup_begin_us = ggml_time_us();
+            auto it = sequence_ffn_branch_cache.find(key);
+            if (timing != nullptr) {
+                timing->cache_lookup_us +=
+                    ggml_time_us() - lookup_begin_us;
+            }
+
+            if (it != sequence_ffn_branch_cache.end()) {
+                llama_sequence_ffn_branch_graph * cached =
+                    it->second.get();
+                if (cached != nullptr &&
+                        cached->backend == backend &&
+                        cached->layer_index == stage.layer_begin &&
+                        cached->tokens == tokens &&
+                        cached->child_index == child) {
+                    ++hits;
+                    LLAMA_LOG_ERROR(
+                        "[SEQ_FFN_CACHE] layer=%d child=%zu tokens=%d "
+                        "backend=%s result=HIT entries=%zu\n",
+                        stage.layer_begin, child, tokens,
+                        ggml_backend_name(backend),
+                        sequence_ffn_branch_cache.size());
+                    return cached;
+                }
+
+                // A changed child backend invalidates this shape. This should
+                // not happen in the serial V1 path, but rebuild safely rather
+                // than reusing a graph bound to another backend.
+                sequence_ffn_branch_cache.erase(it);
+            }
+
+            ++misses;
+            auto entry =
+                std::make_unique<llama_sequence_ffn_branch_graph>();
+            int64_t graph_us = 0;
+            int64_t buffer_us = 0;
+            if (!llama_sequence_ffn_build_branch(
+                    model, stage.layer_begin, tokens,
+                    child, backend, *entry,
+                    graph_us, buffer_us)) {
+                return nullptr;
+            }
+
+            build_us += graph_us;
+            alloc_us += buffer_us;
+
+            llama_sequence_ffn_branch_graph * raw =
+                entry.get();
+            sequence_ffn_branch_cache.emplace(
+                key, std::move(entry));
+
+            LLAMA_LOG_ERROR(
+                "[SEQ_FFN_CACHE] layer=%d child=%zu tokens=%d "
+                "backend=%s result=MISS graph_ms=%.3f alloc_ms=%.3f "
+                "entries=%zu\n",
+                stage.layer_begin, child, tokens,
+                ggml_backend_name(backend),
+                graph_us / 1000.0,
+                buffer_us / 1000.0,
+                sequence_ffn_branch_cache.size());
+            return raw;
+        };
+
+    int pc_hits = 0;
+    int pc_misses = 0;
+    int phone_hits = 0;
+    int phone_misses = 0;
+    int64_t pc_build_us = 0;
+    int64_t pc_alloc_us = 0;
+    int64_t phone_build_us = 0;
+    int64_t phone_alloc_us = 0;
+
+    llama_sequence_ffn_branch_graph * pc_branch =
+        get_cached_branch(
+            0, pc_tokens, pc_backend,
+            pc_hits, pc_misses,
+            pc_build_us, pc_alloc_us);
+    llama_sequence_ffn_branch_graph * phone_branch =
+        get_cached_branch(
+            1, phone_tokens, phone_backend,
+            phone_hits, phone_misses,
+            phone_build_us, phone_alloc_us);
+
+    if (timing != nullptr) {
+        timing->pc_cache_hits = pc_hits;
+        timing->pc_cache_misses = pc_misses;
+        timing->phone_cache_hits = phone_hits;
+        timing->phone_cache_misses = phone_misses;
+        timing->pc_build_us = pc_build_us;
+        timing->pc_alloc_us = pc_alloc_us;
+        timing->phone_build_us = phone_build_us;
+        timing->phone_alloc_us = phone_alloc_us;
+    }
+
+    if (pc_branch == nullptr || phone_branch == nullptr) {
         LLAMA_LOG_ERROR(
             "[SEQ_FFN_EXEC] layer=%d tokens=%u "
             "pc_tokens=%d phone_tokens=%d status=FAIL "
-            "reason=BRANCH_BUILD\n",
+            "reason=CACHE_BUILD\n",
             stage.layer_begin, block_tokens,
             pc_tokens, phone_tokens);
         ret = GGML_STATUS_FAILED;
@@ -2747,7 +2870,7 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
 
     const int64_t pc_stage_begin_us = ggml_time_us();
     ggml_backend_tensor_set(
-        pc_branch.input,
+        pc_branch->input,
         residual.data(),
         0,
         pc_bytes);
@@ -2756,7 +2879,7 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
 
     const int64_t c2p_begin_us = ggml_time_us();
     ggml_backend_tensor_set(
-        phone_branch.input,
+        phone_branch->input,
         residual.data() +
             (size_t) pc_tokens * n_embd,
         0,
@@ -2775,7 +2898,7 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
         const int64_t begin_us = ggml_time_us();
         pc_status =
             ggml_backend_graph_compute(
-                pc_backend, pc_branch.graph);
+                pc_backend, pc_branch->graph);
         ggml_backend_synchronize(pc_backend);
         pc_ffn_us = ggml_time_us() - begin_us;
     });
@@ -2783,7 +2906,7 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
         const int64_t begin_us = ggml_time_us();
         phone_status =
             ggml_backend_graph_compute(
-                phone_backend, phone_branch.graph);
+                phone_backend, phone_branch->graph);
         ggml_backend_synchronize(phone_backend);
         phone_ffn_us = ggml_time_us() - begin_us;
     });
@@ -2805,9 +2928,14 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
         return nullptr;
     }
 
+    // Join is direct placement into the final host output:
+    // PC fills the prefix and Phone fills the suffix. There is no arithmetic
+    // reduce and no extra host concat copy.
+    const int64_t join_begin_us = ggml_time_us();
+
     const int64_t pc_get_begin_us = ggml_time_us();
     ggml_backend_tensor_get(
-        pc_branch.output,
+        pc_branch->output,
         stage_output,
         0,
         pc_bytes);
@@ -2816,7 +2944,7 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
 
     const int64_t p2c_begin_us = ggml_time_us();
     ggml_backend_tensor_get(
-        phone_branch.output,
+        phone_branch->output,
         stage_output +
             (size_t) pc_tokens * n_embd,
         0,
@@ -2824,25 +2952,67 @@ llm_graph_result * llama_context::run_sequence_ffn_stage(
     ggml_backend_synchronize(phone_backend);
     const int64_t p2c_us =
         ggml_time_us() - p2c_begin_us;
+    const int64_t join_wall_us =
+        ggml_time_us() - join_begin_us;
+
+    const int64_t total_us =
+        ggml_time_us() - total_begin_us;
+    const int64_t remote_branch_us =
+        c2p_us + phone_ffn_us + p2c_us;
+    const int64_t pc_branch_us =
+        pc_stage_us + pc_ffn_us + pc_get_us;
+    const int64_t overlap_saved_us =
+        std::max<int64_t>(
+            0, pc_ffn_us + phone_ffn_us - overlap_us);
+
+    if (timing != nullptr) {
+        timing->total_us = total_us;
+        timing->pc_stage_us = pc_stage_us;
+        timing->c2p_us = c2p_us;
+        timing->pc_ffn_us = pc_ffn_us;
+        timing->phone_ffn_us = phone_ffn_us;
+        timing->ffn_overlap_us = overlap_us;
+        timing->pc_get_us = pc_get_us;
+        timing->p2c_us = p2c_us;
+        timing->join_wall_us = join_wall_us;
+    }
 
     LLAMA_LOG_ERROR(
         "[SEQ_FFN_EXEC] layer=%d block=%zu tokens=%u "
         "pc_tokens=%d phone_tokens=%d "
+        "pc_cache=%s phone_cache=%s cache_lookup_ms=%.3f "
+        "pc_build_ms=%.3f pc_alloc_ms=%.3f "
+        "phone_build_ms=%.3f phone_alloc_ms=%.3f "
         "attn_ms=%.3f pc_stage_ms=%.3f c2p_ms=%.3f "
         "pc_ffn_ms=%.3f phone_ffn_ms=%.3f "
-        "ffn_overlap_wall_ms=%.3f pc_get_ms=%.3f "
-        "p2c_ms=%.3f c2p_bytes=%zu p2c_bytes=%zu "
-        "join=TOKEN_CONCAT reduce=0 causal_wavefront=0 status=OK\n",
+        "ffn_overlap_wall_ms=%.3f overlap_saved_ms=%.3f "
+        "pc_get_ms=%.3f p2c_ms=%.3f join_wall_ms=%.3f "
+        "pc_branch_ms=%.3f remote_branch_ms=%.3f total_ms=%.3f "
+        "c2p_bytes=%zu p2c_bytes=%zu "
+        "join=TOKEN_DIRECT_PLACE reduce=0 causal_wavefront=0 status=OK\n",
         stage.layer_begin, block_index, block_tokens,
         pc_tokens, phone_tokens,
+        pc_hits > 0 ? "HIT" : "MISS",
+        phone_hits > 0 ? "HIT" : "MISS",
+        timing != nullptr ?
+            timing->cache_lookup_us / 1000.0 : 0.0,
+        pc_build_us / 1000.0,
+        pc_alloc_us / 1000.0,
+        phone_build_us / 1000.0,
+        phone_alloc_us / 1000.0,
         attn_us / 1000.0,
         pc_stage_us / 1000.0,
         c2p_us / 1000.0,
         pc_ffn_us / 1000.0,
         phone_ffn_us / 1000.0,
         overlap_us / 1000.0,
+        overlap_saved_us / 1000.0,
         pc_get_us / 1000.0,
         p2c_us / 1000.0,
+        join_wall_us / 1000.0,
+        pc_branch_us / 1000.0,
+        remote_branch_us / 1000.0,
+        total_us / 1000.0,
         phone_bytes, phone_bytes);
 
     ret = GGML_STATUS_SUCCESS;
