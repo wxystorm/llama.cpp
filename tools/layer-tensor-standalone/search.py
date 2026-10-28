@@ -380,6 +380,112 @@ def print_summary(summary):
         )
 
 
+def run_preflight(args, chunk_sizes, ratios, first_owners):
+    print("=== numerical preflight (L=1) ===")
+
+    references = {}
+    for xt in chunk_sizes:
+        ref_candidate = {
+            "mode": "layer",
+            "layers": 1,
+            "xt": xt,
+            "owners": "pc",
+        }
+        ref = run_once(args, ref_candidate, -1)
+        if not ref.get("ok"):
+            print(
+                f"PRECHECK FAIL: Layer reference XT={xt} did not run",
+                file=sys.stderr,
+            )
+            return False
+        references[xt] = ref
+        print(
+            f"  REF XT={xt} checksum={ref['checksum']:.9f} "
+            f"wall={ref['wall_ms']:.3f} ms"
+        )
+
+        for first_owner in first_owners:
+            for ratio in ratios:
+                candidate = {
+                    "mode": "tensor",
+                    "layers": 1,
+                    "xt": xt,
+                    "first_owner": first_owner,
+                    "ratio": ratio,
+                }
+                run = run_once(args, candidate, -1)
+                if not run.get("ok"):
+                    print(
+                        f"PRECHECK FAIL: Tensor XT={xt} "
+                        f"first={first_owner} ratio={ratio:.6f} "
+                        "did not run",
+                        file=sys.stderr,
+                    )
+                    return False
+
+                rel = checksum_rel(
+                    ref["checksum"],
+                    run["checksum"],
+                )
+                status = (
+                    "PASS"
+                    if rel <= args.checksum_rel_tol
+                    else "FAIL"
+                )
+                print(
+                    f"  TENSOR XT={xt} first={first_owner} "
+                    f"ratio={ratio:.6f} checksum={run['checksum']:.9f} "
+                    f"rel={rel:.6g} {status}"
+                )
+                if status != "PASS":
+                    print(
+                        "PRECHECK ABORT: Tensor split is not numerically "
+                        "aligned with the full-layer reference; performance "
+                        "ranking would be invalid.",
+                        file=sys.stderr,
+                    )
+                    return False
+
+    return True
+
+
+def run_warmup(args, chunk_sizes, ratios, first_owners):
+    print("=== unmeasured OpenCL warmup ===")
+
+    for xt in chunk_sizes:
+        # Exercise a Phone full-layer graph.
+        layer = {
+            "mode": "layer",
+            "layers": 2,
+            "xt": xt,
+            "owners": "pc,phone",
+        }
+        run = run_once(args, layer, -2)
+        print(
+            f"  LAYER XT={xt} "
+            f"{'PASS' if run.get('ok') else 'WARN'}"
+        )
+
+        # Exercise each distinct Tensor shard width / direction used by the
+        # actual search so the first measured candidate does not pay lazy
+        # OpenCL kernel compilation.
+        for first_owner in first_owners:
+            for ratio in ratios:
+                tensor = {
+                    "mode": "tensor",
+                    "layers": 2,
+                    "xt": xt,
+                    "first_owner": first_owner,
+                    "ratio": ratio,
+                }
+                run = run_once(args, tensor, -2)
+                print(
+                    f"  TENSOR XT={xt} first={first_owner} "
+                    f"ratio={ratio:.6f} "
+                    f"{'PASS' if run.get('ok') else 'WARN'}"
+                )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -404,8 +510,12 @@ def main():
     )
     parser.add_argument(
         "--tensor-ratios",
-        default="0.20,0.33,0.50,0.67,0.80",
-        help="same physical PC FFN ratio used in C2P/P2C",
+        default="0.333333,0.666667",
+        help=(
+            "physical PC FFN ratios. Qwen3-30B-A3B Q4_K_M/q6_K "
+            "has n_ff_exp=768 and 256-element shard granularity, so "
+            "the only non-empty distinct splits are 1/3 and 2/3"
+        ),
     )
     parser.add_argument(
         "--tensor-first-owners",
@@ -455,6 +565,16 @@ def main():
     parser.add_argument("--connect-retry-delay", type=float, default=0.25)
     parser.add_argument("--settle-delay", type=float, default=0.10)
     parser.add_argument("--checksum-rel-tol", type=float, default=5e-3)
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help="skip L=1 numerical split validation",
+    )
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="skip unmeasured OpenCL kernel warmup sessions",
+    )
 
     parser.add_argument(
         "--output-prefix",
@@ -479,6 +599,21 @@ def main():
         parser.error("--top-k must be > 0")
     if any(x not in ("pc", "phone") for x in first_owners):
         parser.error("--tensor-first-owners accepts only pc,phone")
+
+    if not args.dry_run and not args.skip_preflight:
+        if not run_preflight(
+                args,
+                chunk_sizes,
+                ratios,
+                first_owners):
+            return 3
+
+    if not args.dry_run and not args.skip_warmup:
+        run_warmup(
+            args,
+            chunk_sizes,
+            ratios,
+            first_owners)
 
     candidates = []
 
