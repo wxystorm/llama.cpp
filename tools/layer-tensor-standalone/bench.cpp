@@ -2,6 +2,7 @@
 #include "lt-runtime.h"
 #include "lt-tcp.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
