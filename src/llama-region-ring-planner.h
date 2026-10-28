@@ -397,14 +397,14 @@ inline bool simulate(const model & m,
             if (m.prepare_ms) {
                 const int layers =
                     regions[r].layer_end - regions[r].layer_begin;
-                const int prefetch_tokens =
+                const int refill_tokens =
                     std::min(m.tokens, std::max(1, c.xg));
-                const int prefetch_kv =
-                    m.kv_start + prefetch_tokens;
+                const int refill_kv =
+                    m.kv_start + refill_tokens;
                 double prepare_ms = 0.0;
                 if (!m.prepare_ms(
-                        device::GPU, layers, prefetch_tokens,
-                        prefetch_kv, prepare_ms) ||
+                        device::GPU, layers, refill_tokens,
+                        refill_kv, prepare_ms) ||
                     !std::isfinite(prepare_ms) ||
                     prepare_ms < 0.0) {
                     return reject("WEIGHT_PREPARE_PROFILE_MISSING");
@@ -425,7 +425,7 @@ inline bool simulate(const model & m,
     std::deque<int> weight_queue;
     bool weight_busy = false;
     // A single shared PREPARE lane approximates region graph/split setup and
-    // the dedicated weight-prefetch worker's graph preparation. The lane is
+    // the single Bank mover's Region binding. The lane is
     // independent from CPU/CUDA/Phone compute.
     double prepare_available_ms = 0.0;
     double prepare_busy_ms = 0.0;
@@ -529,7 +529,7 @@ inline bool simulate(const model & m,
             weight_prepare_busy_ms += weight_prepare;
 
             // H2D uses its own transfer backend/stream. The single dedicated
-            // prefetch worker still serializes weight jobs end-to-end.
+            // single Bank mover serializes refill jobs end-to-end.
             gpu_weight_start_ms[(size_t) r] = prepare_end;
             const double ms = gpu_weight_load_ms[(size_t) r];
             weight_h2d_busy_ms += ms;
