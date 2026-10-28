@@ -171,8 +171,9 @@ inline bool gpu_weight_bank_peaks(
                 bytes == 0) {
             return false;
         }
-        peaks[gpu_ordinal & 1] =
-            std::max(peaks[gpu_ordinal & 1], bytes);
+        const size_t bank =
+            llama_region_ring_gpu_weight_bank_for_rank(gpu_ordinal);
+        peaks[bank] = std::max(peaks[bank], bytes);
         if (total_bytes) {
             if (bytes > std::numeric_limits<size_t>::max() - *total_bytes) {
                 return false;
@@ -706,10 +707,12 @@ inline bool simulate(const model & m,
                     if (rank < 0) {
                         return reject("GPU_RANK_MISSING");
                     }
-                    const int next_rank = rank + 2;
-                    if (next_rank < (int) gpu_regions.size()) {
+                    const auto next_rank =
+                        llama_region_ring_gpu_weight_next_rank(
+                            (size_t) rank, gpu_regions.size());
+                    if (next_rank.has_value()) {
                         const int next_region =
-                            gpu_regions[(size_t) next_rank];
+                            gpu_regions[*next_rank];
                         if (!gpu_weight_enqueued[
                                 (size_t) next_region]) {
                             gpu_weight_enqueued[
