@@ -5,6 +5,7 @@
 #include "llama.h"
 #include "llama-hybrid.h"
 #include "llama-model.h"
+#include "llama-model-loader.h"
 
 #include <algorithm>
 #include <atomic>
@@ -266,6 +267,21 @@ struct ggml_compute::impl {
     ggml_tensor * activation_root = nullptr;
     std::vector<ggml_tensor *> activation_chunks;
 
+    struct materialized_ffn_shard {
+        ggml_tensor * gate = nullptr;
+        ggml_tensor * up = nullptr;
+        ggml_tensor * down = nullptr;
+        int64_t begin = 0;
+        int64_t width = 0;
+    };
+
+    // OpenCL cannot safely execute Q4_K/Q6_K MoE sub-views because its
+    // quantized weights are backend-repacked. Materialize the Phone shard as
+    // independent backend tensors so the repack is built for the shard shape.
+    ggml_context * phone_shard_ctx = nullptr;
+    ggml_backend_buffer_t phone_shard_buffer = nullptr;
+    std::vector<materialized_ffn_shard> phone_shards;
+
     int32_t total_tokens = 0;
     int32_t n_embd = 0;
     int32_t n_expert = 0;
@@ -283,6 +299,15 @@ struct ggml_compute::impl {
     ~impl() {
         owner_cache.clear();
         remote_cache.clear();
+
+        if (phone_shard_buffer != nullptr) {
+            ggml_backend_buffer_free(phone_shard_buffer);
+            phone_shard_buffer = nullptr;
+        }
+        if (phone_shard_ctx != nullptr) {
+            ggml_free(phone_shard_ctx);
+            phone_shard_ctx = nullptr;
+        }
 
         if (activation_buffer != nullptr) {
             ggml_backend_buffer_free(activation_buffer);
@@ -310,6 +335,357 @@ struct ggml_compute::impl {
             llama_model_free(model);
             model = nullptr;
         }
+    }
+
+
+    bool read_gate_up_shard(
+            llama_model_loader & loader,
+            const ggml_tensor * source,
+            ggml_tensor * dest,
+            int64_t begin,
+            std::string & error) {
+        if (source == nullptr ||
+            dest == nullptr ||
+            source->type != dest->type ||
+            source->ne[0] != dest->ne[0] ||
+            source->ne[2] != dest->ne[2] ||
+            begin < 0 ||
+            begin + dest->ne[1] > source->ne[1]) {
+            error = "invalid gate/up shard materialization shape";
+            return false;
+        }
+
+        const size_t dst_bytes =
+            ggml_nbytes(dest);
+        std::vector<uint8_t> packed(dst_bytes);
+
+        const size_t copy_bytes =
+            static_cast<size_t>(dest->ne[1]) *
+            source->nb[1];
+
+        for (int64_t expert = 0;
+             expert < source->ne[2];
+             ++expert) {
+            const size_t src_off =
+                static_cast<size_t>(expert) *
+                    source->nb[2] +
+                static_cast<size_t>(begin) *
+                    source->nb[1];
+            const size_t dst_off =
+                static_cast<size_t>(expert) *
+                    dest->nb[2];
+
+            if (dst_off > packed.size() ||
+                copy_bytes > packed.size() - dst_off ||
+                !loader.read_local_tensor(
+                    source->name,
+                    packed.data() + dst_off,
+                    src_off,
+                    copy_bytes)) {
+                error =
+                    std::string("failed to read gate/up shard from GGUF: ") +
+                    source->name;
+                return false;
+            }
+        }
+
+        ggml_backend_tensor_set(
+            dest,
+            packed.data(),
+            0,
+            packed.size());
+        return true;
+    }
+
+    bool read_down_shard(
+            llama_model_loader & loader,
+            const ggml_tensor * source,
+            ggml_tensor * dest,
+            int64_t begin,
+            std::string & error) {
+        if (source == nullptr ||
+            dest == nullptr ||
+            source->type != dest->type ||
+            source->ne[1] != dest->ne[1] ||
+            source->ne[2] != dest->ne[2] ||
+            begin < 0 ||
+            begin + dest->ne[0] > source->ne[0]) {
+            error = "invalid down shard materialization shape";
+            return false;
+        }
+
+        const int64_t block =
+            ggml_blck_size(source->type);
+        if (block <= 0 ||
+            begin % block != 0 ||
+            dest->ne[0] % block != 0) {
+            error = "down shard is not quantization-block aligned";
+            return false;
+        }
+
+        const size_t src_dim0_off =
+            quantized_dim0_offset(
+                source,
+                begin);
+        const size_t row_copy_bytes =
+            dest->nb[1];
+
+        std::vector<uint8_t> packed(
+            ggml_nbytes(dest));
+        std::vector<uint8_t> expert_src(
+            source->nb[2]);
+
+        for (int64_t expert = 0;
+             expert < source->ne[2];
+             ++expert) {
+            const size_t expert_src_off =
+                static_cast<size_t>(expert) *
+                source->nb[2];
+
+            if (!loader.read_local_tensor(
+                    source->name,
+                    expert_src.data(),
+                    expert_src_off,
+                    expert_src.size())) {
+                error =
+                    std::string("failed to read down expert from GGUF: ") +
+                    source->name;
+                return false;
+            }
+
+            for (int64_t row = 0;
+                 row < source->ne[1];
+                 ++row) {
+                const size_t src_off =
+                    static_cast<size_t>(row) *
+                        source->nb[1] +
+                    src_dim0_off;
+                const size_t dst_off =
+                    static_cast<size_t>(expert) *
+                        dest->nb[2] +
+                    static_cast<size_t>(row) *
+                        dest->nb[1];
+
+                if (src_off > expert_src.size() ||
+                    row_copy_bytes >
+                        expert_src.size() - src_off ||
+                    dst_off > packed.size() ||
+                    row_copy_bytes >
+                        packed.size() - dst_off) {
+                    error = "down shard packing range is invalid";
+                    return false;
+                }
+
+                std::memcpy(
+                    packed.data() + dst_off,
+                    expert_src.data() + src_off,
+                    row_copy_bytes);
+            }
+        }
+
+        ggml_backend_tensor_set(
+            dest,
+            packed.data(),
+            0,
+            packed.size());
+        return true;
+    }
+
+    bool initialize_phone_shards(
+            std::string & error) {
+        const auto device_type =
+            ggml_backend_dev_type(device);
+
+        if (config.local_side != side::phone ||
+            config.runtime_plan.execution_mode != mode::tensor ||
+            device_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return true;
+        }
+
+        const size_t layer_count =
+            static_cast<size_t>(
+                config.runtime_plan.layers);
+
+        ggml_init_params shard_params {};
+        shard_params.mem_size =
+            (layer_count * 3 + 32) *
+            ggml_tensor_overhead();
+        shard_params.mem_buffer = nullptr;
+        shard_params.no_alloc = true;
+
+        phone_shard_ctx =
+            ggml_init(shard_params);
+        if (phone_shard_ctx == nullptr) {
+            error =
+                "failed to create Phone FFN shard context";
+            return false;
+        }
+
+        phone_shards.resize(layer_count);
+
+        for (int il = 0;
+             il < config.runtime_plan.layers;
+             ++il) {
+            const key task { il, 0 };
+            int64_t begin = 0;
+            int64_t width = 0;
+
+            if (!shard_for_side(
+                    task,
+                    side::phone,
+                    begin,
+                    width,
+                    error)) {
+                return false;
+            }
+
+            const llama_layer & layer =
+                model->layers[
+                    static_cast<size_t>(il)];
+
+            materialized_ffn_shard & shard =
+                phone_shards[
+                    static_cast<size_t>(il)];
+            shard.begin = begin;
+            shard.width = width;
+
+            shard.gate =
+                ggml_new_tensor_3d(
+                    phone_shard_ctx,
+                    layer.ffn_gate_exps->type,
+                    layer.ffn_gate_exps->ne[0],
+                    width,
+                    layer.ffn_gate_exps->ne[2]);
+            shard.up =
+                ggml_new_tensor_3d(
+                    phone_shard_ctx,
+                    layer.ffn_up_exps->type,
+                    layer.ffn_up_exps->ne[0],
+                    width,
+                    layer.ffn_up_exps->ne[2]);
+            shard.down =
+                ggml_new_tensor_3d(
+                    phone_shard_ctx,
+                    layer.ffn_down_exps->type,
+                    width,
+                    layer.ffn_down_exps->ne[1],
+                    layer.ffn_down_exps->ne[2]);
+
+            if (shard.gate == nullptr ||
+                shard.up == nullptr ||
+                shard.down == nullptr) {
+                error =
+                    "failed to create Phone FFN shard tensors";
+                return false;
+            }
+
+            char name[GGML_MAX_NAME];
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.phone.blk.%d.ffn_gate_exps.shard",
+                il);
+            ggml_set_name(shard.gate, name);
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.phone.blk.%d.ffn_up_exps.shard",
+                il);
+            ggml_set_name(shard.up, name);
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.phone.blk.%d.ffn_down_exps.shard",
+                il);
+            ggml_set_name(shard.down, name);
+        }
+
+        phone_shard_buffer =
+            ggml_backend_alloc_ctx_tensors(
+                phone_shard_ctx,
+                backend);
+        if (phone_shard_buffer == nullptr) {
+            error =
+                "failed to allocate Phone FFN shard buffer";
+            return false;
+        }
+
+        try {
+            std::vector<std::string> splits;
+            llama_model_loader loader(
+                nullptr,
+                nullptr,
+                nullptr,
+                config.model_path,
+                splits,
+                nullptr,
+                false,
+                false,
+                false,
+                true,
+                nullptr,
+                nullptr);
+
+            for (int il = 0;
+                 il < config.runtime_plan.layers;
+                 ++il) {
+                const llama_layer & layer =
+                    model->layers[
+                        static_cast<size_t>(il)];
+                materialized_ffn_shard & shard =
+                    phone_shards[
+                        static_cast<size_t>(il)];
+
+                if (!read_gate_up_shard(
+                        loader,
+                        layer.ffn_gate_exps,
+                        shard.gate,
+                        shard.begin,
+                        error) ||
+                    !read_gate_up_shard(
+                        loader,
+                        layer.ffn_up_exps,
+                        shard.up,
+                        shard.begin,
+                        error) ||
+                    !read_down_shard(
+                        loader,
+                        layer.ffn_down_exps,
+                        shard.down,
+                        shard.begin,
+                        error)) {
+                    return false;
+                }
+
+                std::fprintf(
+                    stderr,
+                    "[LT_GGML_PHONE_SHARD] layer=%d begin=%lld width=%lld "
+                    "gate=%.3fMiB up=%.3fMiB down=%.3fMiB "
+                    "buffer=%s status=READY\n",
+                    il,
+                    static_cast<long long>(shard.begin),
+                    static_cast<long long>(shard.width),
+                    static_cast<double>(
+                        ggml_nbytes(shard.gate)) /
+                        (1024.0 * 1024.0),
+                    static_cast<double>(
+                        ggml_nbytes(shard.up)) /
+                        (1024.0 * 1024.0),
+                    static_cast<double>(
+                        ggml_nbytes(shard.down)) /
+                        (1024.0 * 1024.0),
+                    ggml_backend_buffer_name(
+                        phone_shard_buffer));
+            }
+        } catch (const std::exception & ex) {
+            error =
+                std::string("Phone FFN shard GGUF load failed: ") +
+                ex.what();
+            return false;
+        }
+
+        ggml_backend_synchronize(backend);
+        return true;
     }
 
     bool initialize(std::string & error) {
@@ -497,6 +873,10 @@ struct ggml_compute::impl {
                             static_cast<double>(n_ff_exp));
                 }
             }
+        }
+
+        if (!initialize_phone_shards(error)) {
+            return false;
         }
 
         if (device_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
