@@ -17,17 +17,19 @@ struct options {
     std::string device = "auto";
     int threads = 8;
     bool trace = false;
+    bool serve = false;
 };
 
 void usage(const char * argv0) {
     std::fprintf(
         stderr,
         "usage: %s --model MODEL.gguf "
-        "[--listen HOST:PORT] [--device NAME] [--trace]\n\n"
+        "[--listen HOST:PORT] [--device NAME] [--serve] [--trace]\n\n"
         "  --model PATH       Phone-local GGUF path\n"
         "  --listen HOST:PORT default 0.0.0.0:50061\n"
         "  --device NAME      GGML device; default auto selects first GPU/IGPU\n"
         "  --threads N        backend threads when supported (default 8)\n"
+        "  --serve            accept benchmark sessions repeatedly\n"
         "  --trace            print task transitions\n",
         argv0);
 }
@@ -43,6 +45,8 @@ bool parse_options(
 
         if (arg == "--trace") {
             opts.trace = true;
+        } else if (arg == "--serve") {
+            opts.serve = true;
         } else if (arg == "--listen") {
             if (i + 1 >= argc) {
                 return false;
@@ -86,21 +90,9 @@ bool parse_options(
     return !opts.model_path.empty();
 }
 
-} // namespace
-
-int main(
-        int argc,
-        char ** argv) {
-    options opts;
-
-    if (!parse_options(
-            argc,
-            argv,
-            opts)) {
-        usage(argv[0]);
-        return 2;
-    }
-
+int run_session(
+        const options & opts,
+        uint64_t session_id) {
     auto channel =
         std::make_shared<lt::tcp_channel>();
 
@@ -108,7 +100,8 @@ int main(
 
     std::fprintf(
         stderr,
-        "[LT_WORKER] event=LISTEN endpoint=%s\n",
+        "[LT_WORKER] event=LISTEN session=%llu endpoint=%s\n",
+        static_cast<unsigned long long>(session_id),
         opts.listen_endpoint.c_str());
 
     if (!channel->listen_and_accept(
@@ -116,7 +109,9 @@ int main(
             error)) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] event=LISTEN status=FAIL reason=%s\n",
+            "[LT_WORKER] event=LISTEN session=%llu "
+            "status=FAIL reason=%s\n",
+            static_cast<unsigned long long>(session_id),
             error.c_str());
         return 3;
     }
@@ -127,15 +122,18 @@ int main(
             runtime_plan)) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] event=PLAN status=FAIL\n");
+            "[LT_WORKER] event=PLAN session=%llu status=FAIL\n",
+            static_cast<unsigned long long>(session_id));
         return 4;
     }
 
     std::fprintf(
         stderr,
-        "[LT_WORKER] event=PLAN status=READY "
+        "[LT_WORKER] event=PLAN session=%llu status=READY "
         "mode=%s layers=%d chunks=%zu first_owner=%s "
-        "c2p_pc_ratio=%.6f p2c_pc_ratio=%.6f\n",
+        "c2p_pc_ratio=%.6f p2c_pc_ratio=%.6f "
+        "max_owner_ahead=%d\n",
+        static_cast<unsigned long long>(session_id),
         lt::mode_name(
             runtime_plan.execution_mode),
         runtime_plan.layers,
@@ -143,7 +141,8 @@ int main(
         lt::side_name(
             runtime_plan.owner_for_layer(0)),
         runtime_plan.c2p_pc_ratio,
-        runtime_plan.p2c_pc_ratio);
+        runtime_plan.p2c_pc_ratio,
+        runtime_plan.max_owner_ahead);
 
     lt::ggml_compute_config compute_config;
     compute_config.local_side =
@@ -167,7 +166,9 @@ int main(
     if (compute == nullptr) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] event=MODEL status=FAIL reason=%s\n",
+            "[LT_WORKER] event=MODEL session=%llu "
+            "status=FAIL reason=%s\n",
+            static_cast<unsigned long long>(session_id),
             error.c_str());
         return 5;
     }
@@ -186,7 +187,9 @@ int main(
     if (!phone.start()) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] event=RUNTIME status=FAIL reason=%s\n",
+            "[LT_WORKER] event=RUNTIME session=%llu "
+            "status=FAIL reason=%s\n",
+            static_cast<unsigned long long>(session_id),
             phone.failure_reason().c_str());
         return 6;
     }
@@ -199,15 +202,17 @@ int main(
             model_ready)) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] event=MODEL_READY status=FAIL\n");
+            "[LT_WORKER] event=MODEL_READY session=%llu status=FAIL\n",
+            static_cast<unsigned long long>(session_id));
         phone.stop();
         return 6;
     }
 
     std::fprintf(
         stderr,
-        "[LT_WORKER] event=MODEL_READY "
+        "[LT_WORKER] event=MODEL_READY session=%llu "
         "device=%s n_embd=%d layers=%d status=READY\n",
+        static_cast<unsigned long long>(session_id),
         compute->device_name(),
         compute->n_embd(),
         compute->n_layers());
@@ -229,8 +234,9 @@ int main(
             lt::message_kind::model_ready) {
             std::fprintf(
                 stderr,
-                "[LT_WORKER] status=FAIL "
-                "reason=UNEXPECTED_MODEL_READY\n");
+                "[LT_WORKER] session=%llu status=FAIL "
+                "reason=UNEXPECTED_MODEL_READY\n",
+                static_cast<unsigned long long>(session_id));
             break;
         }
 
@@ -243,6 +249,7 @@ int main(
     }
 
     phone.stop();
+    channel->close();
 
     const lt::stats stats =
         phone.snapshot_stats();
@@ -250,16 +257,18 @@ int main(
     if (phone.failed()) {
         std::fprintf(
             stderr,
-            "[LT_WORKER] status=FAIL reason=%s\n",
+            "[LT_WORKER] session=%llu status=FAIL reason=%s\n",
+            static_cast<unsigned long long>(session_id),
             phone.failure_reason().c_str());
         return 7;
     }
 
     std::fprintf(
         stderr,
-        "[LT_WORKER] status=%s "
+        "[LT_WORKER] session=%llu status=%s "
         "owner=%llu remote=%llu reduce=%llu full=%llu "
         "engine=GGML_REAL\n",
+        static_cast<unsigned long long>(session_id),
         received_stop ?
             "PASS" :
             "DISCONNECTED",
@@ -273,4 +282,42 @@ int main(
             stats.full_layer_tasks));
 
     return received_stop ? 0 : 8;
+}
+
+} // namespace
+
+int main(
+        int argc,
+        char ** argv) {
+    options opts;
+
+    if (!parse_options(
+            argc,
+            argv,
+            opts)) {
+        usage(argv[0]);
+        return 2;
+    }
+
+    uint64_t session_id = 1;
+
+    while (true) {
+        const int rc =
+            run_session(
+                opts,
+                session_id);
+
+        if (!opts.serve) {
+            return rc;
+        }
+
+        std::fprintf(
+            stderr,
+            "[LT_WORKER] event=SESSION_END session=%llu "
+            "rc=%d action=RELISTEN\n",
+            static_cast<unsigned long long>(session_id),
+            rc);
+
+        ++session_id;
+    }
 }
