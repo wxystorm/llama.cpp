@@ -9702,23 +9702,17 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false;
     }
 
+    // Load-time Bank binding is graph metadata only. init_full() is the
+    // canonical llama.cpp dummy memory context for graph construction; it has
+    // no applied ubatch and therefore must NOT be converted to a stage view.
     llama_memory_context_ptr full_mctx;
     if (memory) {
         full_mctx = memory->init_full();
     }
-    auto * kv_full =
-        dynamic_cast<llama_kv_cache_context *>(full_mctx.get());
-    if (!kv_full) {
+    if (memory && !full_mctx) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
-            "status=FAIL reason=KV_CONTEXT\n");
-        return false;
-    }
-    auto kv_view = kv_full->make_stage_view();
-    if (!kv_view) {
-        LLAMA_LOG_ERROR(
-            "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
-            "status=FAIL reason=KV_STAGE_VIEW\n");
+            "status=FAIL reason=FULL_MEMORY_CONTEXT\n");
         return false;
     }
 
@@ -9780,41 +9774,56 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             const size_t bank_index =
                 llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
 
-            if (!kv_view->set_stage_range(0, 0, load_tokens)) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
-                    "rank=%zu region=%zu bank=%c status=FAIL "
-                    "reason=KV_STAGE_RANGE\n",
-                    gpu_rank, region, bank_index == 0 ? 'A' : 'B');
-                return false;
-            }
-
             ggml_status status = GGML_STATUS_SUCCESS;
             const int64_t prepare_begin_us = ggml_time_us();
-            llm_graph_result * result = nullptr;
+            llm_graph_result * result = bank.res.get();
             {
                 std::unique_lock<std::mutex> prepare_gate(
                     region_ring_prepare_mutex);
                 ggml_backend_sched_synchronize(bank.sched.get());
-                bank.res->reset();
+                result->reset();
                 ggml_backend_sched_reset(bank.sched.get());
                 ggml_backend_sched_set_weight_cache(
                     bank.sched.get(), true);
+                ggml_backend_sched_set_eval_callback(
+                    bank.sched.get(),
+                    cparams.cb_eval,
+                    cparams.cb_eval_user_data);
                 bank.bank_ready = false;
-                result = prepare_ubatch(
-                    bank.res.get(), bank.sched.get(),
+
+                auto gparams = graph_params(
+                    result,
                     load_ubatch,
+                    full_mctx.get(),
                     ctx_type_to_graph_type(cparams.ctx_type),
-                    kv_view.get(), status, false,
-                    &stage, 0, true, false, false);
+                    bank.sched.get(),
+                    0);
+
+                const int n_layer = model.hparams.n_layer();
+                GGML_ASSERT(stage.layer_begin >= 0);
+                GGML_ASSERT(stage.layer_begin < stage.layer_end);
+                GGML_ASSERT(stage.layer_end <= n_layer);
+                gparams.hybrid_layer_begin = stage.layer_begin;
+                gparams.hybrid_layer_end = stage.layer_end;
+                gparams.hybrid_hidden_input = true;
+                gparams.hybrid_output_head = false;
+                gparams.hybrid_wave_probe = stage.wave_probe;
+                gparams.hybrid_embedding_only = false;
+
+                ggml_cgraph * gf = model.build_graph(gparams);
+                if (!gf) {
+                    status = GGML_STATUS_FAILED;
+                } else if (!ggml_backend_sched_alloc_graph(
+                               bank.sched.get(), gf)) {
+                    status = GGML_STATUS_ALLOC_FAILED;
+                }
             }
             total_prepare_us += ggml_time_us() - prepare_begin_us;
-            if (!result || status != GGML_STATUS_SUCCESS) {
-                kv_view->clear_stage_range();
+            if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
                     "rank=%zu region=%zu bank=%c status=FAIL "
-                    "reason=GRAPH_PREPARE code=%d\n",
+                    "reason=GRAPH_BIND code=%d\n",
                     gpu_rank, region, bank_index == 0 ? 'A' : 'B',
                     (int) status);
                 return false;
@@ -9823,14 +9832,12 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             const int n_splits =
                 ggml_backend_sched_get_n_splits(bank.sched.get());
             if (n_splits <= 0) {
-                kv_view->clear_stage_range();
                 return false;
             }
             for (int split = 0; split < n_splits; ++split) {
                 if (ggml_backend_sched_get_split_backend(
                         bank.sched.get(), split) != backend_ptrs[1]) {
-                    kv_view->clear_stage_range();
-                    LLAMA_LOG_ERROR(
+                        LLAMA_LOG_ERROR(
                         "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
                         "rank=%zu region=%zu bank=%c status=FAIL "
                         "reason=NON_CUDA_SPLIT split=%d/%d\n",
@@ -9861,7 +9868,6 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             ggml_backend_synchronize(
                 region_ring_cuda_transfer_backend.get());
             total_h2d_us += ggml_time_us() - h2d_begin_us;
-            kv_view->clear_stage_range();
 
             if (status != GGML_STATUS_SUCCESS) {
                 LLAMA_LOG_ERROR(
