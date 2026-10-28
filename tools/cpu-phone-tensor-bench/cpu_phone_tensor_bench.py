@@ -900,6 +900,8 @@ def main() -> int:
             f"tensor={best_tensor.policy} "
             f"R={best_tensor.c2p_ratio:.3f}/{best_tensor.p2c_ratio:.3f} "
             f"XT={best_tensor.tensor_chunk} {best_tensor.prompt_ms:.3f}ms "
+            f"WF={best_tensor.wavefront_overlap_boundaries}/"
+            f"{best_tensor.wavefront_ahead_attn} "
             f"speedup={speedup:.4f} winner={winner}"
         )
 
@@ -914,6 +916,8 @@ def main() -> int:
             f"x={row['x_layers']:>2} "
             f"layer={row['layer_prompt_ms']:.3f}ms "
             f"tensor={row['tensor_prompt_ms']:.3f}ms "
+            f"WF={row['tensor_wavefront_overlap_boundaries']}/"
+            f"{row['tensor_wavefront_ahead_attn']} "
             f"speedup={row['tensor_speedup_vs_layer']:.4f} "
             f"winner={row['winner']}"
         )
