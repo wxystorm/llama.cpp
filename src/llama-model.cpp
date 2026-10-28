@@ -2485,7 +2485,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
-    ml.done_getting_tensors();
+    const bool experiment_truncated =
+        std::getenv("LLAMA_HYBRID_EXPERIMENT_N_LAYERS") != nullptr;
+    ml.done_getting_tensors(experiment_truncated);
+    if (experiment_truncated) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_EXPERIMENT_TENSOR_LOAD] active_layers=%d "
+            "mode=PARTIAL_GGUF status=ACCEPTED\n",
+            n_layer_all);
+    }
 
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
