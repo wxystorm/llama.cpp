@@ -57,6 +57,41 @@ static void test_layout() {
 }
 
 
+static void test_adaptive_default_layouts() {
+    const auto legacy48 = llama_region_ring_default_regions(48);
+    check(llama_region_ring_layout_string(legacy48) ==
+              "G4,C7,P5,G4,C7,P5,G3,C8,P5",
+          "48-layer legacy baseline changed");
+
+    struct expected_layout {
+        int layers;
+        const char * text;
+    };
+    const std::array<expected_layout, 5> dense = {{
+        {16, "G1,C1,P2,G1,C1,P2,G1,C1,P2,G1,C1,P2"},
+        {28, "G2,C3,P2,G2,C3,P2,G2,C3,P2,G2,C3,P2"},
+        {32, "G2,C3,P3,G2,C3,P3,G2,C3,P3,G2,C3,P3"},
+        {40, "G2,C5,P3,G2,C5,P3,G2,C5,P3,G2,C5,P3"},
+        {64, "G4,C7,P5,G4,C7,P5,G4,C7,P5,G4,C7,P5"},
+    }};
+
+    for (const auto & item : dense) {
+        const auto regions =
+            llama_region_ring_default_regions(item.layers);
+        check(llama_region_ring_apply_topology_compatible(
+                  regions, item.layers),
+              "adaptive Dense baseline is not topology-compatible");
+        check(regions.front().layer_begin == 0 &&
+                  regions.back().layer_end == item.layers,
+              "adaptive Dense baseline does not cover all layers");
+        check(regions.back().device ==
+                  llama_region_ring_device::PHONE,
+              "adaptive Dense baseline must end on Phone");
+        check(llama_region_ring_layout_string(regions) == item.text,
+              "adaptive Dense baseline changed unexpectedly");
+    }
+}
+
 static void test_general_topology() {
     const auto two_cycle_tail = llama_region_ring_parse(
         "G4,C6,P8,G4,C6,P8,G4,C8",48,true);
@@ -774,6 +809,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_adaptive_default_layouts();
+        std::fprintf(stderr, "[REGION_RING_TEST] adaptive_default_layouts=PASS\n");
         test_general_topology();
         std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
         test_apply_safe_compatibility();
