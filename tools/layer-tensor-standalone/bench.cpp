@@ -1629,25 +1629,49 @@ int run_sequence_ffn_bench(
             2,
             opts.stream_repeats);
 
+    const int network_batch_repeats =
+        std::max(
+            32,
+            opts.stream_repeats);
+
     auto measure_c2p =
         [&](const std::vector<float> & payload,
             double & ms) -> bool {
-            double total = 0.0;
-
-            auto once =
-                [&](bool measured) -> bool {
-                    lt::message ping;
-                    ping.kind =
-                        lt::message_kind::bench_ping;
-                    ping.task = { 0, 0 };
-                    ping.hidden =
+            auto run_batch =
+                [&](int repeats,
+                    bool measured,
+                    double & elapsed_ms) -> bool {
+                    lt::message data;
+                    data.kind =
+                        lt::message_kind::bench_push_data;
+                    data.task = { 0, 0 };
+                    data.hidden =
                         payload;
 
                     const auto begin =
                         std::chrono::steady_clock::now();
 
+                    for (int i = 0;
+                         i < repeats;
+                         ++i) {
+                        data.seq =
+                            static_cast<uint64_t>(i);
+                        if (!channel->send_message(
+                                data)) {
+                            return false;
+                        }
+                    }
+
+                    lt::message done;
+                    done.kind =
+                        lt::message_kind::bench_push_done;
+                    done.task = { 0, 0 };
+                    done.seq =
+                        static_cast<uint64_t>(
+                            repeats);
+
                     if (!channel->send_message(
-                            ping)) {
+                            done)) {
                         return false;
                     }
 
@@ -1655,7 +1679,11 @@ int run_sequence_ffn_bench(
                     if (!channel->recv_message(
                             pong) ||
                         pong.kind !=
-                            lt::message_kind::bench_pong) {
+                            lt::message_kind::bench_pong ||
+                        pong.partial.empty() ||
+                        static_cast<int>(
+                            pong.partial[0]) !=
+                            repeats) {
                         return false;
                     }
 
@@ -1663,7 +1691,7 @@ int run_sequence_ffn_bench(
                         std::chrono::steady_clock::now();
 
                     if (measured) {
-                        total +=
+                        elapsed_ms =
                             std::chrono::duration<
                                 double,
                                 std::milli>(
@@ -1672,42 +1700,45 @@ int run_sequence_ffn_bench(
                     return true;
                 };
 
-            for (int i = 0;
-                 i < warmup;
-                 ++i) {
-                if (!once(false)) {
-                    return false;
-                }
+            double ignored = 0.0;
+            if (!run_batch(
+                    4,
+                    false,
+                    ignored)) {
+                return false;
             }
-            for (int i = 0;
-                 i < opts.stream_repeats;
-                 ++i) {
-                if (!once(true)) {
-                    return false;
-                }
+
+            double elapsed_ms = 0.0;
+            if (!run_batch(
+                    network_batch_repeats,
+                    true,
+                    elapsed_ms)) {
+                return false;
             }
 
             ms =
-                total /
+                elapsed_ms /
                 static_cast<double>(
-                    opts.stream_repeats);
+                    network_batch_repeats);
             return true;
         };
 
     auto measure_p2c =
         [&](size_t float_count,
             double & ms) -> bool {
-            double total = 0.0;
-
-            auto once =
-                [&](bool measured) -> bool {
+            auto run_batch =
+                [&](int repeats,
+                    bool measured,
+                    double & elapsed_ms) -> bool {
                     lt::message request;
                     request.kind =
-                        lt::message_kind::bench_pull;
+                        lt::message_kind::bench_pull_batch;
                     request.task = { 0, 0 };
                     request.partial = {
                         static_cast<float>(
-                            float_count)
+                            float_count),
+                        static_cast<float>(
+                            repeats),
                     };
 
                     const auto begin =
@@ -1718,21 +1749,28 @@ int run_sequence_ffn_bench(
                         return false;
                     }
 
-                    lt::message response;
-                    if (!channel->recv_message(
-                            response) ||
-                        response.kind !=
-                            lt::message_kind::bench_pull_result ||
-                        response.hidden.size() !=
-                            float_count) {
-                        return false;
+                    for (int i = 0;
+                         i < repeats;
+                         ++i) {
+                        lt::message response;
+                        if (!channel->recv_message(
+                                response) ||
+                            response.kind !=
+                                lt::message_kind::bench_pull_result ||
+                            response.hidden.size() !=
+                                float_count ||
+                            response.seq !=
+                                static_cast<uint64_t>(
+                                    i)) {
+                            return false;
+                        }
                     }
 
                     const auto end =
                         std::chrono::steady_clock::now();
 
                     if (measured) {
-                        total +=
+                        elapsed_ms =
                             std::chrono::duration<
                                 double,
                                 std::milli>(
@@ -1741,25 +1779,26 @@ int run_sequence_ffn_bench(
                     return true;
                 };
 
-            for (int i = 0;
-                 i < warmup;
-                 ++i) {
-                if (!once(false)) {
-                    return false;
-                }
+            double ignored = 0.0;
+            if (!run_batch(
+                    4,
+                    false,
+                    ignored)) {
+                return false;
             }
-            for (int i = 0;
-                 i < opts.stream_repeats;
-                 ++i) {
-                if (!once(true)) {
-                    return false;
-                }
+
+            double elapsed_ms = 0.0;
+            if (!run_batch(
+                    network_batch_repeats,
+                    true,
+                    elapsed_ms)) {
+                return false;
             }
 
             ms =
-                total /
+                elapsed_ms /
                 static_cast<double>(
-                    opts.stream_repeats);
+                    network_batch_repeats);
             return true;
         };
 
@@ -1863,17 +1902,36 @@ int run_sequence_ffn_bench(
 
         std::printf(
             "[LT_SEQUENCE_FFN] pc_tokens=%d phone_tokens=%d "
+            "bytes_each=%zu net_batch=%d "
             "pc_ffn_ms=%.3f c2p_ms=%.3f "
             "phone_ffn_ms=%.3f p2c_ms=%.3f "
+            "c2p_mib_s=%.3f p2c_mib_s=%.3f "
             "remote_branch_ms=%.3f ideal_compute_ms=%.3f "
             "critical_ms=%.3f speedup_vs_pc_full=%.3fx "
             "phone_checksum=%.6f phone_l2=%.6f\n",
             pc_tokens,
             phone_tokens,
+            phone_residual.size() *
+                sizeof(float),
+            network_batch_repeats,
             pc_result.ffn_ms,
             c2p_ms,
             phone_result.ffn_ms,
             p2c_ms,
+            c2p_ms > 0.0 ?
+                (static_cast<double>(
+                    phone_residual.size() *
+                        sizeof(float)) /
+                    (1024.0 * 1024.0)) /
+                    (c2p_ms / 1000.0) :
+                0.0,
+            p2c_ms > 0.0 ?
+                (static_cast<double>(
+                    phone_residual.size() *
+                        sizeof(float)) /
+                    (1024.0 * 1024.0)) /
+                    (p2c_ms / 1000.0) :
+                0.0,
             remote_branch_ms,
             ideal_compute_ms,
             critical_ms,
