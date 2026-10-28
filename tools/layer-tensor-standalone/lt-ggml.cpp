@@ -270,11 +270,8 @@ struct ggml_compute::impl {
         owner_cache;
     std::unordered_map<key, std::shared_ptr<graph_hold>, key_hash>
         remote_cache;
-    std::unordered_map<key, std::shared_ptr<graph_hold>, key_hash>
-        input_cache;
 
     ~impl() {
-        input_cache.clear();
         owner_cache.clear();
         remote_cache.clear();
 
@@ -723,41 +720,34 @@ struct ggml_compute::impl {
             ggml_tensor *& host_input_tensor,
             std::shared_ptr<graph_hold> & cached_input,
             std::string & error) {
-        const int32_t tokens = chunk_tokens(task);
+        (void) cached_input;
+
+        const int32_t tokens =
+            chunk_tokens(task);
         if (tokens <= 0) {
             error = "invalid task chunk";
             return false;
         }
 
-        if (!host_input.empty()) {
-            if (!validate_hidden_size(
-                    task,
-                    host_input,
-                    error)) {
-                return false;
-            }
-
-            host_input_tensor =
-                ggml_new_tensor_2d(
-                    graph->ctx,
-                    GGML_TYPE_F32,
-                    n_embd,
-                    tokens);
-            input = host_input_tensor;
-            return true;
-        }
-
-        cached_input =
-            take_cache(input_cache, task);
-        if (cached_input == nullptr ||
-            cached_input->primary == nullptr) {
-            error =
-                "device-local input handle is missing";
+        if (!validate_hidden_size(
+                task,
+                host_input,
+                error)) {
             return false;
         }
 
-        input = cached_input->primary;
-        host_input_tensor = nullptr;
+        // OpenCL graph-local tensors carry backend-specific metadata.
+        // Reusing an activation allocated by a previous standalone graph
+        // as src0 of the next graph is not valid on Adreno OpenCL.
+        // Materialize cross-graph activations through host F32 until
+        // persistent activation slots are introduced.
+        host_input_tensor =
+            ggml_new_tensor_2d(
+                graph->ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                tokens);
+        input = host_input_tensor;
         return true;
     }
 
