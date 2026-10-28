@@ -762,6 +762,7 @@ void llama_context::sched_reserve() {
         worker.last_use = 0;
     }
     region_ring_gpu_weight_bank_epoch = 0;
+    region_ring_initial_banks_primed = false;
 
     const int64_t t_start_us = ggml_time_us();
 
