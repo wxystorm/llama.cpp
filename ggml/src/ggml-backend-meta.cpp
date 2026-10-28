@@ -10586,8 +10586,61 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_tensor * phone_residual =
                 find_exact_named_tensor(
                     1, chunk_residual_name);
-            const bool chunk_local_residual =
+            bool chunk_local_residual =
                 phone_residual != nullptr;
+
+            // In the exact directional wave builder the named
+            // prefill_wave_ffn_inp_chunk_* object is a sibling VIEW of the
+            // real Attention+residual ADD. The VIEW itself does not have to be
+            // materialized as a graph node, while the FFN norm that consumes
+            // the same ADD is materialized and has just executed on Phone.
+            // Recover the already-computed residual from that norm input
+            // instead of changing the graph topology merely to expose the VIEW.
+            if (phone_residual == nullptr && wave_chunk_output) {
+                char norm_chunk_name[96];
+                std::snprintf(
+                    norm_chunk_name,
+                    sizeof(norm_chunk_name),
+                    "prefill_ffn_norm_chunk_%d-%d",
+                    prefill_down_chunk_0,
+                    prefill_down_layer_0);
+
+                ggml_tensor * norm_chunk =
+                    find_exact_named_tensor(
+                        1, norm_chunk_name);
+                ggml_tensor * norm_base =
+                    norm_chunk != nullptr &&
+                            norm_chunk->view_src != nullptr ?
+                        norm_chunk->view_src :
+                        norm_chunk;
+                ggml_tensor * norm_input =
+                    norm_base != nullptr ?
+                        norm_base->src[0] :
+                        nullptr;
+
+                if (norm_input != nullptr &&
+                        ggml_nelements(norm_input) ==
+                            ggml_nelements(phone_partial) &&
+                        ggml_nbytes(norm_input) ==
+                            ggml_nbytes(phone_partial)) {
+                    phone_residual = norm_input;
+                    chunk_local_residual = true;
+                    if (pipeline_debug) {
+                        printf(
+                            "[WAVE_P2C_RESIDUAL_RECOVER] "
+                            "layer=%d chunk=%d source=NORM_INPUT "
+                            "norm=%s residual=%s bytes=%zu status=OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            norm_chunk != nullptr ?
+                                norm_chunk->name : "(null)",
+                            phone_residual->name[0] != '\0' ?
+                                phone_residual->name : "(unnamed)",
+                            ggml_nbytes(phone_residual));
+                    }
+                }
+            }
+
             if (phone_residual == nullptr) {
                 phone_residual =
                     find_recent_ffn_inp(
