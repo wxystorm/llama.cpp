@@ -3315,7 +3315,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 return nullptr;
             }
 
-            if (gpu_weight_prefetch) {
+            if (gpu_bank_streaming) {
                 ggml_backend_dev_t cuda_dev =
                     ggml_backend_get_device(backend_ptrs[1]);
                 if (region_ring_cuda_transfer_backend &&
@@ -3396,6 +3396,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker.bank_region =
                     std::numeric_limits<size_t>::max();
                 worker.bank_generation = 0;
+                worker.bank_ready = false;
+                worker.bank_ready = false;
+                if (gpu_resource) {
+                    region_ring_initial_banks_loaded = false;
+                }
             }
             if (!worker.sched) {
                 worker.sched.reset(ggml_backend_sched_new(
@@ -3488,14 +3493,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         if (gpu_weight_streaming) {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT] phase=BANK_INIT banks=2 "
-                "canonical=CPU destination=CUDA "
-                "eviction=%s load=%s cache=PERSISTENT "
-                "prefetch_min_tokens=%d demand_fallback=%d status=READY\n",
-                gpu_weight_prefetch ? "NONE" : "LRU",
-                gpu_weight_prefetch ? "LOOKAHEAD_2" : "DEMAND",
-                gpu_prefetch_min_tokens,
-                gpu_weight_prefetch ? 0 : 1);
+                "[REGION_RING_GPU_BANK] phase=INIT banks=2 "
+                "mapping=FIXED_PARITY canonical=CPU destination=CUDA "
+                "mover=%s min_tokens=%d status=READY\n",
+                gpu_bank_streaming ? "CPU_SINGLE" : "INACTIVE_SMALL_BATCH",
+                gpu_bank_min_tokens);
         }
 
         if (ring_sched[0] == ring_sched[1] ||
