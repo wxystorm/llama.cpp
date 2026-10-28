@@ -60,6 +60,11 @@ struct llama_sequence_ffn_branch_graph {
     ggml_tensor * input = nullptr;
     ggml_tensor * output = nullptr;
 
+    ggml_backend_t backend = nullptr;
+    int layer_index = -1;
+    int tokens = 0;
+    size_t child_index = 0;
+
     ~llama_sequence_ffn_branch_graph() {
         if (buffer != nullptr) {
             ggml_backend_buffer_free(buffer);
