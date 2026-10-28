@@ -806,6 +806,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ffn_inp_name.c_str(),
                     wave_layer);
 
+                // The directional Reduce(L,C) consumes this exact residual
+                // before the final layer output graph is materialized. Make
+                // the named chunk view an explicit graph object now, rather
+                // than letting it appear only later as src[1] of
+                // prefill_wave_l_out_chunk_*. This also keeps the residual on
+                // the Attention owner (Phone for P2C) where Meta can resolve
+                // it by its exact (layer,chunk) name.
+                ggml_build_forward_expand(gf, ffn_inp);
+
                 ggml_tensor * ffn_norm =
                     ggml_view_2d(
                         ctx0, group_ffn_norm,
