@@ -951,6 +951,25 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         split_state.nr[0] = 1;
         split_state.n_segments = 1;
     }
+
+    // Sequence-FFN duplicates the complete expert weights on PC and Phone.
+    // The activation, not the expert hidden dimension, is split at runtime.
+    if (mode == llama_hybrid_layer_mode::SEQUENCE_FFN &&
+            is_ffn_split_tensor) {
+        memset(split_state.ne, 0, sizeof(split_state.ne));
+        split_state.axis =
+            GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+        split_state.nr[0] = 1;
+        split_state.n_segments = 1;
+
+        if (std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
+            LLAMA_LOG_ERROR(
+                "[SEQ_FFN_WEIGHT] layer=%u tensor=%s "
+                "placement=MIRRORED pc=FULL phone=FULL status=READY\n",
+                tc.il, tensor_name.c_str());
+        }
+    }
+
     //如果是q,k,v权重，打印切分信息
     const bool is_attention_tensor =
         std::regex_match(tensor_name, pattern_q_weight) ||
