@@ -2100,16 +2100,60 @@ struct ggml_compute::impl {
                 return false;
             }
 
-            const size_t count =
-                static_cast<size_t>(n_embd) *
-                static_cast<size_t>(tokens);
-            output.resize(count);
+            const bool final_layer =
+                task.layer + 1 ==
+                    config.runtime_plan.layers;
 
-            ggml_backend_tensor_get(
-                reduced,
-                output.data(),
-                0,
-                count * sizeof(float));
+            if (final_layer) {
+                const size_t count =
+                    static_cast<size_t>(n_embd) *
+                    static_cast<size_t>(tokens);
+                output.resize(count);
+
+                ggml_backend_tensor_get(
+                    reduced,
+                    output.data(),
+                    0,
+                    count * sizeof(float));
+            } else {
+                ggml_tensor * slot =
+                    activation_output_slot(task);
+
+                if (slot == nullptr ||
+                    slot->buffer == nullptr ||
+                    (ggml_backend_dev_type(device) !=
+                         GGML_BACKEND_DEVICE_TYPE_CPU &&
+                     slot->extra == nullptr)) {
+                    error =
+                        "REDUCE activation output slot is not backend-ready";
+                    return false;
+                }
+
+                ggml_backend_tensor_copy_async(
+                    backend,
+                    backend,
+                    reduced,
+                    slot);
+                ggml_backend_synchronize(
+                    backend);
+
+                // Empty output tells runtime that the next OWNER input is
+                // already resident in its persistent activation slot.
+                output.clear();
+
+                if (config.log_events) {
+                    std::fprintf(
+                        stderr,
+                        "[LT_GGML_LOCAL_CONT] side=%s "
+                        "from_layer=%d to_layer=%d chunk=%d "
+                        "slot=%d mode=REDUCE status=READY\n",
+                        side_name(config.local_side),
+                        task.layer,
+                        task.layer + 1,
+                        task.chunk,
+                        (task.layer + 1) & 1);
+                }
+            }
         }
 
         return true;
