@@ -2623,6 +2623,70 @@ struct ggml_compute::impl {
         return true;
     }
 
+    void log_tensor_fingerprint(
+            const char * phase,
+            const key & task,
+            ggml_tensor * tensor) {
+        if (!config.log_events ||
+            tensor == nullptr) {
+            return;
+        }
+
+        const size_t count =
+            static_cast<size_t>(n_embd) *
+            static_cast<size_t>(
+                chunk_tokens(task));
+
+        std::vector<float> values(count);
+        ggml_backend_tensor_get(
+            tensor,
+            values.data(),
+            0,
+            count * sizeof(float));
+
+        double sum = 0.0;
+        double l2_sq = 0.0;
+        double max_abs = 0.0;
+        size_t nonfinite = 0;
+
+        for (float value : values) {
+            const double x =
+                static_cast<double>(value);
+            if (!std::isfinite(x)) {
+                ++nonfinite;
+                continue;
+            }
+            sum += x;
+            l2_sq += x * x;
+            max_abs =
+                std::max(
+                    max_abs,
+                    std::fabs(x));
+        }
+
+        std::fprintf(
+            stderr,
+            "[LT_NUMERIC] side=%s phase=%s "
+            "layer=%d chunk=%d tokens=%d "
+            "checksum=%.12f sum=%.12f l2=%.12f "
+            "max_abs=%.9g nonfinite=%zu "
+            "v0=%.9g v1=%.9g v2=%.9g v3=%.9g\n",
+            side_name(config.local_side),
+            phase,
+            task.layer,
+            task.chunk,
+            chunk_tokens(task),
+            checksum(values),
+            sum,
+            std::sqrt(l2_sq),
+            max_abs,
+            nonfinite,
+            values.size() > 0 ? values[0] : 0.0f,
+            values.size() > 1 ? values[1] : 0.0f,
+            values.size() > 2 ? values[2] : 0.0f,
+            values.size() > 3 ? values[3] : 0.0f);
+    }
+
     bool copy_local_continuation(
             const key & task,
             const char * mode_name_value,
@@ -2753,6 +2817,11 @@ struct ggml_compute::impl {
                     "REDUCE GGML compute failed";
                 return false;
             }
+
+            log_tensor_fingerprint(
+                "REDUCE_OUT",
+                task,
+                reduced);
 
             const bool final_layer =
                 task.layer + 1 ==
@@ -2942,6 +3011,11 @@ struct ggml_compute::impl {
                     "FULL_LAYER GGML compute failed";
                 return false;
             }
+
+            log_tensor_fingerprint(
+                "FULL_OUT",
+                task,
+                layer_out);
 
             if (next_local) {
                 ggml_tensor * arena_view =
