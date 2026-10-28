@@ -632,6 +632,17 @@ struct ggml_compute::impl {
                 static_cast<size_t>(
                     layer_index)];
 
+        if (layer.attn_norm->type !=
+                GGML_TYPE_F32 ||
+            layer.wq->ne[0] != n_embd ||
+            layer.wk->ne[0] != n_embd ||
+            layer.wv->ne[0] != n_embd) {
+            error =
+                "stream precompute requires F32 attention norm "
+                "and Q/K/V input width equal to n_embd";
+            return false;
+        }
+
         for (const ggml_tensor * weight :
              { layer.wq, layer.wk, layer.wv }) {
             const int64_t block =
