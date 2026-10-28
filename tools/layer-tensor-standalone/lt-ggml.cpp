@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -284,6 +285,21 @@ struct ggml_compute::impl {
     ggml_backend_buffer_t phone_shard_buffer = nullptr;
     std::vector<materialized_ffn_shard> phone_shards;
 
+    struct materialized_attn_slice {
+        ggml_tensor * wq = nullptr;
+        ggml_tensor * wk = nullptr;
+        ggml_tensor * wv = nullptr;
+        ggml_tensor * gamma = nullptr;
+        int64_t begin = 0;
+        int64_t width = 0;
+    };
+
+    // Lazily created only for --stream-precompute-bench. Each 512-wide slice
+    // is independent so OpenCL never consumes a quantized offset view.
+    ggml_context * stream_attn_ctx = nullptr;
+    ggml_backend_buffer_t stream_attn_buffer = nullptr;
+    std::vector<materialized_attn_slice> stream_attn_slices;
+
     int32_t total_tokens = 0;
     int32_t n_embd = 0;
     int32_t n_expert = 0;
@@ -301,6 +317,15 @@ struct ggml_compute::impl {
     ~impl() {
         owner_cache.clear();
         remote_cache.clear();
+
+        if (stream_attn_buffer != nullptr) {
+            ggml_backend_buffer_free(stream_attn_buffer);
+            stream_attn_buffer = nullptr;
+        }
+        if (stream_attn_ctx != nullptr) {
+            ggml_free(stream_attn_ctx);
+            stream_attn_ctx = nullptr;
+        }
 
         if (phone_shard_buffer != nullptr) {
             ggml_backend_buffer_free(phone_shard_buffer);
