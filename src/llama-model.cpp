@@ -1903,13 +1903,27 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOKENS must be positive");
             }
 
+            const char * ring_exec_env =
+                std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+            const bool causal_sequence_pipeline =
+                ring_exec_env != nullptr &&
+                std::strcmp(
+                    ring_exec_env,
+                    "fifo-pc-phone-seq") == 0;
+
             LLAMA_LOG_ERROR(
                 "[SEQ_FFN_POLICY] layers=[%d,%d) "
                 "base_placement=CPU runtime_stage=SEQUENCE_FFN "
                 "attention=PC_CPU kv=PC ffn=TOKEN_SPLIT "
-                "phone_tokens=%d weights=MIRRORED "
-                "causal_wavefront=0 status=READY\n",
-                seq_begin, seq_end, phone_tokens);
+                "phone_tokens_seed=%d weights=MIRRORED "
+                "partition=%s causal_wavefront=%s status=READY\n",
+                seq_begin, seq_end, phone_tokens,
+                causal_sequence_pipeline ?
+                    "GLOBAL_CONTIGUOUS" :
+                    "PER_BLOCK_REFERENCE",
+                causal_sequence_pipeline ?
+                    "TOKEN_INTERVAL_TASK_DAG" :
+                    "0");
         }
 
         hybrid_tensor_pc_ratios.assign(
