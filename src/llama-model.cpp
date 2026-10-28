@@ -436,6 +436,66 @@ static bool llama_hybrid_region_boundary_v1_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static std::vector<llama_hybrid_layer_mode>
+llama_hybrid_experiment_policy_from_env(int n_layer) {
+    const char * raw = std::getenv("LLAMA_HYBRID_EXPERIMENT_POLICY");
+    if (raw == nullptr || raw[0] == '\0') {
+        return {};
+    }
+
+    std::vector<llama_hybrid_layer_mode> policy;
+    std::string spec(raw);
+    size_t begin = 0;
+    while (begin <= spec.size()) {
+        const size_t comma = spec.find(',', begin);
+        const std::string token =
+            spec.substr(begin, comma == std::string::npos ?
+                std::string::npos : comma - begin);
+
+        if (token == "C" || token == "CPU") {
+            policy.push_back(llama_hybrid_layer_mode::PC_ONLY);
+        } else if (token == "P" || token == "PHONE") {
+            policy.push_back(llama_hybrid_layer_mode::PHONE_ONLY);
+        } else if (token == "C2P") {
+            policy.push_back(llama_hybrid_layer_mode::TENSOR_C2P);
+        } else if (token == "P2C") {
+            policy.push_back(llama_hybrid_layer_mode::TENSOR_P2C);
+        } else {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_EXPERIMENT_POLICY token must be "
+                "C, P, C2P or P2C");
+        }
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        begin = comma + 1;
+    }
+
+    if ((int) policy.size() != n_layer) {
+        throw std::runtime_error(
+            "LLAMA_HYBRID_EXPERIMENT_POLICY must contain exactly "
+            + std::to_string(n_layer) + " layer modes");
+    }
+
+    int n_c = 0;
+    int n_p = 0;
+    int n_c2p = 0;
+    int n_p2c = 0;
+    for (const auto mode : policy) {
+        n_c += mode == llama_hybrid_layer_mode::PC_ONLY;
+        n_p += mode == llama_hybrid_layer_mode::PHONE_ONLY;
+        n_c2p += mode == llama_hybrid_layer_mode::TENSOR_C2P;
+        n_p2c += mode == llama_hybrid_layer_mode::TENSOR_P2C;
+    }
+    LLAMA_LOG_ERROR(
+        "[HYBRID_EXPERIMENT_POLICY] layers=%d C=%d P=%d C2P=%d P2C=%d "
+        "status=READY\n",
+        n_layer, n_c, n_p, n_c2p, n_p2c);
+
+    return policy;
+}
+
 static int llama_hybrid_region_boundary_env_int(
         const char * name, int fallback) {
     const char * value = std::getenv(name);
@@ -1649,6 +1709,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_plan runtime_plan;
         const bool has_runtime_plan = llama_hybrid_runtime_plan_get(runtime_plan);
+        const std::vector<llama_hybrid_layer_mode> experiment_policy =
+            llama_hybrid_experiment_policy_from_env(n_layer);
+        const bool has_experiment_policy = !experiment_policy.empty();
         const bool force_phone_primary =
             has_runtime_plan &&
             llama_hybrid_force_phone_primary_enabled() &&
@@ -1668,6 +1731,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
 
         const bool region_ring = llama_region_ring_enabled();
+        if (region_ring && has_experiment_policy) {
+            throw std::runtime_error(
+                "LLAMA_HYBRID_EXPERIMENT_POLICY is independent of Region Ring; "
+                "disable LLAMA_HYBRID_REGION_RING_V1");
+        }
         const bool ring_gpu_weight_stream_requested =
             region_ring &&
             std::getenv(
@@ -1801,7 +1869,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             }
         }
 
-        hybrid_layer_modes = region_ring ?
+        hybrid_layer_modes = has_experiment_policy ?
+            experiment_policy :
+            region_ring ?
             std::vector<llama_hybrid_layer_mode>(n_layer, llama_hybrid_layer_mode::PC_ONLY) :
             llama_hybrid_region_boundary_v1_enabled() ?
             llama_build_region_boundary_v1_policy(n_layer) :
@@ -1834,7 +1904,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         // Directional boundaries use a physical PC expert-width share.
         // Keep the ratios explicit per direction; performance tuning can change
         // them later without changing the ownership protocol.
-        if (llama_hybrid_region_boundary_v1_enabled()) {
+        if (llama_hybrid_region_boundary_v1_enabled() ||
+                has_experiment_policy) {
             auto read_region_ratio = [&](const char * name, float fallback) {
                 const char * raw = std::getenv(name);
                 const float ratio =
