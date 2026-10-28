@@ -62,14 +62,18 @@ PC CPU
 Phone RPC GPU
 ```
 
-The command registers the phone with `--rpc`, then passes:
+The command registers the phone with `--rpc`. In experiment mode the model
+device builder itself constructs the Tensor Meta backend as:
 
 ```
---device RPC0
+[PC CPU, Phone RPC]
 ```
 
-so the local CUDA GPU is excluded from the offload device list.  If the phone
-registers under another device name, use `--phone-device`.
+and excludes local CUDA from that Meta device. The runner deliberately does
+not pass `--device RPC0`, because that would remove CPU from the Meta children.
+
+`--phone-device` is used only by the startup preflight to verify that the
+expected RPC device was registered.
 
 ## Layer planner
 
