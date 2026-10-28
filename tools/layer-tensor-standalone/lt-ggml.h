@@ -46,6 +46,17 @@ public:
         std::vector<float> & output,
         std::string & error);
 
+    // PC-only diagnostic: build one real layer prefix once, then compare the
+    // complete MoE FFN against two complementary hidden-dimension shards in
+    // the same graph. This isolates quantized weight-view slicing from TCP,
+    // Phone/OpenCL, REDUCE, and cross-graph continuation.
+    bool ffn_split_selfcheck(
+        const key & task,
+        const std::vector<float> & input,
+        float pc_ratio,
+        std::string & report,
+        std::string & error);
+
     bool owner_prefix(
         const key & task,
         const std::vector<float> & input,
