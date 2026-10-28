@@ -643,6 +643,74 @@ static void test_window_failure_wakes_workers() {
     }
 }
 
+static void test_gpu_same_bank_lifetime_scheduler() {
+    // Three GPU Regions isolate the rolling two-Bank lifetime rule:
+    // rank0(A) and rank1(B) may interleave, while rank2(A) must wait for
+    // rank0(A) to drain before Bank A can be reused.
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::GPU, 0, 1},
+        {llama_region_ring_device::GPU, 1, 2},
+        {llama_region_ring_device::GPU, 2, 3},
+    };
+    llama_region_ring_ready ready(regions, 32, 16, 0, true);
+
+    const auto r0c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r0c0 && r0c0->region == 0 && r0c0->chunk == 0,
+          "rank0 chunk0 missing");
+    ready.complete(*r0c0);
+
+    const auto r1c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r1c0 && r1c0->region == 1 && r1c0->chunk == 0,
+          "rank1/B was incorrectly blocked by rank0/A");
+    ready.complete(*r1c0);
+
+    // rank2/A is input-ready now, but Bank A still belongs to rank0 because
+    // rank0 chunk1 remains unfinished. The scheduler must continue rank0.
+    const auto r0c1 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r0c1 && r0c1->region == 0 && r0c1->chunk == 1,
+          "rank2/A reused Bank A before rank0 drained");
+    ready.complete(*r0c1);
+
+    // Bank A is now free. rank2 may start even though rank1/B still has its
+    // second chunk queued.
+    const auto r2c0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(r2c0 && r2c0->region == 2 && r2c0->chunk == 0,
+          "rank2/A did not become claimable after rank0 drained");
+}
+
+static void test_gpu_weight_two_bank_policy() {
+    const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
+
+    check(llama_region_ring_gpu_weight_bank_for_rank(0) == 0,
+          "rank0 must use Bank A");
+    check(llama_region_ring_gpu_weight_bank_for_rank(1) == 1,
+          "rank1 must use Bank B");
+    check(llama_region_ring_gpu_weight_bank_for_rank(2) == 0,
+          "rank2 must reuse Bank A");
+    check(llama_region_ring_gpu_weight_bank_for_rank(3) == 1,
+          "rank3 must reuse Bank B");
+
+    const auto next0 =
+        llama_region_ring_gpu_weight_next_rank(0, gpu_regions.size());
+    const auto next1 =
+        llama_region_ring_gpu_weight_next_rank(1, gpu_regions.size());
+    const auto next2 =
+        llama_region_ring_gpu_weight_next_rank(2, gpu_regions.size());
+    const auto next3 =
+        llama_region_ring_gpu_weight_next_rank(3, gpu_regions.size());
+
+    check(next0 && *next0 == 2,
+          "rank0 drain must prefetch rank2");
+    check(next1 && *next1 == 3,
+          "rank1 drain must prefetch rank3");
+    check(!next2 && !next3,
+          "last two GPU ranks must not prefetch past the window");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -684,6 +752,10 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
         test_window_failure_wakes_workers();
         std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
+        test_gpu_same_bank_lifetime_scheduler();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_same_bank_lifetime_scheduler=PASS\n");
+        test_gpu_weight_two_bank_policy();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
