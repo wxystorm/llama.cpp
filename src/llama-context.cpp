@@ -4740,48 +4740,42 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ++joined;
             }
         }
-        if (gpu_prefetch_worker_started) {
+        if (gpu_bank_mover_started) {
             {
                 std::lock_guard<std::mutex> lock(
-                    gpu_prefetch_mutex);
-                gpu_prefetch_stop = true;
+                    gpu_bank_mover_mutex);
+                gpu_bank_mover_stop = true;
             }
-            gpu_prefetch_cv.notify_all();
-            gpu_bank_cv.notify_all();
-            if (gpu_prefetch_worker.joinable()) {
-                gpu_prefetch_worker.join();
-                gpu_prefetch_worker_joined = true;
+            gpu_bank_mover_cv.notify_all();
+            gpu_bank_ready_cv.notify_all();
+            if (gpu_bank_mover_thread.joinable()) {
+                gpu_bank_mover_thread.join();
+                gpu_bank_mover_joined = true;
             }
         }
-        if (gpu_weight_prefetch) {
+        if (gpu_bank_streaming) {
             LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_WEIGHT_PREFETCH_SUM] "
-                "worker=CPU_DEDICATED started=%zu completed=%zu "
-                "failures=%zu upload_mib=%.3f cache_hit_mib=%.3f "
+                "[REGION_RING_GPU_BANK_MOVER_SUM] "
+                "worker=CPU_SINGLE started=%zu completed=%zu "
+                "failures=%zu upload_mib=%.3f "
                 "stage_cpu_copy_ms=%.3f stage_chunks=%zu "
-                "prepare_ms=%.3f h2d_pipeline_ms=%.3f "
-                "other_ms=%.3f copy_wall_ms=%.3f gpu_wait_ms=%.3f "
+                "prepare_ms=%.3f h2d_ms=%.3f wall_ms=%.3f "
+                "gpu_wait_ms=%.3f "
                 "thread_started=%d thread_joined=%d status=%s\n",
-                gpu_prefetch_stats.started,
-                gpu_prefetch_stats.completed,
-                gpu_prefetch_stats.failures,
-                gpu_prefetch_stats.upload_bytes / 1048576.0,
-                gpu_prefetch_stats.cache_hit_bytes / 1048576.0,
-                gpu_prefetch_stats.stage_cpu_copy_us / 1000.0,
-                gpu_prefetch_stats.stage_chunks,
-                gpu_prefetch_stats.prepare_us / 1000.0,
-                gpu_prefetch_stats.h2d_us / 1000.0,
-                std::max<int64_t>(
-                    0,
-                    gpu_prefetch_stats.wall_us -
-                        gpu_prefetch_stats.prepare_us -
-                        gpu_prefetch_stats.h2d_us) / 1000.0,
-                gpu_prefetch_stats.wall_us / 1000.0,
-                worker_states[1].weight_prefetch_wait_us / 1000.0,
-                gpu_prefetch_worker_started ? 1 : 0,
-                gpu_prefetch_worker_joined ? 1 : 0,
-                gpu_prefetch_stats.failures == 0 ?
-                    "PASS" : "FALLBACK");
+                gpu_bank_mover_stats_v.started,
+                gpu_bank_mover_stats_v.completed,
+                gpu_bank_mover_stats_v.failures,
+                gpu_bank_mover_stats_v.upload_bytes / 1048576.0,
+                gpu_bank_mover_stats_v.stage_cpu_copy_us / 1000.0,
+                gpu_bank_mover_stats_v.stage_chunks,
+                gpu_bank_mover_stats_v.prepare_us / 1000.0,
+                gpu_bank_mover_stats_v.h2d_us / 1000.0,
+                gpu_bank_mover_stats_v.wall_us / 1000.0,
+                worker_states[1].weight_bank_wait_us / 1000.0,
+                gpu_bank_mover_started ? 1 : 0,
+                gpu_bank_mover_joined ? 1 : 0,
+                gpu_bank_mover_stats_v.failures == 0 ?
+                    "PASS" : "FAIL");
         }
 
         for (size_t dev = 0; dev < worker_states.size(); ++dev) {
@@ -4807,13 +4801,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker_states[1].compute_intervals, worker_states[2].compute_intervals) : 0;
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_SUM] created=%zu joined=%zu "
-            "prefetch_created=%d prefetch_joined=%d "
+            "bank_mover_created=%d bank_mover_joined=%d "
             "finished=%zu completed=%zu cpu_tasks=%zu gpu_tasks=%zu "
             "phone_tasks=%zu backend_gate=%s "
             "graph_overlap=%s final_owner=%s status=%s\n",
             created, joined,
-            gpu_prefetch_worker_started ? 1 : 0,
-            gpu_prefetch_worker_joined ? 1 : 0,
+            gpu_bank_mover_started ? 1 : 0,
+            gpu_bank_mover_joined ? 1 : 0,
             ready.finished(), executed,
             worker_states[0].completed, worker_states[1].completed,
             worker_states[2].completed,
