@@ -550,6 +550,10 @@ enum class llama_hybrid_layer_mode {
     TENSOR_C2P,
     TENSOR_P2C,
     TENSOR_PHONE_PRIMARY,
+    // Attention/KV stay on PC. The FFN weights are fully replicated on
+    // PC+Phone and the FFN activation is split along the token dimension.
+    // V1 gathers the token slices only at the Region host boundary.
+    SEQUENCE_FFN,
     PHONE_ONLY,
 };
 
