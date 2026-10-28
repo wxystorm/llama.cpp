@@ -4481,6 +4481,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
             return GGML_STATUS_SUCCESS;
         };
+    auto acquire_directional_wave_reduce_slot =
+        [&](int layer, int chunk,
+            size_t & return_slot,
+            size_t & return_lane,
+            ggml_backend_meta_transfer_worker *& worker) {
+            GGML_ASSERT(chunk >= 0);
+            return_slot =
+                static_cast<size_t>(chunk) %
+                ggml_backend_meta_context::PREFILL_RETURN_SLOTS;
+            return_lane =
+                return_slot %
+                ggml_backend_meta_context::PREFILL_RETURN_LANES;
+
+            if (pending_prefill_reduce_task[return_slot] != 0) {
+                const int old_layer =
+                    pending_prefill_reduce_layer[return_slot];
+                const int old_chunk =
+                    pending_prefill_reduce_chunk[return_slot];
+                const int64_t wait_begin_us = ggml_time_us();
+                const ggml_status status =
+                    wait_prefill_reduce_slot(return_slot);
+                const int64_t wait_us =
+                    ggml_time_us() - wait_begin_us;
+
+                ++lane_reuse_wait_count;
+                lane_reuse_wait_us += wait_us;
+                lane_reuse_wait_max_us =
+                    std::max(lane_reuse_wait_max_us, wait_us);
+                ++lane_reuse_wait_count_by_lane[return_lane];
+                lane_reuse_wait_us_by_lane[return_lane] +=
+                    wait_us;
+
+                printf(
+                    "[DIRECTIONAL_WAVE_SLOT_REUSE] "
+                    "slot=%zu lane=%zu old_layer=%d old_chunk=%d "
+                    "new_layer=%d new_chunk=%d wait_ms=%.3f "
+                    "status=%d\n",
+                    return_slot, return_lane,
+                    old_layer, old_chunk,
+                    layer, chunk,
+                    wait_us / 1000.0,
+                    (int) status);
+
+                if (status != GGML_STATUS_SUCCESS) {
+                    return status;
+                }
+            }
+
+            auto & lane_worker =
+                backend_ctx->prefill_reduce_workers[
+                    return_lane];
+            if (lane_worker == nullptr) {
+                lane_worker =
+                    new ggml_backend_meta_transfer_worker();
+            }
+            worker = lane_worker;
+            return GGML_STATUS_SUCCESS;
+        };
+
     auto wait_prefill_reduces_before =
         [&](int layer_exclusive, bool & waited, int64_t & wait_us) {
             waited = false;
