@@ -52,6 +52,15 @@ TRUNCATE_RE = re.compile(
 )
 
 
+class BenchStartupError(RuntimeError):
+    pass
+
+
+def output_tail(text: str, n: int = 60) -> str:
+    lines = text.splitlines()
+    return "\n".join(lines[-n:])
+
+
 @dataclass(frozen=True)
 class Candidate:
     family: str
@@ -367,7 +376,14 @@ def run_candidate(
                 f"log={log_path}",
                 flush=True,
             )
+            print("[BENCH_CHILD_TAIL_BEGIN]", flush=True)
+            print(output_tail(text), flush=True)
+            print("[BENCH_CHILD_TAIL_END]", flush=True)
             final_rc = proc.returncode if proc.returncode != 0 else 2
+            if loaded_layers is None:
+                raise BenchStartupError(
+                    f"llama-cli failed before truncated model load; see {log_path}"
+                )
             break
 
         prompt_times.append(prompt_ms)
@@ -483,6 +499,49 @@ def main() -> int:
         p.error("rep counts must be positive")
     if args.max_phone_layers is not None and args.max_phone_layers < 0:
         p.error("--max-phone-layers must be >= 0")
+
+    exe_path = Path(args.exe)
+    model_path = Path(args.model)
+    if not exe_path.is_file():
+        p.error(f"--exe does not exist: {exe_path}")
+    if not model_path.is_file():
+        p.error(f"--model does not exist: {model_path}")
+    if args.prompt_file is not None and not Path(args.prompt_file).is_file():
+        p.error(f"--prompt-file does not exist: {args.prompt_file}")
+
+    preflight_cmd = [
+        args.exe,
+        "--rpc", args.rpc,
+        "--list-devices",
+    ]
+    if not args.dry_run:
+        preflight = subprocess.run(
+            preflight_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=min(args.timeout, 30),
+        )
+        if preflight.returncode != 0:
+            raise BenchStartupError(
+                "RPC/device preflight failed:\n" + output_tail(preflight.stdout)
+            )
+        dev_line = re.compile(
+            r"^\s*" + re.escape(args.phone_device) + r":",
+            re.MULTILINE,
+        )
+        if dev_line.search(preflight.stdout) is None:
+            raise BenchStartupError(
+                f"requested phone device {args.phone_device!r} not found. "
+                "Available device output:\n" + output_tail(preflight.stdout)
+            )
+        print(
+            f"[BENCH_PREFLIGHT] rpc={args.rpc} "
+            f"phone_device={args.phone_device} status=READY",
+            flush=True,
+        )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
