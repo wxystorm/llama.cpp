@@ -132,10 +132,11 @@ bool runtime::start() {
     if (log_events_) {
         std::fprintf(stderr,
             "[LT_RUNTIME] side=%s mode=%s layers=%d chunks=%zu "
-            "owner_burst=%d status=STARTED\n",
+            "owner_burst=%d max_owner_ahead=%d status=STARTED\n",
             side_name(local_side_), mode_name(plan_.execution_mode),
             plan_.layers, plan_.chunk_tokens.size(),
-            plan_.owner_burst_limit);
+            plan_.owner_burst_limit,
+            plan_.max_owner_ahead);
     }
     return true;
 }
