@@ -70,6 +70,10 @@ WAVEFRONT_SUM_RE = re.compile(
     r"ahead_attn=(\d+).*?"
     r"ahead_phone_submit=(\d+)"
 )
+DIAGONAL_WAVE_SCHEDULE_RE = re.compile(
+    r"\[HYBRID_EXPERIMENT_WAVE_SCHEDULE\].*?"
+    r"mode=DIAGONAL_EXACT_CHUNK"
+)
 
 
 class BenchStartupError(RuntimeError):
@@ -117,6 +121,7 @@ class Result:
     correctness: str
     correctness_reason: str
     wavefront_seen: bool
+    diagonal_wave_schedule_seen: bool
     wavefront_overlap_boundaries: Optional[int]
     wavefront_ahead_attn: Optional[int]
     wavefront_ahead_phone_submit: Optional[int]
@@ -307,7 +312,7 @@ def parse_run_output(
     Optional[float], Optional[int], Optional[float],
     Optional[int], Optional[int],
     Optional[int], Optional[int], Optional[int],
-    Optional[int], Optional[float], bool,
+    Optional[int], Optional[float], bool, bool,
     Optional[int], Optional[int], Optional[int],
 ]:
     prompt_matches = list(PROMPT_RE.finditer(text))
@@ -346,6 +351,8 @@ def parse_run_output(
         top1_logit = float(m.group(5))
 
     wavefront_seen = WAVEFRONT_RE.search(text) is not None
+    diagonal_wave_schedule_seen =
+        DIAGONAL_WAVE_SCHEDULE_RE.search(text) is not None
     wave_summaries = list(WAVEFRONT_SUM_RE.finditer(text))
     wavefront_overlap_boundaries: Optional[int] = None
     wavefront_ahead_attn: Optional[int] = None
@@ -361,6 +368,7 @@ def parse_run_output(
         original_layers, loaded_layers,
         logits_count, logits_zero, logits_nonfinite,
         top1_token, top1_logit, wavefront_seen,
+        diagonal_wave_schedule_seen,
         wavefront_overlap_boundaries,
         wavefront_ahead_attn,
         wavefront_ahead_phone_submit,
@@ -388,6 +396,7 @@ def run_candidate(
     top1_token: Optional[int] = None
     top1_logit: Optional[float] = None
     wavefront_seen = False
+    diagonal_wave_schedule_seen = False
     wavefront_overlap_boundaries: Optional[int] = None
     wavefront_ahead_attn: Optional[int] = None
     wavefront_ahead_phone_submit: Optional[int] = None
@@ -482,6 +491,7 @@ def run_candidate(
             rep_top1_token,
             rep_top1_logit,
             rep_wavefront_seen,
+            rep_diagonal_wave_schedule_seen,
             rep_wave_overlap,
             rep_wave_ahead_attn,
             rep_wave_ahead_phone,
@@ -495,6 +505,10 @@ def run_candidate(
         top1_token = rep_top1_token
         top1_logit = rep_top1_logit
         wavefront_seen = wavefront_seen or rep_wavefront_seen
+        diagonal_wave_schedule_seen = (
+            diagonal_wave_schedule_seen
+            or rep_diagonal_wave_schedule_seen
+        )
         wavefront_overlap_boundaries = rep_wave_overlap
         wavefront_ahead_attn = rep_wave_ahead_attn
         wavefront_ahead_phone_submit = rep_wave_ahead_phone
@@ -549,6 +563,13 @@ def run_candidate(
         elif (
             candidate.family == "tensor"
             and candidate.x_layers > 1
+            and not rep_diagonal_wave_schedule_seen
+        ):
+            rep_correct = False
+            rep_reason = "DIAGONAL_WAVE_SCHEDULE_MISSING"
+        elif (
+            candidate.family == "tensor"
+            and candidate.x_layers > 1
             and rep_wave_overlap is None
         ):
             rep_correct = False
@@ -576,6 +597,7 @@ def run_candidate(
             f"top1={rep_top1_token} "
             f"reference_top1={reference_top1} "
             f"wavefront={1 if rep_wavefront_seen else 0} "
+            f"diagonal={1 if rep_diagonal_wave_schedule_seen else 0} "
             f"overlap={rep_wave_overlap} "
             f"ahead_attn={rep_wave_ahead_attn} "
             f"ahead_phone={rep_wave_ahead_phone} "
@@ -633,6 +655,7 @@ def run_candidate(
             )
         ),
         wavefront_seen=wavefront_seen,
+        diagonal_wave_schedule_seen=diagonal_wave_schedule_seen,
         wavefront_overlap_boundaries=wavefront_overlap_boundaries,
         wavefront_ahead_attn=wavefront_ahead_attn,
         wavefront_ahead_phone_submit=wavefront_ahead_phone_submit,
@@ -651,7 +674,8 @@ def write_csv(path: Path, results: Sequence[Result]) -> None:
         "original_layers", "loaded_layers", "returncode", "reps_ok",
         "policy", "logits_count", "logits_zero", "logits_nonfinite",
         "top1_token", "top1_logit", "correctness", "correctness_reason",
-        "wavefront_seen", "wavefront_overlap_boundaries",
+        "wavefront_seen", "diagonal_wave_schedule_seen",
+        "wavefront_overlap_boundaries",
         "wavefront_ahead_attn", "wavefront_ahead_phone_submit", "log_files",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -886,6 +910,8 @@ def main() -> int:
             "layer_correctness": best_layer.correctness,
             "tensor_correctness": best_tensor.correctness,
             "tensor_wavefront_seen": best_tensor.wavefront_seen,
+            "tensor_diagonal_wave_schedule_seen":
+                best_tensor.diagonal_wave_schedule_seen,
             "tensor_wavefront_overlap_boundaries":
                 best_tensor.wavefront_overlap_boundaries,
             "tensor_wavefront_ahead_attn":
