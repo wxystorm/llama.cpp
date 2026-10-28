@@ -560,6 +560,10 @@ extern "C" {
     GGML_API bool           ggml_backend_is_meta(ggml_backend_t backend);
     GGML_API size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // Return the physical tensor owned by one Meta child backend. The tensor
+    // remains owned by Meta and must not be freed by the caller.
+    GGML_API struct ggml_tensor * ggml_backend_meta_simple_tensor(
+        const struct ggml_tensor * tensor, size_t index);
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
