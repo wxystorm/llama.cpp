@@ -683,7 +683,7 @@ static void test_gpu_same_bank_lifetime_scheduler() {
         {llama_region_ring_device::GPU, 1, 2},
         {llama_region_ring_device::GPU, 2, 3},
     };
-    llama_region_ring_ready ready(regions, 32, 16, 0);
+    llama_region_ring_ready ready(regions, 32, 16, 0, true);
 
     const auto r0c0 =
         ready.try_take(llama_region_ring_device::GPU);
