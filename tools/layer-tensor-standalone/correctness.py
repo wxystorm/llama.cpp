@@ -9,6 +9,48 @@ RUN_RE = re.compile(
 )
 
 
+def parse_numeric_records(text):
+    records = {}
+    for line in text.splitlines():
+        if not line.startswith("[LT_NUMERIC]"):
+            continue
+
+        fields = {}
+        for token in line.split()[1:]:
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            fields[key] = value
+
+        phase = fields.get("phase")
+        if phase not in ("FULL_OUT", "REDUCE_OUT"):
+            continue
+
+        try:
+            layer = int(fields["layer"])
+            chunk = int(fields["chunk"])
+            records[(layer, chunk)] = {
+                "phase": phase,
+                "side": fields.get("side", ""),
+                "tokens": int(fields["tokens"]),
+                "checksum": float(fields["checksum"]),
+                "sum": float(fields["sum"]),
+                "l2": float(fields["l2"]),
+                "max_abs": float(fields["max_abs"]),
+                "nonfinite": int(fields["nonfinite"]),
+                "v": [
+                    float(fields["v0"]),
+                    float(fields["v1"]),
+                    float(fields["v2"]),
+                    float(fields["v3"]),
+                ],
+            }
+        except (KeyError, ValueError):
+            continue
+
+    return records
+
+
 def rel_diff(a, b):
     return abs(a - b) / max(1.0, abs(a), abs(b))
 
@@ -25,8 +67,11 @@ def run_case(args, name, mode, layers, extra):
         "--threads", str(args.threads),
     ]
     cmd.extend(extra)
-    if args.trace:
-        cmd.append("--trace")
+
+    # Correctness runs intentionally enable trace. The added tensor readbacks
+    # distort wall time but give per-layer numerical fingerprints, which are
+    # much stronger than the legacy weighted checksum.
+    cmd.append("--trace")
 
     proc = subprocess.run(
         cmd,
@@ -49,6 +94,7 @@ def run_case(args, name, mode, layers, extra):
         "checksum": None,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
+        "numeric": parse_numeric_records(combined),
     }
 
     if match is not None:
@@ -60,6 +106,106 @@ def run_case(args, name, mode, layers, extra):
         )
 
     return result
+
+
+def numeric_layer_summary(reference, candidate, layers, n_embd=2048):
+    rows = []
+
+    for layer in range(layers):
+        chunk_rows = []
+        keys = sorted(
+            key for key in reference.get("numeric", {})
+            if key[0] == layer and key in candidate.get("numeric", {})
+        )
+
+        for key in keys:
+            ref = reference["numeric"][key]
+            cur = candidate["numeric"][key]
+
+            l2_rel = abs(cur["l2"] - ref["l2"]) / max(
+                1e-12,
+                abs(ref["l2"]),
+            )
+            max_rel = abs(cur["max_abs"] - ref["max_abs"]) / max(
+                1e-12,
+                abs(ref["max_abs"]),
+            )
+
+            count = max(
+                1,
+                ref["tokens"] * n_embd,
+            )
+            ref_rms = ref["l2"] / (count ** 0.5)
+            cur_rms = cur["l2"] / (count ** 0.5)
+            scale = max(
+                1e-12,
+                ref_rms,
+                cur_rms,
+            )
+            sample_scaled = max(
+                abs(a - b)
+                for a, b in zip(ref["v"], cur["v"])
+            ) / scale
+
+            chunk_rows.append({
+                "chunk": key[1],
+                "l2_rel": l2_rel,
+                "max_rel": max_rel,
+                "sample_scaled": sample_scaled,
+                "ref_side": ref["side"],
+                "cur_side": cur["side"],
+            })
+
+        if chunk_rows:
+            rows.append({
+                "layer": layer,
+                "chunks": len(chunk_rows),
+                "l2_rel_max": max(x["l2_rel"] for x in chunk_rows),
+                "max_rel_max": max(x["max_rel"] for x in chunk_rows),
+                "sample_scaled_max": max(
+                    x["sample_scaled"] for x in chunk_rows
+                ),
+                "ref_side": chunk_rows[0]["ref_side"],
+                "cur_side": chunk_rows[0]["cur_side"],
+            })
+
+    return rows
+
+
+def print_numeric_summary(reference, candidate, layers):
+    rows = numeric_layer_summary(
+        reference,
+        candidate,
+        layers,
+    )
+
+    if not rows:
+        print("    numeric: no comparable per-layer fingerprints")
+        return
+
+    first_large = None
+    for row in rows:
+        if (
+            row["l2_rel_max"] > 0.02 or
+            row["sample_scaled_max"] > 0.25
+        ):
+            first_large = row["layer"]
+            break
+
+    print("    numeric layer comparison:")
+    for row in rows:
+        marker = " <-- first large divergence" if (
+            first_large is not None and
+            row["layer"] == first_large
+        ) else ""
+        print(
+            f"      L{row['layer']}: "
+            f"l2_rel_max={row['l2_rel_max']:.6g} "
+            f"max_abs_rel_max={row['max_rel_max']:.6g} "
+            f"sample_scaled_max={row['sample_scaled_max']:.6g} "
+            f"{row['ref_side']}->{row['cur_side']}"
+            f"{marker}"
+        )
 
 
 def print_case(result, reference=None, tol=5e-3):
@@ -129,8 +275,8 @@ def main():
         "--trace",
         action="store_true",
         help=(
-            "keep per-layer [LT_NUMERIC] and "
-            "[LT_CONT_COPY_CHECK] diagnostics"
+            "compatibility flag; correctness runs always enable trace "
+            "to collect per-layer numerical fingerprints"
         ),
     )
     args = parser.parse_args()
@@ -212,6 +358,20 @@ def main():
             ) else reference,
             args.tol,
         )
+
+        if (
+            reference is not None and
+            name not in (
+                "L1 PC",
+                "L2 all PC",
+                "L4 all PC",
+            )
+        ):
+            print_numeric_summary(
+                reference,
+                result,
+                layers,
+            )
 
         if not result["ok"]:
             if result["stderr"]:
