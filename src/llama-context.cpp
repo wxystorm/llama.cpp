@@ -4248,75 +4248,163 @@ llm_graph_result * llama_context::process_ubatch_region_ring_sequence(
         graph_max_nodes(
             std::min(cparams.n_ctx, cparams.n_ubatch));
 
-    auto ensure_worker_resource =
-        [&](size_t resource_id,
-            size_t backend_start,
-            size_t backend_count,
-            bool op_offload) -> bool {
-            auto & worker =
-                region_ring_worker_resources[resource_id];
+    auto ensure_cpu_resource = [&]() -> bool {
+        auto & worker = region_ring_worker_resources[0];
 
-            bool matches =
-                worker.sched &&
-                ggml_backend_sched_get_n_backends(
-                    worker.sched.get()) ==
-                    (int) backend_count;
-            if (matches) {
-                for (size_t i = 0; i < backend_count; ++i) {
-                    if (ggml_backend_sched_get_backend(
-                            worker.sched.get(), (int) i) !=
-                            backend_ptrs[backend_start + i]) {
-                        matches = false;
-                        break;
-                    }
-                }
-            }
+        const bool matches =
+            worker.sched &&
+            ggml_backend_sched_get_n_backends(
+                worker.sched.get()) == 1 &&
+            ggml_backend_sched_get_backend(
+                worker.sched.get(), 0) == backend_cpu;
 
-            if (worker.sched && !matches) {
-                ggml_backend_sched_synchronize(
-                    worker.sched.get());
-                worker.res.reset();
-                worker.sched.reset();
-                worker.bank_region =
-                    std::numeric_limits<size_t>::max();
-                worker.bank_generation = 0;
-                worker.bank_ready = false;
-            }
+        if (worker.sched && !matches) {
+            ggml_backend_sched_synchronize(
+                worker.sched.get());
+            worker.res.reset();
+            worker.sched.reset();
+            worker.bank_region =
+                std::numeric_limits<size_t>::max();
+            worker.bank_generation = 0;
+            worker.bank_ready = false;
+        }
 
-            if (!worker.sched) {
-                worker.sched.reset(
-                    ggml_backend_sched_new(
-                        backend_ptrs.data() + backend_start,
-                        backend_buft.data() + backend_start,
-                        (int) backend_count,
-                        max_nodes,
-                        false,
-                        op_offload));
-            }
-            if (!worker.sched) {
-                return false;
-            }
+        if (!worker.sched) {
+            ggml_backend_t cpu_backends[1] = {
+                backend_cpu,
+            };
+            ggml_backend_buffer_type_t cpu_bufts[1] = {
+                ggml_backend_dev_buffer_type(
+                    ggml_backend_get_device(backend_cpu)),
+            };
+            worker.sched.reset(
+                ggml_backend_sched_new(
+                    cpu_backends,
+                    cpu_bufts,
+                    1,
+                    max_nodes,
+                    false,
+                    false));
+        }
+        if (!worker.sched) {
+            return false;
+        }
 
-            ggml_backend_sched_set_weight_cache(
-                worker.sched.get(), false);
+        ggml_backend_sched_set_weight_cache(
+            worker.sched.get(), false);
+        if (!worker.res) {
+            worker.res.reset(
+                new llm_graph_result(max_nodes));
+        }
+        return true;
+    };
 
-            if (!worker.res) {
-                worker.res.reset(
-                    new llm_graph_result(max_nodes));
-            }
-            return true;
-        };
+    // The GPU scheduler gets an independent CPU backend sentinel.  GGML
+    // requires the final scheduler backend to be CPU, but no sequence-pipeline
+    // CPU work is allowed to execute there.  This eliminates the old need for
+    // a shared CPU execution gate between GPU staging and the CPU worker.
+    ggml_backend_dev_t cpu_dev =
+        backend_cpu != nullptr ?
+            ggml_backend_get_device(backend_cpu) :
+            nullptr;
+    if (cpu_dev == nullptr) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+    if (region_ring_gpu_aux_cpu_backend &&
+            ggml_backend_get_device(
+                region_ring_gpu_aux_cpu_backend.get()) !=
+                cpu_dev) {
+        region_ring_gpu_aux_cpu_backend.reset();
+    }
+    if (!region_ring_gpu_aux_cpu_backend) {
+        region_ring_gpu_aux_cpu_backend.reset(
+            ggml_backend_dev_init(cpu_dev, nullptr));
+    }
+    if (!region_ring_gpu_aux_cpu_backend) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_RESOURCE] status=FAIL "
+            "reason=GPU_AUX_CPU_INIT\n");
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
+    }
 
-    if (!ensure_worker_resource(
-            0, 2, 1, false) ||
-        !ensure_worker_resource(
-            1, 1, 2, cparams.op_offload)) {
+    auto ensure_gpu_resource = [&]() -> bool {
+        auto & worker = region_ring_worker_resources[1];
+        ggml_backend_t aux_cpu =
+            region_ring_gpu_aux_cpu_backend.get();
+
+        const bool matches =
+            worker.sched &&
+            ggml_backend_sched_get_n_backends(
+                worker.sched.get()) == 2 &&
+            ggml_backend_sched_get_backend(
+                worker.sched.get(), 0) ==
+                backend_ptrs[1] &&
+            ggml_backend_sched_get_backend(
+                worker.sched.get(), 1) ==
+                aux_cpu;
+
+        if (worker.sched && !matches) {
+            ggml_backend_sched_synchronize(
+                worker.sched.get());
+            worker.res.reset();
+            worker.sched.reset();
+            worker.bank_region =
+                std::numeric_limits<size_t>::max();
+            worker.bank_generation = 0;
+            worker.bank_ready = false;
+        }
+
+        if (!worker.sched) {
+            ggml_backend_t gpu_backends[2] = {
+                backend_ptrs[1],
+                aux_cpu,
+            };
+            ggml_backend_buffer_type_t gpu_bufts[2] = {
+                backend_buft[1],
+                ggml_backend_dev_buffer_type(cpu_dev),
+            };
+            worker.sched.reset(
+                ggml_backend_sched_new(
+                    gpu_backends,
+                    gpu_bufts,
+                    2,
+                    max_nodes,
+                    false,
+                    cparams.op_offload));
+        }
+        if (!worker.sched) {
+            return false;
+        }
+
+        ggml_backend_sched_set_weight_cache(
+            worker.sched.get(), false);
+        if (!worker.res) {
+            worker.res.reset(
+                new llm_graph_result(max_nodes));
+        }
+        return true;
+    };
+
+    if (!ensure_cpu_resource() ||
+            !ensure_gpu_resource()) {
         LLAMA_LOG_ERROR(
             "[SEQ_PIPE_RESOURCE] status=FAIL "
             "reason=SCHED_ALLOC\n");
         ret = GGML_STATUS_ALLOC_FAILED;
         return nullptr;
     }
+
+    LLAMA_LOG_ERROR(
+        "[SEQ_PIPE_RESOURCE] cpu=%s gpu=%s gpu_aux_cpu=%s "
+        "phone=%s ownership=THREE_EXECUTORS_NO_DEVICE_GATE "
+        "status=READY\n",
+        ggml_backend_name(backend_cpu),
+        ggml_backend_name(backend_ptrs[1]),
+        ggml_backend_name(
+            region_ring_gpu_aux_cpu_backend.get()),
+        ggml_backend_name(seq_phone_backend));
 
     std::array<ggml_backend_sched_t, 3> worker_sched = {
         region_ring_worker_resources[0].sched.get(),
