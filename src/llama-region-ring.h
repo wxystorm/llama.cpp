@@ -358,22 +358,27 @@ class llama_region_ring_ready {
 public:
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
-            int n_tokens, int chunk_tokens, size_t slot_pool_size = 0) :
+            int n_tokens,
+            int chunk_tokens,
+            size_t slot_pool_size = 0,
+            bool gpu_two_bank_lifetime = false) :
         llama_region_ring_ready(
             regions, n_tokens,
             std::vector<int>(regions.size(), chunk_tokens),
-            slot_pool_size) {
+            slot_pool_size, gpu_two_bank_lifetime) {
     }
 
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
             int n_tokens,
             const std::vector<int> & region_chunk_tokens,
-            size_t slot_pool_size = 0) :
+            size_t slot_pool_size = 0,
+            bool gpu_two_bank_lifetime = false) :
         regions_(regions),
         region_chunk_tokens_(region_chunk_tokens),
         slot_pool_size_(slot_pool_size),
-        n_tokens_(n_tokens) {
+        n_tokens_(n_tokens),
+        gpu_two_bank_lifetime_(gpu_two_bank_lifetime) {
         if (regions_.empty() || n_tokens_ <= 0 ||
                 region_chunk_tokens_.size() != regions_.size() ||
                 std::any_of(
@@ -733,7 +738,8 @@ private:
         // NOT wait for the immediately preceding opposite-Bank Region. The
         // previous "all earlier GPU Regions must finish" rule serialized the
         // Ring and broke nonuniform READY_V2 fan-out.
-        if (regions_[task.region].device ==
+        if (gpu_two_bank_lifetime_ &&
+                regions_[task.region].device ==
                 llama_region_ring_device::GPU) {
             size_t gpu_rank = 0;
             for (size_t r = 0; r < task.region; ++r) {
@@ -867,6 +873,7 @@ private:
     const std::vector<int> region_chunk_tokens_;
     const size_t slot_pool_size_ = 0;
     const int n_tokens_ = 0;
+    const bool gpu_two_bank_lifetime_ = false;
     std::vector<std::vector<output_slot>> output_slots_;
     std::vector<std::vector<int>> chunk_begins_;
     std::vector<std::vector<int>> chunk_sizes_;
