@@ -323,10 +323,88 @@ inline bool llama_region_ring_apply_safe_phone_shape(
     return true;
 }
 
+inline std::vector<llama_region_ring_region>
+llama_region_ring_default_regions(int n_layer) {
+    if (n_layer <= 0) {
+        throw std::runtime_error(
+            "region ring requires a positive layer count");
+    }
+
+    // Preserve the proven 48-layer Qwen3-MoE baseline exactly.
+    if (n_layer == 48) {
+        return llama_region_ring_parse(
+            "G4,C7,P5,G4,C7,P5,G3,C8,P5", n_layer);
+    }
+
+    // Dense models use the same G/C/P runtime but may have very different
+    // depths (for example 16/28/32/40/64 layers). Choose the largest
+    // supported cycle count that divides the model depth, then scale the
+    // historical 48-layer G:C:P proportions (11:22:15) within each cycle.
+    // This is only the safe starting baseline; APPLY_WIDE is still free to
+    // search all legal G/C/P widths and independent XC/XG/XP values.
+    int cycles = 0;
+    for (const int candidate : {4, 3, 2}) {
+        if (n_layer % candidate == 0 &&
+                n_layer / candidate >= 4) {
+            cycles = candidate;
+            break;
+        }
+    }
+    if (cycles == 0) {
+        throw std::runtime_error(
+            "region ring cannot form 2-4 complete G/C/P cycles "
+            "for this model layer count");
+    }
+
+    const int width = n_layer / cycles;
+    const int max_phone = std::min(8, width - 2);
+    int p = std::clamp(
+        (int) std::llround(width * (15.0 / 48.0)),
+        2, max_phone);
+    int g = std::clamp(
+        (int) std::llround(width * (11.0 / 48.0)),
+        1, width - p - 1);
+    int c = width - g - p;
+    if (c < 1) {
+        --p;
+        c = width - g - p;
+    }
+    if (c < 1 || p < 2 || g < 1) {
+        throw std::runtime_error(
+            "region ring failed to construct adaptive baseline");
+    }
+
+    std::vector<llama_region_ring_region> regions;
+    regions.reserve((size_t) cycles * 3);
+    int layer = 0;
+    for (int cycle = 0; cycle < cycles; ++cycle) {
+        regions.push_back({
+            llama_region_ring_device::GPU, layer, layer + g});
+        layer += g;
+        regions.push_back({
+            llama_region_ring_device::CPU, layer, layer + c});
+        layer += c;
+        regions.push_back({
+            llama_region_ring_device::PHONE, layer, layer + p});
+        layer += p;
+    }
+
+    if (layer != n_layer ||
+            !llama_region_ring_apply_topology_compatible(
+                regions, n_layer)) {
+        throw std::runtime_error(
+            "adaptive region ring baseline failed topology validation");
+    }
+    return regions;
+}
+
 inline std::vector<llama_region_ring_region> llama_region_ring_from_env(
         int n_layer) {
     const char * spec = std::getenv("LLAMA_HYBRID_REGION_RING_LAYOUT");
-    return llama_region_ring_parse(spec != nullptr ? spec : "", n_layer);
+    if (spec != nullptr && *spec != '\0') {
+        return llama_region_ring_parse(spec, n_layer);
+    }
+    return llama_region_ring_default_regions(n_layer);
 }
 
 inline std::array<int, 3> llama_region_ring_layer_counts(
