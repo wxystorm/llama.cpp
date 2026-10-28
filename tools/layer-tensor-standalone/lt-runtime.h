@@ -31,6 +31,7 @@ enum class message_kind : uint8_t {
     stop = 5,
     initial = 6,
     model_ready = 7,
+    debug_partial = 8,
 };
 
 struct key {
@@ -89,6 +90,10 @@ struct plan {
     // stay at most this many chunks ahead of the next (remote-owned) layer
     // having published READY back to this endpoint.
     int32_t max_owner_ahead = 1;
+
+    // Diagnostic only. Phone reads its REMOTE_FFN shard back to host and
+    // publishes DEBUG_PARTIAL so PC can compare against a CPU reference.
+    bool debug_phone_partial = false;
 
     bool valid(std::string * reason = nullptr) const;
     side owner_for_layer(int32_t layer) const;
