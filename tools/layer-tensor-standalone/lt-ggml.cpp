@@ -2562,6 +2562,702 @@ struct ggml_compute::impl {
         return true;
     }
 
+    bool run_stream_precompute_bench(
+            const key & task,
+            const std::vector<float> & host_input,
+            int repeats,
+            stream_precompute_result & result,
+            std::string & error) {
+        constexpr int k_slices = 4;
+        constexpr int k_warmup = 2;
+
+        result = {};
+
+        if (config.local_side != side::phone) {
+            error =
+                "stream precompute microbench must run on Phone";
+            return false;
+        }
+        if (repeats <= 0) {
+            error =
+                "stream precompute repeats must be > 0";
+            return false;
+        }
+        if (!validate_hidden_size(
+                task,
+                host_input,
+                error)) {
+            return false;
+        }
+        if (!ensure_stream_attn_slices(
+                task.layer,
+                error)) {
+            return false;
+        }
+
+        const int32_t tokens =
+            chunk_tokens(task);
+        const llama_hparams & hp =
+            model->hparams;
+        llama_layer & layer =
+            model->layers[
+                static_cast<size_t>(
+                    task.layer)];
+
+        auto measure_graph =
+            [&](ggml_cgraph * graph,
+                double & ms) -> bool {
+                for (int i = 0;
+                     i < k_warmup;
+                     ++i) {
+                    const ggml_status status =
+                        ggml_backend_graph_compute(
+                            backend,
+                            graph);
+                    ggml_backend_synchronize(
+                        backend);
+                    if (status !=
+                        GGML_STATUS_SUCCESS) {
+                        error =
+                            "stream precompute warmup compute failed";
+                        return false;
+                    }
+                }
+
+                const auto begin =
+                    std::chrono::steady_clock::now();
+
+                for (int i = 0;
+                     i < repeats;
+                     ++i) {
+                    const ggml_status status =
+                        ggml_backend_graph_compute(
+                            backend,
+                            graph);
+                    ggml_backend_synchronize(
+                        backend);
+                    if (status !=
+                        GGML_STATUS_SUCCESS) {
+                        error =
+                            "stream precompute timed compute failed";
+                        return false;
+                    }
+                }
+
+                const auto end =
+                    std::chrono::steady_clock::now();
+
+                ms =
+                    std::chrono::duration<
+                        double,
+                        std::milli>(
+                        end - begin).count() /
+                    static_cast<double>(
+                        repeats);
+                return true;
+            };
+
+        std::lock_guard<std::mutex> lock(
+            backend_mutex);
+
+        // Current path baseline: full RMSNorm + Q/K/V projection.
+        auto full_state =
+            new_graph_hold();
+        if (full_state == nullptr) {
+            error =
+                "failed to create full QKV benchmark context";
+            return false;
+        }
+
+        ggml_tensor * full_input =
+            ggml_new_tensor_2d(
+                full_state->ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                tokens);
+
+        ggml_tensor * full_norm =
+            ggml_rms_norm(
+                full_state->ctx,
+                full_input,
+                hp.f_norm_rms_eps);
+        full_norm =
+            ggml_mul(
+                full_state->ctx,
+                full_norm,
+                layer.attn_norm);
+
+        ggml_tensor * full_q =
+            ggml_mul_mat(
+                full_state->ctx,
+                layer.wq,
+                full_norm);
+        ggml_tensor * full_k =
+            ggml_mul_mat(
+                full_state->ctx,
+                layer.wk,
+                full_norm);
+        ggml_tensor * full_v =
+            ggml_mul_mat(
+                full_state->ctx,
+                layer.wv,
+                full_norm);
+
+        ggml_cgraph * full_graph =
+            ggml_new_graph_custom(
+                full_state->ctx,
+                256,
+                false);
+        ggml_build_forward_expand(
+            full_graph,
+            full_q);
+        ggml_build_forward_expand(
+            full_graph,
+            full_k);
+        ggml_build_forward_expand(
+            full_graph,
+            full_v);
+
+        if (!allocate_state(
+                full_state,
+                error)) {
+            return false;
+        }
+
+        ggml_backend_tensor_set(
+            full_input,
+            host_input.data(),
+            0,
+            host_input.size() *
+                sizeof(float));
+
+        if (!measure_graph(
+                full_graph,
+                result.qkv_full_ms)) {
+            return false;
+        }
+
+        const size_t q_count =
+            static_cast<size_t>(
+                layer.wq->ne[1]) *
+            static_cast<size_t>(
+                tokens);
+        const size_t k_count =
+            static_cast<size_t>(
+                layer.wk->ne[1]) *
+            static_cast<size_t>(
+                tokens);
+        const size_t v_count =
+            static_cast<size_t>(
+                layer.wv->ne[1]) *
+            static_cast<size_t>(
+                tokens);
+
+        std::vector<float> q_full(
+            q_count);
+        std::vector<float> k_full(
+            k_count);
+        std::vector<float> v_full(
+            v_count);
+
+        ggml_backend_tensor_get(
+            full_q,
+            q_full.data(),
+            0,
+            q_full.size() *
+                sizeof(float));
+        ggml_backend_tensor_get(
+            full_k,
+            k_full.data(),
+            0,
+            k_full.size() *
+                sizeof(float));
+        ggml_backend_tensor_get(
+            full_v,
+            v_full.data(),
+            0,
+            v_full.size() *
+                sizeof(float));
+
+        // The sender can compute one RMS scalar per token from the complete
+        // hidden state. The receiver streams raw hidden slices, multiplies
+        // each by its local attn_norm gamma, and accumulates Q/K/V partials.
+        std::vector<float> rms_scale(
+            static_cast<size_t>(tokens),
+            0.0f);
+
+        for (int32_t t = 0;
+             t < tokens;
+             ++t) {
+            double sum_sq = 0.0;
+            const float * row =
+                host_input.data() +
+                static_cast<size_t>(t) *
+                    static_cast<size_t>(
+                        n_embd);
+
+            for (int32_t i = 0;
+                 i < n_embd;
+                 ++i) {
+                const double x =
+                    static_cast<double>(
+                        row[i]);
+                sum_sq += x * x;
+            }
+
+            rms_scale[
+                static_cast<size_t>(t)] =
+                static_cast<float>(
+                    1.0 /
+                    std::sqrt(
+                        sum_sq /
+                            static_cast<double>(
+                                n_embd) +
+                        static_cast<double>(
+                            hp.f_norm_rms_eps)));
+        }
+
+        struct slice_graph {
+            std::shared_ptr<graph_hold> state;
+            ggml_tensor * input = nullptr;
+            ggml_tensor * q = nullptr;
+            ggml_tensor * k = nullptr;
+            ggml_tensor * v = nullptr;
+            ggml_cgraph * graph = nullptr;
+        };
+
+        std::vector<slice_graph> slice_graphs(
+            k_slices);
+        result.qkv_slice_ms.assign(
+            k_slices,
+            0.0);
+
+        std::vector<float> q_combined(
+            q_count,
+            0.0f);
+        std::vector<float> k_combined(
+            k_count,
+            0.0f);
+        std::vector<float> v_combined(
+            v_count,
+            0.0f);
+
+        for (int slice = 0;
+             slice < k_slices;
+             ++slice) {
+            const materialized_attn_slice & shard =
+                stream_attn_slices[
+                    static_cast<size_t>(
+                        slice)];
+
+            slice_graph & sg =
+                slice_graphs[
+                    static_cast<size_t>(
+                        slice)];
+            sg.state =
+                new_graph_hold();
+            if (sg.state == nullptr) {
+                error =
+                    "failed to create sliced QKV benchmark context";
+                return false;
+            }
+
+            sg.input =
+                ggml_new_tensor_2d(
+                    sg.state->ctx,
+                    GGML_TYPE_F32,
+                    shard.width,
+                    tokens);
+
+            ggml_tensor * weighted =
+                ggml_mul(
+                    sg.state->ctx,
+                    sg.input,
+                    shard.gamma);
+
+            sg.q =
+                ggml_mul_mat(
+                    sg.state->ctx,
+                    shard.wq,
+                    weighted);
+            sg.k =
+                ggml_mul_mat(
+                    sg.state->ctx,
+                    shard.wk,
+                    weighted);
+            sg.v =
+                ggml_mul_mat(
+                    sg.state->ctx,
+                    shard.wv,
+                    weighted);
+
+            sg.graph =
+                ggml_new_graph_custom(
+                    sg.state->ctx,
+                    256,
+                    false);
+            ggml_build_forward_expand(
+                sg.graph,
+                sg.q);
+            ggml_build_forward_expand(
+                sg.graph,
+                sg.k);
+            ggml_build_forward_expand(
+                sg.graph,
+                sg.v);
+
+            if (!allocate_state(
+                    sg.state,
+                    error)) {
+                return false;
+            }
+
+            std::vector<float> slice_input(
+                static_cast<size_t>(
+                    shard.width) *
+                static_cast<size_t>(
+                    tokens));
+
+            for (int32_t t = 0;
+                 t < tokens;
+                 ++t) {
+                std::memcpy(
+                    slice_input.data() +
+                        static_cast<size_t>(t) *
+                            static_cast<size_t>(
+                                shard.width),
+                    host_input.data() +
+                        static_cast<size_t>(t) *
+                            static_cast<size_t>(
+                                n_embd) +
+                        static_cast<size_t>(
+                            shard.begin),
+                    static_cast<size_t>(
+                        shard.width) *
+                        sizeof(float));
+            }
+
+            ggml_backend_tensor_set(
+                sg.input,
+                slice_input.data(),
+                0,
+                slice_input.size() *
+                    sizeof(float));
+
+            if (!measure_graph(
+                    sg.graph,
+                    result.qkv_slice_ms[
+                        static_cast<size_t>(
+                            slice)])) {
+                return false;
+            }
+
+            std::vector<float> q_part(
+                q_count);
+            std::vector<float> k_part(
+                k_count);
+            std::vector<float> v_part(
+                v_count);
+
+            ggml_backend_tensor_get(
+                sg.q,
+                q_part.data(),
+                0,
+                q_part.size() *
+                    sizeof(float));
+            ggml_backend_tensor_get(
+                sg.k,
+                k_part.data(),
+                0,
+                k_part.size() *
+                    sizeof(float));
+            ggml_backend_tensor_get(
+                sg.v,
+                v_part.data(),
+                0,
+                v_part.size() *
+                    sizeof(float));
+
+            const size_t q_width =
+                static_cast<size_t>(
+                    layer.wq->ne[1]);
+            const size_t k_width =
+                static_cast<size_t>(
+                    layer.wk->ne[1]);
+            const size_t v_width =
+                static_cast<size_t>(
+                    layer.wv->ne[1]);
+
+            for (int32_t t = 0;
+                 t < tokens;
+                 ++t) {
+                const float scale =
+                    rms_scale[
+                        static_cast<size_t>(t)];
+
+                const size_t q_base =
+                    static_cast<size_t>(t) *
+                    q_width;
+                const size_t k_base =
+                    static_cast<size_t>(t) *
+                    k_width;
+                const size_t v_base =
+                    static_cast<size_t>(t) *
+                    v_width;
+
+                for (size_t i = 0;
+                     i < q_width;
+                     ++i) {
+                    q_combined[
+                        q_base + i] +=
+                        q_part[
+                            q_base + i] *
+                        scale;
+                }
+                for (size_t i = 0;
+                     i < k_width;
+                     ++i) {
+                    k_combined[
+                        k_base + i] +=
+                        k_part[
+                            k_base + i] *
+                        scale;
+                }
+                for (size_t i = 0;
+                     i < v_width;
+                     ++i) {
+                    v_combined[
+                        v_base + i] +=
+                        v_part[
+                            v_base + i] *
+                        scale;
+                }
+            }
+        }
+
+        double diff_sq = 0.0;
+        double ref_sq = 0.0;
+        double max_abs = 0.0;
+
+        auto compare =
+            [&](const std::vector<float> & ref,
+                const std::vector<float> & got) {
+                for (size_t i = 0;
+                     i < ref.size();
+                     ++i) {
+                    const double a =
+                        static_cast<double>(
+                            ref[i]);
+                    const double b =
+                        static_cast<double>(
+                            got[i]);
+                    const double d =
+                        a - b;
+                    diff_sq += d * d;
+                    ref_sq += a * a;
+                    max_abs =
+                        std::max(
+                            max_abs,
+                            std::fabs(d));
+                }
+            };
+
+        compare(
+            q_full,
+            q_combined);
+        compare(
+            k_full,
+            k_combined);
+        compare(
+            v_full,
+            v_combined);
+
+        result.qkv_rel_rms =
+            std::sqrt(
+                diff_sq /
+                std::max(
+                    1e-30,
+                    ref_sq));
+        result.qkv_max_abs =
+            max_abs;
+
+        // Measure the final four-way accumulation and per-token RMS scalar.
+        // The slice projection outputs remain device-resident and are consumed
+        // directly by this graph.
+        auto combine_state =
+            new_graph_hold();
+        if (combine_state == nullptr) {
+            error =
+                "failed to create QKV combine benchmark context";
+            return false;
+        }
+
+        ggml_tensor * scale_tensor =
+            ggml_new_tensor_2d(
+                combine_state->ctx,
+                GGML_TYPE_F32,
+                1,
+                tokens);
+
+        auto combine_four =
+            [&](ggml_tensor * a,
+                ggml_tensor * b,
+                ggml_tensor * c,
+                ggml_tensor * d) {
+                ggml_tensor * ab =
+                    ggml_add(
+                        combine_state->ctx,
+                        a,
+                        b);
+                ggml_tensor * cd =
+                    ggml_add(
+                        combine_state->ctx,
+                        c,
+                        d);
+                ggml_tensor * sum =
+                    ggml_add(
+                        combine_state->ctx,
+                        ab,
+                        cd);
+                return ggml_mul(
+                    combine_state->ctx,
+                    sum,
+                    scale_tensor);
+            };
+
+        ggml_tensor * q_scaled =
+            combine_four(
+                slice_graphs[0].q,
+                slice_graphs[1].q,
+                slice_graphs[2].q,
+                slice_graphs[3].q);
+        ggml_tensor * k_scaled =
+            combine_four(
+                slice_graphs[0].k,
+                slice_graphs[1].k,
+                slice_graphs[2].k,
+                slice_graphs[3].k);
+        ggml_tensor * v_scaled =
+            combine_four(
+                slice_graphs[0].v,
+                slice_graphs[1].v,
+                slice_graphs[2].v,
+                slice_graphs[3].v);
+
+        ggml_cgraph * combine_graph =
+            ggml_new_graph_custom(
+                combine_state->ctx,
+                256,
+                false);
+        ggml_build_forward_expand(
+            combine_graph,
+            q_scaled);
+        ggml_build_forward_expand(
+            combine_graph,
+            k_scaled);
+        ggml_build_forward_expand(
+            combine_graph,
+            v_scaled);
+
+        if (!allocate_state(
+                combine_state,
+                error)) {
+            return false;
+        }
+
+        ggml_backend_tensor_set(
+            scale_tensor,
+            rms_scale.data(),
+            0,
+            rms_scale.size() *
+                sizeof(float));
+
+        if (!measure_graph(
+                combine_graph,
+                result.combine_ms)) {
+            return false;
+        }
+
+        // Full current owner-prefix compute, excluding all host readback/TCP.
+        auto prefix_state =
+            new_graph_hold();
+        if (prefix_state == nullptr) {
+            error =
+                "failed to create full prefix benchmark context";
+            return false;
+        }
+
+        ggml_tensor * prefix_input =
+            ggml_new_tensor_2d(
+                prefix_state->ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                tokens);
+
+        prefix_nodes prefix;
+        std::vector<int32_t> pos_data;
+        std::vector<ggml_fp16_t> mask_data;
+
+        if (!build_prefix(
+                task,
+                prefix_state->ctx,
+                prefix_input,
+                prefix,
+                pos_data,
+                mask_data,
+                error)) {
+            return false;
+        }
+
+        ggml_cgraph * prefix_graph =
+            ggml_new_graph_custom(
+                prefix_state->ctx,
+                2048,
+                false);
+        ggml_build_forward_expand(
+            prefix_graph,
+            prefix.k_write);
+        ggml_build_forward_expand(
+            prefix_graph,
+            prefix.v_write);
+        ggml_build_forward_expand(
+            prefix_graph,
+            prefix.weights);
+
+        if (!allocate_state(
+                prefix_state,
+                error)) {
+            return false;
+        }
+
+        ggml_backend_tensor_set(
+            prefix_input,
+            host_input.data(),
+            0,
+            host_input.size() *
+                sizeof(float));
+        ggml_backend_tensor_set(
+            prefix.pos,
+            pos_data.data(),
+            0,
+            pos_data.size() *
+                sizeof(int32_t));
+        ggml_backend_tensor_set(
+            prefix.mask,
+            mask_data.data(),
+            0,
+            mask_data.size() *
+                sizeof(ggml_fp16_t));
+
+        if (!measure_graph(
+                prefix_graph,
+                result.prefix_full_ms)) {
+            return false;
+        }
+
+        return true;
+    }
+
     bool run_owner_prefix(
             const key & task,
             const std::vector<float> & host_input,
