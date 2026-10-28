@@ -791,13 +791,24 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                  ci < group_end; ++ci) {
                 const int64_t count =
                     wave_chunk_sizes[ci];
-                ggml_tensor * ffn_inp =
-                    ggml_view_2d(
-                        ctx0, group_ffn_inp,
-                        group_ffn_inp->ne[0], count,
-                        group_ffn_inp->nb[1],
-                        group_offset_tokens *
-                            group_ffn_inp->nb[1]);
+                // In the exact directional wavefront each Attention group
+                // is one XT chunk. Reuse the real residual ADD as the chunk
+                // object instead of creating a sibling VIEW and force-expanding
+                // it. The ADD is already a dependency of group_ffn_norm, so it
+                // is naturally materialized on the Attention owner without
+                // perturbing subgraph boundaries.
+                ggml_tensor * ffn_inp = nullptr;
+                if (group_end - group_start == 1) {
+                    ffn_inp = group_ffn_inp;
+                } else {
+                    ffn_inp =
+                        ggml_view_2d(
+                            ctx0, group_ffn_inp,
+                            group_ffn_inp->ne[0], count,
+                            group_ffn_inp->nb[1],
+                            group_offset_tokens *
+                                group_ffn_inp->nb[1]);
+                }
                 const std::string ffn_inp_name =
                     "prefill_wave_ffn_inp_chunk_" +
                     std::to_string(ci);
@@ -805,15 +816,6 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     ffn_inp,
                     ffn_inp_name.c_str(),
                     wave_layer);
-
-                // The directional Reduce(L,C) consumes this exact residual
-                // before the final layer output graph is materialized. Make
-                // the named chunk view an explicit graph object now, rather
-                // than letting it appear only later as src[1] of
-                // prefill_wave_l_out_chunk_*. This also keeps the residual on
-                // the Attention owner (Phone for P2C) where Meta can resolve
-                // it by its exact (layer,chunk) name.
-                ggml_build_forward_expand(gf, ffn_inp);
 
                 ggml_tensor * ffn_norm =
                     ggml_view_2d(
