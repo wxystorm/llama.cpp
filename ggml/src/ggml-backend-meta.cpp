@@ -20639,13 +20639,38 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    while (!pending_phone_prefill_pc_branches.empty()) {
-        const int pending_layer =
-            pending_phone_prefill_pc_branches.front().layer;
-        const ggml_status drain_status =
-            drain_phone_prefill_pc_layer(pending_layer);
-        if (drain_status != GGML_STATUS_SUCCESS) {
-            return drain_status;
+    if (experiment_tensor_wavefront) {
+        // Directional-wave P2C branches are completed by the exact per-chunk
+        // REDUCE tasks above. The legacy phone-prefill drain would wait/send
+        // the same PC partial a second time and can deadlock after the ready
+        // scheduler has already consumed it.
+        const ggml_status reduce_status =
+            wait_all_prefill_reduces(nullptr);
+        if (reduce_status != GGML_STATUS_SUCCESS) {
+            return reduce_status;
+        }
+        for (const auto & branch : pending_phone_prefill_pc_branches) {
+            pending_phone_prefill_routes.erase(
+                { branch.layer, branch.chunk });
+            deferred_phone_prefill_return_sgs.erase(branch.sg);
+        }
+        if (pipeline_debug &&
+                !pending_phone_prefill_pc_branches.empty()) {
+            printf(
+                "[TENSOR_READY_DRAIN] mode=DIRECTIONAL "
+                "branches=%zu action=CLEAR_AFTER_REDUCE\n",
+                pending_phone_prefill_pc_branches.size());
+        }
+        pending_phone_prefill_pc_branches.clear();
+    } else {
+        while (!pending_phone_prefill_pc_branches.empty()) {
+            const int pending_layer =
+                pending_phone_prefill_pc_branches.front().layer;
+            const ggml_status drain_status =
+                drain_phone_prefill_pc_layer(pending_layer);
+            if (drain_status != GGML_STATUS_SUCCESS) {
+                return drain_status;
+            }
         }
     }
 
