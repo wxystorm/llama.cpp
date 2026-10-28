@@ -478,6 +478,97 @@ struct ggml_compute::impl {
             }
         }
 
+        if (device_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            auto check_gpu_tensor =
+                [&](int il,
+                    const char * name,
+                    const ggml_tensor * tensor) -> bool {
+                    if (tensor == nullptr) {
+                        error =
+                            std::string("missing tensor: ") +
+                            name;
+                        return false;
+                    }
+
+                    const char * buffer_name =
+                        tensor->buffer != nullptr ?
+                            ggml_backend_buffer_name(
+                                tensor->buffer) :
+                            "NULL";
+
+                    std::fprintf(
+                        stderr,
+                        "[LT_GGML_WEIGHT] side=%s layer=%d "
+                        "tensor=%s buffer=%s extra=%p\n",
+                        side_name(config.local_side),
+                        il,
+                        name,
+                        buffer_name,
+                        tensor->extra);
+
+                    if (tensor->buffer == nullptr ||
+                        tensor->extra == nullptr) {
+                        std::ostringstream oss;
+                        oss << "GPU tensor is not backend-resident: layer="
+                            << il
+                            << " tensor=" << name
+                            << " buffer=" << buffer_name
+                            << " extra=" << tensor->extra;
+                        error = oss.str();
+                        return false;
+                    }
+
+                    return true;
+                };
+
+            for (int il = 0;
+                 il < config.runtime_plan.layers;
+                 ++il) {
+                const llama_layer & layer =
+                    model->layers[
+                        static_cast<size_t>(il)];
+
+                if (!check_gpu_tensor(
+                        il, "attn_norm",
+                        layer.attn_norm) ||
+                    !check_gpu_tensor(
+                        il, "wq",
+                        layer.wq) ||
+                    !check_gpu_tensor(
+                        il, "wk",
+                        layer.wk) ||
+                    !check_gpu_tensor(
+                        il, "wv",
+                        layer.wv) ||
+                    !check_gpu_tensor(
+                        il, "wo",
+                        layer.wo) ||
+                    !check_gpu_tensor(
+                        il, "attn_q_norm",
+                        layer.attn_q_norm) ||
+                    !check_gpu_tensor(
+                        il, "attn_k_norm",
+                        layer.attn_k_norm) ||
+                    !check_gpu_tensor(
+                        il, "ffn_norm",
+                        layer.ffn_norm) ||
+                    !check_gpu_tensor(
+                        il, "ffn_gate_inp",
+                        layer.ffn_gate_inp) ||
+                    !check_gpu_tensor(
+                        il, "ffn_gate_exps",
+                        layer.ffn_gate_exps) ||
+                    !check_gpu_tensor(
+                        il, "ffn_up_exps",
+                        layer.ffn_up_exps) ||
+                    !check_gpu_tensor(
+                        il, "ffn_down_exps",
+                        layer.ffn_down_exps)) {
+                    return false;
+                }
+            }
+        }
+
         backend = ggml_backend_dev_init(
             device,
             nullptr);
