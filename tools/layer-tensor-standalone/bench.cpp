@@ -818,6 +818,400 @@ int run_ffn_split_selfcheck(
     return 0;
 }
 
+int run_stream_precompute_bench(
+        const options & opts) {
+    if (opts.connect_endpoint.empty() ||
+        opts.model_path.empty() ||
+        opts.prompt_file.empty()) {
+        std::fprintf(
+            stderr,
+            "--connect, --model and --prompt-file are required "
+            "for --stream-precompute-bench\n");
+        return 2;
+    }
+
+    std::string error;
+    std::string prompt;
+
+    if (!lt::read_text_file(
+            opts.prompt_file,
+            prompt,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=PROMPT status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    std::vector<int32_t> tokens;
+    if (!lt::tokenize_prompt(
+            opts.model_path,
+            prompt,
+            tokens,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=TOKENIZE status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    if (tokens.empty()) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=TOKENIZE status=FAIL "
+            "reason=EMPTY_PROMPT\n");
+        return 2;
+    }
+
+    const int32_t bench_tokens =
+        static_cast<int32_t>(
+            std::min<size_t>(
+                tokens.size(),
+                static_cast<size_t>(
+                    opts.chunk_tokens)));
+
+    options diag = opts;
+    diag.execution_mode =
+        lt::mode::layer;
+    diag.layers = 1;
+    diag.layer_owners = {
+        lt::side::phone
+    };
+    diag.debug_phone_partial = false;
+
+    const std::vector<int32_t> chunk_sizes {
+        bench_tokens
+    };
+
+    const lt::plan runtime_plan =
+        make_plan(
+            diag,
+            &chunk_sizes);
+
+    std::string reason;
+    if (!runtime_plan.valid(&reason)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=PLAN status=FAIL reason=%s\n",
+            reason.c_str());
+        return 2;
+    }
+
+    auto channel =
+        std::make_shared<lt::tcp_channel>();
+
+    if (!channel->connect_to(
+            opts.connect_endpoint,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=CONNECT status=FAIL reason=%s\n",
+            error.c_str());
+        return 3;
+    }
+
+    if (!channel->send_plan(
+            runtime_plan)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=PLAN_TX status=FAIL\n");
+        return 3;
+    }
+
+    lt::ggml_compute_config compute_config;
+    compute_config.local_side =
+        lt::side::pc;
+    compute_config.runtime_plan =
+        runtime_plan;
+    compute_config.model_path =
+        opts.model_path;
+    compute_config.device =
+        opts.device;
+    compute_config.threads =
+        opts.threads;
+    compute_config.log_events = false;
+
+    auto compute =
+        lt::ggml_compute::create(
+            std::move(compute_config),
+            error);
+
+    if (compute == nullptr) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=PC_MODEL status=FAIL reason=%s\n",
+            error.c_str());
+        return 4;
+    }
+
+    std::vector<int32_t> bench_token_ids(
+        tokens.begin(),
+        tokens.begin() +
+            static_cast<std::ptrdiff_t>(
+                bench_tokens));
+
+    std::vector<float> embedded;
+    if (!compute->embed_tokens(
+            bench_token_ids,
+            embedded,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=EMBED status=FAIL reason=%s\n",
+            error.c_str());
+        return 4;
+    }
+
+    lt::message worker_ready;
+    if (!channel->recv_message(
+            worker_ready) ||
+        worker_ready.kind !=
+            lt::message_kind::model_ready) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=PHONE_MODEL_READY status=FAIL\n");
+        return 4;
+    }
+
+    const int warmup =
+        std::min(
+            2,
+            opts.stream_repeats);
+
+    auto network_roundtrip =
+        [&](bool measured,
+            double & total_ms) -> bool {
+            lt::message ping;
+            ping.kind =
+                lt::message_kind::bench_ping;
+            ping.task = { 0, 0 };
+            ping.hidden =
+                embedded;
+
+            const auto begin =
+                std::chrono::steady_clock::now();
+
+            if (!channel->send_message(
+                    ping)) {
+                return false;
+            }
+
+            lt::message pong;
+            if (!channel->recv_message(
+                    pong) ||
+                pong.kind !=
+                    lt::message_kind::bench_pong) {
+                return false;
+            }
+
+            const auto end =
+                std::chrono::steady_clock::now();
+
+            if (measured) {
+                total_ms +=
+                    std::chrono::duration<
+                        double,
+                        std::milli>(
+                        end - begin).count();
+            }
+            return true;
+        };
+
+    double net_total_ms = 0.0;
+
+    for (int i = 0;
+         i < warmup;
+         ++i) {
+        if (!network_roundtrip(
+                false,
+                net_total_ms)) {
+            std::fprintf(
+                stderr,
+                "[LT_STREAM] phase=NET_WARMUP status=FAIL\n");
+            return 5;
+        }
+    }
+
+    for (int i = 0;
+         i < opts.stream_repeats;
+         ++i) {
+        if (!network_roundtrip(
+                true,
+                net_total_ms)) {
+            std::fprintf(
+                stderr,
+                "[LT_STREAM] phase=NET status=FAIL\n");
+            return 5;
+        }
+    }
+
+    // Request carries the real 64-token embedding once. The Phone performs
+    // all compute timing locally; model-load/materialization time is outside
+    // the reported compute measurements.
+    lt::message request;
+    request.kind =
+        lt::message_kind::stream_bench_request;
+    request.task = { 0, 0 };
+    request.hidden =
+        embedded;
+    request.partial = {
+        static_cast<float>(
+            opts.stream_repeats)
+    };
+
+    if (!channel->send_message(
+            request)) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=REQUEST status=FAIL\n");
+        return 5;
+    }
+
+    lt::message response;
+    if (!channel->recv_message(
+            response) ||
+        response.kind !=
+            lt::message_kind::stream_bench_result ||
+        response.hidden.size() < 9) {
+        std::fprintf(
+            stderr,
+            "[LT_STREAM] phase=RESULT status=FAIL "
+            "values=%zu\n",
+            response.hidden.size());
+        return 5;
+    }
+
+    const double prefix_full_ms =
+        response.hidden[0];
+    const double qkv_full_ms =
+        response.hidden[1];
+    const double combine_ms =
+        response.hidden[2];
+    const double qkv_rel_rms =
+        response.hidden[3];
+    const double qkv_max_abs =
+        response.hidden[4];
+
+    std::vector<double> slice_ms(4);
+    for (size_t i = 0;
+         i < slice_ms.size();
+         ++i) {
+        slice_ms[i] =
+            response.hidden[5 + i];
+    }
+
+    const double net_hidden_ms =
+        net_total_ms /
+        static_cast<double>(
+            opts.stream_repeats);
+
+    // bench_ping sends the full hidden payload and receives only a tiny ACK,
+    // so this elapsed time is a practical PC->Phone transfer estimate rather
+    // than RTT/2.
+    const double net_slice_ms =
+        net_hidden_ms / 4.0;
+
+    double slice_sum_ms = 0.0;
+    for (double value :
+         slice_ms) {
+        slice_sum_ms += value;
+    }
+
+    // Current path:
+    //   full hidden transfer -> full owner prefix.
+    const double serial_ms =
+        net_hidden_ms +
+        prefix_full_ms;
+
+    // Four-stage streaming event simulation. Slice i can start computing only
+    // when both its bytes have arrived and the previous slice GEMM has freed
+    // the Phone compute queue.
+    double arrival_ms = 0.0;
+    double compute_end_ms = 0.0;
+
+    for (double value :
+         slice_ms) {
+        arrival_ms +=
+            net_slice_ms;
+        compute_end_ms =
+            std::max(
+                compute_end_ms,
+                arrival_ms) +
+            value;
+    }
+
+    const double post_qkv_est_ms =
+        std::max(
+            0.0,
+            prefix_full_ms -
+                qkv_full_ms);
+
+    const double predicted_stream_ms =
+        compute_end_ms +
+        combine_ms +
+        post_qkv_est_ms;
+
+    const double predicted_speedup =
+        predicted_stream_ms > 0.0 ?
+            serial_ms /
+                predicted_stream_ms :
+            0.0;
+
+    const double hidden_mib =
+        static_cast<double>(
+            embedded.size() *
+            sizeof(float)) /
+        (1024.0 * 1024.0);
+
+    std::printf(
+        "[LT_STREAM_PRECOMPUTE] tokens=%d hidden=%d "
+        "hidden_mib=%.3f repeats=%d "
+        "net_hidden_ms=%.3f net_slice_ms=%.3f "
+        "prefix_full_ms=%.3f qkv_full_ms=%.3f "
+        "slice0_ms=%.3f slice1_ms=%.3f "
+        "slice2_ms=%.3f slice3_ms=%.3f "
+        "slice_sum_ms=%.3f combine_ms=%.3f "
+        "post_qkv_est_ms=%.3f "
+        "serial_ms=%.3f predicted_stream_ms=%.3f "
+        "predicted_speedup=%.3fx "
+        "qkv_rel_rms=%.6g qkv_max_abs=%.6g "
+        "status=%s\n",
+        bench_tokens,
+        compute->n_embd(),
+        hidden_mib,
+        opts.stream_repeats,
+        net_hidden_ms,
+        net_slice_ms,
+        prefix_full_ms,
+        qkv_full_ms,
+        slice_ms[0],
+        slice_ms[1],
+        slice_ms[2],
+        slice_ms[3],
+        slice_sum_ms,
+        combine_ms,
+        post_qkv_est_ms,
+        serial_ms,
+        predicted_stream_ms,
+        predicted_speedup,
+        qkv_rel_rms,
+        qkv_max_abs,
+        qkv_rel_rms <= 0.03 ?
+            "PASS" :
+            "NUMERIC_WARN");
+
+    lt::message stop;
+    stop.kind =
+        lt::message_kind::stop;
+    (void) channel->send_message(
+        stop);
+    channel->close();
+
+    return 0;
+}
+
 int run_real(
         const options & opts) {
     if (opts.connect_endpoint.empty() ||
