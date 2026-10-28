@@ -256,6 +256,7 @@ def build_command(args: argparse.Namespace) -> List[str]:
         "-n", "1",
         "--seed", str(args.seed),
         "--no-conversation",
+        "--single-turn",
         "-lv", str(args.log_verbosity),
     ]
     if args.prompt_file:
