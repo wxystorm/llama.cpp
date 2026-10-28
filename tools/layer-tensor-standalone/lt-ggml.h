@@ -57,6 +57,13 @@ public:
         std::string & report,
         std::string & error);
 
+    bool ffn_shard_reference(
+        const key & task,
+        const ready_payload & ready,
+        side shard_side,
+        std::vector<float> & partial,
+        std::string & error);
+
     bool owner_prefix(
         const key & task,
         const std::vector<float> & input,
