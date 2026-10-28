@@ -384,9 +384,9 @@ def run_candidate(
             print(output_tail(text), flush=True)
             print("[BENCH_CHILD_TAIL_END]", flush=True)
             final_rc = proc.returncode if proc.returncode != 0 else 2
-            if loaded_layers is None:
+            if loaded_layers is None or "failed to load model" in text:
                 raise BenchStartupError(
-                    f"llama-cli failed before truncated model load; see {log_path}"
+                    f"llama-cli failed during benchmark model setup; see {log_path}"
                 )
             break
 
