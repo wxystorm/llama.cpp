@@ -10,6 +10,7 @@
 #  include <ws2tcpip.h>
 #else
 #  include <netdb.h>
+#  include <netinet/tcp.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #endif
@@ -170,6 +171,22 @@ intptr_t as_stored(native_socket value) {
     return static_cast<intptr_t>(value);
 }
 
+bool set_tcp_nodelay(
+        native_socket value,
+        std::string & error) {
+    int yes = 1;
+    if (setsockopt(
+            value,
+            IPPROTO_TCP,
+            TCP_NODELAY,
+            reinterpret_cast<const char *>(&yes),
+            sizeof(yes)) != 0) {
+        error = "setsockopt(TCP_NODELAY) failed";
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 tcp_channel::tcp_channel() = default;
@@ -236,6 +253,13 @@ bool tcp_channel::connect_to(
 
     if (connected == invalid_socket) {
         error = "connect failed";
+        return false;
+    }
+
+    if (!set_tcp_nodelay(
+            connected,
+            error)) {
+        close_socket(connected);
         return false;
     }
 
@@ -327,6 +351,13 @@ bool tcp_channel::listen_and_accept(
 
     if (accepted == invalid_socket) {
         error = "accept failed";
+        return false;
+    }
+
+    if (!set_tcp_nodelay(
+            accepted,
+            error)) {
+        close_socket(accepted);
         return false;
     }
 
