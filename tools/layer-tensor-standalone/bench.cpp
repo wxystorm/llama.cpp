@@ -17,6 +17,7 @@ namespace {
 
 struct options {
     bool self_test = false;
+    bool ffn_split_selfcheck = false;
     bool trace = false;
 
     std::string connect_endpoint;
@@ -49,6 +50,8 @@ void usage(const char * argv0) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s --self-test [--trace]\n"
+        "  %s --ffn-split-selfcheck --model MODEL.gguf --prompt-file prompt.txt "
+        "[--chunk-tokens N] [--pc-ratio R]\n"
         "  %s --connect HOST:PORT --model MODEL.gguf --prompt-file prompt.txt "
         "--mode tensor|layer --layers N --chunk-tokens N [options]\n\n"
         "real-model options:\n"
@@ -68,7 +71,7 @@ void usage(const char * argv0) {
         "reference self-test options:\n"
         "  --chunks N               synthetic chunk count\n"
         "  --hidden N               synthetic hidden width\n",
-        argv0, argv0);
+        argv0, argv0, argv0);
 }
 
 bool parse_side(
@@ -174,6 +177,8 @@ bool parse_options(
 
         if (arg == "--self-test") {
             opts.self_test = true;
+        } else if (arg == "--ffn-split-selfcheck") {
+            opts.ffn_split_selfcheck = true;
         } else if (arg == "--trace") {
             opts.trace = true;
         } else if (arg == "--connect") {
@@ -581,6 +586,172 @@ bool run_self_test_case(
     return true;
 }
 
+int run_ffn_split_selfcheck(
+        const options & opts) {
+    if (opts.model_path.empty() ||
+        opts.prompt_file.empty()) {
+        std::fprintf(
+            stderr,
+            "--model and --prompt-file are required "
+            "for --ffn-split-selfcheck\n");
+        return 2;
+    }
+
+    options diag = opts;
+    diag.execution_mode = lt::mode::tensor;
+    diag.layers = 1;
+    diag.first_owner = lt::side::pc;
+
+    std::string error;
+    std::string prompt;
+    if (!lt::read_text_file(
+            diag.prompt_file,
+            prompt,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_FFN_SPLIT_SELF] phase=PROMPT "
+            "status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    std::vector<int32_t> tokens;
+    if (!lt::tokenize_prompt(
+            diag.model_path,
+            prompt,
+            tokens,
+            error)) {
+        std::fprintf(
+            stderr,
+            "[LT_FFN_SPLIT_SELF] phase=TOKENIZE "
+            "status=FAIL reason=%s\n",
+            error.c_str());
+        return 2;
+    }
+
+    const std::vector<int32_t> chunk_sizes =
+        lt::split_prompt_chunks(
+            static_cast<int32_t>(
+                tokens.size()),
+            diag.chunk_tokens);
+    if (chunk_sizes.empty()) {
+        std::fprintf(
+            stderr,
+            "[LT_FFN_SPLIT_SELF] phase=CHUNK status=FAIL\n");
+        return 2;
+    }
+
+    const lt::plan runtime_plan =
+        make_plan(
+            diag,
+            &chunk_sizes);
+
+    std::string reason;
+    if (!runtime_plan.valid(&reason)) {
+        std::fprintf(
+            stderr,
+            "[LT_FFN_SPLIT_SELF] phase=PLAN "
+            "status=FAIL reason=%s\n",
+            reason.c_str());
+        return 2;
+    }
+
+    lt::ggml_compute_config compute_config;
+    compute_config.local_side =
+        lt::side::pc;
+    compute_config.runtime_plan =
+        runtime_plan;
+    compute_config.model_path =
+        diag.model_path;
+    compute_config.device = "cpu";
+    compute_config.threads =
+        diag.threads;
+    compute_config.log_events =
+        diag.trace;
+
+    auto compute =
+        lt::ggml_compute::create(
+            std::move(compute_config),
+            error);
+    if (compute == nullptr) {
+        std::fprintf(
+            stderr,
+            "[LT_FFN_SPLIT_SELF] phase=MODEL "
+            "status=FAIL reason=%s\n",
+            error.c_str());
+        return 4;
+    }
+
+    size_t token_offset = 0;
+    for (size_t chunk = 0;
+         chunk < chunk_sizes.size();
+         ++chunk) {
+        const size_t count =
+            static_cast<size_t>(
+                chunk_sizes[chunk]);
+
+        std::vector<int32_t> chunk_token_ids(
+            tokens.begin() +
+                static_cast<std::ptrdiff_t>(
+                    token_offset),
+            tokens.begin() +
+                static_cast<std::ptrdiff_t>(
+                    token_offset + count));
+
+        std::vector<float> embedded;
+        if (!compute->embed_tokens(
+                chunk_token_ids,
+                embedded,
+                error)) {
+            std::fprintf(
+                stderr,
+                "[LT_FFN_SPLIT_SELF] phase=EMBED chunk=%zu "
+                "status=FAIL reason=%s\n",
+                chunk,
+                error.c_str());
+            return 4;
+        }
+
+        std::string report;
+        const lt::key task {
+            0,
+            static_cast<int32_t>(chunk)
+        };
+
+        if (!compute->ffn_split_selfcheck(
+                task,
+                embedded,
+                diag.c2p_pc_ratio,
+                report,
+                error)) {
+            std::fprintf(
+                stderr,
+                "[LT_FFN_SPLIT_SELF] phase=CHECK chunk=%zu "
+                "status=FAIL reason=%s\n",
+                chunk,
+                error.c_str());
+            return 4;
+        }
+
+        std::printf(
+            "[LT_FFN_SPLIT_SELF] %s status=OBSERVED\n",
+            report.c_str());
+
+        token_offset += count;
+    }
+
+    std::printf(
+        "[LT_FFN_SPLIT_SELF] tokens=%zu chunks=%zu "
+        "XT=%d ratio=%.6f status=PASS\n",
+        tokens.size(),
+        chunk_sizes.size(),
+        diag.chunk_tokens,
+        diag.c2p_pc_ratio);
+
+    return 0;
+}
+
 int run_real(
         const options & opts) {
     if (opts.connect_endpoint.empty() ||
@@ -974,6 +1145,10 @@ int main(
             opts)) {
         usage(argv[0]);
         return 2;
+    }
+
+    if (opts.ffn_split_selfcheck) {
+        return run_ffn_split_selfcheck(opts);
     }
 
     if (opts.self_test) {
