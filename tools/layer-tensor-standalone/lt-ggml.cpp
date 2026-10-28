@@ -1107,6 +1107,11 @@ struct ggml_compute::impl {
         const size_t chunk_count =
             config.runtime_plan.chunk_tokens.size();
 
+        const bool independent_chunks =
+            config.local_side == side::phone &&
+            ggml_backend_dev_type(device) !=
+                GGML_BACKEND_DEVICE_TYPE_CPU;
+
         ggml_init_params params {};
         params.mem_size =
             (chunk_count + 40) *
@@ -1121,47 +1126,88 @@ struct ggml_compute::impl {
             return false;
         }
 
-        activation_root =
-            ggml_new_tensor_2d(
-                activation_ctx,
-                GGML_TYPE_F32,
-                n_embd,
-                total_tokens);
-
-        if (activation_root == nullptr) {
-            error =
-                "failed to create persistent activation arena";
-            return false;
-        }
-
         activation_chunks.resize(
             chunk_count,
             nullptr);
 
         int32_t token_begin = 0;
-        for (size_t chunk = 0;
-             chunk < chunk_count;
-             ++chunk) {
-            const int32_t tokens =
-                config.runtime_plan.chunk_tokens[chunk];
 
-            activation_chunks[chunk] =
-                ggml_view_2d(
+        if (independent_chunks) {
+            // OpenCL has already shown that backend-represented sub-views can
+            // have semantics different from the logical GGML view. Keep each
+            // chunk as an independent persistent tensor so local continuation
+            // never feeds an offset view directly into the next graph.
+            activation_root = nullptr;
+
+            for (size_t chunk = 0;
+                 chunk < chunk_count;
+                 ++chunk) {
+                const int32_t tokens =
+                    config.runtime_plan.chunk_tokens[chunk];
+
+                activation_chunks[chunk] =
+                    ggml_new_tensor_2d(
+                        activation_ctx,
+                        GGML_TYPE_F32,
+                        n_embd,
+                        tokens);
+
+                if (activation_chunks[chunk] == nullptr) {
+                    error =
+                        "failed to create independent activation chunk tensor";
+                    return false;
+                }
+
+                char name[GGML_MAX_NAME];
+                std::snprintf(
+                    name,
+                    sizeof(name),
+                    "lt.activation.chunk.%zu",
+                    chunk);
+                ggml_set_name(
+                    activation_chunks[chunk],
+                    name);
+
+                token_begin += tokens;
+            }
+        } else {
+            activation_root =
+                ggml_new_tensor_2d(
                     activation_ctx,
-                    activation_root,
+                    GGML_TYPE_F32,
                     n_embd,
-                    tokens,
-                    activation_root->nb[1],
-                    static_cast<size_t>(token_begin) *
-                        activation_root->nb[1]);
+                    total_tokens);
 
-            if (activation_chunks[chunk] == nullptr) {
+            if (activation_root == nullptr) {
                 error =
-                    "failed to create persistent activation chunk view";
+                    "failed to create persistent activation arena";
                 return false;
             }
 
-            token_begin += tokens;
+            for (size_t chunk = 0;
+                 chunk < chunk_count;
+                 ++chunk) {
+                const int32_t tokens =
+                    config.runtime_plan.chunk_tokens[chunk];
+
+                activation_chunks[chunk] =
+                    ggml_view_2d(
+                        activation_ctx,
+                        activation_root,
+                        n_embd,
+                        tokens,
+                        activation_root->nb[1],
+                        static_cast<size_t>(token_begin) *
+                            activation_root->nb[1]);
+
+                if (activation_chunks[chunk] == nullptr) {
+                    error =
+                        "failed to create persistent activation chunk view";
+                    return false;
+                }
+
+                token_begin += tokens;
+            }
         }
 
         if (token_begin != total_tokens) {
@@ -1184,10 +1230,12 @@ struct ggml_compute::impl {
             activation_buffer,
             0);
 
-        if (activation_root->buffer == nullptr ||
-            (ggml_backend_dev_type(device) !=
-                 GGML_BACKEND_DEVICE_TYPE_CPU &&
-             activation_root->extra == nullptr)) {
+        if (!independent_chunks &&
+            (activation_root == nullptr ||
+             activation_root->buffer == nullptr ||
+             (ggml_backend_dev_type(device) !=
+                  GGML_BACKEND_DEVICE_TYPE_CPU &&
+              activation_root->extra == nullptr))) {
             error =
                 "persistent activation root is not backend-ready";
             return false;
@@ -1196,21 +1244,27 @@ struct ggml_compute::impl {
         for (size_t chunk = 0;
              chunk < chunk_count;
              ++chunk) {
-            ggml_tensor * view =
+            ggml_tensor * tensor =
                 activation_chunks[chunk];
 
-            if (view->buffer == nullptr ||
+            if (tensor == nullptr ||
+                tensor->buffer == nullptr ||
                 (ggml_backend_dev_type(device) !=
                      GGML_BACKEND_DEVICE_TYPE_CPU &&
-                 view->extra == nullptr)) {
+                 tensor->extra == nullptr)) {
                 std::ostringstream oss;
-                oss << "persistent activation view is not backend-ready"
+                oss << "persistent activation chunk is not backend-ready"
                     << ": chunk=" << chunk
                     << " buffer="
-                    << (view->buffer != nullptr ?
-                        ggml_backend_buffer_name(view->buffer) :
+                    << (tensor != nullptr &&
+                        tensor->buffer != nullptr ?
+                        ggml_backend_buffer_name(
+                            tensor->buffer) :
                         "NULL")
-                    << " extra=" << view->extra;
+                    << " extra="
+                    << (tensor != nullptr ?
+                        tensor->extra :
+                        nullptr);
                 error = oss.str();
                 return false;
             }
@@ -1219,7 +1273,8 @@ struct ggml_compute::impl {
         std::fprintf(
             stderr,
             "[LT_GGML_ACTIVATION_ARENA] side=%s tokens=%d chunks=%zu "
-            "n_embd=%d bytes=%.3f MiB buffer=%s status=READY\n",
+            "n_embd=%d bytes=%.3f MiB buffer=%s "
+            "layout=%s status=READY\n",
             side_name(config.local_side),
             total_tokens,
             chunk_count,
@@ -1229,7 +1284,10 @@ struct ggml_compute::impl {
                     activation_buffer)) /
                 (1024.0 * 1024.0),
             ggml_backend_buffer_name(
-                activation_buffer));
+                activation_buffer),
+            independent_chunks ?
+                "INDEPENDENT_CHUNKS" :
+                "ROOT_VIEWS");
 
         return true;
     }
