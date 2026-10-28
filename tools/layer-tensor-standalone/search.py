@@ -131,6 +131,9 @@ def build_command(args, candidate):
             f"{candidate['ratio']:.8f}",
         ]
 
+    if candidate.get("debug_phone_partial"):
+        cmd.append("--debug-phone-partial")
+
     return cmd
 
 
@@ -412,6 +415,37 @@ def run_local_ffn_diagnostic(args, xt, ratio):
     )
 
 
+def run_phone_shard_diagnostic(args, xt, ratio, first_owner):
+    candidate = {
+        "mode": "tensor",
+        "layers": 1,
+        "xt": xt,
+        "first_owner": first_owner,
+        "ratio": ratio,
+        "debug_phone_partial": True,
+    }
+
+    print("=== PC reference vs Phone OpenCL shard diagnostic ===")
+    run = run_once(args, candidate, -3)
+
+    if run.get("stdout"):
+        for line in run["stdout"].splitlines():
+            if (
+                line.startswith("[LT_PHONE_SHARD_CHECK]")
+                or line.startswith("[LT_PHONE_SHARD_CHECK_SUM]")
+                or line.startswith("[LT_RUN]")
+            ):
+                print(line)
+
+    if not run.get("ok"):
+        print(
+            f"Phone shard diagnostic failed rc={run.get('returncode')}",
+            file=sys.stderr,
+        )
+        if run.get("stderr"):
+            print(run["stderr"].rstrip(), file=sys.stderr)
+
+
 def run_preflight(args, chunk_sizes, ratios, first_owners):
     print("=== numerical preflight (L=1) ===")
 
@@ -480,6 +514,12 @@ def run_preflight(args, chunk_sizes, ratios, first_owners):
                         args,
                         xt,
                         ratio,
+                    )
+                    run_phone_shard_diagnostic(
+                        args,
+                        xt,
+                        ratio,
+                        first_owner,
                     )
                     return False
 
