@@ -685,6 +685,22 @@ bool runtime::run_remote(const key & task) {
         return false;
     }
 
+    if (plan_.debug_phone_partial &&
+        local_side_ == side::phone &&
+        !partial.empty()) {
+        message debug;
+        debug.kind =
+            message_kind::debug_partial;
+        debug.task = task;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            debug.seq = next_seq_++;
+        }
+        debug.partial = partial;
+        enqueue_tx(std::move(debug));
+        log("DEBUG_PARTIAL_PUBLISH", task);
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tensor_state & state = tensor_states_[task];
