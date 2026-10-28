@@ -1900,6 +1900,139 @@ struct ggml_compute::impl {
         return true;
     }
 
+    bool run_ffn_shard_reference(
+            const key & task,
+            const ready_payload & ready,
+            side shard_side,
+            std::vector<float> & partial,
+            std::string & error) {
+        if (!validate_ready(
+                task,
+                ready,
+                error)) {
+            return false;
+        }
+
+        int64_t shard_begin = 0;
+        int64_t shard_width = 0;
+        if (!shard_for_side(
+                task,
+                shard_side,
+                shard_begin,
+                shard_width,
+                error)) {
+            return false;
+        }
+
+        const int32_t tokens =
+            chunk_tokens(task);
+
+        auto state = new_graph_hold();
+        if (state == nullptr) {
+            error =
+                "failed to create FFN shard reference context";
+            return false;
+        }
+
+        ggml_tensor * hidden =
+            ggml_new_tensor_2d(
+                state->ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                tokens);
+        ggml_tensor * ids =
+            ggml_new_tensor_2d(
+                state->ctx,
+                GGML_TYPE_I32,
+                n_expert_used,
+                tokens);
+        ggml_tensor * weights =
+            ggml_new_tensor_3d(
+                state->ctx,
+                GGML_TYPE_F32,
+                1,
+                n_expert_used,
+                tokens);
+
+        ggml_tensor * output =
+            build_moe_partial(
+                state->ctx,
+                task,
+                hidden,
+                ids,
+                weights,
+                shard_begin,
+                shard_width,
+                error);
+        if (output == nullptr) {
+            return false;
+        }
+
+        ggml_cgraph * graph =
+            ggml_new_graph_custom(
+                state->ctx,
+                1024,
+                false);
+        ggml_build_forward_expand(
+            graph,
+            output);
+
+        if (!allocate_state(
+                state,
+                error)) {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(
+                backend_mutex);
+
+            ggml_backend_tensor_set(
+                hidden,
+                ready.hidden.data(),
+                0,
+                ready.hidden.size() *
+                    sizeof(float));
+            ggml_backend_tensor_set(
+                ids,
+                ready.topk.data(),
+                0,
+                ready.topk.size() *
+                    sizeof(int32_t));
+            ggml_backend_tensor_set(
+                weights,
+                ready.weights.data(),
+                0,
+                ready.weights.size() *
+                    sizeof(float));
+
+            const ggml_status status =
+                ggml_backend_graph_compute(
+                    backend,
+                    graph);
+            ggml_backend_synchronize(
+                backend);
+
+            if (status != GGML_STATUS_SUCCESS) {
+                error =
+                    "FFN shard reference GGML compute failed";
+                return false;
+            }
+
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(tokens);
+            partial.resize(count);
+            ggml_backend_tensor_get(
+                output,
+                partial.data(),
+                0,
+                count * sizeof(float));
+        }
+
+        return true;
+    }
+
     bool run_remote_ffn(
             const key & task,
             const ready_payload & ready,
@@ -2032,14 +2165,31 @@ struct ggml_compute::impl {
         state->primary = output;
         state->residual = residual;
 
+        if (config.runtime_plan.debug_phone_partial &&
+            config.local_side == side::phone) {
+            const size_t count =
+                static_cast<size_t>(n_embd) *
+                static_cast<size_t>(tokens);
+            partial.resize(count);
+
+            std::lock_guard<std::mutex> lock(
+                backend_mutex);
+            ggml_backend_tensor_get(
+                output,
+                partial.data(),
+                0,
+                count * sizeof(float));
+        } else {
+            // Normal performance path: keep the local shard device-resident
+            // until REDUCE and avoid a host readback.
+            partial.clear();
+        }
+
         put_cache(
             remote_cache,
             task,
             state);
 
-        // This partial never crosses the network. Keep it device-local until
-        // REDUCE instead of forcing a host readback/re-upload.
-        partial.clear();
         return true;
     }
 
@@ -2809,6 +2959,20 @@ bool ggml_compute::ffn_split_selfcheck(
         input,
         pc_ratio,
         report,
+        error);
+}
+
+bool ggml_compute::ffn_shard_reference(
+        const key & task,
+        const ready_payload & ready,
+        side shard_side,
+        std::vector<float> & partial,
+        std::string & error) {
+    return impl_->run_ffn_shard_reference(
+        task,
+        ready,
+        shard_side,
+        partial,
         error);
 }
 
