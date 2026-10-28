@@ -22,6 +22,7 @@ namespace {
 struct options {
     bool self_test = false;
     bool ffn_split_selfcheck = false;
+    bool stream_precompute_bench = false;
     bool debug_phone_partial = false;
     bool trace = false;
 
@@ -43,6 +44,7 @@ struct options {
     int owner_burst = 1;
     int max_owner_ahead = 1;
     int threads = 8;
+    int stream_repeats = 10;
     lt::side first_owner = lt::side::pc;
 
     float c2p_pc_ratio = 0.5f;
@@ -57,6 +59,9 @@ void usage(const char * argv0) {
         "  %s --self-test [--trace]\n"
         "  %s --ffn-split-selfcheck --model MODEL.gguf --prompt-file prompt.txt "
         "[--chunk-tokens N] [--pc-ratio R]\n"
+        "  %s --stream-precompute-bench --connect HOST:PORT "
+        "--model MODEL.gguf --prompt-file prompt.txt "
+        "[--chunk-tokens N] [--stream-repeats N]\n"
         "  %s --connect HOST:PORT --model MODEL.gguf --prompt-file prompt.txt "
         "--mode tensor|layer --layers N --chunk-tokens N [options]\n\n"
         "real-model options:\n"
@@ -73,11 +78,13 @@ void usage(const char * argv0) {
         "  --max-owner-ahead N      Tensor frontier lead over downstream READY (default 1)\n"
         "  --threads N              PC CPU GGML threads (default 8)\n"
         "  --debug-phone-partial    diagnostic: compare Phone FFN shard with PC CPU reference\n"
+        "  --stream-precompute-bench measure 4-way streamed hidden->QKV overlap potential\n"
+        "  --stream-repeats N       compute/network repeats for stream microbench (default 10)\n"
         "  --trace                  print task transitions\n\n"
         "reference self-test options:\n"
         "  --chunks N               synthetic chunk count\n"
         "  --hidden N               synthetic hidden width\n",
-        argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0);
 }
 
 bool parse_side(
@@ -185,6 +192,8 @@ bool parse_options(
             opts.self_test = true;
         } else if (arg == "--ffn-split-selfcheck") {
             opts.ffn_split_selfcheck = true;
+        } else if (arg == "--stream-precompute-bench") {
+            opts.stream_precompute_bench = true;
         } else if (arg == "--debug-phone-partial") {
             opts.debug_phone_partial = true;
         } else if (arg == "--trace") {
@@ -284,6 +293,15 @@ bool parse_options(
                 !parse_int(
                     value,
                     opts.threads)) {
+                return false;
+            }
+        } else if (arg == "--stream-repeats") {
+            const char * value =
+                need_value("--stream-repeats");
+            if (value == nullptr ||
+                !parse_int(
+                    value,
+                    opts.stream_repeats)) {
                 return false;
             }
         } else if (arg == "--owner-burst") {
@@ -1340,6 +1358,10 @@ int main(
 
     if (opts.ffn_split_selfcheck) {
         return run_ffn_split_selfcheck(opts);
+    }
+
+    if (opts.stream_precompute_bench) {
+        return run_stream_precompute_bench(opts);
     }
 
     if (opts.self_test) {
