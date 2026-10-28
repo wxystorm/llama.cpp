@@ -2134,7 +2134,7 @@ struct ggml_compute::impl {
                 ggml_tensor * arena_view =
                     activation_chunk_view(task);
 
-                if (slot == nullptr ||
+                if (arena_view == nullptr ||
                     arena_view->buffer == nullptr ||
                     (ggml_backend_dev_type(device) !=
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
@@ -2307,7 +2307,7 @@ struct ggml_compute::impl {
                 ggml_tensor * arena_view =
                     activation_chunk_view(task);
 
-                if (slot == nullptr ||
+                if (arena_view == nullptr ||
                     arena_view->buffer == nullptr ||
                     (ggml_backend_dev_type(device) !=
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
