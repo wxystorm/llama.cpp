@@ -219,10 +219,16 @@ llama_kv_cache::llama_kv_cache(
             // placement.  Put this layer's cache directly on CPU so the
             // causal Attention task can run on the single CPU executor without
             // touching the Phone/Meta execution path.
-            const bool sequence_ffn =
+            const char * ring_exec_env =
+                std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+            const bool sequence_ffn_direct =
                 model.hybrid_layer_mode((int) il) ==
-                    llama_hybrid_layer_mode::SEQUENCE_FFN;
-            auto * dev = sequence_ffn ?
+                    llama_hybrid_layer_mode::SEQUENCE_FFN &&
+                ring_exec_env != nullptr &&
+                std::strcmp(
+                    ring_exec_env,
+                    "fifo-pc-phone-seq") == 0;
+            auto * dev = sequence_ffn_direct ?
                 ggml_backend_dev_by_type(
                     GGML_BACKEND_DEVICE_TYPE_CPU) :
                 model.dev_layer(il);
@@ -233,7 +239,7 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
             dev_name = ggml_backend_dev_name(dev);
 
-            if (sequence_ffn &&
+            if (sequence_ffn_direct &&
                     std::getenv(
                         "LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
                 LLAMA_LOG_ERROR(
