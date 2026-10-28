@@ -225,6 +225,7 @@ rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
 
     rpc_phone_tensor_queue_kind best =
         rpc_phone_tensor_queue_kind::NONE;
+    const bool reduce_shape = graph->n_nodes == 1;
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * node = graph->nodes[i];
         if (node == nullptr) {
@@ -232,7 +233,8 @@ rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
         }
         const rpc_phone_tensor_queue_kind node_kind =
             classify_name(node->name);
-        if (node_kind == rpc_phone_tensor_queue_kind::REDUCE) {
+        if (node_kind == rpc_phone_tensor_queue_kind::REDUCE &&
+                reduce_shape) {
             return node_kind;
         }
         if (node_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
@@ -248,7 +250,8 @@ rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
         if (node->view_src != nullptr) {
             const rpc_phone_tensor_queue_kind view_kind =
                 classify_name(node->view_src->name);
-            if (view_kind == rpc_phone_tensor_queue_kind::REDUCE) {
+            if (view_kind == rpc_phone_tensor_queue_kind::REDUCE &&
+                    reduce_shape) {
                 return view_kind;
             }
             if (view_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
@@ -265,7 +268,8 @@ rpc_tensor_phone_graph_queue_kind(const ggml_cgraph * graph) {
             }
             const rpc_phone_tensor_queue_kind src_kind =
                 classify_name(node->src[src]->name);
-            if (src_kind == rpc_phone_tensor_queue_kind::REDUCE) {
+            if (src_kind == rpc_phone_tensor_queue_kind::REDUCE &&
+                    reduce_shape) {
                 return src_kind;
             }
             if (src_kind == rpc_phone_tensor_queue_kind::REMOTE_FFN) {
