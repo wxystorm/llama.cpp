@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,47 @@ struct llama_region_ring_region {
     int layer_begin;
     int layer_end; // exclusive
 };
+
+// Shared Dense stage contract used by the runtime audit and unit tests.
+// Intermediate stages expose hidden state only; only a stage ending at the
+// final model layer may own the output head.  Embedding-only is a layer-0
+// prelude and therefore cannot simultaneously consume a hidden input.
+inline bool llama_region_ring_stage_contract_valid(
+        int n_layer,
+        int layer_begin,
+        int layer_end,
+        bool hidden_input,
+        bool output_head,
+        bool embedding_only) {
+    if (n_layer <= 0 ||
+            layer_begin < 0 ||
+            layer_begin >= layer_end ||
+            layer_end > n_layer ||
+            (layer_begin > 0 && !hidden_input) ||
+            (output_head && layer_end != n_layer) ||
+            (embedding_only &&
+             (layer_begin != 0 || hidden_input || output_head))) {
+        return false;
+    }
+    return true;
+}
+
+// Weight Streaming V1.5 has a fixed two-Bank rolling window.  Keeping these
+// tiny policy helpers shared prevents the runtime and tests from silently
+// drifting on parity or lookahead semantics.
+inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
+    return rank & 1u;
+}
+
+inline std::optional<size_t> llama_region_ring_gpu_weight_next_rank(
+        size_t rank, size_t gpu_region_count) {
+    if (rank > std::numeric_limits<size_t>::max() - 2) {
+        return std::nullopt;
+    }
+    const size_t next = rank + 2;
+    return next < gpu_region_count ?
+        std::optional<size_t>(next) : std::nullopt;
+}
 
 // Exact intersection of disjoint PC execution intervals with disjoint
 // Phone-compute intervals. Both vectors are written by their owner threads
