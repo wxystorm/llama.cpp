@@ -351,8 +351,9 @@ def parse_run_output(
         top1_logit = float(m.group(5))
 
     wavefront_seen = WAVEFRONT_RE.search(text) is not None
-    diagonal_wave_schedule_seen =
+    diagonal_wave_schedule_seen = (
         DIAGONAL_WAVE_SCHEDULE_RE.search(text) is not None
+    )
     wave_summaries = list(WAVEFRONT_SUM_RE.finditer(text))
     wavefront_overlap_boundaries: Optional[int] = None
     wavefront_ahead_attn: Optional[int] = None
