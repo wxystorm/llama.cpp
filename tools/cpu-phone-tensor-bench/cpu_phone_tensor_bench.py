@@ -152,7 +152,11 @@ def sanitize_env(base: Dict[str, str]) -> Dict[str, str]:
     }
     prefixes = (
         "LLAMA_HYBRID_FIXED_",
-        "LLAMA_HYBRID_REGION_RING_PLAN_",
+        # This benchmark is intentionally independent from every Region Ring
+        # planner/runtime mode. In particular, PLANNER is not covered by the
+        # older REGION_RING_PLAN_ prefix and can leak apply-wide from a prior
+        # PowerShell session.
+        "LLAMA_HYBRID_REGION_RING_",
     )
     for key in list(env):
         if key in exact or any(key.startswith(prefix) for prefix in prefixes):
