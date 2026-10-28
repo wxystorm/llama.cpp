@@ -127,6 +127,18 @@ PC
   ...
 ```
 
+Tensor candidates enable the experiment-only directional return wavefront.
+The graph exposes chunk-local outputs and exact dependencies:
+
+```
+Reduce(L, c) -> OUT(L, c) -> Attention(L+1, c)
+```
+
+so a later layer no longer requires the whole previous layer to finish before
+its own chunk can become ready. The runtime prints
+`[HYBRID_EXPERIMENT_WAVEFRONT] enabled=1` when this graph is actually built.
+A Tensor run that does not emit that marker is rejected by the benchmark.
+
 For every `x`, the Tensor planner searches:
 
 - C2P physical PC FFN share;
@@ -191,10 +203,30 @@ To cap the full-layer planner's Phone residency:
 --max-phone-layers 4
 ```
 
+## Correctness gate
+
+Timing alone is not enough. For each `x`, the runner first executes the
+all-CPU policy and records its final prompt top-1 token as the reference.
+
+Every other Layer/Tensor candidate must satisfy all of these conditions before
+it can enter planner ranking:
+
+- full-vocabulary logits are present;
+- no non-finite logits are reported;
+- the entire logits tensor is not zero;
+- top-1 token matches the all-CPU reference;
+- Tensor candidates also prove the directional wavefront was built.
+
+The runner prints one `[BENCH_CORRECTNESS]` line per repetition. A candidate
+can complete and have a prompt time while still being marked `FAIL`; such a
+candidate is never eligible to win. This catches the previously observed
+all-zero P2C-last-layer output and Full-Phone placement divergences instead of
+silently ranking them by speed.
+
 ## Output
 
-For each `x`, both planners choose a measured winner and the runner then
-re-runs the two winners.
+For each `x`, both planners choose a measured **correct** winner and the
+runner then re-runs the two winners.
 
 The console summary is:
 
