@@ -231,6 +231,118 @@ int run_session(
         }
 
         if (incoming.kind ==
+            lt::message_kind::bench_ping) {
+            lt::message pong;
+            pong.kind =
+                lt::message_kind::bench_pong;
+            pong.task =
+                incoming.task;
+            pong.seq =
+                incoming.seq;
+
+            if (!channel->send_message(
+                    pong)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_STREAM_PHONE] phase=NET_PONG "
+                    "status=FAIL\n");
+                break;
+            }
+
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
+            lt::message_kind::stream_bench_request) {
+            int repeats = 10;
+            if (!incoming.partial.empty()) {
+                repeats =
+                    std::max(
+                        1,
+                        static_cast<int>(
+                            incoming.partial[0]));
+            }
+
+            lt::stream_precompute_result result;
+            std::string bench_error;
+
+            if (!compute->stream_precompute_bench(
+                    incoming.task,
+                    incoming.hidden,
+                    repeats,
+                    result,
+                    bench_error)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_STREAM_PHONE] phase=COMPUTE "
+                    "status=FAIL reason=%s\n",
+                    bench_error.c_str());
+                break;
+            }
+
+            lt::message response;
+            response.kind =
+                lt::message_kind::stream_bench_result;
+            response.task =
+                incoming.task;
+            response.seq =
+                incoming.seq;
+
+            response.hidden.reserve(
+                5 +
+                result.qkv_slice_ms.size());
+            response.hidden.push_back(
+                static_cast<float>(
+                    result.prefix_full_ms));
+            response.hidden.push_back(
+                static_cast<float>(
+                    result.qkv_full_ms));
+            response.hidden.push_back(
+                static_cast<float>(
+                    result.combine_ms));
+            response.hidden.push_back(
+                static_cast<float>(
+                    result.qkv_rel_rms));
+            response.hidden.push_back(
+                static_cast<float>(
+                    result.qkv_max_abs));
+
+            for (double value :
+                 result.qkv_slice_ms) {
+                response.hidden.push_back(
+                    static_cast<float>(
+                        value));
+            }
+
+            if (!channel->send_message(
+                    response)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_STREAM_PHONE] phase=RESULT "
+                    "status=FAIL\n");
+                break;
+            }
+
+            std::fprintf(
+                stderr,
+                "[LT_STREAM_PHONE] layer=%d chunk=%d "
+                "repeats=%d prefix_ms=%.3f qkv_ms=%.3f "
+                "combine_ms=%.3f rel_rms=%.6g "
+                "status=PASS\n",
+                incoming.task.layer,
+                incoming.task.chunk,
+                repeats,
+                result.prefix_full_ms,
+                result.qkv_full_ms,
+                result.combine_ms,
+                result.qkv_rel_rms);
+
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
             lt::message_kind::model_ready) {
             std::fprintf(
                 stderr,
