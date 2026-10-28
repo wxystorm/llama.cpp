@@ -91,8 +91,8 @@ struct model {
     // Keep this switch only so tests can compare the historical gated model.
     bool pc_compute_gate = false;
     // Runtime contract: logical CUDA layer count may exceed VRAM because
-    // weights are rolled through two persistent Banks. GPU Regions still
-    // execute strictly in model order.
+    // weights are rolled through two persistent Banks. Adjacent GPU Regions
+    // may interleave; only same-Bank rank k-2 lifetime is serialized.
     bool gpu_weight_streaming = false;
     double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
     // Return false when no measured/interpolated profile supports the shape.
