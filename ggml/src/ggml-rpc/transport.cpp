@@ -564,10 +564,12 @@ socket_t::socket_t(std::unique_ptr<impl> p) : pimpl(std::move(p)) {}
 socket_t::~socket_t() = default;
 
 bool socket_t::send_data(const void * data, size_t size) {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->rpc_mutex);
     return pimpl->send_data(data, size);
 }
 
 bool socket_t::recv_data(void * data, size_t size) {
+    std::lock_guard<std::recursive_mutex> lock(pimpl->rpc_mutex);
     return pimpl->recv_data(data, size);
 }
 
