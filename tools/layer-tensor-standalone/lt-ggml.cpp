@@ -11,7 +11,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -1853,24 +1855,52 @@ struct ggml_compute::impl {
             return nullptr;
         }
 
-        ggml_tensor * gate_w =
-            weight_view_gate_up(
-                ctx,
-                layer.ffn_gate_exps,
-                shard_begin,
-                shard_width);
-        ggml_tensor * up_w =
-            weight_view_gate_up(
-                ctx,
-                layer.ffn_up_exps,
-                shard_begin,
-                shard_width);
-        ggml_tensor * down_w =
-            weight_view_down(
-                ctx,
-                layer.ffn_down_exps,
-                shard_begin,
-                shard_width);
+        ggml_tensor * gate_w = nullptr;
+        ggml_tensor * up_w = nullptr;
+        ggml_tensor * down_w = nullptr;
+
+        const bool use_materialized_phone_shard =
+            config.local_side == side::phone &&
+            config.runtime_plan.execution_mode == mode::tensor &&
+            task.layer >= 0 &&
+            static_cast<size_t>(task.layer) <
+                phone_shards.size() &&
+            phone_shards[
+                static_cast<size_t>(task.layer)].gate != nullptr &&
+            phone_shards[
+                static_cast<size_t>(task.layer)].begin ==
+                shard_begin &&
+            phone_shards[
+                static_cast<size_t>(task.layer)].width ==
+                shard_width;
+
+        if (use_materialized_phone_shard) {
+            const materialized_ffn_shard & shard =
+                phone_shards[
+                    static_cast<size_t>(task.layer)];
+            gate_w = shard.gate;
+            up_w = shard.up;
+            down_w = shard.down;
+        } else {
+            gate_w =
+                weight_view_gate_up(
+                    ctx,
+                    layer.ffn_gate_exps,
+                    shard_begin,
+                    shard_width);
+            up_w =
+                weight_view_gate_up(
+                    ctx,
+                    layer.ffn_up_exps,
+                    shard_begin,
+                    shard_width);
+            down_w =
+                weight_view_down(
+                    ctx,
+                    layer.ffn_down_exps,
+                    shard_begin,
+                    shard_width);
+        }
 
         const int32_t tokens =
             chunk_tokens(task);
