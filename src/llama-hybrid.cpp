@@ -7234,9 +7234,9 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
         return false;
     }
 
-    static constexpr size_t graph_size = 64;
+    static constexpr size_t graph_size = 96;
     const ggml_init_params  params     = {
-        /*.mem_size   =*/128 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_size   =*/192 * ggml_tensor_overhead() + ggml_graph_overhead_custom(graph_size, false),
         /*.mem_buffer =*/nullptr,
         /*.no_alloc   =*/true,
     };
@@ -7252,12 +7252,29 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
     ggml_tensor * wv          = ggml_new_tensor_2d(ctx.get(), desc.v_type, desc.n_embd, desc.v_dim);
     ggml_tensor * wo          = ggml_new_tensor_2d(ctx.get(), desc.o_type, desc.o_in_dim, desc.n_embd);
 
+    ggml_tensor * wq_b = desc.has_q_bias ? ggml_new_tensor_1d(ctx.get(), desc.q_bias_type, desc.q_dim) : nullptr;
+    ggml_tensor * wk_b = desc.has_k_bias ? ggml_new_tensor_1d(ctx.get(), desc.k_bias_type, desc.k_dim) : nullptr;
+    ggml_tensor * wv_b = desc.has_v_bias ? ggml_new_tensor_1d(ctx.get(), desc.v_bias_type, desc.v_dim) : nullptr;
+    ggml_tensor * wo_b = desc.has_o_bias ? ggml_new_tensor_1d(ctx.get(), desc.o_bias_type, desc.n_embd) : nullptr;
+    ggml_tensor * wq_s = desc.has_q_scale ? ggml_new_tensor_1d(ctx.get(), desc.q_scale_type, 1) : nullptr;
+    ggml_tensor * wk_s = desc.has_k_scale ? ggml_new_tensor_1d(ctx.get(), desc.k_scale_type, 1) : nullptr;
+    ggml_tensor * wv_s = desc.has_v_scale ? ggml_new_tensor_1d(ctx.get(), desc.v_scale_type, 1) : nullptr;
+    ggml_tensor * wo_s = desc.has_o_scale ? ggml_new_tensor_1d(ctx.get(), desc.o_scale_type, 1) : nullptr;
+    ggml_tensor * rope_factors = desc.has_rope_factors ?
+        ggml_new_tensor_1d(ctx.get(), desc.rope_factors_type, desc.rope_factors_ne0) : nullptr;
+
     ggml_tensor * norm = ggml_rms_norm(ctx.get(), input, desc.rms_eps);
     norm               = ggml_mul(ctx.get(), norm, attn_norm_w);
 
     ggml_tensor * q = ggml_mul_mat(ctx.get(), wq, norm);
     ggml_tensor * k = ggml_mul_mat(ctx.get(), wk, norm);
     ggml_tensor * v = ggml_mul_mat(ctx.get(), wv, norm);
+    if (wq_s) q = ggml_mul(ctx.get(), q, wq_s);
+    if (wk_s) k = ggml_mul(ctx.get(), k, wk_s);
+    if (wv_s) v = ggml_mul(ctx.get(), v, wv_s);
+    if (wq_b) q = ggml_add(ctx.get(), q, wq_b);
+    if (wk_b) k = ggml_add(ctx.get(), k, wk_b);
+    if (wv_b) v = ggml_add(ctx.get(), v, wv_b);
 
     q = ggml_reshape_3d(ctx.get(), q, head_dim_q, desc.n_head, tokens);
     k = ggml_reshape_3d(ctx.get(), k, head_dim_k, desc.n_head_kv, tokens);
@@ -7277,9 +7294,9 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
     }
 
     ggml_tensor * pos = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I32, tokens);
-    q = ggml_rope_ext(ctx.get(), q, pos, nullptr, desc.n_rot, (int) desc.rope_type, desc.n_ctx_orig, desc.freq_base,
+    q = ggml_rope_ext(ctx.get(), q, pos, rope_factors, desc.n_rot, (int) desc.rope_type, desc.n_ctx_orig, desc.freq_base,
                       desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
-    k = ggml_rope_ext(ctx.get(), k, pos, nullptr, desc.n_rot, (int) desc.rope_type, desc.n_ctx_orig, desc.freq_base,
+    k = ggml_rope_ext(ctx.get(), k, pos, rope_factors, desc.n_rot, (int) desc.rope_type, desc.n_ctx_orig, desc.freq_base,
                       desc.freq_scale, 0.0f, 1.0f, 32.0f, 1.0f);
 
     q = ggml_permute(ctx.get(), q, 0, 2, 1, 3);
@@ -7290,13 +7307,16 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
 
     ggml_tensor * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, kv_tokens, tokens);
 
-    const float   kq_scale = 1.0f / std::sqrt((float) head_dim_q);
-    ggml_tensor * attn     = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, kq_scale, 0.0f, 0.0f);
+    const float kq_scale = desc.kq_scale > 0.0f ?
+        desc.kq_scale : 1.0f / std::sqrt((float) head_dim_q);
+    ggml_tensor * attn = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, kq_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(ctx.get(), attn, desc.o_in_dim, tokens);
 
     ggml_tensor * output = ggml_mul_mat(ctx.get(), wo, attn);
-    output               = ggml_add(ctx.get(), output, input);
+    if (wo_s) output = ggml_mul(ctx.get(), output, wo_s);
+    if (wo_b) output = ggml_add(ctx.get(), output, wo_b);
+    output = ggml_add(ctx.get(), output, input);
 
     ggml_cgraph *                graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
     static std::atomic<uint64_t> next_attn_probe_uid{ uint64_t(1) << 61 };
@@ -7329,6 +7349,13 @@ static bool llama_hybrid_profile_attn_point(const llama_hybrid_attn_desc & desc,
         (q_norm_w != nullptr && !llama_hybrid_add_bytes(weight_bytes, ggml_nbytes(q_norm_w))) ||
         (k_norm_w != nullptr && !llama_hybrid_add_bytes(weight_bytes, ggml_nbytes(k_norm_w)))) {
         return false;
+    }
+    for (ggml_tensor * optional :
+            {wq_b, wk_b, wv_b, wo_b, wq_s, wk_s, wv_s, wo_s, rope_factors}) {
+        if (optional != nullptr &&
+                !llama_hybrid_add_bytes(weight_bytes, ggml_nbytes(optional))) {
+            return false;
+        }
     }
     runtime_bytes = total_buffer > weight_bytes ? total_buffer - weight_bytes : 0;
 
@@ -7396,8 +7423,9 @@ static bool llama_hybrid_profile_attn_kv_kernel_point(const llama_hybrid_attn_de
     ggml_tensor * v    = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, head_dim_v, kv_tokens, desc.n_head_kv);
     ggml_tensor * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, kv_tokens, tokens);
 
-    const float   kq_scale = 1.0f / std::sqrt((float) head_dim_q);
-    ggml_tensor * attn     = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, kq_scale, 0.0f, 0.0f);
+    const float kq_scale = desc.kq_scale > 0.0f ?
+        desc.kq_scale : 1.0f / std::sqrt((float) head_dim_q);
+    ggml_tensor * attn = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, kq_scale, 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
 
     ggml_cgraph *                graph = ggml_new_graph_custom(ctx.get(), graph_size, false);
