@@ -499,13 +499,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         std::vector<wave_work_item> wave_schedule;
 
         if (experiment_directional_wavefront) {
-            // Diagonal schedule:
+            // Diagonal ready frontier, lower layer first:
             //   L0C0,
-            //   L1C0, L0C1,
-            //   L2C0, L1C1, L0C2, ...
-            // Each exact predecessor is represented by prefill_wave_l_out,
-            // so Meta can wait only for Reduce(L-1,C) and leave later chunks
-            // of L-1 in flight.
+            //   L0C1, L1C0,
+            //   L0C2, L1C1, L2C0, ...
+            //
+            // This one-chunk lookahead is intentional.  By the time L1C0
+            // consumes Reduce(L0,C0), L0C1 has already been submitted and can
+            // remain in flight.  Meta therefore waits only the exact C0
+            // dependency while preserving overlap with the later predecessor
+            // chunk instead of collapsing back to a whole-layer barrier.
             const size_t n_groups = wave_groups.size();
             const size_t n_diagonals =
                 n_groups + (size_t) wave_layer_count - 1;
@@ -513,7 +516,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                  diag < n_diagonals; ++diag) {
                 const int layer_hi = std::min(
                     wave_layer_count - 1, (int) diag);
-                for (int li = layer_hi; li >= 0; --li) {
+                for (int li = 0; li <= layer_hi; ++li) {
                     const int gi = (int) diag - li;
                     if (gi < 0 || gi >= (int) n_groups) {
                         continue;
