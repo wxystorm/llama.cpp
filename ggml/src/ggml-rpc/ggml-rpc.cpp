@@ -6142,6 +6142,17 @@ bool rpc_server::run_phone_tensor_graph(
     }
 
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
+    if (rpc_phone_tensor_scheduler_active &&
+            (RPC_DEBUG || rpc_tensor_phone_stage_profile_enabled())) {
+        std::fprintf(
+            stderr,
+            "[TENSOR_READY_GRAPH] side=PHONE event=EXECUTE_LOCKED "
+            "uid=%" PRIu64 " nodes=%d kind=%s\n",
+            graph_uid,
+            graph->n_nodes,
+            compute_kind);
+        std::fflush(stderr);
+    }
     const int64_t t0 = ggml_time_us();
     const ggml_status status =
         ggml_backend_graph_compute(backends[device], graph);
@@ -7350,13 +7361,21 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             queue_kind != rpc_phone_tensor_queue_kind::NONE) {
         auto completion =
             std::make_shared<rpc_phone_tensor_task_completion>();
+
+        // Never enqueue a raw ggml_cgraph pointer. The graph lives inside
+        // stored_graphs[device][graph_uid].buffer, which another RPC lane can
+        // rebuild before this task reaches the worker. Queue the serialized
+        // request instead, then reconstruct and execute only after the local
+        // scheduler owns the Phone compute slot.
+        std::vector<uint8_t> queued_input = input;
         graph_lock.unlock();
         const uint64_t task_id =
             enqueue_phone_tensor_task(
                 queue_kind,
-                [this, device, graph_uid, graph]() {
-                    return run_phone_tensor_graph(
-                        device, graph_uid, graph, "compute");
+                [this, queued_input = std::move(queued_input)]() {
+                    return graph_compute(
+                        queued_input,
+                        /* register_only = */ false);
                 },
                 completion);
         if (task_id == 0) {
@@ -7365,7 +7384,9 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
         return wait_phone_tensor_task(completion);
     }
 
-    graph_lock.unlock();
+    // Scheduler-owned execution must keep graph_compute_mutex held from graph
+    // reconstruction through backend submission. That makes the backing
+    // stored_graph buffer immutable for the complete graph lifetime.
     return run_phone_tensor_graph(
         device, graph_uid, graph, "compute");
 }
@@ -7391,13 +7412,13 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
             queue_kind != rpc_phone_tensor_queue_kind::NONE) {
         auto completion =
             std::make_shared<rpc_phone_tensor_task_completion>();
+        const rpc_msg_graph_recompute_req queued_request = request;
         graph_lock.unlock();
         const uint64_t task_id =
             enqueue_phone_tensor_task(
                 queue_kind,
-                [this, device, graph_uid = request.graph_uid, graph]() {
-                    return run_phone_tensor_graph(
-                        device, graph_uid, graph, "recompute");
+                [this, queued_request]() {
+                    return graph_recompute(queued_request);
                 },
                 completion);
         if (task_id == 0) {
@@ -7406,7 +7427,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         return wait_phone_tensor_task(completion);
     }
 
-    graph_lock.unlock();
+    // Keep the cache lock held while a scheduler-owned recompute executes, so
+    // the stored graph cannot be replaced by a concurrent RPC lane.
     return run_phone_tensor_graph(
         device, request.graph_uid, graph, "recompute");
 }
