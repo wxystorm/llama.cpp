@@ -1696,6 +1696,17 @@ struct ggml_compute::impl {
                 probs,
                 n_expert_used);
 
+        // ggml_argsort_top_k() returns a view of the full [n_expert, tokens]
+        // argsort tensor. Its ne[0] is n_expert_used, but nb[1] still strides
+        // across all n_expert entries, so raw tensor_get() of
+        // n_expert_used*tokens elements would serialize the wrong IDs.
+        // Materialize a contiguous [topk, tokens] tensor before both
+        // ggml_get_rows() and READY export.
+        out.topk =
+            ggml_cont(
+                ctx,
+                out.topk);
+
         probs =
             ggml_reshape_3d(
                 ctx,
@@ -2179,6 +2190,15 @@ struct ggml_compute::impl {
             ready.hidden.resize(hidden_count);
             ready.topk.resize(route_count);
             ready.weights.resize(route_count);
+
+            if (!ggml_is_contiguous(prefix.residual) ||
+                !ggml_is_contiguous(prefix.hidden) ||
+                !ggml_is_contiguous(prefix.topk) ||
+                !ggml_is_contiguous(prefix.weights)) {
+                error =
+                    "READY export tensor is not contiguous";
+                return false;
+            }
 
             ggml_backend_tensor_get(
                 prefix.residual,
