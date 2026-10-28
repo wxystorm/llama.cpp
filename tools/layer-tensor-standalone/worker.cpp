@@ -219,6 +219,7 @@ int run_session(
         compute->n_layers());
 
     bool received_stop = false;
+    uint64_t bench_push_received = 0;
     lt::message incoming;
 
     while (channel->recv_message(
@@ -229,6 +230,96 @@ int run_session(
             (void) phone.on_message(
                 std::move(incoming));
             break;
+        }
+
+        if (incoming.kind ==
+            lt::message_kind::bench_push_data) {
+            ++bench_push_received;
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
+            lt::message_kind::bench_push_done) {
+            lt::message pong;
+            pong.kind =
+                lt::message_kind::bench_pong;
+            pong.task =
+                incoming.task;
+            pong.seq =
+                incoming.seq;
+            pong.partial = {
+                static_cast<float>(
+                    bench_push_received)
+            };
+
+            if (!channel->send_message(
+                    pong)) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=PUSH_DONE "
+                    "status=FAIL\n");
+                break;
+            }
+
+            bench_push_received = 0;
+            incoming = {};
+            continue;
+        }
+
+        if (incoming.kind ==
+            lt::message_kind::bench_pull_batch) {
+            if (incoming.partial.size() < 2) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=PULL_BATCH "
+                    "status=FAIL reason=MISSING_PARAMS\n");
+                break;
+            }
+
+            const size_t count =
+                static_cast<size_t>(
+                    std::max(
+                        0.0f,
+                        incoming.partial[0]));
+            const int repeats =
+                std::max(
+                    1,
+                    static_cast<int>(
+                        incoming.partial[1]));
+
+            lt::message response;
+            response.kind =
+                lt::message_kind::bench_pull_result;
+            response.task =
+                incoming.task;
+            response.hidden.assign(
+                count,
+                0.0f);
+
+            bool ok = true;
+            for (int i = 0;
+                 i < repeats;
+                 ++i) {
+                response.seq =
+                    static_cast<uint64_t>(i);
+                if (!channel->send_message(
+                        response)) {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if (!ok) {
+                std::fprintf(
+                    stderr,
+                    "[LT_SEQUENCE_PHONE] phase=PULL_BATCH "
+                    "status=FAIL\n");
+                break;
+            }
+
+            incoming = {};
+            continue;
         }
 
         if (incoming.kind ==
