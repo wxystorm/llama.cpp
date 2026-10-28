@@ -1624,14 +1624,9 @@ int run_sequence_ffn_bench(
             "PASS" :
             "NUMERIC_WARN");
 
-    const int warmup =
-        std::min(
-            2,
-            opts.stream_repeats);
-
     const int network_batch_repeats =
         std::max(
-            32,
+            64,
             opts.stream_repeats);
 
     auto measure_c2p =
