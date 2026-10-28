@@ -174,6 +174,61 @@ size_t quantized_dim0_offset(
         element_begin / block) * tensor->nb[0];
 }
 
+
+uint32_t hp_n_layer(
+        const llama_hparams & hp) {
+    return hp.n_layer_all -
+        hp.n_layer_nextn;
+}
+
+bool hp_is_swa(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp.is_swa_impl[il] != 0;
+}
+
+uint32_t hp_n_head(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp.n_head_arr[il];
+}
+
+uint32_t hp_n_head_kv(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp.n_head_kv_arr[il];
+}
+
+uint32_t hp_n_embd_head_k(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp_is_swa(hp, il) ?
+        hp.n_embd_head_k_swa :
+        hp.n_embd_head_k_full;
+}
+
+uint32_t hp_n_embd_head_v(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp_is_swa(hp, il) ?
+        hp.n_embd_head_v_swa :
+        hp.n_embd_head_v_full;
+}
+
+uint32_t hp_n_rot(
+        const llama_hparams & hp,
+        uint32_t il) {
+    GGML_ASSERT(il < hp.n_layer_all);
+    return hp_is_swa(hp, il) ?
+        hp.n_rot_swa :
+        hp.n_rot_full;
+}
+
 } // namespace
 
 struct ggml_compute::impl {
@@ -308,11 +363,11 @@ struct ggml_compute::impl {
         }
 
         if (static_cast<int32_t>(
-                model->hparams.n_layer()) !=
+                hp_n_layer(model->hparams)) !=
             config.runtime_plan.layers) {
             std::ostringstream oss;
             oss << "loaded layer count mismatch: model="
-                << model->hparams.n_layer()
+                << hp_n_layer(model->hparams)
                 << " plan=" << config.runtime_plan.layers;
             error = oss.str();
             return false;
@@ -521,9 +576,9 @@ struct ggml_compute::impl {
              il < config.runtime_plan.layers;
              ++il) {
             const llama_hparams & hp = model->hparams;
-            const int64_t head_k = hp.n_embd_head_k(il);
-            const int64_t head_v = hp.n_embd_head_v(il);
-            const int64_t heads_kv = hp.n_head_kv(il);
+            const int64_t head_k = hp_n_embd_head_k(hp, il);
+            const int64_t head_v = hp_n_embd_head_v(hp, il);
+            const int64_t heads_kv = hp_n_head_kv(hp, il);
 
             kv_k[static_cast<size_t>(il)] =
                 ggml_new_tensor_3d(
@@ -729,15 +784,15 @@ struct ggml_compute::impl {
             model->layers[
                 static_cast<size_t>(task.layer)];
 
-        const int64_t n_head = hp.n_head(task.layer);
+        const int64_t n_head = hp_n_head(hp, task.layer);
         const int64_t n_head_kv =
-            hp.n_head_kv(task.layer);
+            hp_n_head_kv(hp, task.layer);
         const int64_t head_k =
-            hp.n_embd_head_k(task.layer);
+            hp_n_embd_head_k(hp, task.layer);
         const int64_t head_v =
-            hp.n_embd_head_v(task.layer);
+            hp_n_embd_head_v(hp, task.layer);
         const int64_t n_rot =
-            hp.n_rot(task.layer);
+            hp_n_rot(hp, task.layer);
 
         if (head_k <= 0 ||
             head_v <= 0 ||
