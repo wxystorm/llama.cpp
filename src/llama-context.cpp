@@ -10747,6 +10747,29 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             }
         }
 
+        // Sequence-FFN Attention is a PC-only task in the causal pipeline.
+        // The layer container remains Meta only because its FFN experts are
+        // mirrored to RPC.  Its Attention graph borrows child0 physical
+        // weights and its KV is CPU_DIRECT, so pin every callback node to the
+        // one CPU executor instead of following model.dev_layer(il)==Meta.
+        if (il >= 0 &&
+            backend_cpu != nullptr &&
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::SEQUENCE_FFN) {
+            const char * ring_exec_env =
+                std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+            if (ring_exec_env != nullptr &&
+                    std::strcmp(
+                        ring_exec_env,
+                        "fifo-pc-phone-seq") == 0 &&
+                    ggml_backend_supports_op(
+                        backend_cpu, cur)) {
+                ggml_backend_sched_set_tensor_backend(
+                    sched_use, cur, backend_cpu);
+                return;
+            }
+        }
+
         // PC_ONLY layers placed on CPU_DIRECT must stay as one CPU region.
         // The generic scheduler deliberately expands higher-priority GPU
         // assignments across unassigned ops while not expanding CPU, which
