@@ -1884,7 +1884,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 if (it == ring_regions.end() ||
                         it->device != llama_region_ring_device::CPU) {
                     throw std::runtime_error(
-                        "sequence-FFN V1 layers must be inside CPU Regions");
+                        "sequence-FFN V1 layers must originate from a CPU "
+                        "placement region in the base G/C/P Ring layout");
                 }
                 hybrid_layer_modes[il] =
                     llama_hybrid_layer_mode::SEQUENCE_FFN;
@@ -1904,7 +1905,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
             LLAMA_LOG_ERROR(
                 "[SEQ_FFN_POLICY] layers=[%d,%d) "
-                "attention=PC_CPU ffn=TOKEN_SPLIT "
+                "base_placement=CPU runtime_stage=SEQUENCE_FFN "
+                "attention=PC_CPU kv=PC ffn=TOKEN_SPLIT "
                 "phone_tokens=%d weights=MIRRORED "
                 "causal_wavefront=0 status=READY\n",
                 seq_begin, seq_end, phone_tokens);
