@@ -911,6 +911,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     (size_t) layer_offset][ci] = down;
                 pending_wave_residual[
                     (size_t) layer_offset][ci] = ffn_inp;
+
+                // A directional Reduce(L,C) needs its owner output tensor at
+                // the FFN boundary, not only after the whole wave schedule has
+                // been constructed. Intermediate-layer outputs are naturally
+                // materialized when the next layer consumes them; the final
+                // layer has no such consumer, so create its exact chunk output
+                // immediately. materialize_wave_out() is idempotent and the
+                // output-head assembly below will reuse this same tensor.
+                if (layer_offset == wave_layer_count - 1) {
+                    materialize_wave_out(layer_offset, ci);
+                }
+
                 group_offset_tokens += count;
             }
 
