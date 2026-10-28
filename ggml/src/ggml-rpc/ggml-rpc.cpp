@@ -1606,6 +1606,10 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
+    const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
+    const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
+
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -1673,13 +1677,31 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
     }   //恢复原来的计算图
+    if (jupiter_trace) {
+        GGML_LOG_INFO(
+                "[JUPITER_RPC_STAGE] event=BEGIN uid=%" PRIu64 " device=%u nodes=%u\n",
+                graph_uid, device, n_nodes);
+    }
+
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    if (jupiter_trace) {
+        GGML_LOG_INFO(
+                "[JUPITER_RPC_STAGE] event=END uid=%" PRIu64 " device=%u nodes=%u wall_ms=%.3f\n",
+                graph_uid, device, n_nodes,
+                (ggml_time_us() - jupiter_trace_begin_us) / 1000.0);
+    }
+
     graph_entry.graph = graph;
     return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
+    const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
+    const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
+
     uint32_t device = request.device;
     if (device >= backends.size()) {
         return false;
@@ -1690,8 +1712,23 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     }
     ggml_cgraph * graph = it->second.graph;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
+
+    if (jupiter_trace) {
+        GGML_LOG_INFO(
+                "[JUPITER_RPC_STAGE] event=BEGIN uid=%" PRIu64 " device=%u nodes=%d reused=1\n",
+                request.graph_uid, device, graph->n_nodes);
+    }
+
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+
+    if (jupiter_trace) {
+        GGML_LOG_INFO(
+                "[JUPITER_RPC_STAGE] event=END uid=%" PRIu64 " device=%u nodes=%d reused=1 wall_ms=%.3f\n",
+                request.graph_uid, device, graph->n_nodes,
+                (ggml_time_us() - jupiter_trace_begin_us) / 1000.0);
+    }
+
     return true;
 }
 
