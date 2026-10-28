@@ -2366,6 +2366,454 @@ bool llama_context::copy_hybrid_stage_output(
     return true;
 }
 
+
+struct llama_sequence_ffn_branch_graph {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+
+    ~llama_sequence_ffn_branch_graph() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+    }
+
+    llama_sequence_ffn_branch_graph() = default;
+    llama_sequence_ffn_branch_graph(
+        const llama_sequence_ffn_branch_graph &) = delete;
+    llama_sequence_ffn_branch_graph & operator=(
+        const llama_sequence_ffn_branch_graph &) = delete;
+};
+
+static bool llama_sequence_ffn_build_branch(
+        const llama_model & model,
+        int                 layer_index,
+        int                 tokens,
+        size_t              child_index,
+        ggml_backend_t      backend,
+        llama_sequence_ffn_branch_graph & state) {
+    if (model.arch != LLM_ARCH_QWEN3MOE ||
+            layer_index < 0 ||
+            layer_index >= (int) model.layers.size() ||
+            tokens <= 0 ||
+            backend == nullptr) {
+        return false;
+    }
+
+    const llama_hparams & hp = model.hparams;
+    const llama_layer & layer = model.layers[(size_t) layer_index];
+    const int64_t n_embd = hp.n_embd;
+    const int64_t n_expert = hp.n_expert;
+    const int64_t n_expert_used = hp.n_expert_used;
+
+    if (n_embd <= 0 || n_expert <= 0 || n_expert_used <= 0 ||
+            layer.ffn_norm == nullptr ||
+            layer.ffn_gate_inp == nullptr ||
+            layer.ffn_gate_exps == nullptr ||
+            layer.ffn_up_exps == nullptr ||
+            layer.ffn_down_exps == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * ffn_norm =
+        ggml_backend_meta_simple_tensor(layer.ffn_norm, child_index);
+    ggml_tensor * ffn_gate_inp =
+        ggml_backend_meta_simple_tensor(layer.ffn_gate_inp, child_index);
+    ggml_tensor * ffn_gate_exps =
+        ggml_backend_meta_simple_tensor(layer.ffn_gate_exps, child_index);
+    ggml_tensor * ffn_up_exps =
+        ggml_backend_meta_simple_tensor(layer.ffn_up_exps, child_index);
+    ggml_tensor * ffn_down_exps =
+        ggml_backend_meta_simple_tensor(layer.ffn_down_exps, child_index);
+
+    if (ffn_norm == nullptr ||
+            ffn_gate_inp == nullptr ||
+            ffn_gate_exps == nullptr ||
+            ffn_up_exps == nullptr ||
+            ffn_down_exps == nullptr) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_BRANCH_BUILD] layer=%d child=%zu tokens=%d "
+            "status=FAIL reason=PHYSICAL_WEIGHT_MISSING "
+            "norm=%p router=%p gate=%p up=%p down=%p\n",
+            layer_index, child_index, tokens,
+            (void *) ffn_norm, (void *) ffn_gate_inp,
+            (void *) ffn_gate_exps, (void *) ffn_up_exps,
+            (void *) ffn_down_exps);
+        return false;
+    }
+
+    constexpr size_t meta_bytes = 16u * 1024u * 1024u;
+    ggml_init_params params = {
+        /*.mem_size   =*/ meta_bytes,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    state.ctx = ggml_init(params);
+    if (state.ctx == nullptr) {
+        return false;
+    }
+
+    state.input =
+        ggml_new_tensor_2d(
+            state.ctx, GGML_TYPE_F32, n_embd, tokens);
+    ggml_set_name(state.input, "seq_ffn_branch_input");
+
+    ggml_tensor * hidden =
+        ggml_rms_norm(
+            state.ctx, state.input, hp.f_norm_rms_eps);
+    hidden =
+        ggml_mul(state.ctx, hidden, ffn_norm);
+
+    ggml_tensor * logits =
+        ggml_mul_mat(state.ctx, ffn_gate_inp, hidden);
+    ggml_tensor * probs =
+        ggml_soft_max(state.ctx, logits);
+
+    ggml_tensor * ids =
+        ggml_argsort_top_k(
+            state.ctx, probs, n_expert_used);
+    ids = ggml_cont(state.ctx, ids);
+
+    probs =
+        ggml_reshape_3d(
+            state.ctx, probs, 1, n_expert, tokens);
+
+    ggml_tensor * weights =
+        ggml_get_rows(state.ctx, probs, ids);
+    weights =
+        ggml_reshape_2d(
+            state.ctx, weights, n_expert_used, tokens);
+
+    ggml_tensor * weights_sum =
+        ggml_sum_rows(state.ctx, weights);
+    weights_sum =
+        ggml_clamp(
+            state.ctx,
+            weights_sum,
+            6.103515625e-5f,
+            std::numeric_limits<float>::infinity());
+    weights =
+        ggml_div(state.ctx, weights, weights_sum);
+    weights =
+        ggml_reshape_3d(
+            state.ctx, weights, 1, n_expert_used, tokens);
+
+    if (hp.expert_weights_scale != 0.0f &&
+            hp.expert_weights_scale != 1.0f) {
+        weights =
+            ggml_scale(
+                state.ctx,
+                weights,
+                hp.expert_weights_scale);
+    }
+
+    ggml_tensor * input3 =
+        ggml_reshape_3d(
+            state.ctx, hidden, n_embd, 1, tokens);
+
+    ggml_tensor * gate =
+        ggml_mul_mat_id(
+            state.ctx, ffn_gate_exps, input3, ids);
+    ggml_tensor * up =
+        ggml_mul_mat_id(
+            state.ctx, ffn_up_exps, input3, ids);
+    ggml_tensor * activated =
+        ggml_swiglu_split(state.ctx, gate, up);
+    ggml_tensor * experts =
+        ggml_mul_mat_id(
+            state.ctx, ffn_down_exps, activated, ids);
+    experts =
+        ggml_mul(state.ctx, experts, weights);
+
+    std::vector<ggml_tensor *> expert_views;
+    expert_views.reserve((size_t) n_expert_used);
+    for (int64_t ie = 0; ie < n_expert_used; ++ie) {
+        expert_views.push_back(
+            ggml_view_2d(
+                state.ctx,
+                experts,
+                n_embd,
+                tokens,
+                experts->nb[2],
+                (size_t) ie * experts->nb[1]));
+    }
+    if (expert_views.empty()) {
+        return false;
+    }
+
+    ggml_tensor * moe_out = expert_views.front();
+    for (size_t ie = 1; ie < expert_views.size(); ++ie) {
+        moe_out =
+            ggml_add(
+                state.ctx, moe_out, expert_views[ie]);
+    }
+    if (expert_views.size() == 1) {
+        moe_out = ggml_cont(state.ctx, moe_out);
+    }
+
+    state.output =
+        ggml_add(state.ctx, state.input, moe_out);
+    state.output =
+        ggml_cont(state.ctx, state.output);
+    ggml_set_name(state.output, "seq_ffn_branch_output");
+
+    state.graph =
+        ggml_new_graph_custom(
+            state.ctx, 2048, false);
+    ggml_build_forward_expand(
+        state.graph, state.output);
+
+    state.buffer =
+        ggml_backend_alloc_ctx_tensors(
+            state.ctx, backend);
+    if (state.buffer == nullptr) {
+        return false;
+    }
+
+    return state.input->buffer != nullptr &&
+           state.output->buffer != nullptr;
+}
+
+llm_graph_result * llama_context::run_sequence_ffn_stage(
+        const llama_ubatch &               ubatch,
+        const llama_hybrid_runtime_stage & stage,
+        uint32_t                           token_begin,
+        uint32_t                           block_tokens,
+        float *                            stage_input,
+        float *                            stage_output,
+        llm_graph_type                     gtype,
+        llama_memory_context_i *           mctx,
+        ggml_backend_sched_t               sched_use,
+        llm_graph_result *                 res_use,
+        int                                ubatch_id,
+        size_t                             stage_index,
+        size_t                             block_index,
+        int32_t                            block_outputs,
+        bool &                             apply_mctx,
+        ggml_status &                      ret) {
+    if (model.arch != LLM_ARCH_QWEN3MOE ||
+            stage.kind != llama_hybrid_runtime_stage_kind::SEQUENCE_FFN ||
+            stage.layer_end != stage.layer_begin + 1 ||
+            model.hybrid_layer_mode(stage.layer_begin) !=
+                llama_hybrid_layer_mode::SEQUENCE_FFN ||
+            stage_input == nullptr ||
+            stage_output == nullptr ||
+            block_tokens <= 1 ||
+            block_outputs != 0) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_EXEC] stage=%zu block=%zu layers=[%d,%d) "
+            "tokens=%u status=REJECT reason=V1_CONTRACT\n",
+            stage_index, block_index,
+            stage.layer_begin, stage.layer_end,
+            block_tokens);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    ggml_backend_t meta_backend = nullptr;
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (backend != nullptr &&
+                ggml_backend_is_meta(backend)) {
+            meta_backend = backend;
+            break;
+        }
+    }
+    if (meta_backend == nullptr ||
+            ggml_backend_meta_n_backends(meta_backend) < 2) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_EXEC] layer=%d status=FAIL "
+            "reason=META_CHILDREN_UNAVAILABLE\n",
+            stage.layer_begin);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    ggml_backend_t pc_backend =
+        ggml_backend_meta_simple_backend(
+            meta_backend, 0);
+    ggml_backend_t phone_backend =
+        ggml_backend_meta_simple_backend(
+            meta_backend, 1);
+    if (pc_backend == nullptr || phone_backend == nullptr) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const char * phone_tokens_env =
+        std::getenv(
+            "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOKENS");
+    const int requested_phone_tokens =
+        phone_tokens_env != nullptr &&
+                phone_tokens_env[0] != '\0' ?
+            std::atoi(phone_tokens_env) : 8;
+    const int phone_tokens =
+        std::min<int>(
+            std::max(1, requested_phone_tokens),
+            (int) block_tokens - 1);
+    const int pc_tokens =
+        (int) block_tokens - phone_tokens;
+    const size_t n_embd =
+        (size_t) model.hparams.n_embd;
+    const size_t token_bytes =
+        n_embd * sizeof(float);
+    const size_t phone_bytes =
+        (size_t) phone_tokens * token_bytes;
+    const size_t pc_bytes =
+        (size_t) pc_tokens * token_bytes;
+
+    std::vector<float> residual(
+        n_embd * (size_t) block_tokens);
+
+    // S_ATTN: one normal staged Qwen3-MoE graph, but the graph builder stops
+    // at Attention + residual. KV writes remain owned by the PC path.
+    const int64_t attn_begin_us = ggml_time_us();
+    llm_graph_result * result =
+        run_hybrid_stage_block(
+            ubatch, stage,
+            token_begin, block_tokens,
+            stage_input, residual.data(),
+            gtype, mctx, sched_use, res_use,
+            ubatch_id, stage_index, block_index,
+            llama_hybrid_boundary_action::PASS,
+            0, apply_mctx, true, ret);
+    const int64_t attn_us =
+        ggml_time_us() - attn_begin_us;
+    if (result == nullptr ||
+            ret != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_ATTN] layer=%d tokens=%u "
+            "status=FAIL code=%d\n",
+            stage.layer_begin, block_tokens, (int) ret);
+        return nullptr;
+    }
+
+    llama_sequence_ffn_branch_graph pc_branch;
+    llama_sequence_ffn_branch_graph phone_branch;
+    if (!llama_sequence_ffn_build_branch(
+            model, stage.layer_begin, pc_tokens,
+            0, pc_backend, pc_branch) ||
+        !llama_sequence_ffn_build_branch(
+            model, stage.layer_begin, phone_tokens,
+            1, phone_backend, phone_branch)) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_EXEC] layer=%d tokens=%u "
+            "pc_tokens=%d phone_tokens=%d status=FAIL "
+            "reason=BRANCH_BUILD\n",
+            stage.layer_begin, block_tokens,
+            pc_tokens, phone_tokens);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const int64_t pc_stage_begin_us = ggml_time_us();
+    ggml_backend_tensor_set(
+        pc_branch.input,
+        residual.data(),
+        0,
+        pc_bytes);
+    const int64_t pc_stage_us =
+        ggml_time_us() - pc_stage_begin_us;
+
+    const int64_t c2p_begin_us = ggml_time_us();
+    ggml_backend_tensor_set(
+        phone_branch.input,
+        residual.data() +
+            (size_t) pc_tokens * n_embd,
+        0,
+        phone_bytes);
+    ggml_backend_synchronize(phone_backend);
+    const int64_t c2p_us =
+        ggml_time_us() - c2p_begin_us;
+
+    ggml_status pc_status = GGML_STATUS_SUCCESS;
+    ggml_status phone_status = GGML_STATUS_SUCCESS;
+    int64_t pc_ffn_us = 0;
+    int64_t phone_ffn_us = 0;
+    const int64_t overlap_begin_us = ggml_time_us();
+
+    std::thread pc_worker([&]() {
+        const int64_t begin_us = ggml_time_us();
+        pc_status =
+            ggml_backend_graph_compute(
+                pc_backend, pc_branch.graph);
+        ggml_backend_synchronize(pc_backend);
+        pc_ffn_us = ggml_time_us() - begin_us;
+    });
+    std::thread phone_worker([&]() {
+        const int64_t begin_us = ggml_time_us();
+        phone_status =
+            ggml_backend_graph_compute(
+                phone_backend, phone_branch.graph);
+        ggml_backend_synchronize(phone_backend);
+        phone_ffn_us = ggml_time_us() - begin_us;
+    });
+
+    pc_worker.join();
+    phone_worker.join();
+    const int64_t overlap_us =
+        ggml_time_us() - overlap_begin_us;
+
+    if (pc_status != GGML_STATUS_SUCCESS ||
+            phone_status != GGML_STATUS_SUCCESS) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_BRANCH] layer=%d pc_status=%d "
+            "phone_status=%d status=FAIL\n",
+            stage.layer_begin,
+            (int) pc_status, (int) phone_status);
+        ret = pc_status != GGML_STATUS_SUCCESS ?
+            pc_status : phone_status;
+        return nullptr;
+    }
+
+    const int64_t pc_get_begin_us = ggml_time_us();
+    ggml_backend_tensor_get(
+        pc_branch.output,
+        stage_output,
+        0,
+        pc_bytes);
+    const int64_t pc_get_us =
+        ggml_time_us() - pc_get_begin_us;
+
+    const int64_t p2c_begin_us = ggml_time_us();
+    ggml_backend_tensor_get(
+        phone_branch.output,
+        stage_output +
+            (size_t) pc_tokens * n_embd,
+        0,
+        phone_bytes);
+    ggml_backend_synchronize(phone_backend);
+    const int64_t p2c_us =
+        ggml_time_us() - p2c_begin_us;
+
+    LLAMA_LOG_ERROR(
+        "[SEQ_FFN_EXEC] layer=%d block=%zu tokens=%u "
+        "pc_tokens=%d phone_tokens=%d "
+        "attn_ms=%.3f pc_stage_ms=%.3f c2p_ms=%.3f "
+        "pc_ffn_ms=%.3f phone_ffn_ms=%.3f "
+        "ffn_overlap_wall_ms=%.3f pc_get_ms=%.3f "
+        "p2c_ms=%.3f c2p_bytes=%zu p2c_bytes=%zu "
+        "join=TOKEN_CONCAT reduce=0 causal_wavefront=0 status=OK\n",
+        stage.layer_begin, block_index, block_tokens,
+        pc_tokens, phone_tokens,
+        attn_us / 1000.0,
+        pc_stage_us / 1000.0,
+        c2p_us / 1000.0,
+        pc_ffn_us / 1000.0,
+        phone_ffn_us / 1000.0,
+        overlap_us / 1000.0,
+        pc_get_us / 1000.0,
+        p2c_us / 1000.0,
+        phone_bytes, phone_bytes);
+
+    ret = GGML_STATUS_SUCCESS;
+    return result;
+}
+
 llm_graph_result * llama_context::run_hybrid_stage_block(
         const llama_ubatch &               ubatch,
         const llama_hybrid_runtime_stage & stage,
