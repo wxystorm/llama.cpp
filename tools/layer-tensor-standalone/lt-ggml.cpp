@@ -7,7 +7,6 @@
 #include "llama-model.h"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -258,12 +257,13 @@ struct ggml_compute::impl {
     std::vector<ggml_tensor *> kv_k;
     std::vector<ggml_tensor *> kv_v;
 
-    // Persistent activation slots live for the whole benchmark run. Two
-    // slots per chunk ping-pong by layer parity, so a graph never consumes
-    // and overwrites the same backend tensor in one step.
+    // One persistent activation arena for the whole prompt. Every chunk owns
+    // a fixed token range inside this long-lived backend buffer and overwrites
+    // that range after each completed local layer.
     ggml_context * activation_ctx = nullptr;
     ggml_backend_buffer_t activation_buffer = nullptr;
-    std::vector<std::array<ggml_tensor *, 2>> activation_slots;
+    ggml_tensor * activation_root = nullptr;
+    std::vector<ggml_tensor *> activation_chunks;
 
     int32_t total_tokens = 0;
     int32_t n_embd = 0;
@@ -628,7 +628,7 @@ struct ggml_compute::impl {
         if (!initialize_kv(error)) {
             return false;
         }
-        if (!initialize_activation_slots(error)) {
+        if (!initialize_activation_buffer(error)) {
             return false;
         }
 
@@ -717,13 +717,13 @@ struct ggml_compute::impl {
         return true;
     }
 
-    bool initialize_activation_slots(std::string & error) {
+    bool initialize_activation_buffer(std::string & error) {
         const size_t chunk_count =
             config.runtime_plan.chunk_tokens.size();
 
         ggml_init_params params {};
         params.mem_size =
-            (chunk_count * 2 + 32) *
+            (chunk_count + 40) *
             ggml_tensor_overhead();
         params.mem_buffer = nullptr;
         params.no_alloc = true;
@@ -731,32 +731,57 @@ struct ggml_compute::impl {
         activation_ctx = ggml_init(params);
         if (activation_ctx == nullptr) {
             error =
-                "failed to create activation slot metadata context";
+                "failed to create activation arena metadata context";
             return false;
         }
 
-        activation_slots.resize(chunk_count);
+        activation_root =
+            ggml_new_tensor_2d(
+                activation_ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                total_tokens);
 
+        if (activation_root == nullptr) {
+            error =
+                "failed to create persistent activation arena";
+            return false;
+        }
+
+        activation_chunks.resize(
+            chunk_count,
+            nullptr);
+
+        int32_t token_begin = 0;
         for (size_t chunk = 0;
              chunk < chunk_count;
              ++chunk) {
             const int32_t tokens =
                 config.runtime_plan.chunk_tokens[chunk];
 
-            for (int slot = 0; slot < 2; ++slot) {
-                activation_slots[chunk][slot] =
-                    ggml_new_tensor_2d(
-                        activation_ctx,
-                        GGML_TYPE_F32,
-                        n_embd,
-                        tokens);
+            activation_chunks[chunk] =
+                ggml_view_2d(
+                    activation_ctx,
+                    activation_root,
+                    n_embd,
+                    tokens,
+                    activation_root->nb[1],
+                    static_cast<size_t>(token_begin) *
+                        activation_root->nb[1]);
 
-                if (activation_slots[chunk][slot] == nullptr) {
-                    error =
-                        "failed to create persistent activation slot";
-                    return false;
-                }
+            if (activation_chunks[chunk] == nullptr) {
+                error =
+                    "failed to create persistent activation chunk view";
+                return false;
             }
+
+            token_begin += tokens;
+        }
+
+        if (token_begin != total_tokens) {
+            error =
+                "activation arena token partition mismatch";
+            return false;
         }
 
         activation_buffer =
@@ -765,7 +790,7 @@ struct ggml_compute::impl {
                 backend);
         if (activation_buffer == nullptr) {
             error =
-                "failed to allocate persistent activation buffer";
+                "failed to allocate persistent activation arena";
             return false;
         }
 
@@ -773,38 +798,46 @@ struct ggml_compute::impl {
             activation_buffer,
             0);
 
+        if (activation_root->buffer == nullptr ||
+            (ggml_backend_dev_type(device) !=
+                 GGML_BACKEND_DEVICE_TYPE_CPU &&
+             activation_root->extra == nullptr)) {
+            error =
+                "persistent activation root is not backend-ready";
+            return false;
+        }
+
         for (size_t chunk = 0;
              chunk < chunk_count;
              ++chunk) {
-            for (int slot = 0; slot < 2; ++slot) {
-                ggml_tensor * tensor =
-                    activation_slots[chunk][slot];
+            ggml_tensor * view =
+                activation_chunks[chunk];
 
-                if (tensor->buffer == nullptr ||
-                    (ggml_backend_dev_type(device) !=
-                         GGML_BACKEND_DEVICE_TYPE_CPU &&
-                     tensor->extra == nullptr)) {
-                    std::ostringstream oss;
-                    oss << "persistent activation slot is not backend-ready"
-                        << ": chunk=" << chunk
-                        << " slot=" << slot
-                        << " buffer="
-                        << (tensor->buffer != nullptr ?
-                            ggml_backend_buffer_name(tensor->buffer) :
-                            "NULL")
-                        << " extra=" << tensor->extra;
-                    error = oss.str();
-                    return false;
-                }
+            if (view->buffer == nullptr ||
+                (ggml_backend_dev_type(device) !=
+                     GGML_BACKEND_DEVICE_TYPE_CPU &&
+                 view->extra == nullptr)) {
+                std::ostringstream oss;
+                oss << "persistent activation view is not backend-ready"
+                    << ": chunk=" << chunk
+                    << " buffer="
+                    << (view->buffer != nullptr ?
+                        ggml_backend_buffer_name(view->buffer) :
+                        "NULL")
+                    << " extra=" << view->extra;
+                error = oss.str();
+                return false;
             }
         }
 
         std::fprintf(
             stderr,
-            "[LT_GGML_ACTIVATION_SLOTS] side=%s chunks=%zu "
-            "slots_per_chunk=2 bytes=%.3f MiB buffer=%s status=READY\n",
+            "[LT_GGML_ACTIVATION_ARENA] side=%s tokens=%d chunks=%zu "
+            "n_embd=%d bytes=%.3f MiB buffer=%s status=READY\n",
             side_name(config.local_side),
+            total_tokens,
             chunk_count,
+            n_embd,
             static_cast<double>(
                 ggml_backend_buffer_get_size(
                     activation_buffer)) /
@@ -835,34 +868,16 @@ struct ggml_compute::impl {
     }
 
 
-    ggml_tensor * activation_input_slot(
+    ggml_tensor * activation_chunk_view(
             const key & task) const {
         if (task.chunk < 0 ||
             static_cast<size_t>(task.chunk) >=
-                activation_slots.size()) {
+                activation_chunks.size()) {
             return nullptr;
         }
 
-        const int slot =
-            task.layer & 1;
-
-        return activation_slots[
-            static_cast<size_t>(task.chunk)][slot];
-    }
-
-    ggml_tensor * activation_output_slot(
-            const key & task) const {
-        if (task.chunk < 0 ||
-            static_cast<size_t>(task.chunk) >=
-                activation_slots.size()) {
-            return nullptr;
-        }
-
-        const int slot =
-            (task.layer + 1) & 1;
-
-        return activation_slots[
-            static_cast<size_t>(task.chunk)][slot];
+        return activation_chunks[
+            static_cast<size_t>(task.chunk)];
     }
 
     std::shared_ptr<graph_hold> take_cache(
@@ -991,7 +1006,7 @@ struct ggml_compute::impl {
         // Unlike the old temporary-graph pointer reuse, this tensor is owned
         // by a persistent backend buffer for the entire benchmark lifetime.
         input =
-            activation_input_slot(task);
+            activation_chunk_view(task);
         host_input_tensor = nullptr;
 
         if (input == nullptr ||
@@ -1000,7 +1015,7 @@ struct ggml_compute::impl {
                  GGML_BACKEND_DEVICE_TYPE_CPU &&
              input->extra == nullptr)) {
             std::ostringstream oss;
-            oss << "persistent activation input is not backend-ready"
+            oss << "persistent activation chunk view is not backend-ready"
                 << ": layer=" << task.layer
                 << " chunk=" << task.chunk
                 << " tensor=" << input;
@@ -2117,7 +2132,7 @@ struct ggml_compute::impl {
                     count * sizeof(float));
             } else {
                 ggml_tensor * slot =
-                    activation_output_slot(task);
+                    activation_chunk_view(task);
 
                 if (slot == nullptr ||
                     slot->buffer == nullptr ||
@@ -2125,7 +2140,7 @@ struct ggml_compute::impl {
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
                      slot->extra == nullptr)) {
                     error =
-                        "REDUCE activation output slot is not backend-ready";
+                        "REDUCE activation chunk view is not backend-ready";
                     return false;
                 }
 
@@ -2146,12 +2161,11 @@ struct ggml_compute::impl {
                         stderr,
                         "[LT_GGML_LOCAL_CONT] side=%s "
                         "from_layer=%d to_layer=%d chunk=%d "
-                        "slot=%d mode=REDUCE status=READY\n",
+                        "arena=FIXED_RANGE mode=REDUCE status=READY\n",
                         side_name(config.local_side),
                         task.layer,
                         task.layer + 1,
-                        task.chunk,
-                        (task.layer + 1) & 1);
+                        task.chunk);
                 }
             }
         }
@@ -2291,7 +2305,7 @@ struct ggml_compute::impl {
 
             if (next_local) {
                 ggml_tensor * slot =
-                    activation_output_slot(task);
+                    activation_chunk_view(task);
 
                 if (slot == nullptr ||
                     slot->buffer == nullptr ||
@@ -2299,7 +2313,7 @@ struct ggml_compute::impl {
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
                      slot->extra == nullptr)) {
                     error =
-                        "FULL_LAYER activation output slot is not backend-ready";
+                        "FULL_LAYER activation chunk view is not backend-ready";
                     return false;
                 }
 
@@ -2317,12 +2331,11 @@ struct ggml_compute::impl {
                         stderr,
                         "[LT_GGML_LOCAL_CONT] side=%s "
                         "from_layer=%d to_layer=%d chunk=%d "
-                        "slot=%d mode=FULL status=READY\n",
+                        "arena=FIXED_RANGE mode=FULL status=READY\n",
                         side_name(config.local_side),
                         task.layer,
                         task.layer + 1,
-                        task.chunk,
-                        (task.layer + 1) & 1);
+                        task.chunk);
                 }
             } else {
                 const size_t count =
