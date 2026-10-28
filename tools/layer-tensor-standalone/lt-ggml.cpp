@@ -2685,6 +2685,273 @@ struct ggml_compute::impl {
         return true;
     }
 
+    bool run_sequence_ffn_bench(
+            int32_t layer_index,
+            int32_t tokens,
+            const std::vector<float> & residual_host,
+            int repeats,
+            sequence_ffn_bench_result & result,
+            std::vector<float> * output_host,
+            std::string & error) {
+        constexpr int k_warmup = 2;
+
+        result = {};
+
+        if (layer_index < 0 ||
+            layer_index >= config.runtime_plan.layers ||
+            tokens <= 0 ||
+            repeats <= 0) {
+            error =
+                "invalid sequence FFN benchmark parameters";
+            return false;
+        }
+
+        const size_t hidden_count =
+            static_cast<size_t>(n_embd) *
+            static_cast<size_t>(tokens);
+        if (residual_host.size() != hidden_count) {
+            std::ostringstream oss;
+            oss << "sequence FFN residual size mismatch: got="
+                << residual_host.size()
+                << " expected=" << hidden_count;
+            error = oss.str();
+            return false;
+        }
+
+        const llama_hparams & hp =
+            model->hparams;
+        llama_layer & layer =
+            model->layers[
+                static_cast<size_t>(
+                    layer_index)];
+
+        auto state =
+            new_graph_hold();
+        if (state == nullptr) {
+            error =
+                "failed to create sequence FFN benchmark context";
+            return false;
+        }
+
+        ggml_tensor * residual =
+            ggml_new_tensor_2d(
+                state->ctx,
+                GGML_TYPE_F32,
+                n_embd,
+                tokens);
+
+        ggml_tensor * hidden =
+            ggml_rms_norm(
+                state->ctx,
+                residual,
+                hp.f_norm_rms_eps);
+        hidden =
+            ggml_mul(
+                state->ctx,
+                hidden,
+                layer.ffn_norm);
+
+        ggml_tensor * logits =
+            ggml_mul_mat(
+                state->ctx,
+                layer.ffn_gate_inp,
+                hidden);
+        ggml_tensor * probs =
+            ggml_soft_max(
+                state->ctx,
+                logits);
+
+        ggml_tensor * ids =
+            ggml_argsort_top_k(
+                state->ctx,
+                probs,
+                n_expert_used);
+        ids =
+            ggml_cont(
+                state->ctx,
+                ids);
+
+        probs =
+            ggml_reshape_3d(
+                state->ctx,
+                probs,
+                1,
+                n_expert,
+                tokens);
+
+        ggml_tensor * weights =
+            ggml_get_rows(
+                state->ctx,
+                probs,
+                ids);
+        weights =
+            ggml_reshape_2d(
+                state->ctx,
+                weights,
+                n_expert_used,
+                tokens);
+
+        ggml_tensor * weights_sum =
+            ggml_sum_rows(
+                state->ctx,
+                weights);
+        weights_sum =
+            ggml_clamp(
+                state->ctx,
+                weights_sum,
+                6.103515625e-5f,
+                std::numeric_limits<float>::infinity());
+        weights =
+            ggml_div(
+                state->ctx,
+                weights,
+                weights_sum);
+        weights =
+            ggml_reshape_3d(
+                state->ctx,
+                weights,
+                1,
+                n_expert_used,
+                tokens);
+
+        if (hp.expert_weights_scale != 0.0f &&
+            hp.expert_weights_scale != 1.0f) {
+            weights =
+                ggml_scale(
+                    state->ctx,
+                    weights,
+                    hp.expert_weights_scale);
+        }
+
+        ggml_tensor * ffn =
+            build_full_moe_for_tokens(
+                state->ctx,
+                layer_index,
+                tokens,
+                hidden,
+                ids,
+                weights,
+                error);
+        if (ffn == nullptr) {
+            return false;
+        }
+
+        ggml_tensor * output =
+            ggml_add(
+                state->ctx,
+                residual,
+                ffn);
+        output =
+            ggml_cont(
+                state->ctx,
+                output);
+
+        ggml_cgraph * graph =
+            ggml_new_graph_custom(
+                state->ctx,
+                2048,
+                false);
+        ggml_build_forward_expand(
+            graph,
+            output);
+
+        if (!allocate_state(
+                state,
+                error)) {
+            return false;
+        }
+
+        std::lock_guard<std::mutex> lock(
+            backend_mutex);
+
+        ggml_backend_tensor_set(
+            residual,
+            residual_host.data(),
+            0,
+            residual_host.size() *
+                sizeof(float));
+
+        for (int i = 0;
+             i < k_warmup;
+             ++i) {
+            const ggml_status status =
+                ggml_backend_graph_compute(
+                    backend,
+                    graph);
+            ggml_backend_synchronize(
+                backend);
+
+            if (status !=
+                GGML_STATUS_SUCCESS) {
+                error =
+                    "sequence FFN warmup compute failed";
+                return false;
+            }
+        }
+
+        const auto begin =
+            std::chrono::steady_clock::now();
+
+        for (int i = 0;
+             i < repeats;
+             ++i) {
+            const ggml_status status =
+                ggml_backend_graph_compute(
+                    backend,
+                    graph);
+            ggml_backend_synchronize(
+                backend);
+
+            if (status !=
+                GGML_STATUS_SUCCESS) {
+                error =
+                    "sequence FFN timed compute failed";
+                return false;
+            }
+        }
+
+        const auto end =
+            std::chrono::steady_clock::now();
+
+        result.ffn_ms =
+            std::chrono::duration<
+                double,
+                std::milli>(
+                end - begin).count() /
+            static_cast<double>(
+                repeats);
+
+        std::vector<float> values(
+            hidden_count);
+        ggml_backend_tensor_get(
+            output,
+            values.data(),
+            0,
+            values.size() *
+                sizeof(float));
+
+        result.output_checksum =
+            checksum(values);
+
+        double l2_sq = 0.0;
+        for (float value :
+             values) {
+            const double x =
+                static_cast<double>(
+                    value);
+            l2_sq += x * x;
+        }
+        result.output_l2 =
+            std::sqrt(l2_sq);
+
+        if (output_host != nullptr) {
+            *output_host =
+                std::move(values);
+        }
+
+        return true;
+    }
+
     bool run_stream_precompute_bench(
             const key & task,
             const std::vector<float> & host_input,
@@ -4874,6 +5141,24 @@ bool ggml_compute::embed_tokens(
     }
 
     return true;
+}
+
+bool ggml_compute::sequence_ffn_bench(
+        int32_t layer,
+        int32_t tokens,
+        const std::vector<float> & residual,
+        int repeats,
+        sequence_ffn_bench_result & result,
+        std::vector<float> * output,
+        std::string & error) {
+    return impl_->run_sequence_ffn_bench(
+        layer,
+        tokens,
+        residual,
+        repeats,
+        result,
+        output,
+        error);
 }
 
 bool ggml_compute::stream_precompute_bench(
