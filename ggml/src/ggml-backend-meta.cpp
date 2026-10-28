@@ -16201,6 +16201,53 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 prefill_wave_prework_layer);
         const bool is_phone_only_sg = subgraph_is_phone_only(i);
 
+        // The last directional Tensor layer has no Attention(L+1,C) consumer
+        // to enforce its exact reduce dependency.  Detect the first full-batch
+        // terminal consumer (final l_out / result_norm / result_output) and
+        // drain the remaining per-chunk reduce tasks before that consumer can
+        // read their storage.  This is a terminal dependency only; it does not
+        // introduce a barrier between Tensor layers.
+        bool is_directional_wave_terminal_sg = false;
+        if (return_wavefront_graph && n_backends == 2) {
+            ggml_cgraph * pc_terminal_graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[i].cgraph_main;
+            if (pc_terminal_graph != nullptr) {
+                for (int k = 0;
+                     k < pc_terminal_graph->n_nodes;
+                     ++k) {
+                    const char * name =
+                        pc_terminal_graph->nodes[k]->name;
+                    if (name == nullptr) {
+                        continue;
+                    }
+
+                    const bool result_consumer =
+                        std::strncmp(
+                            name, "result_norm", 11) == 0 ||
+                        std::strncmp(
+                            name, "result_output", 13) == 0;
+
+                    int l_out_layer = -1;
+                    int l_out_parsed = 0;
+                    const bool final_full_l_out =
+                        std::sscanf(
+                            name, "l_out-%d%n",
+                            &l_out_layer,
+                            &l_out_parsed) == 1 &&
+                        name[l_out_parsed] == '\0' &&
+                        l_out_layer >=
+                            return_wavefront_first_layer;
+
+                    if (result_consumer ||
+                            final_full_l_out) {
+                        is_directional_wave_terminal_sg = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         // C2P decode FFN can appear as a PHONE_ONLY_SG because its terminal
         // ffn_moe_out node is Phone-active, even though the PC Router and PC
         // expert shard must execute first.  Detect this boundary explicitly
@@ -16336,6 +16383,63 @@ auto prefill_norm_sg_has_prework =
             is_prefill_norm_sg &&
             prefill_norm_layer >= 0 &&
             prefill_norm_chunk >= 0;
+
+        if (return_wavefront_graph &&
+                is_directional_wave_terminal_sg &&
+                has_pending_prefill_reduce()) {
+            size_t pending_lanes = 0;
+            int terminal_layer = -1;
+            for (size_t slot = 0;
+                 slot <
+                    ggml_backend_meta_context::
+                        PREFILL_RETURN_SLOTS;
+                 ++slot) {
+                if (pending_prefill_reduce_task[slot] == 0) {
+                    continue;
+                }
+                ++pending_lanes;
+                terminal_layer =
+                    std::max(
+                        terminal_layer,
+                        pending_prefill_reduce_layer[slot]);
+            }
+
+            int last_lane = -1;
+            const int64_t wait_start_us = ggml_time_us();
+            const ggml_status terminal_status =
+                wait_all_prefill_reduces(&last_lane);
+            const int64_t wait_us =
+                ggml_time_us() - wait_start_us;
+
+            ++layer_barrier_wait_count;
+            layer_barrier_wait_us += wait_us;
+            layer_barrier_wait_max_us =
+                std::max(
+                    layer_barrier_wait_max_us,
+                    wait_us);
+            if (terminal_layer >=
+                    return_wavefront_first_layer) {
+                return_wave_layer_barrier_us[
+                    terminal_layer] += wait_us;
+            }
+
+            printf(
+                "[DIRECTIONAL_WAVE_TERMINAL_WAIT] "
+                "sg=%zu layer=%d pending=%zu "
+                "last_lane=%d wait_ms=%.3f "
+                "status=%s\n",
+                i,
+                terminal_layer,
+                pending_lanes,
+                last_lane,
+                wait_us / 1000.0,
+                terminal_status == GGML_STATUS_SUCCESS ?
+                    "OK" : "FAIL");
+
+            if (terminal_status != GGML_STATUS_SUCCESS) {
+                return terminal_status;
+            }
+        }
 
         if (pc_phone_exact_prefill_dep) {
             // One-layer lookahead for ordinary Qwen3-MoE TENSOR_SPLIT.
