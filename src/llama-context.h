@@ -399,6 +399,16 @@ private:
                                       int                                             ubatch_id,
                                       ggml_status &                                   ret);
 
+    llm_graph_result * process_ubatch_region_ring_sequence(
+                                       const llama_ubatch &                            ubatch,
+                                       llm_graph_type                                  gtype,
+                                       llama_memory_context_i *                       mctx,
+                                       ggml_backend_sched_t                           sched_use,
+                                       llm_graph_result *                             res_use,
+                                       const std::vector<llama_hybrid_runtime_stage> & stages,
+                                       int                                             ubatch_id,
+                                       ggml_status &                                   ret);
+
     llm_graph_result * process_ubatch_region_ring(
                                        const llama_ubatch &                            ubatch,
                                        llm_graph_type                                  gtype,
@@ -420,6 +430,27 @@ private:
                                       uint32_t                          probe_tokens,
                                       int                               probe_layers,
                                       const llama_hybrid_plan &         runtime_plan);
+
+    llama_sequence_ffn_branch_graph * get_sequence_ffn_branch(
+                                      int                                  layer_index,
+                                      int                                  tokens,
+                                      size_t                               child_index,
+                                      ggml_backend_t                       backend,
+                                      int &                                cache_hit,
+                                      int &                                cache_miss,
+                                      int64_t &                            graph_build_us,
+                                      int64_t &                            alloc_us);
+
+    bool run_sequence_ffn_branch_task(
+                                      int                                  layer_index,
+                                      int                                  token_begin,
+                                      int                                  tokens,
+                                      size_t                               child_index,
+                                      ggml_backend_t                       backend,
+                                      const float *                        input,
+                                      float *                              output,
+                                      llama_sequence_ffn_timing *          timing,
+                                      ggml_status &                        ret);
 
     llm_graph_result * run_sequence_ffn_stage(
                                       const llama_ubatch &                 ubatch,
