@@ -20,7 +20,11 @@ Tensor planner:
     measured winner.
 
 Every candidate is a real llama-cli prompt evaluation over PC CPU + Phone RPC.
-Local CUDA is excluded with --device RPC0 (configurable).
+Experiment mode constructs Meta=[CPU, Phone RPC] and excludes local CUDA.
+
+Tensor candidates additionally enable the directional return-wavefront graph.
+Every measured candidate must pass a correctness gate against the all-CPU
+reference before it is eligible to win.
 """
 
 from __future__ import annotations
@@ -50,6 +54,15 @@ LAYER_SUM_RE = re.compile(
 )
 TRUNCATE_RE = re.compile(
     r"\[HYBRID_EXPERIMENT_TRUNCATE\].*?original_layers=(\d+).*?active_layers=(\d+)"
+)
+LOGITS_BLOCK_RE = re.compile(
+    r"decoded=0\s+source=full_vocab\s+count=(\d+)\s+zero=(\d+)\s+nonfinite=(\d+)"
+    r".*?"
+    r"top\[0\]:\s+token=(\d+)\s+logit=([-+0-9.eE]+)",
+    re.DOTALL,
+)
+WAVEFRONT_RE = re.compile(
+    r"\[HYBRID_EXPERIMENT_WAVEFRONT\].*?enabled=1"
 )
 
 
@@ -90,6 +103,14 @@ class Result:
     reps_ok: int
     log_files: List[str]
     policy: str
+    logits_count: Optional[int]
+    logits_zero: Optional[int]
+    logits_nonfinite: Optional[int]
+    top1_token: Optional[int]
+    top1_logit: Optional[float]
+    correctness: str
+    correctness_reason: str
+    wavefront_seen: bool
 
     @property
     def ok(self) -> bool:
@@ -97,6 +118,7 @@ class Result:
             self.returncode == 0
             and self.prompt_ms is not None
             and self.loaded_layers == self.x_layers
+            and self.correctness == "PASS"
         )
 
 
@@ -145,6 +167,9 @@ def sanitize_env(base: Dict[str, str]) -> Dict[str, str]:
         "LLAMA_HYBRID_EXPERIMENT_POLICY",
         "LLAMA_HYBRID_EXPERIMENT_N_LAYERS",
         "LLAMA_HYBRID_EXPERIMENT_TENSOR_CHUNK_TOKENS",
+        "LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT",
+        "LLAMA_HYBRID_RETURN_WAVEFRONT",
+        "GGML_META_PC_PHONE_EXEC_V1",
         "GGML_META_REGION_C2P_SELF_CHECK",
         "GGML_META_AB_TRACE_LAYER",
         "LLAMA_ARG_DEVICE",
@@ -269,7 +294,12 @@ def build_command(args: argparse.Namespace) -> List[str]:
 
 def parse_run_output(
     text: str, x_layers: int
-) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[int], Optional[int]]:
+) -> Tuple[
+    Optional[float], Optional[int], Optional[float],
+    Optional[int], Optional[int],
+    Optional[int], Optional[int], Optional[int],
+    Optional[int], Optional[float], bool,
+]:
     prompt_matches = list(PROMPT_RE.finditer(text))
     prompt_ms: Optional[float] = None
     prompt_tokens: Optional[int] = None
@@ -290,7 +320,28 @@ def parse_run_output(
     trunc = TRUNCATE_RE.search(text)
     original_layers = int(trunc.group(1)) if trunc else None
     loaded_layers = int(trunc.group(2)) if trunc else None
-    return prompt_ms, prompt_tokens, active_layer_ms, original_layers, loaded_layers
+
+    logits_matches = list(LOGITS_BLOCK_RE.finditer(text))
+    logits_count: Optional[int] = None
+    logits_zero: Optional[int] = None
+    logits_nonfinite: Optional[int] = None
+    top1_token: Optional[int] = None
+    top1_logit: Optional[float] = None
+    if logits_matches:
+        m = logits_matches[-1]
+        logits_count = int(m.group(1))
+        logits_zero = int(m.group(2))
+        logits_nonfinite = int(m.group(3))
+        top1_token = int(m.group(4))
+        top1_logit = float(m.group(5))
+
+    wavefront_seen = WAVEFRONT_RE.search(text) is not None
+    return (
+        prompt_ms, prompt_tokens, active_layer_ms,
+        original_layers, loaded_layers,
+        logits_count, logits_zero, logits_nonfinite,
+        top1_token, top1_logit, wavefront_seen,
+    )
 
 
 def run_candidate(
@@ -298,6 +349,7 @@ def run_candidate(
     args: argparse.Namespace,
     reps: int,
     out_dir: Path,
+    reference_top1: Optional[int] = None,
 ) -> Result:
     key = candidate_key(candidate, args)
     prompt_times: List[float] = []
@@ -307,6 +359,14 @@ def run_candidate(
     loaded_layers: Optional[int] = None
     logs: List[str] = []
     final_rc = 0
+    logits_count: Optional[int] = None
+    logits_zero: Optional[int] = None
+    logits_nonfinite: Optional[int] = None
+    top1_token: Optional[int] = None
+    top1_logit: Optional[float] = None
+    wavefront_seen = False
+    correctness_ok = True
+    correctness_reasons: List[str] = []
 
     for rep in range(reps):
         env = sanitize_env(os.environ)
@@ -318,6 +378,11 @@ def run_candidate(
             env["LLAMA_HYBRID_EXPERIMENT_TENSOR_CHUNK_TOKENS"] = str(
                 candidate.tensor_chunk
             )
+        if candidate.family == "tensor":
+            # Build the existing Qwen3-MoE return-wavefront graph for the
+            # alternating C2P/P2C experiment. Meta detects its chunk markers
+            # and enforces exact OUT(L-1,C) -> ATTN(L,C) dependencies.
+            env["LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT"] = "1"
 
         for item in args.extra_env:
             if "=" not in item:
@@ -385,10 +450,22 @@ def run_candidate(
             active_ms,
             original,
             loaded,
+            rep_logits_count,
+            rep_logits_zero,
+            rep_logits_nonfinite,
+            rep_top1_token,
+            rep_top1_logit,
+            rep_wavefront_seen,
         ) = parse_run_output(text, candidate.x_layers)
 
         original_layers = original
         loaded_layers = loaded
+        logits_count = rep_logits_count
+        logits_zero = rep_logits_zero
+        logits_nonfinite = rep_logits_nonfinite
+        top1_token = rep_top1_token
+        top1_logit = rep_top1_logit
+        wavefront_seen = wavefront_seen or rep_wavefront_seen
         if (
             proc.returncode != 0
             or prompt_ms is None
@@ -409,6 +486,49 @@ def run_candidate(
                     f"llama-cli failed during benchmark model setup; see {log_path}"
                 )
             break
+
+        rep_correct = True
+        rep_reason = "OK"
+        if rep_logits_count is None or rep_top1_token is None:
+            rep_correct = False
+            rep_reason = "NO_LOGITS"
+        elif rep_logits_count <= 0:
+            rep_correct = False
+            rep_reason = "EMPTY_LOGITS"
+        elif rep_logits_nonfinite is None or rep_logits_nonfinite != 0:
+            rep_correct = False
+            rep_reason = f"NONFINITE_{rep_logits_nonfinite}"
+        elif rep_logits_zero is None or rep_logits_zero >= rep_logits_count:
+            rep_correct = False
+            rep_reason = "ALL_ZERO"
+        elif reference_top1 is not None and rep_top1_token != reference_top1:
+            rep_correct = False
+            rep_reason = (
+                f"TOP1_MISMATCH_expected_{reference_top1}"
+                f"_got_{rep_top1_token}"
+            )
+        elif candidate.family == "tensor" and not rep_wavefront_seen:
+            rep_correct = False
+            rep_reason = "WAVEFRONT_NOT_BUILT"
+
+        if not rep_correct:
+            correctness_ok = False
+            correctness_reasons.append(
+                f"rep{rep + 1}:{rep_reason}"
+            )
+        print(
+            f"[BENCH_CORRECTNESS] family={candidate.family} "
+            f"x={candidate.x_layers} name={candidate.name} "
+            f"rep={rep + 1}/{reps} "
+            f"count={rep_logits_count} zero={rep_logits_zero} "
+            f"nonfinite={rep_logits_nonfinite} "
+            f"top1={rep_top1_token} "
+            f"reference_top1={reference_top1} "
+            f"wavefront={1 if rep_wavefront_seen else 0} "
+            f"status={'PASS' if rep_correct else 'FAIL'} "
+            f"reason={rep_reason}",
+            flush=True,
+        )
 
         prompt_times.append(prompt_ms)
         prompt_tokens = tokens
@@ -439,6 +559,26 @@ def run_candidate(
         reps_ok=len(prompt_times),
         log_files=logs,
         policy=",".join(candidate.policy),
+        logits_count=logits_count,
+        logits_zero=logits_zero,
+        logits_nonfinite=logits_nonfinite,
+        top1_token=top1_token,
+        top1_logit=top1_logit,
+        correctness=(
+            "PASS"
+            if prompt_times and correctness_ok
+            else ("DRY_RUN" if args.dry_run else "FAIL")
+        ),
+        correctness_reason=(
+            "OK"
+            if prompt_times and correctness_ok
+            else (
+                "DRY_RUN"
+                if args.dry_run
+                else ";".join(correctness_reasons) or "EXECUTION_FAILED"
+            )
+        ),
+        wavefront_seen=wavefront_seen,
     )
 
 
@@ -452,7 +592,9 @@ def write_csv(path: Path, results: Sequence[Result]) -> None:
         "family", "x_layers", "name", "c2p_ratio", "p2c_ratio",
         "tensor_chunk", "prompt_ms", "prompt_tokens", "active_layer_ms",
         "original_layers", "loaded_layers", "returncode", "reps_ok",
-        "policy", "log_files",
+        "policy", "logits_count", "logits_zero", "logits_nonfinite",
+        "top1_token", "top1_logit", "correctness", "correctness_reason",
+        "wavefront_seen", "log_files",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -479,8 +621,11 @@ def main() -> int:
         help="actual model layer counts x to load, e.g. 1:8 or 2,4,6,8",
     )
     p.add_argument(
-        "--ratios", default="0.20,0.33,0.50",
-        help="PC FFN shares searched for C2P/P2C",
+        "--ratios", default="0.34,0.67",
+        help=(
+            "PC FFN shares searched for C2P/P2C; defaults straddle "
+            "the Q4_K MoE 1/3 and 2/3 physical split points"
+        ),
     )
     p.add_argument(
         "--tensor-chunks", default="32,64,128",
@@ -586,13 +731,44 @@ def main() -> int:
             )
         )
 
-        layer_results = [
-            run_candidate(c, args, args.search_reps, out_dir) for c in layer_cs
-        ]
+        # The all-CPU candidate is the correctness oracle for this exact
+        # truncated x-layer model. Run it first so every Phone/Tensor candidate
+        # is judged against the same top-1 token before it may enter ranking.
+        reference = run_candidate(
+            layer_cs[0], args, args.search_reps, out_dir
+        )
+        all_results.append(reference)
+        if not reference.ok or reference.top1_token is None:
+            print(
+                f"[BENCH_X_FAIL] x={x} reason=INVALID_ALL_CPU_REFERENCE "
+                f"correctness={reference.correctness} "
+                f"detail={reference.correctness_reason}"
+            )
+            continue
+
+        reference_top1 = reference.top1_token
+        print(
+            f"[BENCH_REFERENCE] x={x} top1={reference_top1} "
+            f"logit={reference.top1_logit} status=READY",
+            flush=True,
+        )
+
+        layer_results = [reference]
+        layer_results.extend(
+            run_candidate(
+                candidate, args, args.search_reps, out_dir,
+                reference_top1=reference_top1,
+            )
+            for candidate in layer_cs[1:]
+        )
         tensor_results = [
-            run_candidate(c, args, args.search_reps, out_dir) for c in tensor_cs
+            run_candidate(
+                candidate, args, args.search_reps, out_dir,
+                reference_top1=reference_top1,
+            )
+            for candidate in tensor_cs
         ]
-        all_results.extend(layer_results)
+        all_results.extend(layer_results[1:])
         all_results.extend(tensor_results)
 
         search_layer = choose_best(layer_results)
@@ -618,10 +794,12 @@ def main() -> int:
         )
 
         best_layer = run_candidate(
-            layer_winner, args, args.winner_reps, out_dir
+            layer_winner, args, args.winner_reps, out_dir,
+            reference_top1=reference_top1,
         )
         best_tensor = run_candidate(
-            tensor_winner, args, args.winner_reps, out_dir
+            tensor_winner, args, args.winner_reps, out_dir,
+            reference_top1=reference_top1,
         )
         all_results.extend([best_layer, best_tensor])
 
@@ -646,6 +824,10 @@ def main() -> int:
             "tensor_prompt_ms": best_tensor.prompt_ms,
             "tensor_speedup_vs_layer": speedup,
             "winner": winner,
+            "reference_top1": reference_top1,
+            "layer_correctness": best_layer.correctness,
+            "tensor_correctness": best_tensor.correctness,
+            "tensor_wavefront_seen": best_tensor.wavefront_seen,
         }
         summary.append(row)
         print(
