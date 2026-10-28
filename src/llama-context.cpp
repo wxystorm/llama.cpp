@@ -1982,6 +1982,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     // reach across a Region boundary or attach the output head too early.
     const bool dense_region_stage =
         stage != nullptr && !stage->wave_probe &&
+        !cparams.embeddings &&
         (model.arch == LLM_ARCH_QWEN3 ||
          (model.arch == LLM_ARCH_LLAMA &&
           model.hparams.n_expert == 0));
