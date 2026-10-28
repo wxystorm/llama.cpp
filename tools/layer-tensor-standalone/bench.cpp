@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <memory>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
