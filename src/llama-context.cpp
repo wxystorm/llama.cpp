@@ -2401,7 +2401,12 @@ static bool llama_sequence_ffn_build_branch(
         int                 tokens,
         size_t              child_index,
         ggml_backend_t      backend,
-        llama_sequence_ffn_branch_graph & state) {
+        llama_sequence_ffn_branch_graph & state,
+        int64_t &           graph_build_us,
+        int64_t &           alloc_us) {
+    graph_build_us = 0;
+    alloc_us = 0;
+
     if (model.arch != LLM_ARCH_QWEN3MOE ||
             layer_index < 0 ||
             layer_index >= (int) model.layers.size() ||
@@ -2409,6 +2414,8 @@ static bool llama_sequence_ffn_build_branch(
             backend == nullptr) {
         return false;
     }
+
+    const int64_t build_begin_us = ggml_time_us();
 
     const llama_hparams & hp = model.hparams;
     const llama_layer & layer = model.layers[(size_t) layer_index];
@@ -2462,6 +2469,11 @@ static bool llama_sequence_ffn_build_branch(
     if (state.ctx == nullptr) {
         return false;
     }
+
+    state.backend = backend;
+    state.layer_index = layer_index;
+    state.tokens = tokens;
+    state.child_index = child_index;
 
     state.input =
         ggml_new_tensor_2d(
@@ -2573,15 +2585,33 @@ static bool llama_sequence_ffn_build_branch(
     ggml_build_forward_expand(
         state.graph, state.output);
 
+    const int64_t alloc_begin_us = ggml_time_us();
+    graph_build_us = alloc_begin_us - build_begin_us;
+
     state.buffer =
         ggml_backend_alloc_ctx_tensors(
             state.ctx, backend);
+    alloc_us = ggml_time_us() - alloc_begin_us;
+
     if (state.buffer == nullptr) {
         return false;
     }
 
-    return state.input->buffer != nullptr &&
-           state.output->buffer != nullptr;
+    const bool ok =
+        state.input->buffer != nullptr &&
+        state.output->buffer != nullptr;
+
+    if (ok) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_FFN_CACHE_BUILD] layer=%d child=%zu tokens=%d "
+            "backend=%s graph_ms=%.3f alloc_ms=%.3f status=READY\n",
+            layer_index, child_index, tokens,
+            ggml_backend_name(backend),
+            graph_build_us / 1000.0,
+            alloc_us / 1000.0);
+    }
+
+    return ok;
 }
 
 llm_graph_result * llama_context::run_sequence_ffn_stage(
