@@ -307,7 +307,7 @@ int main(
                 opts,
                 session_id);
 
-        if (!opts.serve) {
+        if (!opts.serve || rc == 3) {
             return rc;
         }
 
