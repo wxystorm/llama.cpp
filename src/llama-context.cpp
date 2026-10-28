@@ -7833,9 +7833,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ring_exec != "fifo-owned" && ring_exec != "fifo-state" &&
         ring_exec != "fifo-workers" && ring_exec != "fifo-backend-audit" &&
         ring_exec != "fifo-pc-phone" &&
+        ring_exec != "fifo-pc-phone-seq" &&
         ring_exec != "serial" && ring_exec != "full") {
         throw std::runtime_error(
-            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, fifo-pc-phone, serial or full");
+            "LLAMA_HYBRID_REGION_RING_EXEC must be ready, fifo, fifo-isolated, fifo-owned, fifo-state, fifo-workers, fifo-backend-audit, fifo-pc-phone, fifo-pc-phone-seq, serial or full");
     }
     int region_ring_chunk_tokens = 128;
     int region_ring_xc = 0;
@@ -7896,10 +7897,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 return stage.kind ==
                     llama_hybrid_runtime_stage_kind::SEQUENCE_FFN;
             });
-    if (sequence_ffn_runtime && ring_exec != "serial") {
+    if (sequence_ffn_runtime &&
+            ring_exec != "serial" &&
+            ring_exec != "fifo-pc-phone-seq") {
         throw std::runtime_error(
-            "Sequence-FFN V1 is an independent runtime stage and currently "
-            "requires LLAMA_HYBRID_REGION_RING_EXEC=serial");
+            "Sequence-FFN requires either the serial correctness path or "
+            "LLAMA_HYBRID_REGION_RING_EXEC=fifo-pc-phone-seq");
     }
     if (sequence_ffn_runtime &&
             !model.hybrid_ring_plan_layout.empty()) {
@@ -7987,6 +7990,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ring_exec == "fifo-workers" ? "DEVICE_FIFO_GATED_WORKERS" :
             ring_exec == "fifo-backend-audit" ? "DEVICE_FIFO_BACKEND_AUDIT" :
             ring_exec == "fifo-pc-phone" ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
+            ring_exec == "fifo-pc-phone-seq" ? "CAUSAL_SEQUENCE_TASK_PIPELINE" :
             ring_exec == "serial" ? "SERIAL_STAGE_REFERENCE" :
                                    "FULL_GRAPH_REFERENCE");
     }
@@ -9272,6 +9276,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-workers = three real host threads, one shared Backend graph gate;
             // fifo-backend-audit = workers + actual split/resource/Meta child audit;
             // fifo-pc-phone = PC CPU+CUDA shared execution, Meta/RPC independent;
+            // fifo-pc-phone-seq = token-interval causal task DAG with one
+            //                      CPU, CUDA and Phone executor; Sequence-FFN
+            //                      expands into Attention/PC-FFN/Phone-FFN tasks.
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
             LLAMA_LOG_ERROR(
@@ -9279,6 +9286,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ring_exec.c_str(), ubatch_id, ubatch.n_tokens);
             if (ring_exec == "serial") {
                 res = process_ubatch_staged(
+                    ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                    mctx.get(), sched.get(), gf_res_prev.get(),
+                    runtime_stages, ubatch_id, status);
+            } else if (ring_exec == "fifo-pc-phone-seq") {
+                res = process_ubatch_region_ring_sequence(
                     ubatch, ctx_type_to_graph_type(cparams.ctx_type),
                     mctx.get(), sched.get(), gf_res_prev.get(),
                     runtime_stages, ubatch_id, status);
