@@ -3470,7 +3470,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "[REGION_RING_PC_SCHED] resource=%zu worker=%s "
                     "policy=%s bank=%s backends=%d "
                     "first=%s last=%s offload=%d "
-                    "weight_cache=%d meta_registered=0 status=READY\n",
+                    "bank_arena=%d meta_registered=0 status=READY\n",
                     resource_id,
                     cpu_resource ? "CPU" : "GPU",
                     policy,
@@ -4133,7 +4133,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         auto enqueue_gpu_bank_refill =
             [&](size_t region, size_t bank_index,
                 size_t source_region) -> bool {
-                if (!gpu_bank_streaming || bank_index >= 2) {
+                if (!gpu_bank_streaming || bank_index >= 2 ||
+                        region >= gpu_region_rank.size()) {
+                    return false;
+                }
+                const int target_rank = gpu_region_rank[region];
+                if (target_rank < 0 ||
+                        llama_region_ring_gpu_weight_bank_for_rank(
+                            (size_t) target_rank) != bank_index) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_GPU_BANK_MOVER] event=REJECT "
+                        "region=%zu target_rank=%d bank=%c "
+                        "reason=PARITY_MISMATCH\n",
+                        region, target_rank,
+                        bank_index == 0 ? 'A' : 'B');
                     return false;
                 }
                 {
