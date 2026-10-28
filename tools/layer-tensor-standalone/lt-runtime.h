@@ -81,9 +81,14 @@ struct plan {
     float c2p_pc_ratio = 0.5f;
     float p2c_pc_ratio = 0.5f;
 
-    // OWNER has priority, but REMOTE_FFN must not starve.  With the default
+    // OWNER has priority, but REMOTE_FFN must not starve. With the default
     // value 1, a waiting REMOTE_FFN is serviced after at most one OWNER task.
     int32_t owner_burst_limit = 1;
+
+    // Admission gate for diagonal Tensor wavefront. A local owner layer may
+    // stay at most this many chunks ahead of the next (remote-owned) layer
+    // having published READY back to this endpoint.
+    int32_t max_owner_ahead = 1;
 
     bool valid(std::string * reason = nullptr) const;
     side owner_for_layer(int32_t layer) const;
@@ -250,6 +255,7 @@ private:
 
     int32_t consecutive_owner_ = 0;
     std::vector<int32_t> next_owner_chunk_;
+    std::vector<int32_t> remote_owner_started_;
     uint64_t next_seq_ = 1;
     uint64_t completed_chunks_ = 0;
 
