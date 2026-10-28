@@ -215,10 +215,10 @@ struct llama_context {
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
-    // Load-time Region Ring residency: after the standard llama.cpp warmup,
-    // prime the first two streamed GPU Regions into Bank A/B so prompt
-    // execution starts with both initial Banks resident.
-    bool region_ring_prime_initial_gpu_banks();
+    // Load-time Region Ring residency: after initialization probes finish,
+    // load GPU rank0/rank1 into the two fixed CUDA Banks. Prompt execution is
+    // not allowed to synthesize this initial window on its critical path.
+    bool region_ring_load_initial_gpu_banks();
 
     llama_memory_breakdown memory_breakdown() const;
 
@@ -537,17 +537,21 @@ private:
     struct region_ring_worker_resource {
         ggml_backend_sched_ptr sched;
         llm_graph_result_ptr   res;
-        size_t cached_region = std::numeric_limits<size_t>::max();
-        uint64_t last_use = 0;
+
+        // GPU resources [1]/[2] are fixed physical Banks, never a cache/LRU.
+        // bank_region is diagnostic ownership, bank_ready is the synchronization
+        // contract, and generation increments after every completed refill.
+        size_t   bank_region = std::numeric_limits<size_t>::max();
+        uint64_t bank_generation = 0;
+        bool     bank_ready = false;
     };
-    // [0] CPU worker, [1] GPU Bank A / legacy GPU worker, [2] GPU Bank B.
+    // [0] CPU worker, [1] fixed GPU Bank A, [2] fixed GPU Bank B.
     std::array<region_ring_worker_resource, 3> region_ring_worker_resources;
-    uint64_t region_ring_gpu_weight_bank_epoch = 0;
-    bool region_ring_initial_banks_primed = false;
+    bool region_ring_initial_banks_loaded = false;
 
     // Same physical CUDA device as the Region Ring GPU compute backend, but a
-    // separate backend context/stream owned only by the CPU weight-prefetch
-    // worker. It never participates in graph scheduling.
+    // separate backend context/stream owned only by the single CPU Bank mover.
+    // It never chooses Regions/Banks; it only executes explicit refill jobs.
     ggml_backend_ptr region_ring_cuda_transfer_backend;
 
     // Threaded Region Ring lock hierarchy:
