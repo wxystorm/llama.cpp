@@ -380,6 +380,38 @@ def print_summary(summary):
         )
 
 
+def run_local_ffn_diagnostic(args, xt, ratio):
+    cmd = [
+        args.bench,
+        "--ffn-split-selfcheck",
+        "--model", args.model,
+        "--prompt-file", args.prompt_file,
+        "--chunk-tokens", str(xt),
+        "--pc-ratio", f"{ratio:.8f}",
+        "--threads", str(args.threads),
+    ]
+
+    print("=== PC-only FULL vs split FFN diagnostic ===")
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=args.timeout,
+    )
+
+    if proc.stdout:
+        print(proc.stdout.rstrip())
+    if proc.stderr:
+        print(proc.stderr.rstrip(), file=sys.stderr)
+
+    print(
+        f"=== diagnostic rc={proc.returncode} ==="
+    )
+
+
 def run_preflight(args, chunk_sizes, ratios, first_owners):
     print("=== numerical preflight (L=1) ===")
 
@@ -443,6 +475,11 @@ def run_preflight(args, chunk_sizes, ratios, first_owners):
                         "aligned with the full-layer reference; performance "
                         "ranking would be invalid.",
                         file=sys.stderr,
+                    )
+                    run_local_ffn_diagnostic(
+                        args,
+                        xt,
+                        ratio,
                     )
                     return False
 
