@@ -4317,142 +4317,87 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     llm_graph_result * task_res =
                         ring_res[dev];
                     int gpu_bank = -1;
-                    bool gpu_bank_hit = false;
-                    bool gpu_prefetch_hit = false;
-                    bool gpu_load_prime_hit = false;
-                    size_t evicted_region =
-                        std::numeric_limits<size_t>::max();
+                    int64_t gpu_bank_wait_us = 0;
 
                     if (dev == 1 && gpu_weight_streaming) {
                         const int rank =
                             task.region < gpu_region_rank.size() ?
                                 gpu_region_rank[task.region] : -1;
-                        size_t selected_bank =
-                            rank >= 0 ?
-                                1 + llama_region_ring_gpu_weight_bank_for_rank(
-                                        (size_t) rank) :
-                                1;
-                        int64_t gpu_weight_wait_us = 0;
-
-                        if (gpu_weight_prefetch) {
-                            // Strict simple contract:
-                            //   GPU never replaces a Bank.
-                            //   The last chunk of the previous same-parity
-                            //   Region tells the CPU prefetch worker what to
-                            //   load. GPU only waits until that load is done.
-                            const int64_t wait_begin_us = ggml_time_us();
-                            std::unique_lock<std::mutex> lock(
-                                gpu_prefetch_mutex);
-                            auto & bank_state =
-                                gpu_bank_runtime[selected_bank - 1];
-
-                            if (bank_state.loading ||
-                                    bank_state.loaded_region != task.region) {
-                                LLAMA_LOG_ERROR(
-                                    "[REGION_RING_GPU_WEIGHT_PREFETCH] "
-                                    "event=WAIT region=%zu chunk=%zu "
-                                    "bank=%c status=CPU_LOADING\n",
-                                    task.region, task.chunk,
-                                    selected_bank == 1 ? 'A' : 'B');
-                                gpu_bank_cv.wait(lock, [&]() {
-                                    return gpu_prefetch_failed ||
-                                        (!bank_state.loading &&
-                                         bank_state.loaded_region ==
-                                            task.region);
-                                });
-                                gpu_weight_wait_us =
-                                    ggml_time_us() - wait_begin_us;
-                                state.weight_prefetch_wait_us +=
-                                    gpu_weight_wait_us;
-                            }
-
-                            if (gpu_prefetch_failed) {
-                                throw std::runtime_error(
-                                    "GPU weight prefetch worker failed");
-                            }
-
-                            auto & selected =
-                                region_ring_worker_resources[selected_bank];
-                            if (selected.bank_region != task.region) {
-                                throw std::runtime_error(
-                                    "GPU weight Bank publication mismatch");
-                            }
-
-                            gpu_bank_hit = true;
-                            gpu_load_prime_hit =
-                                load_primed_window &&
-                                rank >= 0 && rank < 2 &&
-                                task.chunk == 0;
-                            gpu_prefetch_hit =
-                                !gpu_load_prime_hit &&
-                                task.chunk == 0 &&
-                                gpu_bank_prefetched[selected_bank - 1];
-                            if (gpu_prefetch_hit) {
-                                ++state.weight_prefetch_hits;
-                                gpu_bank_prefetched[selected_bank - 1] = false;
-                            }
-                            ++state.weight_bank_hits;
-
-                            selected.bank_generation =
-                                ++region_ring_gpu_weight_bank_generation;
-                            task_sched = selected.sched.get();
-                            task_res = selected.res.get();
-                            gpu_bank = (int) selected_bank - 1;
-                        } else {
-                            // Tiny batches keep the proven demand-load path.
-                            for (size_t bank = 1; bank <= 2; ++bank) {
-                                auto & candidate =
-                                    region_ring_worker_resources[bank];
-                                if (candidate.bank_region == task.region) {
-                                    selected_bank = bank;
-                                    gpu_bank_hit = true;
-                                    break;
-                                }
-                            }
-
-                            auto & selected =
-                                region_ring_worker_resources[selected_bank];
-                            if (!gpu_bank_hit) {
-                                if (selected.bank_region !=
-                                        std::numeric_limits<size_t>::max()) {
-                                    evicted_region = selected.bank_region;
-                                    ggml_backend_sched_synchronize(
-                                        selected.sched.get());
-                                    selected.res->reset();
-                                    ggml_backend_sched_reset(
-                                        selected.sched.get());
-                                    ggml_backend_sched_set_weight_cache(
-                                        selected.sched.get(), true);
-                                    ++state.weight_bank_evictions;
-                                }
-                                selected.bank_region = task.region;
-                                ++state.weight_bank_misses;
-                            } else {
-                                ++state.weight_bank_hits;
-                            }
-
-                            selected.bank_generation =
-                                ++region_ring_gpu_weight_bank_generation;
-                            task_sched = selected.sched.get();
-                            task_res = selected.res.get();
-                            gpu_bank = (int) selected_bank - 1;
+                        if (rank < 0) {
+                            throw std::runtime_error(
+                                "GPU Region missing fixed Bank rank");
                         }
 
-                        const std::string evicted_region_text =
-                            evicted_region ==
-                                std::numeric_limits<size_t>::max() ?
-                                "NONE" : std::to_string(evicted_region);
+                        const size_t bank_index =
+                            llama_region_ring_gpu_weight_bank_for_rank(
+                                (size_t) rank);
+                        const size_t selected_bank = bank_index + 1;
+                        auto & selected =
+                            region_ring_worker_resources[selected_bank];
+
+                        if (gpu_bank_streaming) {
+                            const int64_t wait_begin_us = ggml_time_us();
+                            std::unique_lock<std::mutex> lock(
+                                gpu_bank_mover_mutex);
+                            if (!selected.bank_ready ||
+                                    selected.bank_region != task.region) {
+                                LLAMA_LOG_ERROR(
+                                    "[REGION_RING_GPU_BANK] event=WAIT "
+                                    "region=%zu chunk=%zu bank=%c "
+                                    "expected_region=%zu current_region=%zu "
+                                    "generation=%" PRIu64 " status=MOVER\n",
+                                    task.region, task.chunk,
+                                    bank_index == 0 ? 'A' : 'B',
+                                    task.region, selected.bank_region,
+                                    selected.bank_generation);
+                                gpu_bank_ready_cv.wait(lock, [&]() {
+                                    return gpu_bank_mover_failed ||
+                                        (selected.bank_ready &&
+                                         selected.bank_region ==
+                                            task.region);
+                                });
+                            }
+                            gpu_bank_wait_us =
+                                ggml_time_us() - wait_begin_us;
+                            state.weight_prefetch_wait_us +=
+                                gpu_bank_wait_us;
+                            if (gpu_bank_mover_failed) {
+                                throw std::runtime_error(
+                                    "GPU Bank mover failed");
+                            }
+                        } else {
+                            // Tiny/decode batches keep the existing on-demand
+                            // weight bind for correctness, but Bank selection is
+                            // still fixed by rank parity. No search/LRU/cache
+                            // policy participates in control flow.
+                            if (selected.bank_region != task.region) {
+                                ggml_backend_sched_synchronize(
+                                    selected.sched.get());
+                                selected.res->reset();
+                                ggml_backend_sched_reset(
+                                    selected.sched.get());
+                                ggml_backend_sched_set_weight_cache(
+                                    selected.sched.get(), true);
+                                selected.bank_region = task.region;
+                                selected.bank_ready = false;
+                            }
+                        }
+
+                        task_sched = selected.sched.get();
+                        task_res = selected.res.get();
+                        gpu_bank = (int) bank_index;
+
                         LLAMA_LOG_ERROR(
-                            "[REGION_RING_GPU_WEIGHT] event=BANK_SELECT "
-                            "region=%zu chunk=%zu bank=%c region_map=%s "
-                            "evicted_region=%s weight_wait_ms=%.3f "
-                            "status=READY\n",
-                            task.region, task.chunk,
+                            "[REGION_RING_GPU_BANK] event=USE "
+                            "region=%zu chunk=%zu rank=%d bank=%c "
+                            "generation=%" PRIu64 " wait_ms=%.3f "
+                            "mode=%s status=READY\n",
+                            task.region, task.chunk, rank,
                             gpu_bank == 0 ? 'A' : 'B',
-                            gpu_prefetch_hit ? "PREFETCH_HIT" :
-                                (gpu_bank_hit ? "HIT" : "MISS"),
-                            evicted_region_text.c_str(),
-                            gpu_weight_wait_us / 1000.0);
+                            selected.bank_generation,
+                            gpu_bank_wait_us / 1000.0,
+                            gpu_bank_streaming ?
+                                "REFILL" : "SMALL_BATCH_DEMAND");
                     }
 
                     ggml_status task_status = GGML_STATUS_SUCCESS;
