@@ -636,6 +636,13 @@ private:
     // It never chooses Regions/Banks; it only executes explicit refill jobs.
     ggml_backend_ptr region_ring_cuda_transfer_backend;
 
+    // GGML schedulers require a CPU backend as the final fallback.  The causal
+    // sequence pipeline gives the GPU scheduler its own auxiliary CPU context
+    // so CUDA input staging/fallback bookkeeping never shares the one CPU
+    // executor backend handle.  Strict-backend validation still rejects real
+    // GPU Region compute that falls back to this auxiliary CPU.
+    ggml_backend_ptr region_ring_gpu_aux_cpu_backend;
+
     // Threaded Region Ring lock hierarchy:
     //   phase A: PREPARE gate only for graph/scheduler mutation
     //   phase B: if prepare_split() may synchronize a non-INPUT CPU producer,
