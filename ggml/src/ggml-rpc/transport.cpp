@@ -135,6 +135,7 @@ struct socket_t::impl {
 #endif // GGML_RPC_RDMA
     bool     use_rdma;
     sockfd_t fd;
+    std::recursive_mutex rpc_mutex;
 };
 
 socket_t::impl::~impl() {
@@ -568,6 +569,10 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+std::recursive_mutex & socket_t::rpc_mutex() {
+    return pimpl->rpc_mutex;
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
