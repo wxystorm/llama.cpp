@@ -1977,6 +1977,79 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         }
     }
 
+    // Dense Region graphs must be self-contained.  Validate the actual graph
+    // result after build/reuse so a future model optimization cannot silently
+    // reach across a Region boundary or attach the output head too early.
+    const bool dense_region_stage =
+        stage != nullptr && !stage->wave_probe &&
+        (model.arch == LLM_ARCH_QWEN3 ||
+         (model.arch == LLM_ARCH_LLAMA &&
+          model.hparams.n_expert == 0));
+    if (dense_region_stage) {
+        const int n_layer = model.hparams.n_layer();
+        const bool contract_ok =
+            llama_region_ring_stage_contract_valid(
+                n_layer,
+                gparams.hybrid_layer_begin,
+                gparams.hybrid_layer_end,
+                gparams.hybrid_hidden_input,
+                gparams.hybrid_output_head,
+                gparams.hybrid_embedding_only);
+
+        bool layer_scope_ok = contract_ok;
+        for (int il = 0; il < n_layer; ++il) {
+            const bool expected =
+                !gparams.hybrid_embedding_only &&
+                il >= gparams.hybrid_layer_begin &&
+                il < gparams.hybrid_layer_end;
+            const bool present = res->get_layer_inp(il) != nullptr;
+            if (present != expected) {
+                layer_scope_ok = false;
+                break;
+            }
+        }
+
+        const bool stage_output_ok =
+            gparams.hybrid_output_head ?
+                res->get_stage_output() == nullptr :
+                res->get_stage_output() != nullptr;
+        const bool logits_ok =
+            gparams.hybrid_output_head ?
+                res->get_logits() != nullptr :
+                res->get_logits() == nullptr;
+
+        if (!layer_scope_ok || !stage_output_ok || !logits_ok) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_DENSE_STAGE_AUDIT] arch=%s "
+                "layers=[%d,%d) hidden=%d output_head=%d embedding_only=%d "
+                "layer_scope=%d stage_output=%d logits=%d "
+                "status=FAIL\n",
+                model.arch == LLM_ARCH_QWEN3 ? "qwen3" : "llama",
+                gparams.hybrid_layer_begin,
+                gparams.hybrid_layer_end,
+                gparams.hybrid_hidden_input ? 1 : 0,
+                gparams.hybrid_output_head ? 1 : 0,
+                gparams.hybrid_embedding_only ? 1 : 0,
+                layer_scope_ok ? 1 : 0,
+                stage_output_ok ? 1 : 0,
+                logits_ok ? 1 : 0);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        LLAMA_LOG_DEBUG(
+            "[REGION_RING_DENSE_STAGE_AUDIT] arch=%s "
+            "layers=[%d,%d) hidden=%d output_head=%d embedding_only=%d "
+            "reused=%d status=PASS\n",
+            model.arch == LLM_ARCH_QWEN3 ? "qwen3" : "llama",
+            gparams.hybrid_layer_begin,
+            gparams.hybrid_layer_end,
+            gparams.hybrid_hidden_input ? 1 : 0,
+            gparams.hybrid_output_head ? 1 : 0,
+            gparams.hybrid_embedding_only ? 1 : 0,
+            reused_graph ? 1 : 0);
+    }
+
     if (log_prepare_breakdown) {
         const int64_t prepare_total_us = ggml_time_us() - prepare_total_begin_us;
 
@@ -4303,10 +4376,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             const size_t init_source =
                 std::numeric_limits<size_t>::max();
             (void) enqueue_gpu_prefetch(
-                gpu_region_order[0], 0,
+                gpu_region_order[0],
+                llama_region_ring_gpu_weight_bank_for_rank(0),
                 "INITIAL_WINDOW", init_source);
             (void) enqueue_gpu_prefetch(
-                gpu_region_order[1], 1,
+                gpu_region_order[1],
+                llama_region_ring_gpu_weight_bank_for_rank(1),
                 "INITIAL_WINDOW", init_source);
             try {
                 gpu_prefetch_worker =
@@ -4808,15 +4883,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         const int rank =
                             task.region < gpu_region_rank.size() ?
                                 gpu_region_rank[task.region] : -1;
-                        const size_t next_rank =
+                        const auto next_rank =
                             rank >= 0 ?
-                                (size_t) rank + 2 :
-                                gpu_region_order.size();
-                        if (next_rank < gpu_region_order.size()) {
+                                llama_region_ring_gpu_weight_next_rank(
+                                    (size_t) rank,
+                                    gpu_region_order.size()) :
+                                std::nullopt;
+                        if (next_rank.has_value()) {
                             const size_t bank_index =
-                                (size_t) rank & 1;
+                                llama_region_ring_gpu_weight_bank_for_rank(
+                                    (size_t) rank);
                             (void) enqueue_gpu_prefetch(
-                                gpu_region_order[next_rank],
+                                gpu_region_order[*next_rank],
                                 bank_index,
                                 "REGION_DRAIN",
                                 task.region);
