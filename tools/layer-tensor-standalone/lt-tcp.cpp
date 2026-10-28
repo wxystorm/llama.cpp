@@ -18,7 +18,7 @@ namespace lt {
 namespace {
 
 constexpr uint32_t k_magic = 0x3156544cU; // LTV1
-constexpr uint32_t k_version = 4;
+constexpr uint32_t k_version = 5;
 constexpr uint32_t k_frame_plan = 1;
 constexpr uint32_t k_frame_message = 2;
 constexpr uint32_t k_max_frame = 256U * 1024U * 1024U;
