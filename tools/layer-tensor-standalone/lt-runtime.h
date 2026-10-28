@@ -32,6 +32,10 @@ enum class message_kind : uint8_t {
     initial = 6,
     model_ready = 7,
     debug_partial = 8,
+    bench_ping = 9,
+    bench_pong = 10,
+    stream_bench_request = 11,
+    stream_bench_result = 12,
 };
 
 struct key {
