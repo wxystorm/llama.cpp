@@ -348,39 +348,64 @@ void runtime::compute_loop() {
 
             const auto eligible_owner =
                 [&]() {
-                    return std::find_if(
-                        owner_queue_.begin(),
-                        owner_queue_.end(),
-                        [&](const owner_work & work) {
-                            if (work.task.layer < 0 ||
-                                work.task.layer >= plan_.layers) {
-                                return false;
-                            }
-                            const size_t layer_index =
+                    auto selected =
+                        owner_queue_.end();
+
+                    for (auto it = owner_queue_.begin();
+                         it != owner_queue_.end();
+                         ++it) {
+                        const owner_work & work = *it;
+
+                        if (work.task.layer < 0 ||
+                            work.task.layer >= plan_.layers) {
+                            continue;
+                        }
+
+                        const size_t layer_index =
+                            static_cast<size_t>(
+                                work.task.layer);
+
+                        if (work.task.chunk !=
+                            next_owner_chunk_[layer_index]) {
+                            continue;
+                        }
+
+                        if (plan_.execution_mode == mode::tensor &&
+                            work.task.layer + 1 < plan_.layers) {
+                            const size_t next_layer_index =
                                 static_cast<size_t>(
-                                    work.task.layer);
+                                    work.task.layer + 1);
 
-                            if (work.task.chunk !=
-                                next_owner_chunk_[layer_index]) {
-                                return false;
+                            if (next_owner_chunk_[layer_index] >
+                                remote_owner_started_[
+                                    next_layer_index] +
+                                plan_.max_owner_ahead) {
+                                continue;
                             }
+                        }
 
-                            if (plan_.execution_mode == mode::tensor &&
-                                work.task.layer + 1 < plan_.layers) {
-                                const size_t next_layer_index =
-                                    static_cast<size_t>(
-                                        work.task.layer + 1);
+                        if (plan_.execution_mode == mode::tensor) {
+                            // Tensor keeps queue order; the owner-ahead gate
+                            // shapes the diagonal frontier.
+                            return it;
+                        }
 
-                                if (next_owner_chunk_[layer_index] >
-                                    remote_owner_started_[
-                                        next_layer_index] +
-                                    plan_.max_owner_ahead) {
-                                    return false;
-                                }
-                            }
+                        // Layer mode should push a chunk through the current
+                        // contiguous local region as soon as possible. This
+                        // reaches the next PC<->Phone boundary early and lets
+                        // the peer overlap its layers with later chunks here.
+                        if (selected == owner_queue_.end() ||
+                            work.task.layer >
+                                selected->task.layer ||
+                            (work.task.layer ==
+                                 selected->task.layer &&
+                             work.task.chunk <
+                                 selected->task.chunk)) {
+                            selected = it;
+                        }
+                    }
 
-                            return true;
-                        });
+                    return selected;
                 };
 
             compute_cv_.wait(lock, [&]() {
