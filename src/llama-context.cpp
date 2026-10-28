@@ -1786,8 +1786,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
+    const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
+    const int64_t jupiter_trace_t0_us = jupiter_trace ? ggml_time_us() : 0;
+    uint32_t jupiter_chunk_idx = 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        if (jupiter_trace && n_tokens_all > 1) {
+            LLAMA_LOG_INFO(
+                    "[JUPITER_UBATCH] event=BEGIN chunk=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
+                    jupiter_chunk_idx,
+                    (long long) n_tokens_prev,
+                    ubatch.n_tokens,
+                    (long long) (ggml_time_us() - jupiter_trace_t0_us));
+        }
+
         // 拿出要处理的一个 ubatch
         // count the outputs in this ubatch
         {
@@ -1808,6 +1823,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (jupiter_trace && n_tokens_all > 1 && res != nullptr) {
+            LLAMA_LOG_INFO(
+                    "[JUPITER_UBATCH] event=QUEUED chunk=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
+                    jupiter_chunk_idx,
+                    (long long) n_tokens_prev,
+                    ubatch.n_tokens,
+                    (long long) (ggml_time_us() - jupiter_trace_t0_us));
+        }
+
         // 根据当前ubatch构建计算图并执行计算，返回结果res
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1964,6 +1989,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        jupiter_chunk_idx++;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
