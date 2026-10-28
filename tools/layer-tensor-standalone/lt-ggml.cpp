@@ -2131,14 +2131,14 @@ struct ggml_compute::impl {
                     0,
                     count * sizeof(float));
             } else {
-                ggml_tensor * slot =
+                ggml_tensor * arena_view =
                     activation_chunk_view(task);
 
                 if (slot == nullptr ||
-                    slot->buffer == nullptr ||
+                    arena_view->buffer == nullptr ||
                     (ggml_backend_dev_type(device) !=
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
-                     slot->extra == nullptr)) {
+                     arena_view->extra == nullptr)) {
                     error =
                         "REDUCE activation chunk view is not backend-ready";
                     return false;
@@ -2148,12 +2148,12 @@ struct ggml_compute::impl {
                     backend,
                     backend,
                     reduced,
-                    slot);
+                    arena_view);
                 ggml_backend_synchronize(
                     backend);
 
                 // Empty output tells runtime that the next OWNER input is
-                // already resident in its persistent activation slot.
+                // already resident in its persistent activation arena.
                 output.clear();
 
                 if (config.log_events) {
@@ -2304,14 +2304,14 @@ struct ggml_compute::impl {
             }
 
             if (next_local) {
-                ggml_tensor * slot =
+                ggml_tensor * arena_view =
                     activation_chunk_view(task);
 
                 if (slot == nullptr ||
-                    slot->buffer == nullptr ||
+                    arena_view->buffer == nullptr ||
                     (ggml_backend_dev_type(device) !=
                          GGML_BACKEND_DEVICE_TYPE_CPU &&
-                     slot->extra == nullptr)) {
+                     arena_view->extra == nullptr)) {
                     error =
                         "FULL_LAYER activation chunk view is not backend-ready";
                     return false;
@@ -2321,7 +2321,7 @@ struct ggml_compute::impl {
                     backend,
                     backend,
                     layer_out,
-                    slot);
+                    arena_view);
                 ggml_backend_synchronize(
                     backend);
                 output.clear();
