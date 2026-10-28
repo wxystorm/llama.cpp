@@ -444,6 +444,44 @@ std::vector<float> make_input(
     return values;
 }
 
+class diagnostic_socket_transport final : public lt::transport {
+public:
+    explicit diagnostic_socket_transport(
+            std::shared_ptr<lt::tcp_channel> channel)
+        : channel_(std::move(channel)) {
+    }
+
+    bool send(
+            const lt::message & value) override {
+        if (value.kind == lt::message_kind::ready) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ready_[value.task] = value.ready;
+        }
+        return channel_->send_message(value);
+    }
+
+    bool take_ready(
+            const lt::key & task,
+            lt::ready_payload & ready) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = ready_.find(task);
+        if (it == ready_.end()) {
+            return false;
+        }
+        ready = std::move(it->second);
+        ready_.erase(it);
+        return true;
+    }
+
+private:
+    std::shared_ptr<lt::tcp_channel> channel_;
+    std::mutex mutex_;
+    std::unordered_map<
+        lt::key,
+        lt::ready_payload,
+        lt::key_hash> ready_;
+};
+
 class loopback_transport final : public lt::transport {
 public:
     void bind(lt::runtime * peer) {
@@ -944,9 +982,20 @@ int run_real(
     const auto prelude_end =
         std::chrono::steady_clock::now();
 
-    auto transport =
-        std::make_shared<lt::socket_transport>(
-            channel);
+    std::shared_ptr<diagnostic_socket_transport>
+        diagnostic_transport;
+    std::shared_ptr<lt::transport> transport;
+
+    if (runtime_plan.debug_phone_partial) {
+        diagnostic_transport =
+            std::make_shared<diagnostic_socket_transport>(
+                channel);
+        transport = diagnostic_transport;
+    } else {
+        transport =
+            std::make_shared<lt::socket_transport>(
+                channel);
+    }
 
     lt::runtime pc(
         lt::side::pc,
@@ -961,6 +1010,8 @@ int run_real(
 
     std::atomic<bool> rx_ok { true };
     std::atomic<bool> shutting_down { false };
+    std::atomic<uint64_t> shard_checks { 0 };
+    std::atomic<uint64_t> shard_failures { 0 };
 
     std::thread rx([&]() {
         lt::message incoming;
@@ -975,6 +1026,122 @@ int run_real(
                     "reason=DUPLICATE_MODEL_READY\n");
                 rx_ok.store(false);
                 return;
+            }
+
+            if (incoming.kind ==
+                lt::message_kind::debug_partial) {
+                if (!runtime_plan.debug_phone_partial ||
+                    diagnostic_transport == nullptr) {
+                    std::fprintf(
+                        stderr,
+                        "[LT_PHONE_SHARD_CHECK] status=FAIL "
+                        "reason=UNEXPECTED_DEBUG_PARTIAL\n");
+                    shard_failures.fetch_add(1);
+                    incoming = {};
+                    continue;
+                }
+
+                lt::ready_payload ready;
+                if (!diagnostic_transport->take_ready(
+                        incoming.task,
+                        ready)) {
+                    std::fprintf(
+                        stderr,
+                        "[LT_PHONE_SHARD_CHECK] layer=%d chunk=%d "
+                        "status=FAIL reason=MISSING_CAPTURED_READY\n",
+                        incoming.task.layer,
+                        incoming.task.chunk);
+                    shard_failures.fetch_add(1);
+                    incoming = {};
+                    continue;
+                }
+
+                std::vector<float> reference;
+                std::string diag_error;
+                if (!compute->ffn_shard_reference(
+                        incoming.task,
+                        ready,
+                        lt::side::phone,
+                        reference,
+                        diag_error) ||
+                    reference.size() != incoming.partial.size()) {
+                    std::fprintf(
+                        stderr,
+                        "[LT_PHONE_SHARD_CHECK] layer=%d chunk=%d "
+                        "status=FAIL reason=%s ref=%zu actual=%zu\n",
+                        incoming.task.layer,
+                        incoming.task.chunk,
+                        diag_error.empty() ?
+                            "REFERENCE_OR_SIZE_MISMATCH" :
+                            diag_error.c_str(),
+                        reference.size(),
+                        incoming.partial.size());
+                    shard_failures.fetch_add(1);
+                    incoming = {};
+                    continue;
+                }
+
+                double diff_sq = 0.0;
+                double ref_sq = 0.0;
+                double max_abs = 0.0;
+                for (size_t i = 0;
+                     i < reference.size();
+                     ++i) {
+                    const double a =
+                        static_cast<double>(
+                            reference[i]);
+                    const double b =
+                        static_cast<double>(
+                            incoming.partial[i]);
+                    const double d =
+                        std::fabs(a - b);
+                    diff_sq += d * d;
+                    ref_sq += a * a;
+                    max_abs =
+                        std::max(max_abs, d);
+                }
+
+                const double rms =
+                    std::sqrt(
+                        diff_sq /
+                        std::max<size_t>(
+                            1,
+                            reference.size()));
+                const double ref_rms =
+                    std::sqrt(
+                        ref_sq /
+                        std::max<size_t>(
+                            1,
+                            reference.size()));
+                const double rel_rms =
+                    rms /
+                    std::max(
+                        1e-12,
+                        ref_rms);
+                const bool ok =
+                    rel_rms <= 5e-3;
+
+                std::printf(
+                    "[LT_PHONE_SHARD_CHECK] layer=%d chunk=%d "
+                    "ref_checksum=%.12f actual_checksum=%.12f "
+                    "max_abs=%.9g rms=%.9g rel_rms=%.9g "
+                    "status=%s\n",
+                    incoming.task.layer,
+                    incoming.task.chunk,
+                    lt::checksum(reference),
+                    lt::checksum(incoming.partial),
+                    max_abs,
+                    rms,
+                    rel_rms,
+                    ok ? "PASS" : "FAIL");
+
+                shard_checks.fetch_add(1);
+                if (!ok) {
+                    shard_failures.fetch_add(1);
+                }
+
+                incoming = {};
+                continue;
             }
 
             if (!pc.on_message(
@@ -1102,6 +1269,20 @@ int run_real(
 
     const lt::stats stats =
         pc.snapshot_stats();
+
+    if (runtime_plan.debug_phone_partial) {
+        std::printf(
+            "[LT_PHONE_SHARD_CHECK_SUM] checks=%llu failures=%llu "
+            "status=%s\n",
+            static_cast<unsigned long long>(
+                shard_checks.load()),
+            static_cast<unsigned long long>(
+                shard_failures.load()),
+            shard_failures.load() == 0 &&
+                    shard_checks.load() ==
+                        chunk_sizes.size() ?
+                "PASS" : "FAIL");
+    }
 
     std::printf(
         "[LT_RUN] mode=%s layers=%d tokens=%zu chunks=%zu "
