@@ -2638,25 +2638,14 @@ struct ggml_compute::impl {
             return false;
         }
 
-        const bool copied_async =
-            ggml_backend_tensor_copy_async(
-                backend,
-                backend,
-                src,
-                dst);
-
-        if (!copied_async) {
-            // OpenCL currently reports that it does not support async
-            // backend-to-backend copies. Ignoring the false return leaves the
-            // persistent activation arena stale, so the next local layer reads
-            // the previous contents. Fall back to the canonical synchronous
-            // tensor copy just like ggml-backend's scheduler does.
-            ggml_backend_synchronize(backend);
-            ggml_backend_tensor_copy(
-                src,
-                dst);
-        }
-
+        // Public ggml_backend_tensor_copy_async() is a void API and
+        // already performs its own synchronized blocking fallback when the
+        // destination backend does not implement cpy_tensor_async.
+        ggml_backend_tensor_copy_async(
+            backend,
+            backend,
+            src,
+            dst);
         ggml_backend_synchronize(backend);
 
         if (config.log_events) {
@@ -2664,13 +2653,12 @@ struct ggml_compute::impl {
                 stderr,
                 "[LT_GGML_LOCAL_COPY] side=%s mode=%s "
                 "from_layer=%d to_layer=%d chunk=%d "
-                "copy=%s status=READY\n",
+                "copy=BACKEND_API_AUTO_FALLBACK status=READY\n",
                 side_name(config.local_side),
                 mode_name_value,
                 task.layer,
                 task.layer + 1,
-                task.chunk,
-                copied_async ? "ASYNC" : "SYNC_FALLBACK");
+                task.chunk);
         }
 
         return true;
