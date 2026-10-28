@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 
 struct socket_t;
 typedef std::shared_ptr<socket_t> socket_ptr;
@@ -15,6 +16,12 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+
+    // A single RPC transaction may consist of several socket operations
+    // (header, payload, response header, response payload). Ready-task
+    // execution can call the same RPC connection from multiple threads, so
+    // callers must be able to hold one lock across the whole transaction.
+    std::recursive_mutex & rpc_mutex();
 
     socket_ptr accept();
 
