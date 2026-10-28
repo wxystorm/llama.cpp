@@ -9779,7 +9779,306 @@ llama_perf_context_data llama_context::perf_get_data() const {
     return data;
 }
 
+bool llama_context::region_ring_prime_initial_gpu_banks() {
+    if (!model.hybrid_ring_gpu_weight_streaming ||
+            model.hybrid_ring_plan_mode != "APPLY_WIDE") {
+        return false;
+    }
+
+    int xc = model.hybrid_ring_plan_cpu_chunk_tokens;
+    int xg = model.hybrid_ring_plan_gpu_chunk_tokens;
+    int xp = model.hybrid_ring_plan_phone_chunk_tokens;
+    if (xc <= 0 || xg <= 0 || xp <= 0) {
+        int common_chunk = model.hybrid_ring_plan_chunk_tokens;
+        if (common_chunk <= 0) {
+            common_chunk = 128;
+            if (const char * env =
+                    std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+                const int requested = std::atoi(env);
+                if (requested > 0) {
+                    common_chunk = requested;
+                }
+            }
+        }
+        xc = xg = xp = common_chunk;
+    }
+
+    std::vector<llama_region_ring_region> regions;
+    try {
+        regions = model.hybrid_ring_plan_layout.empty() ?
+            llama_region_ring_from_env(model.hparams.n_layer()) :
+            llama_region_ring_parse(
+                model.hybrid_ring_plan_layout,
+                model.hparams.n_layer());
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+            "status=SKIP reason=LAYOUT_INVALID detail=%s\n",
+            e.what());
+        return false;
+    }
+
+    const auto stages =
+        llama_region_ring_runtime_stages(regions, xc, xg, xp);
+    std::vector<size_t> gpu_regions;
+    for (size_t r = 0; r < stages.size(); ++r) {
+        if (stages[r].kind == llama_hybrid_runtime_stage_kind::GPU) {
+            gpu_regions.push_back(r);
+        }
+    }
+    if (gpu_regions.size() < 2 || xg <= 0) {
+        return false;
+    }
+
+    auto & bank_a = region_ring_worker_resources[1];
+    auto & bank_b = region_ring_worker_resources[2];
+    if (!bank_a.sched || !bank_a.res ||
+            !bank_b.sched || !bank_b.res ||
+            backend_ptrs.size() < 2 ||
+            backend_ptrs[1] == nullptr) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+            "status=SKIP reason=BANK_RESOURCES_NOT_READY\n");
+        return false;
+    }
+
+    ggml_backend_dev_t cuda_dev =
+        ggml_backend_get_device(backend_ptrs[1]);
+    if (region_ring_cuda_transfer_backend &&
+            ggml_backend_get_device(
+                region_ring_cuda_transfer_backend.get()) != cuda_dev) {
+        region_ring_cuda_transfer_backend.reset();
+    }
+    if (!region_ring_cuda_transfer_backend) {
+        region_ring_cuda_transfer_backend.reset(
+            ggml_backend_dev_init(cuda_dev, nullptr));
+    }
+    if (!region_ring_cuda_transfer_backend) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+            "status=FAIL reason=TRANSFER_BACKEND\n");
+        return false;
+    }
+
+    llama_memory_context_ptr full_mctx =
+        memory ? memory->init_full() : nullptr;
+    auto * kv_full =
+        dynamic_cast<llama_kv_cache_context *>(full_mctx.get());
+    if (!kv_full) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+            "status=FAIL reason=KV_CONTEXT\n");
+        return false;
+    }
+    auto kv_view = kv_full->make_stage_view();
+    if (!kv_view) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+            "status=FAIL reason=KV_STAGE_VIEW\n");
+        return false;
+    }
+
+    const int prime_tokens =
+        std::max(1, std::min<int>(
+            xg, (int) std::max<uint32_t>(1, cparams.n_ubatch)));
+    const uint32_t n_pos =
+        std::max<uint32_t>(
+            1, model.hparams.n_pos_per_embd());
+
+    auto data = std::make_shared<llama_ubatch::data_t>();
+    data->embd.assign(
+        (size_t) prime_tokens * model.hparams.n_embd, 0.0f);
+    data->pos.resize((size_t) prime_tokens * n_pos);
+    for (uint32_t p = 0; p < n_pos; ++p) {
+        for (int i = 0; i < prime_tokens; ++i) {
+            data->pos[
+                (size_t) p * prime_tokens + (size_t) i] = i;
+        }
+    }
+    data->n_seq_id.assign((size_t) prime_tokens, 1);
+    data->seq_id.resize((size_t) prime_tokens);
+    data->seq_id_data.assign(1, 0);
+    for (int i = 0; i < prime_tokens; ++i) {
+        data->seq_id[(size_t) i] = data->seq_id_data.data();
+    }
+    data->seq_id_unq.assign(1, 0);
+    data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
+    data->seq_idx[0] = 0;
+    data->output.assign((size_t) prime_tokens, 0);
+
+    llama_ubatch prime_ubatch {
+        /*.b_equal_seqs =*/ 0,
+        /*.n_tokens     =*/ (uint32_t) prime_tokens,
+        /*.n_seq_tokens =*/ 1,
+        /*.n_seqs       =*/ (uint32_t) prime_tokens,
+        /*.n_seqs_unq   =*/ 1,
+        /*.n_pos        =*/ n_pos,
+        /*.token        =*/ nullptr,
+        /*.embd         =*/ data->embd.data(),
+        /*.pos          =*/ data->pos.data(),
+        /*.n_seq_id     =*/ data->n_seq_id.data(),
+        /*.seq_id       =*/ data->seq_id.data(),
+        /*.seq_id_unq   =*/ data->seq_id_unq.data(),
+        /*.seq_idx      =*/ data->seq_idx.data(),
+        /*.output       =*/ data->output.data(),
+        /*.data         =*/ data,
+    };
+
+    const int64_t prime_begin_us = ggml_time_us();
+    size_t total_upload_bytes = 0;
+    size_t total_cache_hit_bytes = 0;
+    int64_t total_prepare_us = 0;
+    int64_t total_h2d_us = 0;
+
+    const auto prime_one =
+        [&](size_t gpu_rank, region_ring_worker_resource & bank) -> bool {
+            const size_t region = gpu_regions[gpu_rank];
+            const auto & stage = stages[region];
+            const size_t bank_index =
+                llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
+
+            if (!kv_view->set_stage_range(0, 0, prime_tokens)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+                    "rank=%zu region=%zu bank=%c status=FAIL "
+                    "reason=KV_STAGE_RANGE\n",
+                    gpu_rank, region, bank_index == 0 ? 'A' : 'B');
+                return false;
+            }
+
+            ggml_status status = GGML_STATUS_SUCCESS;
+            const int64_t prepare_begin_us = ggml_time_us();
+            llm_graph_result * result = nullptr;
+            {
+                std::unique_lock<std::mutex> prepare_gate(
+                    region_ring_prepare_mutex);
+                result = prepare_ubatch(
+                    bank.res.get(), bank.sched.get(),
+                    prime_ubatch,
+                    ctx_type_to_graph_type(cparams.ctx_type),
+                    kv_view.get(), status, false,
+                    &stage, 0, true, false, false);
+            }
+            total_prepare_us += ggml_time_us() - prepare_begin_us;
+            if (!result || status != GGML_STATUS_SUCCESS) {
+                kv_view->clear_stage_range();
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+                    "rank=%zu region=%zu bank=%c status=FAIL "
+                    "reason=GRAPH_PREPARE code=%d\n",
+                    gpu_rank, region, bank_index == 0 ? 'A' : 'B',
+                    (int) status);
+                return false;
+            }
+
+            const int n_splits =
+                ggml_backend_sched_get_n_splits(bank.sched.get());
+            if (n_splits <= 0) {
+                kv_view->clear_stage_range();
+                return false;
+            }
+            for (int split = 0; split < n_splits; ++split) {
+                if (ggml_backend_sched_get_split_backend(
+                        bank.sched.get(), split) != backend_ptrs[1]) {
+                    kv_view->clear_stage_range();
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+                        "rank=%zu region=%zu bank=%c status=FAIL "
+                        "reason=NON_CUDA_SPLIT split=%d/%d\n",
+                        gpu_rank, region,
+                        bank_index == 0 ? 'A' : 'B',
+                        split, n_splits);
+                    return false;
+                }
+            }
+
+            size_t upload_bytes = 0;
+            size_t cache_hit_bytes = 0;
+            const int64_t h2d_begin_us = ggml_time_us();
+            ggml_backend_sched_t staging_owner =
+                region_ring_worker_resources[1].sched.get();
+            for (int split = 0; split < n_splits; ++split) {
+                status =
+                    ggml_backend_sched_prepare_split_weights_staged_async(
+                        bank.sched.get(), split,
+                        region_ring_cuda_transfer_backend.get(),
+                        staging_owner);
+                upload_bytes +=
+                    ggml_backend_sched_get_last_weight_upload_bytes(
+                        bank.sched.get());
+                cache_hit_bytes +=
+                    ggml_backend_sched_get_last_weight_cache_hit_bytes(
+                        bank.sched.get());
+                if (status != GGML_STATUS_SUCCESS) {
+                    break;
+                }
+            }
+            ggml_backend_synchronize(
+                region_ring_cuda_transfer_backend.get());
+            total_h2d_us += ggml_time_us() - h2d_begin_us;
+            kv_view->clear_stage_range();
+
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+                    "rank=%zu region=%zu bank=%c status=FAIL "
+                    "reason=WEIGHT_STAGE code=%d\n",
+                    gpu_rank, region, bank_index == 0 ? 'A' : 'B',
+                    (int) status);
+                return false;
+            }
+
+            bank.cached_region = region;
+            bank.last_use = 0;
+            total_upload_bytes += upload_bytes;
+            total_cache_hit_bytes += cache_hit_bytes;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT_PRIME] phase=LOAD_TIME "
+                "rank=%zu region=%zu bank=%c tokens=%d "
+                "upload_mib=%.3f cache_hit_mib=%.3f status=READY\n",
+                gpu_rank, region, bank_index == 0 ? 'A' : 'B',
+                prime_tokens,
+                upload_bytes / 1048576.0,
+                cache_hit_bytes / 1048576.0);
+            return true;
+        };
+
+    region_ring_initial_banks_primed = false;
+    const bool ok_a = prime_one(0, bank_a);
+    const bool ok_b = ok_a && prime_one(1, bank_b);
+    region_ring_initial_banks_primed =
+        ok_a && ok_b &&
+        bank_a.cached_region == gpu_regions[0] &&
+        bank_b.cached_region == gpu_regions[1];
+
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_GPU_WEIGHT_PRIME_SUM] phase=LOAD_TIME "
+        "region0=%zu region1=%zu bankA=%d bankB=%d "
+        "upload_mib=%.3f cache_hit_mib=%.3f "
+        "prepare_ms=%.3f h2d_ms=%.3f wall_ms=%.3f status=%s\n",
+        gpu_regions[0], gpu_regions[1],
+        bank_a.cached_region == gpu_regions[0] ? 1 : 0,
+        bank_b.cached_region == gpu_regions[1] ? 1 : 0,
+        total_upload_bytes / 1048576.0,
+        total_cache_hit_bytes / 1048576.0,
+        total_prepare_us / 1000.0,
+        total_h2d_us / 1000.0,
+        (ggml_time_us() - prime_begin_us) / 1000.0,
+        region_ring_initial_banks_primed ? "READY" : "FAIL");
+
+    return region_ring_initial_banks_primed;
+}
+
 void llama_context::perf_reset() {
+    // The standard llama.cpp load path calls perf_reset() after its warmup,
+    // memory clear and synchronize. Prime the first two streamed GPU Regions
+    // here so their H2D cost belongs to model/context load, not prompt eval.
+    if (has_evaluated_once &&
+            model.hybrid_ring_gpu_weight_streaming &&
+            model.hybrid_ring_plan_mode == "APPLY_WIDE") {
+        (void) region_ring_prime_initial_gpu_banks();
+    }
+
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
