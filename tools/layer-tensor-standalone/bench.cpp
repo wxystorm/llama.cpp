@@ -24,6 +24,7 @@ struct options {
     bool self_test = false;
     bool ffn_split_selfcheck = false;
     bool stream_precompute_bench = false;
+    bool sequence_ffn_bench = false;
     bool debug_phone_partial = false;
     bool trace = false;
 
@@ -63,6 +64,9 @@ void usage(const char * argv0) {
         "  %s --stream-precompute-bench --connect HOST:PORT "
         "--model MODEL.gguf --prompt-file prompt.txt "
         "[--chunk-tokens N] [--stream-repeats N]\n"
+        "  %s --sequence-ffn-bench --connect HOST:PORT "
+        "--model MODEL.gguf --prompt-file prompt.txt "
+        "[--chunk-tokens 64] [--stream-repeats N]\n"
         "  %s --connect HOST:PORT --model MODEL.gguf --prompt-file prompt.txt "
         "--mode tensor|layer --layers N --chunk-tokens N [options]\n\n"
         "real-model options:\n"
@@ -80,12 +84,13 @@ void usage(const char * argv0) {
         "  --threads N              PC CPU GGML threads (default 8)\n"
         "  --debug-phone-partial    diagnostic: compare Phone FFN shard with PC CPU reference\n"
         "  --stream-precompute-bench measure 4-way streamed hidden->QKV overlap potential\n"
-        "  --stream-repeats N       compute/network repeats for stream microbench (default 10)\n"
+        "  --sequence-ffn-bench     sweep token-wise PC/Phone replicated FFN splits\n"
+        "  --stream-repeats N       compute/network repeats for microbenchmarks (default 10)\n"
         "  --trace                  print task transitions\n\n"
         "reference self-test options:\n"
         "  --chunks N               synthetic chunk count\n"
         "  --hidden N               synthetic hidden width\n",
-        argv0, argv0, argv0, argv0);
+        argv0, argv0, argv0, argv0, argv0);
 }
 
 bool parse_side(
@@ -195,6 +200,8 @@ bool parse_options(
             opts.ffn_split_selfcheck = true;
         } else if (arg == "--stream-precompute-bench") {
             opts.stream_precompute_bench = true;
+        } else if (arg == "--sequence-ffn-bench") {
+            opts.sequence_ffn_bench = true;
         } else if (arg == "--debug-phone-partial") {
             opts.debug_phone_partial = true;
         } else if (arg == "--trace") {
@@ -1851,6 +1858,10 @@ int main(
 
     if (opts.stream_precompute_bench) {
         return run_stream_precompute_bench(opts);
+    }
+
+    if (opts.sequence_ffn_bench) {
+        return run_sequence_ffn_bench(opts);
     }
 
     if (opts.self_test) {
