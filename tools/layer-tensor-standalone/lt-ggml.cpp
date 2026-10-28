@@ -969,25 +969,45 @@ struct ggml_compute::impl {
             return false;
         }
 
-        if (!validate_hidden_size(
-                task,
-                host_input,
-                error)) {
+        if (!host_input.empty()) {
+            if (!validate_hidden_size(
+                    task,
+                    host_input,
+                    error)) {
+                return false;
+            }
+
+            host_input_tensor =
+                ggml_new_tensor_2d(
+                    graph->ctx,
+                    GGML_TYPE_F32,
+                    n_embd,
+                    tokens);
+            input = host_input_tensor;
+            return true;
+        }
+
+        // Empty host input is the explicit device-local continuation signal.
+        // Unlike the old temporary-graph pointer reuse, this tensor is owned
+        // by a persistent backend buffer for the entire benchmark lifetime.
+        input =
+            activation_input_slot(task);
+        host_input_tensor = nullptr;
+
+        if (input == nullptr ||
+            input->buffer == nullptr ||
+            (ggml_backend_dev_type(device) !=
+                 GGML_BACKEND_DEVICE_TYPE_CPU &&
+             input->extra == nullptr)) {
+            std::ostringstream oss;
+            oss << "persistent activation input is not backend-ready"
+                << ": layer=" << task.layer
+                << " chunk=" << task.chunk
+                << " tensor=" << input;
+            error = oss.str();
             return false;
         }
 
-        // OpenCL graph-local tensors carry backend-specific metadata.
-        // Reusing an activation allocated by a previous standalone graph
-        // as src0 of the next graph is not valid on Adreno OpenCL.
-        // Materialize cross-graph activations through host F32 until
-        // persistent activation slots are introduced.
-        host_input_tensor =
-            ggml_new_tensor_2d(
-                graph->ctx,
-                GGML_TYPE_F32,
-                n_embd,
-                tokens);
-        input = host_input_tensor;
         return true;
     }
 
