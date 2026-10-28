@@ -2328,7 +2328,6 @@ static ggml_guid_t ggml_backend_meta_guid() {
 
 struct ggml_backend_meta_compute_workers;
 struct ggml_backend_meta_transfer_worker;
-struct ggml_backend_meta_priority_worker;
 
 struct ggml_backend_meta_context;
 static bool ggml_backend_meta_tensor_phone_primary_layer(
@@ -2457,15 +2456,7 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * phone_exec_completion_worker = nullptr;
     uint64_t                            next_pc_phone_exec_seq = 1;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
-    // Tensor-ready PC executor. OWNER work (local Attention/Router/FFN path)
-    // is always selected before REMOTE_FFN work that arrived from Phone.
-    // There is intentionally no window/fairness policy: OWNER is strict
-    // priority, as requested by the experimental scheduler design.
-    ggml_backend_meta_priority_worker * prefill_pc_worker = nullptr;
-    // Directional Tensor reductions use one lightweight worker independent
-    // from the two compute queues. Legacy return lanes keep their existing
-    // workers below.
-    ggml_backend_meta_transfer_worker * tensor_reduce_worker = nullptr;
+    ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -2729,101 +2720,6 @@ struct ggml_backend_meta_transfer_worker {
         std::unique_lock<std::mutex> lock(mutex);
         stage_cv.wait(lock, [&]() { return stage_ready >= id || completed >= id; });
         return status;
-    }
-};
-
-struct ggml_backend_meta_priority_worker {
-    enum class kind {
-        OWNER,
-        REMOTE_FFN,
-    };
-
-    struct task {
-        uint64_t id;
-        kind queue;
-        std::function<ggml_status(uint64_t)> run;
-    };
-
-    std::thread worker;
-    std::mutex mutex;
-    std::condition_variable task_cv;
-    std::condition_variable done_cv;
-    std::deque<task> owner_tasks;
-    std::deque<task> remote_ffn_tasks;
-    std::unordered_map<uint64_t, ggml_status> completed;
-    uint64_t submitted = 0;
-    bool stop = false;
-
-    ggml_backend_meta_priority_worker() : worker([this]() {
-        std::unique_lock<std::mutex> lock(mutex);
-        while (true) {
-            task_cv.wait(lock, [&]() {
-                return stop ||
-                    !owner_tasks.empty() ||
-                    !remote_ffn_tasks.empty();
-            });
-            if (stop && owner_tasks.empty() && remote_ffn_tasks.empty()) {
-                return;
-            }
-
-            // Strict priority by design: OWNER always wins whenever one is
-            // ready. No window or starvation guard is used in this first
-            // ready-task implementation.
-            task current;
-            if (!owner_tasks.empty()) {
-                current = std::move(owner_tasks.front());
-                owner_tasks.pop_front();
-            } else {
-                current = std::move(remote_ffn_tasks.front());
-                remote_ffn_tasks.pop_front();
-            }
-
-            lock.unlock();
-            const ggml_status status = current.run(current.id);
-            lock.lock();
-            completed[current.id] = status;
-            done_cv.notify_all();
-        }
-    }) {}
-
-    ~ggml_backend_meta_priority_worker() {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            stop = true;
-        }
-        task_cv.notify_all();
-        worker.join();
-    }
-
-    uint64_t enqueue_owner(std::function<ggml_status(uint64_t)> run) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const uint64_t id = ++submitted;
-        owner_tasks.push_back({ id, kind::OWNER, std::move(run) });
-        task_cv.notify_one();
-        return id;
-    }
-
-    uint64_t enqueue_remote_ffn(std::function<ggml_status(uint64_t)> run) {
-        std::lock_guard<std::mutex> lock(mutex);
-        const uint64_t id = ++submitted;
-        remote_ffn_tasks.push_back({
-            id, kind::REMOTE_FFN, std::move(run)
-        });
-        task_cv.notify_one();
-        return id;
-    }
-
-    ggml_status wait(uint64_t id) {
-        std::unique_lock<std::mutex> lock(mutex);
-        done_cv.wait(lock, [&]() {
-            return completed.find(id) != completed.end();
-        });
-        return completed.at(id);
-    }
-
-    bool is_completed(uint64_t id) {
-        std::lock_guard<std::mutex> lock(mutex);
-        return completed.find(id) != completed.end();
     }
 };
 
@@ -3229,7 +3125,6 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete phone_exec_worker;
     delete prefill_input_worker;
     delete prefill_pc_worker;
-    delete tensor_reduce_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
@@ -4634,15 +4529,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 }
             }
 
-            if (backend_ctx->tensor_reduce_worker == nullptr) {
-                backend_ctx->tensor_reduce_worker =
+            auto & lane_worker =
+                backend_ctx->prefill_reduce_workers[
+                    return_lane];
+            if (lane_worker == nullptr) {
+                lane_worker =
                     new ggml_backend_meta_transfer_worker();
             }
-            // Storage slots/lanes remain independent, but all READY reductions
-            // are serialized by one lightweight worker. This keeps reduction
-            // off the OWNER/REMOTE_FFN compute queues without creating a
-            // second compute scheduler.
-            worker = backend_ctx->tensor_reduce_worker;
+            worker = lane_worker;
             return GGML_STATUS_SUCCESS;
         };
 
@@ -6143,12 +6037,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             }
         }
     }
-
-    const char * experiment_tensor_wavefront_env =
-        std::getenv("LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT");
-    const bool experiment_tensor_wavefront =
-        experiment_tensor_wavefront_env != nullptr &&
-        std::atoi(experiment_tensor_wavefront_env) != 0;
 
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
@@ -10856,29 +10744,6 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     prefill_down_chunk_0;
                 const size_t wave_sg = i;
 
-                // P2C Reduce must consume the exact PC REMOTE_FFN result for
-                // this (layer,chunk). Do not make the Meta/main thread join it;
-                // the lightweight reduce worker owns that dependency.
-                uint64_t wave_pc_remote_task = 0;
-                ggml_backend_meta_priority_worker * wave_pc_worker =
-                    backend_ctx->prefill_pc_worker;
-                const auto wave_pc_branch =
-                    std::find_if(
-                        pending_phone_prefill_pc_branches.begin(),
-                        pending_phone_prefill_pc_branches.end(),
-                        [&](const phone_prefill_pc_branch & branch) {
-                            return branch.layer == wave_layer &&
-                                branch.chunk == wave_chunk;
-                        });
-                if (experiment_tensor_wavefront) {
-                    GGML_ASSERT(
-                        wave_pc_branch !=
-                        pending_phone_prefill_pc_branches.end());
-                    wave_pc_remote_task = wave_pc_branch->pc_task;
-                    GGML_ASSERT(wave_pc_worker != nullptr);
-                    GGML_ASSERT(wave_pc_remote_task != 0);
-                }
-
                 const uint64_t reduce_task =
                     wave_reduce_worker->enqueue(
                         [&, phone_partial, pc_partial,
@@ -10887,38 +10752,10 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             phone_backend, pc_backend,
                             wave_layer, wave_chunk,
                             wave_sg, wave_return_slot,
-                            wave_return_lane,
-                            wave_pc_worker,
-                            wave_pc_remote_task,
-                            experiment_tensor_wavefront]
+                            wave_return_lane]
                         (uint64_t task_id) -> ggml_status {
                             const int64_t begin_us =
                                 ggml_time_us();
-
-                            if (experiment_tensor_wavefront) {
-                                const int64_t pc_wait_begin_us =
-                                    ggml_time_us();
-                                const ggml_status pc_ready_status =
-                                    wave_pc_worker->wait(
-                                        wave_pc_remote_task);
-                                const int64_t pc_wait_us =
-                                    ggml_time_us() -
-                                    pc_wait_begin_us;
-                                printf(
-                                    "[TENSOR_READY_REDUCE_DEP] "
-                                    "direction=P2C layer=%d chunk=%d "
-                                    "remote_task=%" PRIu64
-                                    " wait_ms=%.3f status=%d\n",
-                                    wave_layer,
-                                    wave_chunk,
-                                    wave_pc_remote_task,
-                                    pc_wait_us / 1000.0,
-                                    (int) pc_ready_status);
-                                if (pc_ready_status !=
-                                        GGML_STATUS_SUCCESS) {
-                                    return pc_ready_status;
-                                }
-                            }
 
                             ggml_backend_synchronize(
                                 phone_backend);
@@ -17207,10 +17044,7 @@ auto prefill_norm_sg_has_prework =
             return GGML_STATUS_FAILED;
         }
 
-        if (return_wavefront_graph && !experiment_tensor_wavefront) {
-            // Legacy return-wavefront producer credit. The experiment
-            // ready-task scheduler intentionally has no producer window;
-            // buffer-slot reuse below remains the only safety backpressure.
+        if (return_wavefront_graph) {
             // Dense graphs normally arrive here with an async PC->Phone input
             // task. MoE can insert Router/Top-K/expert subgraphs between the
             // norm and down boundaries, so Meta may legitimately fall back to
@@ -17266,16 +17100,7 @@ auto prefill_norm_sg_has_prework =
 
         const auto route_it = pending_phone_prefill_routes.find(
             { prefill_down_layer, prefill_down_chunk });
-        const bool directional_wave_p2c_ready_task =
-            experiment_tensor_wavefront &&
-            return_wavefront_graph &&
-            !has_async_prefill_input &&
-            ggml_backend_meta_tensor_p2c_layer(
-                backend_ctx, prefill_down_layer) &&
-            layer_attention_phone_owned(prefill_down_layer) &&
-            route_it != pending_phone_prefill_routes.end();
-
-        const bool legacy_phone_prefill_down =
+        const bool pipeline_phone_prefill_down =
             phone_prefill_chunk_pipeline &&
             !return_wavefront_graph &&
             !has_async_prefill_input &&
@@ -17283,10 +17108,6 @@ auto prefill_norm_sg_has_prework =
             route_it != pending_phone_prefill_routes.end() &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_SINGLE_OWNER") != nullptr &&
             std::getenv("LLAMA_HYBRID_PHONE_PRIMARY_ONEWAY_REDUCE") != nullptr;
-
-        const bool pipeline_phone_prefill_down =
-            directional_wave_p2c_ready_task ||
-            legacy_phone_prefill_down;
 
         const auto local_main_it =
             phone_region_local_main_chunks.find(
@@ -17380,14 +17201,6 @@ auto prefill_norm_sg_has_prework =
             }
         } else if (pipeline_phone_prefill_down) {
             const phone_prefill_route_task route = route_it->second;
-            if (pipeline_debug && directional_wave_p2c_ready_task) {
-                printf(
-                    "[TENSOR_READY_P2C] layer=%d chunk=%d sg=%zu "
-                    "action=REMOTE_FFN_QUEUE owner=PHONE\n",
-                    prefill_down_layer,
-                    prefill_down_chunk,
-                    i);
-            }
             GGML_ASSERT(route.worker != nullptr);
             GGML_ASSERT(route.task != 0);
 
@@ -17402,7 +17215,7 @@ auto prefill_norm_sg_has_prework =
 
             if (backend_ctx->prefill_pc_worker == nullptr) {
                 backend_ctx->prefill_pc_worker =
-                    new ggml_backend_meta_priority_worker();
+                    new ggml_backend_meta_transfer_worker();
             }
 
             ggml_cgraph * pc_graph =
@@ -17541,23 +17354,11 @@ auto prefill_norm_sg_has_prework =
             }
 
             const uint64_t pc_task =
-                backend_ctx->prefill_pc_worker->enqueue_remote_ffn(
+                backend_ctx->prefill_pc_worker->enqueue(
                     [&, route, pc_graph, pc_backend,
                         pc_return_src, return_payload,
                         prefill_down_layer, prefill_down_chunk, i]
                     (uint64_t task_id) -> ggml_status {
-                        if (pipeline_debug ||
-                                tensor_phone_stage_profile) {
-                            printf(
-                                "[TENSOR_READY_QUEUE] side=PC "
-                                "queue=REMOTE_FFN event=BEGIN "
-                                "layer=%d chunk=%d sg=%zu "
-                                "task=%" PRIu64 "\n",
-                                prefill_down_layer,
-                                prefill_down_chunk,
-                                i,
-                                task_id);
-                        }
                         const int64_t route_wait_begin_us = ggml_time_us();
                         const ggml_status route_status =
                             route.worker->wait(route.task);
@@ -17718,19 +17519,6 @@ auto prefill_norm_sg_has_prework =
                                 (int) status);
                         }
 
-                        if (pipeline_debug ||
-                                tensor_phone_stage_profile) {
-                            printf(
-                                "[TENSOR_READY_QUEUE] side=PC "
-                                "queue=REMOTE_FFN event=END "
-                                "layer=%d chunk=%d sg=%zu "
-                                "task=%" PRIu64 " status=%d\n",
-                                prefill_down_layer,
-                                prefill_down_chunk,
-                                i,
-                                task_id,
-                                (int) status);
-                        }
                         return status;
                     });
 
@@ -17768,7 +17556,7 @@ auto prefill_norm_sg_has_prework =
                     lane1_return_gate = gate;
                 }
 
-                ggml_backend_meta_priority_worker * pc_worker =
+                ggml_backend_meta_transfer_worker * pc_worker =
                     backend_ctx->prefill_pc_worker;
                 ggml_backend_meta_transfer_worker * return_worker =
                     return_worker_slot;
@@ -17983,7 +17771,6 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_prefix_graph = nullptr;
             int c2p_pc_route_stop = -1;
             bool c2p_parallel_ready = false;
-            uint64_t c2p_pc_owner_task = 0;
 
             if (c2p_prefill_exec) {
                 char topk_name[96];
@@ -18094,50 +17881,9 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (c2p_prefill_exec) {
-                if (backend_ctx->prefill_pc_worker == nullptr) {
-                    backend_ctx->prefill_pc_worker =
-                        new ggml_backend_meta_priority_worker();
-                }
-                ggml_cgraph * owner_graph =
-                    c2p_parallel_ready ?
-                        c2p_pc_prefix_graph :
-                        backend_ctx->backend_configs[0].
-                            cgraphs[i].cgraph_main;
-                ggml_backend_t owner_backend =
-                    backend_ctx->backend_configs[0].backend;
-                const int owner_layer = prefill_down_layer;
-                const int owner_chunk = prefill_down_chunk;
-                const size_t owner_sg = i;
-                c2p_pc_owner_task =
-                    backend_ctx->prefill_pc_worker->enqueue_owner(
-                        [owner_backend, owner_graph,
-                         owner_layer, owner_chunk, owner_sg,
-                         pipeline_debug]
-                        (uint64_t task_id) -> ggml_status {
-                            if (pipeline_debug) {
-                                printf(
-                                    "[TENSOR_READY_QUEUE] side=PC "
-                                    "queue=OWNER event=BEGIN "
-                                    "layer=%d chunk=%d sg=%zu "
-                                    "task=%" PRIu64 "\n",
-                                    owner_layer, owner_chunk,
-                                    owner_sg, task_id);
-                            }
-                            const ggml_status status =
-                                ggml_backend_graph_compute_async(
-                                    owner_backend, owner_graph);
-                            if (pipeline_debug) {
-                                printf(
-                                    "[TENSOR_READY_QUEUE] side=PC "
-                                    "queue=OWNER event=END "
-                                    "layer=%d chunk=%d sg=%zu "
-                                    "task=%" PRIu64 " status=%d\n",
-                                    owner_layer, owner_chunk,
-                                    owner_sg, task_id, (int) status);
-                            }
-                            return status;
-                        });
+            if (c2p_parallel_ready) {
+                compute_workers.start_graph(
+                    0, c2p_pc_prefix_graph);
             } else {
                 compute_workers.start(0, i);
             }
@@ -18153,12 +17899,7 @@ auto prefill_norm_sg_has_prework =
                 pending_prefill_input_layer = -1;
                 pending_prefill_input_chunk = -1;
                 if (input_status != GGML_STATUS_SUCCESS) {
-                    if (c2p_prefill_exec && c2p_pc_owner_task != 0) {
-                        backend_ctx->prefill_pc_worker->wait(
-                            c2p_pc_owner_task);
-                    } else {
-                        compute_workers.wait(0);
-                    }
+                    compute_workers.wait(0);
                     if (c2p_pc_graph != nullptr) {
                         c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                     }
@@ -18195,10 +17936,7 @@ auto prefill_norm_sg_has_prework =
                 // The pin is required because the PC graph itself consumes the
                 // Router outputs and would otherwise be free to recycle their
                 // arena storage before Meta performs the cross-device copy.
-                GGML_ASSERT(c2p_pc_owner_task != 0);
-                pc_status =
-                    backend_ctx->prefill_pc_worker->wait(
-                        c2p_pc_owner_task);
+                pc_status = compute_workers.wait(0);
                 if (c2p_pc_graph != nullptr) {
                     c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                 }
@@ -18296,47 +18034,12 @@ auto prefill_norm_sg_has_prework =
 
                         const int64_t parallel_begin_us =
                             ggml_time_us();
-                        ggml_backend_t pc_backend =
-                            backend_ctx->backend_configs[0].backend;
-                        const int owner_layer = prefill_down_layer;
-                        const int owner_chunk = prefill_down_chunk;
-                        const size_t owner_sg = i;
-                        const uint64_t pc_ffn_task =
-                            backend_ctx->prefill_pc_worker->enqueue_owner(
-                                [pc_backend, c2p_pc_suffix_graph,
-                                 owner_layer, owner_chunk, owner_sg,
-                                 pipeline_debug]
-                                (uint64_t task_id) -> ggml_status {
-                                    if (pipeline_debug) {
-                                        printf(
-                                            "[TENSOR_READY_QUEUE] side=PC "
-                                            "queue=OWNER event=BEGIN_FFN "
-                                            "layer=%d chunk=%d sg=%zu "
-                                            "task=%" PRIu64 "\n",
-                                            owner_layer, owner_chunk,
-                                            owner_sg, task_id);
-                                    }
-                                    const ggml_status status =
-                                        ggml_backend_graph_compute_async(
-                                            pc_backend,
-                                            c2p_pc_suffix_graph);
-                                    if (pipeline_debug) {
-                                        printf(
-                                            "[TENSOR_READY_QUEUE] side=PC "
-                                            "queue=OWNER event=END_FFN "
-                                            "layer=%d chunk=%d sg=%zu "
-                                            "task=%" PRIu64 " status=%d\n",
-                                            owner_layer, owner_chunk,
-                                            owner_sg, task_id,
-                                            (int) status);
-                                    }
-                                    return status;
-                                });
+                        compute_workers.start_graph(
+                            0, c2p_pc_suffix_graph);
                         compute_workers.start(1, i);
 
                         const ggml_status pc_ffn_status =
-                            backend_ctx->prefill_pc_worker->wait(
-                                pc_ffn_task);
+                            compute_workers.wait(0);
                         phone_status = compute_workers.wait(1);
                         pc_status = pc_ffn_status;
 
@@ -18492,9 +18195,7 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (return_wavefront_graph &&
-                    !experiment_tensor_wavefront &&
-                    phone_status == GGML_STATUS_SUCCESS) {
+            if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
                 if (snapshot_prepares[i].prepared) {
                     return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
                 } else if (pipeline_debug) {
@@ -20639,38 +20340,13 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    if (experiment_tensor_wavefront) {
-        // Directional-wave P2C branches are completed by the exact per-chunk
-        // REDUCE tasks above. The legacy phone-prefill drain would wait/send
-        // the same PC partial a second time and can deadlock after the ready
-        // scheduler has already consumed it.
-        const ggml_status reduce_status =
-            wait_all_prefill_reduces(nullptr);
-        if (reduce_status != GGML_STATUS_SUCCESS) {
-            return reduce_status;
-        }
-        for (const auto & branch : pending_phone_prefill_pc_branches) {
-            pending_phone_prefill_routes.erase(
-                { branch.layer, branch.chunk });
-            deferred_phone_prefill_return_sgs.erase(branch.sg);
-        }
-        if (pipeline_debug &&
-                !pending_phone_prefill_pc_branches.empty()) {
-            printf(
-                "[TENSOR_READY_DRAIN] mode=DIRECTIONAL "
-                "branches=%zu action=CLEAR_AFTER_REDUCE\n",
-                pending_phone_prefill_pc_branches.size());
-        }
-        pending_phone_prefill_pc_branches.clear();
-    } else {
-        while (!pending_phone_prefill_pc_branches.empty()) {
-            const int pending_layer =
-                pending_phone_prefill_pc_branches.front().layer;
-            const ggml_status drain_status =
-                drain_phone_prefill_pc_layer(pending_layer);
-            if (drain_status != GGML_STATUS_SUCCESS) {
-                return drain_status;
-            }
+    while (!pending_phone_prefill_pc_branches.empty()) {
+        const int pending_layer =
+            pending_phone_prefill_pc_branches.front().layer;
+        const ggml_status drain_status =
+            drain_phone_prefill_pc_layer(pending_layer);
+        if (drain_status != GGML_STATUS_SUCCESS) {
+            return drain_status;
         }
     }
 
@@ -20749,9 +20425,7 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    if (return_wavefront_graph &&
-            !experiment_tensor_wavefront &&
-            return_wave_snapshot_ready_waiter != nullptr) {
+    if (return_wavefront_graph && return_wave_snapshot_ready_waiter != nullptr) {
         // Full returns are drained now, so any remaining producer credits are
         // already READY. Consume their notifications to avoid carrying stale
         // seq entries into a later graph execution.
