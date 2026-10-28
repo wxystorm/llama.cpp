@@ -3660,7 +3660,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const size_t slot_pool_size = 0;
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens,
-        region_chunk_tokens, slot_pool_size);
+        region_chunk_tokens, slot_pool_size,
+        gpu_weight_streaming);
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
         "XC=%d XG=%d XP=%d dependency=TOKEN_INTERVAL "
@@ -4300,10 +4301,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             const size_t init_source =
                 std::numeric_limits<size_t>::max();
             (void) enqueue_gpu_prefetch(
-                gpu_region_order[0], 0,
+                gpu_region_order[0],
+                llama_region_ring_gpu_weight_bank_for_rank(0),
                 "INITIAL_WINDOW", init_source);
             (void) enqueue_gpu_prefetch(
-                gpu_region_order[1], 1,
+                gpu_region_order[1],
+                llama_region_ring_gpu_weight_bank_for_rank(1),
                 "INITIAL_WINDOW", init_source);
             try {
                 gpu_prefetch_worker =
@@ -4805,15 +4808,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         const int rank =
                             task.region < gpu_region_rank.size() ?
                                 gpu_region_rank[task.region] : -1;
-                        const size_t next_rank =
+                        const auto next_rank =
                             rank >= 0 ?
-                                (size_t) rank + 2 :
-                                gpu_region_order.size();
-                        if (next_rank < gpu_region_order.size()) {
+                                llama_region_ring_gpu_weight_next_rank(
+                                    (size_t) rank,
+                                    gpu_region_order.size()) :
+                                std::nullopt;
+                        if (next_rank.has_value()) {
                             const size_t bank_index =
-                                (size_t) rank & 1;
+                                llama_region_ring_gpu_weight_bank_for_rank(
+                                    (size_t) rank);
                             (void) enqueue_gpu_prefetch(
-                                gpu_region_order[next_rank],
+                                gpu_region_order[*next_rank],
                                 bank_index,
                                 "REGION_DRAIN",
                                 task.region);
