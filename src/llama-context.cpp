@@ -3257,22 +3257,45 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         (int) ubatch.n_tokens >= gpu_prefetch_min_tokens;
     std::array<bool, 2> gpu_bank_prefetched = {false, false};
 
+    const bool load_primed_window =
+        gpu_weight_streaming &&
+        gpu_region_order.size() >= 2 &&
+        region_ring_initial_banks_primed &&
+        region_ring_worker_resources[1].cached_region ==
+            gpu_region_order[0] &&
+        region_ring_worker_resources[2].cached_region ==
+            gpu_region_order[1];
+
     if (gpu_weight_streaming) {
-        for (size_t bank = 1; bank <= 2; ++bank) {
-            region_ring_worker_resources[bank].cached_region =
-                std::numeric_limits<size_t>::max();
-            region_ring_worker_resources[bank].last_use = 0;
+        if (!load_primed_window) {
+            for (size_t bank = 1; bank <= 2; ++bank) {
+                region_ring_worker_resources[bank].cached_region =
+                    std::numeric_limits<size_t>::max();
+                region_ring_worker_resources[bank].last_use = 0;
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
+                "reason=NEW_UBATCH graph_cache=PRESERVED "
+                "region_metadata=CLEARED prefetch_window=%d "
+                "prefetch_min_tokens=%d ubatch_tokens=%u status=READY\n",
+                gpu_weight_prefetch ? 2 : 0,
+                gpu_prefetch_min_tokens,
+                ubatch.n_tokens);
+        } else {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_REUSE "
+                "source=LOAD_PRIME region0=%zu bankA=1 "
+                "region1=%zu bankB=1 prefetch_window=%d "
+                "ubatch_tokens=%u status=READY\n",
+                gpu_region_order[0], gpu_region_order[1],
+                gpu_weight_prefetch ? 2 : 0,
+                ubatch.n_tokens);
         }
         region_ring_gpu_weight_bank_epoch = 0;
-        gpu_bank_prefetched.fill(false);
-        LLAMA_LOG_ERROR(
-            "[REGION_RING_GPU_WEIGHT] phase=BANK_EPOCH_RESET "
-            "reason=NEW_UBATCH graph_cache=PRESERVED "
-            "region_metadata=CLEARED prefetch_window=%d "
-            "prefetch_min_tokens=%d ubatch_tokens=%u status=READY\n",
-            gpu_weight_prefetch ? 2 : 0,
-            gpu_prefetch_min_tokens,
-            ubatch.n_tokens);
+        // The load-time prime is a one-shot initial window. Once this ubatch
+        // starts, rolling replacements may overwrite A/B, so a later ubatch
+        // must not assume the original pair is still resident.
+        region_ring_initial_banks_primed = false;
     }
     if (isolate_device_resources) {
         // The caller uses the main scheduler to discover and extract logits
@@ -3922,6 +3945,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         };
 
         std::array<gpu_weight_bank_runtime, 2> gpu_bank_runtime;
+        if (load_primed_window) {
+            gpu_bank_runtime[0].loaded_region = gpu_region_order[0];
+            gpu_bank_runtime[1].loaded_region = gpu_region_order[1];
+        }
         std::mutex gpu_prefetch_mutex;
         std::condition_variable gpu_prefetch_cv;
         std::condition_variable gpu_bank_cv;
@@ -4298,16 +4325,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool gpu_prefetch_worker_started = false;
         bool gpu_prefetch_worker_joined = false;
         if (gpu_weight_prefetch) {
-            const size_t init_source =
-                std::numeric_limits<size_t>::max();
-            (void) enqueue_gpu_prefetch(
-                gpu_region_order[0],
-                llama_region_ring_gpu_weight_bank_for_rank(0),
-                "INITIAL_WINDOW", init_source);
-            (void) enqueue_gpu_prefetch(
-                gpu_region_order[1],
-                llama_region_ring_gpu_weight_bank_for_rank(1),
-                "INITIAL_WINDOW", init_source);
+            if (!load_primed_window) {
+                const size_t init_source =
+                    std::numeric_limits<size_t>::max();
+                (void) enqueue_gpu_prefetch(
+                    gpu_region_order[0],
+                    llama_region_ring_gpu_weight_bank_for_rank(0),
+                    "INITIAL_WINDOW", init_source);
+                (void) enqueue_gpu_prefetch(
+                    gpu_region_order[1],
+                    llama_region_ring_gpu_weight_bank_for_rank(1),
+                    "INITIAL_WINDOW", init_source);
+            }
             try {
                 gpu_prefetch_worker =
                     std::thread(run_gpu_prefetch_worker);
@@ -4336,10 +4365,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         std::numeric_limits<size_t>::max();
                 }
                 gpu_bank_cv.notify_all();
-            } else {
-                // Initial A/B loads complete before GPU work starts. Rolling
-                // loads are requested only by the last chunk of the current
-                // GPU Region.
+            } else if (!load_primed_window) {
+                // Fallback for contexts that were not load-primed. Normal
+                // server startup primes A/B before prompt timing, so this path
+                // should not be on the first-prompt critical path.
                 std::unique_lock<std::mutex> lock(
                     gpu_prefetch_mutex);
                 gpu_bank_cv.wait(lock, [&]() {
@@ -4444,6 +4473,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     int gpu_bank = -1;
                     bool gpu_bank_hit = false;
                     bool gpu_prefetch_hit = false;
+                    bool gpu_load_prime_hit = false;
                     size_t evicted_region =
                         std::numeric_limits<size_t>::max();
 
@@ -4503,7 +4533,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             }
 
                             gpu_bank_hit = true;
+                            gpu_load_prime_hit =
+                                load_primed_window &&
+                                rank >= 0 && rank < 2 &&
+                                task.chunk == 0;
                             gpu_prefetch_hit =
+                                !gpu_load_prime_hit &&
                                 task.chunk == 0 &&
                                 gpu_bank_prefetched[selected_bank - 1];
                             if (gpu_prefetch_hit) {
@@ -4660,6 +4695,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "compute_range_ms=%.3f status=%d\n",
                                     task.region, task.chunk,
                                     gpu_bank == 0 ? 'A' : 'B',
+                                    gpu_load_prime_hit ?
+                                        "LOAD_PRIMED_HIT" :
                                     gpu_prefetch_hit ?
                                         "PREFETCH_HIT" :
                                     task_timing.weight_upload_bytes > 0 ?
