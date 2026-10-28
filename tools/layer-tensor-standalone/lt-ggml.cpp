@@ -300,6 +300,8 @@ struct ggml_compute::impl {
     ggml_backend_buffer_t stream_attn_buffer = nullptr;
     std::vector<materialized_attn_slice> stream_attn_slices;
 
+    int32_t stream_attn_layer = -1;
+
     int32_t total_tokens = 0;
     int32_t n_embd = 0;
     int32_t n_expert = 0;
@@ -515,6 +517,332 @@ struct ggml_compute::impl {
             packed.data(),
             0,
             packed.size());
+        return true;
+    }
+
+    bool read_attn_dim0_shard(
+            llama_model_loader & loader,
+            const ggml_tensor * source,
+            ggml_tensor * dest,
+            int64_t begin,
+            std::string & error) {
+        if (source == nullptr ||
+            dest == nullptr ||
+            source->type != dest->type ||
+            source->ne[1] != dest->ne[1] ||
+            begin < 0 ||
+            begin + dest->ne[0] > source->ne[0]) {
+            error = "invalid attention dim0 shard shape";
+            return false;
+        }
+
+        const int64_t block =
+            ggml_blck_size(source->type);
+        if (block <= 0 ||
+            begin % block != 0 ||
+            dest->ne[0] % block != 0) {
+            error =
+                "attention shard is not quantization-block aligned";
+            return false;
+        }
+
+        const size_t src_dim0_off =
+            quantized_dim0_offset(
+                source,
+                begin);
+        const size_t row_copy_bytes =
+            dest->nb[1];
+
+        std::vector<uint8_t> packed(
+            ggml_nbytes(dest));
+
+        for (int64_t row = 0;
+             row < source->ne[1];
+             ++row) {
+            const size_t src_off =
+                static_cast<size_t>(row) *
+                    source->nb[1] +
+                src_dim0_off;
+            const size_t dst_off =
+                static_cast<size_t>(row) *
+                    dest->nb[1];
+
+            if (dst_off > packed.size() ||
+                row_copy_bytes >
+                    packed.size() - dst_off ||
+                !loader.read_local_tensor(
+                    source->name,
+                    packed.data() + dst_off,
+                    src_off,
+                    row_copy_bytes)) {
+                error =
+                    std::string("failed to read attention shard from GGUF: ") +
+                    source->name;
+                return false;
+            }
+        }
+
+        ggml_backend_tensor_set(
+            dest,
+            packed.data(),
+            0,
+            packed.size());
+        return true;
+    }
+
+    bool ensure_stream_attn_slices(
+            int32_t layer_index,
+            std::string & error) {
+        constexpr int k_slices = 4;
+
+        if (layer_index < 0 ||
+            layer_index >= config.runtime_plan.layers) {
+            error = "stream precompute layer is out of range";
+            return false;
+        }
+
+        if (stream_attn_layer == layer_index &&
+            stream_attn_buffer != nullptr &&
+            stream_attn_slices.size() == k_slices) {
+            return true;
+        }
+
+        if (stream_attn_buffer != nullptr) {
+            ggml_backend_buffer_free(
+                stream_attn_buffer);
+            stream_attn_buffer = nullptr;
+        }
+        if (stream_attn_ctx != nullptr) {
+            ggml_free(stream_attn_ctx);
+            stream_attn_ctx = nullptr;
+        }
+        stream_attn_slices.clear();
+        stream_attn_layer = -1;
+
+        if (n_embd % k_slices != 0) {
+            error =
+                "hidden width is not divisible by four";
+            return false;
+        }
+
+        const int64_t width =
+            n_embd / k_slices;
+        const llama_layer & layer =
+            model->layers[
+                static_cast<size_t>(
+                    layer_index)];
+
+        for (const ggml_tensor * weight :
+             { layer.wq, layer.wk, layer.wv }) {
+            const int64_t block =
+                ggml_blck_size(weight->type);
+            if (block <= 0 ||
+                width % block != 0) {
+                std::ostringstream oss;
+                oss << "4-way QKV slice width "
+                    << width
+                    << " is not aligned to block "
+                    << block
+                    << " for tensor "
+                    << weight->name;
+                error = oss.str();
+                return false;
+            }
+        }
+
+        ggml_init_params params {};
+        params.mem_size =
+            (k_slices * 4 + 32) *
+            ggml_tensor_overhead();
+        params.mem_buffer = nullptr;
+        params.no_alloc = true;
+
+        stream_attn_ctx =
+            ggml_init(params);
+        if (stream_attn_ctx == nullptr) {
+            error =
+                "failed to create stream attention shard context";
+            return false;
+        }
+
+        stream_attn_slices.resize(
+            k_slices);
+
+        for (int slice = 0;
+             slice < k_slices;
+             ++slice) {
+            materialized_attn_slice & out =
+                stream_attn_slices[
+                    static_cast<size_t>(slice)];
+            out.begin =
+                static_cast<int64_t>(slice) *
+                width;
+            out.width = width;
+
+            out.wq =
+                ggml_new_tensor_2d(
+                    stream_attn_ctx,
+                    layer.wq->type,
+                    width,
+                    layer.wq->ne[1]);
+            out.wk =
+                ggml_new_tensor_2d(
+                    stream_attn_ctx,
+                    layer.wk->type,
+                    width,
+                    layer.wk->ne[1]);
+            out.wv =
+                ggml_new_tensor_2d(
+                    stream_attn_ctx,
+                    layer.wv->type,
+                    width,
+                    layer.wv->ne[1]);
+            out.gamma =
+                ggml_new_tensor_1d(
+                    stream_attn_ctx,
+                    GGML_TYPE_F32,
+                    width);
+
+            if (out.wq == nullptr ||
+                out.wk == nullptr ||
+                out.wv == nullptr ||
+                out.gamma == nullptr) {
+                error =
+                    "failed to create stream attention slice tensors";
+                return false;
+            }
+
+            char name[GGML_MAX_NAME];
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.stream.L%d.S%d.wq",
+                layer_index,
+                slice);
+            ggml_set_name(out.wq, name);
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.stream.L%d.S%d.wk",
+                layer_index,
+                slice);
+            ggml_set_name(out.wk, name);
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.stream.L%d.S%d.wv",
+                layer_index,
+                slice);
+            ggml_set_name(out.wv, name);
+            std::snprintf(
+                name,
+                sizeof(name),
+                "lt.stream.L%d.S%d.gamma",
+                layer_index,
+                slice);
+            ggml_set_name(out.gamma, name);
+        }
+
+        stream_attn_buffer =
+            ggml_backend_alloc_ctx_tensors(
+                stream_attn_ctx,
+                backend);
+        if (stream_attn_buffer == nullptr) {
+            error =
+                "failed to allocate stream attention shard buffer";
+            return false;
+        }
+
+        try {
+            std::vector<std::string> splits;
+            llama_model_loader loader(
+                nullptr,
+                nullptr,
+                nullptr,
+                config.model_path,
+                splits,
+                nullptr,
+                false,
+                false,
+                false,
+                true,
+                nullptr,
+                nullptr);
+
+            std::vector<float> gamma_full(
+                static_cast<size_t>(n_embd));
+            ggml_backend_tensor_get(
+                layer.attn_norm,
+                gamma_full.data(),
+                0,
+                gamma_full.size() *
+                    sizeof(float));
+
+            for (int slice = 0;
+                 slice < k_slices;
+                 ++slice) {
+                materialized_attn_slice & out =
+                    stream_attn_slices[
+                        static_cast<size_t>(
+                            slice)];
+
+                if (!read_attn_dim0_shard(
+                        loader,
+                        layer.wq,
+                        out.wq,
+                        out.begin,
+                        error) ||
+                    !read_attn_dim0_shard(
+                        loader,
+                        layer.wk,
+                        out.wk,
+                        out.begin,
+                        error) ||
+                    !read_attn_dim0_shard(
+                        loader,
+                        layer.wv,
+                        out.wv,
+                        out.begin,
+                        error)) {
+                    return false;
+                }
+
+                ggml_backend_tensor_set(
+                    out.gamma,
+                    gamma_full.data() +
+                        out.begin,
+                    0,
+                    static_cast<size_t>(
+                        out.width) *
+                        sizeof(float));
+            }
+        } catch (const std::exception & ex) {
+            error =
+                std::string(
+                    "stream attention shard GGUF load failed: ") +
+                ex.what();
+            return false;
+        }
+
+        ggml_backend_synchronize(backend);
+        stream_attn_layer = layer_index;
+
+        std::fprintf(
+            stderr,
+            "[LT_STREAM_WEIGHTS] side=%s layer=%d "
+            "slices=%d width=%lld buffer=%s "
+            "bytes=%.3fMiB status=READY\n",
+            side_name(config.local_side),
+            layer_index,
+            k_slices,
+            static_cast<long long>(width),
+            ggml_backend_buffer_name(
+                stream_attn_buffer),
+            static_cast<double>(
+                ggml_backend_buffer_get_size(
+                    stream_attn_buffer)) /
+                (1024.0 * 1024.0));
+
         return true;
     }
 
