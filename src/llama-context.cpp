@@ -9722,7 +9722,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false;
     }
 
-    const int prime_tokens =
+    const int load_tokens =
         std::max(1, std::min<int>(
             xg, (int) std::max<uint32_t>(1, cparams.n_ubatch)));
     const uint32_t n_pos =
@@ -9731,30 +9731,30 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 
     auto data = std::make_shared<llama_ubatch::data_t>();
     data->embd.assign(
-        (size_t) prime_tokens * model.hparams.n_embd, 0.0f);
-    data->pos.resize((size_t) prime_tokens * n_pos);
+        (size_t) load_tokens * model.hparams.n_embd, 0.0f);
+    data->pos.resize((size_t) load_tokens * n_pos);
     for (uint32_t p = 0; p < n_pos; ++p) {
-        for (int i = 0; i < prime_tokens; ++i) {
+        for (int i = 0; i < load_tokens; ++i) {
             data->pos[
-                (size_t) p * prime_tokens + (size_t) i] = i;
+                (size_t) p * load_tokens + (size_t) i] = i;
         }
     }
-    data->n_seq_id.assign((size_t) prime_tokens, 1);
-    data->seq_id.resize((size_t) prime_tokens);
+    data->n_seq_id.assign((size_t) load_tokens, 1);
+    data->seq_id.resize((size_t) load_tokens);
     data->seq_id_data.assign(1, 0);
-    for (int i = 0; i < prime_tokens; ++i) {
+    for (int i = 0; i < load_tokens; ++i) {
         data->seq_id[(size_t) i] = data->seq_id_data.data();
     }
     data->seq_id_unq.assign(1, 0);
     data->seq_idx.assign(LLAMA_MAX_SEQ, -1);
     data->seq_idx[0] = 0;
-    data->output.assign((size_t) prime_tokens, 0);
+    data->output.assign((size_t) load_tokens, 0);
 
-    llama_ubatch prime_ubatch {
+    llama_ubatch load_ubatch {
         /*.b_equal_seqs =*/ 0,
-        /*.n_tokens     =*/ (uint32_t) prime_tokens,
+        /*.n_tokens     =*/ (uint32_t) load_tokens,
         /*.n_seq_tokens =*/ 1,
-        /*.n_seqs       =*/ (uint32_t) prime_tokens,
+        /*.n_seqs       =*/ (uint32_t) load_tokens,
         /*.n_seqs_unq   =*/ 1,
         /*.n_pos        =*/ n_pos,
         /*.token        =*/ nullptr,
@@ -9768,19 +9768,19 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         /*.data         =*/ data,
     };
 
-    const int64_t prime_begin_us = ggml_time_us();
+    const int64_t load_begin_us = ggml_time_us();
     size_t total_upload_bytes = 0;
     int64_t total_prepare_us = 0;
     int64_t total_h2d_us = 0;
 
-    const auto prime_one =
+    const auto load_one =
         [&](size_t gpu_rank, region_ring_worker_resource & bank) -> bool {
             const size_t region = gpu_regions[gpu_rank];
             const auto & stage = stages[region];
             const size_t bank_index =
                 llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
 
-            if (!kv_view->set_stage_range(0, 0, prime_tokens)) {
+            if (!kv_view->set_stage_range(0, 0, load_tokens)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
                     "rank=%zu region=%zu bank=%c status=FAIL "
@@ -9803,7 +9803,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
                 bank.bank_ready = false;
                 result = prepare_ubatch(
                     bank.res.get(), bank.sched.get(),
-                    prime_ubatch,
+                    load_ubatch,
                     ctx_type_to_graph_type(cparams.ctx_type),
                     kv_view.get(), status, false,
                     &stage, 0, true, false, false);
@@ -9882,14 +9882,14 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
                 "rank=%zu region=%zu bank=%c tokens=%d "
                 "generation=%" PRIu64 " upload_mib=%.3f status=READY\n",
                 gpu_rank, region, bank_index == 0 ? 'A' : 'B',
-                prime_tokens, bank.bank_generation,
+                load_tokens, bank.bank_generation,
                 upload_bytes / 1048576.0);
             return true;
         };
 
     region_ring_initial_banks_loaded = false;
-    const bool ok_a = prime_one(0, bank_a);
-    const bool ok_b = ok_a && prime_one(1, bank_b);
+    const bool ok_a = load_one(0, bank_a);
+    const bool ok_b = ok_a && load_one(1, bank_b);
     region_ring_initial_banks_loaded =
         ok_a && ok_b &&
         bank_a.bank_ready && bank_b.bank_ready &&
@@ -9907,7 +9907,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         total_upload_bytes / 1048576.0,
         total_prepare_us / 1000.0,
         total_h2d_us / 1000.0,
-        (ggml_time_us() - prime_begin_us) / 1000.0,
+        (ggml_time_us() - load_begin_us) / 1000.0,
         region_ring_initial_banks_loaded ? "READY" : "FAIL");
 
     return region_ring_initial_banks_loaded;
