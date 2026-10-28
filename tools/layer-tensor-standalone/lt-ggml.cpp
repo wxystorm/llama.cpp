@@ -2623,6 +2623,59 @@ struct ggml_compute::impl {
         return true;
     }
 
+    bool copy_local_continuation(
+            const key & task,
+            const char * mode_name_value,
+            ggml_tensor * src,
+            ggml_tensor * dst,
+            std::string & error) {
+        if (src == nullptr ||
+            dst == nullptr ||
+            src->buffer == nullptr ||
+            dst->buffer == nullptr) {
+            error =
+                "local continuation copy tensor is not backend-ready";
+            return false;
+        }
+
+        const bool copied_async =
+            ggml_backend_tensor_copy_async(
+                backend,
+                backend,
+                src,
+                dst);
+
+        if (!copied_async) {
+            // OpenCL currently reports that it does not support async
+            // backend-to-backend copies. Ignoring the false return leaves the
+            // persistent activation arena stale, so the next local layer reads
+            // the previous contents. Fall back to the canonical synchronous
+            // tensor copy just like ggml-backend's scheduler does.
+            ggml_backend_synchronize(backend);
+            ggml_backend_tensor_copy(
+                src,
+                dst);
+        }
+
+        ggml_backend_synchronize(backend);
+
+        if (config.log_events) {
+            std::fprintf(
+                stderr,
+                "[LT_GGML_LOCAL_COPY] side=%s mode=%s "
+                "from_layer=%d to_layer=%d chunk=%d "
+                "copy=%s status=READY\n",
+                side_name(config.local_side),
+                mode_name_value,
+                task.layer,
+                task.layer + 1,
+                task.chunk,
+                copied_async ? "ASYNC" : "SYNC_FALLBACK");
+        }
+
+        return true;
+    }
+
     bool run_reduce(
             const key & task,
             const std::vector<float> & remote_partial,
@@ -2742,13 +2795,14 @@ struct ggml_compute::impl {
                     return false;
                 }
 
-                ggml_backend_tensor_copy_async(
-                    backend,
-                    backend,
-                    reduced,
-                    arena_view);
-                ggml_backend_synchronize(
-                    backend);
+                if (!copy_local_continuation(
+                        task,
+                        "REDUCE",
+                        reduced,
+                        arena_view,
+                        error)) {
+                    return false;
+                }
 
                 // Empty output tells runtime that the next OWNER input is
                 // already resident in its persistent activation arena.
@@ -2915,13 +2969,14 @@ struct ggml_compute::impl {
                     return false;
                 }
 
-                ggml_backend_tensor_copy_async(
-                    backend,
-                    backend,
-                    layer_out,
-                    arena_view);
-                ggml_backend_synchronize(
-                    backend);
+                if (!copy_local_continuation(
+                        task,
+                        "FULL",
+                        layer_out,
+                        arena_view,
+                        error)) {
+                    return false;
+                }
                 output.clear();
 
                 if (config.log_events) {
