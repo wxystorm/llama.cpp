@@ -18,7 +18,7 @@ namespace lt {
 namespace {
 
 constexpr uint32_t k_magic = 0x3156544cU; // LTV1
-constexpr uint32_t k_version = 2;
+constexpr uint32_t k_version = 3;
 constexpr uint32_t k_frame_plan = 1;
 constexpr uint32_t k_frame_message = 2;
 constexpr uint32_t k_max_frame = 256U * 1024U * 1024U;
@@ -36,6 +36,7 @@ struct plan_header {
     uint32_t chunks;
     uint32_t first_tensor_owner;
     int32_t owner_burst_limit;
+    int32_t max_owner_ahead;
     uint32_t layer_owners;
     float c2p_pc_ratio;
     float p2c_pc_ratio;
@@ -343,6 +344,8 @@ bool tcp_channel::send_plan(const plan & value) {
         static_cast<uint32_t>(value.first_tensor_owner);
     header.owner_burst_limit =
         value.owner_burst_limit;
+    header.max_owner_ahead =
+        value.max_owner_ahead;
     header.layer_owners =
         static_cast<uint32_t>(value.layer_owners.size());
     header.c2p_pc_ratio = value.c2p_pc_ratio;
@@ -381,7 +384,8 @@ bool tcp_channel::recv_plan(plan & value) {
             static_cast<uint32_t>(side::phone) ||
         header.layers <= 0 ||
         header.chunks == 0 ||
-        header.owner_burst_limit <= 0) {
+        header.owner_burst_limit <= 0 ||
+        header.max_owner_ahead < 0) {
         return false;
     }
 
@@ -393,6 +397,8 @@ bool tcp_channel::recv_plan(plan & value) {
         static_cast<side>(header.first_tensor_owner);
     value.owner_burst_limit =
         header.owner_burst_limit;
+    value.max_owner_ahead =
+        header.max_owner_ahead;
     value.c2p_pc_ratio = header.c2p_pc_ratio;
     value.p2c_pc_ratio = header.p2c_pc_ratio;
 
