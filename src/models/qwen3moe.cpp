@@ -270,6 +270,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         }
     }
 
+    if (experiment_directional_wavefront &&
+            stage_graph && n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_EXPERIMENT_WAVEFRONT] enabled=%d "
+            "layers=[%d,%d) tokens=%" PRId64
+            " XT=%d mode=ALTERNATING_DIRECTIONAL\n",
+            moe_stage_wavefront ? 1 : 0,
+            layer_begin, layer_end,
+            n_tokens, planned_chunk_tokens);
+    }
+
     std::vector<int> wave_chunk_sizes;
     std::vector<int> wave_attn_group_counts;
     const int wave_attn_target_tokens =
