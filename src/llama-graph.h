@@ -737,6 +737,7 @@ struct llm_graph_params {
     bool hybrid_output_head   = true;
     bool hybrid_wave_probe    = false;
     bool hybrid_embedding_only = false;
+    bool hybrid_sequence_ffn_attention_only = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -781,7 +782,9 @@ struct llm_graph_params {
             hybrid_hidden_input  != other.hybrid_hidden_input ||
             hybrid_output_head   != other.hybrid_output_head  ||
             hybrid_wave_probe    != other.hybrid_wave_probe   ||
-            hybrid_embedding_only != other.hybrid_embedding_only) {
+            hybrid_embedding_only != other.hybrid_embedding_only ||
+            hybrid_sequence_ffn_attention_only !=
+                other.hybrid_sequence_ffn_attention_only) {
             return false;
         }
 
