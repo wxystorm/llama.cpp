@@ -157,10 +157,16 @@ output head consumes the last layer, Meta drains only the remaining terminal
 chunk reductions and logs `[DIRECTIONAL_WAVE_TERMINAL_WAIT]`.
 
 The benchmark also parses `[RETURN_WAVEFRONT_SUM]`. For Tensor depths above
-one layer, merely building the graph is not enough: at least one real
-cross-layer overlap signal (`overlap_boundaries` or `ahead_attn`) must be
-observed. Otherwise the candidate is rejected as
-`WAVEFRONT_NO_CROSS_LAYER_OVERLAP`.
+one layer, a candidate must prove that the experiment built the explicit
+`DIAGONAL_EXACT_CHUNK` schedule. This is the structural proof that execution
+order is a real `(layer, chunk)` wavefront rather than the legacy layer-major
+path.
+
+`overlap_boundaries`, `ahead_attn`, and `ahead_phone_submit` are still
+recorded, but they are performance observations rather than correctness gates.
+A well-hidden return can finish during useful upstream work and therefore leave
+no pending reduce at the next Attention boundary even though the pipeline is
+working correctly.
 
 For every `x`, the Tensor planner searches:
 
@@ -240,7 +246,9 @@ it can enter planner ranking:
 - no non-finite logits are reported;
 - the entire logits tensor is not zero;
 - top-1 token matches the all-CPU reference;
-- Tensor candidates also prove the directional wavefront was built.
+- Tensor candidates also prove the directional wavefront was built;
+- Tensor depths above one layer prove the graph used
+  `mode=DIAGONAL_EXACT_CHUNK` rather than the legacy layer-major schedule.
 
 The runner prints one `[BENCH_CORRECTNESS]` line per repetition. A candidate
 can complete and have a prompt time while still being marked `FAIL`; such a
