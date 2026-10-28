@@ -643,6 +643,77 @@ static void test_window_failure_wakes_workers() {
     }
 }
 
+static void test_dense_stage_contract() {
+    check(llama_region_ring_stage_contract_valid(
+              32, 0, 6, false, false, false),
+          "dense stage0 contract rejected");
+    check(llama_region_ring_stage_contract_valid(
+              32, 6, 12, true, false, false),
+          "dense hidden-input middle stage rejected");
+    check(llama_region_ring_stage_contract_valid(
+              32, 28, 32, true, true, false),
+          "dense final output-head stage rejected");
+    check(llama_region_ring_stage_contract_valid(
+              32, 0, 6, false, false, true),
+          "dense embedding prelude rejected");
+
+    check(!llama_region_ring_stage_contract_valid(
+              32, 6, 12, false, false, false),
+          "middle dense stage accepted without hidden input");
+    check(!llama_region_ring_stage_contract_valid(
+              32, 6, 12, true, true, false),
+          "non-final dense stage accepted output head");
+    check(!llama_region_ring_stage_contract_valid(
+              32, 0, 6, true, false, true),
+          "embedding prelude accepted hidden input");
+    check(!llama_region_ring_stage_contract_valid(
+              32, 0, 32, false, true, true),
+          "embedding prelude accepted output head");
+    check(!llama_region_ring_stage_contract_valid(
+              32, 12, 12, true, false, false),
+          "empty dense stage accepted");
+}
+
+static void test_gpu_weight_two_bank_policy() {
+    // Runtime scans GPU Regions in model order.  For the canonical G/C/P
+    // sequence the physical stage ids are 0,3,6,9 while the GPU ranks are
+    // 0,1,2,3. Bank parity follows rank, not absolute stage id.
+    const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
+    for (size_t rank = 0; rank < gpu_regions.size(); ++rank) {
+        check(llama_region_ring_gpu_weight_bank_for_rank(rank) ==
+                  (rank & 1u),
+              "GPU weight Bank parity drifted");
+    }
+
+    check(llama_region_ring_gpu_weight_bank_for_rank(0) == 0,
+          "rank0 must start in Bank A");
+    check(llama_region_ring_gpu_weight_bank_for_rank(1) == 1,
+          "rank1 must start in Bank B");
+
+    const auto next0 = llama_region_ring_gpu_weight_next_rank(
+        0, gpu_regions.size());
+    const auto next1 = llama_region_ring_gpu_weight_next_rank(
+        1, gpu_regions.size());
+    const auto next2 = llama_region_ring_gpu_weight_next_rank(
+        2, gpu_regions.size());
+    const auto next3 = llama_region_ring_gpu_weight_next_rank(
+        3, gpu_regions.size());
+
+    check(next0 && *next0 == 2,
+          "drain rank0 must prefetch rank2");
+    check(next1 && *next1 == 3,
+          "drain rank1 must prefetch rank3");
+    check(!next2 && !next3,
+          "last two GPU ranks must not prefetch beyond the window");
+
+    check(gpu_regions[*next0] == 6 &&
+              llama_region_ring_gpu_weight_bank_for_rank(*next0) == 0,
+          "rank2 must replace rank0 in Bank A");
+    check(gpu_regions[*next1] == 9 &&
+              llama_region_ring_gpu_weight_bank_for_rank(*next1) == 1,
+          "rank3 must replace rank1 in Bank B");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -684,6 +755,10 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_parallel=PASS\n");
         test_window_failure_wakes_workers();
         std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
+        test_dense_stage_contract();
+        std::fprintf(stderr, "[REGION_RING_TEST] dense_stage_contract=PASS\n");
+        test_gpu_weight_two_bank_policy();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
