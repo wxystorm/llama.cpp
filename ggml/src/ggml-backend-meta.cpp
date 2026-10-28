@@ -20246,6 +20246,12 @@ ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, siz
     return backend_ctx->backend_configs[index].backend;
 }
 
+struct ggml_tensor * ggml_backend_meta_simple_tensor(
+        const struct ggml_tensor * tensor,
+        size_t index) {
+    return ggml_backend_meta_buffer_simple_tensor(tensor, index);
+}
+
 static bool ggml_backend_meta_tensor_phone_primary_layer(
         const ggml_backend_meta_context * backend_ctx, int layer) {
     if (backend_ctx == nullptr || layer < 0) {
