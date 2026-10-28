@@ -14,6 +14,7 @@
 #include <array>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -29,6 +30,7 @@ struct llama_hybrid_plan;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+struct llama_sequence_ffn_branch_graph;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -69,6 +71,35 @@ struct llama_hybrid_stage_timing {
     int64_t weight_stage_us  = 0;
     size_t  weight_upload_bytes    = 0;
     size_t  weight_cache_hit_bytes = 0;
+};
+
+struct llama_sequence_ffn_timing {
+    int64_t total_us          = 0;
+    int64_t attn_us           = 0;
+    int64_t cache_lookup_us   = 0;
+    int64_t pc_build_us       = 0;
+    int64_t phone_build_us    = 0;
+    int64_t pc_alloc_us       = 0;
+    int64_t phone_alloc_us    = 0;
+    int64_t pc_stage_us       = 0;
+    int64_t c2p_us            = 0;
+    int64_t pc_ffn_us         = 0;
+    int64_t phone_ffn_us      = 0;
+    int64_t ffn_overlap_us    = 0;
+    int64_t pc_get_us         = 0;
+    int64_t p2c_us            = 0;
+    int64_t join_wall_us      = 0;
+
+    size_t c2p_bytes = 0;
+    size_t p2c_bytes = 0;
+
+    int pc_tokens    = 0;
+    int phone_tokens = 0;
+
+    int pc_cache_hits     = 0;
+    int pc_cache_misses   = 0;
+    int phone_cache_hits  = 0;
+    int phone_cache_misses = 0;
 };
 
 struct llama_context {
@@ -406,7 +437,8 @@ private:
                                       size_t                               block_index,
                                       int32_t                              block_outputs,
                                       bool &                               apply_mctx,
-                                      ggml_status &                        ret);
+                                      ggml_status &                        ret,
+                                      llama_sequence_ffn_timing *          timing);
 
     llm_graph_result * run_hybrid_stage_block(
                                       const llama_ubatch &                 ubatch,
@@ -592,6 +624,12 @@ private:
 
     ggml_backend_t                backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Reusable FFN-only graphs keyed by (layer, Meta child, token count).
+    // Entries own only compute graph metadata/buffers; model weights remain
+    // owned by Meta and are borrowed by the cached graph.
+    std::map<uint64_t, std::unique_ptr<llama_sequence_ffn_branch_graph>>
+        sequence_ffn_branch_cache;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
