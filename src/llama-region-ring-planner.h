@@ -68,9 +68,10 @@ struct candidate {
     // Single CPU-owned CUDA transfer lane used by rolling two-Bank weight
     // streaming. This is one load per logical GPU Region, not per Chunk.
     double weight_h2d_busy_ms = 0.0;
-    // The first two Bank loads happen before workers start and are therefore
-    // fully exposed. Later loads are only expensive when they finish after
-    // the corresponding GPU Region would otherwise become runnable.
+    // The first two GPU Regions are load-time resident in Bank A/B and do not
+    // contribute to prompt latency. Only rolling rank>=2 replacements are
+    // modeled here; their H2D is exposed only when it misses the natural-ready
+    // point of the target GPU Region.
     double weight_h2d_startup_ms = 0.0;
     double weight_h2d_exposed_ms = 0.0;
     double weight_h2d_hidden_ms = 0.0;
@@ -196,8 +197,15 @@ inline bool gpu_weight_h2d_total(
     if (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms) {
         return false;
     }
+    size_t gpu_rank = 0;
     for (const auto & region : regions) {
         if (region.device != device::GPU) {
+            continue;
+        }
+        // rank0/rank1 are primed during load/warmup and already resident when
+        // prompt timing begins. Weight Streaming accounts only rolling
+        // replacements from rank2 onward.
+        if (gpu_rank++ < 2) {
             continue;
         }
         size_t bytes = 0;
@@ -479,32 +487,19 @@ inline bool simulate(const model & m,
     }
     offer(by_region[0].front());
 
-    // Runtime waits for the first two GPU Banks before launching device
-    // workers. The same single CPU prefetch worker loads them sequentially.
+    // Load-time residency contract: rank0(A) and rank1(B) are already
+    // prepared and resident before prompt timing begins. The simulator starts
+    // at t=0 with both Banks ready; only rank2+ rolling replacements consume
+    // PREPARE/H2D service during the prompt.
     double now = 0.0;
     if (m.gpu_weight_streaming) {
         const size_t initial =
             std::min<size_t>(2, gpu_regions.size());
         for (size_t i = 0; i < initial; ++i) {
             const int r = gpu_regions[i];
-            const double weight_prepare =
-                gpu_weight_prepare_ms[(size_t) r];
-            const double prepare_start =
-                std::max(now, prepare_available_ms);
-            const double prepare_end =
-                prepare_start + weight_prepare;
-            prepare_available_ms = prepare_end;
-            prepare_busy_ms += weight_prepare;
-            weight_prepare_busy_ms += weight_prepare;
-
-            // The dedicated prefetch worker waits for this upload before
-            // preparing the next Bank, so startup A/B remain sequential.
             gpu_weight_release_ms[(size_t) r] = 0.0;
-            gpu_weight_start_ms[(size_t) r] = prepare_end;
-            now = prepare_end + gpu_weight_load_ms[(size_t) r];
-            weight_h2d_busy_ms += gpu_weight_load_ms[(size_t) r];
-            weight_h2d_startup_ms += gpu_weight_load_ms[(size_t) r];
-            gpu_weight_ready_ms[(size_t) r] = now;
+            gpu_weight_start_ms[(size_t) r] = 0.0;
+            gpu_weight_ready_ms[(size_t) r] = 0.0;
             gpu_weight_ready[(size_t) r] = true;
             gpu_weight_enqueued[(size_t) r] = true;
         }
