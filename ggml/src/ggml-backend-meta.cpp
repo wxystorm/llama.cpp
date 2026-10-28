@@ -6038,6 +6038,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
         }
     }
 
+    const char * experiment_tensor_wavefront_env =
+        std::getenv("LLAMA_HYBRID_EXPERIMENT_TENSOR_WAVEFRONT");
+    const bool experiment_tensor_wavefront =
+        experiment_tensor_wavefront_env != nullptr &&
+        std::atoi(experiment_tensor_wavefront_env) != 0;
+
     int64_t return_wave_dependency_wait_count  = 0;
     int64_t return_wave_dependency_wait_us     = 0;
     int64_t return_wave_dependency_wait_max_us = 0;
@@ -6045,6 +6051,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
     int64_t return_wave_ahead_attn_chunks      = 0;
     int64_t return_wave_ahead_phone_submits    = 0;
     int64_t return_wave_phone_credit_wait_count = 0;
+    if (return_wavefront_graph &&
+            experiment_tensor_wavefront &&
+            pipeline_debug) {
+        printf(
+            "[RETURN_WAVEFRONT_CREDIT] mode=DISABLED "
+            "reason=EXPERIMENT_NO_WINDOW\n");
+    }
     int64_t return_wave_phone_credit_wait_us    = 0;
     int64_t return_wave_phone_credit_wait_max_us = 0;
     std::deque<uint64_t> return_wave_phone_credit_seqs;
@@ -17044,7 +17057,10 @@ auto prefill_norm_sg_has_prework =
             return GGML_STATUS_FAILED;
         }
 
-        if (return_wavefront_graph) {
+        if (return_wavefront_graph && !experiment_tensor_wavefront) {
+            // Legacy producer-credit window. The exact directional experiment
+            // intentionally runs without this scheduling window; reduce-slot
+            // and buffer-reuse waits remain responsible for memory safety.
             // Dense graphs normally arrive here with an async PC->Phone input
             // task. MoE can insert Router/Top-K/expert subgraphs between the
             // norm and down boundaries, so Meta may legitimately fall back to
@@ -18262,7 +18278,9 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
-            if (return_wavefront_graph && phone_status == GGML_STATUS_SUCCESS) {
+            if (return_wavefront_graph &&
+                    !experiment_tensor_wavefront &&
+                    phone_status == GGML_STATUS_SUCCESS) {
                 if (snapshot_prepares[i].prepared) {
                     return_wave_phone_credit_seqs.push_back(snapshot_prepares[i].seq);
                 } else if (pipeline_debug) {
@@ -20492,7 +20510,9 @@ auto prefill_norm_sg_has_prework =
         }
     }
 
-    if (return_wavefront_graph && return_wave_snapshot_ready_waiter != nullptr) {
+    if (return_wavefront_graph &&
+            !experiment_tensor_wavefront &&
+            return_wave_snapshot_ready_waiter != nullptr) {
         // Full returns are drained now, so any remaining producer credits are
         // already READY. Consume their notifications to avoid carrying stale
         // seq entries into a later graph execution.
