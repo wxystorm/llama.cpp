@@ -43,13 +43,15 @@ Attention
 
 The non-Attention owner runs its expert shard from READY. REDUCE combines residual + both partials, then directly unlocks `(L+1,C)` on the same endpoint. Device-local continuation is preserved across REDUCE -> next OWNER and consecutive local Full-Layer stages; host/TCP transfer is used only at actual cross-device boundaries.
 
-Attention chunks are admitted in increasing chunk order within each layer so persistent KV is causally valid. Different layers may still overlap diagonally.
+Attention chunks are admitted in increasing chunk order within each layer so persistent KV is causally valid. `--max-owner-ahead 1` is the default diagonal-wave admission gate: a layer may stay only one chunk ahead of READY progress from the downstream owner layer.
 
 ## Real model loading
 
 Both processes use `LLAMA_HYBRID_EXPERIMENT_N_LAYERS=x` internally while loading the model, so only `blk.0 ... blk.(x-1)` are materialized. PC uses a local CPU backend. Phone defaults to the first local GPU/IGPU backend (`--device auto`), intended for Adreno OpenCL.
 
 Model loading is outside the measured interval. Phone sends `MODEL_READY` only after its local GGUF/backend/KV state is ready. PC also tokenizes and computes the common token embeddings before starting `wall_ms`.
+
+Local cross-layer continuation uses one persistent F32 activation arena shaped `[n_embd, total_tokens]`. Every chunk owns a fixed token range in that arena. `REDUCE(L,C)` or a local Full-Layer writes its output to that range with a backend-local tensor copy; the next local OWNER reads the same range directly. There are no per-chunk ping-pong slots and no GPU -> Host -> GPU bounce on this path.
 
 ## Build
 
@@ -99,6 +101,7 @@ The worker prints `[LT_GGML_MODEL] ... status=READY` followed by `[LT_WORKER] ev
   --layers 6 `
   --chunk-tokens 64 `
   --pc-ratio 0.50 `
+  --max-owner-ahead 1 `
   --threads 8 `
   --trace
 ```
