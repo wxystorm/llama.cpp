@@ -2615,6 +2615,171 @@ static bool llama_sequence_ffn_build_branch(
     return ok;
 }
 
+
+llama_sequence_ffn_branch_graph * llama_context::get_sequence_ffn_branch(
+        int                 layer_index,
+        int                 tokens,
+        size_t              child_index,
+        ggml_backend_t      backend,
+        int &               cache_hit,
+        int &               cache_miss,
+        int64_t &           graph_build_us,
+        int64_t &           alloc_us) {
+    cache_hit = 0;
+    cache_miss = 0;
+    graph_build_us = 0;
+    alloc_us = 0;
+
+    if (tokens <= 0 || backend == nullptr) {
+        return nullptr;
+    }
+
+    const uint64_t key =
+        (uint64_t(uint32_t(layer_index)) << 40) |
+        (uint64_t(child_index & 0xffu) << 32) |
+        uint64_t(uint32_t(tokens));
+
+    auto it = sequence_ffn_branch_cache.find(key);
+    if (it != sequence_ffn_branch_cache.end()) {
+        llama_sequence_ffn_branch_graph * cached =
+            it->second.get();
+        if (cached != nullptr &&
+                cached->backend == backend &&
+                cached->layer_index == layer_index &&
+                cached->tokens == tokens &&
+                cached->child_index == child_index) {
+            cache_hit = 1;
+            return cached;
+        }
+        sequence_ffn_branch_cache.erase(it);
+    }
+
+    cache_miss = 1;
+    auto entry =
+        std::make_unique<llama_sequence_ffn_branch_graph>();
+    if (!llama_sequence_ffn_build_branch(
+            model, layer_index, tokens,
+            child_index, backend, *entry,
+            graph_build_us, alloc_us)) {
+        return nullptr;
+    }
+
+    llama_sequence_ffn_branch_graph * raw = entry.get();
+    sequence_ffn_branch_cache.emplace(key, std::move(entry));
+    return raw;
+}
+
+bool llama_context::run_sequence_ffn_branch_task(
+        int                         layer_index,
+        int                         token_begin,
+        int                         tokens,
+        size_t                      child_index,
+        ggml_backend_t              backend,
+        const float *               input,
+        float *                     output,
+        llama_sequence_ffn_timing * timing,
+        ggml_status &               ret) {
+    if (tokens <= 0 || backend == nullptr ||
+            input == nullptr || output == nullptr) {
+        ret = GGML_STATUS_FAILED;
+        return false;
+    }
+
+    int cache_hit = 0;
+    int cache_miss = 0;
+    int64_t graph_build_us = 0;
+    int64_t alloc_us = 0;
+    const int64_t lookup_begin_us = ggml_time_us();
+    llama_sequence_ffn_branch_graph * branch =
+        get_sequence_ffn_branch(
+            layer_index, tokens, child_index, backend,
+            cache_hit, cache_miss,
+            graph_build_us, alloc_us);
+    const int64_t lookup_us =
+        ggml_time_us() - lookup_begin_us;
+
+    if (branch == nullptr) {
+        ret = GGML_STATUS_FAILED;
+        return false;
+    }
+
+    const size_t bytes =
+        (size_t) model.hparams.n_embd *
+        (size_t) tokens * sizeof(float);
+
+    const int64_t stage_begin_us = ggml_time_us();
+    ggml_backend_tensor_set(
+        branch->input, input, 0, bytes);
+    if (child_index != 0) {
+        ggml_backend_synchronize(backend);
+    }
+    const int64_t stage_us =
+        ggml_time_us() - stage_begin_us;
+
+    const int64_t compute_begin_us = ggml_time_us();
+    ret = ggml_backend_graph_compute(
+        backend, branch->graph);
+    if (ret != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_backend_synchronize(backend);
+    const int64_t compute_us =
+        ggml_time_us() - compute_begin_us;
+
+    const int64_t get_begin_us = ggml_time_us();
+    ggml_backend_tensor_get(
+        branch->output, output, 0, bytes);
+    if (child_index != 0) {
+        ggml_backend_synchronize(backend);
+    }
+    const int64_t get_us =
+        ggml_time_us() - get_begin_us;
+
+    if (timing != nullptr) {
+        timing->total_us +=
+            lookup_us + stage_us + compute_us + get_us;
+        timing->cache_lookup_us += lookup_us;
+        if (child_index == 0) {
+            timing->pc_build_us += graph_build_us;
+            timing->pc_alloc_us += alloc_us;
+            timing->pc_stage_us += stage_us;
+            timing->pc_ffn_us += compute_us;
+            timing->pc_get_us += get_us;
+            timing->pc_tokens += tokens;
+            timing->pc_cache_hits += cache_hit;
+            timing->pc_cache_misses += cache_miss;
+        } else {
+            timing->phone_build_us += graph_build_us;
+            timing->phone_alloc_us += alloc_us;
+            timing->c2p_us += stage_us;
+            timing->phone_ffn_us += compute_us;
+            timing->p2c_us += get_us;
+            timing->phone_tokens += tokens;
+            timing->c2p_bytes += bytes;
+            timing->p2c_bytes += bytes;
+        }
+    }
+
+    LLAMA_LOG_ERROR(
+        "[SEQ_PIPE_BRANCH] layer=%d task=%s tokens=[%d,%d) "
+        "cache=%s graph_ms=%.3f alloc_ms=%.3f "
+        "stage_ms=%.3f compute_ms=%.3f return_ms=%.3f "
+        "bytes=%zu status=OK\n",
+        layer_index,
+        child_index == 0 ? "PC_FFN" : "PHONE_FFN",
+        token_begin, token_begin + tokens,
+        cache_hit ? "HIT" : "MISS",
+        graph_build_us / 1000.0,
+        alloc_us / 1000.0,
+        stage_us / 1000.0,
+        compute_us / 1000.0,
+        get_us / 1000.0,
+        bytes);
+
+    ret = GGML_STATUS_SUCCESS;
+    return true;
+}
+
 llm_graph_result * llama_context::run_sequence_ffn_stage(
         const llama_ubatch &               ubatch,
         const llama_hybrid_runtime_stage & stage,
