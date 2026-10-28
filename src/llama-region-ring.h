@@ -736,49 +736,32 @@ private:
         if (regions_[task.region].device ==
                 llama_region_ring_device::GPU) {
             size_t gpu_rank = 0;
-            size_t previous_same_bank_region = regions_.size();
-
-            for (size_t r = 0; r <= task.region; ++r) {
-                if (regions_[r].device !=
-                        llama_region_ring_device::GPU) {
-                    continue;
-                }
-                if (r == task.region) {
-                    break;
-                }
-
-                if (llama_region_ring_gpu_weight_bank_for_rank(gpu_rank) ==
-                        llama_region_ring_gpu_weight_bank_for_rank(
-                            gpu_rank + 2)) {
-                    previous_same_bank_region = r;
-                }
-                ++gpu_rank;
+            for (size_t r = 0; r < task.region; ++r) {
+                gpu_rank +=
+                    regions_[r].device ==
+                    llama_region_ring_device::GPU;
             }
 
             if (gpu_rank >= 2) {
-                // The scan above leaves the most recent earlier GPU Region,
-                // but the Bank predecessor is exactly rank-2 rather than
-                // rank-1. Locate it explicitly so opposite-Bank work remains
-                // overlap-capable.
                 const size_t predecessor_rank = gpu_rank - 2;
                 size_t seen_rank = 0;
-                previous_same_bank_region = regions_.size();
+                size_t predecessor_region = regions_.size();
                 for (size_t r = 0; r < task.region; ++r) {
                     if (regions_[r].device !=
                             llama_region_ring_device::GPU) {
                         continue;
                     }
                     if (seen_rank == predecessor_rank) {
-                        previous_same_bank_region = r;
+                        predecessor_region = r;
                         break;
                     }
                     ++seen_rank;
                 }
 
-                if (previous_same_bank_region >= regions_.size() ||
+                if (predecessor_region >= regions_.size() ||
                         std::any_of(
-                            state_[previous_same_bank_region].begin(),
-                            state_[previous_same_bank_region].end(),
+                            state_[predecessor_region].begin(),
+                            state_[predecessor_region].end(),
                             [](uint8_t state) { return state != 3; })) {
                     return false;
                 }
