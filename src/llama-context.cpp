@@ -5609,10 +5609,25 @@ llm_graph_result * llama_context::process_ubatch_staged(
                 }
             }
 
-            result = run_hybrid_stage_block(
-                ubatch, stage, token_begin, block_tokens, stage_input, stage_output, gtype, mctx, sched_use,
-                res_use, ubatch_id, stage_index, block_index, block.action, block_outputs, apply_mctx, true, ret,
-                (profile_cpu || profile_tensor) ? &stage_timing : nullptr);
+            if (stage.kind ==
+                    llama_hybrid_runtime_stage_kind::SEQUENCE_FFN) {
+                result = run_sequence_ffn_stage(
+                    ubatch, stage,
+                    token_begin, block_tokens,
+                    stage_input, stage_output,
+                    gtype, mctx, sched_use, res_use,
+                    ubatch_id, stage_index, block_index,
+                    block_outputs, apply_mctx, ret);
+            } else {
+                result = run_hybrid_stage_block(
+                    ubatch, stage,
+                    token_begin, block_tokens,
+                    stage_input, stage_output, gtype, mctx, sched_use,
+                    res_use, ubatch_id, stage_index, block_index,
+                    block.action, block_outputs, apply_mctx, true, ret,
+                    (profile_cpu || profile_tensor) ?
+                        &stage_timing : nullptr);
+            }
             if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
                 finish(ret);
                 return nullptr;
