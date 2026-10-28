@@ -187,7 +187,19 @@ void llama_hybrid_runtime_plan_clear() {
 
 int llama_hybrid_runtime_prefill_chunk_tokens() {
     std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
-    return g_llama_hybrid_runtime_plan.has_value() ? g_llama_hybrid_runtime_plan->tensor_chunk_tokens : 0;
+    if (g_llama_hybrid_runtime_plan.has_value()) {
+        return g_llama_hybrid_runtime_plan->tensor_chunk_tokens;
+    }
+
+    // Standalone CPU/Phone crossover benchmark: allow directional Tensor
+    // chunking without publishing a full Hybrid Auto plan. This keeps the
+    // experiment's placement source of truth in the explicit per-layer policy.
+    if (const char * raw =
+            std::getenv("LLAMA_HYBRID_EXPERIMENT_TENSOR_CHUNK_TOKENS")) {
+        const int value = std::atoi(raw);
+        return value > 0 ? value : 0;
+    }
+    return 0;
 }
 
 int llama_hybrid_runtime_prefill_attn_group_chunks() {
