@@ -35,6 +35,7 @@ struct options {
     int hidden = 256;
 
     int owner_burst = 1;
+    int max_owner_ahead = 1;
     int threads = 8;
     lt::side first_owner = lt::side::pc;
 
@@ -61,6 +62,7 @@ void usage(const char * argv0) {
         "  --layer-owners CSV       Layer mode owners, e.g. pc,pc,phone,phone,pc,pc\n"
         "  --first-owner pc|phone   Tensor layer-0 Attention owner (default pc)\n"
         "  --owner-burst N          OWNER burst before waiting REMOTE_FFN (default 1)\n"
+        "  --max-owner-ahead N      Tensor frontier lead over downstream READY (default 1)\n"
         "  --threads N              PC CPU GGML threads (default 8)\n"
         "  --trace                  print task transitions\n\n"
         "reference self-test options:\n"
@@ -245,6 +247,23 @@ bool parse_options(
                     opts.hidden)) {
                 return false;
             }
+        } else if (arg == "--max-owner-ahead") {
+            const char * value =
+                need_value("--max-owner-ahead");
+            if (value == nullptr) {
+                return false;
+            }
+            char * end = nullptr;
+            const long parsed =
+                std::strtol(value, &end, 10);
+            if (end == value ||
+                *end != '\0' ||
+                parsed < 0 ||
+                parsed > 1000000) {
+                return false;
+            }
+            opts.max_owner_ahead =
+                static_cast<int>(parsed);
         } else if (arg == "--threads") {
             const char * value =
                 need_value("--threads");
@@ -350,6 +369,8 @@ lt::plan make_plan(
         opts.first_owner;
     runtime_plan.owner_burst_limit =
         opts.owner_burst;
+    runtime_plan.max_owner_ahead =
+        opts.max_owner_ahead;
     runtime_plan.c2p_pc_ratio =
         opts.c2p_pc_ratio;
     runtime_plan.p2c_pc_ratio =
@@ -803,7 +824,7 @@ int run_real(
         "[LT_PC] phase=RUN mode=%s layers=%d "
         "tokens=%zu chunks=%zu XT=%d "
         "c2p_pc_ratio=%.6f p2c_pc_ratio=%.6f "
-        "pc_device=%s status=BEGIN\n",
+        "max_owner_ahead=%d pc_device=%s status=BEGIN\n",
         lt::mode_name(
             runtime_plan.execution_mode),
         runtime_plan.layers,
@@ -812,6 +833,7 @@ int run_real(
         opts.chunk_tokens,
         runtime_plan.c2p_pc_ratio,
         runtime_plan.p2c_pc_ratio,
+        runtime_plan.max_owner_ahead,
         compute->device_name());
 
     const auto begin =
