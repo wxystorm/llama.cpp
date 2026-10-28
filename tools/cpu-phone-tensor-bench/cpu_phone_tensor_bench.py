@@ -64,6 +64,12 @@ LOGITS_BLOCK_RE = re.compile(
 WAVEFRONT_RE = re.compile(
     r"\[HYBRID_EXPERIMENT_WAVEFRONT\].*?enabled=1"
 )
+WAVEFRONT_SUM_RE = re.compile(
+    r"\[RETURN_WAVEFRONT_SUM\].*?"
+    r"overlap_boundaries=(\d+).*?"
+    r"ahead_attn=(\d+).*?"
+    r"ahead_phone_submit=(\d+)"
+)
 
 
 class BenchStartupError(RuntimeError):
@@ -111,6 +117,9 @@ class Result:
     correctness: str
     correctness_reason: str
     wavefront_seen: bool
+    wavefront_overlap_boundaries: Optional[int]
+    wavefront_ahead_attn: Optional[int]
+    wavefront_ahead_phone_submit: Optional[int]
 
     @property
     def ok(self) -> bool:
@@ -299,6 +308,7 @@ def parse_run_output(
     Optional[int], Optional[int],
     Optional[int], Optional[int], Optional[int],
     Optional[int], Optional[float], bool,
+    Optional[int], Optional[int], Optional[int],
 ]:
     prompt_matches = list(PROMPT_RE.finditer(text))
     prompt_ms: Optional[float] = None
@@ -336,11 +346,24 @@ def parse_run_output(
         top1_logit = float(m.group(5))
 
     wavefront_seen = WAVEFRONT_RE.search(text) is not None
+    wave_summaries = list(WAVEFRONT_SUM_RE.finditer(text))
+    wavefront_overlap_boundaries: Optional[int] = None
+    wavefront_ahead_attn: Optional[int] = None
+    wavefront_ahead_phone_submit: Optional[int] = None
+    if wave_summaries:
+        m = wave_summaries[-1]
+        wavefront_overlap_boundaries = int(m.group(1))
+        wavefront_ahead_attn = int(m.group(2))
+        wavefront_ahead_phone_submit = int(m.group(3))
+
     return (
         prompt_ms, prompt_tokens, active_layer_ms,
         original_layers, loaded_layers,
         logits_count, logits_zero, logits_nonfinite,
         top1_token, top1_logit, wavefront_seen,
+        wavefront_overlap_boundaries,
+        wavefront_ahead_attn,
+        wavefront_ahead_phone_submit,
     )
 
 
@@ -365,6 +388,9 @@ def run_candidate(
     top1_token: Optional[int] = None
     top1_logit: Optional[float] = None
     wavefront_seen = False
+    wavefront_overlap_boundaries: Optional[int] = None
+    wavefront_ahead_attn: Optional[int] = None
+    wavefront_ahead_phone_submit: Optional[int] = None
     correctness_ok = True
     correctness_reasons: List[str] = []
 
@@ -456,6 +482,9 @@ def run_candidate(
             rep_top1_token,
             rep_top1_logit,
             rep_wavefront_seen,
+            rep_wave_overlap,
+            rep_wave_ahead_attn,
+            rep_wave_ahead_phone,
         ) = parse_run_output(text, candidate.x_layers)
 
         original_layers = original
@@ -466,6 +495,9 @@ def run_candidate(
         top1_token = rep_top1_token
         top1_logit = rep_top1_logit
         wavefront_seen = wavefront_seen or rep_wavefront_seen
+        wavefront_overlap_boundaries = rep_wave_overlap
+        wavefront_ahead_attn = rep_wave_ahead_attn
+        wavefront_ahead_phone_submit = rep_wave_ahead_phone
         if (
             proc.returncode != 0
             or prompt_ms is None
@@ -514,6 +546,21 @@ def run_candidate(
         ):
             rep_correct = False
             rep_reason = "WAVEFRONT_NOT_BUILT"
+        elif (
+            candidate.family == "tensor"
+            and candidate.x_layers > 1
+            and rep_wave_overlap is None
+        ):
+            rep_correct = False
+            rep_reason = "WAVEFRONT_SUM_MISSING"
+        elif (
+            candidate.family == "tensor"
+            and candidate.x_layers > 1
+            and (rep_wave_overlap or 0) <= 0
+            and (rep_wave_ahead_attn or 0) <= 0
+        ):
+            rep_correct = False
+            rep_reason = "WAVEFRONT_NO_CROSS_LAYER_OVERLAP"
 
         if not rep_correct:
             correctness_ok = False
@@ -529,6 +576,9 @@ def run_candidate(
             f"top1={rep_top1_token} "
             f"reference_top1={reference_top1} "
             f"wavefront={1 if rep_wavefront_seen else 0} "
+            f"overlap={rep_wave_overlap} "
+            f"ahead_attn={rep_wave_ahead_attn} "
+            f"ahead_phone={rep_wave_ahead_phone} "
             f"status={'PASS' if rep_correct else 'FAIL'} "
             f"reason={rep_reason}",
             flush=True,
@@ -583,6 +633,9 @@ def run_candidate(
             )
         ),
         wavefront_seen=wavefront_seen,
+        wavefront_overlap_boundaries=wavefront_overlap_boundaries,
+        wavefront_ahead_attn=wavefront_ahead_attn,
+        wavefront_ahead_phone_submit=wavefront_ahead_phone_submit,
     )
 
 
@@ -598,7 +651,8 @@ def write_csv(path: Path, results: Sequence[Result]) -> None:
         "original_layers", "loaded_layers", "returncode", "reps_ok",
         "policy", "logits_count", "logits_zero", "logits_nonfinite",
         "top1_token", "top1_logit", "correctness", "correctness_reason",
-        "wavefront_seen", "log_files",
+        "wavefront_seen", "wavefront_overlap_boundaries",
+        "wavefront_ahead_attn", "wavefront_ahead_phone_submit", "log_files",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -832,6 +886,12 @@ def main() -> int:
             "layer_correctness": best_layer.correctness,
             "tensor_correctness": best_tensor.correctness,
             "tensor_wavefront_seen": best_tensor.wavefront_seen,
+            "tensor_wavefront_overlap_boundaries":
+                best_tensor.wavefront_overlap_boundaries,
+            "tensor_wavefront_ahead_attn":
+                best_tensor.wavefront_ahead_attn,
+            "tensor_wavefront_ahead_phone_submit":
+                best_tensor.wavefront_ahead_phone_submit,
         }
         summary.append(row)
         print(
