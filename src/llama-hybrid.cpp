@@ -8346,21 +8346,47 @@ static bool llama_hybrid_profile_full_layer_point(const llama_hybrid_attn_desc &
         LLAMA_LOG_ERROR("%s: invalid/mismatched layer descriptor\n", __func__);
         return false;
     }
-    if (ffn_desc.ffn_norm_type < 0 || ffn_desc.ffn_norm_type >= GGML_TYPE_COUNT || ffn_desc.gate_type < 0 ||
-        ffn_desc.gate_type >= GGML_TYPE_COUNT || ffn_desc.up_type < 0 || ffn_desc.up_type >= GGML_TYPE_COUNT ||
-        ffn_desc.down_type < 0 || ffn_desc.down_type >= GGML_TYPE_COUNT || attn_desc.attn_norm_type < 0 ||
-        attn_desc.attn_norm_type >= GGML_TYPE_COUNT || attn_desc.q_type < 0 || attn_desc.q_type >= GGML_TYPE_COUNT ||
-        attn_desc.k_type < 0 || attn_desc.k_type >= GGML_TYPE_COUNT || attn_desc.v_type < 0 ||
-        attn_desc.v_type >= GGML_TYPE_COUNT || attn_desc.o_type < 0 || attn_desc.o_type >= GGML_TYPE_COUNT ||
-        (attn_desc.has_q_norm && (attn_desc.q_norm_type < 0 || attn_desc.q_norm_type >= GGML_TYPE_COUNT)) ||
-        (attn_desc.has_k_norm && (attn_desc.k_norm_type < 0 || attn_desc.k_norm_type >= GGML_TYPE_COUNT))) {
+    auto valid_type = [](ggml_type type) {
+        return type >= 0 && type < GGML_TYPE_COUNT;
+    };
+    auto valid_optional = [&](bool present, ggml_type type) {
+        return !present || valid_type(type);
+    };
+    if (!valid_type(ffn_desc.ffn_norm_type) ||
+        !valid_type(ffn_desc.gate_type) ||
+        !valid_type(ffn_desc.up_type) ||
+        !valid_type(ffn_desc.down_type) ||
+        !valid_type(attn_desc.attn_norm_type) ||
+        !valid_type(attn_desc.q_type) ||
+        !valid_type(attn_desc.k_type) ||
+        !valid_type(attn_desc.v_type) ||
+        !valid_type(attn_desc.o_type) ||
+        !valid_optional(attn_desc.has_q_norm, attn_desc.q_norm_type) ||
+        !valid_optional(attn_desc.has_k_norm, attn_desc.k_norm_type) ||
+        !valid_optional(attn_desc.has_q_bias, attn_desc.q_bias_type) ||
+        !valid_optional(attn_desc.has_k_bias, attn_desc.k_bias_type) ||
+        !valid_optional(attn_desc.has_v_bias, attn_desc.v_bias_type) ||
+        !valid_optional(attn_desc.has_o_bias, attn_desc.o_bias_type) ||
+        !valid_optional(attn_desc.has_q_scale, attn_desc.q_scale_type) ||
+        !valid_optional(attn_desc.has_k_scale, attn_desc.k_scale_type) ||
+        !valid_optional(attn_desc.has_v_scale, attn_desc.v_scale_type) ||
+        !valid_optional(attn_desc.has_o_scale, attn_desc.o_scale_type) ||
+        !valid_optional(ffn_desc.has_gate_bias, ffn_desc.gate_bias_type) ||
+        !valid_optional(ffn_desc.has_up_bias, ffn_desc.up_bias_type) ||
+        !valid_optional(ffn_desc.has_down_bias, ffn_desc.down_bias_type) ||
+        !valid_optional(ffn_desc.has_gate_scale, ffn_desc.gate_scale_type) ||
+        !valid_optional(ffn_desc.has_up_scale, ffn_desc.up_scale_type) ||
+        !valid_optional(ffn_desc.has_down_scale, ffn_desc.down_scale_type) ||
+        !valid_optional(attn_desc.has_rope_factors, attn_desc.rope_factors_type)) {
         LLAMA_LOG_ERROR("%s: invalid layer tensor types\n", __func__);
         return false;
     }
     if (attn_desc.n_head <= 0 || attn_desc.n_head_kv <= 0 || attn_desc.q_dim % attn_desc.n_head != 0 ||
         attn_desc.k_dim % attn_desc.n_head_kv != 0 || attn_desc.v_dim % attn_desc.n_head_kv != 0 ||
         attn_desc.rope_type == LLAMA_ROPE_TYPE_NONE || attn_desc.n_rot <= 0 || attn_desc.n_ctx_orig <= 0 ||
-        attn_desc.freq_base <= 0.0f || attn_desc.freq_scale <= 0.0f) {
+        attn_desc.freq_base <= 0.0f || attn_desc.freq_scale <= 0.0f ||
+        !(attn_desc.kq_scale > 0.0f) ||
+        (attn_desc.has_rope_factors && attn_desc.rope_factors_ne0 <= 0)) {
         return false;
     }
 
