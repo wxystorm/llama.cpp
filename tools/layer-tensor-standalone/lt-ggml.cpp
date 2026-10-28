@@ -877,10 +877,6 @@ struct ggml_compute::impl {
             }
         }
 
-        if (!initialize_phone_shards(error)) {
-            return false;
-        }
-
         if (device_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
             auto check_gpu_tensor =
                 [&](int il,
@@ -983,6 +979,10 @@ struct ggml_compute::impl {
 
         if (config.threads <= 0) {
             error = "backend thread count must be > 0";
+            return false;
+        }
+
+        if (!initialize_phone_shards(error)) {
             return false;
         }
 
