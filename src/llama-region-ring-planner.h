@@ -449,20 +449,20 @@ inline bool simulate(const model & m,
         const auto & t = tasks[(size_t) id];
         const int r = t.region;
 
-        if (regions[(size_t) r].device == device::GPU) {
-            // Match the runtime's single CUDA execution lane: later GPU
-            // Regions cannot overtake an earlier GPU Region even when their
-            // token dependency becomes READY first.
-            for (int prior : gpu_regions) {
-                if (prior >= r) {
-                    break;
-                }
-                if (!region_done[(size_t) prior]) {
+        if (regions[(size_t) r].device == device::GPU &&
+                m.gpu_weight_streaming) {
+            const int rank = gpu_rank[(size_t) r];
+            if (rank < 0) {
+                return false;
+            }
+            if (rank >= 2) {
+                const int predecessor =
+                    gpu_regions[(size_t) rank - 2];
+                if (!region_done[(size_t) predecessor]) {
                     return false;
                 }
             }
-            if (m.gpu_weight_streaming &&
-                    !gpu_weight_ready[(size_t) r]) {
+            if (!gpu_weight_ready[(size_t) r]) {
                 return false;
             }
         }
@@ -570,18 +570,17 @@ inline bool simulate(const model & m,
                         by_region[(size_t) r].empty()) {
                     continue;
                 }
-                bool prior_done = true;
-                for (int prior : gpu_regions) {
-                    if (prior >= r) {
-                        break;
-                    }
-                    if (!region_done[(size_t) prior]) {
-                        prior_done = false;
-                        break;
-                    }
+                const int rank = gpu_rank[(size_t) r];
+                bool bank_reusable = rank >= 0;
+                if (bank_reusable && rank >= 2) {
+                    const int predecessor =
+                        gpu_regions[(size_t) rank - 2];
+                    bank_reusable =
+                        region_done[(size_t) predecessor];
                 }
                 const int first = by_region[(size_t) r].front();
-                if (prior_done && task_dependencies_ready(first)) {
+                if (bank_reusable &&
+                        task_dependencies_ready(first)) {
                     gpu_natural_ready_ms[(size_t) r] = now;
                 }
             }
