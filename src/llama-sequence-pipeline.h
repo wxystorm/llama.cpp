@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 enum class llama_sequence_pipe_resource : uint8_t {
