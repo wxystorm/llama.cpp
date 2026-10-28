@@ -4015,6 +4015,835 @@ bool llama_context::run_hybrid_wave_probe(
     return true;
 }
 
+
+llm_graph_result * llama_context::process_ubatch_region_ring_sequence(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_backend_sched_t sched_use,
+        llm_graph_result * res_use,
+        const std::vector<llama_hybrid_runtime_stage> & stages,
+        int ubatch_id,
+        ggml_status & ret) {
+    auto * kv_mctx =
+        dynamic_cast<llama_kv_cache_context *>(mctx);
+    if (kv_mctx == nullptr || stages.size() < 4 ||
+            ubatch.n_tokens <= 1 ||
+            model.arch != LLM_ARCH_QWEN3MOE ||
+            !loras->empty()) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    size_t sequence_stage = stages.size();
+    for (size_t s = 0; s < stages.size(); ++s) {
+        if (stages[s].kind !=
+                llama_hybrid_runtime_stage_kind::SEQUENCE_FFN) {
+            continue;
+        }
+        if (sequence_stage != stages.size()) {
+            LLAMA_LOG_ERROR(
+                "[SEQ_PIPE_PLAN] status=REJECT "
+                "reason=MULTIPLE_SEQUENCE_STAGES\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        sequence_stage = s;
+    }
+
+    if (sequence_stage == stages.size() ||
+            sequence_stage == 0 ||
+            sequence_stage + 1 >= stages.size() ||
+            stages[sequence_stage].layer_end !=
+                stages[sequence_stage].layer_begin + 1 ||
+            stages.back().kind !=
+                llama_hybrid_runtime_stage_kind::PHONE) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_PLAN] status=REJECT "
+            "reason=UNSUPPORTED_STAGE_TOPOLOGY seq_stage=%zu stages=%zu\n",
+            sequence_stage, stages.size());
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    if (model.hybrid_ring_gpu_weight_streaming) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_PLAN] status=REJECT "
+            "reason=GPU_WEIGHT_STREAMING_V1_DISABLED\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    // V1 keeps the already validated physical topology:
+    //   [Meta(CPU,RPC0), CUDA0, CPU].
+    const bool topology_ok =
+        backend_ptrs.size() == 3 &&
+        ggml_backend_is_meta(backend_ptrs[0]) &&
+        backend_ptrs[1] != nullptr &&
+        backend_ptrs[2] == backend_cpu &&
+        ggml_backend_dev_type(
+            ggml_backend_get_device(backend_ptrs[1])) ==
+                GGML_BACKEND_DEVICE_TYPE_GPU;
+    if (!topology_ok ||
+            ggml_backend_meta_n_backends(
+                backend_ptrs[0]) < 2) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_PLAN] status=REJECT "
+            "reason=OUTER_BACKEND_TOPOLOGY\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    ggml_backend_t meta_backend = backend_ptrs[0];
+    ggml_backend_t seq_pc_backend =
+        ggml_backend_meta_simple_backend(
+            meta_backend, 0);
+    ggml_backend_t seq_phone_backend =
+        ggml_backend_meta_simple_backend(
+            meta_backend, 1);
+    if (seq_pc_backend == nullptr ||
+            seq_phone_backend == nullptr) {
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    const int n_tokens = (int) ubatch.n_tokens;
+    const int seq_chunk =
+        stages[sequence_stage].macro_tokens;
+
+    const char * per_chunk_env =
+        std::getenv(
+            "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOKENS");
+    const int per_chunk_phone =
+        per_chunk_env != nullptr &&
+                per_chunk_env[0] != '\0' ?
+            std::max(1, std::atoi(per_chunk_env)) : 8;
+
+    const int seq_chunks =
+        (n_tokens + seq_chunk - 1) / seq_chunk;
+
+    const char * total_env =
+        std::getenv(
+            "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TOTAL_TOKENS");
+    int phone_total =
+        total_env != nullptr &&
+                total_env[0] != '\0' ?
+            std::atoi(total_env) :
+            seq_chunks * per_chunk_phone;
+    phone_total =
+        std::min(
+            std::max(1, phone_total),
+            n_tokens - 1);
+    const int sequence_pc_end =
+        n_tokens - phone_total;
+
+    auto env_positive =
+        [](const char * name, int fallback) {
+            const char * value = std::getenv(name);
+            if (value == nullptr || value[0] == '\0') {
+                return fallback;
+            }
+            return std::max(1, std::atoi(value));
+        };
+    const int phone_min_task_tokens =
+        env_positive(
+            "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_MIN_TASK_TOKENS",
+            16);
+    const int phone_target_task_tokens =
+        std::max(
+            phone_min_task_tokens,
+            env_positive(
+                "LLAMA_HYBRID_SEQUENCE_FFN_PHONE_TARGET_TASK_TOKENS",
+                32));
+
+    std::vector<llama_sequence_pipe_stage> pipe_stages;
+    pipe_stages.reserve(stages.size());
+    for (const auto & stage : stages) {
+        llama_sequence_pipe_stage_kind kind;
+        switch (stage.kind) {
+            case llama_hybrid_runtime_stage_kind::CPU:
+                kind = llama_sequence_pipe_stage_kind::CPU;
+                break;
+            case llama_hybrid_runtime_stage_kind::GPU:
+                kind = llama_sequence_pipe_stage_kind::GPU;
+                break;
+            case llama_hybrid_runtime_stage_kind::PHONE:
+                kind = llama_sequence_pipe_stage_kind::PHONE;
+                break;
+            case llama_hybrid_runtime_stage_kind::SEQUENCE_FFN:
+                kind = llama_sequence_pipe_stage_kind::SEQUENCE_FFN;
+                break;
+            case llama_hybrid_runtime_stage_kind::TENSOR:
+                LLAMA_LOG_ERROR(
+                    "[SEQ_PIPE_PLAN] status=REJECT "
+                    "reason=TENSOR_STAGE_UNSUPPORTED\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+        }
+        pipe_stages.push_back({
+            kind,
+            stage.layer_begin,
+            stage.layer_end,
+            stage.macro_tokens,
+        });
+    }
+
+    llama_sequence_pipe_ready ready(
+        std::move(pipe_stages),
+        n_tokens,
+        sequence_stage,
+        sequence_pc_end,
+        phone_min_task_tokens,
+        phone_target_task_tokens);
+
+    LLAMA_LOG_ERROR(
+        "[SEQ_PIPE_PLAN] tokens=%d stages=%zu seq_stage=%zu layer=%d "
+        "attn_chunk=%d split_token=%d pc_tokens=%d phone_tokens=%d "
+        "phone_min=%d phone_target=%d "
+        "partition=GLOBAL_CONTIGUOUS dependency=TOKEN_INTERVAL "
+        "control=LOCAL_NO_READY_ACK status=READY\n",
+        n_tokens, stages.size(), sequence_stage,
+        stages[sequence_stage].layer_begin,
+        seq_chunk, sequence_pc_end,
+        sequence_pc_end, phone_total,
+        phone_min_task_tokens,
+        phone_target_task_tokens);
+
+    // CPU and CUDA each own one scheduler.  The Phone worker exclusively owns
+    // the canonical scheduler/result because the final Region is Phone and
+    // logits must remain discoverable by the caller.
+    const size_t max_nodes =
+        graph_max_nodes(
+            std::min(cparams.n_ctx, cparams.n_ubatch));
+
+    auto ensure_worker_resource =
+        [&](size_t resource_id,
+            size_t backend_start,
+            size_t backend_count,
+            bool op_offload) -> bool {
+            auto & worker =
+                region_ring_worker_resources[resource_id];
+
+            bool matches =
+                worker.sched &&
+                ggml_backend_sched_get_n_backends(
+                    worker.sched.get()) ==
+                    (int) backend_count;
+            if (matches) {
+                for (size_t i = 0; i < backend_count; ++i) {
+                    if (ggml_backend_sched_get_backend(
+                            worker.sched.get(), (int) i) !=
+                            backend_ptrs[backend_start + i]) {
+                        matches = false;
+                        break;
+                    }
+                }
+            }
+
+            if (worker.sched && !matches) {
+                ggml_backend_sched_synchronize(
+                    worker.sched.get());
+                worker.res.reset();
+                worker.sched.reset();
+                worker.bank_region =
+                    std::numeric_limits<size_t>::max();
+                worker.bank_generation = 0;
+                worker.bank_ready = false;
+            }
+
+            if (!worker.sched) {
+                worker.sched.reset(
+                    ggml_backend_sched_new(
+                        backend_ptrs.data() + backend_start,
+                        backend_buft.data() + backend_start,
+                        (int) backend_count,
+                        max_nodes,
+                        false,
+                        op_offload));
+            }
+            if (!worker.sched) {
+                return false;
+            }
+
+            ggml_backend_sched_set_weight_cache(
+                worker.sched.get(), false);
+
+            if (!worker.res) {
+                worker.res.reset(
+                    new llm_graph_result(max_nodes));
+            }
+            return true;
+        };
+
+    if (!ensure_worker_resource(
+            0, 2, 1, false) ||
+        !ensure_worker_resource(
+            1, 1, 2, cparams.op_offload)) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_RESOURCE] status=FAIL "
+            "reason=SCHED_ALLOC\n");
+        ret = GGML_STATUS_ALLOC_FAILED;
+        return nullptr;
+    }
+
+    std::array<ggml_backend_sched_t, 3> worker_sched = {
+        region_ring_worker_resources[0].sched.get(),
+        region_ring_worker_resources[1].sched.get(),
+        sched_use,
+    };
+    std::array<llm_graph_result *, 3> worker_res = {
+        region_ring_worker_resources[0].res.get(),
+        region_ring_worker_resources[1].res.get(),
+        res_use,
+    };
+
+    if (worker_sched[0] == worker_sched[1] ||
+            worker_sched[0] == worker_sched[2] ||
+            worker_sched[1] == worker_sched[2] ||
+            worker_res[0] == worker_res[1] ||
+            worker_res[0] == worker_res[2] ||
+            worker_res[1] == worker_res[2]) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_RESOURCE] status=FAIL "
+            "reason=RESOURCE_ALIAS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    // Configure backend thread pools once.  Task execution below calls
+    // run_hybrid_stage_block() in its preconfigured/raw-compute mode and never
+    // reconfigures threads from competing workers.
+    const bool batched = ubatch.n_tokens > 1;
+    const int n_threads =
+        batched ? cparams.n_threads_batch :
+                  cparams.n_threads;
+    ggml_threadpool_t tp =
+        batched ? threadpool_batch : threadpool;
+    if (backend_cpu != nullptr) {
+        auto * reg =
+            ggml_backend_dev_backend_reg(
+                ggml_backend_get_device(backend_cpu));
+        auto * set_threadpool_fn =
+            (decltype(ggml_backend_cpu_set_threadpool) *)
+                ggml_backend_reg_get_proc_address(
+                    reg,
+                    "ggml_backend_cpu_set_threadpool");
+        if (set_threadpool_fn) {
+            set_threadpool_fn(backend_cpu, tp);
+        }
+    }
+    for (const auto & entry : set_n_threads_fns) {
+        entry.second(entry.first, n_threads);
+    }
+
+    const int32_t saved_outputs = n_outputs;
+    if (!kv_mctx->apply()) {
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_RESOURCE] status=FAIL "
+            "reason=KV_APPLY\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
+
+    std::array<std::unique_ptr<llama_kv_cache_context>, 3>
+        kv_views;
+    for (size_t r = 0; r < kv_views.size(); ++r) {
+        kv_views[r] = kv_mctx->make_stage_view();
+        if (!kv_views[r]) {
+            LLAMA_LOG_ERROR(
+                "[SEQ_PIPE_RESOURCE] status=FAIL "
+                "reason=KV_STAGE_VIEW resource=%zu\n",
+                r);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+    }
+
+    const int64_t n_embd = model.hparams.n_embd;
+    std::vector<std::vector<float>> outputs(
+        stages.size() - 1);
+    for (auto & output : outputs) {
+        output.resize(
+            (size_t) n_tokens *
+            (size_t) n_embd);
+    }
+    std::vector<float> seq_residual(
+        (size_t) n_tokens *
+        (size_t) n_embd);
+
+    // GPU-first Qwen prelude: materialize all embeddings once on CPU so every
+    // real GPU task is hidden-input CUDA work.  This keeps the GPU worker from
+    // borrowing CPU while the causal scheduler is live.
+    std::vector<float> ring_input_hidden;
+    bool embedding_prelude = false;
+    if (stages.front().kind ==
+            llama_hybrid_runtime_stage_kind::GPU &&
+            stages.front().layer_begin == 0 &&
+            ubatch.token != nullptr) {
+        if (!kv_views[0]->set_stage_range(
+                ubatch_id, 0, ubatch.n_tokens)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        ggml_status prelude_status =
+            GGML_STATUS_SUCCESS;
+        llm_graph_result * prelude_res =
+            prepare_ubatch(
+                worker_res[0],
+                worker_sched[0],
+                ubatch,
+                gtype,
+                kv_views[0].get(),
+                prelude_status,
+                false,
+                &stages.front(),
+                0,
+                false,
+                true);
+        if (prelude_res == nullptr ||
+                prelude_status !=
+                    GGML_STATUS_SUCCESS) {
+            kv_views[0]->clear_stage_range();
+            ret = prelude_status ==
+                    GGML_STATUS_SUCCESS ?
+                GGML_STATUS_FAILED :
+                prelude_status;
+            return nullptr;
+        }
+
+        const int n_splits =
+            ggml_backend_sched_get_n_splits(
+                worker_sched[0]);
+        prelude_status =
+            ggml_backend_sched_compute_range(
+                worker_sched[0], 0, n_splits);
+        if (prelude_status !=
+                GGML_STATUS_SUCCESS) {
+            kv_views[0]->clear_stage_range();
+            ret = prelude_status;
+            return nullptr;
+        }
+
+        ring_input_hidden.resize(
+            (size_t) n_tokens *
+            (size_t) n_embd);
+        if (!copy_hybrid_stage_output(
+                prelude_res,
+                worker_sched[0],
+                ring_input_hidden.data(),
+                ubatch.n_tokens,
+                ubatch_id,
+                0,
+                0,
+                false)) {
+            kv_views[0]->clear_stage_range();
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        kv_views[0]->clear_stage_range();
+        embedding_prelude = true;
+
+        LLAMA_LOG_ERROR(
+            "[SEQ_PIPE_EMBED] tokens=%d bytes=%zu "
+            "owner=CPU_FULL_BATCH next=GPU status=READY\n",
+            n_tokens,
+            ring_input_hidden.size() *
+                sizeof(float));
+    }
+
+    struct worker_state {
+        size_t tasks = 0;
+        size_t region_tasks = 0;
+        size_t attn_tasks = 0;
+        size_t pc_ffn_tasks = 0;
+        size_t phone_ffn_tasks = 0;
+        int64_t wait_us = 0;
+        int64_t exec_us = 0;
+        ggml_status status = GGML_STATUS_SUCCESS;
+        llm_graph_result * final_result = nullptr;
+        std::vector<std::pair<int64_t, int64_t>>
+            intervals;
+    };
+
+    std::array<worker_state, 3> states;
+    const std::array<
+        llama_sequence_pipe_resource, 3> resources = {
+            llama_sequence_pipe_resource::CPU,
+            llama_sequence_pipe_resource::GPU,
+            llama_sequence_pipe_resource::PHONE,
+        };
+
+    const int64_t wall_begin_us = ggml_time_us();
+
+    auto run_worker = [&](size_t resource_index) {
+        auto & state = states[resource_index];
+        const auto resource =
+            resources[resource_index];
+
+        try {
+            while (state.status ==
+                    GGML_STATUS_SUCCESS) {
+                const int64_t wait_begin_us =
+                    ggml_time_us();
+                auto task_opt =
+                    ready.wait_take(resource);
+                state.wait_us +=
+                    ggml_time_us() -
+                    wait_begin_us;
+                if (!task_opt.has_value()) {
+                    break;
+                }
+
+                const auto task = *task_opt;
+                const int64_t task_begin_us =
+                    ggml_time_us();
+                ggml_status task_status =
+                    GGML_STATUS_SUCCESS;
+                llm_graph_result * task_result =
+                    nullptr;
+                bool task_ok = true;
+
+                LLAMA_LOG_ERROR(
+                    "[SEQ_PIPE_TASK] event=BEGIN id=%" PRIu64
+                    " resource=%s kind=%s stage=%zu "
+                    "tokens=[%d,%d) cpu_q=%zu gpu_q=%zu "
+                    "phone_q=%zu phone_pending=%d\n",
+                    task.id,
+                    llama_sequence_pipe_resource_name(
+                        task.resource),
+                    llama_sequence_pipe_task_name(
+                        task.kind),
+                    task.stage,
+                    task.token_begin,
+                    task.token_begin + task.n_tokens,
+                    ready.queue_size(
+                        llama_sequence_pipe_resource::CPU),
+                    ready.queue_size(
+                        llama_sequence_pipe_resource::GPU),
+                    ready.queue_size(
+                        llama_sequence_pipe_resource::PHONE),
+                    ready.phone_pending_tokens());
+
+                if (task.kind ==
+                        llama_sequence_pipe_task_kind::REGION) {
+                    const auto & stage =
+                        stages[task.stage];
+                    const bool first =
+                        task.stage == 0;
+                    const bool last =
+                        task.stage + 1 ==
+                            stages.size();
+
+                    float * input =
+                        first ?
+                            (embedding_prelude ?
+                                ring_input_hidden.data() +
+                                    (size_t) task.token_begin *
+                                    (size_t) n_embd :
+                                nullptr) :
+                            outputs[task.stage - 1].data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd;
+                    float * output =
+                        last ? nullptr :
+                        outputs[task.stage].data() +
+                            (size_t) task.token_begin *
+                            (size_t) n_embd;
+
+                    int32_t block_outputs = 0;
+                    if (last) {
+                        for (int i = 0;
+                             i < task.n_tokens; ++i) {
+                            block_outputs +=
+                                ubatch.output[
+                                    task.token_begin + i] != 0;
+                        }
+                    }
+
+                    bool task_apply_mctx = false;
+                    task_result =
+                        run_hybrid_stage_block(
+                            ubatch,
+                            stage,
+                            task.token_begin,
+                            task.n_tokens,
+                            input,
+                            output,
+                            gtype,
+                            kv_views[resource_index].get(),
+                            worker_sched[resource_index],
+                            worker_res[resource_index],
+                            ubatch_id,
+                            task.stage,
+                            task.chunk,
+                            llama_hybrid_boundary_action::PASS,
+                            block_outputs,
+                            task_apply_mctx,
+                            true,
+                            task_status,
+                            nullptr,
+                            true,
+                            true,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            resource ==
+                                llama_sequence_pipe_resource::GPU ?
+                                backend_ptrs[1] :
+                                nullptr,
+                            -1);
+
+                    task_ok =
+                        task_result != nullptr &&
+                        task_status ==
+                            GGML_STATUS_SUCCESS;
+                    if (task_ok && last) {
+                        state.final_result =
+                            task_result;
+                    }
+                    ++state.region_tasks;
+                } else if (task.kind ==
+                        llama_sequence_pipe_task_kind::SEQ_ATTN) {
+                    const auto & stage =
+                        stages[task.stage];
+                    bool task_apply_mctx = false;
+                    task_result =
+                        run_hybrid_stage_block(
+                            ubatch,
+                            stage,
+                            task.token_begin,
+                            task.n_tokens,
+                            outputs[task.stage - 1].data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            seq_residual.data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            gtype,
+                            kv_views[0].get(),
+                            worker_sched[0],
+                            worker_res[0],
+                            ubatch_id,
+                            task.stage,
+                            task.chunk,
+                            llama_hybrid_boundary_action::PASS,
+                            0,
+                            task_apply_mctx,
+                            true,
+                            task_status,
+                            nullptr,
+                            true,
+                            true);
+                    task_ok =
+                        task_result != nullptr &&
+                        task_status ==
+                            GGML_STATUS_SUCCESS;
+                    ++state.attn_tasks;
+                } else if (task.kind ==
+                        llama_sequence_pipe_task_kind::SEQ_PC_FFN) {
+                    llama_sequence_ffn_timing timing {};
+                    task_ok =
+                        run_sequence_ffn_branch_task(
+                            task.layer,
+                            task.token_begin,
+                            task.n_tokens,
+                            0,
+                            seq_pc_backend,
+                            seq_residual.data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            outputs[task.stage].data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            &timing,
+                            task_status);
+                    ++state.pc_ffn_tasks;
+                } else {
+                    llama_sequence_ffn_timing timing {};
+                    task_ok =
+                        run_sequence_ffn_branch_task(
+                            task.layer,
+                            task.token_begin,
+                            task.n_tokens,
+                            1,
+                            seq_phone_backend,
+                            seq_residual.data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            outputs[task.stage].data() +
+                                (size_t) task.token_begin *
+                                (size_t) n_embd,
+                            &timing,
+                            task_status);
+                    ++state.phone_ffn_tasks;
+                }
+
+                const int64_t task_end_us =
+                    ggml_time_us();
+                state.exec_us +=
+                    task_end_us - task_begin_us;
+                state.intervals.emplace_back(
+                    task_begin_us, task_end_us);
+
+                if (!task_ok ||
+                        task_status !=
+                            GGML_STATUS_SUCCESS) {
+                    state.status =
+                        task_status ==
+                                GGML_STATUS_SUCCESS ?
+                            GGML_STATUS_FAILED :
+                            task_status;
+                    ready.fail(task);
+                    LLAMA_LOG_ERROR(
+                        "[SEQ_PIPE_TASK] event=FAIL id=%" PRIu64
+                        " resource=%s kind=%s status=%d\n",
+                        task.id,
+                        llama_sequence_pipe_resource_name(
+                            task.resource),
+                        llama_sequence_pipe_task_name(
+                            task.kind),
+                        (int) state.status);
+                    break;
+                }
+
+                ready.complete(task);
+                ++state.tasks;
+
+                LLAMA_LOG_ERROR(
+                    "[SEQ_PIPE_TASK] event=END id=%" PRIu64
+                    " resource=%s kind=%s tokens=[%d,%d) "
+                    "wall_ms=%.3f finished_tokens=%zu\n",
+                    task.id,
+                    llama_sequence_pipe_resource_name(
+                        task.resource),
+                    llama_sequence_pipe_task_name(
+                        task.kind),
+                    task.token_begin,
+                    task.token_begin + task.n_tokens,
+                    (task_end_us - task_begin_us) /
+                        1000.0,
+                    ready.finished_output_tokens());
+            }
+        } catch (const std::exception & e) {
+            state.status = GGML_STATUS_FAILED;
+            ready.cancel();
+            LLAMA_LOG_ERROR(
+                "[SEQ_PIPE_WORKER] resource=%s "
+                "event=EXCEPTION reason=%s\n",
+                llama_sequence_pipe_resource_name(
+                    resource),
+                e.what());
+        } catch (...) {
+            state.status = GGML_STATUS_FAILED;
+            ready.cancel();
+            LLAMA_LOG_ERROR(
+                "[SEQ_PIPE_WORKER] resource=%s "
+                "event=EXCEPTION reason=UNKNOWN\n",
+                llama_sequence_pipe_resource_name(
+                    resource));
+        }
+    };
+
+    std::array<std::thread, 3> workers = {
+        std::thread(run_worker, 0),
+        std::thread(run_worker, 1),
+        std::thread(run_worker, 2),
+    };
+    for (auto & worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+    ret = GGML_STATUS_SUCCESS;
+    for (const auto & state : states) {
+        if (state.status != GGML_STATUS_SUCCESS &&
+                ret == GGML_STATUS_SUCCESS) {
+            ret = state.status;
+        }
+    }
+
+    for (auto & view : kv_views) {
+        if (view) {
+            view->clear_stage_range();
+        }
+    }
+    n_outputs = saved_outputs;
+
+    llm_graph_result * result =
+        states[
+            (size_t) llama_sequence_pipe_resource::PHONE].
+            final_result;
+
+    const int64_t cpu_phone_overlap_us =
+        llama_region_ring_interval_overlap_us(
+            states[
+                (size_t) llama_sequence_pipe_resource::CPU].
+                intervals,
+            states[
+                (size_t) llama_sequence_pipe_resource::PHONE].
+                intervals);
+    const int64_t gpu_phone_overlap_us =
+        llama_region_ring_interval_overlap_us(
+            states[
+                (size_t) llama_sequence_pipe_resource::GPU].
+                intervals,
+            states[
+                (size_t) llama_sequence_pipe_resource::PHONE].
+                intervals);
+    const int64_t cpu_gpu_overlap_us =
+        llama_region_ring_interval_overlap_us(
+            states[
+                (size_t) llama_sequence_pipe_resource::CPU].
+                intervals,
+            states[
+                (size_t) llama_sequence_pipe_resource::GPU].
+                intervals);
+
+    const bool ok =
+        ret == GGML_STATUS_SUCCESS &&
+        ready.all_done() &&
+        result == res_use;
+
+    LLAMA_LOG_ERROR(
+        "[SEQ_PIPE_SUM] tokens=%d split_token=%d "
+        "pc_tokens=%d phone_tokens=%d "
+        "cpu_tasks=%zu gpu_tasks=%zu phone_tasks=%zu "
+        "attn_tasks=%zu pc_ffn_tasks=%zu phone_ffn_tasks=%zu "
+        "cpu_wait_ms=%.3f gpu_wait_ms=%.3f phone_wait_ms=%.3f "
+        "cpu_exec_ms=%.3f gpu_exec_ms=%.3f phone_exec_ms=%.3f "
+        "cpu_phone_overlap_ms=%.3f gpu_phone_overlap_ms=%.3f "
+        "cpu_gpu_overlap_ms=%.3f wall_ms=%.3f "
+        "control_rpc=0 completion=P2C_PAYLOAD status=%s\n",
+        n_tokens,
+        sequence_pc_end,
+        sequence_pc_end,
+        phone_total,
+        states[0].tasks,
+        states[1].tasks,
+        states[2].tasks,
+        states[0].attn_tasks,
+        states[0].pc_ffn_tasks,
+        states[2].phone_ffn_tasks,
+        states[0].wait_us / 1000.0,
+        states[1].wait_us / 1000.0,
+        states[2].wait_us / 1000.0,
+        states[0].exec_us / 1000.0,
+        states[1].exec_us / 1000.0,
+        states[2].exec_us / 1000.0,
+        cpu_phone_overlap_us / 1000.0,
+        gpu_phone_overlap_us / 1000.0,
+        cpu_gpu_overlap_us / 1000.0,
+        (ggml_time_us() - wall_begin_us) / 1000.0,
+        ok ? "PASS" : "FAIL");
+
+    if (!ok && ret == GGML_STATUS_SUCCESS) {
+        ret = GGML_STATUS_FAILED;
+    }
+    return ok ? result : nullptr;
+}
+
 llm_graph_result * llama_context::process_ubatch_region_ring(
         const llama_ubatch & ubatch,
         llm_graph_type gtype,
