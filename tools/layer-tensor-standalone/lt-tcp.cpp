@@ -491,7 +491,7 @@ bool tcp_channel::recv_message(message & value) {
                 message_kind::ready) ||
         header.kind >
             static_cast<uint32_t>(
-                message_kind::debug_partial)) {
+                message_kind::stream_bench_result)) {
         return false;
     }
 
