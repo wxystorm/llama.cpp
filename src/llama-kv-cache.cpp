@@ -212,10 +212,34 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
-            auto * dev = model.dev_layer(il);
+            // Sequence-FFN keeps Attention and KV entirely on PC.  The layer
+            // weights themselves remain Meta-owned so the FFN expert tensors
+            // can be mirrored to RPC, but KV must not inherit that Meta
+            // placement.  Put this layer's cache directly on CPU so the
+            // causal Attention task can run on the single CPU executor without
+            // touching the Phone/Meta execution path.
+            const bool sequence_ffn =
+                model.hybrid_layer_mode((int) il) ==
+                    llama_hybrid_layer_mode::SEQUENCE_FFN;
+            auto * dev = sequence_ffn ?
+                ggml_backend_dev_by_type(
+                    GGML_BACKEND_DEVICE_TYPE_CPU) :
+                model.dev_layer(il);
+            if (dev == nullptr) {
+                throw std::runtime_error(
+                    "Sequence-FFN KV requested CPU device but none exists");
+            }
             buft = ggml_backend_dev_buffer_type(dev);
-
             dev_name = ggml_backend_dev_name(dev);
+
+            if (sequence_ffn &&
+                    std::getenv(
+                        "LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[SEQ_FFN_KV] layer=%u placement=CPU_DIRECT "
+                    "attention=PC status=READY\n",
+                    il);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
