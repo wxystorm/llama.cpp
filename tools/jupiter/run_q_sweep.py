@@ -134,6 +134,16 @@ def print_sweep_plans(
     return plans
 
 
+def should_echo_runtime_line(line: str) -> bool:
+    """Keep the console quiet; all runtime lines still go to the log file."""
+    return (
+        "[JUPITER_SEQUENCE_PLAN]" in line
+        or "[JUPITER_SEQUENCE_DECISION]" in line
+        or "prompt eval time" in line
+        or line.lstrip().startswith(("Error:", "FATAL:", "error:"))
+    )
+
+
 def stream_process(
     cmd: Sequence[str],
     env: dict[str, str],
@@ -169,15 +179,15 @@ def stream_process(
             while b"\n" in pending:
                 raw, pending = pending.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace").rstrip("\r")
-                print(line, flush=True)
+                if should_echo_runtime_line(line):
+                    print(line, flush=True)
                 log.write(line + "\n")
-                log.flush()
 
         if pending:
             line = pending.decode("utf-8", errors="replace").rstrip("\r")
-            print(line, flush=True)
+            if should_echo_runtime_line(line):
+                print(line, flush=True)
             log.write(line + "\n")
-            log.flush()
 
         return proc.wait()
 
@@ -318,10 +328,10 @@ def build_cli_command(
         "-n", "1",
         "-t", str(args.threads),
         "--flash-attn", "on",
-        # LLAMA_LOG_INFO is routed through common_log_default_callback as
-        # LOG_LEVEL_TRACE (4), not LOG_LEVEL_INFO (3). With -lv 3, Jupiter's
-        # SEQUENCE_PLAN / UBATCH / STAGE_PROFILE logs are silently suppressed.
-        "-lv", "4",
+        # The q-sweep opt-in makes only required Jupiter calibration records
+        # visible at -lv 3; other TRACE-level runtime noise stays filtered.
+        # Requires the matching common/log.cpp change in the PC binary.
+        "-lv", "3",
         "--no-conversation",
         "--single-turn",
         "--simple-io",
@@ -462,6 +472,8 @@ def main() -> int:
     base_env["LLAMA_JUPITER_WINDOW"] = "1"
     base_env["LLAMA_JUPITER_TRACE"] = "1"
     base_env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
+    base_env["LLAMA_JUPITER_Q_SWEEP"] = "1"
+    base_env["LLAMA_JUPITER_LOGITS_TOP10"] = "0"
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
 
@@ -483,6 +495,14 @@ def main() -> int:
             f"token probe failed with exit={exit_code}; log={probe_log}"
         )
 
+    probe_text = probe_log.read_text(encoding="utf-8", errors="replace")
+    if not UBATCH_RE.search(probe_text):
+        raise RuntimeError(
+            "q-sweep prefill UBATCH records are missing at -lv 3. "
+            "Update common/log.cpp and rebuild the PC llama-cli so "
+            "LLAMA_JUPITER_Q_SWEEP=1 exposes calibration records. "
+            f"Probe log: {probe_log}"
+        )
     total_tokens, source = infer_runtime_prompt_tokens(probe_log)
     print(
         f"[JUPITER_SWEEP_TOKENS] actual={total_tokens} source={source} "
