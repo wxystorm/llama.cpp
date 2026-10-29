@@ -81,6 +81,7 @@ def main():
         ap.add_argument("--"+key, required=True)
     ap.add_argument("--boundaries",default="20,22,24,25,26,28")
     ap.add_argument("--chunk",type=int,default=64)
+    ap.add_argument("--target-tokens",type=int,default=357)
     ap.add_argument("--repeats",type=int,default=2)
     ap.add_argument("--threads",type=int,default=8)
     ap.add_argument("--pc-budget-mib",type=float)
@@ -90,7 +91,7 @@ def main():
     ap.add_argument("--plan-output",default="jupiter-model.plan")
     args=ap.parse_args()
     boundaries=sorted(set(int(x) for x in args.boundaries.split(",")))
-    if not boundaries or min(boundaries)<1 or args.chunk<2 or args.repeats<1:
+    if not boundaries or min(boundaries)<1 or args.chunk<2 or args.repeats<1 or args.target_tokens<args.chunk:
         ap.error("invalid boundaries, chunk or repeats")
     exe,model,prompt_file=(Path(getattr(args,k)).resolve() for k in ("exe","model","prompt_file"))
     if not all(p.is_file() for p in (exe,model,prompt_file)):
@@ -98,6 +99,16 @@ def main():
     prompt=prompt_file.read_text(encoding="utf-8-sig").rstrip("\r\n")
     out=Path(args.out_dir).resolve()
     out.mkdir(parents=True,exist_ok=True)
+    # Partition the *entire* prefill batch; otherwise runtime ignores the
+    # override and measurements may silently use its default microbatches.
+    count,tail=divmod(args.target_tokens,args.chunk)
+    if tail == 0:
+        chunks=[args.chunk]*count
+    elif tail >= 32:
+        chunks=[args.chunk]*count+[tail]
+    else:
+        chunks=[args.chunk]*(count-1)+[args.chunk+tail]
+    plan_text=",".join(map(str,chunks))
     rows=[]
     for boundary in boundaries:
         for repeat in range(1,args.repeats+1):
@@ -107,11 +118,11 @@ def main():
                        LLAMA_JUPITER_WINDOW="1",LLAMA_JUPITER_TRACE="1",
                        LLAMA_JUPITER_PROFILE_STAGE="1",LLAMA_JUPITER_Q_SWEEP="1",
                        LLAMA_JUPITER_ASYNC_C2P="0",LLAMA_JUPITER_LOGITS_TOP10="0",
-                       LLAMA_JUPITER_SEQUENCE_PLAN=str(args.chunk))
+                       LLAMA_JUPITER_SEQUENCE_PLAN=plan_text)
             env.pop("LLAMA_JUPITER_PLAN_FILE",None)
             cmd=[str(exe),"-m",str(model),"--rpc",args.rpc,"--split-mode","layer",
-                 "-ngl","all","-ub",str(args.chunk),"-b",str(args.chunk),
-                 "-c",str(max(512,args.chunk)),"-n","1","-t",str(args.threads),
+                 "-ngl","all","-ub",str(max(chunks)),"-b",str(max(512,args.target_tokens)),
+                 "-c",str(max(512,args.target_tokens)),"-n","1","-t",str(args.threads),
                  "--flash-attn","on","-lv","4",
                  "--no-conversation","--single-turn","--simple-io","-p",prompt]
             row=dict(pc_layers=boundary,repeat=repeat,status="FAILED",reason="",log=str(log))
@@ -122,7 +133,11 @@ def main():
                                           stdout=f,stderr=subprocess.STDOUT)
                 if result.returncode:
                     raise RuntimeError(f"llama-cli exit={result.returncode}")
-                row.update(parse_log(log.read_text(encoding="utf-8",errors="replace"),boundary,args.chunk))
+                raw=log.read_text(encoding="utf-8",errors="replace")
+                expected=f"chunks={plan_text}"
+                if expected not in raw:
+                    raise ValueError("runtime did not confirm expected sequence plan")
+                row.update(parse_log(raw,boundary,chunks[0]))
                 row["status"]="OK"
                 print(f"[JUPITER_MODEL_SAMPLE] pc={boundary} "
                       f"pc_ms={row['pc_compute_ms']:.3f} phone_ms={row['phone_compute_ms']:.3f}",flush=True)
