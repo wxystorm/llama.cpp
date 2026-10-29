@@ -162,10 +162,19 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         cb(ffn_inp, "ffn_inp", il);
 
         // feed-forward network
+        const llama_hybrid_layer_mode hybrid_mode = model.hybrid_layer_mode(il);
+        const bool directional_stage_prefill =
+            stage_graph && n_tokens > 1 &&
+            llama_hybrid_layer_mode_directional_tensor(hybrid_mode);
+
         cur = build_norm(ffn_inp, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+        if (directional_stage_prefill) {
+            // Region Ring already sliced this stage into one causal outer
+            // chunk. The completed FFN norm is the exact READY payload.
+            cur->flags |= GGML_TENSOR_FLAG_META_SEND_READY;
+        }
         cb(cur, "ffn_norm", il);
 
-        const llama_hybrid_layer_mode hybrid_mode      = model.hybrid_layer_mode(il);
         const int                     n_decode_chunks  = std::min<int64_t>(qwen3_ffn_chunk_count(), n_embd);
         const int planned_chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
         const int n_prefill_chunks = planned_chunk_tokens > 0 ?
@@ -174,10 +183,23 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         const bool use_decode_chunked_ffn = n_tokens == 1 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                                             hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
                                             n_decode_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
-        const bool use_prefill_chunked_ffn = n_tokens > 1 && cur->ne[1] > 1 &&
+        const bool use_prefill_chunked_ffn = !directional_stage_prefill &&
+                                             n_tokens > 1 && cur->ne[1] > 1 &&
                                              model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                                              llama_hybrid_layer_mode_uses_split_ffn_chunks(hybrid_mode) &&
                                              n_prefill_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
+
+        if (directional_stage_prefill &&
+                std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+            LLAMA_LOG_ERROR(
+                "[DIRECTIONAL_DENSE_GRAPH] layer=%d tokens=%" PRId64
+                " mode=%d split_mode=%d stage=1 planned_chunk=%d "
+                "n_prefill_chunks=%d inner_chunked=%d "
+                "ready=ffn_norm partial=directional_ffn_partial\n",
+                il, n_tokens, (int) hybrid_mode, (int) model.split_mode(),
+                planned_chunk_tokens, n_prefill_chunks,
+                use_prefill_chunked_ffn ? 1 : 0);
+        }
 
         if (use_decode_chunked_ffn) {
             ggml_tensor * ffn_hidden = build_ffn(cur, model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s,
@@ -246,6 +268,12 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
             cur = build_ffn(cur, model.layers[il].ffn_up, NULL, model.layers[il].ffn_up_s, model.layers[il].ffn_gate,
                             NULL, model.layers[il].ffn_gate_s, model.layers[il].ffn_down, NULL,
                             model.layers[il].ffn_down_s, NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
+            if (directional_stage_prefill) {
+                // This is the local FFN contribution before residual ADD.
+                // Completion of this exact producer means SEND_PARTIAL.
+                cur->flags |= GGML_TENSOR_FLAG_META_SEND_PARTIAL;
+                cb(cur, "directional_ffn_partial", il);
+            }
             cur = ggml_add(ctx0, cur, ffn_inp);
         }
         cb(cur, "ffn_out", il);
