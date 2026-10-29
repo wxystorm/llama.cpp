@@ -74,6 +74,50 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
+    // Dense RPC graph costs are based on actual Stage kind and whether
+    // Phone Full is inside a C2P->P2C Meta island. A non-directional Phone
+    // Region is already one direct RPC graph; an unfused embedded one needs
+    // multiple subgraph submissions. This callback must participate in both
+    // the full event simulation and the coarse balance equations.
+    model dense_registration = mock_profile();
+    bool saw_embedded = false;
+    bool saw_direct = false;
+    bool saw_c2p = false;
+    bool saw_p2c = false;
+    dense_registration.phone_registration_cost =
+        [&](llama_region_ring_stage_kind kind, int layers,
+            int tokens, bool embedded, double & ms) {
+            REQUIRE(layers > 0 && tokens > 0);
+            saw_embedded |=
+                kind == llama_region_ring_stage_kind::PHONE && embedded;
+            saw_direct |=
+                kind == llama_region_ring_stage_kind::PHONE && !embedded;
+            saw_c2p |= kind == llama_region_ring_stage_kind::C2P;
+            saw_p2c |= kind == llama_region_ring_stage_kind::P2C;
+            ms = kind == llama_region_ring_stage_kind::PHONE ?
+                 (embedded ? 1.0 : 2.0) : 0.5;
+            return true;
+        };
+    const auto dense_island = llama_region_ring_parse(
+        "G4,C6,C2P1,P4,P2C1,G4,C7,P5,G3,C8,P5", 48);
+    candidate dense_island_est = uniform;
+    REQUIRE(simulate(
+        dense_registration, dense_island,
+        dense_island_est, &reason));
+    REQUIRE(saw_embedded && saw_direct && saw_c2p && saw_p2c);
+    REQUIRE(dense_island_est.wall_ms > 0.0);
+
+    model invalid_dense_registration = mock_profile();
+    invalid_dense_registration.phone_registration_cost =
+        [](llama_region_ring_stage_kind, int, int, bool, double &) {
+            return false;
+        };
+    candidate invalid_dense_est = uniform;
+    REQUIRE(!simulate(
+        invalid_dense_registration, regions,
+        invalid_dense_est, &reason));
+    REQUIRE(reason == "PHONE_REGISTRATION_PROFILE_MISSING");
+
     // Simplified full-prompt prepare model: every claimed task queues on one
     // shared PREPARE lane before entering its independent device compute lane.
     model prepared = mock_profile();
