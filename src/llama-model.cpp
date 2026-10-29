@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-jupiter.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1278,12 +1279,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
-    const char * jupiter_env = std::getenv("LLAMA_JUPITER_PREFILL");
-    const bool jupiter_prefill = jupiter_env != nullptr && std::atoi(jupiter_env) != 0;
-    int jupiter_pc_layers = n_layer_all / 2;
-    if (const char * value = std::getenv("LLAMA_JUPITER_PC_LAYERS")) {
-        jupiter_pc_layers = std::atoi(value);
-    }
+    const bool jupiter_prefill = llama_jupiter::enabled();
+    const bool jupiter_pc_layers_env = std::getenv("LLAMA_JUPITER_PC_LAYERS") != nullptr;
+    const bool jupiter_plan_file = std::getenv("LLAMA_JUPITER_PLAN_FILE") != nullptr;
+    const int jupiter_pc_layers = llama_jupiter::model_pc_layers(n_layer_all / 2);
 
     ggml_backend_dev_t jupiter_pc_dev = nullptr;
     ggml_backend_dev_t jupiter_phone_dev = nullptr;
@@ -1318,8 +1317,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires one local GPU and one RPC device");
         }
 
+        const char * plan_source =
+                jupiter_pc_layers_env ? "ENV" :
+                jupiter_plan_file     ? "PAPER_DP" :
+                                        "DEFAULT_HALF";
+
         LLAMA_LOG_INFO(
-                "[JUPITER_STAGE_PLAN] mode=FIXED pc_device=%s pc_layers=0..%d phone_device=%s phone_layers=%d..%d output=PHONE\n",
+                "[JUPITER_STAGE_PLAN] mode=%s pc_device=%s pc_layers=0..%d phone_device=%s phone_layers=%d..%d output=PHONE\n",
+                plan_source,
                 ggml_backend_dev_name(jupiter_pc_dev), jupiter_pc_layers - 1,
                 ggml_backend_dev_name(jupiter_phone_dev), jupiter_pc_layers, n_layer_all - 1);
     }
