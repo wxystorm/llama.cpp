@@ -14669,6 +14669,27 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             state.pc_prepared = true;
+            const bool c2p_fold_final_submitted =
+                region_bidir_pipeline_requested &&
+                !c2p_self_check &&
+                std::getenv(
+                    "GGML_META_REGION_C2P_NUMERIC_TRACE") ==
+                    nullptr;
+            if (!c2p_fold_final_submitted &&
+                    backend_ctx->cpu_task_executor != nullptr) {
+                const int32_t logical_chunk =
+                    backend_ctx->cpu_task_outer_chunk.load(
+                        std::memory_order_relaxed) >= 0 ?
+                        backend_ctx->cpu_task_outer_chunk.load(
+                            std::memory_order_relaxed) :
+                        chunk;
+                backend_ctx->cpu_task_executor->release_sticky(
+                    ggml_backend_meta_cpu_task_group(
+                        GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN,
+                        layer,
+                        logical_chunk),
+                    "C2P_PC_PREP_READY_NO_FOLD");
+            }
 
             if (pipeline_debug) {
                 printf(
@@ -17966,8 +17987,9 @@ auto prefill_norm_sg_has_prework =
                     .cgraphs[i].cgraph_main;
             GGML_ASSERT(pc_graph != nullptr);
 
-            GGML_ASSERT(
-                backend_ctx->cpu_task_executor != nullptr);
+            ggml_backend_meta_cpu_task_executor * remote_executor =
+                ggml_backend_meta_ensure_cpu_task_executor(
+                    backend_ctx);
             ggml_backend_meta_cpu_task_desc remote_desc {};
             remote_desc.kind =
                 GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
@@ -17989,7 +18011,7 @@ auto prefill_norm_sg_has_prework =
             int64_t stage_copy_us = 0;
             int64_t pc_compute_us = 0;
             const uint64_t pc_task =
-                backend_ctx->cpu_task_executor->enqueue(
+                remote_executor->enqueue(
                     remote_desc,
                     [pc_backend, pc_graph, route,
                      &stage_copy_us, &pc_compute_us]
@@ -18026,7 +18048,7 @@ auto prefill_norm_sg_has_prework =
                         return status;
                     });
             compute_status =
-                backend_ctx->cpu_task_executor->wait(
+                remote_executor->wait(
                     pc_task);
             if (compute_status !=
                     GGML_STATUS_SUCCESS) {
