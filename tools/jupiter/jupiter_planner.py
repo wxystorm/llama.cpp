@@ -128,7 +128,7 @@ class QProfile:
         all_stages = {stage for _, _, stage in grouped_stage}
         self.require_phone = any(s.startswith("RPC") for s in all_stages)
         self.require_pc_accel = any(
-            not s.startswith("RPC") and s != "CPU" for s in all_stages
+            not s.startswith("RPC") and not s.startswith("CPU") for s in all_stages
         )
         self.stages_by_xy: Dict[Tuple[int, int], set[str]] = {}
         for x, y, stage in grouped_stage:
@@ -146,7 +146,7 @@ class QProfile:
             return False
         stages = self.stages_by_xy.get((x, y), set())
         has_phone = any(s.startswith("RPC") for s in stages)
-        has_pc = any(not s.startswith("RPC") and s != "CPU" for s in stages)
+        has_pc = any(not s.startswith("RPC") and not s.startswith("CPU") for s in stages)
         return (
             (not self.require_phone or has_phone)
             and (not self.require_pc_accel or has_pc)
