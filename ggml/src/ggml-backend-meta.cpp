@@ -2432,6 +2432,7 @@ struct ggml_backend_meta_context {
     uint64_t                    next_phone_prefill_route_seq = 1;
     uint64_t                    next_phone_prefill_ffn_seq = 1;
     uint64_t                    next_p2c_return_seq = 1;
+    size_t                      next_p2c_return_lane = 0;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
     std::vector<uint8_t>        tensor_phone_layer_mask;
@@ -10651,10 +10652,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     p2c_mark_ready =
                         ggml_backend_meta_get_phone_ffn_mark_ready(
                             phone_cfg.backend);
+                // prefill_down_chunk_0 is local to one Outer Ring stage and
+                // is commonly 0 for every macro chunk. Use a context-level
+                // round-robin instead so the two physical RETURN lanes really
+                // alternate across outer chunks.
                 p2c_return_lane =
-                    (prefill_down_chunk_0 >= 0 ?
-                        static_cast<size_t>(
-                            prefill_down_chunk_0) : 0) %
+                    backend_ctx->next_p2c_return_lane++ %
                     ggml_backend_meta_context::PREFILL_RETURN_LANES;
                 const bool p2c_return_capable =
                     p2c_return_get != nullptr &&
