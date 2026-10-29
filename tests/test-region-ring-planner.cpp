@@ -74,6 +74,28 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
+    // Unequal Cycle boundaries reuse the exact Region list instead of
+    // reconstructing the first Cycle's widths. This is the MoE APPLY_SAFE
+    // concrete-region capability, now part of APPLY_WIDE candidate scoring.
+    candidate uneven = uniform;
+    uneven.concrete_regions = llama_region_ring_parse(
+        "G4,C8,P4,G5,C7,P4,G3,C8,P5", 48);
+    std::vector<llama_region_ring_region> uneven_regions;
+    REQUIRE(make_regions(uneven, m.layers, uneven_regions));
+    REQUIRE(llama_region_ring_layout_string(uneven_regions) ==
+            "G4,C8,P4,G5,C7,P4,G3,C8,P5");
+    REQUIRE(estimate_region_ring_balance(
+        m, uneven_regions, uneven));
+    REQUIRE(simulate(m, uneven_regions, uneven, &reason));
+    REQUIRE(uneven.wall_ms > 0.0);
+    REQUIRE(uneven.concrete_regions.size() == 9);
+    // A deliberately malformed explicit plan must not silently fall back
+    // to its unrelated legacy uniform C/G/P fields.
+    candidate invalid_uneven = uneven;
+    invalid_uneven.concrete_regions[1].layer_end++;
+    REQUIRE(!make_regions(
+        invalid_uneven, m.layers, uneven_regions));
+
     // Dense RPC graph costs are based on actual Stage kind and whether
     // Phone Full is inside a C2P->P2C Meta island. A non-directional Phone
     // Region is already one direct RPC graph; an unfused embedded one needs
@@ -416,6 +438,8 @@ int main() {
             value_profile, value_baseline, 64, 16, 0.50, 0);
         REQUIRE(value_result.valid);
         REQUIRE(value_result.shortlisted == value_result.simulated);
+        REQUIRE(value_result.nonuniform_profiled > 0);
+        REQUIRE(value_result.nonuniform_simulated > 0);
         REQUIRE(value_result.simulated > 16);
         REQUIRE(value_result.selected.ring_error_max <=
                 value_result.shortlist_e_limit + 1e-12);
@@ -436,13 +460,14 @@ int main() {
         REQUIRE(floor_result.shortlisted >=
                 floor_result.e_window_shortlisted);
         if (floor_result.e_window_shortlisted < expected_floor) {
-            REQUIRE(floor_result.shortlisted == expected_floor);
+            REQUIRE(floor_result.shortlisted >= expected_floor);
             REQUIRE(floor_result.shortlist_e_limit + 1e-12 >=
                     floor_result.coarse_e_limit);
         } else {
-            REQUIRE(floor_result.shortlisted ==
+            REQUIRE(floor_result.shortlisted >=
                     floor_result.e_window_shortlisted);
         }
+        REQUIRE(floor_result.nonuniform_profiled > 0);
         REQUIRE(floor_result.selected.ring_error_max <=
                 floor_result.shortlist_e_limit + 1e-12);
     }
