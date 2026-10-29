@@ -428,6 +428,20 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                                              model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                                              llama_hybrid_layer_mode_uses_split_ffn_chunks(hybrid_mode) &&
                                              n_prefill_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
+        if (stage_graph &&
+                llama_hybrid_layer_mode_directional_tensor(hybrid_mode) &&
+                std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+            LLAMA_LOG_ERROR(
+                "[DENSE_DIRECTIONAL_STAGE] arch=qwen2 layer=%d "
+                "layers=[%d,%d) tokens=%" PRId64 " outer_chunk=%d "
+                "planned_chunk=%d n_prefill_chunks=%d chunked=%d status=READY\n",
+                il, layer_begin, layer_end, n_tokens,
+                params.hybrid_chunk_tokens,
+                planned_chunk_tokens,
+                n_prefill_chunks,
+                use_prefill_chunked_ffn ? 1 : 0);
+        }
+
 
         if (use_decode_chunked_ffn) {
             ggml_tensor * ffn_hidden =
