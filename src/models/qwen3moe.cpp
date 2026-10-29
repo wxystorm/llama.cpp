@@ -805,8 +805,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         return;
     }
 
-    // Preserve the chunk-local L45 outputs and their range-Attention inputs
-    // across the loop boundary. L46 is a P2C Tensor layer whose Attention is
+    // Preserve chunk-local Phone-region outputs and range-Attention inputs
+    // across the loop boundary for the following P2C Tensor layer.
     std::vector<ggml_tensor *> phone_region_outputs_for_tensor;
     std::vector<llm_graph_input_attn_kv *> phone_region_attn_inputs_for_tensor;
     std::vector<int64_t> phone_region_token_begin_for_tensor;
@@ -815,11 +815,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         if (il == phone_region_first) {
             // Keep the C2P final owner and the following P2C protocol
             // untouched. The complete C2P Phone-owned output is the immutable
-            // input to
-            // each chunk; only the Phone Full region is re-tiled here.
+            // input to each chunk; only the Phone Full region is re-tiled here.
             GGML_ASSERT(inpL->ne[1] == n_tokens);
             // The C2P final reduction has already materialized the complete
-            // the C2P l_out in the Phone-owned tensor buffer. Creating a CONT
+            // C2P l_out in the Phone-owned tensor buffer. Creating a CONT
             // here is not a harmless view: Meta marks it COMPUTE on both
             // PC and Phone and may recompute from the stale PC mirror.
             // Keep the C2P buffer as the only Region input owner and make
@@ -847,7 +846,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
                 // K/V write indices and causal mask depend on token range,
                 // not on the current transformer layer. Build them ONCE per
-                // chunk and reuse for all L35-L45 attention calls. Otherwise
+                // chunk and reuse for all Phone-region attention calls.
+                // Otherwise
                 // each layer creates fresh host inputs, and ggml's outer
                 // scheduler (30 cross-backend inputs per split) fragments a
                 // single Phone Region across multiple scheduler splits.
@@ -987,8 +987,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // through Router/Top-K and FFN. The previous implementation joined
             // all Phone Region outputs and ran one full-batch P2C Attention,
             // which created a hard barrier: FFN chunk0 still depended on
-            // Region1/2. Reuse the same per-range KV indices/mask that drove
-            // L35-L45 so causal Attention can advance one chunk at a time.
+            // later Region chunks. Reuse the same per-range KV indices/mask
+            // that drove the Phone region so causal Attention can advance one
+            // chunk at a time.
             const llama_hybrid_layer_mode hybrid_mode =
                 model.hybrid_layer_mode(il);
             GGML_ASSERT(
