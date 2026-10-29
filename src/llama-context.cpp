@@ -3984,7 +3984,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (!worker_kv_views[0] ||
                 !worker_kv_views[0]->set_stage_range(
                     ubatch_id, 0, ubatch.n_tokens)) {
-            LLAMA_LOG_INFO(
+            LLAMA_LOG_ERROR(
                 "[REGION_RING_EMBED_PRELUDE] phase=BEGIN status=FAIL "
                 "reason=KV_STAGE_RANGE\n");
             ret = GGML_STATUS_FAILED;
@@ -4517,7 +4517,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::atomic<size_t> p2c_join_completed { 0 };
 
         auto run_p2c_joiner = [&](size_t joiner) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_P2C_JOINER] worker=%zu "
                 "event=START role=RETURN_REDUCE status=READY\n",
                 joiner);
@@ -4598,7 +4598,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             const char * name = llama_region_ring_device_name(device);
             bool worker_apply_mctx = false; // canonical KV ubatch was applied once above
             std::optional<llama_region_ring_task> active_task;
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_WORKER] device=%s event=START "
                 "scheduler=%p result=%p kv_view=%p\n",
                 name, (void *) ring_sched[dev], (void *) ring_res[dev],
@@ -4692,7 +4692,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 gpu_bank_mover_mutex);
                             if (!selected.bank_ready ||
                                     selected.bank_region != task.region) {
-                                LLAMA_LOG_ERROR(
+                                LLAMA_LOG_INFO(
                                     "[REGION_RING_GPU_BANK] event=WAIT "
                                     "region=%zu chunk=%zu bank=%c "
                                     "expected_region=%zu current_region=%zu "
@@ -5152,7 +5152,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ready.defer(task);
                         p2c_join_cv.notify_one();
 
-                        LLAMA_LOG_ERROR(
+                        LLAMA_LOG_INFO(
                             "[REGION_RING_P2C_DEFER] "
                             "region=%zu chunk=%zu ticket=%" PRIu64
                             " bytes=%zu state=P2C_WAITING "
@@ -5198,7 +5198,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     "failed to enqueue GPU Bank refill");
                             }
                         } else {
-                            LLAMA_LOG_ERROR(
+                            LLAMA_LOG_INFO(
                                 "[REGION_RING_GPU_BANK] event=DRAIN "
                                 "region=%zu bank=%c next=NONE status=DONE\n",
                                 task.region,
