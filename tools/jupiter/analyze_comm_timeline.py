@@ -25,6 +25,9 @@ METRIC_FIELDS = {
         "payload_alloc_ms", "gpu_sync_ms", "device_read_ms",
         "enqueue_wait_ms", "stage_ms",
     ),
+    "JUPITER_C2P_SYNC_FALLBACK": (
+        "sync_wait_ms", "copy_ms", "total_ms",
+    ),
     "JUPITER_C2P_SEND": ("queue_ms", "socket_send_ms"),
     "JUPITER_TRANSFER_FENCE": ("wait_ms",),
     "JUPITER_GRAPH_PREPARE": ("control_fence_ms", "graph_prepare_ms"),
