@@ -319,20 +319,80 @@ try {
             }
 
             $planLine = Select-String -Path $logPath -Pattern "\[JUPITER_SEQUENCE_PLAN\].*total=(\d+).*chunks=([^ ]+)" | Select-Object -Last 1
-            if ($null -eq $planLine) {
-                throw "runtime did not report JUPITER_SEQUENCE_PLAN for x=$($plan.X)"
+            $actualTotal = 0
+            $actualPlan = $null
+            $planSource = "SEQUENCE_PLAN"
+
+            if ($null -ne $planLine) {
+                $match = [regex]::Match($planLine.Line, "total=(\d+).*chunks=([^ ]+)")
+                if (-not $match.Success) {
+                    throw "could not parse runtime plan line: $($planLine.Line)"
+                }
+
+                $actualTotal = [int] $match.Groups[1].Value
+                $actualPlan = $match.Groups[2].Value.Trim()
+            } else {
+                # Some CLI runs can omit the summary line even though the
+                # runtime still executes the requested sequence plan. Rebuild
+                # the formal prompt partition from JUPITER_UBATCH BEGIN lines.
+                # Warmup ubatches are excluded by requiring tokens >= MinChunk.
+                $ubatchChunks = @()
+                $ubatchLines = Select-String -Path $logPath -Pattern "\[JUPITER_UBATCH\].*event=BEGIN.*prefix_tokens=(\d+).*tokens=(\d+)"
+
+                foreach ($line in $ubatchLines) {
+                    $m = [regex]::Match($line.Line, "prefix_tokens=(\d+).*tokens=(\d+)")
+                    if (-not $m.Success) {
+                        continue
+                    }
+
+                    $prefix = [int] $m.Groups[1].Value
+                    $tokens = [int] $m.Groups[2].Value
+
+                    if ($tokens -lt $MinChunk) {
+                        continue
+                    }
+
+                    $ubatchChunks += [pscustomobject]@{
+                        Prefix = $prefix
+                        Tokens = $tokens
+                    }
+                }
+
+                if ($ubatchChunks.Count -gt 0) {
+                    $ordered = @($ubatchChunks | Sort-Object Prefix)
+                    $expectedPrefix = 0
+                    $chunks = @()
+                    $valid = $true
+
+                    foreach ($item in $ordered) {
+                        if ($item.Prefix -ne $expectedPrefix) {
+                            $valid = $false
+                            break
+                        }
+                        $chunks += $item.Tokens
+                        $expectedPrefix += $item.Tokens
+                    }
+
+                    if ($valid -and $expectedPrefix -eq $TargetTokens) {
+                        $actualTotal = $expectedPrefix
+                        $actualPlan = ($chunks -join ",")
+                        $planSource = "UBATCH_RECONSTRUCT"
+                        Write-Host "[JUPITER_SWEEP_PLAN_FALLBACK] x=$($plan.X) repeat=$repeat source=$planSource chunks=$actualPlan"
+                    }
+                }
             }
 
-            $match = [regex]::Match($planLine.Line, "total=(\d+).*chunks=([^ ]+)")
-            if (-not $match.Success) {
-                throw "could not parse runtime plan line: $($planLine.Line)"
+            if ($null -eq $actualPlan) {
+                $tail = Get-Content -Path $logPath -Tail 40 -ErrorAction SilentlyContinue
+                Write-Host "[JUPITER_SWEEP_DIAG] missing plan summary and no complete ubatch reconstruction; log=$logPath"
+                if ($null -ne $tail) {
+                    $tail | ForEach-Object { Write-Host $_ }
+                }
+                throw "runtime did not expose a complete Jupiter sequence plan for x=$($plan.X)"
             }
-
-            $actualTotal = [int] $match.Groups[1].Value
-            $actualPlan = $match.Groups[2].Value.Trim()
 
             if ($actualTotal -ne $TargetTokens -or $actualPlan -ne $plan.Text) {
-                throw "runtime plan mismatch: expected total=$TargetTokens chunks=$($plan.Text), got total=$actualTotal chunks=$actualPlan"
+                throw "runtime plan mismatch: expected total=$TargetTokens chunks=$($plan.Text), got total=$actualTotal chunks=$actualPlan source=$planSource"
             }
 
             $extractArgs = @(
