@@ -277,8 +277,41 @@ try {
                 $cliArgs += $ExtraArgs
             }
 
-            & $exePath @cliArgs 2>&1 | Tee-Object -FilePath $logPath
-            $exitCode = $LASTEXITCODE
+            # Windows PowerShell 5.x wraps native stderr as ErrorRecord objects.
+            # llama.cpp intentionally writes normal INFO logs to stderr, so the
+            # script must not treat those records as terminating PowerShell errors.
+            # The real failure signal for the native process is $LASTEXITCODE.
+            $savedErrorActionPreference = $ErrorActionPreference
+            $hasNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+            if ($hasNativePreference) {
+                $savedNativePreference = $PSNativeCommandUseErrorActionPreference
+            }
+
+            try {
+                $ErrorActionPreference = "Continue"
+                if ($hasNativePreference) {
+                    $PSNativeCommandUseErrorActionPreference = $false
+                }
+
+                & $exePath @cliArgs 2>&1 |
+                    ForEach-Object {
+                        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+                            $_.Exception.Message
+                        } else {
+                            [string] $_
+                        }
+                    } |
+                    Tee-Object -FilePath $logPath
+
+                $exitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $savedErrorActionPreference
+                if ($hasNativePreference) {
+                    $PSNativeCommandUseErrorActionPreference = $savedNativePreference
+                }
+            }
+
             if ($exitCode -ne 0) {
                 throw "llama-cli failed for x=$($plan.X), repeat=$repeat, exit=$exitCode"
             }
