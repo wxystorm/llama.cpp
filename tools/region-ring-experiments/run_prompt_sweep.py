@@ -126,9 +126,15 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
     layout = runtime_layout or (plan.get("selected_layout", "")
                                 if plan.get("applied") else "")
     layers = count_layers(layout)
-    initial = match_last(r"\[REGION_RING_GPU_BANK_LOAD_SUM\][^\n]*", logs) or ""
-    initial_mib = match_last(r"upload_mib=" + number, initial)
-    initial_ms = match_last(r"wall_ms=" + number, initial)
+    # A perf reset may recheck a resident pair and emit ALREADY_READY
+    # with zero bytes. Sum real preload events, not simply the last line.
+    bank_summaries = re.findall(r"\[REGION_RING_GPU_BANK_LOAD_SUM\][^\n]*", logs)
+    bank_summaries = [x for x in bank_summaries if "ALREADY_READY" not in x]
+    def bank_sum(field):
+        return round(sum(float(m) for line in bank_summaries
+                         if (m := match_last(field + number, line))), 3)
+    initial_mib = bank_sum(r"upload_mib=") if bank_summaries else None
+    initial_ms = bank_sum(r"wall_ms=") if bank_summaries else None
     row = {
         "prompt_file": prompt.name, "prompt_hint": hint,
         "actual_prefill_tokens": pre_n, "actual_decode_tokens": dec_n,
@@ -173,8 +179,8 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "gpu_bank_mover_wall_ms": total(ring, "bank_mover_wall_ms"),
         "gpu_bank_wait_ms": total(ring, "bank_gpu_wait_ms"),
         "gpu_bank_stage_cpu_copy_ms": total(ring, "bank_stage_cpu_copy_ms"),
-        "bank_initial_upload_mib": float(initial_mib) if initial_mib else None,
-        "bank_initial_load_ms": float(initial_ms) if initial_ms else None,
+        "bank_initial_upload_mib": initial_mib,
+        "bank_initial_load_ms": initial_ms,
         "meta_available": any(x.get("meta_available", False) for x in ring),
         "run_dir": str(folder),
     }
