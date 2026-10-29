@@ -2720,9 +2720,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 model.hybrid_layer_mode(stage.layer_end - 1) ==
                     llama_hybrid_layer_mode::TENSOR_P2C;
             const bool target_uses_cpu =
-                target_is_cpu ||
-                (ring_lane == 2 && directional_meta_stage &&
-                 ggml_backend_is_meta(target));
+                target_is_cpu;
 
             const uint64_t prepare_sync_mask =
                 gpu_weight_streaming ?
@@ -2770,7 +2768,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_DIRECTIONAL_GATE] stage=%zu kind=%s "
                     "layers=[%d,%d) block=%zu executor=META "
-                    "cpu_gate=HELD ownership=%s status=READY\n",
+                    "cpu_gate=TASK_EXECUTOR ownership=%s status=READY\n",
                     stage_index,
                     llama_hybrid_runtime_stage_name(stage.kind),
                     stage.layer_begin,
@@ -3377,6 +3375,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     stage.kind == llama_hybrid_runtime_stage_kind::C2P ||
                     stage.kind == llama_hybrid_runtime_stage_kind::P2C;
             });
+
+    ggml_backend_t region_ring_meta_cpu_backend = nullptr;
+    if (directional_runtime && pc_phone_overlap) {
+        for (ggml_backend_t backend : backend_ptrs) {
+            if (backend != nullptr && ggml_backend_is_meta(backend)) {
+                region_ring_meta_cpu_backend = backend;
+                break;
+            }
+        }
+        if (region_ring_meta_cpu_backend != nullptr) {
+            // Reset a previous invocation before enabling this ubatch's
+            // causal frontier at chunk 0.
+            (void) ggml_backend_meta_cpu_task_set_frontier(
+                region_ring_meta_cpu_backend, -1);
+            (void) ggml_backend_meta_cpu_task_set_frontier(
+                region_ring_meta_cpu_backend, 0);
+        }
+    }
 
     // Planner runs ONLY in explicit dry-run mode for the legacy G/C/P Ring.
     // Directional C2P/P2C placement is fixed-layout V1; Planner integration is
@@ -4734,7 +4750,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_status task_status = GGML_STATUS_SUCCESS;
                     llm_graph_result * task_result = nullptr;
                     bool cancelled_before_compute = false;
+
+                    if (dev ==
+                            (size_t) llama_region_ring_device::PHONE &&
+                            region_ring_meta_cpu_backend != nullptr) {
+                        (void) ggml_backend_meta_cpu_task_set_outer_chunk(
+                            region_ring_meta_cpu_backend,
+                            (int32_t) task.chunk);
+                    }
+
                     const int64_t backend_begin_us = ggml_time_us();
+                    auto execute_backend_task = [&]() -> ggml_status {
                     {
                         std::unique_lock<std::mutex> broad_backend_lock;
                         std::unique_lock<std::mutex> cpu_gate;
@@ -4932,8 +4958,79 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                         "PREPARE_PLUS_PER_BACKEND" :
                                         "CONTEXT_SHARED");
                             }
+
                         }
                     }
+                    return task_status;
+                    };
+
+                    if (dev ==
+                            (size_t) llama_region_ring_device::CPU &&
+                            region_ring_meta_cpu_backend != nullptr) {
+                        ggml_backend_meta_cpu_task_desc cpu_desc {};
+                        cpu_desc.kind =
+                            GGML_BACKEND_META_CPU_TASK_CPU_FULL;
+                        cpu_desc.urgency =
+                            GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+                        cpu_desc.chunk = (int32_t) task.chunk;
+                        cpu_desc.layer = stage.layer_begin;
+
+                        std::function<ggml_status()> cpu_run =
+                            execute_backend_task;
+                        struct cpu_run_bridge {
+                            std::function<ggml_status()> * run;
+                        } bridge { &cpu_run };
+                        const auto thunk =
+                            +[](void * user_data,
+                                uint64_t) -> ggml_status {
+                                auto * b =
+                                    static_cast<cpu_run_bridge *>(
+                                        user_data);
+                                return (*b->run)();
+                            };
+
+                        const uint64_t cpu_task_id =
+                            ggml_backend_meta_cpu_task_submit(
+                                region_ring_meta_cpu_backend,
+                                &cpu_desc,
+                                thunk,
+                                &bridge);
+                        if (cpu_task_id == 0) {
+                            task_status = GGML_STATUS_FAILED;
+                        } else {
+                            LLAMA_LOG_DEBUG(
+                                "[REGION_RING_CPU_TASK] "
+                                "event=SUBMIT id=%" PRIu64
+                                " region=%zu chunk=%zu "
+                                "layers=[%d,%d) kind=CPU_FULL\n",
+                                cpu_task_id,
+                                task.region,
+                                task.chunk,
+                                stage.layer_begin,
+                                stage.layer_end);
+                            const ggml_status cpu_status =
+                                ggml_backend_meta_cpu_task_wait(
+                                    region_ring_meta_cpu_backend,
+                                    cpu_task_id);
+                            if (task_status ==
+                                    GGML_STATUS_SUCCESS &&
+                                    cpu_status !=
+                                        GGML_STATUS_SUCCESS) {
+                                task_status = cpu_status;
+                            }
+                            LLAMA_LOG_DEBUG(
+                                "[REGION_RING_CPU_TASK] "
+                                "event=COMPLETE id=%" PRIu64
+                                " region=%zu chunk=%zu status=%d\n",
+                                cpu_task_id,
+                                task.region,
+                                task.chunk,
+                                (int) cpu_status);
+                        }
+                    } else {
+                        (void) execute_backend_task();
+                    }
+
                     // Do not publish a downstream READY while the producer's
                     // graph or transfer is running. run_hybrid_stage_block()
                     // already synchronizes both intermediate hidden copies

@@ -17470,6 +17470,14 @@ auto prefill_norm_sg_has_prework =
         const int64_t phone_begin_us =
             ggml_time_us();
         compute_workers.start(1, i);
+        if (backend_ctx->cpu_task_executor != nullptr) {
+            const int32_t outer_chunk =
+                backend_ctx->cpu_task_outer_chunk.load(
+                    std::memory_order_relaxed);
+            backend_ctx->cpu_task_executor->set_frontier(
+                (outer_chunk >= 0 ? outer_chunk :
+                    prefill_down_chunk) + 1);
+        }
         compute_status =
             compute_workers.wait(1);
         const int64_t phone_us =
@@ -18389,11 +18397,32 @@ auto prefill_norm_sg_has_prework =
                 }
             }
 
+            ggml_backend_meta_cpu_task_desc c2p_pc_main_desc {};
+            c2p_pc_main_desc.kind =
+                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+            c2p_pc_main_desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+            c2p_pc_main_desc.chunk =
+                backend_ctx->cpu_task_outer_chunk.load(
+                    std::memory_order_relaxed);
+            if (c2p_pc_main_desc.chunk < 0) {
+                c2p_pc_main_desc.chunk = prefill_down_chunk;
+            }
+            c2p_pc_main_desc.layer = prefill_down_layer;
+            c2p_pc_main_desc.continuation_group =
+                (UINT64_C(0x43525000) << 32) ^
+                (uint64_t) (uint32_t) (prefill_down_layer + 1) << 16 ^
+                (uint64_t) (uint32_t) (c2p_pc_main_desc.chunk + 1);
             if (c2p_parallel_ready) {
+                c2p_pc_main_desc.flags =
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
                 compute_workers.start_graph(
-                    0, c2p_pc_prefix_graph);
+                    0, c2p_pc_prefix_graph,
+                    &c2p_pc_main_desc);
             } else {
-                compute_workers.start(0, i);
+                compute_workers.start_graph(
+                    0, c2p_pc_graph,
+                    &c2p_pc_main_desc);
             }
 
             if (has_async_prefill_input) {
@@ -18542,14 +18571,25 @@ auto prefill_norm_sg_has_prework =
 
                         const int64_t parallel_begin_us =
                             ggml_time_us();
+                        ggml_backend_meta_cpu_task_desc
+                            c2p_pc_suffix_desc =
+                                c2p_pc_main_desc;
+                        c2p_pc_suffix_desc.flags =
+                            GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL;
                         compute_workers.start_graph(
-                            0, c2p_pc_suffix_graph);
+                            0, c2p_pc_suffix_graph,
+                            &c2p_pc_suffix_desc);
                         compute_workers.start(1, i);
 
                         const ggml_status pc_ffn_status =
                             compute_workers.wait(0);
-                        phone_status = compute_workers.wait(1);
                         pc_status = pc_ffn_status;
+                        if (pc_status == GGML_STATUS_SUCCESS &&
+                                backend_ctx->cpu_task_executor != nullptr) {
+                            backend_ctx->cpu_task_executor->set_frontier(
+                                c2p_pc_main_desc.chunk + 1);
+                        }
+                        phone_status = compute_workers.wait(1);
 
                         if (pipeline_debug) {
                             printf(
@@ -18577,6 +18617,11 @@ auto prefill_norm_sg_has_prework =
                         restore_c2p_route_bindings(
                             c2p_bindings);
                         compute_workers.start(1, i);
+                        if (pc_status == GGML_STATUS_SUCCESS &&
+                                backend_ctx->cpu_task_executor != nullptr) {
+                            backend_ctx->cpu_task_executor->set_frontier(
+                                c2p_pc_main_desc.chunk + 1);
+                        }
                         phone_status =
                             compute_workers.wait(1);
                     }
