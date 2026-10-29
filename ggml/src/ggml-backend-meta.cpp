@@ -2727,7 +2727,12 @@ struct ggml_backend_meta_cpu_task_executor {
             if ((current.desc.flags &
                     GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES) != 0) {
                 GGML_ASSERT(current.desc.continuation_group != 0);
-                sticky_group = current.desc.continuation_group;
+                // Reserve the executor only after a successful prefix. If the
+                // prefix fails there will be no suffix task to release the
+                // group, so retaining it would deadlock shutdown/fallback.
+                sticky_group =
+                    status == GGML_STATUS_SUCCESS ?
+                        current.desc.continuation_group : 0;
             }
             if ((current.desc.flags &
                     GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 &&
