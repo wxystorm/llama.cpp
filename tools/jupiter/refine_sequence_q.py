@@ -108,7 +108,7 @@ def targeted_rows(
     ]
     devices = {row["device"] for row in rows}
     has_phone = any(d.startswith("RPC") for d in devices)
-    has_pc = any(not d.startswith("RPC") and d != "CPU" for d in devices)
+    has_pc = any(not d.startswith("RPC") and not d.startswith("CPU") for d in devices)
     if not (has_phone and has_pc):
         raise RuntimeError(
             f"q({x},{y}) requires both PC accelerator and phone RPC stage "
