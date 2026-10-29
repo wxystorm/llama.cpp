@@ -1568,6 +1568,7 @@ struct result {
     size_t first_cycle_selected = 0;
     size_t prefix_expanded = 0;
     size_t prefix_completed = 0;
+    double first_cycle_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_limit = std::numeric_limits<double>::infinity();
     double shortlist_e_limit = std::numeric_limits<double>::infinity();
@@ -2006,13 +2007,16 @@ inline result search_runtime_applicable(
             (size_t) m.hidden * (size_t) x * sizeof(float);
         double t = 0.0;
         pg[xi] = m.transfer_ms(
-            device::PHONE, device::GPU, bytes, t) ? t / x : invalid;
+            device::PHONE, device::GPU, bytes, t) &&
+            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
         t = 0.0;
         gc[xi] = m.transfer_ms(
-            device::GPU, device::CPU, bytes, t) ? t / x : invalid;
+            device::GPU, device::CPU, bytes, t) &&
+            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
         t = 0.0;
         cp[xi] = m.transfer_ms(
-            device::CPU, device::PHONE, bytes, t) ? t / x : invalid;
+            device::CPU, device::PHONE, bytes, t) &&
+            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
     }
 
     struct first_cycle_seed {
@@ -2093,6 +2097,19 @@ inline result search_runtime_applicable(
                                     service[(size_t) device::PHONE][pi][(size_t) p]
                                 };
                                 seed.links = {pg[pi], gc[gi], cp[ci]};
+                                if (!std::all_of(
+                                        seed.load.begin(), seed.load.end(),
+                                        [](double v) {
+                                            return std::isfinite(v);
+                                        }) ||
+                                        !std::all_of(
+                                            seed.links.begin(), seed.links.end(),
+                                            [](double v) {
+                                                return std::isfinite(v) &&
+                                                       v >= 0.0;
+                                            })) {
+                                    continue;
+                                }
                                 seed.first_e = prefix_cycle_max_error(
                                     seed.load, seed.links, 1);
                                 if (!std::isfinite(seed.first_e)) {
@@ -2117,6 +2134,8 @@ inline result search_runtime_applicable(
                 }
                 return a.width < b.width;
             });
+        out.first_cycle_e_min = std::min(
+            out.first_cycle_e_min, first_seeds.front().first_e);
         const double seed_e_limit =
             std::min(1.0, first_seeds.front().first_e + e_margin);
 
