@@ -74,6 +74,20 @@ int main() {
     REQUIRE(uniform.service_ms_per_token[1] > 0.0);
     REQUIRE(uniform.service_ms_per_token[2] > 0.0);
 
+    // The prefix score must compensate accumulated service imbalance,
+    // rather than forcing every individual Cycle to have the same shape.
+    {
+        const std::array<double, 3> links {{0.1, 0.1, 0.1}};
+        const std::array<double, 3> first {{1.4, 1.2, 1.6}};
+        const std::array<double, 3> compensated {{2.8, 2.6, 2.8}};
+        const double e1 = prefix_cycle_max_error(first, links, 1);
+        const double e2 = prefix_cycle_max_error(
+            compensated, links, 2);
+        REQUIRE(std::isfinite(e1) && std::isfinite(e2));
+        REQUIRE(e2 < e1);
+        REQUIRE(e2 < 0.15);
+    }
+
     // Unequal Cycle boundaries reuse the exact Region list instead of
     // reconstructing the first Cycle's widths. This is the MoE APPLY_SAFE
     // concrete-region capability, now part of APPLY_WIDE candidate scoring.
@@ -438,11 +452,22 @@ int main() {
             value_profile, value_baseline, 64, 16, 0.50, 0);
         REQUIRE(value_result.valid);
         REQUIRE(value_result.shortlisted == value_result.simulated);
+        REQUIRE(value_result.first_cycle_profiled > 0);
+        REQUIRE(value_result.first_cycle_selected > 0);
+        REQUIRE(value_result.first_cycle_selected <= 36);
+        REQUIRE(value_result.prefix_expanded > 0);
+        REQUIRE(value_result.prefix_completed > 0);
+        REQUIRE(std::isfinite(value_result.first_cycle_e_min));
         REQUIRE(value_result.nonuniform_profiled > 0);
         REQUIRE(value_result.nonuniform_simulated > 0);
         REQUIRE(value_result.simulated > 16);
-        REQUIRE(value_result.selected.ring_error_max <=
-                value_result.shortlist_e_limit + 1e-12);
+        // Only the uniform control is subject to the original E floor.
+        // Prefix-generated layouts are selected by full DAG wall time.
+        REQUIRE(std::isfinite(value_result.selected.ring_error_max));
+        if (value_result.selected.concrete_regions.empty()) {
+            REQUIRE(value_result.selected.ring_error_max <=
+                    value_result.shortlist_e_limit + 1e-12);
+        }
         REQUIRE(std::fabs(
             value_result.coarse_e_limit -
             std::min(1.0, value_result.coarse_e_min + 0.50)) < 1e-12);
@@ -467,9 +492,14 @@ int main() {
             REQUIRE(floor_result.shortlisted >=
                     floor_result.e_window_shortlisted);
         }
+        REQUIRE(floor_result.first_cycle_selected > 0);
+        REQUIRE(floor_result.prefix_completed > 0);
         REQUIRE(floor_result.nonuniform_profiled > 0);
-        REQUIRE(floor_result.selected.ring_error_max <=
-                floor_result.shortlist_e_limit + 1e-12);
+        REQUIRE(std::isfinite(floor_result.selected.ring_error_max));
+        if (floor_result.selected.concrete_regions.empty()) {
+            REQUIRE(floor_result.selected.ring_error_max <=
+                    floor_result.shortlist_e_limit + 1e-12);
+        }
     }
 
     // Unlike the old repeated-width APPLY_WIDE, 40 layers may form three
@@ -487,6 +517,8 @@ int main() {
             search_runtime_applicable(
                 forty, forty_base, 64, 16, 0.20, 16);
         REQUIRE(forty_result.valid);
+        REQUIRE(forty_result.first_cycle_selected > 0);
+        REQUIRE(forty_result.prefix_completed > 0);
         REQUIRE(forty_result.selected.cycles == 3);
         std::vector<llama_region_ring_region> forty_regions;
         REQUIRE(make_regions(
