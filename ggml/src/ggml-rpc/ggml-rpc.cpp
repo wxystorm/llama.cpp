@@ -345,14 +345,6 @@ static uint64_t jupiter_tensor_layout_key(const rpc_tensor & tensor) {
     return h != 0 ? h : 1;
 }
 
-static uint64_t jupiter_tensor_layout_key(const ggml_tensor * tensor) {
-    if (tensor == nullptr) {
-        return 0;
-    }
-    rpc_tensor serialized = serialize_tensor(tensor);
-    return jupiter_tensor_layout_key(serialized);
-}
-
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
     if (!sock->send_data(&msg_size, sizeof(msg_size))) {
         return false;
