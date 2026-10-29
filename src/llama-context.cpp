@@ -9698,8 +9698,7 @@ llama_perf_context_data llama_context::perf_get_data() const {
 }
 
 bool llama_context::region_ring_load_initial_gpu_banks() {
-    if (!model.hybrid_ring_gpu_weight_streaming ||
-            model.hybrid_ring_plan_mode != "APPLY_WIDE") {
+    if (!model.hybrid_ring_gpu_weight_streaming) {
         return false;
     }
 
@@ -9734,6 +9733,23 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             "status=SKIP reason=LAYOUT_INVALID detail=%s\n",
             e.what());
         return false;
+    }
+
+    const bool directional_fixed =
+        model.hybrid_ring_plan_layout.empty() &&
+        llama_region_ring_has_directional_stages(regions);
+    if (model.hybrid_ring_plan_mode != "APPLY_WIDE" &&
+            !directional_fixed) {
+        return false;
+    }
+
+    if (directional_fixed) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
+            "source=FIXED_DIRECTIONAL_LAYOUT "
+            "layout=%s XC=%d XG=%d XP=%d status=ENABLED\n",
+            llama_region_ring_layout_string(regions).c_str(),
+            xc, xg, xp);
     }
 
     const auto stages =
@@ -10015,8 +10031,10 @@ void llama_context::perf_reset() {
     // warmup/probes. Ensure the fixed initial pair G0/G1 is resident here.
     // The ensure is idempotent, so an already-correct pair costs nothing.
     if (has_evaluated_once &&
-            model.hybrid_ring_gpu_weight_streaming &&
-            model.hybrid_ring_plan_mode == "APPLY_WIDE") {
+            model.hybrid_ring_gpu_weight_streaming) {
+        // The loader itself accepts either legacy APPLY_WIDE or the new fixed
+        // directional Ring. Keeping the decision there prevents call sites
+        // from drifting from the runtime-stage layout used for Bank indices.
         (void) region_ring_load_initial_gpu_banks();
     }
 
