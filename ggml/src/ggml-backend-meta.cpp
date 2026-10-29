@@ -3259,6 +3259,68 @@ struct ggml_backend_meta_compute_workers {
         return GGML_STATUS_SUCCESS;
     }
 
+    int find_pc_subgraph_index(
+            const ggml_cgraph * graph) const {
+        if (graph == nullptr || backend_ctx == nullptr ||
+                backend_ctx->backend_configs.empty()) {
+            return -1;
+        }
+        for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+            if (backend_ctx->backend_configs[0]
+                    .cgraphs[sg].cgraph_main == graph) {
+                return (int) sg;
+            }
+        }
+        return -1;
+    }
+
+    bool has_later_c2p_pc_compute(
+            int current_sg,
+            int layer) const {
+        if (backend_ctx == nullptr || current_sg < 0 || layer < 0 ||
+                backend_ctx->backend_configs.empty()) {
+            return false;
+        }
+
+        for (size_t sg = (size_t) current_sg + 1;
+                sg < backend_ctx->n_subgraphs;
+                ++sg) {
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[0]
+                    .cgraphs[sg].cgraph_main;
+            if (graph == nullptr) {
+                continue;
+            }
+
+            bool has_compute = false;
+            for (int k = 0; k < graph->n_nodes; ++k) {
+                if ((graph->nodes[k]->flags &
+                        GGML_TENSOR_FLAG_COMPUTE) != 0) {
+                    has_compute = true;
+                    break;
+                }
+            }
+            if (!has_compute) {
+                continue;
+            }
+
+            int later_layer = -1;
+            int later_chunk = -1;
+            if (!ggml_backend_meta_cpu_task_graph_identity(
+                    graph, later_layer, later_chunk)) {
+                continue;
+            }
+
+            if (later_layer == layer &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, later_layer)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     ggml_backend_meta_cpu_task_desc default_pc_desc(
             ggml_cgraph * graph) const {
         ggml_backend_meta_cpu_task_desc desc {};
@@ -3320,34 +3382,41 @@ struct ggml_backend_meta_compute_workers {
             const bool c2p_ffn_terminal =
                 ggml_backend_meta_cpu_task_graph_has_tensor_ffn_terminal(
                     graph, graph_layer);
+            const int c2p_sg =
+                find_pc_subgraph_index(graph);
+            const bool c2p_has_later_pc =
+                c2p_sg >= 0 &&
+                has_later_c2p_pc_compute(
+                    c2p_sg, graph_layer);
 
-            // Dense directional C2P intentionally has no PC-owned l_out:
-            // ownership moves to Phone after the split FFN reduction. Treat
-            // the final dense FFN chunk as the sticky terminator instead of
-            // waiting forever for a PC l_out that must not exist.
+            // Sticky lifetime follows the already-partitioned PC subgraphs.
+            // This is more robust than relying on terminal tensor names:
+            // backend splitting may leave the final dense C2P graph ending in
+            // an anonymous node even though it is the last PC continuation.
             //
-            // MoE C2P still uses the explicit Router-prefix / FFN-suffix
-            // descriptors below, so its proven sticky lifecycle is preserved.
-            if (c2p_l_out || c2p_ffn_terminal) {
-                desc.flags =
-                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL;
-            } else {
-                desc.flags =
+            // Explicit MoE Router-prefix / FFN-suffix descriptors still
+            // override this default classification.
+            const bool c2p_final =
+                c2p_l_out ||
+                c2p_ffn_terminal ||
+                (c2p_sg >= 0 && !c2p_has_later_pc);
+            desc.flags =
+                c2p_final ?
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL :
                     GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
-            }
 
             if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
                 std::fprintf(
                     stderr,
-                    "[CPU_TASK_C2P_STICKY] layer=%d chunk=%d "
-                    "l_out=%d ffn_terminal=%d phase=%s\n",
+                    "[CPU_TASK_C2P_STICKY] layer=%d chunk=%d sg=%d "
+                    "l_out=%d ffn_terminal=%d later_pc=%d phase=%s\n",
                     graph_layer,
                     desc.chunk,
+                    c2p_sg,
                     c2p_l_out ? 1 : 0,
                     c2p_ffn_terminal ? 1 : 0,
-                    (desc.flags &
-                     GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 ?
-                        "FINAL" : "CONTINUE");
+                    c2p_has_later_pc ? 1 : 0,
+                    c2p_final ? "FINAL" : "CONTINUE");
                 std::fflush(stderr);
             }
         }
