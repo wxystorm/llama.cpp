@@ -10989,10 +10989,12 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     return GGML_STATUS_FAILED;
                 }
 
-                if (!p2c_deferred_active) {
-                    ggml_backend_synchronize(
-                        phone_cfg.backend);
-                }
+                // Fence only the tiny Phone fold before releasing this
+                // Meta graph's transient inputs. RETURN_TRANSFER is independent
+                // and may continue receiving the persistent folded output
+                // after this fence while the next outer chunk is prepared.
+                ggml_backend_synchronize(
+                    phone_cfg.backend);
                 phone_fold_us =
                     ggml_time_us() - phone_fold_begin_us;
 
