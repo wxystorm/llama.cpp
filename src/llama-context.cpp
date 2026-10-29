@@ -1288,6 +1288,16 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const char * timeline_env = getenv("LLAMA_JUPITER_TIMELINE");
+    const char * prefill_env = getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_timeline = ubatch.n_tokens > 1 &&
+        timeline_env != nullptr && atoi(timeline_env) != 0 &&
+        prefill_env != nullptr && atoi(prefill_env) != 0;
+    const int64_t jupiter_host_begin_us = jupiter_timeline ? ggml_time_us() : 0;
+    int64_t jupiter_graph_build_us = 0;
+    int64_t jupiter_graph_alloc_us = 0;
+    bool jupiter_graph_reused = false;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1312,6 +1322,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        jupiter_graph_reused = true;
     } else {
         res->reset();
 
@@ -1320,7 +1331,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        const int64_t jupiter_build_begin_us = jupiter_timeline ? ggml_time_us() : 0;
         gf = model.build_graph(gparams);
+        if (jupiter_timeline) {
+            jupiter_graph_build_us = ggml_time_us() - jupiter_build_begin_us;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1330,13 +1345,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const int64_t jupiter_alloc_begin_us = jupiter_timeline ? ggml_time_us() : 0;
+        const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (jupiter_timeline) {
+            jupiter_graph_alloc_us = ggml_time_us() - jupiter_alloc_begin_us;
+        }
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
     }
 
+    const int64_t jupiter_inputs_begin_us = jupiter_timeline ? ggml_time_us() : 0;
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1347,7 +1368,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t jupiter_inputs_done_us = jupiter_timeline ? ggml_time_us() : 0;
+    const int64_t jupiter_submit_begin_us = jupiter_timeline ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (jupiter_timeline) {
+        const int64_t done_us = ggml_time_us();
+        const double host_prepare_ms =
+            (jupiter_submit_begin_us - jupiter_host_begin_us)/1000.0;
+        const double build_ms = jupiter_graph_build_us/1000.0;
+        const double alloc_ms = jupiter_graph_alloc_us/1000.0;
+        const double input_ms =
+            (jupiter_inputs_done_us - jupiter_inputs_begin_us)/1000.0;
+        LLAMA_LOG_INFO(
+            "[JUPITER_GRAPH_HOST] tokens=%u reused=%d host_prepare_ms=%.3f "
+            "graph_build_ms=%.3f graph_alloc_ms=%.3f set_inputs_ms=%.3f "
+            "submit_ms=%.3f other_prepare_ms=%.3f t_us=%" PRId64 " status=%d\n",
+            ubatch.n_tokens, (int) jupiter_graph_reused, host_prepare_ms,
+            build_ms, alloc_ms, input_ms,
+            (done_us - jupiter_submit_begin_us)/1000.0,
+            host_prepare_ms - build_ms - alloc_ms - input_ms,
+            done_us, (int) status);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1812,6 +1853,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         jupiter_window = std::max(1, atoi(value));
     }
     const int64_t jupiter_trace_t0_us = jupiter_trace ? ggml_time_us() : 0;
+    const char * jupiter_timeline_env = getenv("LLAMA_JUPITER_TIMELINE");
+    const char * jupiter_prefill_env = getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_timeline = jupiter_timeline_env != nullptr &&
+        atoi(jupiter_timeline_env) != 0 &&
+        jupiter_prefill_env != nullptr && atoi(jupiter_prefill_env) != 0;
     uint32_t jupiter_chunk_idx = 0;
 
     do {
@@ -1825,6 +1871,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     (long long) n_tokens_prev,
                     ubatch.n_tokens,
                     (long long) (ggml_time_us() - jupiter_trace_t0_us));
+        }
+
+        if (jupiter_timeline && n_tokens_all > 1) {
+            LLAMA_LOG_INFO(
+                "[JUPITER_UBATCH_TIMELINE] event=BEGIN chunk=%u slot=%u "
+                "prefix=%lld tokens=%u t_us=%" PRId64 "\n",
+                jupiter_chunk_idx,
+                jupiter_chunk_idx % (uint32_t) jupiter_window,
+                (long long) n_tokens_prev, ubatch.n_tokens, ggml_time_us());
         }
 
         // 拿出要处理的一个 ubatch
@@ -1856,6 +1911,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     (long long) n_tokens_prev,
                     ubatch.n_tokens,
                     (long long) (ggml_time_us() - jupiter_trace_t0_us));
+        }
+
+        if (jupiter_timeline && n_tokens_all > 1 && res != nullptr) {
+            LLAMA_LOG_INFO(
+                "[JUPITER_UBATCH_TIMELINE] event=QUEUED chunk=%u slot=%u "
+                "prefix=%lld tokens=%u t_us=%" PRId64 "\n",
+                jupiter_chunk_idx,
+                jupiter_chunk_idx % (uint32_t) jupiter_window,
+                (long long) n_tokens_prev, ubatch.n_tokens, ggml_time_us());
         }
 
         // 根据当前ubatch构建计算图并执行计算，返回结果res
