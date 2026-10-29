@@ -324,8 +324,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     // to the historical L34/L46 pair. A stage graph is eligible only when it
     // exactly spans one complete island; a full-model graph may contain the
     // same single pair anywhere in the model.
-    const char * phone_region_env = std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
-    const bool phone_region_requested =
+    const char * phone_region_env =
+        std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
+    const bool phone_region_env_requested =
         phone_region_env != nullptr && std::atoi(phone_region_env) != 0;
     int phone_region_c2p = -1;
     int phone_region_p2c = -1;
@@ -357,6 +358,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         (phone_region_pair &&
          layer_begin == phone_region_c2p &&
          layer_end == phone_region_p2c + 1);
+    const bool phone_region_requested =
+        phone_region_env_requested ||
+        (stage_graph &&
+         phone_region_pair &&
+         phone_region_stage_shape);
 
     int phone_region_first = -1;
     int phone_region_end = -1;  // exclusive Phone-full end == P2C layer
@@ -406,13 +412,17 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
             " stage=%d equal_seqs=%d n_seqs=%u n_seq_tokens=%u"
             " n_seqs_unq=%u n_pos=%u one_sequence=%d"
-            " tensor_mode=%d loras=%zu c2p=%d p2c=%d status=%s\n",
+            " tensor_mode=%d loras=%zu c2p=%d p2c=%d source=%s status=%s\n",
             n_tokens, stage_graph ? 1 : 0,
             ubatch.equal_seqs() ? 1 : 0, ubatch.n_seqs,
             ubatch.n_seq_tokens, ubatch.n_seqs_unq,
             ubatch.n_pos, phone_region_single_sequence ? 1 : 0,
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 1 : 0,
             loras->size(), phone_region_c2p, phone_region_p2c,
+            stage_graph && phone_region_pair &&
+                    phone_region_stage_shape ?
+                "DIRECTIONAL_STAGE" :
+                (phone_region_env_requested ? "ENV" : "NONE"),
             phone_region_first >= 0 ? "READY" : "SKIP");
         LLAMA_LOG_ERROR(
             "[PHONE_REGION_GRAPH_PLAN] enabled=%d layers=[%d,%d) "
