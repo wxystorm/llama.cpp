@@ -10446,7 +10446,8 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             const bool local_main_partial =
                 region_pipeline_active &&
                 region_local_main_active &&
-                prefill_down_layer_0 == 46 &&
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, prefill_down_layer_0) &&
                 local_main_partial_it !=
                     phone_region_local_main_chunks.end() &&
                 local_main_partial_it->second.submitted;
@@ -10460,9 +10461,9 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 prefill_is_last_down_chunk(
                     i, prefill_down_layer_0);
 
-            // Chunk-local L46 Attention now produces a chunk-local residual:
+            // Chunk-local P2C Attention produces a chunk-local residual:
             //
-            //   phone_tensor_ffn_inp_chunk_N-46
+            //   phone_tensor_ffn_inp_chunk_N-<p2c-layer>
             //
             // The legacy path instead exposes one full-batch ffn_inp-46.
             // Prefer the exact chunk tensor when present. Its logical offset
@@ -16637,7 +16638,8 @@ auto prefill_norm_sg_has_prework =
         const bool region_local_main_p2c_down =
             region_pipeline_active &&
             region_local_main_active &&
-            prefill_down_layer == 46 &&
+            ggml_backend_meta_tensor_p2c_layer(
+                backend_ctx, prefill_down_layer) &&
             local_main_it !=
                 phone_region_local_main_chunks.end() &&
             local_main_it->second.submitted &&
@@ -18099,10 +18101,10 @@ auto prefill_norm_sg_has_prework =
         int first_fused_layer = -1;
         int phone_region_chunk_id = -1;
 
-        // Qwen3-MoE emits a chunk-major L35..L45 Phone-only DAG. Meta's
-        // PARTIAL markers still split it into many scheduling subgraphs.
-        // Find the exact chunk boundaries and submit their union once,
-        // avoiding communication/hand-off checks at internal PARTIALs.
+        // Qwen3-MoE emits a chunk-major Phone-only DAG between the
+        // discovered C2P/P2C boundaries. PARTIAL markers still split it
+        // into many scheduling subgraphs. Find the exact chunk boundaries
+        // and submit their union once, avoiding internal hand-off checks.
         //
         // Scan *all* PC flags, not just each subgraph's terminal flag.
         // If the graph actually needs PC work, fail closed rather than
@@ -18118,7 +18120,8 @@ auto prefill_norm_sg_has_prework =
                             "phone_region_attn_chunk_%d-%d%n",
                             &chunk, &layer, &parsed) == 2 &&
                             name[parsed] == '\0' &&
-                            chunk >= 0 && layer == 35) {
+                            chunk >= 0 &&
+                            layer == region_pipe_phone_first_layer) {
                         phone_region_chunk_id = chunk;
                         break;
                     }
@@ -18154,9 +18157,9 @@ auto prefill_norm_sg_has_prework =
                         (phone_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
 
                     if (pc_compute) {
-                        // The L35-L45 graph is explicitly Phone-only, but
-                        // Meta keeps mirrored activation operations such
-                        // as norm-35 active on both devices. In this region
+                        // This discovered Region graph is explicitly
+                        // Phone-only, but Meta keeps mirrored activation
+                        // operations active on both devices. In this region
                         // the PC copy sees an obsolete C2P shadow; only the
                         // Phone-owned activation is valid. Suppress *only*
                         // the redundant PC side of a same-shape operation
@@ -18220,7 +18223,8 @@ auto prefill_norm_sg_has_prework =
                             "phone_region_attn_chunk_%d-%d%n",
                             &chunk, &layer, &parsed) == 2 &&
                         name[parsed] == '\0' &&
-                        layer == 35 && chunk != phone_region_chunk_id;
+                        layer == region_pipe_phone_first_layer &&
+                        chunk != phone_region_chunk_id;
                     if (is_another_begin) {
                         printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
                                "reason=NEXT_CHUNK_BEFORE_END action=STOP\n",
@@ -18233,7 +18237,8 @@ auto prefill_norm_sg_has_prework =
                             "phone_region_chunk_end_%d-%d%n",
                             &chunk, &layer, &parsed) == 2 &&
                             name[parsed] == '\0') {
-                        if (chunk != phone_region_chunk_id || layer != 45 ||
+                        if (chunk != phone_region_chunk_id ||
+                                layer != region_pipe_phone_last_layer ||
                                 k + 1 != phone_part->n_nodes) {
                             printf("[PHONE_REGION_GRAPH_REJECT] chunk=%d sg=%zu "
                                    "node=%s reason=INVALID_END action=STOP\n",
@@ -18273,12 +18278,12 @@ auto prefill_norm_sg_has_prework =
             }
             phone_block_fused = true;
             phone_region_fused = true;
-            first_fused_layer = 35;
-            // No forced PC handoff here: L46's Attention is Phone-owned.
-            // The real C2P/P2C boundaries remain managed by the baseline.
+            first_fused_layer = region_pipe_phone_first_layer;
+            // No forced PC handoff here: the following P2C Attention
+            // is Phone-owned. The directional boundaries remain managed
             phone_block_last_layer = -1;
-            timing_first_layer = 35;
-            timing_last_layer = 45;
+            timing_first_layer = region_pipe_phone_first_layer;
+            timing_last_layer = region_pipe_phone_last_layer;
         } else {
             std::string fusion_reason;
             size_t fusion_failed_sg = i;
@@ -18447,8 +18452,9 @@ auto prefill_norm_sg_has_prework =
             char output_name[96];
             std::snprintf(
                 output_name, sizeof(output_name),
-                "phone_region_chunk_end_%d-45",
-                phone_region_chunk_id);
+                "phone_region_chunk_end_%d-%d",
+                phone_region_chunk_id,
+                region_pipe_phone_last_layer);
             ggml_tensor * region_output =
                 find_sg_named_tensor(
                     1, phone_block_end, output_name);
@@ -18463,7 +18469,8 @@ auto prefill_norm_sg_has_prework =
             if (!output_bound) {
                 printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
                        "reason=OUTPUT_BIND_FAILED action=STOP\n",
-                       phone_region_chunk_id);
+                       phone_region_chunk_id,
+                region_pipe_p2c_layer);
                 return GGML_STATUS_FAILED;
             }
             const size_t slot_index =
@@ -18530,8 +18537,10 @@ auto prefill_norm_sg_has_prework =
         }
         if (phone_region_fused && pipeline_debug) {
             printf("[PHONE_REGION_GRAPH] chunk=%d sg=%zu..%zu "
-                   "layers=[35,46) nodes=%d status=DEVICE_LOCAL_READY\n",
+                   "layers=[%d,%d) nodes=%d status=DEVICE_LOCAL_READY\n",
                    phone_region_chunk_id, i, phone_block_end,
+                   region_pipe_phone_first_layer,
+                   region_pipe_phone_last_layer + 1,
                    phone_graph->n_nodes);
         }
         if (region_pipeline_active &&
@@ -18542,7 +18551,8 @@ auto prefill_norm_sg_has_prework =
             if (chunk_it == region_pipe_chunks.end()) {
                 printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
                        "reason=CHUNK_PLAN_MISSING action=STOP\n",
-                       phone_region_chunk_id);
+                       phone_region_chunk_id,
+                region_pipe_p2c_layer);
                 return GGML_STATUS_FAILED;
             }
             const auto & entry = chunk_it->second;
@@ -18550,11 +18560,12 @@ auto prefill_norm_sg_has_prework =
             const bool route_prearmed =
                 prearm_phone_prefill_route(
                     entry.continuation_ready_sg,
-                    46,
+                    region_pipe_p2c_layer,
                     phone_region_chunk_id);
             const auto route_it =
                 pending_phone_prefill_routes.find(
-                    { 46, phone_region_chunk_id });
+                    { region_pipe_p2c_layer,
+                      phone_region_chunk_id });
             if (!route_prearmed ||
                     route_it ==
                         pending_phone_prefill_routes.end()) {
@@ -18580,11 +18591,11 @@ auto prefill_norm_sg_has_prework =
             char residual_name[96];
             std::snprintf(
                 partial_name, sizeof(partial_name),
-                "prefill_ffn_down_chunk_%d-46",
+                "prefill_ffn_down_chunk_%d-%d",
                 phone_region_chunk_id);
             std::snprintf(
                 residual_name, sizeof(residual_name),
-                "phone_tensor_ffn_inp_chunk_%d-46",
+                "phone_tensor_ffn_inp_chunk_%d-%d",
                 phone_region_chunk_id);
 
             ggml_tensor * phone_partial =
