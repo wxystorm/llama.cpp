@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <thread>
 
@@ -36,6 +37,12 @@ static bool jupiter_prefill_enabled() {
 static bool jupiter_trace_enabled() {
     const char * value = std::getenv("LLAMA_JUPITER_TRACE");
     return value != nullptr && std::atoi(value) != 0;
+}
+
+// Opt-in asynchronous network send; the source is privately staged first.
+static bool jupiter_async_c2p_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_ASYNC_C2P");
+    return jupiter_prefill_enabled() && value != nullptr && std::atoi(value) != 0;
 }
 
 namespace fs = std::filesystem;
@@ -275,10 +282,13 @@ struct ggml_backend_rpc_buffer_type_context {
     size_t      max_size;
 };
 
+struct jupiter_rpc_comm_worker;
+
 struct ggml_backend_rpc_context {
     std::string endpoint;
     uint32_t    device;
     std::string name;
+    std::unique_ptr<jupiter_rpc_comm_worker> comm;
 };
 
 struct ggml_backend_rpc_event_context {
@@ -489,6 +499,164 @@ static std::shared_ptr<socket_t> get_socket_lane(const std::string & endpoint, c
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return get_socket_lane(endpoint, "control");
 }
+
+static std::atomic<uint64_t> g_jupiter_comm_worker_id {1};
+
+// Adapted from Region Ring's ggml_backend_meta_transfer_worker. Each
+// command owns its wire payload, so scheduler slot reuse cannot race a send.
+// The worker has its own transfer and compute sockets (same remote RPC
+// tensor/graph registry). No new protocol opcode is needed.
+struct jupiter_rpc_comm_worker {
+    struct task {
+        uint64_t id;
+        std::function<bool()> run;
+    };
+
+    const std::string endpoint;
+    const std::string transfer_lane;
+    const std::string compute_lane;
+    socket_ptr transfer_sock;
+    socket_ptr compute_sock;
+    std::mutex mutex;
+    std::condition_variable ready_cv;
+    std::condition_variable done_cv;
+    std::condition_variable space_cv;
+    std::deque<task> tasks;
+    uint64_t submitted = 0;
+    uint64_t completed = 0;
+    bool stop = false;
+    std::thread thread;
+
+    explicit jupiter_rpc_comm_worker(const std::string & ep) :
+        endpoint(ep),
+        transfer_lane("jupiter-c2p-" + std::to_string(g_jupiter_comm_worker_id.fetch_add(1))),
+        compute_lane("jupiter-compute-" + transfer_lane),
+        thread([this]() {
+            std::unique_lock<std::mutex> lock(mutex);
+            while (true) {
+                ready_cv.wait(lock, [&] { return stop || !tasks.empty(); });
+                if (stop && tasks.empty()) {
+                    return;
+                }
+                task current = std::move(tasks.front());
+                tasks.pop_front();
+                space_cv.notify_all();
+                lock.unlock();
+                if (!current.run()) {
+                    GGML_ABORT("Jupiter asynchronous C2P transport failed");
+                }
+                lock.lock();
+                completed = current.id;
+                done_cv.notify_all();
+            }
+        }) {
+    }
+
+    ~jupiter_rpc_comm_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        ready_cv.notify_all();
+        thread.join();
+    }
+
+    uint64_t enqueue(std::function<bool()> run) {
+        std::unique_lock<std::mutex> lock(mutex);
+        space_cv.wait(lock, [&] { return stop || tasks.size() < 32; });
+        GGML_ASSERT(!stop);
+        const uint64_t id = ++submitted;
+        tasks.push_back({id, std::move(run)});
+        ready_cv.notify_one();
+        return id;
+    }
+
+    void flush() {
+        std::unique_lock<std::mutex> lock(mutex);
+        const uint64_t target = submitted;
+        done_cv.wait(lock, [&] { return completed >= target; });
+    }
+
+    socket_ptr transfer_socket() {
+        if (!transfer_sock) {
+            transfer_sock = get_socket_lane(endpoint, transfer_lane.c_str());
+        }
+        return transfer_sock;
+    }
+
+    socket_ptr compute_socket() {
+        if (!compute_sock) {
+            compute_sock = get_socket_lane(endpoint, compute_lane.c_str());
+        }
+        return compute_sock;
+    }
+
+    bool fence_transfers() {
+        const auto sock = transfer_socket();
+        if (!sock) {
+            return false;
+        }
+        rpc_msg_jupiter_rsp rsp {};
+        return send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
+                            &rsp, sizeof(rsp)) && rsp.ok == 1;
+    }
+
+    uint64_t enqueue_c2p(std::vector<uint8_t> payload, size_t bytes) {
+        return enqueue([this, payload = std::move(payload), bytes]() {
+            const auto sock = transfer_socket();
+            if (!sock) {
+                return false;
+            }
+            const int64_t t0 = jupiter_trace_enabled() ? ggml_time_us() : 0;
+            const bool ok = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR,
+                                         payload.data(), payload.size());
+            if (jupiter_trace_enabled()) {
+                GGML_LOG_INFO("[JUPITER_COMM] action=C2P_SENT bytes=%zu send_ms=%.3f status=%s\n",
+                              bytes, (ggml_time_us() - t0)/1000.0, ok ? "OK" : "FAIL");
+            }
+            return ok;
+        });
+    }
+
+    uint64_t enqueue_graph_recompute(rpc_msg_graph_recompute_req req) {
+        return enqueue([this, req]() {
+            if (!fence_transfers()) {
+                return false;
+            }
+            const auto sock = compute_socket();
+            return sock && send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &req, sizeof(req));
+        });
+    }
+
+    uint64_t enqueue_graph_build(std::vector<uint8_t> payload) {
+        return enqueue([this, payload = std::move(payload)]() {
+            if (!fence_transfers()) {
+                return false;
+            }
+            const auto sock = compute_socket();
+            return sock && send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE,
+                                        payload.data(), payload.size());
+        });
+    }
+
+    uint64_t enqueue_event(rpc_msg_jupiter_event_req req) {
+        return enqueue([this, req]() {
+            const auto sock = compute_socket();
+            return sock && send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &req, sizeof(req));
+        });
+    }
+
+    bool synchronize_remote() {
+        flush();
+        const auto sock = compute_socket();
+        if (!sock) {
+            return false;
+        }
+        rpc_msg_jupiter_rsp rsp {};
+        return send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
+                            &rsp, sizeof(rsp)) && rsp.ok == 1;
+    }
+};
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 
