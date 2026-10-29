@@ -176,6 +176,7 @@ inline bool llama_region_ring_directional_topology_compatible(
         int n_layer) {
     if (regions.size() < 6 || n_layer <= 0 ||
             regions.front().layer_begin != 0 ||
+            regions.front().kind != llama_region_ring_stage_kind::GPU ||
             regions.back().layer_end != n_layer ||
             regions.back().kind != llama_region_ring_stage_kind::PHONE) {
         return false;
