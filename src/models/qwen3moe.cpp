@@ -216,8 +216,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
+    // Outer Region stages carry their own macro chunk. Do not make
+    // directional C2P/P2C graph construction depend on the legacy global
+    // Tensor runtime plan: fixed Ring layouts intentionally have no T plan.
     const int planned_chunk_tokens =
-        llama_hybrid_runtime_prefill_chunk_tokens();
+        stage_graph && params.hybrid_chunk_tokens > 0 ?
+            params.hybrid_chunk_tokens :
+            llama_hybrid_runtime_prefill_chunk_tokens();
     const char * pc_phone_exec_v1_env =
         std::getenv("GGML_META_PC_PHONE_EXEC_V1");
     const bool pc_phone_exec_v1_requested =
@@ -226,6 +231,15 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool return_wavefront_requested =
         pc_phone_exec_v1_requested ||
         std::getenv("LLAMA_HYBRID_RETURN_WAVEFRONT") != nullptr;
+
+    if (stage_graph) {
+        LLAMA_LOG_ERROR(
+            "[HYBRID_STAGE_CHUNK] layers=[%d,%d) tokens=%" PRId64
+            " outer_chunk=%d planned_chunk=%d status=READY\n",
+            layer_begin, layer_end, n_tokens,
+            params.hybrid_chunk_tokens,
+            planned_chunk_tokens);
+    }
 
     bool moe_stage_wavefront =
         return_wavefront_requested &&
