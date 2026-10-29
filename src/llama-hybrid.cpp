@@ -9267,14 +9267,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                           profile.phone_layer_blocks;
                 const auto & primary_ffn =
                     c2p ? profile.cpu_ffn : profile.phone_ffn;
-                const float ratio =
+                const float pc_ratio =
                     c2p ? c2p_pc_ratio : p2c_pc_ratio;
 
                 double attn_kv_ms = 0.0;
                 double attn_base_ms = 0.0;
                 double layer_base_ms = 0.0;
                 double full_ffn_ms = 0.0;
-                double pipeline_ms = 0.0;
+                double pc_ffn_ms = 0.0;
+                double phone_ffn_ms = 0.0;
                 if (!llama_hybrid_attn_cost(
                         attn_points, tokens, kv_tokens,
                         attn_kv_ms) ||
@@ -9286,19 +9287,93 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         layer_base_ms) ||
                     !llama_hybrid_ffn_cost(
                         primary_ffn, tokens, 1.0f,
-                        full_ffn_ms)) {
+                        full_ffn_ms) ||
+                    !llama_hybrid_ffn_cost(
+                        profile.cpu_ffn, tokens, pc_ratio,
+                        pc_ffn_ms) ||
+                    !llama_hybrid_ffn_cost(
+                        profile.phone_ffn, tokens,
+                        1.0f - pc_ratio, phone_ffn_ms)) {
                     return false;
                 }
 
-                const bool pipeline_ok = c2p ?
-                    llama_hybrid_tensor_ffn_cost(
-                        profile, ratio, tokens, tokens,
-                        pipeline_ms, nullptr, 1) :
-                    llama_hybrid_tensor_phone_ffn_cost(
-                        profile, ratio, tokens, tokens,
-                        pipeline_ms, nullptr, 1);
-                if (!pipeline_ok) {
-                    return false;
+                const size_t bytes =
+                    (size_t) profile.n_embd *
+                    (size_t) tokens * sizeof(float);
+                double first_wire_ms = 0.0;
+                double second_wire_ms = 0.0;
+                double pipeline_ms = 0.0;
+
+                if (c2p) {
+                    // Current Region C2P is not the legacy PC-primary Tensor
+                    // protocol. Ownership flips to Phone:
+                    //
+                    //   PC Router/READY ----> Phone
+                    //   PC FFN -----------\
+                    //                       +--> PC partial ----> Phone Reduce
+                    //   Phone FFN <--------/
+                    //
+                    // Both network legs therefore use PC->Phone. The second
+                    // transfer shares that link and cannot start until READY
+                    // has drained and the PC partial exists.
+                    if (!llama_hybrid_transfer_cost(
+                            profile.pc_to_phone, bytes,
+                            first_wire_ms) ||
+                        !llama_hybrid_transfer_cost(
+                            profile.pc_to_phone, bytes,
+                            second_wire_ms)) {
+                        return false;
+                    }
+                    const double ready_end = first_wire_ms;
+                    const double pc_finish = pc_ffn_ms;
+                    const double phone_finish =
+                        ready_end + phone_ffn_ms;
+                    const double partial_start =
+                        std::max(ready_end, pc_finish);
+                    const double partial_end =
+                        partial_start + second_wire_ms;
+                    pipeline_ms =
+                        std::max(phone_finish, partial_end) +
+                        profile.reduce_ms;
+                } else {
+                    // Current Region P2C likewise differs from the legacy
+                    // Phone-primary Tensor protocol. Ownership flips to PC:
+                    //
+                    //   Phone Router/READY ----> PC FFN
+                    //   Phone FFN -------------\
+                    //                            +--> Phone partial ----> PC Reduce
+                    //
+                    // Route and folded partial both move Phone->PC. Route
+                    // uses the snapshot path; the folded partial uses the
+                    // ordinary return path. The Phone FFN may overlap the
+                    // route transfer, but both network legs share one link.
+                    const auto & route_points =
+                        !profile.snapshot_phone_to_pc.empty() ?
+                            profile.snapshot_phone_to_pc :
+                            profile.phone_to_pc;
+                    const auto & return_points =
+                        !profile.phone_to_pc.empty() ?
+                            profile.phone_to_pc :
+                            profile.snapshot_phone_to_pc;
+                    if (!llama_hybrid_transfer_cost(
+                            route_points, bytes,
+                            first_wire_ms) ||
+                        !llama_hybrid_transfer_cost(
+                            return_points, bytes,
+                            second_wire_ms)) {
+                        return false;
+                    }
+                    const double route_end = first_wire_ms;
+                    const double pc_finish =
+                        route_end + pc_ffn_ms;
+                    const double phone_finish = phone_ffn_ms;
+                    const double return_start =
+                        std::max(route_end, phone_finish);
+                    const double return_end =
+                        return_start + second_wire_ms;
+                    pipeline_ms =
+                        std::max(pc_finish, return_end) +
+                        profile.reduce_ms;
                 }
 
                 const double misc_ms =
