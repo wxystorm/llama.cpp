@@ -122,10 +122,14 @@ class QProfile:
             per_xy.setdefault((x, y), []).append(statistics.median(samples))
 
         self.values = {key: max(timings) for key, timings in per_xy.items()}
-        # A coordinate is directly measured only when every backend stage
-        # present in the calibration dataset has a sample there. Otherwise a
-        # partially captured log could silently lower the bottleneck cost.
-        self.required_stages = {stage for _, _, stage in grouped_stage}
+        # Treat a point as measured when its PC accelerator and phone RPC
+        # stages are present. CPU-only housekeeping splits can be legitimately
+        # absent for some graph shapes, so do not require those everywhere.
+        all_stages = {stage for _, _, stage in grouped_stage}
+        self.require_phone = any(s.startswith("RPC") for s in all_stages)
+        self.require_pc_accel = any(
+            not s.startswith("RPC") and s != "CPU" for s in all_stages
+        )
         self.stages_by_xy: Dict[Tuple[int, int], set[str]] = {}
         for x, y, stage in grouped_stage:
             self.stages_by_xy.setdefault((x, y), set()).add(stage)
@@ -138,9 +142,14 @@ class QProfile:
 
     def is_measured(self, x: int, y: int) -> bool:
         """True only for a calibrated (x, prefix) pair, not an interpolation."""
+        if (x, y) not in self.values:
+            return False
+        stages = self.stages_by_xy.get((x, y), set())
+        has_phone = any(s.startswith("RPC") for s in stages)
+        has_pc = any(not s.startswith("RPC") and s != "CPU" for s in stages)
         return (
-            (x, y) in self.values
-            and self.required_stages.issubset(self.stages_by_xy.get((x, y), set()))
+            (not self.require_phone or has_phone)
+            and (not self.require_pc_accel or has_pc)
         )
 
     def sample_status(self, x: int, y: int) -> str:
