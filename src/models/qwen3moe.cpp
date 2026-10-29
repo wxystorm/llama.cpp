@@ -316,14 +316,50 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
-    // Region Boundary V1: the Phone-only middle is executed as a single
-    // device-local graph for each prefill chunk, not as per-layer RPC graphs.
-    // Keep this opt-in and restricted to the verified directional pair.
+    // Directional Region island:
+    //
+    //   C2P(X) -> PHONE(X+1 .. Y-1) -> P2C(Y)
+    //
+    // Derive X/Y from the current graph range instead of binding the fast path
+    // to the historical L34/L46 pair. A stage graph is eligible only when it
+    // exactly spans one complete island; a full-model graph may contain the
+    // same single pair anywhere in the model.
     const char * phone_region_env = std::getenv("LLAMA_HYBRID_PHONE_REGION_GRAPH");
     const bool phone_region_requested =
         phone_region_env != nullptr && std::atoi(phone_region_env) != 0;
+    int phone_region_c2p = -1;
+    int phone_region_p2c = -1;
+    bool phone_region_pair_unique = true;
+    for (int il = layer_begin; il < layer_end; ++il) {
+        const auto mode = model.hybrid_layer_mode(il);
+        if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+            if (phone_region_c2p >= 0) {
+                phone_region_pair_unique = false;
+                break;
+            }
+            phone_region_c2p = il;
+        } else if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+            if (phone_region_p2c >= 0) {
+                phone_region_pair_unique = false;
+                break;
+            }
+            phone_region_p2c = il;
+        }
+    }
+
+    const bool phone_region_pair =
+        phone_region_pair_unique &&
+        phone_region_c2p >= layer_begin &&
+        phone_region_p2c > phone_region_c2p + 1 &&
+        phone_region_p2c < layer_end;
+    const bool phone_region_stage_shape =
+        !stage_graph ||
+        (phone_region_pair &&
+         layer_begin == phone_region_c2p &&
+         layer_end == phone_region_p2c + 1);
+
     int phone_region_first = -1;
-    int phone_region_end = -1;  // exclusive
+    int phone_region_end = -1;  // exclusive Phone-full end == P2C layer
     std::vector<int> phone_region_chunks;
     // A real, non-equal single-sequence prefill is represented as
     // n_seqs=n_tokens, n_seqs_unq=1 by llama_batch_allocr. Reserve graphs
@@ -331,16 +367,16 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
     const bool phone_region_single_sequence =
         ubatch.n_seqs_unq == 1 &&
         (!ubatch.equal_seqs() || ubatch.n_seqs == 1);
-    if (phone_region_requested && !stage_graph && n_layer == 48 &&
+    if (phone_region_requested && phone_region_pair &&
+            phone_region_stage_shape &&
             n_tokens > 1 && ubatch.n_pos == 1 &&
             phone_region_single_sequence &&
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             planned_chunk_tokens > 0 && loras->empty() &&
-            !moe_stage_wavefront &&
-            model.hybrid_layer_mode(34) == llama_hybrid_layer_mode::TENSOR_C2P &&
-            model.hybrid_layer_mode(46) == llama_hybrid_layer_mode::TENSOR_P2C) {
+            !moe_stage_wavefront) {
         bool phone_only = true;
-        for (int il = 35; il < 46; ++il) {
+        for (int il = phone_region_c2p + 1;
+             il < phone_region_p2c; ++il) {
             phone_only = phone_only &&
                 model.hybrid_layer_mode(il) == llama_hybrid_layer_mode::PHONE_ONLY &&
                 cvec->tensor_for(il) == nullptr &&
@@ -352,17 +388,11 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 (int) n_tokens, planned_chunk_tokens);
 
             // The Region Graph exists to make multi-chunk prefill a schedulable
-            // unit. For a single chunk there is no pipeline opportunity, and
-            // the current Meta graph does not fuse that shape: it falls back to
-            // many PHONE_ONLY_SG submissions plus a one-node terminal graph.
-            // Keep warmup / tiny-prefill on the already-validated legacy path.
-            //
-            // This also avoids exercising the range-input / SET_ROWS path on a
-            // shape for which it provides no performance benefit. Multi-chunk
-            // prefill (the 358-token XT=128 case) remains unchanged.
+            // unit. For a single chunk there is no pipeline opportunity, so
+            // keep warmup / tiny-prefill on the ordinary directional path.
             if (phone_region_chunks.size() > 1) {
-                phone_region_first = 35;
-                phone_region_end = 46;
+                phone_region_first = phone_region_c2p + 1;
+                phone_region_end = phone_region_p2c;
             } else {
                 phone_region_chunks.clear();
             }
@@ -373,13 +403,14 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
             " stage=%d equal_seqs=%d n_seqs=%u n_seq_tokens=%u"
             " n_seqs_unq=%u n_pos=%u one_sequence=%d"
-            " tensor_mode=%d loras=%zu status=%s\n",
+            " tensor_mode=%d loras=%zu c2p=%d p2c=%d status=%s\n",
             n_tokens, stage_graph ? 1 : 0,
             ubatch.equal_seqs() ? 1 : 0, ubatch.n_seqs,
             ubatch.n_seq_tokens, ubatch.n_seqs_unq,
             ubatch.n_pos, phone_region_single_sequence ? 1 : 0,
             model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? 1 : 0,
-            loras->size(), phone_region_first >= 0 ? "READY" : "SKIP");
+            loras->size(), phone_region_c2p, phone_region_p2c,
+            phone_region_first >= 0 ? "READY" : "SKIP");
         LLAMA_LOG_ERROR(
             "[PHONE_REGION_GRAPH_PLAN] enabled=%d layers=[%d,%d) "
             "tokens=%" PRId64 " chunks=%zu graph_per_chunk=1 "
@@ -763,20 +794,19 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     // Preserve the chunk-local L45 outputs and their range-Attention inputs
     // across the loop boundary. L46 is a P2C Tensor layer whose Attention is
-    // Phone-owned, so it must continue from each Region chunk directly rather
-    // than rebuilding one full-batch Attention barrier.
     std::vector<ggml_tensor *> phone_region_outputs_for_tensor;
     std::vector<llm_graph_input_attn_kv *> phone_region_attn_inputs_for_tensor;
     std::vector<int64_t> phone_region_token_begin_for_tensor;
 
     for (int il = layer_begin; il < layer_end; ++il) {
         if (il == phone_region_first) {
-            // Keep the C2P final owner and the L46 P2C protocol untouched.
-            // L34's complete Phone-owned output is the immutable input to
+            // Keep the C2P final owner and the following P2C protocol
+            // untouched. The complete C2P Phone-owned output is the immutable
+            // input to
             // each chunk; only the Phone Full region is re-tiled here.
             GGML_ASSERT(inpL->ne[1] == n_tokens);
             // The C2P final reduction has already materialized the complete
-            // l_out-34 in the Phone-owned tensor buffer. Creating a CONT
+            // the C2P l_out in the Phone-owned tensor buffer. Creating a CONT
             // here is not a harmless view: Meta marks it COMPUTE on both
             // PC and Phone and may recompute from the stale PC mirror.
             // Keep the C2P buffer as the only Region input owner and make
@@ -925,8 +955,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
             if (region_outputs.size() == 1) {
                 // Do not rename the only chunk's end tensor: Meta relies on
-                // phone_region_chunk_end_N-45 for the single-graph boundary.
-                // This VIEW is a separate zero-copy alias for L46's input.
+                // phone_region_chunk_end_N-<last-phone-layer> for the
+                // single-graph boundary. This VIEW is a separate zero-copy
+                // alias for the following P2C layer input.
                 region_join = ggml_view_2d(
                     ctx0, region_join, region_join->ne[0],
                     region_join->ne[1], region_join->nb[1], 0);
@@ -939,9 +970,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         if (il == phone_region_end &&
                 !phone_region_outputs_for_tensor.empty()) {
-            // L46 P2C Tensor continuation, fully chunk-local from Attention
+            // P2C Tensor continuation, fully chunk-local from Attention
             // through Router/Top-K and FFN. The previous implementation joined
-            // all L45 Region outputs and ran one full-batch L46 Attention,
+            // all Phone Region outputs and ran one full-batch P2C Attention,
             // which created a hard barrier: FFN chunk0 still depended on
             // Region1/2. Reuse the same per-range KV indices/mask that drove
             // L35-L45 so causal Attention can advance one chunk at a time.
@@ -1118,12 +1149,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 LLAMA_LOG_ERROR(
                     "[PHONE_TENSOR_ATTN_CHUNK] layer=%d chunk=%zu "
                     "begin=%" PRId64 " tokens=%" PRId64
-                    " source=REGION_L45 status=BUILT\n",
-                    il, ci, token_begin, token_count);
+                    " source_region_last=%d status=BUILT\n",
+                    il, ci, token_begin, token_count,
+                    phone_region_end - 1);
             }
             GGML_ASSERT(tensor_token_total == n_tokens);
 
-            // Keep the old shared L46 tail shape: Meta's P2C reduce consumes
+            // Keep the shared P2C tail shape: Meta's reduce consumes
             // each prefill_ffn_down_chunk_N independently, while the final
             // concat + residual add stays after all chunk continuations.
             ggml_tensor * down_join = tensor_down_chunks.front();
