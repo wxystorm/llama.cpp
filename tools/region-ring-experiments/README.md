@@ -18,6 +18,18 @@ python .\tools\region-ring-experiments\run_prompt_sweep.py `
     --n-predict 32
 ```
 
+For the shorter PowerShell entrypoint, use:
+
+```powershell
+.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
+    -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+    -Rpc "10.39.52.114:50052" `
+    -PromptDir "D:\prima.cpp\prompts"
+```
+
+The wrapper defaults to `build-tensor-v2\bin\Release\llama-completion.exe`
+and saves `summary.csv` under `region-ring-results`.
+
 Replace the model filename, executable path and RPC address as appropriate.
 The Phone `ggml-rpc-server` must be running. Set `--streaming off` to
 compare a non-streaming configuration. For a fixed-layout A/B test, use
