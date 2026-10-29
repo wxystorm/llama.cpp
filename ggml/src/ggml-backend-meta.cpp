@@ -19331,8 +19331,14 @@ auto prefill_norm_sg_has_prework =
             ggml_cgraph * c2p_pc_prefix_graph = nullptr;
             int c2p_pc_route_stop = -1;
             bool c2p_parallel_ready = false;
+            bool c2p_route_exec = false;
 
             if (c2p_prefill_exec) {
+                c2p_pc_graph =
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[i].cgraph_main;
+                GGML_ASSERT(c2p_pc_graph != nullptr);
+                c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
                 char topk_name[96];
                 char weights_name[96];
                 std::snprintf(
@@ -19353,48 +19359,49 @@ auto prefill_norm_sg_has_prework =
                 c2p_dst_weights =
                     find_sg_named_tensor(1, i, weights_name);
 
-                GGML_ASSERT(c2p_src_topk != nullptr);
-                GGML_ASSERT(c2p_dst_topk != nullptr);
-                GGML_ASSERT(c2p_src_weights != nullptr);
-                GGML_ASSERT(c2p_dst_weights != nullptr);
-                GGML_ASSERT(c2p_src_topk->type == GGML_TYPE_I32);
-                GGML_ASSERT(c2p_dst_topk->type == GGML_TYPE_I32);
-                GGML_ASSERT(c2p_src_weights->type == GGML_TYPE_F32);
-                GGML_ASSERT(c2p_dst_weights->type == GGML_TYPE_F32);
+                const int route_tensor_count =
+                    (c2p_src_topk != nullptr ? 1 : 0) +
+                    (c2p_dst_topk != nullptr ? 1 : 0) +
+                    (c2p_src_weights != nullptr ? 1 : 0) +
+                    (c2p_dst_weights != nullptr ? 1 : 0);
                 GGML_ASSERT(
-                    ggml_are_same_layout(
-                        c2p_src_topk, c2p_dst_topk));
-                GGML_ASSERT(
-                    ggml_are_same_layout(
-                        c2p_src_weights, c2p_dst_weights));
+                    route_tensor_count == 0 ||
+                    route_tensor_count == 4);
+                c2p_route_exec = route_tensor_count == 4;
 
-                const size_t route_slot =
-                    static_cast<size_t>(
-                        std::max(0, prefill_down_chunk));
-                auto & c2p_slots =
-                    backend_ctx->backend_configs[0].
-                        c2p_route_stage_bufs;
-                if (c2p_slots.size() <= route_slot) {
-                    c2p_slots.resize(route_slot + 1);
-                }
+                if (c2p_route_exec) {
+                    // Validated MoE C2P path: Router/TopK is produced on PC,
+                    // pinned before allocator reuse, then copied PC->Phone
+                    // before the Phone expert shard executes.
+                    GGML_ASSERT(c2p_src_topk->type == GGML_TYPE_I32);
+                    GGML_ASSERT(c2p_dst_topk->type == GGML_TYPE_I32);
+                    GGML_ASSERT(c2p_src_weights->type == GGML_TYPE_F32);
+                    GGML_ASSERT(c2p_dst_weights->type == GGML_TYPE_F32);
+                    GGML_ASSERT(
+                        ggml_are_same_layout(
+                            c2p_src_topk, c2p_dst_topk));
+                    GGML_ASSERT(
+                        ggml_are_same_layout(
+                            c2p_src_weights, c2p_dst_weights));
 
-                bind_c2p_route_storage(
-                    c2p_src_topk,
-                    c2p_slots[route_slot][0],
-                    c2p_bindings);
-                bind_c2p_route_storage(
-                    c2p_src_weights,
-                    c2p_slots[route_slot][1],
-                    c2p_bindings);
+                    const size_t route_slot =
+                        static_cast<size_t>(
+                            std::max(0, prefill_down_chunk));
+                    auto & c2p_slots =
+                        backend_ctx->backend_configs[0].
+                            c2p_route_stage_bufs;
+                    if (c2p_slots.size() <= route_slot) {
+                        c2p_slots.resize(route_slot + 1);
+                    }
 
-                // Rebinding graph tensors changes their backing addresses.
-                // Force the local backend to rebuild/rebind this graph instead
-                // of reusing a cached graph prepared for the old arena.
-                c2p_pc_graph =
-                    backend_ctx->backend_configs[0]
-                        .cgraphs[i].cgraph_main;
-                if (c2p_pc_graph != nullptr) {
-                    c2p_saved_pc_graph_uid = c2p_pc_graph->uid;
+                    bind_c2p_route_storage(
+                        c2p_src_topk,
+                        c2p_slots[route_slot][0],
+                        c2p_bindings);
+                    bind_c2p_route_storage(
+                        c2p_src_weights,
+                        c2p_slots[route_slot][1],
+                        c2p_bindings);
 
                     if (region_parallel_ffn) {
                         const int topk_index =
@@ -19422,22 +19429,31 @@ auto prefill_norm_sg_has_prework =
                     }
 
                     if (!c2p_parallel_ready) {
-                        // Serial fallback keeps the old cache invalidation
+                        // Serial MoE fallback keeps the old cache invalidation
                         // because Router tensors were rebound to private storage.
                         c2p_pc_graph->uid = 0;
                     }
-                }
 
-                if (pipeline_debug) {
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
+                            "topk_bytes=%zu weights_bytes=%zu "
+                            "trigger=PREFILL_DOWN status=READY\n",
+                            prefill_down_layer,
+                            prefill_down_chunk,
+                            i,
+                            ggml_nbytes(c2p_src_topk),
+                            ggml_nbytes(c2p_src_weights));
+                    }
+                } else if (pipeline_debug) {
+                    // Dense C2P has no Router metadata. READY already carried
+                    // FFN_NORM PC->Phone, so both shards can execute directly.
                     printf(
-                        "[REGION_C2P_ROUTE_PIN] layer=%d chunk=%d sg=%zu "
-                        "topk_bytes=%zu weights_bytes=%zu "
-                        "trigger=PREFILL_DOWN status=READY\n",
+                        "[REGION_C2P_DENSE_FFN] layer=%d chunk=%d sg=%zu "
+                        "route=NONE action=RUN_BOTH_FFN_SHARDS status=READY\n",
                         prefill_down_layer,
                         prefill_down_chunk,
-                        i,
-                        ggml_nbytes(c2p_src_topk),
-                        ggml_nbytes(c2p_src_weights));
+                        i);
                 }
             }
 
@@ -19568,17 +19584,17 @@ auto prefill_norm_sg_has_prework =
             ggml_status pc_status = GGML_STATUS_SUCCESS;
             ggml_status phone_status = GGML_STATUS_SUCCESS;
 
-            if (c2p_prefill_exec) {
-                // Correctness-first C2P order:
+            if (c2p_prefill_exec && c2p_route_exec) {
+                // Correctness-first MoE C2P order:
                 //
                 //   pin PC Router outputs
                 //   -> PC graph
                 //   -> copy exact Router TopK/weights PC->Phone
                 //   -> Phone expert graph
                 //
-                // The pin is required because the PC graph itself consumes the
-                // Router outputs and would otherwise be free to recycle their
-                // arena storage before Meta performs the cross-device copy.
+                // Dense C2P deliberately skips this block because it has no
+                // Router metadata; its two FFN shards are independent after
+                // READY and are handled by the branch below.
                 pc_status = compute_workers.wait(0);
                 if (c2p_pc_graph != nullptr) {
                     c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
@@ -19733,6 +19749,33 @@ auto prefill_norm_sg_has_prework =
                     }
                 } else {
                     restore_c2p_route_bindings(c2p_bindings);
+                }
+            } else if (c2p_prefill_exec) {
+                // Dense directional C2P: READY already copied the normalized
+                // FFN input PC->Phone. There is no Router/TopK dependency, so
+                // run the local PC and Phone FFN shards independently, then
+                // let the shared PARTIAL C2P reduction below fold residual +
+                // PC partial and send it PC->Phone.
+                compute_workers.start(1, i);
+                pc_status = compute_workers.wait(0);
+                if (pc_status == GGML_STATUS_SUCCESS &&
+                        backend_ctx->cpu_task_executor != nullptr) {
+                    backend_ctx->cpu_task_executor->set_frontier(
+                        c2p_pc_main_desc.chunk + 1);
+                }
+                phone_status = compute_workers.wait(1);
+                c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
+
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_C2P_DENSE_FFN] layer=%d chunk=%d sg=%zu "
+                        "phase=COMPLETE pc_status=%d phone_status=%d "
+                        "next=PARTIAL_REDUCE\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        (int) pc_status,
+                        (int) phone_status);
                 }
             } else {
                 const bool legacy_pc_primary_split =
