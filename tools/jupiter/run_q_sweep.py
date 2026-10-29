@@ -318,7 +318,10 @@ def build_cli_command(
         "-n", "1",
         "-t", str(args.threads),
         "--flash-attn", "on",
-        "-lv", "3",
+        # LLAMA_LOG_INFO is routed through common_log_default_callback as
+        # LOG_LEVEL_TRACE (4), not LOG_LEVEL_INFO (3). With -lv 3, Jupiter's
+        # SEQUENCE_PLAN / UBATCH / STAGE_PROFILE logs are silently suppressed.
+        "-lv", "4",
         "--no-conversation",
         "--single-turn",
         "--simple-io",
