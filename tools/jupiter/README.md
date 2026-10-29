@@ -159,6 +159,83 @@ Offline runner checks (no model or RPC needed):
 python -m unittest discover -s .\tools\jupiter -p test_run_q_sweep.py -v
 ```
 
+## Formal prefill A/B benchmark (async, low logging)
+
+After q calibration and DP plan generation, **do not benchmark with
+`LLAMA_JUPITER_PROFILE_STAGE=1`**; it synchronizes every backend split and
+is only for q(x,y) profiling. A normal throughput run uses:
+
+- `LLAMA_JUPITER_PREFILL=1`
+- `LLAMA_JUPITER_PROFILE_STAGE=0`
+- `LLAMA_JUPITER_TRACE=0`
+- `LLAMA_JUPITER_WINDOW=2`
+- `LLAMA_JUPITER_LOGITS_TOP10=0`
+- `-lv 3` (keep server `prompt eval time` visible; Jupiter trace logs hidden)
+
+The old unconditional first-token top-10 sorting/printing in
+`tools/server/server-context.cpp` is now **opt-in** via
+`LLAMA_JUPITER_LOGITS_TOP10=1`. Rebuild the **PC** CLI after pulling that
+change; the phone RPC server does not need to be rebuilt.
+
+Run all three modes with separate fresh processes, 3 repeats each:
+
+```powershell
+cmake --build build-jupiter --config Release -j
+
+python .\tools\jupiter\run_prefill_bench.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --plan .\jupiter.plan `
+  --target-tokens 357 `
+  --pc-layers 25 `
+  --modes default,fixed64,dp `
+  --repeats 3 `
+  --out-dir .\jupiter-bench-formal
+```
+
+- `default`: no plan-file or sequence override; runtime uses its default
+  ubatch split.
+- `fixed64`: a valid 64-token-oriented sequence, generated for the exact
+  target length.
+- `dp`: `LLAMA_JUPITER_PLAN_FILE` points to the generated DP plan file;
+  the explicit sequence env override is absent.
+
+Before measuring, the runner verifies the two explicit plans in separate
+`-lv 4` runs (with stage profiling **off**) and stores
+`verify-fixed64.log` and `verify-dp.log`. These verification timings are
+never included in results. For actual measured runs, logs are captured to
+files without printing full CLI output to the terminal. The mode order
+rotates between repeats to reduce order/temperature bias.
+
+Outputs:
+
+```text
+jupiter-bench-formal/
+  configuration.json
+  verify-fixed64.log
+  verify-dp.log
+  default-r1.log
+  fixed64-r1.log
+  dp-r1.log
+  ...
+  results.csv
+  summary.txt
+```
+
+Use `--modes dp` to run only the DP policy, or `--resume` to reuse complete
+previous logs. The `--target-tokens` value must correspond to the actual
+prompt-length entry in the DP plan; the runner checks the measured token count
+for every run. Use a new output directory for a new official comparison.
+
+Offline checks:
+
+```powershell
+python -m unittest discover -s .\tools\jupiter -p test_run_prefill_bench.py -v
+```
+
+
 ## Sequence partition DP
 
 Input CSV:
