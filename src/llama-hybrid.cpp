@@ -28,6 +28,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -548,10 +549,47 @@ static bool llama_hybrid_profile_rpc_fence(ggml_backend_t backend, double & resu
     return true;
 }
 
+// Mirror the RPC GRAPH_COMPUTE serialization footprint without sending a
+// synthetic graph. rpc_tensor is packed in ggml-rpc.cpp; count every reachable
+// tensor once, matching serialize_graph/add_tensor for profile-owned inputs.
+static size_t llama_hybrid_rpc_graph_wire_bytes(
+        const ggml_cgraph * graph) {
+    if (graph == nullptr || graph->n_nodes <= 0) {
+        return 0;
+    }
+    std::unordered_set<const ggml_tensor *> seen;
+    std::function<void(const ggml_tensor *)> visit =
+        [&](const ggml_tensor * tensor) {
+            if (tensor == nullptr ||
+                    !seen.insert(tensor).second) {
+                return;
+            }
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                visit(tensor->src[i]);
+            }
+            visit(tensor->view_src);
+        };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        visit(graph->nodes[i]);
+    }
+
+    // Packed rpc_tensor fields: id/buffer/src/view_src/view_offs/data;
+    // type/ne/nb/op/op_params/flags; name and four-byte padding.
+    const size_t rpc_tensor_bytes =
+        sizeof(uint64_t) * (5 + GGML_MAX_SRC) +
+        sizeof(uint32_t) * (3 + 2 * GGML_MAX_DIMS) +
+        GGML_MAX_OP_PARAMS + GGML_MAX_NAME + 4;
+    return 2 * sizeof(uint32_t) + sizeof(uint64_t) +
+           sizeof(uint32_t) +
+           (size_t) graph->n_nodes * sizeof(uint64_t) +
+           seen.size() * rpc_tensor_bytes;
+}
+
 struct llama_hybrid_graph_timing {
     double wall_ms        = 0.0;
     double compute_est_ms = 0.0;
     double prepare_ms     = 0.0;
+    size_t rpc_graph_wire_bytes = 0;
 };
 
 static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backend,
@@ -707,6 +745,10 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
 
     result.wall_ms        = llama_hybrid_rpc_median(wall_samples);
     result.compute_est_ms = std::max(0.0, llama_hybrid_rpc_median(compute_samples));
+    if (rpc_fence != nullptr) {
+        result.rpc_graph_wire_bytes =
+            llama_hybrid_rpc_graph_wire_bytes(graph);
+    }
     return true;
 }
 
@@ -8631,12 +8673,17 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
             return false;
         }
 
-        profile.phone_blocks.push_back({ n_layers, tokens, tokens, timing.wall_ms, timing.compute_est_ms });
-        LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_COMPUTE] backend=%s kind=phone_block layers=%d tokens=%d kv_tokens=%d "
-            "wall_ms=%.3f compute_est_ms=%.3f per_layer_est_ms=%.3f\n",
-            ggml_backend_name(phone_backend), n_layers, tokens, tokens, timing.wall_ms, timing.compute_est_ms,
-            timing.compute_est_ms / n_layers);
+        profile.phone_blocks.push_back({
+            n_layers, tokens, tokens, timing.wall_ms,
+            timing.compute_est_ms, timing.rpc_graph_wire_bytes
+        });
+        LLAMA_LOG_ERROR(
+            "[HYBRID_PROFILE_DENSE_PHONE_GRAPH] layers=%d tokens=%d "
+            "rpc_graph_bytes=%zu wall_ms=%.3f compute_est_ms=%.3f "
+            "status=%s\n",
+            n_layers, tokens, timing.rpc_graph_wire_bytes,
+            timing.wall_ms, timing.compute_est_ms,
+            timing.rpc_graph_wire_bytes > 0 ? "READY" : "NO_WIRE_SHAPE");
     }
 
     return true;
@@ -8719,6 +8766,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
+    profile.dense_phone_region_capable =
+        ml.get_arch() == LLM_ARCH_QWEN3;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
         moe_desc.n_embd : ffn_desc.n_embd);
@@ -8775,6 +8824,17 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
                 cpu.get(), phone.get(), gpu.get())) {
             LLAMA_LOG_ERROR("%s: dense profiling failed\n", __func__);
             return false;
+        }
+        // One-layer and five-layer Dense graphs calibrate RPC submission
+        // size instead of importing an observed Qwen3-MoE P5 constant.
+        // Missing probes keep the old fixed-layout runtime available; the
+        // applying Planner below rejects a missing Dense calibration.
+        if (!llama_hybrid_profile_phone_blocks(
+                profile, attn_desc, ffn_desc, phone.get())) {
+            profile.phone_blocks.clear();
+            LLAMA_LOG_WARN(
+                "[HYBRID_PROFILE_DENSE_PHONE_GRAPH] "
+                "status=UNAVAILABLE action=KEEP_FIXED_RING\n");
         }
     }
 
