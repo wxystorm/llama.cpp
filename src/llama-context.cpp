@@ -5586,6 +5586,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         isolate_device_resources ? "DEVICE_FIFO_ISOLATED_SIMULATION" :
         device_fifo_simulation ? "DEVICE_FIFO_SIMULATION" : "COOPERATIVE_READY_QUEUE",
         (int) ret);
+    if (region_ring_meta_cpu_backend != nullptr) {
+        (void) ggml_backend_meta_cpu_task_set_outer_chunk(
+            region_ring_meta_cpu_backend, -1);
+        (void) ggml_backend_meta_cpu_task_set_frontier(
+            region_ring_meta_cpu_backend, -1);
+    }
     return ret == GGML_STATUS_SUCCESS && ready.all_done() ?
         result : nullptr;
 }
