@@ -525,8 +525,10 @@ struct jupiter_rpc_comm_worker {
     std::deque<task> tasks;
     uint64_t submitted = 0;
     uint64_t completed = 0;
+    uint64_t last_remote_synced = 0;
     bool stop = false;
     std::thread thread;
+    std::mutex remote_sync_mutex;
 
     explicit jupiter_rpc_comm_worker(const std::string & ep) :
         endpoint(ep),
@@ -648,14 +650,32 @@ struct jupiter_rpc_comm_worker {
     }
 
     bool synchronize_remote() {
-        flush();
-        const auto sock = compute_socket();
-        if (!sock) {
-            return false;
+        // The worker is the SOLE writer of compute_sock. Submitting a
+        // synchronization as a FIFO task avoids corrupting the stream if
+        // another thread is queuing the next graph or freeing a buffer.
+        std::lock_guard<std::mutex> sync_lock(remote_sync_mutex);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (submitted <= last_remote_synced) {
+                return true;
+            }
         }
-        rpc_msg_jupiter_rsp rsp {};
-        return send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
-                            &rsp, sizeof(rsp)) && rsp.ok == 1;
+        auto ok = std::make_shared<std::atomic<bool>>(false);
+        const uint64_t ticket = enqueue([this, ok]() {
+            const auto sock = compute_socket();
+            rpc_msg_jupiter_rsp rsp {};
+            const bool success = sock &&
+                send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
+                             &rsp, sizeof(rsp)) && rsp.ok == 1;
+            ok->store(success);
+            return success;
+        });
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&] { return completed >= ticket; });
+        if (ok->load()) {
+            last_remote_synced = ticket;
+        }
+        return ok->load();
     }
 };
 
