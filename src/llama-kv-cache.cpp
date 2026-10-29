@@ -713,6 +713,51 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
                 ? llama_jupiter::sequence_plan(balloc.get_n_tokens(), n_ubatch)
                 : std::vector<uint32_t> {};
 
+        // Calibration diagnostic: report exactly why a requested plan was
+        // accepted or rejected for the *decode batch*, not the outer CLI task.
+        // Enabled only when LLAMA_JUPITER_TRACE=1; regular inference unaffected.
+        const char * jupiter_trace = std::getenv("LLAMA_JUPITER_TRACE");
+        if (llama_jupiter::enabled() &&
+            jupiter_trace != nullptr && std::atoi(jupiter_trace) != 0 &&
+            balloc.get_n_tokens() > 2) {
+            const char * raw_plan = std::getenv("LLAMA_JUPITER_SEQUENCE_PLAN");
+            uint64_t requested_sum = 0;
+            uint32_t requested_max = 0;
+            size_t requested_k = 0;
+            const char * reason = "NO_EXPLICIT_PLAN";
+            if (raw_plan != nullptr && raw_plan[0] != '\0') {
+                const auto requested = llama_jupiter::parse_u32_list(raw_plan);
+                requested_k = requested.size();
+                for (const uint32_t x : requested) {
+                    requested_sum += x;
+                    requested_max = std::max(requested_max, x);
+                }
+                if (n_stream != 1) {
+                    reason = "MULTIPLE_KV_STREAMS";
+                } else if (requested_k == 0) {
+                    reason = "INVALID_CHUNKS";
+                } else if (requested_sum != balloc.get_n_tokens()) {
+                    reason = "TOKEN_SUM_MISMATCH";
+                } else if (requested_max > n_ubatch) {
+                    reason = "CHUNK_EXCEEDS_UBATCH";
+                } else {
+                    reason = !jupiter_chunks.empty() ? "APPLIED" : "UNKNOWN_REJECTION";
+                }
+            }
+            LLAMA_LOG_INFO(
+                    "[JUPITER_SEQUENCE_DECISION] batch_tokens=%u requested_sum=%llu "
+                    "requested_k=%zu requested_max=%u max_ubatch=%u n_stream=%u "
+                    "applied=%d reason=%s\n",
+                    balloc.get_n_tokens(),
+                    (unsigned long long) requested_sum,
+                    requested_k,
+                    requested_max,
+                    n_ubatch,
+                    n_stream,
+                    (int) !jupiter_chunks.empty(),
+                    reason);
+        }
+
         if (!jupiter_chunks.empty()) {
             LLAMA_LOG_INFO(
                     "[JUPITER_SEQUENCE_PLAN] mode=PAPER_DP total=%u k=%zu chunks=%s max_ubatch=%u\n",
