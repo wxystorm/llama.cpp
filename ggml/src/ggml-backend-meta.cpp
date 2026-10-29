@@ -4919,6 +4919,18 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
 
+                int directional_down_chunk = -1;
+                int directional_down_layer = -1;
+                const bool is_directional_prefill_down =
+                    ggml_backend_meta_parse_prefill_down_chunk(
+                        node->name,
+                        directional_down_chunk,
+                        directional_down_layer) &&
+                    (ggml_backend_meta_tensor_c2p_layer(
+                         backend_ctx, directional_down_layer) ||
+                     ggml_backend_meta_tensor_p2c_layer(
+                         backend_ctx, directional_down_layer));
+
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
                 const bool is_phone_primary_l_out =
@@ -4949,6 +4961,7 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
                     is_decode_result_norm ||
                     is_prefill_norm_chunk ||
+                    is_directional_prefill_down ||
                     is_phone_route_boundary ||
                     is_phone_primary_l_out ||
                     is_phone_region_end;
