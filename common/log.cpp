@@ -451,8 +451,28 @@ static int common_get_verbosity(enum ggml_log_level level) {
     }
 }
 
+// The offline Jupiter q(x,y) profiler needs only a few trace records to
+// reconstruct its sequence plan and per-device stage service times. Keep the
+// standard -lv 3 filtering for everything else, and only promote these
+// specific records when the q-sweep runner explicitly opts in.
+static bool common_log_is_jupiter_q_sweep_record(const char * text) {
+    const char * enabled = std::getenv("LLAMA_JUPITER_Q_SWEEP");
+    if (enabled == nullptr || std::atoi(enabled) == 0 || text == nullptr) {
+        return false;
+    }
+    return std::strstr(text, "[JUPITER_SEQUENCE_PLAN]")     != nullptr ||
+           std::strstr(text, "[JUPITER_SEQUENCE_DECISION]") != nullptr ||
+           std::strstr(text, "[JUPITER_UBATCH]")            != nullptr ||
+           std::strstr(text, "[JUPITER_STAGE_PROFILE]")     != nullptr;
+}
+
 void common_log_default_callback(enum ggml_log_level level, const char * text, void * /*user_data*/) {
     auto verbosity = common_get_verbosity(level);
+    if (level == GGML_LOG_LEVEL_INFO && verbosity > common_log_verbosity_thold &&
+        common_log_verbosity_thold >= LOG_LEVEL_INFO &&
+        common_log_is_jupiter_q_sweep_record(text)) {
+        verbosity = LOG_LEVEL_INFO;
+    }
     if (verbosity <= common_log_verbosity_thold) {
         common_log_add(common_log_main(), level, "%s", text);
     }
