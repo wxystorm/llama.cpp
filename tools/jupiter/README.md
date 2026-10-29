@@ -92,6 +92,13 @@ Each calibration point then starts a fresh `llama-cli` with stdin closed and
 `--single-turn --simple-io`, so one completed prompt exits before the next
 sweep point starts.
 
+The Python runner forces `-lv 4`, not `-lv 3`. In this version,
+`LLAMA_LOG_INFO` goes through `common_log_default_callback` as
+`LOG_LEVEL_TRACE (4)`; at verbosity 3 the `JUPITER_SEQUENCE_PLAN`,
+`JUPITER_UBATCH`, and `JUPITER_STAGE_PROFILE` records are hidden even if
+the runtime applied the plan correctly. A missing record at `-lv 3` is
+therefore not evidence of a plan failure.
+
 Example for the current 358-token Qwen3-14B experiment:
 
 ```powershell
