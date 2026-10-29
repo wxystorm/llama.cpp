@@ -1092,7 +1092,17 @@ static void ggml_backend_rpc_buffer_set_tensor(
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     if (jupiter_async_c2p_enabled()) {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t t0 = timing ? ggml_time_us() : 0;
         jupiter_comm_drain_endpoint(ctx->endpoint);
+        if (timing) {
+            const int64_t t1 = ggml_time_us();
+            GGML_LOG_INFO(
+                "[JUPITER_BUFFER_DRAIN] reason=FREE bytes=%zu "
+                "buffer=%" PRIu64 " wait_ms=%.3f t_us=%" PRId64 "\n",
+                ggml_backend_buffer_get_size(buffer), ctx->remote_ptr,
+                (t1 - t0)/1000.0, t1);
+        }
     }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
@@ -1103,7 +1113,16 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     if (jupiter_async_c2p_enabled()) {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t t0 = timing ? ggml_time_us() : 0;
         jupiter_comm_drain_endpoint(ctx->endpoint);
+        if (timing) {
+            const int64_t t1 = ggml_time_us();
+            GGML_LOG_INFO(
+                "[JUPITER_BUFFER_DRAIN] reason=GET bytes=%zu tensor=%s "
+                "wait_ms=%.3f t_us=%" PRId64 "\n",
+                size, tensor->name, (t1 - t0)/1000.0, t1);
+        }
     }
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
@@ -1277,7 +1296,17 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
 
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (rpc_ctx->comm) {
-        RPC_STATUS_ASSERT(rpc_ctx->comm->synchronize_remote());
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t t0 = timing ? ggml_time_us() : 0;
+        const bool ok = rpc_ctx->comm->synchronize_remote();
+        if (timing) {
+            const int64_t t1 = ggml_time_us();
+            GGML_LOG_INFO(
+                "[JUPITER_REMOTE_SYNC] reason=BACKEND wait_ms=%.3f "
+                "t_us=%" PRId64 " status=%s\n",
+                (t1 - t0)/1000.0, t1, ok ? "OK" : "FAIL");
+        }
+        RPC_STATUS_ASSERT(ok);
         return;
     }
     auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
@@ -1493,6 +1522,9 @@ static bool ggml_backend_rpc_cpy_tensor_async(
         return false;
     }
 
+    const bool timing = jupiter_timeline_enabled();
+    const bool trace = jupiter_trace_enabled();
+    const int64_t t0 = (timing || trace) ? ggml_time_us() : 0;
     const size_t bytes = ggml_nbytes(src);
     const rpc_tensor remote_dst = serialize_tensor(dst);
     const uint64_t offset = 0;
@@ -1500,16 +1532,31 @@ static bool ggml_backend_rpc_cpy_tensor_async(
     std::memcpy(payload.data(), &remote_dst, sizeof(remote_dst));
     std::memcpy(payload.data() + sizeof(remote_dst), &offset, sizeof(offset));
 
-    const int64_t t0 = jupiter_trace_enabled() ? ggml_time_us() : 0;
+    const int64_t t_alloc = timing ? ggml_time_us() : 0;
     ggml_backend_synchronize(backend_src);
+    const int64_t t_sync = timing ? ggml_time_us() : 0;
     ggml_backend_tensor_get(src,
         payload.data() + sizeof(remote_dst) + sizeof(offset), 0, bytes);
+    const int64_t t_read = timing ? ggml_time_us() : 0;
 
     const uint64_t task = ctx->comm->enqueue_c2p(std::move(payload), bytes);
-    if (jupiter_trace_enabled()) {
+    const int64_t t_queued = (timing || trace) ? ggml_time_us() : 0;
+    if (trace) {
         GGML_LOG_INFO("[JUPITER_COMM] action=C2P_ENQUEUE task=%" PRIu64
                       " bytes=%zu stage_ms=%.3f status=OK\n",
-                      task, bytes, (ggml_time_us() - t0)/1000.0);
+                      task, bytes, (t_queued - t0)/1000.0);
+    }
+    if (timing) {
+        GGML_LOG_INFO(
+            "[JUPITER_C2P_STAGE] task=%" PRIu64 " bytes=%zu src=%s dst=%s "
+            "backend=%s payload_alloc_ms=%.3f gpu_sync_ms=%.3f "
+            "device_read_ms=%.3f enqueue_wait_ms=%.3f stage_ms=%.3f "
+            "t_us=%" PRId64 "\n",
+            task, bytes, src->name, dst->name,
+            ggml_backend_name(backend_src),
+            (t_alloc - t0)/1000.0, (t_sync - t_alloc)/1000.0,
+            (t_read - t_sync)/1000.0, (t_queued - t_read)/1000.0,
+            (t_queued - t0)/1000.0, t_queued);
     }
     return true;
 }
@@ -1521,6 +1568,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
 
+    const bool timeline = jupiter_timeline_enabled();
+    const int64_t graph_prepare_begin_us = timeline ? ggml_time_us() : 0;
+    int64_t control_fence_us = 0;
     if (jupiter_prefill_enabled()) {
         // SET_TENSOR traffic uses the control/data lane while graph execution uses
         // the compute lane. Fence the control lane first so every activation write
@@ -1531,6 +1581,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                                            nullptr, 0,
                                            &fence_response, sizeof(fence_response));
         RPC_STATUS_ASSERT(fence_ok && fence_response.ok == 1);
+        if (timeline) {
+            control_fence_us = ggml_time_us() - graph_prepare_begin_us;
+        }
     }
 
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
@@ -1543,12 +1596,22 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             const rpc_msg_graph_recompute_req request {
                 rpc_ctx->device, graph_uid,
             };
-            task = rpc_ctx->comm->enqueue_graph_recompute(request);
+            task = rpc_ctx->comm->enqueue_graph_recompute(request, jupiter_slot);
         } else {
             std::vector<uint8_t> input;
             serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-            task = rpc_ctx->comm->enqueue_graph_build(std::move(input));
+            task = rpc_ctx->comm->enqueue_graph_build(std::move(input), graph_uid, jupiter_slot);
             rpc_dev_ctx->graph_uids.insert(graph_uid);
+        }
+        if (timeline) {
+            const int64_t t1 = ggml_time_us();
+            GGML_LOG_INFO(
+                "[JUPITER_GRAPH_PREPARE] task=%" PRIu64 " uid=%" PRIu64
+                " slot=%d reused=%d nodes=%d control_fence_ms=%.3f "
+                "graph_prepare_ms=%.3f t_us=%" PRId64 "\n",
+                task, graph_uid, jupiter_slot, (int) reuse, cgraph->n_nodes,
+                control_fence_us/1000.0,
+                (t1 - graph_prepare_begin_us - control_fence_us)/1000.0, t1);
         }
         if (jupiter_trace_enabled()) {
             GGML_LOG_INFO("[JUPITER_COMM] action=PHONE_GRAPH_QUEUED task=%" PRIu64
