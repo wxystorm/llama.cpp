@@ -1867,7 +1867,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     "[REGION_RING_LAYOUT] stage=%s executor=%s "
                     "layers=[%d,%d) status=READY\n",
                     llama_region_ring_stage_name(region.kind),
-                    llama_region_ring_device_name(region.device),
+                    llama_region_ring_stage_is_directional(region.kind) ?
+                        "META" :
+                        llama_region_ring_device_name(region.device),
                     region.layer_begin, region.layer_end);
             }
         }
