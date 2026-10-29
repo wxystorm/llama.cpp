@@ -107,6 +107,10 @@ struct llama_hybrid_phone_block_point {
 
     double wall_ms        = 0.0;
     double compute_est_ms = 0.0;
+    // Size of this synthetic Dense graph in the PC->RPC wire format.
+    // The value is obtained from the actual graph's reachable tensors,
+    // not from a fixed five-layer Qwen3-MoE graph.
+    size_t rpc_graph_wire_bytes = 0;
 };
 
 struct llama_hybrid_attn_desc {
@@ -148,6 +152,7 @@ struct llama_hybrid_attn_desc {
 
 struct llama_hybrid_profile {
     bool is_moe = false;
+    bool dense_phone_region_capable = false; // Qwen3 Dense stage graph only.
 
     int probe_tokens           = 0;
     int reference_tokens       = 0;
