@@ -573,6 +573,27 @@ extern "C" {
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
     GGML_API bool ggml_backend_meta_set_tensor_p2c_layer_mask(
         ggml_backend_t backend, const uint8_t * mask, size_t n_layers);
+
+    // Directional Region Ring P2C may finish its Phone producer before the
+    // outer stage is allowed to publish downstream READY. Arm applies to the
+    // next Meta graph_compute only. If that graph creates a deferred P2C
+    // producer, take() returns a ticket and wait() performs the final host join
+    // into the caller-owned stage output buffer.
+    struct ggml_backend_meta_p2c_deferred_ticket {
+        uint64_t id;
+        size_t bytes;
+    };
+    GGML_API bool ggml_backend_meta_p2c_deferred_arm(
+        ggml_backend_t backend);
+    GGML_API bool ggml_backend_meta_p2c_deferred_take(
+        ggml_backend_t backend,
+        struct ggml_backend_meta_p2c_deferred_ticket * ticket);
+    GGML_API bool ggml_backend_meta_p2c_deferred_wait(
+        ggml_backend_t backend,
+        uint64_t ticket,
+        void * output,
+        size_t bytes);
+
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 

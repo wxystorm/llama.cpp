@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -62,6 +63,16 @@ static const char * llama_hybrid_boundary_action_name(llama_hybrid_boundary_acti
     }
     return "UNKNOWN";
 }
+
+struct llama_region_ring_p2c_deferred {
+    bool active = false;
+    ggml_backend_t backend = nullptr;
+    uint64_t ticket = 0;
+    size_t bytes = 0;
+};
+
+static thread_local llama_region_ring_p2c_deferred
+    llama_region_ring_tls_p2c_deferred;
 
 static void llama_hybrid_log_formal_prepare_prediction(
         uint32_t tokens,
@@ -2439,6 +2450,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_cpu_wait_us,
         int64_t *                          ring_cuda_wait_us,
         bool                               preserve_weight_cache_on_graph_reset) {
+    llama_region_ring_tls_p2c_deferred = {};
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -2702,6 +2714,11 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             const bool directional_meta_stage =
                 stage.kind == llama_hybrid_runtime_stage_kind::C2P ||
                 stage.kind == llama_hybrid_runtime_stage_kind::P2C;
+            const bool c2p_island_returns_pc =
+                stage.kind == llama_hybrid_runtime_stage_kind::C2P &&
+                stage.layer_end > stage.layer_begin &&
+                model.hybrid_layer_mode(stage.layer_end - 1) ==
+                    llama_hybrid_layer_mode::TENSOR_P2C;
             const bool target_uses_cpu =
                 target_is_cpu ||
                 (ring_lane == 2 && directional_meta_stage &&
@@ -2750,11 +2767,6 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
 
             if (directional_meta_stage && block_index == 0) {
-                const bool c2p_island_returns_pc =
-                    stage.kind == llama_hybrid_runtime_stage_kind::C2P &&
-                    stage.layer_end > stage.layer_begin &&
-                    model.hybrid_layer_mode(stage.layer_end - 1) ==
-                        llama_hybrid_layer_mode::TENSOR_P2C;
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_DIRECTIONAL_GATE] stage=%zu kind=%s "
                     "layers=[%d,%d) block=%zu executor=META "
@@ -2851,10 +2863,52 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 stage_index, block_index, ring_lane, split, n_splits,
                 target ? ggml_backend_name(target) : "NULL");
 
-            ret = ggml_backend_sched_compute_split(sched_use, split);
-            if (ret == GGML_STATUS_SUCCESS) {
+            const bool p2c_defer_arm =
+                block_tokens > 1 &&
+                ring_lane == 2 &&
+                c2p_island_returns_pc &&
+                ggml_backend_is_meta(target) &&
+                ggml_backend_meta_p2c_deferred_arm(
+                    target);
+
+            ret = ggml_backend_sched_compute_split(
+                sched_use, split);
+
+            bool p2c_deferred_split = false;
+            if (ret == GGML_STATUS_SUCCESS &&
+                    p2c_defer_arm) {
+                ggml_backend_meta_p2c_deferred_ticket
+                    ticket {};
+                if (ggml_backend_meta_p2c_deferred_take(
+                        target, &ticket)) {
+                    llama_region_ring_tls_p2c_deferred.active =
+                        true;
+                    llama_region_ring_tls_p2c_deferred.backend =
+                        target;
+                    llama_region_ring_tls_p2c_deferred.ticket =
+                        ticket.id;
+                    llama_region_ring_tls_p2c_deferred.bytes =
+                        ticket.bytes;
+                    p2c_deferred_split = true;
+                    all_splits_synchronized = false;
+
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_P2C_PRODUCER] "
+                        "stage=%zu block=%zu ticket=%" PRIu64
+                        " bytes=%zu state=P2C_WAITING "
+                        "downstream=BLOCKED next_chunk=RELEASABLE "
+                        "status=READY\n",
+                        stage_index,
+                        block_index,
+                        ticket.id,
+                        ticket.bytes);
+                }
+            }
+
+            if (ret == GGML_STATUS_SUCCESS &&
+                    !p2c_deferred_split) {
                 ggml_backend_synchronize(target);
-            } else {
+            } else if (ret != GGML_STATUS_SUCCESS) {
                 all_splits_synchronized = false;
             }
 
@@ -2894,6 +2948,34 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
     if (ret != GGML_STATUS_SUCCESS) {
         return nullptr;
+    }
+
+    if (llama_region_ring_tls_p2c_deferred.active) {
+        const size_t expected_bytes =
+            (size_t) block_tokens *
+            (size_t) model.hparams.n_embd *
+            sizeof(float);
+        if (stage_output == nullptr ||
+                llama_region_ring_tls_p2c_deferred.bytes !=
+                    expected_bytes) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_P2C_PRODUCER] "
+                "stage=%zu block=%zu ticket=%" PRIu64
+                " bytes=%zu expected=%zu "
+                "status=REJECT reason=OUTPUT_SHAPE\n",
+                stage_index,
+                block_index,
+                llama_region_ring_tls_p2c_deferred.ticket,
+                llama_region_ring_tls_p2c_deferred.bytes,
+                expected_bytes);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+
+        // The stage output is not readable yet. The outer Region Ring owns the
+        // stable host edge buffer and a dedicated join worker will fill it
+        // before publishing downstream READY.
+        return result;
     }
 
     if (stage_output != nullptr) {
@@ -4002,7 +4084,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "kv_views=PER_DEVICE activation_buffer=FULL_BATCH_PER_EDGE "
             "slot_limit=NONE legacy_slot_pool=%zu backend=%s "
             "graph_overlap=%s input=%s bank_mover=%s status=READY\n",
-            gpu_bank_streaming ? 4 : 3,
+            3 +
+                (gpu_bank_streaming ? 1 : 0) +
+                (directional_runtime && pc_phone_overlap ? 2 : 0),
             slot_pool_size,
             pc_phone_overlap ? "PREPARE_PLUS_CPU_CUDA_META" : "SHARED_GATED",
             pc_phone_overlap ? "MEASURED" : "0",
@@ -4391,6 +4475,97 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
 
+        struct p2c_join_job {
+            llama_region_ring_task task;
+            ggml_backend_t backend = nullptr;
+            uint64_t ticket = 0;
+            float * output = nullptr;
+            size_t bytes = 0;
+            int64_t queued_us = 0;
+        };
+        std::mutex p2c_join_mutex;
+        std::condition_variable p2c_join_cv;
+        std::deque<p2c_join_job> p2c_join_jobs;
+        bool p2c_join_stop = false;
+        std::atomic<bool> p2c_join_failed { false };
+        std::atomic<size_t> p2c_join_completed { 0 };
+
+        auto run_p2c_joiner = [&](size_t joiner) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_P2C_JOINER] worker=%zu "
+                "event=START role=RETURN_REDUCE status=READY\n",
+                joiner);
+            while (true) {
+                p2c_join_job job;
+                {
+                    std::unique_lock<std::mutex> lock(
+                        p2c_join_mutex);
+                    p2c_join_cv.wait(
+                        lock,
+                        [&]() {
+                            return p2c_join_stop ||
+                                !p2c_join_jobs.empty();
+                        });
+                    if (p2c_join_stop &&
+                            p2c_join_jobs.empty()) {
+                        break;
+                    }
+                    job = p2c_join_jobs.front();
+                    p2c_join_jobs.pop_front();
+                }
+
+                const int64_t begin_us =
+                    ggml_time_us();
+                bool ok = false;
+                try {
+                    ok =
+                        ggml_backend_meta_p2c_deferred_wait(
+                            job.backend,
+                            job.ticket,
+                            job.output,
+                            job.bytes);
+                    if (ok) {
+                        ready.complete_deferred(job.task);
+                        p2c_join_completed.fetch_add(
+                            1,
+                            std::memory_order_relaxed);
+                    }
+                } catch (...) {
+                    ok = false;
+                }
+
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_P2C_JOIN] worker=%zu "
+                    "region=%zu chunk=%zu ticket=%" PRIu64
+                    " bytes=%zu queue_ms=%.3f wall_ms=%.3f "
+                    "publish=%s status=%s\n",
+                    joiner,
+                    job.task.region,
+                    job.task.chunk,
+                    job.ticket,
+                    job.bytes,
+                    (begin_us - job.queued_us) / 1000.0,
+                    (ggml_time_us() - begin_us) / 1000.0,
+                    ok ? "DOWNSTREAM_READY" : "BLOCKED",
+                    ok ? "OK" : "FAIL");
+
+                if (!ok) {
+                    p2c_join_failed.store(
+                        true,
+                        std::memory_order_relaxed);
+                    ready.cancel();
+                    break;
+                }
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_P2C_JOINER] worker=%zu "
+                "event=END status=%s\n",
+                joiner,
+                p2c_join_failed.load(
+                    std::memory_order_relaxed) ?
+                    "FAIL" : "DONE");
+        };
+
         auto run_worker = [&](size_t dev) {
             auto & state = worker_states[dev];
             const auto device = devices[dev];
@@ -4776,6 +4951,79 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
 
+                    if (llama_region_ring_tls_p2c_deferred.active) {
+                        const auto deferred =
+                            llama_region_ring_tls_p2c_deferred;
+                        llama_region_ring_tls_p2c_deferred = {};
+
+                        const size_t expected_bytes =
+                            (size_t) task.n_tokens *
+                            (size_t) n_embd *
+                            sizeof(float);
+                        if (dev !=
+                                (size_t)
+                                    llama_region_ring_device::PHONE ||
+                                output == nullptr ||
+                                deferred.backend == nullptr ||
+                                deferred.ticket == 0 ||
+                                deferred.bytes !=
+                                    expected_bytes) {
+                            state.status =
+                                GGML_STATUS_FAILED;
+                            LLAMA_LOG_ERROR(
+                                "[REGION_RING_P2C_DEFER] "
+                                "region=%zu chunk=%zu ticket=%" PRIu64
+                                " bytes=%zu expected=%zu "
+                                "status=REJECT reason=CONTRACT\n",
+                                task.region,
+                                task.chunk,
+                                deferred.ticket,
+                                deferred.bytes,
+                                expected_bytes);
+                            ready.fail(task);
+                            active_task.reset();
+                            break;
+                        }
+
+                        p2c_join_job job;
+                        job.task = task;
+                        job.backend =
+                            deferred.backend;
+                        job.ticket =
+                            deferred.ticket;
+                        job.output = output;
+                        job.bytes =
+                            deferred.bytes;
+                        job.queued_us =
+                            ggml_time_us();
+
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                p2c_join_mutex);
+                            p2c_join_jobs.push_back(job);
+                        }
+
+                        // This is the split completion point: same-island
+                        // chunk N+1 may run, but downstream Region N remains
+                        // blocked until the joiner publishes complete_deferred.
+                        ready.defer(task);
+                        p2c_join_cv.notify_one();
+
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_P2C_DEFER] "
+                            "region=%zu chunk=%zu ticket=%" PRIu64
+                            " bytes=%zu state=P2C_WAITING "
+                            "next_chunk=RELEASED downstream=BLOCKED "
+                            "status=QUEUED\n",
+                            task.region,
+                            task.chunk,
+                            job.ticket,
+                            job.bytes);
+
+                        active_task.reset();
+                        continue;
+                    }
+
                     ready.complete(task);
                     const bool gpu_region_drained =
                         dev == 1 && gpu_bank_streaming &&
@@ -4867,6 +5115,34 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 (int) state.status);
         };
 
+        std::array<std::thread, 2> p2c_join_threads;
+        size_t p2c_join_started = 0;
+        size_t p2c_join_joined = 0;
+        const bool p2c_join_requested =
+            directional_runtime && pc_phone_overlap;
+        if (p2c_join_requested) {
+            try {
+                for (size_t i = 0;
+                     i < p2c_join_threads.size();
+                     ++i) {
+                    p2c_join_threads[i] =
+                        std::thread(
+                            run_p2c_joiner, i);
+                    ++p2c_join_started;
+                }
+            } catch (...) {
+                p2c_join_failed.store(
+                    true,
+                    std::memory_order_relaxed);
+                ready.cancel();
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_P2C_JOINER] "
+                    "event=LAUNCH_FAIL created=%zu expected=2 "
+                    "status=FAIL\n",
+                    p2c_join_started);
+            }
+        }
+
         std::vector<std::thread> workers;
         bool launched_all = false;
         try {
@@ -4892,6 +5168,43 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ++joined;
             }
         }
+        if (p2c_join_requested) {
+            {
+                std::lock_guard<std::mutex> lock(
+                    p2c_join_mutex);
+                p2c_join_stop = true;
+            }
+            p2c_join_cv.notify_all();
+            for (auto & worker : p2c_join_threads) {
+                if (worker.joinable()) {
+                    worker.join();
+                    ++p2c_join_joined;
+                }
+            }
+            if (p2c_join_started !=
+                    p2c_join_threads.size() ||
+                    p2c_join_joined !=
+                        p2c_join_started ||
+                    p2c_join_failed.load(
+                        std::memory_order_relaxed)) {
+                if (ret ==
+                        GGML_STATUS_SUCCESS) {
+                    ret = GGML_STATUS_FAILED;
+                }
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_P2C_JOINER_SUM] "
+                "created=%zu joined=%zu completed=%zu "
+                "status=%s\n",
+                p2c_join_started,
+                p2c_join_joined,
+                p2c_join_completed.load(
+                    std::memory_order_relaxed),
+                p2c_join_failed.load(
+                    std::memory_order_relaxed) ?
+                    "FAIL" : "PASS");
+        }
+
         if (gpu_bank_mover_started) {
             {
                 std::lock_guard<std::mutex> lock(
@@ -4937,6 +5250,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = worker_states[dev].status;
             }
         }
+        executed +=
+            p2c_join_completed.load(
+                std::memory_order_relaxed);
         result = worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
         if (!launched_all || created != devices.size() ||
             joined != devices.size() || ready.failed() || !ready.all_done() ||
@@ -4962,7 +5278,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_bank_mover_joined ? 1 : 0,
             ready.finished(), executed,
             worker_states[0].completed, worker_states[1].completed,
-            worker_states[2].completed,
+            worker_states[2].completed +
+                p2c_join_completed.load(
+                    std::memory_order_relaxed),
             pc_phone_overlap ? "PREPARE_PLUS_PER_BACKEND" : "CONTEXT_SHARED",
             pc_phone_overlap ? "MEASURED" : "0",
             result == res_use && result != nullptr ? "MAIN" : "INVALID",

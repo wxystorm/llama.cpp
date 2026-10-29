@@ -2373,6 +2373,10 @@ struct ggml_backend_meta_context {
         // lets network return overlap the PC worker without overwriting an
         // earlier partial before the layer-tail ADD.
         std::vector<ggml_backend_buffer_ptr> prefill_phone_return_stage_bufs;
+        // Two persistent Phone-side folded P2C outputs. A RETURN lane owns its
+        // slot until the outer Region join consumes the matching ticket.
+        std::array<ggml_backend_buffer_ptr, PREFILL_RETURN_LANES>
+            p2c_phone_return_stage_bufs;
 
         // Complete Phone Region (L35-L45) pipeline storage. The stock gallocr
         // intentionally reuses its compute arena according to SERIAL graph
@@ -2477,6 +2481,25 @@ struct ggml_backend_meta_context {
     // the Phone compute/control socket.
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         p2c_return_workers { nullptr, nullptr };
+
+    struct p2c_deferred_state {
+        uint64_t ticket = 0;
+        size_t lane = 0;
+        int layer = -1;
+        int chunk = -1;
+        uint64_t return_task = 0;
+        size_t bytes = 0;
+        int64_t submit_us = 0;
+        std::shared_ptr<std::vector<uint8_t>> pc_partial;
+        std::shared_ptr<std::vector<uint8_t>> phone_fold;
+    };
+    std::mutex p2c_deferred_mutex;
+    bool p2c_defer_armed = false;
+    uint64_t p2c_deferred_published = 0;
+    std::array<uint64_t, PREFILL_RETURN_LANES>
+        p2c_deferred_lane_ticket { 0, 0 };
+    std::map<uint64_t, std::shared_ptr<p2c_deferred_state>>
+        p2c_deferred_states;
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -3292,6 +3315,15 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     GGML_ASSERT(cgraph->grads == nullptr);
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
+
+    bool p2c_defer_requested = false;
+    {
+        std::lock_guard<std::mutex> lock(
+            backend_ctx->p2c_deferred_mutex);
+        p2c_defer_requested =
+            backend_ctx->p2c_defer_armed;
+        backend_ctx->p2c_defer_armed = false;
+    }
 
     ggml_backend_rpc_snapshot_stats rpc_snapshot_stats_begin {};
     ggml_backend_rpc_get_snapshot_stats_t rpc_snapshot_stats_getter = nullptr;
@@ -10640,8 +10672,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             size_t p2c_return_lane = 0;
             std::shared_ptr<std::vector<uint8_t>>
                 p2c_return_payload;
+            std::shared_ptr<std::vector<uint8_t>>
+                p2c_pc_partial_payload;
+            std::shared_ptr<ggml_tensor>
+                p2c_return_src_hold;
             int64_t p2c_return_submit_us = 0;
+            int64_t p2c_pc_stage_us = 0;
             bool p2c_return_prefetch_used = false;
+            bool p2c_deferred_active = false;
+            bool p2c_deferred_lane_reserved = false;
+
+            auto release_p2c_deferred_lane = [&]() {
+                if (!p2c_deferred_lane_reserved) {
+                    return;
+                }
+                std::lock_guard<std::mutex> lock(
+                    backend_ctx->p2c_deferred_mutex);
+                if (p2c_return_lane <
+                        backend_ctx->p2c_deferred_lane_ticket.size() &&
+                        backend_ctx->p2c_deferred_lane_ticket[
+                            p2c_return_lane] == p2c_return_seq) {
+                    backend_ctx->p2c_deferred_lane_ticket[
+                        p2c_return_lane] = 0;
+                }
+                p2c_deferred_lane_reserved = false;
+            };
 
             if (!local_main_partial) {
                 const ggml_backend_rpc_get_tensor_return_wait_t
@@ -10652,27 +10707,13 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     p2c_mark_ready =
                         ggml_backend_meta_get_phone_ffn_mark_ready(
                             phone_cfg.backend);
-                // prefill_down_chunk_0 is local to one Outer Ring stage and
-                // is commonly 0 for every macro chunk. Use a context-level
-                // round-robin instead so the two physical RETURN lanes really
-                // alternate across outer chunks.
-                p2c_return_lane =
-                    backend_ctx->next_p2c_return_lane++ %
-                    ggml_backend_meta_context::PREFILL_RETURN_LANES;
-                const bool p2c_return_capable =
+
+                const bool p2c_base_capable =
                     p2c_return_get != nullptr &&
                     p2c_mark_ready != nullptr &&
-                    p2c_return_get(
-                        phone_cfg.backend,
-                        nullptr,
-                        nullptr,
-                        0,
-                        0,
-                        p2c_return_lane) &&
-                    p2c_mark_ready(
-                        phone_cfg.backend, 0);
+                    p2c_mark_ready(phone_cfg.backend, 0);
 
-                if (p2c_return_capable) {
+                if (p2c_base_capable) {
                     constexpr uint64_t P2C_RETURN_SEQ_PREFIX =
                         UINT64_C(0xC000000000000000);
                     constexpr uint64_t P2C_RETURN_SEQ_MASK =
@@ -10692,6 +10733,132 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         P2C_RETURN_SEQ_PREFIX | local_seq;
                 }
 
+                const size_t first_lane =
+                    backend_ctx->next_p2c_return_lane++ %
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                bool p2c_return_capable = false;
+
+                const bool defer_candidate =
+                    p2c_defer_requested &&
+                    p2c_base_capable &&
+                    !c2p_self_check &&
+                    pc_partial->type == GGML_TYPE_F32 &&
+                    phone_partial->type == GGML_TYPE_F32 &&
+                    residual_chunk->type == GGML_TYPE_F32;
+
+                if (defer_candidate) {
+                    for (size_t attempt = 0;
+                         attempt <
+                            ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                         ++attempt) {
+                        const size_t lane =
+                            (first_lane + attempt) %
+                            ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                        if (!p2c_return_get(
+                                phone_cfg.backend,
+                                nullptr,
+                                nullptr,
+                                0,
+                                0,
+                                lane)) {
+                            continue;
+                        }
+
+                        bool reserved = false;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                backend_ctx->p2c_deferred_mutex);
+                            if (backend_ctx->p2c_deferred_lane_ticket[
+                                    lane] == 0) {
+                                backend_ctx->p2c_deferred_lane_ticket[
+                                    lane] = p2c_return_seq;
+                                reserved = true;
+                            }
+                        }
+                        if (!reserved) {
+                            continue;
+                        }
+
+                        p2c_return_lane = lane;
+                        p2c_return_capable = true;
+                        p2c_deferred_active = true;
+                        p2c_deferred_lane_reserved = true;
+                        break;
+                    }
+                } else if (p2c_base_capable) {
+                    p2c_return_lane = first_lane;
+                    p2c_return_capable =
+                        p2c_return_get(
+                            phone_cfg.backend,
+                            nullptr,
+                            nullptr,
+                            0,
+                            0,
+                            p2c_return_lane);
+                }
+
+                if (p2c_defer_requested && !p2c_deferred_active &&
+                        std::getenv("GGML_P2C_RETURN_PROFILE") != nullptr) {
+                    printf(
+                        "[REGION_P2C_DEFER_FALLBACK] "
+                        "layer=%d chunk=%d reason=%s action=SYNC\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        defer_candidate ?
+                            "RETURN_LANES_BUSY_OR_UNAVAILABLE" :
+                            "UNSUPPORTED_SHAPE_OR_PROFILE");
+                }
+
+                if (p2c_deferred_active) {
+                    const size_t bytes =
+                        ggml_nbytes(phone_partial);
+                    auto & stage_buf =
+                        phone_cfg.p2c_phone_return_stage_bufs[
+                            p2c_return_lane];
+                    if (!stage_buf ||
+                            ggml_backend_buffer_get_size(
+                                stage_buf.get()) < bytes) {
+                        stage_buf.reset(
+                            ggml_backend_alloc_buffer(
+                                phone_cfg.backend,
+                                bytes));
+                    }
+                    if (!stage_buf) {
+                        release_p2c_deferred_lane();
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    // The graph-local fold tensor is normally an in-place
+                    // view. For deferred P2C, make its output lane-private so
+                    // the next outer chunk may rebuild/reuse graph arenas
+                    // without overwriting the payload still in flight.
+                    phone_fold->view_src = nullptr;
+                    phone_fold->view_offs = 0;
+                    phone_fold->buffer = stage_buf.get();
+                    phone_fold->data =
+                        ggml_backend_buffer_get_base(
+                            stage_buf.get());
+
+                    p2c_return_src_hold =
+                        std::make_shared<ggml_tensor>(
+                            *phone_fold);
+
+                    p2c_pc_partial_payload =
+                        std::make_shared<std::vector<uint8_t>>(
+                            bytes);
+                    const int64_t pc_stage_begin_us =
+                        ggml_time_us();
+                    ggml_backend_synchronize(
+                        pc_cfg.backend);
+                    ggml_backend_tensor_get(
+                        pc_partial,
+                        p2c_pc_partial_payload->data(),
+                        0,
+                        bytes);
+                    p2c_pc_stage_us =
+                        ggml_time_us() - pc_stage_begin_us;
+                }
+
                 const int64_t phone_fold_begin_us =
                     ggml_time_us();
                 ggml_backend_synchronize(phone_cfg.backend);
@@ -10699,13 +10866,14 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     ggml_backend_graph_compute_async(
                         phone_cfg.backend, phone_fold_graph);
                 if (status != GGML_STATUS_SUCCESS) {
+                    release_p2c_deferred_lane();
                     return status;
                 }
 
                 // Publish producer completion on the ordered compute socket.
-                // The independent RETURN lane is allowed to issue its GET
-                // immediately, but the Phone handler cannot read the tensor
-                // until this marker becomes visible after the fold graph.
+                // RETURN_TRANSFER may already be blocked in wait_ready_seq(),
+                // but it cannot read the lane-private folded tensor until this
+                // marker executes after the Phone fold graph.
                 if (p2c_return_capable &&
                         p2c_mark_ready(
                             phone_cfg.backend,
@@ -10726,7 +10894,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const ggml_backend_t phone_backend =
                         phone_cfg.backend;
                     const ggml_tensor * return_src =
-                        phone_partial;
+                        p2c_deferred_active ?
+                            p2c_return_src_hold.get() :
+                            phone_partial;
+                    const auto return_src_keepalive =
+                        p2c_return_src_hold;
                     const auto return_get =
                         p2c_return_get;
                     const auto return_payload =
@@ -10744,6 +10916,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             [return_get,
                              phone_backend,
                              return_src,
+                             return_src_keepalive,
                              return_payload,
                              return_seq,
                              return_lane,
@@ -10752,6 +10925,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                              pipeline_debug,
                              tensor_phone_stage_profile]
                             (uint64_t task_id) -> ggml_status {
+                                GGML_UNUSED(return_src_keepalive);
                                 const int64_t begin_us =
                                     ggml_time_us();
                                 const bool ok =
@@ -10805,11 +10979,92 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                             p2c_return_seq,
                             p2c_return_payload->size());
                     }
+                } else if (p2c_deferred_active) {
+                    release_p2c_deferred_lane();
+                    return GGML_STATUS_FAILED;
                 }
 
-                ggml_backend_synchronize(phone_cfg.backend);
+                if (!p2c_deferred_active) {
+                    ggml_backend_synchronize(
+                        phone_cfg.backend);
+                }
                 phone_fold_us =
                     ggml_time_us() - phone_fold_begin_us;
+
+                if (p2c_deferred_active &&
+                        p2c_return_prefetch_used) {
+                    auto deferred =
+                        std::make_shared<
+                            ggml_backend_meta_context::
+                                p2c_deferred_state>();
+                    deferred->ticket = p2c_return_seq;
+                    deferred->lane = p2c_return_lane;
+                    deferred->layer = prefill_down_layer_0;
+                    deferred->chunk = prefill_down_chunk_0;
+                    deferred->return_task =
+                        p2c_return_task;
+                    deferred->bytes =
+                        p2c_return_payload->size();
+                    deferred->submit_us =
+                        p2c_return_submit_us;
+                    deferred->pc_partial =
+                        p2c_pc_partial_payload;
+                    deferred->phone_fold =
+                        p2c_return_payload;
+
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            backend_ctx->p2c_deferred_mutex);
+                        if (backend_ctx->
+                                p2c_deferred_published != 0 ||
+                                backend_ctx->
+                                    p2c_deferred_states.count(
+                                        p2c_return_seq) != 0) {
+                            release_p2c_deferred_lane();
+                            return GGML_STATUS_FAILED;
+                        }
+                        backend_ctx->p2c_deferred_states[
+                            p2c_return_seq] = deferred;
+                        backend_ctx->p2c_deferred_published =
+                            p2c_return_seq;
+                    }
+                    p2c_deferred_lane_reserved = false;
+
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile ||
+                            std::getenv(
+                                "GGML_P2C_RETURN_PROFILE") != nullptr) {
+                        printf(
+                            "[REGION_P2C_PRODUCER] "
+                            "layer=%d chunk=%d ticket=%" PRIu64
+                            " lane=%zu bytes=%zu "
+                            "pc_stage_ms=%.3f fold_submit_ms=%.3f "
+                            "state=P2C_WAITING status=OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            p2c_return_seq,
+                            p2c_return_lane,
+                            deferred->bytes,
+                            p2c_pc_stage_us / 1000.0,
+                            phone_fold_us / 1000.0);
+                        printf(
+                            "[REGION_P2C_PREFILL] "
+                            "layer=%d chunk=%d last=%d bytes=%zu "
+                            "phone_fold_ms=%.3f copy_ms=0.000 "
+                            "pc_reduce_ms=0.000 owner=PC "
+                            "source=DEFERRED_RETURN status=QUEUED\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            last_chunk ? 1 : 0,
+                            deferred->bytes,
+                            phone_fold_us / 1000.0);
+                    }
+
+                    // Do not consume the return here. The outer Region Ring
+                    // will release the next island chunk, while downstream
+                    // READY remains blocked on the deferred join ticket.
+                    return GGML_STATUS_SUCCESS;
+                }
             }
 
             const ggml_backend_rpc_phone_region_partial_get_t
@@ -20857,6 +21112,181 @@ bool ggml_backend_meta_set_tensor_p2c_layer_mask(
             "[META_P2C_POLICY_MASK] layers=%zu selected=%zu "
             "first=%d last=%d\n",
             n_layers, selected, first, last);
+    }
+    return true;
+}
+
+bool ggml_backend_meta_p2c_deferred_arm(
+        ggml_backend_t backend) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    std::lock_guard<std::mutex> lock(
+        backend_ctx->p2c_deferred_mutex);
+    if (backend_ctx->p2c_defer_armed ||
+            backend_ctx->p2c_deferred_published != 0) {
+        return false;
+    }
+    backend_ctx->p2c_defer_armed = true;
+    return true;
+}
+
+bool ggml_backend_meta_p2c_deferred_take(
+        ggml_backend_t backend,
+        ggml_backend_meta_p2c_deferred_ticket * ticket) {
+    if (!ggml_backend_is_meta(backend) ||
+            ticket == nullptr) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    std::lock_guard<std::mutex> lock(
+        backend_ctx->p2c_deferred_mutex);
+    const uint64_t id =
+        backend_ctx->p2c_deferred_published;
+    if (id == 0) {
+        return false;
+    }
+    auto it =
+        backend_ctx->p2c_deferred_states.find(id);
+    if (it ==
+            backend_ctx->p2c_deferred_states.end() ||
+            it->second == nullptr) {
+        return false;
+    }
+    ticket->id = id;
+    ticket->bytes = it->second->bytes;
+    backend_ctx->p2c_deferred_published = 0;
+    return true;
+}
+
+bool ggml_backend_meta_p2c_deferred_wait(
+        ggml_backend_t backend,
+        uint64_t ticket,
+        void * output,
+        size_t bytes) {
+    if (!ggml_backend_is_meta(backend) ||
+            ticket == 0 || output == nullptr) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+
+    std::shared_ptr<
+        ggml_backend_meta_context::p2c_deferred_state>
+        state;
+    {
+        std::lock_guard<std::mutex> lock(
+            backend_ctx->p2c_deferred_mutex);
+        auto it =
+            backend_ctx->p2c_deferred_states.find(
+                ticket);
+        if (it ==
+                backend_ctx->p2c_deferred_states.end() ||
+                it->second == nullptr) {
+            return false;
+        }
+        state = it->second;
+    }
+
+    if (state->bytes != bytes ||
+            state->bytes == 0 ||
+            (state->bytes % sizeof(float)) != 0 ||
+            state->pc_partial == nullptr ||
+            state->phone_fold == nullptr ||
+            state->pc_partial->size() != state->bytes ||
+            state->phone_fold->size() != state->bytes ||
+            state->lane >=
+                ggml_backend_meta_context::
+                    PREFILL_RETURN_LANES) {
+        return false;
+    }
+
+    ggml_backend_meta_transfer_worker * worker =
+        backend_ctx->p2c_return_workers[
+            state->lane];
+    if (worker == nullptr ||
+            state->return_task == 0) {
+        return false;
+    }
+
+    const int64_t wait_begin_us =
+        ggml_time_us();
+    const ggml_status return_status =
+        worker->wait(state->return_task);
+    const int64_t return_wait_us =
+        ggml_time_us() - wait_begin_us;
+    if (return_status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+
+    const int64_t add_begin_us =
+        ggml_time_us();
+    uint8_t * dst =
+        static_cast<uint8_t *>(output);
+    const uint8_t * pc =
+        state->pc_partial->data();
+    const uint8_t * phone =
+        state->phone_fold->data();
+    const size_t n =
+        state->bytes / sizeof(float);
+    for (size_t i = 0; i < n; ++i) {
+        float a = 0.0f;
+        float b = 0.0f;
+        std::memcpy(
+            &a, pc + i * sizeof(float),
+            sizeof(float));
+        std::memcpy(
+            &b, phone + i * sizeof(float),
+            sizeof(float));
+        const float sum = a + b;
+        std::memcpy(
+            dst + i * sizeof(float),
+            &sum, sizeof(float));
+    }
+    const int64_t add_us =
+        ggml_time_us() - add_begin_us;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            backend_ctx->p2c_deferred_mutex);
+        auto it =
+            backend_ctx->p2c_deferred_states.find(
+                ticket);
+        if (it !=
+                backend_ctx->p2c_deferred_states.end()) {
+            backend_ctx->p2c_deferred_states.erase(it);
+        }
+        if (backend_ctx->p2c_deferred_lane_ticket[
+                state->lane] == ticket) {
+            backend_ctx->p2c_deferred_lane_ticket[
+                state->lane] = 0;
+        }
+    }
+
+    if (std::getenv(
+            "GGML_P2C_RETURN_PROFILE") != nullptr ||
+            std::getenv(
+                "GGML_META_PIPELINE_DEBUG") != nullptr) {
+        printf(
+            "[REGION_P2C_RETURN_CONSUMER] "
+            "layer=%d chunk=%d ticket=%" PRIu64
+            " lane=%zu bytes=%zu join_wait_ms=%.3f "
+            "host_add_ms=%.3f since_submit_ms=%.3f "
+            "state=JOINED status=OK\n",
+            state->layer,
+            state->chunk,
+            ticket,
+            state->lane,
+            state->bytes,
+            return_wait_us / 1000.0,
+            add_us / 1000.0,
+            state->submit_us > 0 ?
+                (ggml_time_us() -
+                    state->submit_us) / 1000.0 :
+                0.0);
     }
     return true;
 }

@@ -760,81 +760,39 @@ public:
                 throw std::runtime_error(
                     "invalid region ring completion");
             }
+            complete_locked(task);
+        }
+        cv_.notify_all();
+    }
 
-            if (slot_pool_size_ > 0) {
-                // Legacy bounded-slot mode remains uniform-chunk only.
-                if (task.region > 0) {
-                    if (task.input_slot < 0 ||
-                            (size_t) task.input_slot >=
-                                output_slots_[task.region - 1].size()) {
-                        throw std::runtime_error(
-                            "region ring task lost its input slot lease");
-                    }
-                    auto & input =
-                        output_slots_[task.region - 1]
-                                     [(size_t) task.input_slot];
-                    if (input.state != 3 ||
-                            input.chunk != task.chunk) {
-                        throw std::runtime_error(
-                            "region ring input slot released before consumption");
-                    }
-                    input = {};
-                }
-                if (task.region + 1 < regions_.size()) {
-                    if (task.output_slot < 0 ||
-                            (size_t) task.output_slot >=
-                                output_slots_[task.region].size()) {
-                        throw std::runtime_error(
-                            "region ring task lost its output slot lease");
-                    }
-                    auto & output =
-                        output_slots_[task.region]
-                                     [(size_t) task.output_slot];
-                    if (output.state != 1 ||
-                            output.chunk != task.chunk) {
-                        throw std::runtime_error(
-                            "region ring output slot was overwritten");
-                    }
-                    output.state = 2;
-                }
+    // A directional Meta island may have completed every causal operation
+    // required to start its next chunk while its final P2C payload is still in
+    // flight. DEFERRED releases only the same-region sequence dependency.
+    // Downstream interval dependencies remain blocked until
+    // complete_deferred() publishes the actual stage output.
+    void defer(const llama_region_ring_task & task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!valid_running_locked(task) || slot_pool_size_ > 0) {
+                throw std::runtime_error(
+                    "invalid region ring deferred completion");
             }
-
-            state_[task.region][task.chunk] = 3;
-            ++finished_;
-
+            state_[task.region][task.chunk] = 5;
             if (!failed_) {
-                if (task.region + 1 < regions_.size()) {
-                    const size_t next_region = task.region + 1;
-                    const int sb = task.token_begin;
-                    const int se = sb + task.n_tokens;
-                    for (size_t dst = 0;
-                         dst < chunk_sizes_[next_region].size();
-                         ++dst) {
-                        const int db =
-                            chunk_begins_[next_region][dst];
-                        const int de =
-                            db + chunk_sizes_[next_region][dst];
-                        if (std::min(se, de) <=
-                                std::max(sb, db)) {
-                            continue;
-                        }
-                        int & pending =
-                            input_pending_[next_region][dst];
-                        if (pending <= 0) {
-                            throw std::runtime_error(
-                                "region ring interval dependency underflow");
-                        }
-                        --pending;
-                        if (pending == 0) {
-                            offer_locked(next_region, dst);
-                        }
-                    }
-                }
-
-                // Strict per-Region KV commit order is independent of the
-                // upstream interval geometry.
                 offer_locked(task.region, task.chunk + 1);
             }
+        }
+        cv_.notify_all();
+    }
+
+    void complete_deferred(const llama_region_ring_task & task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!valid_deferred_locked(task)) {
+                throw std::runtime_error(
+                    "invalid region ring deferred join");
+            }
+            complete_locked(task);
         }
         cv_.notify_all();
     }
@@ -842,7 +800,8 @@ public:
     void fail(const llama_region_ring_task & task) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!valid_running_locked(task)) {
+            if (!valid_running_locked(task) &&
+                    !valid_deferred_locked(task)) {
                 throw std::runtime_error(
                     "invalid region ring failure");
             }
@@ -880,6 +839,93 @@ private:
         return task.region < regions_.size() &&
                task.chunk < state_[task.region].size() &&
                state_[task.region][task.chunk] == 2;
+    }
+
+    bool valid_deferred_locked(
+            const llama_region_ring_task & task) const {
+        return task.region < regions_.size() &&
+               task.chunk < state_[task.region].size() &&
+               state_[task.region][task.chunk] == 5;
+    }
+
+    void complete_locked(const llama_region_ring_task & task) {
+        if (slot_pool_size_ > 0) {
+            // Legacy bounded-slot mode remains uniform-chunk only.
+            if (task.region > 0) {
+                if (task.input_slot < 0 ||
+                        (size_t) task.input_slot >=
+                            output_slots_[task.region - 1].size()) {
+                    throw std::runtime_error(
+                        "region ring task lost its input slot lease");
+                }
+                auto & input =
+                    output_slots_[task.region - 1]
+                                 [(size_t) task.input_slot];
+                if (input.state != 3 ||
+                        input.chunk != task.chunk) {
+                    throw std::runtime_error(
+                        "region ring input slot released before consumption");
+                }
+                input = {};
+            }
+            if (task.region + 1 < regions_.size()) {
+                if (task.output_slot < 0 ||
+                        (size_t) task.output_slot >=
+                            output_slots_[task.region].size()) {
+                    throw std::runtime_error(
+                        "region ring task lost its output slot lease");
+                }
+                auto & output =
+                    output_slots_[task.region]
+                                 [(size_t) task.output_slot];
+                if (output.state != 1 ||
+                        output.chunk != task.chunk) {
+                    throw std::runtime_error(
+                        "region ring output slot was overwritten");
+                }
+                output.state = 2;
+            }
+        }
+
+        state_[task.region][task.chunk] = 3;
+        ++finished_;
+
+        if (failed_) {
+            return;
+        }
+
+        if (task.region + 1 < regions_.size()) {
+            const size_t next_region = task.region + 1;
+            const int sb = task.token_begin;
+            const int se = sb + task.n_tokens;
+            for (size_t dst = 0;
+                 dst < chunk_sizes_[next_region].size();
+                 ++dst) {
+                const int db =
+                    chunk_begins_[next_region][dst];
+                const int de =
+                    db + chunk_sizes_[next_region][dst];
+                if (std::min(se, de) <=
+                        std::max(sb, db)) {
+                    continue;
+                }
+                int & pending =
+                    input_pending_[next_region][dst];
+                if (pending <= 0) {
+                    throw std::runtime_error(
+                        "region ring interval dependency underflow");
+                }
+                --pending;
+                if (pending == 0) {
+                    offer_locked(next_region, dst);
+                }
+            }
+        }
+
+        // Normal completion releases the next same-region chunk here.
+        // Deferred completion already released it in defer(); offer_locked()
+        // is idempotent because that task is no longer state 0.
+        offer_locked(task.region, task.chunk + 1);
     }
 
     struct output_slot {
@@ -1043,7 +1089,8 @@ private:
                 state_[region][chunk] != 0 ||
                 input_pending_[region][chunk] != 0 ||
                 (chunk > 0 &&
-                 state_[region][chunk - 1] != 3)) {
+                 state_[region][chunk - 1] != 3 &&
+                 state_[region][chunk - 1] != 5)) {
             return;
         }
 
