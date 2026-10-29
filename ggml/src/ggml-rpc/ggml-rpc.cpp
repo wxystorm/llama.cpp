@@ -1168,6 +1168,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+
+    if (jupiter_prefill_enabled()) {
+        // SET_TENSOR traffic uses the control/data lane while graph execution uses
+        // the compute lane. Fence the control lane first so every activation write
+        // for this microbatch is visible before the remote graph begins.
+        rpc_msg_jupiter_rsp fence_response {};
+        auto control_sock = get_socket(rpc_ctx->endpoint);
+        const bool fence_ok = send_rpc_cmd(control_sock, RPC_CMD_JUPITER_SYNC,
+                                           nullptr, 0,
+                                           &fence_response, sizeof(fence_response));
+        RPC_STATUS_ASSERT(fence_ok && fence_response.ok == 1);
+    }
+
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     const int jupiter_slot = jupiter_prefill_enabled() ? rpc_graph_jupiter_slot(cgraph) : -1;
