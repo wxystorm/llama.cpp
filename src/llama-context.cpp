@@ -21,7 +21,6 @@
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -2451,9 +2450,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_prepare_wait_us,
         int64_t *                          ring_cpu_wait_us,
         int64_t *                          ring_cuda_wait_us,
-        bool                               preserve_weight_cache_on_graph_reset,
-        ggml_backend_t                     cpu_task_backend,
-        uint64_t                           cpu_task_id) {
+        bool                               preserve_weight_cache_on_graph_reset) {
     llama_region_ring_tls_p2c_deferred = {};
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
@@ -2874,150 +2871,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 ggml_backend_meta_p2c_deferred_arm(
                     target);
 
-            const bool cpu_full_checkpoint =
-                ring_lane == 0 &&
-                target_is_cpu &&
-                stage.kind == llama_hybrid_runtime_stage_kind::CPU &&
-                cpu_task_backend != nullptr &&
-                cpu_task_id != 0 &&
-                stage.layer_end - stage.layer_begin > 1 &&
-                ggml_backend_meta_cpu_task_should_checkpoint(
-                    cpu_task_backend, cpu_task_id);
-
-            struct cpu_checkpoint_eval_ctx {
-                ggml_backend_sched_eval_callback original = nullptr;
-                void * original_user_data = nullptr;
-                ggml_backend_t meta_backend = nullptr;
-                uint64_t task_id = 0;
-                int32_t layer_begin = -1;
-                int32_t layer_end = -1;
-                ggml_tensor * pending_node = nullptr;
-                bool pending_original = false;
-                bool pending_checkpoint = false;
-                int32_t pending_layer = -1;
-                int boundaries = 0;
-                int yields = 0;
-                ggml_status status = GGML_STATUS_SUCCESS;
-            } checkpoint_ctx;
-
-            const auto checkpoint_eval =
-                +[](ggml_tensor * tensor, bool ask, void * user_data) -> bool {
-                    auto * ctx =
-                        static_cast<cpu_checkpoint_eval_ctx *>(
-                            user_data);
-                    if (ask) {
-                        const bool original_need =
-                            ctx->original != nullptr &&
-                            ctx->original(
-                                tensor, true,
-                                ctx->original_user_data);
-
-                        int parsed_layer = -1;
-                        int parsed_chars = 0;
-                        const bool exact_l_out =
-                            tensor != nullptr &&
-                            std::sscanf(
-                                tensor->name,
-                                "l_out-%d%n",
-                                &parsed_layer,
-                                &parsed_chars) == 1 &&
-                            tensor->name[parsed_chars] == '\0';
-                        const bool checkpoint =
-                            exact_l_out &&
-                            parsed_layer >= ctx->layer_begin &&
-                            parsed_layer + 1 < ctx->layer_end;
-
-                        if (original_need || checkpoint) {
-                            ctx->pending_node = tensor;
-                            ctx->pending_original = original_need;
-                            ctx->pending_checkpoint = checkpoint;
-                            ctx->pending_layer =
-                                checkpoint ? parsed_layer : -1;
-                        }
-                        return original_need || checkpoint;
-                    }
-
-                    bool keep_running = true;
-                    if (ctx->pending_original &&
-                            ctx->original != nullptr) {
-                        keep_running =
-                            ctx->original(
-                                tensor, false,
-                                ctx->original_user_data);
-                    }
-                    if (!keep_running) {
-                        return false;
-                    }
-
-                    if (ctx->pending_checkpoint &&
-                            tensor == ctx->pending_node) {
-                        bool yielded = false;
-                        ctx->status =
-                            ggml_backend_meta_cpu_task_checkpoint(
-                                ctx->meta_backend,
-                                ctx->task_id,
-                                ctx->pending_layer,
-                                &yielded);
-                        ++ctx->boundaries;
-                        if (yielded) {
-                            ++ctx->yields;
-                        }
-                        if (ctx->status != GGML_STATUS_SUCCESS) {
-                            return false;
-                        }
-                    }
-
-                    ctx->pending_node = nullptr;
-                    ctx->pending_original = false;
-                    ctx->pending_checkpoint = false;
-                    ctx->pending_layer = -1;
-                    return true;
-                };
-
-            if (cpu_full_checkpoint) {
-                checkpoint_ctx.original = cparams.cb_eval;
-                checkpoint_ctx.original_user_data =
-                    cparams.cb_eval_user_data;
-                checkpoint_ctx.meta_backend = cpu_task_backend;
-                checkpoint_ctx.task_id = cpu_task_id;
-                checkpoint_ctx.layer_begin = stage.layer_begin;
-                checkpoint_ctx.layer_end = stage.layer_end;
-                ggml_backend_sched_set_eval_callback(
-                    sched_use,
-                    checkpoint_eval,
-                    &checkpoint_ctx);
-            }
-
             ret = ggml_backend_sched_compute_split(
                 sched_use, split);
-
-            if (cpu_full_checkpoint) {
-                ggml_backend_sched_set_eval_callback(
-                    sched_use,
-                    cparams.cb_eval,
-                    cparams.cb_eval_user_data);
-                if (ret == GGML_STATUS_SUCCESS &&
-                        checkpoint_ctx.status !=
-                            GGML_STATUS_SUCCESS) {
-                    ret = checkpoint_ctx.status;
-                }
-                if (block_index == 0 ||
-                        checkpoint_ctx.yields > 0) {
-                    LLAMA_LOG_ERROR(
-                        "[REGION_RING_CPU_CHECKPOINT] "
-                        "stage=%zu chunk=%zu task=%" PRIu64
-                        " layers=[%d,%d) boundaries=%d yields=%d "
-                        "status=%d\n",
-                        stage_index,
-                        block_index,
-                        cpu_task_id,
-                        stage.layer_begin,
-                        stage.layer_end,
-                        checkpoint_ctx.boundaries,
-                        checkpoint_ctx.yields,
-                        (int) ret);
-                }
-            }
 
             bool p2c_deferred_split = false;
             if (ret == GGML_STATUS_SUCCESS &&
@@ -4906,8 +4761,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     }
 
                     const int64_t backend_begin_us = ggml_time_us();
-                    auto execute_backend_task =
-                        [&](uint64_t running_cpu_task_id) -> ggml_status {
+                    auto execute_backend_task = [&]() -> ggml_status {
                     {
                         std::unique_lock<std::mutex> broad_backend_lock;
                         std::unique_lock<std::mutex> cpu_gate;
@@ -4970,11 +4824,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 pc_phone_overlap ? &state.cpu_wait_us : nullptr,
                                 pc_phone_overlap ? &state.cuda_wait_us : nullptr,
                                 dev == 1 && gpu_weight_streaming &&
-                                    gpu_bank_resident,
-                                dev ==
-                                    (size_t) llama_region_ring_device::CPU ?
-                                    region_ring_meta_cpu_backend : nullptr,
-                                running_cpu_task_id);
+                                    gpu_bank_resident);
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
@@ -5126,18 +4976,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         cpu_desc.chunk = (int32_t) task.chunk;
                         cpu_desc.layer = stage.layer_begin;
 
-                        std::function<ggml_status(uint64_t)> cpu_run =
+                        std::function<ggml_status()> cpu_run =
                             execute_backend_task;
                         struct cpu_run_bridge {
-                            std::function<ggml_status(uint64_t)> * run;
+                            std::function<ggml_status()> * run;
                         } bridge { &cpu_run };
                         const auto thunk =
                             +[](void * user_data,
-                                uint64_t task_id) -> ggml_status {
+                                uint64_t) -> ggml_status {
                                 auto * b =
                                     static_cast<cpu_run_bridge *>(
                                         user_data);
-                                return (*b->run)(task_id);
+                                return (*b->run)();
                             };
 
                         const uint64_t cpu_task_id =
@@ -5179,7 +5029,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 (int) cpu_status);
                         }
                     } else {
-                        (void) execute_backend_task(0);
+                        (void) execute_backend_task();
                     }
 
                     // Do not publish a downstream READY while the producer's
