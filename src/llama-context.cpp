@@ -11597,6 +11597,35 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+    // Official prefill/decode counters remain available when -lv 1 hides
+    // informational timings. This is a single buffered end-of-run record,
+    // never a per-token instrumentation point.
+    if (const char * path = std::getenv(
+            "LLAMA_REGION_RING_METRICS_FILE")) {
+        if (*path != '\0') {
+            std::ofstream out(path, std::ios::app);
+            if (out) {
+                const double prompt_tps =
+                    data.t_p_eval_ms > 0 && data.n_p_eval > 0 ?
+                    1000.0 * data.n_p_eval / data.t_p_eval_ms : 0.0;
+                const double decode_tps =
+                    data.t_eval_ms > 0 && data.n_eval > 0 ?
+                    1000.0 * data.n_eval / data.t_eval_ms : 0.0;
+                out << std::fixed << std::setprecision(3)
+                    << "{\"type\":\"perf\",\"schema\":1,"
+                    << "\"prefill_tokens\":" << data.n_p_eval << ","
+                    << "\"decode_tokens\":" << data.n_eval << ","
+                    << "\"prefill_ms\":" << data.t_p_eval_ms << ","
+                    << "\"decode_ms\":" << data.t_eval_ms << ","
+                    << "\"load_ms\":" << data.t_load_ms << ","
+                    << "\"total_ms\":"
+                    << (t_end_ms - data.t_start_ms) << ","
+                    << "\"prefill_tps\":" << prompt_tps << ","
+                    << "\"decode_tps\":" << decode_tps << "}\n";
+            }
+        }
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {
