@@ -693,3 +693,58 @@ Replace the example PC layer count with the selected Model Partition boundary.
 The chosen b is a heuristic minimum Chunk constraint for q(x,y) Sequence DP,
 not a new runtime environment variable. Do not treat synchronized calibration
 times as comparable to normal async Prefill benchmarks; rerun those separately.
+
+## High-b sequence feasibility (357 tokens with max Chunk 128)
+
+The minimum-chunk selection must be **feasible for the full prompt**, not
+just efficient on an individual first chunk. A legal sequence has integer k
+such that `k * b <= total_tokens <= k * max_chunk`.
+For 357 tokens and `max_chunk=128`, `b=128` cannot produce a plan:
+two chunks are at most 256 tokens, while three require at least 384.
+The profiler now checks this before exporting the minimum. With the
+measured example (PC 20 / Phone 20), the best feasible measured fallback
+is `b=96`, whose PC rate is 89.43% of the measured peak (slightly under
+90%). The status is `NO_FEASIBLE_PLATEAU`, not a claim of full saturation.
+
+Re-select using the existing saved samples; no repeat of the individual
+candidate profiling runs is necessary:
+
+```powershell
+python .\tools\jupiter\run_min_chunk_profile.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --model-plan .\jupiter-model.plan `
+  --target-tokens 357 `
+  --candidates 8,16,24,32,48,64,96,128 `
+  --threshold 0.90 --repeats 2 `
+  --out-dir .\jupiter-min-chunk --resume
+```
+
+A q-sweep with `--min-chunk 96 --max-chunk 128` can no longer
+assume repeating every x produces a legal 357-token tail. The runner now
+skips impossible x=96, falls back to an exact first x=112 plus balanced
+tail `112,123,122`, and retains the legal x=128 plan
+`128,128,101`. The existing targeted q refinement then measures the
+unobserved `q(x,y)` points of the DP candidate and produces a
+fully-measured runtime plan.
+
+```powershell
+$b = (Get-Content .\jupiter-min-chunk\min-chunk.json -Raw |
+      ConvertFrom-Json).min_chunk
+
+python .\tools\jupiter\run_q_sweep.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --pc-layers 20 `
+  --x-values 96,112,128 --min-chunk $b --max-chunk 128 `
+  --repeats 2 --run-dp --plan-output .\jupiter-b96.plan `
+  --out-dir .\jupiter-q-b96
+```
+
+Do not run Sequence DP with `--min-chunk 128 --max-chunk 128` for
+357 tokens; it has no legal partition. Prefer the fully measured
+`refine_sequence_q.py` result for the final comparison.
