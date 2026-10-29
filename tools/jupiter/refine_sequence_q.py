@@ -249,6 +249,7 @@ def main() -> int:
         "LLAMA_JUPITER_PROFILE_STAGE": "1",
         "LLAMA_JUPITER_Q_SWEEP": "1",
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
+        "LLAMA_JUPITER_ASYNC_C2P": "0",
     })
     env.pop("LLAMA_JUPITER_PLAN_FILE", None)
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
