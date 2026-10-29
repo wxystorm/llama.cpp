@@ -1708,7 +1708,27 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     llama_region_ring_from_env(n_layer) :
                     llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
                 std::vector<llama_region_ring_region>{};
-        const bool ring_layout_owned = region_ring && !has_runtime_plan;
+        const bool directional_ring =
+            region_ring &&
+            llama_region_ring_has_directional_stages(ring_regions);
+        const int ring_directional_layers =
+            directional_ring ?
+                llama_region_ring_directional_layer_count(ring_regions) : 0;
+
+        // Directional Ring V1 is intentionally fixed-layout only. A later
+        // Planner may emit C2P/P2C stages, but the current model-owned Plan
+        // format still describes only legacy G/C/P ownership.
+        if (directional_ring && !hybrid_ring_plan_layout.empty()) {
+            throw std::runtime_error(
+                "directional Region Ring does not yet accept Planner APPLY; "
+                "use LLAMA_HYBRID_REGION_RING_LAYOUT for fixed validation");
+        }
+
+        // A directional fixed Ring owns placement even when --hybrid-auto has
+        // published a legacy T=0 runtime plan. The Plan is not allowed to
+        // silently overwrite C2P/P2C layer ownership.
+        const bool ring_layout_owned =
+            region_ring && (!has_runtime_plan || directional_ring);
         const std::array<int, 3> ring_counts =
             region_ring ? llama_region_ring_layer_counts(ring_regions) :
                           std::array<int, 3>{};
@@ -1735,9 +1755,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             ring_counts[1] :
             has_runtime_plan ? runtime_plan.gpu_pc_layers :
             llama_hybrid_gpu_pc_layers();
-        const std::string pc_layout = has_runtime_plan ?
-            "gpu-cpu-tensor-phone" :
-            (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
+        const std::string pc_layout = directional_ring ?
+            "region-directional" :
+            has_runtime_plan ?
+                "gpu-cpu-tensor-phone" :
+                (phone_layers > 0 ? "tail" : llama_hybrid_pc_layout());
 
         if (has_runtime_plan) {
             pimpl->tensor_split_owned.assign(llama_max_devices(), 0.0f);
@@ -1789,15 +1811,24 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                     hybrid_ring_plan_phone_chunk_tokens :
                     hybrid_ring_plan_chunk_tokens);
         }
-        if (region_ring && runtime_plan.tensor_layers != 0) {
-            throw std::runtime_error("region ring needs T=0; set LLAMA_HYBRID_FIXED_TENSOR_LAYERS=0");
+        if (region_ring && has_runtime_plan &&
+                runtime_plan.tensor_layers != 0) {
+            throw std::runtime_error(
+                "region ring needs legacy Planner T=0; "
+                "directional C2P/P2C layers are owned by the Ring layout");
         }
         if (region_ring) {
             const auto counts = llama_region_ring_layer_counts(ring_regions);
-            if (counts[0] + counts[1] != pc_layers || counts[2] != phone_layers ||
+            const int covered =
+                counts[0] + counts[1] + counts[2] +
+                ring_directional_layers;
+            if (covered != n_layer ||
+                    counts[0] + counts[1] != pc_layers ||
+                    counts[2] != phone_layers ||
                     counts[1] != gpu_pc_layers) {
                 throw std::runtime_error(
-                    "region ring layout differs from planner: fix PC/Phone/GPU counts");
+                    "region ring layout differs from executable "
+                    "PC/Phone/GPU/boundary counts");
             }
         }
 
@@ -1813,14 +1844,29 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
         if (region_ring) {
             for (const auto & region : ring_regions) {
+                llama_hybrid_layer_mode mode;
+                switch (region.kind) {
+                    case llama_region_ring_stage_kind::CPU:
+                    case llama_region_ring_stage_kind::GPU:
+                        mode = llama_hybrid_layer_mode::PC_ONLY;
+                        break;
+                    case llama_region_ring_stage_kind::PHONE:
+                        mode = llama_hybrid_layer_mode::PHONE_ONLY;
+                        break;
+                    case llama_region_ring_stage_kind::C2P:
+                        mode = llama_hybrid_layer_mode::TENSOR_C2P;
+                        break;
+                    case llama_region_ring_stage_kind::P2C:
+                        mode = llama_hybrid_layer_mode::TENSOR_P2C;
+                        break;
+                }
                 for (int il = region.layer_begin; il < region.layer_end; ++il) {
-                    hybrid_layer_modes[il] =
-                        region.device == llama_region_ring_device::PHONE ?
-                        llama_hybrid_layer_mode::PHONE_ONLY :
-                        llama_hybrid_layer_mode::PC_ONLY;
+                    hybrid_layer_modes[il] = mode;
                 }
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_LAYOUT] device=%s layers=[%d,%d) status=READY\n",
+                    "[REGION_RING_LAYOUT] stage=%s executor=%s "
+                    "layers=[%d,%d) status=READY\n",
+                    llama_region_ring_stage_name(region.kind),
                     llama_region_ring_device_name(region.device),
                     region.layer_begin, region.layer_end);
             }
@@ -1834,7 +1880,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         // Directional boundaries use a physical PC expert-width share.
         // Keep the ratios explicit per direction; performance tuning can change
         // them later without changing the ownership protocol.
-        if (llama_hybrid_region_boundary_v1_enabled()) {
+        if (llama_hybrid_region_boundary_v1_enabled() ||
+                directional_ring) {
             auto read_region_ratio = [&](const char * name, float fallback) {
                 const char * raw = std::getenv(name);
                 const float ratio =
@@ -1945,7 +1992,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             gpu_pc_layers, pc_layer_ids.size());
         if (region_ring) {
             for (const auto & region : ring_regions) {
-                if (region.device != llama_region_ring_device::GPU) {
+                if (region.kind != llama_region_ring_stage_kind::GPU) {
                     continue;
                 }
                 for (int il = region.layer_begin; il < region.layer_end; ++il) {
