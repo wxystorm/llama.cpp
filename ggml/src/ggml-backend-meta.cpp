@@ -14503,7 +14503,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 }
                 if (ggml_backend_meta_tensor_p2c_layer(
                         backend_ctx, layer)) {
-                    record_region_layer(
+                    record_exact_region_layer(
                         region_pipe_p2c_layer, layer);
                 }
             }
