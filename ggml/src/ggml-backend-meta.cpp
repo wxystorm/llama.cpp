@@ -10810,10 +10810,14 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
 
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
             // Dense/Region P2C entry: the Phone Full layer immediately before
-            // a P2C Tensor layer must remain Phone-resident. The next layer's
-            // Attention is Phone-owned, and its explicit READY boundary will
-            // send only FFN_NORM Phone->PC. Copying l_out-(L-1) here creates
-            // an unnecessary third 1->0 payload before READY/PARTIAL.
+            // a P2C Tensor layer must remain Phone-resident. P2C policy itself
+            // is the authoritative ownership contract: Attention/control stays
+            // on Phone and the explicit READY boundary sends only FFN_NORM
+            // Phone->PC. Do not gate this on layer_attention_phone_owned(),
+            // which infers ownership from transient compute flags and can
+            // misclassify the already-split directional graph. Copying
+            // l_out-(L-1) here creates an unnecessary third 1->0 payload
+            // before READY/PARTIAL.
             int p2c_entry_lout_layer = -1;
             int p2c_entry_parsed = 0;
             const bool p2c_entry_keep_phone =
@@ -10826,9 +10830,7 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     &p2c_entry_parsed) == 1 &&
                 nodes[1]->name[p2c_entry_parsed] == '\0' &&
                 ggml_backend_meta_tensor_p2c_layer(
-                    backend_ctx, p2c_entry_lout_layer + 1) &&
-                layer_attention_phone_owned(
-                    p2c_entry_lout_layer + 1);
+                    backend_ctx, p2c_entry_lout_layer + 1);
 
             if (p2c_entry_keep_phone) {
                 handled = true;
