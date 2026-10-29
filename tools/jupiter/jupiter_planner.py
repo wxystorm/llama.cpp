@@ -32,8 +32,25 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 INF = float("inf")
 
 
+def _open_text_auto(path: str):
+    # Windows PowerShell 5.x Tee-Object commonly writes UTF-16LE with BOM,
+    # while PowerShell 7 and Unix shells generally produce UTF-8. Detect the
+    # BOM instead of assuming UTF-8 so calibration logs work on both.
+    with open(path, "rb") as f:
+        head = f.read(4)
+
+    if head.startswith(b"\\xff\\xfe") or head.startswith(b"\\xfe\\xff"):
+        encoding = "utf-16"
+    elif head.startswith(b"\\xef\\xbb\\xbf"):
+        encoding = "utf-8-sig"
+    else:
+        encoding = "utf-8"
+
+    return open(path, "r", encoding=encoding, errors="replace")
+
+
 def _read_csv(path: str) -> List[dict]:
-    with open(path, "r", newline="", encoding="utf-8") as f:
+    with open(path, "r", newline="", encoding="utf-8-sig") as f:
         return list(csv.DictReader(f))
 
 
@@ -312,7 +329,7 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
         current = None
         stage_sums = {}
 
-    with open(args.log, "r", encoding="utf-8", errors="replace") as f:
+    with _open_text_auto(args.log) as f:
         for line in f:
             m = begin_re.search(line)
             if m:
