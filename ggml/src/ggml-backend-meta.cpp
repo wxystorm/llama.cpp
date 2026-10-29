@@ -2546,6 +2546,122 @@ struct ggml_backend_meta_context {
 };
 
 
+
+static uint64_t ggml_backend_meta_cpu_task_group(
+        int32_t kind,
+        int32_t layer,
+        int32_t chunk) {
+    if (layer < 0 || chunk < 0) {
+        return 0;
+    }
+    return (UINT64_C(0x43505500) << 32) ^
+        ((uint64_t) (uint32_t) (kind + 1) << 48) ^
+        ((uint64_t) (uint32_t) (layer + 1) << 24) ^
+        (uint64_t) (uint32_t) (chunk + 1);
+}
+
+static bool ggml_backend_meta_parse_exact_layer_name(
+        const char * name,
+        const char * format,
+        int & layer) {
+    if (name == nullptr) {
+        return false;
+    }
+    int parsed = 0;
+    int n = 0;
+    if (std::sscanf(name, format, &parsed, &n) != 1 ||
+            name[n] != '\0') {
+        return false;
+    }
+    layer = parsed;
+    return true;
+}
+
+static bool ggml_backend_meta_cpu_task_tensor_identity(
+        const ggml_tensor * tensor,
+        int depth,
+        int & layer,
+        int & chunk) {
+    if (tensor == nullptr || depth < 0) {
+        return false;
+    }
+
+    int parsed_layer = -1;
+    int parsed_chunk = -1;
+    if (ggml_backend_meta_parse_prefill_norm_chunk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_prefill_down_chunk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_phone_route_weights(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_phone_route_topk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_c2p_route_weights(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_c2p_route_topk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_prefill_wave_ffn_inp_chunk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_prefill_wave_attn_out_chunk(
+            tensor->name, parsed_chunk, parsed_layer) ||
+        ggml_backend_meta_parse_decode_ffn_chunk(
+            tensor->name, parsed_chunk, parsed_layer)) {
+        layer = parsed_layer;
+        chunk = parsed_chunk;
+        return true;
+    }
+
+    if (ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "norm-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "attn_out-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "ffn_inp-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "ffn_norm-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "ffn_moe_logits-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "ffn_moe_out-%d%n", parsed_layer) ||
+        ggml_backend_meta_parse_exact_layer_name(
+            tensor->name, "l_out-%d%n", parsed_layer)) {
+        layer = parsed_layer;
+        chunk = -1;
+        return true;
+    }
+
+    if (depth == 0) {
+        return false;
+    }
+
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (ggml_backend_meta_cpu_task_tensor_identity(
+                tensor->src[i], depth - 1, layer, chunk)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_meta_cpu_task_graph_identity(
+        const ggml_cgraph * graph,
+        int & layer,
+        int & chunk) {
+    layer = -1;
+    chunk = -1;
+    if (graph == nullptr) {
+        return false;
+    }
+
+    for (int i = graph->n_nodes - 1; i >= 0; --i) {
+        if (ggml_backend_meta_cpu_task_tensor_identity(
+                graph->nodes[i], 2, layer, chunk)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char * ggml_backend_meta_cpu_task_kind_name(int32_t kind) {
     switch (kind) {
         case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return "CPU_FULL";
@@ -2574,6 +2690,7 @@ struct ggml_backend_meta_cpu_task_executor {
     ggml_backend_meta_cpu_task_desc running_desc {};
     uint64_t sticky_group = 0;
     int32_t causal_frontier = -1;
+    uint64_t unresolved_identity_tasks = 0;
     bool stop = false;
 
     explicit ggml_backend_meta_cpu_task_executor(
@@ -2583,6 +2700,20 @@ struct ggml_backend_meta_cpu_task_executor {
     }
 
     ~ggml_backend_meta_cpu_task_executor() {
+        if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::lock_guard<std::mutex> lock(mutex);
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_SUM] submitted=%" PRIu64
+                " unresolved_identity=%" PRIu64
+                " frontier=%d queued=%zu sticky_group=%" PRIu64 "\n",
+                submitted,
+                unresolved_identity_tasks,
+                causal_frontier,
+                tasks.size(),
+                sticky_group);
+            std::fflush(stderr);
+        }
         {
             std::lock_guard<std::mutex> lock(mutex);
             stop = true;
@@ -2681,7 +2812,7 @@ struct ggml_backend_meta_cpu_task_executor {
             stderr,
             "[CPU_TASK_SCHED] event=%s id=%" PRIu64
             " kind=%s urgency=%d chunk=%d layer=%d "
-            "group=%" PRIu64 " flags=0x%x frontier=%d "
+            "logical_group=%" PRIu64 " phase=%s flags=0x%x frontier=%d "
             "queued=%zu status=%d\n",
             event,
             t.id,
@@ -2690,6 +2821,14 @@ struct ggml_backend_meta_cpu_task_executor {
             t.desc.chunk,
             t.desc.layer,
             t.desc.continuation_group,
+            t.desc.continuation_group != 0 ?
+                ((t.desc.flags &
+                  GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 ?
+                    "FINAL" :
+                 (t.desc.flags &
+                  GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES) != 0 ?
+                    "CONTINUE" : "ATOMIC") :
+                "ATOMIC",
             t.desc.flags,
             causal_frontier,
             queued,
@@ -2757,6 +2896,12 @@ struct ggml_backend_meta_cpu_task_executor {
         t.id = ++submitted;
         t.desc = desc;
         t.run = std::move(run);
+        if (t.desc.layer < 0 &&
+                backend_ctx != nullptr &&
+                backend_ctx->cpu_task_outer_chunk.load(
+                    std::memory_order_relaxed) >= 0) {
+            ++unresolved_identity_tasks;
+        }
 
         if (running_id != 0 &&
                 running_desc.kind ==
@@ -3011,14 +3156,69 @@ struct ggml_backend_meta_compute_workers {
         return GGML_STATUS_SUCCESS;
     }
 
-    ggml_backend_meta_cpu_task_desc default_pc_desc() const {
+    ggml_backend_meta_cpu_task_desc default_pc_desc(
+            ggml_cgraph * graph) const {
         ggml_backend_meta_cpu_task_desc desc {};
-        desc.kind = GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
-        desc.urgency =
-            GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
-        desc.chunk = backend_ctx->cpu_task_outer_chunk.load(
-            std::memory_order_relaxed);
-        desc.layer = -1;
+        int graph_layer = -1;
+        int graph_chunk = -1;
+        (void) ggml_backend_meta_cpu_task_graph_identity(
+            graph, graph_layer, graph_chunk);
+
+        const int32_t outer_chunk =
+            backend_ctx->cpu_task_outer_chunk.load(
+                std::memory_order_relaxed);
+        desc.chunk =
+            outer_chunk >= 0 ? outer_chunk : graph_chunk;
+        desc.layer = graph_layer;
+
+        const bool c2p =
+            graph_layer >= 0 &&
+            ggml_backend_meta_tensor_c2p_layer(
+                backend_ctx, graph_layer);
+        const bool p2c_or_phone_main =
+            graph_layer >= 0 &&
+            (ggml_backend_meta_tensor_p2c_layer(
+                 backend_ctx, graph_layer) ||
+             ggml_backend_meta_tensor_phone_primary_layer(
+                 backend_ctx, graph_layer));
+
+        if (p2c_or_phone_main) {
+            desc.kind =
+                GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
+            desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION;
+        } else {
+            desc.kind =
+                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+            desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+        }
+
+        desc.continuation_group =
+            ggml_backend_meta_cpu_task_group(
+                desc.kind, desc.layer, desc.chunk);
+
+        if (c2p && desc.continuation_group != 0) {
+            desc.flags =
+                GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
+        }
+
+        if (desc.layer < 0 &&
+                outer_chunk >= 0 &&
+                std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_CLASSIFY] kind=%s chunk=%d layer=-1 "
+                "reason=GRAPH_IDENTITY_UNRESOLVED first=%s last=%s "
+                "action=FALLBACK\n",
+                ggml_backend_meta_cpu_task_kind_name(desc.kind),
+                desc.chunk,
+                graph != nullptr && graph->n_nodes > 0 ?
+                    graph->nodes[0]->name : "(none)",
+                graph != nullptr && graph->n_nodes > 0 ?
+                    graph->nodes[graph->n_nodes - 1]->name : "(none)");
+            std::fflush(stderr);
+        }
         return desc;
     }
 
@@ -3039,7 +3239,7 @@ struct ggml_backend_meta_compute_workers {
             ggml_backend_meta_cpu_task_executor * executor =
                 ggml_backend_meta_ensure_cpu_task_executor(backend_ctx);
             ggml_backend_meta_cpu_task_desc selected =
-                desc != nullptr ? *desc : default_pc_desc();
+                desc != nullptr ? *desc : default_pc_desc(graph);
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -18467,9 +18667,10 @@ auto prefill_norm_sg_has_prework =
                 }
                 c2p_pc_main_desc.layer = prefill_down_layer;
                 c2p_pc_main_desc.continuation_group =
-                    (UINT64_C(0x43525000) << 32) ^
-                    (uint64_t) (uint32_t) (prefill_down_layer + 1) << 16 ^
-                    (uint64_t) (uint32_t) (c2p_pc_main_desc.chunk + 1);
+                    ggml_backend_meta_cpu_task_group(
+                        c2p_pc_main_desc.kind,
+                        c2p_pc_main_desc.layer,
+                        c2p_pc_main_desc.chunk);
                 if (c2p_parallel_ready) {
                     c2p_pc_main_desc.flags =
                         GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
@@ -18478,6 +18679,8 @@ auto prefill_norm_sg_has_prework =
                         &c2p_pc_main_desc);
                 } else {
                     GGML_ASSERT(c2p_pc_graph != nullptr);
+                    c2p_pc_main_desc.flags =
+                        GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL;
                     compute_workers.start_graph(
                         0, c2p_pc_graph,
                         &c2p_pc_main_desc);
@@ -18509,6 +18712,11 @@ auto prefill_norm_sg_has_prework =
                     pc_desc.chunk = prefill_down_chunk;
                 }
                 pc_desc.layer = prefill_down_layer;
+                pc_desc.continuation_group =
+                    ggml_backend_meta_cpu_task_group(
+                        pc_desc.kind,
+                        pc_desc.layer,
+                        pc_desc.chunk);
 
                 compute_workers.start_graph(
                     0, pc_prefill_graph, &pc_desc);
