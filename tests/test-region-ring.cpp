@@ -271,6 +271,79 @@ static void test_dependencies() {
     check(!ready.take().has_value(), "scheduler returned a task after drain");
 }
 
+static void test_deferred_p2c_join_scheduler() {
+    // A deferred producer has completed enough causal work to let the next
+    // chunk of the same Region run, but its downstream activation does not
+    // exist until the asynchronous P2C join publishes complete_deferred().
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::PHONE, 0, 1},
+        {llama_region_ring_device::GPU,   1, 2},
+    };
+    llama_region_ring_ready ready(regions, 128, 64);
+
+    const auto p0 =
+        ready.try_take(llama_region_ring_device::PHONE);
+    check(p0 && p0->region == 0 && p0->chunk == 0,
+          "deferred test missing Phone chunk0");
+    ready.defer(*p0);
+    check(ready.finished() == 0,
+          "deferred producer counted as fully completed");
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
+          "deferred producer released downstream before join");
+
+    const auto p1 =
+        ready.try_take(llama_region_ring_device::PHONE);
+    check(p1 && p1->region == 0 && p1->chunk == 1,
+          "deferred producer did not release same-region next chunk");
+    ready.defer(*p1);
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
+          "second deferred producer released downstream before join");
+
+    // Return lane 1 may finish before lane 0. This may satisfy GPU chunk1's
+    // interval input, but strict per-Region order must still keep it queued.
+    ready.complete_deferred(*p1);
+    check(ready.finished() == 1,
+          "deferred join did not count as a completion");
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
+          "out-of-order join bypassed downstream chunk order");
+
+    ready.complete_deferred(*p0);
+    check(ready.finished() == 2,
+          "first deferred join did not publish completion");
+
+    const auto g0 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(g0 && g0->region == 1 && g0->chunk == 0,
+          "downstream chunk0 did not release after P2C join");
+    ready.complete(*g0);
+
+    const auto g1 =
+        ready.try_take(llama_region_ring_device::GPU);
+    check(g1 && g1->region == 1 && g1->chunk == 1,
+          "downstream chunk1 did not release after ordered predecessor");
+    ready.complete(*g1);
+
+    check(ready.all_done() && ready.finished() == 4 &&
+              !ready.failed(),
+          "deferred P2C scheduler did not drain cleanly");
+
+    // Legacy bounded-slot scheduling intentionally keeps the old lifetime
+    // contract and must reject split/deferred completion.
+    llama_region_ring_ready bounded(regions, 128, 64, 2);
+    const auto bounded_p0 =
+        bounded.try_take(llama_region_ring_device::PHONE);
+    check(bounded_p0.has_value(),
+          "bounded deferred test missing first task");
+    bool rejected = false;
+    try {
+        bounded.defer(*bounded_p0);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected,
+          "bounded slot scheduler accepted deferred completion");
+}
+
 static void test_duplicate_completion() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 256, 128);
@@ -831,6 +904,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
         std::fprintf(stderr, "[REGION_RING_TEST] dependencies=PASS\n");
+        test_deferred_p2c_join_scheduler();
+        std::fprintf(stderr, "[REGION_RING_TEST] deferred_p2c_join=PASS\n");
         test_duplicate_completion();
         std::fprintf(stderr, "[REGION_RING_TEST] duplicate=PASS\n");
         test_device_fifo_simulation();
