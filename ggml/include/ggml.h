@@ -649,6 +649,13 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+
+        // Hybrid directional execution semantics. These bits are attached by
+        // the graph builder to the actual producer tensor. Meta consumes them
+        // as task-completion contracts; it must never rediscover READY/PARTIAL
+        // by scanning tensor names after execution.
+        GGML_TENSOR_FLAG_META_SEND_READY   = 32,
+        GGML_TENSOR_FLAG_META_SEND_PARTIAL = 64,
     };
 
     enum ggml_tri_type {
