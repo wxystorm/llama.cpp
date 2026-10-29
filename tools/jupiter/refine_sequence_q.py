@@ -283,6 +283,7 @@ def main() -> int:
                 total, x, y, args.min_chunk, args.max_chunk
             )
             plan_str = ",".join(map(str, chunks))
+            point_rows: list[dict[str, str]] = []
             for repeat in range(1, args.repeats + 1):
                 stem = f"q-x{x}-y{y}-r{repeat}"
                 log_path = out / f"{stem}.log"
@@ -332,16 +333,24 @@ def main() -> int:
                     ])
                     samples = targeted_rows(sample_path, x, y)
 
-                # Save each repeat immediately, preserving useful partial
-                # work even if the next full model load fails.
-                all_rows.extend(samples)
-                write_profile(all_rows, merged_profile)
+                # Keep incomplete repeat sets in per-repeat CSV files. Do
+                # not mark q(x,y) measured in the merged profile until all
+                # repeats succeed; a resumed run can reuse those files safely.
+                point_rows.extend(samples)
                 print(
                     f"[JUPITER_REFINE_MEASURED] x={x} y={y} "
-                    f"repeat={repeat} stages={len(samples)} "
-                    f"csv={merged_profile}",
+                    f"repeat={repeat} stages={len(samples)}",
                     flush=True,
                 )
+
+            all_rows.extend(point_rows)
+            write_profile(all_rows, merged_profile)
+            print(
+                f"[JUPITER_REFINE_COMMIT] x={x} y={y} "
+                f"repeats={args.repeats} rows={len(point_rows)} "
+                f"csv={merged_profile}",
+                flush=True,
+            )
 
     profile = QProfile(all_rows, metric=args.metric)
     final = solve_sequence(
