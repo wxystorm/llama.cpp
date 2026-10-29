@@ -79,6 +79,14 @@ class JupiterInterpolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             QProfile(bad, metric="wall_ms")
 
+    def test_missing_backend_is_not_full_measurement(self) -> None:
+        profile = QProfile([
+            row(32, 0, 100, "RPC0"), row(32, 0, 70, "CUDA0"),
+            row(64, 0, 80, "CUDA0"),
+        ])
+        self.assertTrue(profile.is_measured(32, 0))
+        self.assertFalse(profile.is_measured(64, 0))
+
     def test_coverage_exact_only(self) -> None:
         profile = QProfile([row(32, 0, 90), row(128, 128, 649)])
         missing = sequence_missing_points(profile, [32, 112, 128, 85])
