@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -292,6 +293,14 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+
+    // Jupiter rebuilds the local llama graph for each ubatch so it can rotate
+    // scheduler copies without globally synchronizing. The remote OpenCL tensor
+    // metadata, however, is tied to the stable buffer/data layout. Cache those
+    // layouts here so repeated graph builds do not emit hundreds of INIT_TENSOR
+    // round trips.
+    std::mutex init_mutex;
+    std::unordered_set<uint64_t> initialized_layouts;
 };
 
 // RPC helper functions
@@ -306,6 +315,42 @@ static uint64_t fnv_hash(const uint8_t * data, size_t len) {
         hash *= fnv_prime;
     }
     return hash;
+}
+
+static uint64_t jupiter_hash_bytes(uint64_t h, const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h ^= bytes[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static uint64_t jupiter_hash_cstr(uint64_t h, const char * str) {
+    if (str == nullptr) {
+        const uint8_t zero = 0;
+        return jupiter_hash_bytes(h, &zero, sizeof(zero));
+    }
+    return jupiter_hash_bytes(h, str, std::strlen(str) + 1);
+}
+
+static uint64_t jupiter_tensor_layout_key(const rpc_tensor & tensor) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    h = jupiter_hash_bytes(h, &tensor.data, sizeof(tensor.data));
+    h = jupiter_hash_bytes(h, &tensor.type, sizeof(tensor.type));
+    h = jupiter_hash_bytes(h, tensor.ne, sizeof(tensor.ne));
+    h = jupiter_hash_bytes(h, tensor.nb, sizeof(tensor.nb));
+    h = jupiter_hash_bytes(h, &tensor.view_offs, sizeof(tensor.view_offs));
+    h = jupiter_hash_cstr(h, tensor.name);
+    return h != 0 ? h : 1;
+}
+
+static uint64_t jupiter_tensor_layout_key(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return 0;
+    }
+    rpc_tensor serialized = serialize_tensor(tensor);
+    return jupiter_tensor_layout_key(serialized);
 }
 
 static bool send_msg(socket_ptr sock, const void * msg, size_t msg_size) {
@@ -518,19 +563,42 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 
     // CUDA historically needed INIT_TENSOR only for a subset of quantized tensors.
     // OpenCL, however, attaches backend metadata through tensor->extra for every
-    // allocated tensor. Jupiter therefore initializes every remote tensor and the
-    // server persists the resulting extra pointer by serialized tensor id.
+    // allocated tensor. Jupiter initializes the first occurrence of each stable
+    // remote layout, then reuses that metadata across later local graph rebuilds.
     const bool needs_remote_init =
             jupiter_prefill_enabled() ||
             (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr));
 
-    if (needs_remote_init) {
-        rpc_msg_init_tensor_req request {};
-        request.tensor = serialize_tensor(tensor);
-
-        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
-        RPC_STATUS_ASSERT(status);
+    if (!needs_remote_init) {
+        return GGML_STATUS_SUCCESS;
     }
+
+    rpc_msg_init_tensor_req request {};
+    request.tensor = serialize_tensor(tensor);
+
+    if (jupiter_prefill_enabled()) {
+        const uint64_t layout_key = jupiter_tensor_layout_key(request.tensor);
+        {
+            std::lock_guard<std::mutex> lock(ctx->init_mutex);
+            if (ctx->initialized_layouts.find(layout_key) != ctx->initialized_layouts.end()) {
+                return GGML_STATUS_SUCCESS;
+            }
+        }
+
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR,
+                                   &request, sizeof(request), nullptr, 0);
+        RPC_STATUS_ASSERT(status);
+
+        {
+            std::lock_guard<std::mutex> lock(ctx->init_mutex);
+            ctx->initialized_layouts.insert(layout_key);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR,
+                               &request, sizeof(request), nullptr, 0);
+    RPC_STATUS_ASSERT(status);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -947,7 +1015,109 @@ static uint64_t rpc_hash_u64(uint64_t h, uint64_t v) {
     return h;
 }
 
+static uint64_t rpc_graph_jupiter_uid(const ggml_cgraph * cgraph) {
+    // Build a pointer-independent topology signature. The DFS index captures
+    // source/view relationships, while tensor names capture the scheduler slot
+    // suffix (#0/#1). Shapes/op_params distinguish the short tail graph.
+    std::unordered_map<const ggml_tensor *, uint32_t> tensor_index;
+    std::vector<const ggml_tensor *> ordered;
+
+    std::function<void(const ggml_tensor *)> visit = [&](const ggml_tensor * tensor) {
+        if (tensor == nullptr || tensor_index.find(tensor) != tensor_index.end()) {
+            return;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            visit(tensor->src[i]);
+        }
+        visit(tensor->view_src);
+        const uint32_t index = (uint32_t) ordered.size();
+        tensor_index.emplace(tensor, index);
+        ordered.push_back(tensor);
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        visit(cgraph->nodes[i]);
+    }
+
+    uint64_t uid = 0xcbf29ce484222325ULL;
+    uid = jupiter_hash_bytes(uid, &cgraph->n_nodes, sizeof(cgraph->n_nodes));
+    const uint32_t tensor_count = (uint32_t) ordered.size();
+    uid = jupiter_hash_bytes(uid, &tensor_count, sizeof(tensor_count));
+
+    for (const ggml_tensor * tensor : ordered) {
+        uid = jupiter_hash_bytes(uid, &tensor->type, sizeof(tensor->type));
+        uid = jupiter_hash_bytes(uid, &tensor->op, sizeof(tensor->op));
+        uid = jupiter_hash_bytes(uid, tensor->ne, sizeof(tensor->ne));
+        uid = jupiter_hash_bytes(uid, tensor->nb, sizeof(tensor->nb));
+        uid = jupiter_hash_bytes(uid, tensor->op_params, sizeof(tensor->op_params));
+        uid = jupiter_hash_bytes(uid, &tensor->flags, sizeof(tensor->flags));
+        uid = jupiter_hash_bytes(uid, &tensor->view_offs, sizeof(tensor->view_offs));
+        uid = jupiter_hash_cstr(uid, tensor->name);
+
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            uint32_t src_index = UINT32_MAX;
+            if (tensor->src[i] != nullptr) {
+                auto it = tensor_index.find(tensor->src[i]);
+                GGML_ASSERT(it != tensor_index.end());
+                src_index = it->second;
+            }
+            uid = jupiter_hash_bytes(uid, &src_index, sizeof(src_index));
+        }
+
+        uint32_t view_index = UINT32_MAX;
+        if (tensor->view_src != nullptr) {
+            auto it = tensor_index.find(tensor->view_src);
+            GGML_ASSERT(it != tensor_index.end());
+            view_index = it->second;
+        }
+        uid = jupiter_hash_bytes(uid, &view_index, sizeof(view_index));
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const auto it = tensor_index.find(cgraph->nodes[i]);
+        GGML_ASSERT(it != tensor_index.end());
+        uid = jupiter_hash_bytes(uid, &it->second, sizeof(it->second));
+    }
+
+    return uid != 0 ? uid : 0x4a55504954455231ULL;
+}
+
+static int rpc_graph_jupiter_slot(const ggml_cgraph * cgraph) {
+    auto slot_from_name = [](const char * name) -> int {
+        if (name == nullptr) {
+            return -1;
+        }
+        const size_t len = std::strlen(name);
+        if (len >= 2 && name[len - 2] == '#' &&
+            name[len - 1] >= '0' && name[len - 1] <= '9') {
+            return name[len - 1] - '0';
+        }
+        return -1;
+    };
+
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        int slot = slot_from_name(node->name);
+        if (slot >= 0) {
+            return slot;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (node->src[j] != nullptr) {
+                slot = slot_from_name(node->src[j]->name);
+                if (slot >= 0) {
+                    return slot;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
 static uint64_t rpc_graph_effective_uid(const ggml_cgraph * cgraph) {
+    if (jupiter_prefill_enabled()) {
+        return rpc_graph_jupiter_uid(cgraph);
+    }
+
     if (cgraph->uid != 0) {
         return cgraph->uid;
     }
@@ -1007,12 +1177,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    bool reuse = !jupiter_prefill_enabled() &&
-                 rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
-    // Jupiter Prefill V1 intentionally serializes the full graph for each slot.
-    // Equal-shape chunks may reuse the llama graph object, but their RPC input buffers
-    // belong to different scheduler copies and therefore must not reuse a remote graph
-    // that captured a previous slot's tensor addresses.
+    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    const int jupiter_slot = jupiter_prefill_enabled() ? rpc_graph_jupiter_slot(cgraph) : -1;
+
+    if (jupiter_prefill_enabled()) {
+        GGML_LOG_INFO("[JUPITER_GRAPH_SLOT] slot=%d action=%s uid=%" PRIu64 " nodes=%d\n",
+                      jupiter_slot, reuse ? "REUSE" : "BUILD", graph_uid, cgraph->n_nodes);
+    }
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
@@ -1271,6 +1442,7 @@ private:
 
     std::mutex tensor_meta_mutex;
     std::unordered_map<uint64_t, remote_tensor_meta> tensor_meta;
+    std::unordered_map<uint64_t, remote_tensor_meta> tensor_meta_by_layout;
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
@@ -1324,6 +1496,15 @@ void rpc_server::restore_tensor_extra(const rpc_tensor & serialized, ggml_tensor
         return;
     }
 
+    const uint64_t layout_key = jupiter_tensor_layout_key(serialized);
+    auto layout = tensor_meta_by_layout.find(layout_key);
+    if (layout != tensor_meta_by_layout.end() &&
+        layout->second.buffer == tensor->buffer &&
+        layout->second.data == serialized.data) {
+        tensor->extra = layout->second.extra;
+        return;
+    }
+
     // OpenCL views reuse the parent tensor's extra. INIT_TENSOR for a view does
     // not carry a full server-side view_src object, but the serialized parent id
     // is stable and has already been initialized.
@@ -1342,11 +1523,13 @@ void rpc_server::remember_tensor_extra(const rpc_tensor & serialized, const ggml
     }
 
     std::lock_guard<std::mutex> lock(tensor_meta_mutex);
-    tensor_meta[serialized.id] = remote_tensor_meta {
+    const remote_tensor_meta meta {
         tensor->buffer,
         serialized.data,
         tensor->extra,
     };
+    tensor_meta[serialized.id] = meta;
+    tensor_meta_by_layout[jupiter_tensor_layout_key(serialized)] = meta;
 }
 
 void rpc_server::forget_buffer_tensor_extras(ggml_backend_buffer_t buffer) {
@@ -1354,6 +1537,13 @@ void rpc_server::forget_buffer_tensor_extras(ggml_backend_buffer_t buffer) {
     for (auto it = tensor_meta.begin(); it != tensor_meta.end();) {
         if (it->second.buffer == buffer) {
             it = tensor_meta.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = tensor_meta_by_layout.begin(); it != tensor_meta_by_layout.end();) {
+        if (it->second.buffer == buffer) {
+            it = tensor_meta_by_layout.erase(it);
         } else {
             ++it;
         }
