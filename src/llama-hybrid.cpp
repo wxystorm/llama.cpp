@@ -9974,10 +9974,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        // APPLY_WIDE simulates every candidate inside the natural E window.
-        // If that window is too sharp to give the event simulator a useful
-        // comparison set, extend the E-ranked prefix to at least 64 candidates.
-        // There is still no simulation cap and no topology-family quota.
+        // APPLY_WIDE preserves the original uniform E-window/floor as its
+        // control group. Nonuniform candidates are generated independently:
+        // minimize the first Cycle's E, then compensate accumulated load
+        // through the remaining Cycles before full Prompt simulation.
         constexpr int wide_min_simulations = 64;
         const auto result =
             llama_ring_planner::search_runtime_applicable(
@@ -9988,14 +9988,17 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
             "nonuniform_profiled=%zu nonuniform_simulated=%zu "
+            "first_cycle_profiled=%zu first_cycle_selected=%zu "
+            "prefix_expanded=%zu prefix_completed=%zu "
+            "first_cycle_E_min=%.4f "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
             "E_margin=%.4f shortlist_floor=%d "
-            "filter=E_WINDOW_PLUS_FLOOR exact=FULL_PROMPT_EVENT_SIM "
-            "ranking=SIM_WALL seed_sim_cap=NONE "
-            "nonuniform_beam=8 nonuniform_passes=8 "
-            "nonuniform_sim_per_pass=128 "
-            "cycles=2..4 shape=NONUNIFORM_REFINED "
+            "filter=E1_FIRST_CYCLE_PLUS_UNIFORM_CONTROL "
+            "exact=FULL_PROMPT_EVENT_SIM ranking=SIM_WALL "
+            "uniform_sim_cap=NONE first_seeds_per_n=12 "
+            "prefix_beam_per_seed=8 width_spread_pct=25 "
+            "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
             "tail=PREVIEW_ONLY final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
@@ -10003,7 +10006,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.enumerated, result.profiled,
             result.e_window_shortlisted, result.shortlisted,
             result.simulated, result.nonuniform_profiled,
-            result.nonuniform_simulated, result.rejected_memory,
+            result.nonuniform_simulated, result.first_cycle_profiled,
+            result.first_cycle_selected, result.prefix_expanded,
+            result.prefix_completed, result.first_cycle_e_min,
+            result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
             result.shortlist_e_limit, wide_e_margin,
