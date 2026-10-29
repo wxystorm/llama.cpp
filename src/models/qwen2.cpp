@@ -414,7 +414,7 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
             (cur->ne[1] + planned_chunk_tokens - 1) / planned_chunk_tokens :
             std::min<int64_t>(qwen2_prefill_ffn_chunk_count(), cur->ne[1]);
         const bool use_decode_chunked_ffn = n_tokens == 1 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-                                            llama_hybrid_layer_mode_uses_split_ffn_chunks(hybrid_mode) &&
+                                            hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT &&
                                             n_decode_chunks >= 1 && loras->empty() && cvec->tensor_for(il) == nullptr;
         const bool use_prefill_chunked_ffn = n_tokens > 1 && cur->ne[1] > 1 &&
                                              model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
