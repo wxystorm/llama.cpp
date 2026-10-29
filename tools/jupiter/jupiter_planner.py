@@ -21,7 +21,9 @@ The output is a small text plan consumed at runtime via:
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
+from functools import lru_cache
 import math
 import os
 import re
@@ -87,15 +89,28 @@ def _write_plan(path: str, updates: Dict[str, str]) -> None:
 
 
 class QProfile:
-    def __init__(self, rows: Sequence[dict]):
-        # Calibration sweeps may repeat the same path several times. Collapse
-        # repeats per device with the median first, then use the slowest stage as
-        # q(x,y), which is the service-time bottleneck of the balanced pipeline.
+    """Median-per-device stage profile with conservative prefix interpolation.
+
+    Jupiter sweeps measure several *fixed chunk sizes*. A prefix may therefore
+    have only one observed chunk size. Interpolating x within that prefix would
+    silently treat a 48-token observation as the cost of a 128-token chunk.
+    First interpolate the prefix axis for the SAME x, then interpolate x.
+    Unobserved points remain estimates: use candidate-specific calibration
+    before interpreting a DP plan as measured.
+    """
+
+    def __init__(self, rows: Sequence[dict], metric: str = "latency_ms"):
         grouped_stage: Dict[Tuple[int, int, str], List[float]] = {}
         for row in rows:
             x = int(row["x"])
             y = int(row["y"])
-            t = float(row["latency_ms"])
+            if x <= 0 or y < 0:
+                raise ValueError(f"invalid q coordinate x={x} y={y}")
+            if metric not in row or row[metric] in ("", None):
+                raise ValueError(f"q profile is missing metric {metric!r}")
+            t = float(row[metric])
+            if not math.isfinite(t) or t < 0:
+                raise ValueError(f"invalid {metric}={t} for q({x},{y})")
             stage = (row.get("device") or row.get("stage") or "stage").strip()
             grouped_stage.setdefault((x, y, stage), []).append(t)
 
@@ -106,64 +121,93 @@ class QProfile:
         for (x, y, _stage), samples in grouped_stage.items():
             per_xy.setdefault((x, y), []).append(statistics.median(samples))
 
-        self.values = {k: max(v) for k, v in per_xy.items()}
-        self.ys = sorted({y for _, y in self.values})
-        self.xs_by_y: Dict[int, List[int]] = {}
+        self.values = {key: max(timings) for key, timings in per_xy.items()}
+        self.ys_by_x: Dict[int, List[int]] = {}
         for x, y in self.values:
-            self.xs_by_y.setdefault(y, []).append(x)
-        for y in self.xs_by_y:
-            self.xs_by_y[y] = sorted(set(self.xs_by_y[y]))
+            self.ys_by_x.setdefault(x, []).append(y)
+        for x in self.ys_by_x:
+            self.ys_by_x[x] = sorted(set(self.ys_by_x[x]))
+        self.xs = sorted(self.ys_by_x)
 
-    def _interp_x(self, x: int, y: int) -> float:
-        xs = self.xs_by_y[y]
-        if x <= xs[0]:
-            if x == xs[0] or len(xs) == 1:
-                return self.values[(xs[0], y)]
-            x0, x1 = xs[0], xs[1]
-        elif x >= xs[-1]:
-            if x == xs[-1] or len(xs) == 1:
-                return self.values[(xs[-1], y)]
-            x0, x1 = xs[-2], xs[-1]
-        else:
-            x0, x1 = xs[0], xs[-1]
-            for a, b in zip(xs, xs[1:]):
-                if a <= x <= b:
-                    x0, x1 = a, b
-                    break
+    def is_measured(self, x: int, y: int) -> bool:
+        """True only for a calibrated (x, prefix) pair, not an interpolation."""
+        return (x, y) in self.values
 
-        t0 = self.values[(x0, y)]
-        t1 = self.values[(x1, y)]
-        if x0 == x1:
-            return t0
-        alpha = (x - x0) / (x1 - x0)
-        return t0 + alpha * (t1 - t0)
+    def sample_status(self, x: int, y: int) -> str:
+        if self.is_measured(x, y):
+            return "MEASURED"
+        if x in self.ys_by_x:
+            ys = self.ys_by_x[x]
+            return "INTERP_Y" if ys[0] <= y <= ys[-1] else "EXTRAP_Y"
+        return "INTERP_XY" if self.xs[0] < x < self.xs[-1] else "EXTRAP_X"
 
+    @lru_cache(maxsize=131072)
+    def _interp_y_at_x(self, x: int, y: int) -> float:
+        """Interpolate prefix with chunk size fixed (never borrow a smaller x)."""
+        ys = self.ys_by_x[x]
+        if y <= ys[0]:
+            # Do not extrapolate downwards to an artificially cheaper stage.
+            return self.values[(x, ys[0])]
+        if y >= ys[-1]:
+            last = ys[-1]
+            value = self.values[(x, last)]
+            if len(ys) < 2:
+                return value
+            before = ys[-2]
+            # Conservative non-negative prefix extrapolation; an increasing
+            # observed cost is never replaced by a lower one past last.
+            slope = max(0.0, (value - self.values[(x, before)]) / (last - before))
+            return value + (y - last) * slope
+
+        index = bisect_left(ys, y)
+        if ys[index] == y:
+            return self.values[(x, y)]
+        left, right = ys[index - 1], ys[index]
+        left_t = self.values[(x, left)]
+        right_t = self.values[(x, right)]
+        fraction = (y - left) / (right - left)
+        return left_t + fraction * (right_t - left_t)
+
+    @lru_cache(maxsize=131072)
     def q(self, x: int, y: int) -> float:
+        if x <= 0 or y < 0:
+            raise ValueError(f"invalid q coordinate x={x} y={y}")
         if (x, y) in self.values:
             return self.values[(x, y)]
+        if x in self.ys_by_x:
+            return self._interp_y_at_x(x, y)
 
-        ys = self.ys
-        if y <= ys[0]:
-            if y == ys[0] or len(ys) == 1:
-                return self._interp_x(x, ys[0])
-            y0, y1 = ys[0], ys[1]
-        elif y >= ys[-1]:
-            if y == ys[-1] or len(ys) == 1:
-                return self._interp_x(x, ys[-1])
-            y0, y1 = ys[-2], ys[-1]
-        else:
-            y0, y1 = ys[0], ys[-1]
-            for a, b in zip(ys, ys[1:]):
-                if a <= y <= b:
-                    y0, y1 = a, b
-                    break
+        index = bisect_left(self.xs, x)
+        if index == 0:
+            # A shorter chunk than the smallest measured x may be cheaper,
+            # but a flat upper bound is safer than an optimistic extrapolation.
+            return self._interp_y_at_x(self.xs[0], y)
+        if index == len(self.xs):
+            # No measured x above the query; do not assume the last measured
+            # chunk has constant cost as x increases.
+            last_x = self.xs[-1]
+            return self._interp_y_at_x(last_x, y) * (x / last_x)
 
-        t0 = self._interp_x(x, y0)
-        t1 = self._interp_x(x, y1)
-        if y0 == y1:
-            return t0
-        alpha = (y - y0) / (y1 - y0)
-        return t0 + alpha * (t1 - t0)
+        lower_x, upper_x = self.xs[index - 1], self.xs[index]
+        lower = self._interp_y_at_x(lower_x, y)
+        upper = self._interp_y_at_x(upper_x, y)
+        return lower + (x - lower_x) * (upper - lower) / (upper_x - lower_x)
+
+
+def sequence_points(chunks: Sequence[int]) -> List[Tuple[int, int]]:
+    """Return (chunk_size, prefix) coordinates of a sequence partition."""
+    points: List[Tuple[int, int]] = []
+    prefix = 0
+    for x in chunks:
+        if x <= 0:
+            raise ValueError("sequence chunks must be positive")
+        points.append((x, prefix))
+        prefix += x
+    return points
+
+
+def sequence_missing_points(profile: QProfile, chunks: Sequence[int]) -> List[Tuple[int, int]]:
+    return [(x, y) for x, y in sequence_points(chunks) if not profile.is_measured(x, y)]
 
 
 @dataclass
@@ -264,7 +308,7 @@ def solve_sequence(
 
 
 def cmd_sequence(args: argparse.Namespace) -> None:
-    profile = QProfile(_read_csv(args.profile))
+    profile = QProfile(_read_csv(args.profile), metric=args.metric)
     lengths: Iterable[int]
     if args.target_length is not None:
         lengths = [args.target_length]
@@ -285,11 +329,24 @@ def cmd_sequence(args: argparse.Namespace) -> None:
         except ValueError:
             continue
 
+        missing = sequence_missing_points(profile, sol.chunks)
+        print(
+            f"[JUPITER_SEQUENCE_COVERAGE] total={total} "
+            f"metric={args.metric} measured={len(sol.chunks) - len(missing)} "
+            f"chunks={len(sol.chunks)} missing="
+            f"{';'.join(f'{x}:{y}' for x, y in missing) or 'NONE'} "
+            f"status={'MEASURED' if not missing else 'NEEDS_TARGETED_Q'}"
+        )
+        if missing and args.require_measured:
+            raise SystemExit(
+                "DP candidate uses unmeasured q positions; run "
+                "refine_sequence_q.py before accepting the plan"
+            )
         updates[f"sequence.{total}"] = ",".join(map(str, sol.chunks))
         print(
             f"[JUPITER_SEQUENCE_DP] total={sol.total} k={sol.k} "
             f"chunks={sol.chunks} bottleneck_ms={sol.bottleneck_ms:.3f} "
-            f"predicted_ms={sol.predicted_ms:.3f}"
+            f"predicted_ms={sol.predicted_ms:.3f} metric={args.metric}"
         )
 
     if not updates:
@@ -515,6 +572,15 @@ def build_parser() -> argparse.ArgumentParser:
     seq.add_argument("--devices", type=int, required=True)
     seq.add_argument("--min-chunk", type=int, required=True, dest="min_chunk")
     seq.add_argument("--max-chunk", type=int, default=None, dest="max_chunk")
+    seq.add_argument(
+        "--metric", choices=["latency_ms", "compute_ms", "wall_ms"],
+        default="latency_ms",
+        help="q cost column (latency_ms is the original extracted metric)",
+    )
+    seq.add_argument(
+        "--require-measured", action="store_true",
+        help="refuse DP candidates with unmeasured (x,prefix) positions",
+    )
     seq.add_argument("--max-subsequences", type=int, default=None, dest="max_subsequences")
     seq.add_argument("--target-length", type=int, default=None, dest="target_length")
     seq.add_argument("--smax", type=int, default=4096)
