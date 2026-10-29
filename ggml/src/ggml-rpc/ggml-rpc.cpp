@@ -1133,6 +1133,9 @@ static const char * ggml_backend_rpc_name(ggml_backend_t backend) {
 
 static void ggml_backend_rpc_free(ggml_backend_t backend) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
+    if (rpc_ctx->comm) {
+        RPC_STATUS_ASSERT(rpc_ctx->comm->synchronize_remote());
+    }
     delete rpc_ctx;
     delete backend;
 }
@@ -1144,6 +1147,10 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     }
 
     auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (rpc_ctx->comm) {
+        RPC_STATUS_ASSERT(rpc_ctx->comm->synchronize_remote());
+        return;
+    }
     auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
     rpc_msg_jupiter_rsp response {};
     const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0, &response, sizeof(response));
@@ -1330,6 +1337,53 @@ static void serialize_graph(uint32_t device, uint64_t graph_uid, const ggml_cgra
     memcpy(out_tensors, tensors.data(), n_tensors * sizeof(rpc_tensor));
 }
 
+// Applied only to a scheduler C2P activation copy. Capture the upstream
+// tensor immediately (the graph scheduler may reuse its slot), then send
+// through a private network worker. This first version overlaps SOCKET
+// transmission, not source GPU->Host staging, with PC computation.
+static bool ggml_backend_rpc_cpy_tensor_async(
+        ggml_backend_t backend_src,
+        ggml_backend_t backend_dst,
+        const ggml_tensor * src,
+        ggml_tensor * dst) {
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend_dst->context);
+    if (!ctx->comm || !backend_src || !src || !dst ||
+        !src->buffer || !dst->buffer ||
+        !ggml_backend_buffer_is_rpc(dst->buffer) ||
+        !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+        ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+
+    // The serialized RPC tensor pins the destination's remote address;
+    // no worker closure may dereference a scheduler graph tensor.
+    const auto * dst_ctx =
+        static_cast<const ggml_backend_rpc_buffer_context *>(dst->buffer->context);
+    if (!dst_ctx) {
+        return false;
+    }
+
+    const size_t bytes = ggml_nbytes(src);
+    const rpc_tensor remote_dst = serialize_tensor(dst);
+    const uint64_t offset = 0;
+    std::vector<uint8_t> payload(sizeof(remote_dst) + sizeof(offset) + bytes);
+    std::memcpy(payload.data(), &remote_dst, sizeof(remote_dst));
+    std::memcpy(payload.data() + sizeof(remote_dst), &offset, sizeof(offset));
+
+    const int64_t t0 = jupiter_trace_enabled() ? ggml_time_us() : 0;
+    ggml_backend_synchronize(backend_src);
+    ggml_backend_tensor_get(src,
+        payload.data() + sizeof(remote_dst) + sizeof(offset), 0, bytes);
+
+    const uint64_t task = ctx->comm->enqueue_c2p(std::move(payload), bytes);
+    if (jupiter_trace_enabled()) {
+        GGML_LOG_INFO("[JUPITER_COMM] action=C2P_ENQUEUE task=%" PRIu64
+                      " bytes=%zu stage_ms=%.3f status=OK\n",
+                      task, bytes, (ggml_time_us() - t0)/1000.0);
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
@@ -1352,6 +1406,27 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
     const int jupiter_slot = jupiter_prefill_enabled() ? rpc_graph_jupiter_slot(cgraph) : -1;
+
+    if (rpc_ctx->comm) {
+        uint64_t task = 0;
+        if (reuse) {
+            const rpc_msg_graph_recompute_req request {
+                rpc_ctx->device, graph_uid,
+            };
+            task = rpc_ctx->comm->enqueue_graph_recompute(request);
+        } else {
+            std::vector<uint8_t> input;
+            serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
+            task = rpc_ctx->comm->enqueue_graph_build(std::move(input));
+            rpc_dev_ctx->graph_uids.insert(graph_uid);
+        }
+        if (jupiter_trace_enabled()) {
+            GGML_LOG_INFO("[JUPITER_COMM] action=PHONE_GRAPH_QUEUED task=%" PRIu64
+                          " uid=%" PRIu64 " reused=%d slot=%d status=OK\n",
+                          task, graph_uid, (int) reuse, jupiter_slot);
+        }
+        return GGML_STATUS_SUCCESS;
+    }
 
     if (jupiter_prefill_enabled()) {
         GGML_LOG_INFO("[JUPITER_GRAPH_SLOT] slot=%d action=%s uid=%" PRIu64 " nodes=%d\n",
@@ -1415,6 +1490,15 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
         generation,
     };
 
+    if (rpc_ctx->comm) {
+        const uint64_t task = rpc_ctx->comm->enqueue_event(request);
+        if (jupiter_trace_enabled()) {
+            GGML_LOG_INFO("[JUPITER_COMM] action=EVENT_QUEUED task=%" PRIu64
+                          " event=%" PRIu64 " generation=%" PRIu64 "\n",
+                          task, request.event_id, request.generation);
+        }
+        return;
+    }
     auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
     const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &request, sizeof(request));
     RPC_STATUS_ASSERT(status);
@@ -1467,7 +1551,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_tensor_async        = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL,
+    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
     /* .synchronize             = */ ggml_backend_rpc_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
@@ -1520,6 +1604,11 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .device         = */ device,
         /* .name           = */ dev_name,
     };
+    if (jupiter_async_c2p_enabled()) {
+        ctx->comm = std::make_unique<jupiter_rpc_comm_worker>(ctx->endpoint);
+        GGML_LOG_INFO("[JUPITER_COMM] mode=ASYNC_C2P_NETWORK status=ENABLED "
+                      "source_staging=SYNC graph_submit=WORKER max_pending=32\n");
+    }
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_t backend = new ggml_backend {
         /* .guid    = */ ggml_backend_rpc_guid(),
