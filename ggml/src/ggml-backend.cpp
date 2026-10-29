@@ -1565,6 +1565,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const char * jupiter_profile_env = getenv("LLAMA_JUPITER_PROFILE_STAGE");
     const bool jupiter_profile_stage =
             jupiter_profile_env != NULL && atoi(jupiter_profile_env) != 0;
+    const char * jupiter_timeline_env = getenv("LLAMA_JUPITER_TIMELINE");
+    const char * jupiter_prefill_env = getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_timeline = jupiter_timeline_env != NULL &&
+            atoi(jupiter_timeline_env) != 0 &&
+            jupiter_prefill_env != NULL && atoi(jupiter_prefill_env) != 0;
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1689,13 +1694,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        const bool profile_copy = jupiter_timeline &&
+                                strncmp(ggml_backend_name(split_backend), "RPC", 3) == 0;
+                        const int64_t t0 = profile_copy ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        const int64_t t_copy = profile_copy ? ggml_time_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (profile_copy) {
+                            const int64_t done_us = ggml_time_us();
+                            GGML_LOG_INFO(
+                                "[JUPITER_C2P_SYNC_FALLBACK] split=%d bytes=%zu "
+                                "src=%s dst=%s backend=%s sync_wait_ms=%.3f "
+                                "copy_ms=%.3f total_ms=%.3f t_us=%" PRId64 "\n",
+                                split_id, ggml_nbytes(input),
+                                input->name, input_cpy->name,
+                                ggml_backend_name(input_backend),
+                                (t_copy - t0)/1000.0,
+                                (done_us - t_copy)/1000.0,
+                                (done_us - t0)/1000.0, done_us);
+                        }
                     }
                 }
             }
