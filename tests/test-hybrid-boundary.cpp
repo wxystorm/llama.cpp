@@ -1,8 +1,43 @@
 #include "llama-hybrid.h"
+#include "llama-hybrid-arch.h"
 
 #include <cassert>
 
 int main() {
+    // Region Ring parity contract: dense Llama/Qwen and Qwen3-MoE share the
+    // same topology/ownership/transport capabilities. MoE only specializes
+    // FFN graph construction and Router/TopK payloads.
+    assert(llama_hybrid_arch_supported(LLM_ARCH_LLAMA));
+    assert(llama_hybrid_arch_supported(LLM_ARCH_QWEN2));
+    assert(llama_hybrid_arch_supported(LLM_ARCH_QWEN3));
+    assert(llama_hybrid_arch_supported(LLM_ARCH_QWEN3MOE));
+
+    assert(llama_hybrid_arch_is_dense(LLM_ARCH_LLAMA));
+    assert(llama_hybrid_arch_is_dense(LLM_ARCH_QWEN2));
+    assert(llama_hybrid_arch_is_dense(LLM_ARCH_QWEN3));
+    assert(!llama_hybrid_arch_is_dense(LLM_ARCH_QWEN3MOE));
+    assert(llama_hybrid_arch_is_moe(LLM_ARCH_QWEN3MOE));
+
+    assert(llama_hybrid_arch_supports_region_gpu_weight_streaming(
+        LLM_ARCH_LLAMA));
+    assert(llama_hybrid_arch_supports_region_gpu_weight_streaming(
+        LLM_ARCH_QWEN2));
+    assert(llama_hybrid_arch_supports_region_gpu_weight_streaming(
+        LLM_ARCH_QWEN3));
+    assert(llama_hybrid_arch_supports_region_gpu_weight_streaming(
+        LLM_ARCH_QWEN3MOE));
+
+    assert(llama_hybrid_arch_supports_region_embedding_prelude(
+        LLM_ARCH_LLAMA));
+    assert(llama_hybrid_arch_supports_region_embedding_prelude(
+        LLM_ARCH_QWEN2));
+    assert(llama_hybrid_arch_supports_region_embedding_prelude(
+        LLM_ARCH_QWEN3));
+    assert(llama_hybrid_arch_supports_region_embedding_prelude(
+        LLM_ARCH_QWEN3MOE));
+
+    assert(!llama_hybrid_arch_supported(LLM_ARCH_GPT2));
+
     {
         const auto blocks = llama_hybrid_plan_boundary(128, 128, 128);
         assert(blocks.size() == 1);
