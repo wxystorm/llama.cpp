@@ -122,6 +122,13 @@ class QProfile:
             per_xy.setdefault((x, y), []).append(statistics.median(samples))
 
         self.values = {key: max(timings) for key, timings in per_xy.items()}
+        # A coordinate is directly measured only when every backend stage
+        # present in the calibration dataset has a sample there. Otherwise a
+        # partially captured log could silently lower the bottleneck cost.
+        self.required_stages = {stage for _, _, stage in grouped_stage}
+        self.stages_by_xy: Dict[Tuple[int, int], set[str]] = {}
+        for x, y, stage in grouped_stage:
+            self.stages_by_xy.setdefault((x, y), set()).add(stage)
         self.ys_by_x: Dict[int, List[int]] = {}
         for x, y in self.values:
             self.ys_by_x.setdefault(x, []).append(y)
@@ -131,7 +138,10 @@ class QProfile:
 
     def is_measured(self, x: int, y: int) -> bool:
         """True only for a calibrated (x, prefix) pair, not an interpolation."""
-        return (x, y) in self.values
+        return (
+            (x, y) in self.values
+            and self.required_stages.issubset(self.stages_by_xy.get((x, y), set()))
+        )
 
     def sample_status(self, x: int, y: int) -> str:
         if self.is_measured(x, y):
