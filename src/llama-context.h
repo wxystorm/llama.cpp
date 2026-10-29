@@ -50,6 +50,8 @@ enum class llama_hybrid_runtime_stage_kind {
     CPU,
     TENSOR,
     PHONE,
+    C2P,
+    P2C,
 };
 
 struct llama_hybrid_runtime_stage {
