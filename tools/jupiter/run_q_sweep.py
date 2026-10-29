@@ -213,25 +213,19 @@ def reconstruct_plan_from_log(
     return None, "NONE"
 
 
-def infer_runtime_prompt_tokens(log_path: Path) -> tuple[int, str]:
-    """Read the actual prompt length from llama-cli's output, not a guessed 358."""
-    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+def longest_prefill_ubatch_chain(log_text: str) -> int:
+    """Recover the actual decode-batch token count from Jupiter runtime traces.
 
-    task_counts = [
-        int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)
-    ]
-    timing_counts = [
-        int(m.group(1)) for m in PROMPT_EVAL_RE.finditer(log_text)
-    ]
-
-    # If the slot and timing logs are unavailable, compute the total from the
-    # longest contiguous JUPITER_UBATCH BEGIN chain. A warmup typically reports
-    # two tokens at prefix=0; the real prefill is a longer separate chain.
+    The server's task.n_tokens may include a token handled separately by the
+    prompt cache / generation pipeline. The sequence plan is applied to the
+    llama_context::decode() batch, so that batch is the authoritative count.
+    Warmup has a very short chain, which is ignored when longer chains exist.
+    """
     batches = [
         (int(m.group(1)), int(m.group(2)))
         for m in UBATCH_RE.finditer(log_text)
     ]
-    ubatch_total = 0
+    longest = 0
     for i, (prefix, _) in enumerate(batches):
         if prefix != 0:
             continue
@@ -240,25 +234,42 @@ def infer_runtime_prompt_tokens(log_path: Path) -> tuple[int, str]:
             if pfx != end or tokens <= 0:
                 break
             end += tokens
-        ubatch_total = max(ubatch_total, end)
+        longest = max(longest, end)
+    return longest
+
+
+def infer_runtime_prompt_tokens(log_path: Path) -> tuple[int, str]:
+    """Detect the token count passed to the actual prefill decode batch."""
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+
+    task_counts = [
+        int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)
+    ]
+    timing_counts = [
+        int(m.group(1)) for m in PROMPT_EVAL_RE.finditer(log_text)
+    ]
+    ubatch_total = longest_prefill_ubatch_chain(log_text)
 
     available = []
+    if ubatch_total > 2:
+        available.append(("ubatch_chain", ubatch_total))
     if task_counts:
         available.append(("task.n_tokens", task_counts[-1]))
     if timing_counts:
         available.append(("prompt_eval", timing_counts[-1]))
-    if ubatch_total > 0:
+    if not available and ubatch_total > 0:
         available.append(("ubatch_chain", ubatch_total))
 
     if not available:
         raise RuntimeError(
             "token probe produced no prompt length. Check the probe log: "
-            f"{log_path}; expected task.n_tokens, prompt eval time, "
-            "or JUPITER_UBATCH BEGIN records."
+            f"{log_path}; expected JUPITER_UBATCH BEGIN, task.n_tokens, "
+            "or prompt eval time records."
         )
 
-    # The slot's actual task token count is the authoritative value for the
-    # sequence plan. Timing and UBATCH provide independent diagnostics.
+    # The offline plan is matched against balloc.get_n_tokens() in
+    # llama_kv_cache::init_batch. That count is equal to the sum of actual
+    # JUPITER_UBATCH BEGIN tokens in the prefill decode batch.
     source, total = available[0]
     if total <= 0:
         raise RuntimeError(f"invalid prompt token count {total}: {log_path}")
@@ -271,7 +282,7 @@ def infer_runtime_prompt_tokens(log_path: Path) -> tuple[int, str]:
             print(
                 f"[JUPITER_SWEEP_TOKEN_WARNING] "
                 f"{name}={count} differs from {source}={total}; "
-                "the runtime plan will still be checked after execution.",
+                "using actual prefill batch length for the plan.",
                 file=sys.stderr, flush=True,
             )
     return total, source
