@@ -563,36 +563,43 @@ def main() -> int:
                     encoding="utf-8", errors="replace"
                 )
                 tail = log_text.splitlines()[-60:]
-                task_tokens = [int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)]
-
-                if task_tokens:
-                    actual_prompt_tokens = task_tokens[-1]
-                    print(
-                        "[JUPITER_SWEEP_DIAG] "
-                        f"runtime_prompt_tokens={actual_prompt_tokens} "
-                        f"target_tokens={total_tokens} "
-                        f"plan_sum={sum(chunks)}",
-                        file=sys.stderr,
-                    )
-                    if actual_prompt_tokens != total_tokens:
-                        raise RuntimeError(
-                            "prompt token count mismatch: "
-                            f"runtime={actual_prompt_tokens}, "
-                            f"probed={total_tokens}. "
-                            "The explicit Jupiter sequence plan is ignored when "
-                            "its chunk sum does not match the runtime prompt batch."
-                        )
+                task_tokens = [
+                    int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)
+                ]
+                eval_tokens = [
+                    int(m.group(1)) for m in PROMPT_EVAL_RE.finditer(log_text)
+                ]
+                observed_ubatches = [
+                    (int(m.group(1)), int(m.group(2)))
+                    for m in UBATCH_RE.finditer(log_text)
+                ]
+                actual_prompt_tokens = task_tokens[-1] if task_tokens else None
+                actual_eval_tokens = eval_tokens[-1] if eval_tokens else None
 
                 print(
-                    "[JUPITER_SWEEP_DIAG] no complete plan could be "
-                    f"reconstructed; log={log_path}",
-                    file=sys.stderr,
+                    "[JUPITER_SWEEP_DIAG] "
+                    f"probed_tokens={total_tokens} "
+                    f"task_tokens={actual_prompt_tokens} "
+                    f"prompt_eval_tokens={actual_eval_tokens} "
+                    f"plan_sum={sum(chunks)} "
+                    f"plan_lines={len(PLAN_RE.findall(log_text))} "
+                    f"ubatches={observed_ubatches[:24]} "
+                    f"log={log_path}",
+                    file=sys.stderr, flush=True,
                 )
+                if actual_prompt_tokens is not None and actual_prompt_tokens != total_tokens:
+                    raise RuntimeError(
+                        "prompt length changed between probe and calibration: "
+                        f"probe={total_tokens} calibration={actual_prompt_tokens}; "
+                        f"log={log_path}"
+                    )
+
                 for line in tail:
                     print(line, file=sys.stderr)
                 raise RuntimeError(
-                    f"runtime did not expose a complete Jupiter sequence "
-                    f"plan for x={x}"
+                    f"runtime did not apply the expected sequence plan for "
+                    f"x={x}, tokens={total_tokens}; "
+                    f"inspect [JUPITER_SWEEP_DIAG] and {log_path}"
                 )
 
             actual_text = ",".join(map(str, actual_chunks))
