@@ -9458,43 +9458,6 @@ llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_use) const {
             ggml_set_name(cur, name);
         }
 
-        // Directional Tensor tasks declare their completion action while the
-        // graph is being built. The producer tensor itself carries the
-        // contract all the way through Meta's simple-tensor materialization.
-        // Runtime execution therefore does not scan a completed graph to
-        // decide whether a send should happen.
-        if (il >= 0 &&
-                llama_hybrid_layer_mode_directional_tensor(
-                    model.hybrid_layer_mode(il))) {
-            const bool send_ready =
-                std::strncmp(
-                    name,
-                    "prefill_ffn_norm_chunk_",
-                    sizeof("prefill_ffn_norm_chunk_") - 1) == 0;
-            const bool send_partial =
-                std::strncmp(
-                    name,
-                    "prefill_ffn_down_chunk_",
-                    sizeof("prefill_ffn_down_chunk_") - 1) == 0;
-
-            GGML_ASSERT(!(send_ready && send_partial));
-            if (send_ready) {
-                cur->flags |= GGML_TENSOR_FLAG_META_SEND_READY;
-            } else if (send_partial) {
-                cur->flags |= GGML_TENSOR_FLAG_META_SEND_PARTIAL;
-            }
-
-            if ((send_ready || send_partial) &&
-                    std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
-                LLAMA_LOG_ERROR(
-                    "[DIRECTIONAL_FFN_TASK_BIND] "
-                    "layer=%d tensor=%s action=%s status=READY\n",
-                    il,
-                    cur->name,
-                    send_ready ? "SEND_READY" : "SEND_PARTIAL");
-            }
-        }
-
         if (il >= 0 && strcmp(name, "prefill_wave_entry") == 0) {
             const ggml_backend_dev_t dev_layer = model.dev_layer(il);
 
