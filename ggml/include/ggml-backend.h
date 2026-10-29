@@ -602,6 +602,10 @@ extern "C" {
         GGML_BACKEND_META_CPU_TASK_CPU_FULL = 0,
         GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN = 1,
         GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN = 2,
+        // Final model postlude on PC (for example result_norm/result_output).
+        // This is not a Tensor continuation and must not be counted as a
+        // PC_MAIN/REMOTE_FFN preemption request.
+        GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT = 3,
     };
     enum ggml_backend_meta_cpu_task_urgency {
         GGML_BACKEND_META_CPU_URGENCY_BLOCKING_REDUCE = 0,

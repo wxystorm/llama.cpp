@@ -2551,12 +2551,16 @@ static uint64_t ggml_backend_meta_cpu_task_group(
         int32_t kind,
         int32_t layer,
         int32_t chunk) {
-    if (layer < 0 || chunk < 0) {
+    if (chunk < 0 ||
+            (layer < 0 &&
+             kind != GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT)) {
         return 0;
     }
+    const uint64_t layer_key =
+        layer >= 0 ? (uint64_t) (uint32_t) (layer + 1) : 0;
     return (UINT64_C(0x4350) << 48) |
         (((uint64_t) (uint32_t) (kind + 1) & UINT64_C(0xff)) << 40) |
-        (((uint64_t) (uint32_t) (layer + 1) & UINT64_C(0xffff)) << 24) |
+        ((layer_key & UINT64_C(0xffff)) << 24) |
         ((uint64_t) (uint32_t) (chunk + 1) & UINT64_C(0xffffff));
 }
 
@@ -2662,6 +2666,21 @@ static bool ggml_backend_meta_cpu_task_graph_identity(
     return false;
 }
 
+static bool ggml_backend_meta_cpu_task_graph_is_output(
+        const ggml_cgraph * graph) {
+    if (graph == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const char * name = graph->nodes[i]->name;
+        if (std::strncmp(name, "result_norm", 11) == 0 ||
+                std::strncmp(name, "result_output", 13) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ggml_backend_meta_cpu_task_graph_has_l_out(
         const ggml_cgraph * graph,
         int layer) {
@@ -2686,6 +2705,7 @@ static const char * ggml_backend_meta_cpu_task_kind_name(int32_t kind) {
         case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return "CPU_FULL";
         case GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN: return "TENSOR_PC_MAIN";
         case GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN: return "TENSOR_REMOTE_FFN";
+        case GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT: return "CPU_OUTPUT";
         default: return "UNKNOWN";
     }
 }
@@ -2695,6 +2715,9 @@ struct ggml_backend_meta_cpu_task_executor {
         uint64_t id = 0;
         ggml_backend_meta_cpu_task_desc desc {};
         std::function<ggml_status(uint64_t)> run;
+        int32_t debug_sg = -1;
+        std::string debug_first;
+        std::string debug_last;
     };
 
     ggml_backend_meta_context * backend_ctx = nullptr;
@@ -2750,7 +2773,8 @@ struct ggml_backend_meta_cpu_task_executor {
             case GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN: return 0;
             case GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN: return 1;
             case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return 2;
-            default: return 3;
+            case GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT: return 3;
+            default: return 4;
         }
     }
 
@@ -2832,7 +2856,7 @@ struct ggml_backend_meta_cpu_task_executor {
             "[CPU_TASK_SCHED] event=%s id=%" PRIu64
             " kind=%s urgency=%d chunk=%d layer=%d "
             "logical_group=%" PRIu64 " phase=%s flags=0x%x frontier=%d "
-            "queued=%zu status=%d\n",
+            "sg=%d first=%s last=%s queued=%zu status=%d\n",
             event,
             t.id,
             ggml_backend_meta_cpu_task_kind_name(t.desc.kind),
@@ -2850,6 +2874,9 @@ struct ggml_backend_meta_cpu_task_executor {
                 "ATOMIC",
             t.desc.flags,
             causal_frontier,
+            t.debug_sg,
+            t.debug_first.empty() ? "(none)" : t.debug_first.c_str(),
+            t.debug_last.empty() ? "(none)" : t.debug_last.c_str(),
             queued,
             (int) status);
         std::fflush(stderr);
@@ -2909,22 +2936,35 @@ struct ggml_backend_meta_cpu_task_executor {
 
     uint64_t enqueue(
             const ggml_backend_meta_cpu_task_desc & desc,
-            std::function<ggml_status(uint64_t)> run) {
+            std::function<ggml_status(uint64_t)> run,
+            int32_t debug_sg = -1,
+            const ggml_cgraph * debug_graph = nullptr) {
         std::lock_guard<std::mutex> lock(mutex);
         task t;
         t.id = ++submitted;
         t.desc = desc;
         t.run = std::move(run);
+        t.debug_sg = debug_sg;
+        if (debug_graph != nullptr && debug_graph->n_nodes > 0) {
+            t.debug_first = debug_graph->nodes[0]->name;
+            t.debug_last =
+                debug_graph->nodes[debug_graph->n_nodes - 1]->name;
+        }
         if (t.desc.layer < 0 &&
+                t.desc.kind != GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT &&
                 backend_ctx != nullptr &&
                 backend_ctx->cpu_task_outer_chunk.load(
                     std::memory_order_relaxed) >= 0) {
             ++unresolved_identity_tasks;
         }
 
+        const bool incoming_tensor_continuation =
+            t.desc.kind == GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN ||
+            t.desc.kind == GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
         if (running_id != 0 &&
                 running_desc.kind ==
-                    GGML_BACKEND_META_CPU_TASK_CPU_FULL) {
+                    GGML_BACKEND_META_CPU_TASK_CPU_FULL &&
+                incoming_tensor_continuation) {
             task running;
             running.id = running_id;
             running.desc = running_desc;
@@ -2936,13 +2976,16 @@ struct ggml_backend_meta_cpu_task_executor {
                     "running_id=%" PRIu64 " running_kind=CPU_FULL "
                     "incoming_id=%" PRIu64 " incoming_kind=%s "
                     "incoming_urgency=%d incoming_chunk=%d "
+                    "incoming_layer=%d incoming_sg=%d "
                     "action=DEFER_TO_CPU_FULL_END_V1\n",
                     running_id,
                     t.id,
                     ggml_backend_meta_cpu_task_kind_name(
                         t.desc.kind),
                     t.desc.urgency,
-                    t.desc.chunk);
+                    t.desc.chunk,
+                    t.desc.layer,
+                    t.debug_sg);
                 std::fflush(stderr);
             }
         }
@@ -3178,30 +3221,42 @@ struct ggml_backend_meta_compute_workers {
     ggml_backend_meta_cpu_task_desc default_pc_desc(
             ggml_cgraph * graph) const {
         ggml_backend_meta_cpu_task_desc desc {};
+        const bool output_graph =
+            ggml_backend_meta_cpu_task_graph_is_output(graph);
+
         int graph_layer = -1;
         int graph_chunk = -1;
-        (void) ggml_backend_meta_cpu_task_graph_identity(
-            graph, graph_layer, graph_chunk);
+        if (!output_graph) {
+            (void) ggml_backend_meta_cpu_task_graph_identity(
+                graph, graph_layer, graph_chunk);
+        }
 
         const int32_t outer_chunk =
             backend_ctx->cpu_task_outer_chunk.load(
                 std::memory_order_relaxed);
         desc.chunk =
             outer_chunk >= 0 ? outer_chunk : graph_chunk;
-        desc.layer = graph_layer;
+        desc.layer = output_graph ? -1 : graph_layer;
 
         const bool c2p =
+            !output_graph &&
             graph_layer >= 0 &&
             ggml_backend_meta_tensor_c2p_layer(
                 backend_ctx, graph_layer);
         const bool p2c_or_phone_main =
+            !output_graph &&
             graph_layer >= 0 &&
             (ggml_backend_meta_tensor_p2c_layer(
                  backend_ctx, graph_layer) ||
              ggml_backend_meta_tensor_phone_primary_layer(
                  backend_ctx, graph_layer));
 
-        if (p2c_or_phone_main) {
+        if (output_graph) {
+            desc.kind =
+                GGML_BACKEND_META_CPU_TASK_CPU_OUTPUT;
+            desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+        } else if (p2c_or_phone_main) {
             desc.kind =
                 GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
             desc.urgency =
@@ -3225,7 +3280,21 @@ struct ggml_backend_meta_compute_workers {
                 GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
         }
 
-        if (desc.layer < 0 &&
+        if (output_graph &&
+                std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_CLASSIFY] kind=CPU_OUTPUT chunk=%d layer=-1 "
+                "logical_group=%" PRIu64 " reason=MODEL_OUTPUT "
+                "first=%s last=%s status=READY\n",
+                desc.chunk,
+                desc.continuation_group,
+                graph != nullptr && graph->n_nodes > 0 ?
+                    graph->nodes[0]->name : "(none)",
+                graph != nullptr && graph->n_nodes > 0 ?
+                    graph->nodes[graph->n_nodes - 1]->name : "(none)");
+            std::fflush(stderr);
+        } else if (desc.layer < 0 &&
                 outer_chunk >= 0 &&
                 std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
             std::fprintf(
@@ -3272,6 +3341,17 @@ struct ggml_backend_meta_compute_workers {
 
             const ggml_backend_t pc_backend =
                 backend_ctx->backend_configs[j].backend;
+            int32_t debug_sg = -1;
+            if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
+                    if (backend_ctx->backend_configs[j]
+                            .cgraphs[sg].cgraph_main == graph) {
+                        debug_sg = (int32_t) sg;
+                        break;
+                    }
+                }
+            }
+
             const uint64_t task_id = executor->enqueue(
                 selected,
                 [this, pc_backend, graph](uint64_t) -> ggml_status {
@@ -3290,7 +3370,9 @@ struct ggml_backend_meta_compute_workers {
                         completed_time_us[0] = completed_us;
                     }
                     return status;
-                });
+                },
+                debug_sg,
+                graph);
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -18046,7 +18128,9 @@ auto prefill_norm_sg_has_prework =
                             ggml_time_us() -
                             pc_begin_us;
                         return status;
-                    });
+                    },
+                    (int32_t) i,
+                    pc_graph);
             compute_status =
                 remote_executor->wait(
                     pc_task);
