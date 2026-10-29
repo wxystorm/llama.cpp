@@ -220,11 +220,14 @@ static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
     for (size_t i = 0; i < regions.size(); ++i) {
         const auto & region = regions[i];
 
-        // A C2P boundary finishes with Phone ownership. Execute the following
-        // Phone-full region in the same Meta graph so the activation stays
-        // device-local instead of bouncing Phone -> host -> Phone between two
-        // outer Region tasks. P2C remains its own boundary stage because the
-        // next baseline stage is GPU and already needs a new outer scheduler.
+        // Directional ownership is a single Meta island:
+        //
+        //   PC -- C2P --> Phone-full... -- P2C --> PC
+        //
+        // Keep the complete island in one graph so the C2P result remains
+        // Phone-resident and becomes the following Phone layer input directly;
+        // likewise the Phone-full result feeds P2C without a Phone->host->Phone
+        // bounce. The outer Ring sees one task whose final owner is PC.
         if (region.kind == llama_region_ring_stage_kind::C2P &&
                 i + 1 < regions.size() &&
                 regions[i + 1].kind ==
@@ -234,10 +237,46 @@ static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
                 throw std::runtime_error(
                     "C2P boundary is not contiguous with Phone region");
             }
+
+            int layer_end = phone.layer_end;
+            size_t consumed = 1;
+            if (i + 2 < regions.size() &&
+                    regions[i + 2].kind ==
+                        llama_region_ring_stage_kind::P2C) {
+                const auto & p2c = regions[i + 2];
+                if (phone.layer_end != p2c.layer_begin) {
+                    throw std::runtime_error(
+                        "Phone region is not contiguous with P2C boundary");
+                }
+                layer_end = p2c.layer_end;
+                consumed = 2;
+            }
+
             stages.push_back({
                 llama_hybrid_runtime_stage_kind::C2P,
                 region.layer_begin,
-                phone.layer_end,
+                layer_end,
+                phone_chunk_tokens,
+                0});
+            i += consumed;
+            continue;
+        }
+
+        // A Phone region may also use only an exit boundary. Fuse Phone+P2C
+        // for the same ownership reason; no extra physical worker is created.
+        if (region.kind == llama_region_ring_stage_kind::PHONE &&
+                i + 1 < regions.size() &&
+                regions[i + 1].kind ==
+                    llama_region_ring_stage_kind::P2C) {
+            const auto & p2c = regions[i + 1];
+            if (region.layer_end != p2c.layer_begin) {
+                throw std::runtime_error(
+                    "Phone region is not contiguous with P2C boundary");
+            }
+            stages.push_back({
+                llama_hybrid_runtime_stage_kind::P2C,
+                region.layer_begin,
+                p2c.layer_end,
                 phone_chunk_tokens,
                 0});
             ++i;
@@ -6157,6 +6196,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 region_ring_xc, region_ring_xg, region_ring_xp) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+    if (region_ring_v1 &&
+            llama_region_ring_has_directional_stages(
+                ring_runtime_regions) &&
+            n_tokens_all > 1) {
+        for (size_t s = 0; s < runtime_stages.size(); ++s) {
+            const auto & stage = runtime_stages[s];
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_DIRECTIONAL_STAGE] stage=%zu kind=%s "
+                "layers=[%d,%d) chunk=%d executor=%s status=READY\n",
+                s,
+                llama_hybrid_runtime_stage_name(stage.kind),
+                stage.layer_begin,
+                stage.layer_end,
+                stage.macro_tokens,
+                stage.kind == llama_hybrid_runtime_stage_kind::GPU ?
+                    "CUDA" :
+                stage.kind == llama_hybrid_runtime_stage_kind::CPU ?
+                    "CPU" : "META");
+        }
+    }
     if (region_ring_v1 && !model.hybrid_ring_plan_layout.empty()) {
         // Every executable Stage must match the model's actual weight and
         // KV owner; a split between placement and task routing is fatal.
