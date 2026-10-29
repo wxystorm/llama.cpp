@@ -10433,7 +10433,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "\"source\":\""
                             << (forced_ab ? "forced" :
                                 boundary_tensor_selected ? "tensor" :
-                                "prefix_or_uniform")
+                                best.prefix_cycles > 0 ?
+                                    "prefix" : "uniform")
                             << "\","
                             << "\"selected_layout\":\""
                             << best_text << "\","
@@ -10475,7 +10476,30 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"phone_busy_pred_ms\":"
                             << best.busy_ms[2]
                             << ",\"prepare_pred_ms\":"
-                            << best.prepare_busy_ms << "}\n";
+                            << best.prepare_busy_ms
+                            << ",\"prefix_cycles\":"
+                            << best.prefix_cycles;
+                    if (best.prefix_cycles > 0) {
+                        metrics << ",\"prefix_e\":[";
+                        for (int i = 0; i < best.prefix_cycles; ++i) {
+                            if (i > 0) {
+                                metrics << ",";
+                            }
+                            metrics << best.prefix_error[(size_t) i];
+                        }
+                        metrics << "],\"prefix_service_mspt\":[";
+                        for (int i = 0; i < best.prefix_cycles; ++i) {
+                            if (i > 0) {
+                                metrics << ",";
+                            }
+                            const auto & w =
+                                best.prefix_service[(size_t) i];
+                            metrics << "[" << w[0] << ","
+                                    << w[1] << "," << w[2] << "]";
+                        }
+                        metrics << "]";
+                    }
+                    metrics << "}\n";
                 }
             }
         }
