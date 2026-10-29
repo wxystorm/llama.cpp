@@ -533,7 +533,7 @@ struct rpc_msg_get_snapshot_req {
 struct rpc_msg_phone_region_local_submit_req {
     uint32_t device;
     int32_t chunk;
-    uint64_t graph_sizes[4]; // Region, L46 Attention/Router, Phone FFN, residual fold
+    uint64_t graph_sizes[4]; // Region, P2C Attention/Router, Phone FFN, residual fold
     rpc_msg_route_snapshot_ready_req ready;
     rpc_msg_snapshot_tensor_req partial;
     uint64_t scratch_reuse_seq;
@@ -5847,7 +5847,7 @@ bool rpc_server::run_phone_region_local_task(
     const int64_t begin_us = ggml_time_us();
 
     // MAIN priority: once a chunk enters Region, no unrelated GRAPH_COMPUTE
-    // may interleave before L46 READY/FFN/PARTIAL is published. graph_compute()
+    // may interleave before P2C READY/FFN/PARTIAL is published. graph_compute()
     // takes the same recursive mutex for cache safety.
     const int64_t main_lock_begin_us = ggml_time_us();
     std::lock_guard<std::recursive_mutex> main_graph_lock(
@@ -5856,7 +5856,7 @@ bool rpc_server::run_phone_region_local_task(
         ggml_time_us() - main_lock_begin_us;
 
     // MAIN owns this complete Phone critical path:
-    // Region -> L46 Attention/Router -> READY -> Phone FFN -> PARTIAL.
+    // Region -> P2C Attention/Router -> READY -> Phone FFN -> PARTIAL.
     const int64_t region_begin_us = ggml_time_us();
     if (!graph_compute(task.graphs[0])) {
         return false;
@@ -5919,7 +5919,7 @@ bool rpc_server::run_phone_region_local_task(
             stderr,
             "[PHONE_REGION_MAIN_PROFILE] chunk=%d "
             "main_lock_wait_ms=%.3f region_ms=%.3f "
-            "l46_attn_ms=%.3f ready_snapshot_ms=%.3f "
+            "p2c_attn_ms=%.3f ready_snapshot_ms=%.3f "
             "phone_ffn_ms=%.3f residual_fold_ms=%.3f "
             "partial_publish_ms=%.3f reuse_mark_ms=%.3f "
             "total_ms=%.3f\n",
@@ -5941,8 +5941,8 @@ bool rpc_server::run_phone_region_local_task(
         std::fprintf(
             stderr,
             "[PHONE_REGION_MAIN_PATH] chunk=%d "
-            "path=REGION_L35_L45>L46_ATTN>READY>"
-            "L46_PHONE_FFN>RESIDUAL_FOLD>PARTIAL "
+            "path=PHONE_REGION>P2C_ATTN>READY>"
+            "P2C_PHONE_FFN>RESIDUAL_FOLD>PARTIAL "
             "wall_ms=%.3f status=OK\n",
             task.chunk,
             (ggml_time_us() - begin_us) / 1000.0);
