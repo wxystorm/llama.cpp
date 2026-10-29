@@ -387,10 +387,13 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             phone_region_chunks = llama_hybrid_runtime_tensor_chunks(
                 (int) n_tokens, planned_chunk_tokens);
 
-            // The Region Graph exists to make multi-chunk prefill a schedulable
-            // unit. For a single chunk there is no pipeline opportunity, so
-            // keep warmup / tiny-prefill on the ordinary directional path.
-            if (phone_region_chunks.size() > 1) {
+            // Full-model Region mode historically required multiple
+            // chunks because its purpose was an internal Phone pipeline.
+            // A directional outer-Ring stage is already one schedulable chunk:
+            // even a single local chunk still needs the explicit Phone-region
+            // and P2C markers so C2P -> Phone -> P2C stays on the validated
+            // directional data plane.
+            if (phone_region_chunks.size() > 1 || stage_graph) {
                 phone_region_first = phone_region_c2p + 1;
                 phone_region_end = phone_region_p2c;
             } else {
