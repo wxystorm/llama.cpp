@@ -58,29 +58,33 @@ Run several calibration plans so the q(x,y) grid covers the x and y ranges of
 interest. The sequence DP interpolates between measured points, matching the
 paper's offline profiling + interpolation design.
 
-## Automatic Windows q(x,y) sweep
+## Automatic q(x,y) sweep
 
-For the Windows laptop + phone RPC setup, the sweep can now be run end-to-end
-with one PowerShell command. It generates repeated-X paths that cover
-`x = 32,48,64,80,96,112,128`, runs synchronous calibration, extracts each
-log, merges all samples, and can immediately run the sequence DP.
+Use the Python runner for automated calibration. It avoids PowerShell native
+stderr/interactive-process behavior and works on Windows as well as Unix-like
+hosts.
+
+Each calibration point starts a fresh `llama-cli` with stdin closed and with
+`--single-turn --simple-io`, so one completed prompt exits before the next
+sweep point starts.
 
 The prompt file must contain the same prompt whose tokenized length is supplied
-as `-TargetTokens`.
+as `--target-tokens`.
 
 Example for the current 358-token Qwen3-14B experiment:
 
 ```powershell
-.\tools\jupiter\run_q_sweep.ps1 \
-  -Exe .\build-jupiter\bin\Release\llama-cli.exe \
-  -Model E:\llama\models\Qwen3-14B-Q4_K_M.gguf \
-  -Rpc 10.39.52.114:10139 \
-  -PromptFile .\prompt.txt \
-  -TargetTokens 358 \
-  -PcLayers 25 \
-  -Repeats 2 \
-  -RunDp \
-  -PlanOutput .\jupiter.plan
+python .\tools\jupiter\run_q_sweep.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --target-tokens 358 `
+  --pc-layers 25 `
+  --repeats 2 `
+  --resume `
+  --run-dp `
+  --plan-output .\jupiter.plan
 ```
 
 The default sweep paths for 358 tokens are:
@@ -95,8 +99,9 @@ x=112 -> 112,112,67,67
 x=128 -> 128,128,102
 ```
 
-Use `-DryRun` to print the generated paths without running inference. Use
-`-XValues "32,64,96,128"` for a smaller sweep.
+Use `--dry-run` to print the generated paths without inference. Use
+`--x-values 32,64,96,128` for a smaller sweep. `--resume` skips a point
+only when both its log and extracted CSV already exist.
 
 Artifacts are written under `jupiter-q-sweep\` by default:
 
@@ -107,12 +112,15 @@ q-x32-r1.csv
 q-profile-all.csv
 ```
 
-If `-RunDp` is present, the script also writes the requested runtime plan.
+If `--run-dp` is present, the runner also writes the requested runtime plan.
 
 Repeated samples are intentionally preserved in `q-profile-all.csv`. The
 planner first takes the median of repeated measurements for each
 `(x,y,device)`, then takes the slowest pipeline stage as Jupiter's
 `q(x,y)`.
+
+The older `run_q_sweep.ps1` is retained only for compatibility; the Python
+runner is the recommended path.
 
 ## Sequence partition DP
 
