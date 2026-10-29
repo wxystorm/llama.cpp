@@ -12,6 +12,7 @@ from run_q_sweep import (
     build_cli_command,
     infer_runtime_prompt_tokens,
     make_sweep_plan,
+    print_sweep_plans,
     reconstruct_plan_from_log,
     should_echo_runtime_line,
 )
@@ -93,6 +94,19 @@ class JupiterSweepTests(unittest.TestCase):
                     chunks = make_sweep_plan(total, x, 32, 128)
                     self.assertEqual(sum(chunks), total)
                     self.assertTrue(all(32 <= c <= 128 for c in chunks))
+
+    def test_high_b_sweep_falls_back_to_legal_first_chunk(self) -> None:
+        # Repeated 112 leaves an impossible 133-token tail under max128,
+        # but an exact 112-token first chunk can be profiled with [123,122].
+        # A 96-token chunk cannot occur in any valid three-chunk 357 plan.
+        plans = print_sweep_plans(357, [96, 112, 128], 96, 128)
+        self.assertEqual([x for x, _ in plans], [112, 128])
+        self.assertEqual(plans[0][1], [112, 123, 122])
+        self.assertEqual(plans[1][1], [128, 128, 101])
+        self.assertTrue(all(
+            sum(chunks) == 357 and all(96 <= c <= 128 for c in chunks)
+            for _, chunks in plans
+        ))
 
     def test_console_suppresses_stage_noise_but_keeps_plan_and_errors(self) -> None:
         self.assertFalse(should_echo_runtime_line(
