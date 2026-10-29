@@ -174,19 +174,23 @@ inline bool llama_region_ring_enabled() {
 inline bool llama_region_ring_directional_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
-    if (regions.size() < 6 || n_layer <= 0 ||
+    if (regions.empty() || n_layer <= 0 ||
             regions.front().layer_begin != 0 ||
-            regions.front().kind != llama_region_ring_stage_kind::GPU ||
-            regions.back().layer_end != n_layer ||
-            regions.back().kind != llama_region_ring_stage_kind::PHONE) {
+            regions.back().layer_end != n_layer) {
         return false;
     }
 
+    size_t i = 0;
     int next_layer = 0;
-    int phone_regions = 0;
-    for (size_t i = 0; i < regions.size(); ++i) {
+    int cycles = 0;
+
+    auto take_region = [&](llama_region_ring_stage_kind expected) {
+        if (i >= regions.size()) {
+            return false;
+        }
         const auto & r = regions[i];
-        if (r.layer_begin != next_layer ||
+        if (r.kind != expected ||
+                r.layer_begin != next_layer ||
                 r.layer_end <= r.layer_begin ||
                 r.layer_end > n_layer) {
             return false;
@@ -195,40 +199,63 @@ inline bool llama_region_ring_directional_topology_compatible(
                 r.layer_end - r.layer_begin != 1) {
             return false;
         }
-        if (r.kind == llama_region_ring_stage_kind::PHONE) {
-            ++phone_regions;
+        next_layer = r.layer_end;
+        ++i;
+        return true;
+    };
+
+    auto take_odd_handoff =
+        [&](llama_region_ring_stage_kind first) {
+            if (i >= regions.size() ||
+                    regions[i].kind != first) {
+                return true; // Direct Full -> Full handoff.
+            }
+            llama_region_ring_stage_kind expected = first;
+            int directional_layers = 0;
+            while (i < regions.size() &&
+                    llama_region_ring_stage_is_directional(
+                        regions[i].kind)) {
+                if (!take_region(expected)) {
+                    return false;
+                }
+                expected =
+                    expected == llama_region_ring_stage_kind::C2P ?
+                        llama_region_ring_stage_kind::P2C :
+                        llama_region_ring_stage_kind::C2P;
+                ++directional_layers;
+            }
+            // Every Tensor layer flips the activation owner. An odd chain is
+            // therefore the only shape that completes one net handoff.
+            return directional_layers > 0 &&
+                (directional_layers & 1) != 0;
+        };
+
+    while (i < regions.size()) {
+        if (!take_region(llama_region_ring_stage_kind::GPU) ||
+                !take_region(llama_region_ring_stage_kind::CPU)) {
+            return false;
         }
 
-        if (i + 1 < regions.size()) {
-            const auto next = regions[i + 1].kind;
-            bool ok = false;
-            switch (r.kind) {
-                case llama_region_ring_stage_kind::GPU:
-                    ok = next == llama_region_ring_stage_kind::CPU;
-                    break;
-                case llama_region_ring_stage_kind::CPU:
-                    ok = next == llama_region_ring_stage_kind::PHONE ||
-                         next == llama_region_ring_stage_kind::C2P;
-                    break;
-                case llama_region_ring_stage_kind::C2P:
-                    ok = next == llama_region_ring_stage_kind::PHONE;
-                    break;
-                case llama_region_ring_stage_kind::PHONE:
-                    ok = next == llama_region_ring_stage_kind::GPU ||
-                         next == llama_region_ring_stage_kind::P2C;
-                    break;
-                case llama_region_ring_stage_kind::P2C:
-                    ok = next == llama_region_ring_stage_kind::GPU;
-                    break;
-            }
-            if (!ok) {
-                return false;
-            }
+        // PC -> Phone: C2P, [P2C, C2P]...; width is 1,3,5,...
+        if (!take_odd_handoff(llama_region_ring_stage_kind::C2P) ||
+                !take_region(llama_region_ring_stage_kind::PHONE)) {
+            return false;
         }
-        next_layer = r.layer_end;
+        ++cycles;
+
+        if (i == regions.size()) {
+            break;
+        }
+
+        // Phone -> PC/GPU: P2C, [C2P, P2C]...; width is 1,3,5,...
+        if (!take_odd_handoff(llama_region_ring_stage_kind::P2C)) {
+            return false;
+        }
+        // The next loop iteration consumes the GPU region.
     }
 
-    return phone_regions >= 2;
+    return next_layer == n_layer &&
+        cycles >= 2 && cycles <= 4;
 }
 
 inline bool llama_region_ring_has_directional_stages(
@@ -338,8 +365,9 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
                     regions, n_layer)) {
             throw std::runtime_error(
                 "directional region topology must follow "
-                "GPU -> CPU -> [C2P] -> Phone -> [P2C] -> GPU, "
-                "end on Phone, and cover every layer");
+                "GPU -> CPU -> [odd alternating C2P/P2C] -> Phone -> "
+                "[odd alternating P2C/C2P] -> GPU, end on Phone, "
+                "and cover every layer");
         }
         return regions;
     }

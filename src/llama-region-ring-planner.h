@@ -101,6 +101,14 @@ struct model {
     // Optional host-side scheduler prepare cost for the same shape. Missing
     // callbacks preserve the historical zero-prepare simulator behaviour.
     std::function<bool(device, int, int, int, double &)> prepare_ms;
+    // One directional Tensor layer already includes its internal route,
+    // split-FFN, return and reduce traffic. Keeping this callback separate
+    // prevents C2P/P2C from being mis-scored as ordinary Phone Full work.
+    std::function<bool(
+        llama_region_ring_stage_kind, int, int, double &)> directional_ms;
+    std::function<bool(
+        llama_region_ring_stage_kind, int, int, double &)>
+        directional_prepare_ms;
     std::function<bool(device, device, size_t, double &)> transfer_ms;
     // Exact weight bytes for one contiguous logical GPU Region and the
     // measured/proxied host->CUDA transfer time for those bytes.
@@ -115,6 +123,58 @@ struct model {
 
 inline int chunk_for(const candidate & c, device d) {
     return d == device::CPU ? c.xc : d == device::GPU ? c.xg : c.xp;
+}
+
+inline device region_input_owner(
+        const llama_region_ring_region & region) {
+    switch (region.kind) {
+        case llama_region_ring_stage_kind::C2P:
+            return device::CPU;
+        case llama_region_ring_stage_kind::P2C:
+            return device::PHONE;
+        default:
+            return region.device;
+    }
+}
+
+inline device region_output_owner(
+        const llama_region_ring_region & region) {
+    switch (region.kind) {
+        case llama_region_ring_stage_kind::C2P:
+            return device::PHONE;
+        case llama_region_ring_stage_kind::P2C:
+            return device::CPU;
+        default:
+            return region.device;
+    }
+}
+
+inline device region_queue_device(
+        const llama_region_ring_region & region) {
+    // Queue on the Attention/MAIN owner. The conservative simulator below
+    // still reserves both CPU and Phone compute resources for Tensor work.
+    return region.kind == llama_region_ring_stage_kind::C2P ?
+        device::CPU :
+        region.kind == llama_region_ring_stage_kind::P2C ?
+            device::PHONE : region.device;
+}
+
+inline uint8_t region_resource_mask(
+        const llama_region_ring_region & region) {
+    if (llama_region_ring_stage_is_directional(region.kind)) {
+        return (uint8_t) (
+            (1u << (unsigned) device::CPU) |
+            (1u << (unsigned) device::PHONE));
+    }
+    return (uint8_t) (1u << (unsigned) region.device);
+}
+
+inline int chunk_for_region(
+        const candidate & c,
+        const llama_region_ring_region & region) {
+    // Current Region Ring executes directional Meta stages with XP.
+    return llama_region_ring_stage_is_directional(region.kind) ?
+        c.xp : chunk_for(c, region.device);
 }
 
 inline bool make_regions(const candidate & c, int total_layers,
@@ -229,6 +289,8 @@ struct task {
     int next = -1;
     int inputs = 0;
     int outputs = 0;
+    int queue_device = 0;
+    uint8_t resource_mask = 0;
     // Number of downstream consumers that still retain this producer slot.
     int remaining_outputs = 0;
     double prepare_duration = 0.0;
@@ -287,33 +349,59 @@ inline bool simulate(const model & m,
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
     for (size_t r = 0; r < regions.size(); ++r) {
-        const auto d = regions[r].device;
-        const int x = chunk_for(c, d);
+        const auto & region = regions[r];
+        const auto d = region.device;
+        const bool directional =
+            llama_region_ring_stage_is_directional(region.kind);
+        const int x = chunk_for_region(c, region);
         if (x <= 0) { return reject("INVALID_CHUNK"); }
+        if (directional &&
+                (!m.directional_ms ||
+                 !m.directional_prepare_ms)) {
+            return reject("DIRECTIONAL_PROFILE_MISSING");
+        }
 
         int previous = -1;
         for (int begin = 0; begin < m.tokens; begin += x) {
             const int end = std::min(m.tokens, begin + x);
             const int kv = m.kv_start + end;
             const int layers =
-                regions[r].layer_end - regions[r].layer_begin;
+                region.layer_end - region.layer_begin;
             double ms = 0.0;
             double prepare_ms = 0.0;
-            if (!m.compute_ms(
-                    d, layers, end - begin, kv, ms) ||
-                !std::isfinite(ms) || ms < 0.0) {
-                return reject("COMPUTE_PROFILE_MISSING");
+            const bool compute_ok = directional ?
+                m.directional_ms(
+                    region.kind, end - begin, kv, ms) :
+                m.compute_ms(
+                    d, layers, end - begin, kv, ms);
+            if (!compute_ok || !std::isfinite(ms) || ms < 0.0) {
+                return reject(
+                    directional ?
+                        "DIRECTIONAL_PROFILE_MISSING" :
+                        "COMPUTE_PROFILE_MISSING");
             }
-            if (m.prepare_ms &&
+
+            if (directional) {
+                if (!m.directional_prepare_ms(
+                        region.kind, end - begin, kv,
+                        prepare_ms) ||
+                        !std::isfinite(prepare_ms) ||
+                        prepare_ms < 0.0) {
+                    return reject(
+                        "DIRECTIONAL_PREPARE_PROFILE_MISSING");
+                }
+            } else if (m.prepare_ms &&
                     (!m.prepare_ms(
                         d, layers, end - begin, kv, prepare_ms) ||
                      !std::isfinite(prepare_ms) ||
                      prepare_ms < 0.0)) {
                 return reject("PREPARE_PROFILE_MISSING");
             }
-            if (d == device::PHONE) {
+
+            // Directional Tensor stages also submit Phone-side graph work.
+            if (d == device::PHONE || directional) {
                 ms += m.phone_register_ms *
-                      (double) layers / 5.0;
+                    (double) layers / 5.0;
             }
 
             task t;
@@ -321,6 +409,8 @@ inline bool simulate(const model & m,
             t.begin = begin;
             t.end = end;
             t.previous = previous;
+            t.queue_device = (int) region_queue_device(region);
+            t.resource_mask = region_resource_mask(region);
             t.prepare_duration = prepare_ms;
             t.duration = ms;
             const int id = (int) tasks.size();
@@ -335,10 +425,11 @@ inline bool simulate(const model & m,
 
     std::vector<edge> edges;
     for (size_t r = 0; r + 1 < regions.size(); ++r) {
-        const auto a = regions[r].device;
-        const auto b = regions[r + 1].device;
-        const int lane = a == device::PHONE ? (m.shared_phone_link ? 1 : 2) :
-                         b == device::PHONE ? 1 : 0;
+        const auto a = region_output_owner(regions[r]);
+        const auto b = region_input_owner(regions[r + 1]);
+        const int lane = a == device::PHONE ?
+            (m.shared_phone_link ? 1 : 2) :
+            b == device::PHONE ? 1 : 0;
         for (int src : by_region[r]) {
             for (int dst : by_region[r + 1]) {
                 const int overlap = std::min(tasks[(size_t) src].end,
@@ -349,8 +440,12 @@ inline bool simulate(const model & m,
                 const size_t bytes =
                     (size_t) overlap * (size_t) m.hidden * sizeof(float);
                 double ms = 0.0;
-                if (!m.transfer_ms(a, b, bytes, ms) ||
-                    !std::isfinite(ms) || ms < 0.0) {
+                // Same-owner adjacency is a device-local dependency. The
+                // directional callback has already charged internal network
+                // traffic, so never add another fake boundary transfer.
+                if (a != b &&
+                        (!m.transfer_ms(a, b, bytes, ms) ||
+                         !std::isfinite(ms) || ms < 0.0)) {
                     return reject("TRANSFER_PROFILE_MISSING");
                 }
                 edges.push_back({src, dst, lane, ms});
@@ -451,7 +546,7 @@ inline bool simulate(const model & m,
         }
         auto & t = tasks[(size_t) id];
         t.queued = true;
-        ready_queues[(size_t) regions[(size_t) t.region].device].push_back(id);
+        ready_queues[(size_t) t.queue_device].push_back(id);
     };
     auto claimable = [&](int id) -> bool {
         const auto & t = tasks[(size_t) id];
@@ -473,6 +568,20 @@ inline bool simulate(const model & m,
             if (!gpu_weight_ready[(size_t) r]) {
                 return false;
             }
+        }
+
+        for (int dev = 0; dev < 3; ++dev) {
+            if ((t.resource_mask & (1u << (unsigned) dev)) != 0 &&
+                    device_busy[(size_t) dev]) {
+                return false;
+            }
+        }
+        if (m.pc_compute_gate &&
+                (t.resource_mask &
+                 ((1u << (unsigned) device::CPU) |
+                  (1u << (unsigned) device::GPU))) != 0 &&
+                pc_compute_gate_busy) {
+            return false;
         }
 
         if (m.slot_pool == 0) {
@@ -588,12 +697,6 @@ inline bool simulate(const model & m,
         for (int turn = 0; turn < 3; ++turn) {
             const int dev = m.pc_compute_gate && turn < 2 ?
                 (turn == 0 ? next_pc_device : 1 - next_pc_device) : turn;
-            if (device_busy[(size_t) dev] ||
-                (m.pc_compute_gate && dev != (int) device::PHONE &&
-                 pc_compute_gate_busy)) {
-                continue;
-            }
-
             auto & q = ready_queues[(size_t) dev];
             auto it = std::find_if(q.begin(), q.end(),
                 [&](int id) { return claimable(id); });
@@ -606,10 +709,22 @@ inline bool simulate(const model & m,
             auto & t = tasks[(size_t) selected];
             t.queued = false;
             t.started = true;
-            device_busy[(size_t) dev] = true;
-            if (m.pc_compute_gate && dev != (int) device::PHONE) {
+            for (int resource = 0; resource < 3; ++resource) {
+                if ((t.resource_mask &
+                        (1u << (unsigned) resource)) != 0) {
+                    device_busy[(size_t) resource] = true;
+                }
+            }
+            const bool uses_pc_compute =
+                (t.resource_mask &
+                 ((1u << (unsigned) device::CPU) |
+                  (1u << (unsigned) device::GPU))) != 0;
+            if (m.pc_compute_gate && uses_pc_compute) {
                 pc_compute_gate_busy = true;
-                next_pc_device = 1 - dev;
+                if (dev == (int) device::CPU ||
+                        dev == (int) device::GPU) {
+                    next_pc_device = 1 - dev;
+                }
             }
 
             if (m.slot_pool > 0 &&
@@ -632,7 +747,12 @@ inline bool simulate(const model & m,
             // The worker has already claimed this task, so it cannot claim
             // another while queued on PREPARE. CPU/CUDA/Phone compute lanes
             // remain independent once preparation completes.
-            busy_ms[(size_t) dev] += t.duration;
+            for (int resource = 0; resource < 3; ++resource) {
+                if ((t.resource_mask &
+                        (1u << (unsigned) resource)) != 0) {
+                    busy_ms[(size_t) resource] += t.duration;
+                }
+            }
             events.push({
                 prepare_end + t.duration,
                 selected,
@@ -684,11 +804,16 @@ inline bool simulate(const model & m,
                 return reject("DUPLICATE_TASK_DONE");
             }
             t.done = true;
-            const int finished_device =
-                (int) regions[(size_t) t.region].device;
-            device_busy[(size_t) finished_device] = false;
+            for (int resource = 0; resource < 3; ++resource) {
+                if ((t.resource_mask &
+                        (1u << (unsigned) resource)) != 0) {
+                    device_busy[(size_t) resource] = false;
+                }
+            }
             if (m.pc_compute_gate &&
-                finished_device != (int) device::PHONE) {
+                    (t.resource_mask &
+                     ((1u << (unsigned) device::CPU) |
+                      (1u << (unsigned) device::GPU))) != 0) {
                 pc_compute_gate_busy = false;
             }
             ++completed;
@@ -815,6 +940,304 @@ inline bool simulate(const model & m,
     c.edges = (int) edges.size();
     c.max_live_slots = max_live;
     return true;
+}
+
+
+struct boundary_anchor {
+    int layer = -1;
+    llama_region_ring_stage_kind first =
+        llama_region_ring_stage_kind::C2P;
+    int left_begin = -1;
+    int left_end = -1;
+    int right_begin = -1;
+    int right_end = -1;
+};
+
+struct boundary_choice {
+    std::vector<llama_region_ring_region> regions;
+    candidate estimate;
+    std::vector<int> widths;
+    int tensor_layers = 0;
+};
+
+struct boundary_result {
+    bool valid = false;
+    bool baseline_valid = false;
+    boundary_choice baseline;
+    boundary_choice selected;
+    std::vector<boundary_choice> top;
+    size_t boundaries = 0;
+    size_t enumerated = 0;
+    size_t scored = 0;
+    size_t rejected_shape = 0;
+    size_t rejected_memory = 0;
+    size_t rejected_profile = 0;
+};
+
+inline std::vector<boundary_anchor> boundary_anchors(
+        const std::vector<llama_region_ring_region> & baseline) {
+    std::vector<boundary_anchor> result;
+    for (size_t i = 0; i + 1 < baseline.size(); ++i) {
+        const auto & left = baseline[i];
+        const auto & right = baseline[i + 1];
+        if (llama_region_ring_stage_is_directional(left.kind) ||
+                llama_region_ring_stage_is_directional(right.kind)) {
+            return {};
+        }
+
+        llama_region_ring_stage_kind first;
+        if (left.kind == llama_region_ring_stage_kind::CPU &&
+                right.kind == llama_region_ring_stage_kind::PHONE) {
+            first = llama_region_ring_stage_kind::C2P;
+        } else if (left.kind == llama_region_ring_stage_kind::PHONE &&
+                right.kind == llama_region_ring_stage_kind::GPU) {
+            first = llama_region_ring_stage_kind::P2C;
+        } else {
+            continue;
+        }
+
+        result.push_back({
+            left.layer_end,
+            first,
+            left.layer_begin,
+            left.layer_end,
+            right.layer_begin,
+            right.layer_end,
+        });
+    }
+    return result;
+}
+
+inline std::vector<int> boundary_legal_widths(
+        const boundary_anchor & b) {
+    std::vector<int> widths {0}; // NO_TENSOR is always a candidate.
+    const int left_layers = b.left_end - b.left_begin;
+    const int right_layers = b.right_end - b.right_begin;
+    for (int k = 0;
+            left_layers - (k + 1) >= 1 &&
+            right_layers - k >= 1;
+            ++k) {
+        widths.push_back(1 + 2 * k);
+    }
+    return widths;
+}
+
+inline bool build_boundary_regions(
+        const std::vector<llama_region_ring_region> & baseline,
+        const std::vector<boundary_anchor> & anchors,
+        const std::vector<int> & widths,
+        int n_layer,
+        std::vector<llama_region_ring_region> & regions) {
+    regions.clear();
+    if (n_layer <= 0 || baseline.empty() ||
+            anchors.size() != widths.size()) {
+        return false;
+    }
+
+    std::vector<llama_region_ring_stage_kind> kinds(
+        (size_t) n_layer, llama_region_ring_stage_kind::CPU);
+    std::vector<uint8_t> overwritten((size_t) n_layer, 0);
+
+    int next = 0;
+    for (const auto & r : baseline) {
+        if (llama_region_ring_stage_is_directional(r.kind) ||
+                r.layer_begin != next ||
+                r.layer_end <= r.layer_begin ||
+                r.layer_end > n_layer) {
+            return false;
+        }
+        for (int il = r.layer_begin; il < r.layer_end; ++il) {
+            kinds[(size_t) il] = r.kind;
+        }
+        next = r.layer_end;
+    }
+    if (next != n_layer) {
+        return false;
+    }
+
+    for (size_t bi = 0; bi < anchors.size(); ++bi) {
+        const int width = widths[bi];
+        if (width == 0) {
+            continue;
+        }
+        if (width < 0 || (width & 1) == 0) {
+            return false;
+        }
+        const int k = (width - 1) / 2;
+        const auto & b = anchors[bi];
+        const int begin = b.layer - (k + 1);
+        const int end = b.layer + k;
+        if (begin < b.left_begin || end > b.right_end ||
+                begin < 0 || end > n_layer ||
+                end - begin != width) {
+            return false;
+        }
+
+        auto kind = b.first;
+        for (int il = begin; il < end; ++il) {
+            if (overwritten[(size_t) il] != 0) {
+                return false;
+            }
+            overwritten[(size_t) il] = 1;
+            kinds[(size_t) il] = kind;
+            kind = kind == llama_region_ring_stage_kind::C2P ?
+                llama_region_ring_stage_kind::P2C :
+                llama_region_ring_stage_kind::C2P;
+        }
+    }
+
+    int begin = 0;
+    while (begin < n_layer) {
+        const auto kind = kinds[(size_t) begin];
+        int end = begin + 1;
+        // Directional layers intentionally remain one layer each; Full
+        // regions may be compressed back into one contiguous stage.
+        if (!llama_region_ring_stage_is_directional(kind)) {
+            while (end < n_layer &&
+                    kinds[(size_t) end] == kind) {
+                ++end;
+            }
+        }
+        regions.emplace_back(kind, begin, end);
+        begin = end;
+    }
+
+    return llama_region_ring_directional_topology_compatible(
+        regions, n_layer);
+}
+
+inline int boundary_tensor_layers(const std::vector<int> & widths) {
+    int total = 0;
+    for (int width : widths) {
+        total += std::max(0, width);
+    }
+    return total;
+}
+
+inline boundary_result refine_optional_boundaries(
+        const model & m,
+        const std::vector<llama_region_ring_region> & baseline_regions,
+        const candidate & baseline_candidate,
+        double improve_epsilon_ms = 0.05) {
+    boundary_result result;
+    const auto anchors = boundary_anchors(baseline_regions);
+    result.boundaries = anchors.size();
+
+    auto score = [&](const std::vector<int> & widths,
+                     boundary_choice & choice) -> bool {
+        ++result.enumerated;
+        choice = {};
+        choice.widths = widths;
+        choice.tensor_layers = boundary_tensor_layers(widths);
+        if (!build_boundary_regions(
+                baseline_regions, anchors, widths, m.layers,
+                choice.regions)) {
+            ++result.rejected_shape;
+            return false;
+        }
+        if (m.region_memory_feasible &&
+                !m.region_memory_feasible(choice.regions)) {
+            ++result.rejected_memory;
+            return false;
+        }
+        choice.estimate = baseline_candidate;
+        std::string reason;
+        if (!simulate(m, choice.regions, choice.estimate, &reason)) {
+            ++result.rejected_profile;
+            return false;
+        }
+        ++result.scored;
+        return true;
+    };
+
+    std::vector<int> current_widths(anchors.size(), 0);
+    if (!score(current_widths, result.baseline)) {
+        return result;
+    }
+    result.baseline_valid = true;
+    result.selected = result.baseline;
+
+    std::vector<boundary_choice> seen;
+    seen.push_back(result.baseline);
+    auto record = [&](const boundary_choice & choice) {
+        const std::string layout =
+            llama_region_ring_layout_string(choice.regions);
+        const auto it = std::find_if(
+            seen.begin(), seen.end(),
+            [&](const boundary_choice & x) {
+                return llama_region_ring_layout_string(x.regions) ==
+                    layout;
+            });
+        if (it == seen.end()) {
+            seen.push_back(choice);
+        }
+    };
+
+    // Coordinate search keeps this second-stage planner deliberately local.
+    // Each update must improve the already selected Cycle plan, and a second
+    // pass captures interactions between neighboring entry/exit boundaries.
+    for (int pass = 0; pass < 2; ++pass) {
+        bool changed = false;
+        for (size_t bi = 0; bi < anchors.size(); ++bi) {
+            boundary_choice local_best = result.selected;
+            std::vector<int> local_widths = current_widths;
+
+            for (int width : boundary_legal_widths(anchors[bi])) {
+                if (width == current_widths[bi]) {
+                    continue;
+                }
+                auto probe_widths = current_widths;
+                probe_widths[bi] = width;
+                boundary_choice probe;
+                if (!score(probe_widths, probe)) {
+                    continue;
+                }
+                record(probe);
+
+                const bool faster =
+                    probe.estimate.wall_ms <
+                        local_best.estimate.wall_ms -
+                        improve_epsilon_ms;
+                const bool tie_fewer_tensor =
+                    std::fabs(
+                        probe.estimate.wall_ms -
+                        local_best.estimate.wall_ms) <=
+                        improve_epsilon_ms &&
+                    probe.tensor_layers <
+                        local_best.tensor_layers;
+                if (faster || tie_fewer_tensor) {
+                    local_best = probe;
+                    local_widths = probe_widths;
+                }
+            }
+
+            if (local_widths != current_widths) {
+                current_widths = local_widths;
+                result.selected = local_best;
+                changed = true;
+            }
+        }
+        if (!changed) {
+            break;
+        }
+    }
+
+    std::sort(
+        seen.begin(), seen.end(),
+        [](const boundary_choice & a, const boundary_choice & b) {
+            if (std::fabs(
+                    a.estimate.wall_ms -
+                    b.estimate.wall_ms) > 1e-9) {
+                return a.estimate.wall_ms < b.estimate.wall_ms;
+            }
+            return a.tensor_layers < b.tensor_layers;
+        });
+    if (seen.size() > 10) {
+        seen.resize(10);
+    }
+    result.top = std::move(seen);
+    result.valid = result.baseline_valid;
+    return result;
 }
 
 inline double relative_ring_mismatch(double lhs, double rhs) {
