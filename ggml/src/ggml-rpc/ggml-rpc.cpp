@@ -17,6 +17,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <thread>
