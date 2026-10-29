@@ -3024,14 +3024,15 @@ struct ggml_backend_meta_compute_workers {
                 cpu_task_desc[j] = selected;
             }
 
-            auto & bcj = backend_ctx->backend_configs[j];
+            const ggml_backend_t pc_backend =
+                backend_ctx->backend_configs[j].backend;
             const uint64_t task_id = executor->enqueue(
                 selected,
-                [this, &bcj, graph](uint64_t) -> ggml_status {
+                [this, pc_backend, graph](uint64_t) -> ggml_status {
                     const int64_t start_us = ggml_time_us();
                     const ggml_status status =
                         ggml_backend_graph_compute_async(
-                            bcj.backend, graph);
+                            pc_backend, graph);
                     const int64_t elapsed_us =
                         ggml_time_us() - start_us;
                     const int64_t completed_us =
