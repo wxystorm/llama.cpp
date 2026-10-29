@@ -596,8 +596,9 @@ extern "C" {
 
     // Shared PC CPU ready-task executor used by Region Ring. Task type is not
     // the primary priority key: BLOCKING_REDUCE wins first, then older causal
-    // chunk, then urgency/type. CPU_FULL is intentionally non-preemptive in
-    // V1 so an idle system keeps the original contiguous Region graph.
+    // chunk, then urgency/type. CPU_FULL keeps one contiguous prepared graph,
+    // but may cooperatively yield at runtime layer-output boundaries when an
+    // older/higher-priority Tensor continuation is waiting.
     enum ggml_backend_meta_cpu_task_kind {
         GGML_BACKEND_META_CPU_TASK_CPU_FULL = 0,
         GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN = 1,
@@ -645,6 +646,18 @@ extern "C" {
         ggml_backend_t backend, uint64_t task_id);
     GGML_API bool ggml_backend_meta_cpu_task_promote(
         ggml_backend_t backend, uint64_t task_id, int32_t urgency);
+    // A CPU_FULL only needs boundary checkpoints while it is the current
+    // causal-frontier chunk. Older CPU_FULL work remains one contiguous graph.
+    GGML_API bool ggml_backend_meta_cpu_task_should_checkpoint(
+        ggml_backend_t backend, uint64_t task_id);
+    // Called only by the currently running CPU_FULL task after a completed
+    // layer boundary. The executor runs any queued Tensor continuation that
+    // outranks that CPU_FULL task, then resumes the same CPU_FULL callback.
+    GGML_API enum ggml_status ggml_backend_meta_cpu_task_checkpoint(
+        ggml_backend_t backend,
+        uint64_t task_id,
+        int32_t completed_layer,
+        bool * yielded);
     // outer_chunk tags Meta-created PC_MAIN/REMOTE_FFN tasks with the Region
     // Ring causal chunk instead of the inner directional chunk (which is
     // commonly local chunk 0 for every macro block).

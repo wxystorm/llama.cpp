@@ -2681,6 +2681,22 @@ static bool ggml_backend_meta_cpu_task_graph_is_output(
     return false;
 }
 
+static bool ggml_backend_meta_cpu_task_graph_is_disabled_l_out_bridge(
+        const ggml_cgraph * graph,
+        int & layer) {
+    layer = -1;
+    if (graph == nullptr || graph->n_nodes != 1) {
+        return false;
+    }
+    ggml_tensor * node = graph->nodes[0];
+    if (node == nullptr ||
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+        return false;
+    }
+    return ggml_backend_meta_parse_exact_layer_name(
+        node->name, "l_out-%d%n", layer);
+}
+
 static bool ggml_backend_meta_cpu_task_graph_has_l_out(
         const ggml_cgraph * graph,
         int layer) {
@@ -2733,6 +2749,14 @@ struct ggml_backend_meta_cpu_task_executor {
     uint64_t sticky_group = 0;
     int32_t causal_frontier = -1;
     uint64_t unresolved_identity_tasks = 0;
+    struct preempt_wait {
+        int64_t request_us = 0;
+        uint64_t running_id = 0;
+    };
+    std::map<uint64_t, preempt_wait> preempt_waits;
+    uint64_t preempt_request_count = 0;
+    uint64_t checkpoint_yield_count = 0;
+    int64_t preempt_blocked_us = 0;
     bool stop = false;
 
     explicit ggml_backend_meta_cpu_task_executor(
@@ -2748,9 +2772,15 @@ struct ggml_backend_meta_cpu_task_executor {
                 stderr,
                 "[CPU_TASK_SUM] submitted=%" PRIu64
                 " unresolved_identity=%" PRIu64
-                " frontier=%d queued=%zu sticky_group=%" PRIu64 "\n",
+                " preempt_requests=%" PRIu64
+                " checkpoint_yields=%" PRIu64
+                " preempt_blocked_ms=%.3f "
+                "frontier=%d queued=%zu sticky_group=%" PRIu64 "\n",
                 submitted,
                 unresolved_identity_tasks,
+                preempt_request_count,
+                checkpoint_yield_count,
+                preempt_blocked_us / 1000.0,
                 causal_frontier,
                 tasks.size(),
                 sticky_group);
@@ -2882,6 +2912,189 @@ struct ggml_backend_meta_cpu_task_executor {
         std::fflush(stderr);
     }
 
+    static bool tensor_continuation(const task & t) {
+        return t.desc.kind ==
+                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN ||
+            t.desc.kind ==
+                GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
+    }
+
+    size_t best_preempt_index_locked(const task & running) const {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            if (!eligible_locked(tasks[i]) ||
+                    !tensor_continuation(tasks[i]) ||
+                    !better(tasks[i], running)) {
+                continue;
+            }
+            if (best == SIZE_MAX ||
+                    better(tasks[i], tasks[best])) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void finish_task_locked(
+            const task & current,
+            ggml_status status) {
+        if ((current.desc.flags &
+                GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES) != 0) {
+            GGML_ASSERT(current.desc.continuation_group != 0);
+            sticky_group =
+                status == GGML_STATUS_SUCCESS ?
+                    current.desc.continuation_group : 0;
+        }
+        if ((current.desc.flags &
+                GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 &&
+                sticky_group == current.desc.continuation_group) {
+            sticky_group = 0;
+        }
+
+        completed[current.id] = status;
+        debug_event("END", current, tasks.size(), status);
+        done_cv.notify_all();
+        task_cv.notify_all();
+    }
+
+    void release_preempt_wait_locked(
+            const task & current,
+            const char * reason,
+            int32_t completed_layer) {
+        const auto it = preempt_waits.find(current.id);
+        if (it == preempt_waits.end()) {
+            return;
+        }
+        const int64_t blocked_us =
+            std::max<int64_t>(
+                0, ggml_time_us() - it->second.request_us);
+        preempt_blocked_us += blocked_us;
+        if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_SCHED] event=PREEMPT_RELEASE "
+                "running_id=%" PRIu64
+                " incoming_id=%" PRIu64 " incoming_kind=%s "
+                "incoming_chunk=%d incoming_layer=%d "
+                "checkpoint_layer=%d blocked_ms=%.3f reason=%s\n",
+                it->second.running_id,
+                current.id,
+                ggml_backend_meta_cpu_task_kind_name(
+                    current.desc.kind),
+                current.desc.chunk,
+                current.desc.layer,
+                completed_layer,
+                blocked_us / 1000.0,
+                reason != nullptr ? reason : "UNKNOWN");
+            std::fflush(stderr);
+        }
+        preempt_waits.erase(it);
+    }
+
+    bool should_checkpoint(uint64_t task_id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return running_id == task_id &&
+            running_desc.kind ==
+                GGML_BACKEND_META_CPU_TASK_CPU_FULL &&
+            causal_frontier >= 0 &&
+            running_desc.chunk >= 0 &&
+            running_desc.chunk == causal_frontier;
+    }
+
+    ggml_status checkpoint(
+            uint64_t task_id,
+            int32_t completed_layer,
+            bool * yielded) {
+        if (yielded != nullptr) {
+            *yielded = false;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex);
+        if (running_id != task_id ||
+                running_desc.kind !=
+                    GGML_BACKEND_META_CPU_TASK_CPU_FULL) {
+            return GGML_STATUS_FAILED;
+        }
+
+        task outer;
+        outer.id = running_id;
+        outer.desc = running_desc;
+        bool did_yield = false;
+        size_t yielded_tasks = 0;
+
+        while (true) {
+            size_t index = SIZE_MAX;
+            if (sticky_group != 0) {
+                index = best_index_locked();
+                while (index == SIZE_MAX &&
+                        sticky_group != 0 &&
+                        !stop) {
+                    task_cv.wait(lock);
+                    index = best_index_locked();
+                }
+                if (stop) {
+                    return GGML_STATUS_FAILED;
+                }
+                if (sticky_group == 0) {
+                    continue;
+                }
+            } else {
+                index = best_preempt_index_locked(outer);
+                if (index == SIZE_MAX) {
+                    break;
+                }
+            }
+
+            task nested = std::move(tasks[index]);
+            tasks.erase(tasks.begin() + (ptrdiff_t) index);
+            running_id = nested.id;
+            running_desc = nested.desc;
+            release_preempt_wait_locked(
+                nested, "LAYER_BOUNDARY", completed_layer);
+            debug_event("START", nested, tasks.size());
+
+            lock.unlock();
+            const ggml_status status = nested.run(nested.id);
+            lock.lock();
+
+            finish_task_locked(nested, status);
+            running_id = outer.id;
+            running_desc = outer.desc;
+            did_yield = true;
+            ++yielded_tasks;
+
+            if (status != GGML_STATUS_SUCCESS) {
+                if (yielded != nullptr) {
+                    *yielded = true;
+                }
+                return status;
+            }
+        }
+
+        if (did_yield) {
+            ++checkpoint_yield_count;
+            if (yielded != nullptr) {
+                *yielded = true;
+            }
+            if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[CPU_TASK_CHECKPOINT] event=RESUME "
+                    "running_id=%" PRIu64 " chunk=%d "
+                    "completed_layer=%d yielded_tasks=%zu "
+                    "queued=%zu frontier=%d\n",
+                    outer.id,
+                    outer.desc.chunk,
+                    completed_layer,
+                    yielded_tasks,
+                    tasks.size(),
+                    causal_frontier);
+                std::fflush(stderr);
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
     void run_loop() {
         std::unique_lock<std::mutex> lock(mutex);
         while (true) {
@@ -2903,34 +3116,17 @@ struct ggml_backend_meta_cpu_task_executor {
             tasks.erase(tasks.begin() + (ptrdiff_t) index);
             running_id = current.id;
             running_desc = current.desc;
+            release_preempt_wait_locked(
+                current, "CPU_FULL_END", -1);
             debug_event("START", current, tasks.size());
 
             lock.unlock();
             const ggml_status status = current.run(current.id);
             lock.lock();
 
-            if ((current.desc.flags &
-                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES) != 0) {
-                GGML_ASSERT(current.desc.continuation_group != 0);
-                // Reserve the executor only after a successful prefix. If the
-                // prefix fails there will be no suffix task to release the
-                // group, so retaining it would deadlock shutdown/fallback.
-                sticky_group =
-                    status == GGML_STATUS_SUCCESS ?
-                        current.desc.continuation_group : 0;
-            }
-            if ((current.desc.flags &
-                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 &&
-                    sticky_group == current.desc.continuation_group) {
-                sticky_group = 0;
-            }
-
+            finish_task_locked(current, status);
             running_id = 0;
             running_desc = {};
-            completed[current.id] = status;
-            debug_event("END", current, tasks.size(), status);
-            done_cv.notify_all();
-            task_cv.notify_all();
         }
     }
 
@@ -2968,25 +3164,31 @@ struct ggml_backend_meta_cpu_task_executor {
             task running;
             running.id = running_id;
             running.desc = running_desc;
-            if (better(t, running) &&
-                    std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
-                std::fprintf(
-                    stderr,
-                    "[CPU_TASK_SCHED] event=PREEMPT_REQUEST "
-                    "running_id=%" PRIu64 " running_kind=CPU_FULL "
-                    "incoming_id=%" PRIu64 " incoming_kind=%s "
-                    "incoming_urgency=%d incoming_chunk=%d "
-                    "incoming_layer=%d incoming_sg=%d "
-                    "action=DEFER_TO_CPU_FULL_END_V1\n",
+            if (better(t, running)) {
+                ++preempt_request_count;
+                preempt_waits[t.id] = {
+                    ggml_time_us(),
                     running_id,
-                    t.id,
-                    ggml_backend_meta_cpu_task_kind_name(
-                        t.desc.kind),
-                    t.desc.urgency,
-                    t.desc.chunk,
-                    t.desc.layer,
-                    t.debug_sg);
-                std::fflush(stderr);
+                };
+                if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                    std::fprintf(
+                        stderr,
+                        "[CPU_TASK_SCHED] event=PREEMPT_REQUEST "
+                        "running_id=%" PRIu64 " running_kind=CPU_FULL "
+                        "incoming_id=%" PRIu64 " incoming_kind=%s "
+                        "incoming_urgency=%d incoming_chunk=%d "
+                        "incoming_layer=%d incoming_sg=%d "
+                        "action=WAIT_FOR_LAYER_BOUNDARY_V2\n",
+                        running_id,
+                        t.id,
+                        ggml_backend_meta_cpu_task_kind_name(
+                            t.desc.kind),
+                        t.desc.urgency,
+                        t.desc.chunk,
+                        t.desc.layer,
+                        t.debug_sg);
+                    std::fflush(stderr);
+                }
             }
         }
 
@@ -3327,6 +3529,31 @@ struct ggml_backend_meta_compute_workers {
         GGML_ASSERT(graph != nullptr);
 
         if (j == 0) {
+            int disabled_l_out_layer = -1;
+            if (ggml_backend_meta_cpu_task_graph_is_disabled_l_out_bridge(
+                    graph, disabled_l_out_layer)) {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(
+                    completed_generation[j] == generation[j]);
+                ++generation[j];
+                statuses[j] = GGML_STATUS_SUCCESS;
+                cpu_task_id[j] = 0;
+                completed_generation[j] = generation[j];
+                done_cv.notify_all();
+                if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                    std::fprintf(
+                        stderr,
+                        "[CPU_TASK_CLASSIFY] kind=SKIP_DISABLED_L_OUT "
+                        "layer=%d first=%s last=%s "
+                        "reason=PC_PRODUCER_DISABLED status=READY\n",
+                        disabled_l_out_layer,
+                        graph->nodes[0]->name,
+                        graph->nodes[graph->n_nodes - 1]->name);
+                    std::fflush(stderr);
+                }
+                return;
+            }
+
             ggml_backend_meta_cpu_task_executor * executor =
                 ggml_backend_meta_ensure_cpu_task_executor(backend_ctx);
             ggml_backend_meta_cpu_task_desc selected =
@@ -3397,7 +3624,14 @@ struct ggml_backend_meta_compute_workers {
                 task_id = cpu_task_id[j];
                 target_generation = generation[j];
             }
-            GGML_ASSERT(task_id != 0);
+            if (task_id == 0) {
+                std::unique_lock<std::mutex> lock(mutex);
+                done_cv.wait(lock, [&]() {
+                    return completed_generation[j] ==
+                        target_generation;
+                });
+                return statuses[j];
+            }
             ggml_backend_meta_cpu_task_executor * executor =
                 ggml_backend_meta_ensure_cpu_task_executor(backend_ctx);
             const ggml_status status =
@@ -22167,6 +22401,35 @@ bool ggml_backend_meta_cpu_task_promote(
         (ggml_backend_meta_context *) backend->context;
     return ggml_backend_meta_ensure_cpu_task_executor(
         backend_ctx)->promote(task_id, urgency);
+}
+
+bool ggml_backend_meta_cpu_task_should_checkpoint(
+        ggml_backend_t backend,
+        uint64_t task_id) {
+    if (!ggml_backend_is_meta(backend) ||
+            task_id == 0) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->should_checkpoint(task_id);
+}
+
+ggml_status ggml_backend_meta_cpu_task_checkpoint(
+        ggml_backend_t backend,
+        uint64_t task_id,
+        int32_t completed_layer,
+        bool * yielded) {
+    if (!ggml_backend_is_meta(backend) ||
+            task_id == 0) {
+        return GGML_STATUS_FAILED;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->checkpoint(
+            task_id, completed_layer, yielded);
 }
 
 bool ggml_backend_meta_cpu_task_set_outer_chunk(
