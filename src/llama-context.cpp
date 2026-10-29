@@ -250,7 +250,7 @@ llama_context::llama_context(
             // Reusing one allocated graph would pin every ubatch to the same copy
             // and force a full synchronization before set_inputs().
             graph_reuse_disable = true;
-            LLAMA_LOG_INFO("[JUPITER_PIPE] graph_reuse=DISABLED reason=ROTATE_CHUNK_SLOTS\n");
+            LLAMA_LOG_INFO("[JUPITER_PIPE] local_graph_reuse=DISABLED reason=ROTATE_CHUNK_SLOTS remote_slot_graph_cache=ENABLED\n");
         }
 
         if (graph_reuse_disable) {
