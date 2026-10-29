@@ -39,6 +39,13 @@ static bool jupiter_trace_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+// Independent, opt-in timing. Do not enable the synchronous q(x,y) profiler
+// or the verbose Jupiter TRACE in formal Prefill benchmarks.
+static bool jupiter_timeline_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_TIMELINE");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 // Opt-in asynchronous network send; the source is privately staged first.
 static bool jupiter_async_c2p_enabled() {
     const char * value = std::getenv("LLAMA_JUPITER_ASYNC_C2P");
@@ -510,7 +517,7 @@ static std::atomic<uint64_t> g_jupiter_comm_worker_id {1};
 struct jupiter_rpc_comm_worker {
     struct task {
         uint64_t id;
-        std::function<bool()> run;
+        std::function<bool(uint64_t)> run;
     };
 
     const std::string endpoint;
@@ -545,7 +552,7 @@ struct jupiter_rpc_comm_worker {
                 tasks.pop_front();
                 space_cv.notify_all();
                 lock.unlock();
-                if (!current.run()) {
+                if (!current.run(current.id)) {
                     GGML_ABORT("Jupiter asynchronous C2P transport failed");
                 }
                 lock.lock();
@@ -564,7 +571,7 @@ struct jupiter_rpc_comm_worker {
         thread.join();
     }
 
-    uint64_t enqueue(std::function<bool()> run) {
+    uint64_t enqueue(std::function<bool(uint64_t)> run) {
         std::unique_lock<std::mutex> lock(mutex);
         space_cv.wait(lock, [&] { return stop || tasks.size() < 32; });
         GGML_ASSERT(!stop);
@@ -594,56 +601,110 @@ struct jupiter_rpc_comm_worker {
         return compute_sock;
     }
 
-    bool fence_transfers() {
+    bool fence_transfers(uint64_t task, uint64_t uid, const char * phase) {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t t0 = timing ? ggml_time_us() : 0;
         const auto sock = transfer_socket();
-        if (!sock) {
-            return false;
-        }
         rpc_msg_jupiter_rsp rsp {};
-        return send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
-                            &rsp, sizeof(rsp)) && rsp.ok == 1;
+        const bool ok = sock &&
+            send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0,
+                         &rsp, sizeof(rsp)) && rsp.ok == 1;
+        if (timing) {
+            GGML_LOG_INFO(
+                "[JUPITER_TRANSFER_FENCE] task=%" PRIu64 " uid=%" PRIu64
+                " phase=%s wait_ms=%.3f t_us=%" PRId64 " status=%s\n",
+                task, uid, phase,
+                (ggml_time_us() - t0)/1000.0, ggml_time_us(),
+                ok ? "OK" : "FAIL");
+        }
+        return ok;
     }
 
     uint64_t enqueue_c2p(std::vector<uint8_t> payload, size_t bytes) {
-        return enqueue([this, payload = std::move(payload), bytes]() {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t queued_us = timing ? ggml_time_us() : 0;
+        return enqueue([this, payload = std::move(payload), bytes, timing, queued_us](uint64_t task) {
+            const int64_t begin_us = (timing || jupiter_trace_enabled()) ? ggml_time_us() : 0;
             const auto sock = transfer_socket();
-            if (!sock) {
-                return false;
-            }
-            const int64_t t0 = jupiter_trace_enabled() ? ggml_time_us() : 0;
-            const bool ok = send_rpc_cmd(sock, RPC_CMD_SET_TENSOR,
-                                         payload.data(), payload.size());
+            const int64_t send_begin_us = timing ? ggml_time_us() : 0;
+            const bool ok = sock &&
+                send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, payload.data(), payload.size());
+            const int64_t sent_us = (timing || jupiter_trace_enabled()) ? ggml_time_us() : 0;
             if (jupiter_trace_enabled()) {
                 GGML_LOG_INFO("[JUPITER_COMM] action=C2P_SENT bytes=%zu send_ms=%.3f status=%s\n",
-                              bytes, (ggml_time_us() - t0)/1000.0, ok ? "OK" : "FAIL");
+                              bytes, (sent_us - begin_us)/1000.0, ok ? "OK" : "FAIL");
+            }
+            if (timing) {
+                GGML_LOG_INFO(
+                    "[JUPITER_C2P_SEND] task=%" PRIu64 " bytes=%zu "
+                    "queue_ms=%.3f socket_send_ms=%.3f t_us=%" PRId64 " status=%s\n",
+                    task, bytes, (begin_us - queued_us)/1000.0,
+                    (sent_us - send_begin_us)/1000.0, sent_us,
+                    ok ? "OK" : "FAIL");
             }
             return ok;
         });
     }
 
-    uint64_t enqueue_graph_recompute(rpc_msg_graph_recompute_req req) {
-        return enqueue([this, req]() {
-            if (!fence_transfers()) {
+    uint64_t enqueue_graph_recompute(rpc_msg_graph_recompute_req req, int slot) {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t queued_us = timing ? ggml_time_us() : 0;
+        return enqueue([this, req, slot, timing, queued_us](uint64_t task) {
+            const int64_t start_us = timing ? ggml_time_us() : 0;
+            const int64_t fence_begin_us = timing ? ggml_time_us() : 0;
+            if (!fence_transfers(task, req.graph_uid, "GRAPH")) {
                 return false;
             }
+            const int64_t fence_end_us = timing ? ggml_time_us() : 0;
             const auto sock = compute_socket();
-            return sock && send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &req, sizeof(req));
+            const int64_t send_begin_us = timing ? ggml_time_us() : 0;
+            const bool ok = sock &&
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &req, sizeof(req));
+            if (timing) {
+                const int64_t done_us = ggml_time_us();
+                GGML_LOG_INFO(
+                    "[JUPITER_GRAPH_DISPATCH] task=%" PRIu64 " uid=%" PRIu64
+                    " slot=%d reused=1 queue_ms=%.3f transfer_fence_ms=%.3f "
+                    "graph_send_ms=%.3f t_us=%" PRId64 " status=%s\n",
+                    task, req.graph_uid, slot, (start_us - queued_us)/1000.0,
+                    (fence_end_us - fence_begin_us)/1000.0,
+                    (done_us - send_begin_us)/1000.0, done_us, ok ? "OK" : "FAIL");
+            }
+            return ok;
         });
     }
 
-    uint64_t enqueue_graph_build(std::vector<uint8_t> payload) {
-        return enqueue([this, payload = std::move(payload)]() {
-            if (!fence_transfers()) {
+    uint64_t enqueue_graph_build(std::vector<uint8_t> payload, uint64_t uid, int slot) {
+        const bool timing = jupiter_timeline_enabled();
+        const int64_t queued_us = timing ? ggml_time_us() : 0;
+        return enqueue([this, payload = std::move(payload), uid, slot, timing, queued_us](uint64_t task) {
+            const int64_t start_us = timing ? ggml_time_us() : 0;
+            const int64_t fence_begin_us = timing ? ggml_time_us() : 0;
+            if (!fence_transfers(task, uid, "GRAPH")) {
                 return false;
             }
+            const int64_t fence_end_us = timing ? ggml_time_us() : 0;
             const auto sock = compute_socket();
-            return sock && send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE,
-                                        payload.data(), payload.size());
+            const int64_t send_begin_us = timing ? ggml_time_us() : 0;
+            const bool ok = sock &&
+                send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE,
+                             payload.data(), payload.size());
+            if (timing) {
+                const int64_t done_us = ggml_time_us();
+                GGML_LOG_INFO(
+                    "[JUPITER_GRAPH_DISPATCH] task=%" PRIu64 " uid=%" PRIu64
+                    " slot=%d reused=0 queue_ms=%.3f transfer_fence_ms=%.3f "
+                    "graph_send_ms=%.3f t_us=%" PRId64 " status=%s\n",
+                    task, uid, slot, (start_us - queued_us)/1000.0,
+                    (fence_end_us - fence_begin_us)/1000.0,
+                    (done_us - send_begin_us)/1000.0, done_us, ok ? "OK" : "FAIL");
+            }
+            return ok;
         });
     }
 
     uint64_t enqueue_event(rpc_msg_jupiter_event_req req) {
-        return enqueue([this, req]() {
+        return enqueue([this, req](uint64_t /*task*/) {
             const auto sock = compute_socket();
             return sock && send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &req, sizeof(req));
         });
@@ -661,10 +722,10 @@ struct jupiter_rpc_comm_worker {
             }
         }
         auto ok = std::make_shared<std::atomic<bool>>(false);
-        const uint64_t ticket = enqueue([this, ok]() {
+        const uint64_t ticket = enqueue([this, ok](uint64_t task) {
             // Backend synchronization must cover pending transfer-lane
             // writes even if no Phone graph has been submitted yet.
-            if (!fence_transfers()) {
+            if (!fence_transfers(task, 0, "SYNC")) {
                 ok->store(false);
                 return false;
             }
