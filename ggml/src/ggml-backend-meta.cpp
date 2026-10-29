@@ -2848,6 +2848,30 @@ struct ggml_backend_meta_cpu_task_executor {
         return completed.find(id) != completed.end();
     }
 
+    void release_sticky(
+            uint64_t group,
+            const char * reason) {
+        if (group == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sticky_group != group) {
+            return;
+        }
+        sticky_group = 0;
+        task_cv.notify_all();
+        if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_SCHED] event=STICKY_RELEASE "
+                "group=%" PRIu64 " reason=%s queued=%zu\n",
+                group,
+                reason != nullptr ? reason : "UNKNOWN",
+                tasks.size());
+            std::fflush(stderr);
+        }
+    }
+
     void set_frontier(int32_t frontier) {
         std::lock_guard<std::mutex> lock(mutex);
         if (frontier < 0) {
@@ -18469,6 +18493,12 @@ auto prefill_norm_sg_has_prework =
                 pending_prefill_input_chunk = -1;
                 if (input_status != GGML_STATUS_SUCCESS) {
                     compute_workers.wait(0);
+                    if (c2p_parallel_ready &&
+                            backend_ctx->cpu_task_executor != nullptr) {
+                        backend_ctx->cpu_task_executor->release_sticky(
+                            c2p_pc_main_desc.continuation_group,
+                            "C2P_INPUT_FAILED");
+                    }
                     if (c2p_pc_graph != nullptr) {
                         c2p_pc_graph->uid = c2p_saved_pc_graph_uid;
                     }
