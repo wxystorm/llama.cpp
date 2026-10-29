@@ -2752,6 +2752,32 @@ struct ggml_backend_meta_cpu_task_executor {
         t.id = ++submitted;
         t.desc = desc;
         t.run = std::move(run);
+
+        if (running_id != 0 &&
+                running_desc.kind ==
+                    GGML_BACKEND_META_CPU_TASK_CPU_FULL) {
+            task running;
+            running.id = running_id;
+            running.desc = running_desc;
+            if (better(t, running) &&
+                    std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[CPU_TASK_SCHED] event=PREEMPT_REQUEST "
+                    "running_id=%" PRIu64 " running_kind=CPU_FULL "
+                    "incoming_id=%" PRIu64 " incoming_kind=%s "
+                    "incoming_urgency=%d incoming_chunk=%d "
+                    "action=DEFER_TO_CPU_FULL_END_V1\n",
+                    running_id,
+                    t.id,
+                    ggml_backend_meta_cpu_task_kind_name(
+                        t.desc.kind),
+                    t.desc.urgency,
+                    t.desc.chunk);
+                std::fflush(stderr);
+            }
+        }
+
         debug_event("ENQUEUE", t, tasks.size() + 1);
         tasks.push_back(std::move(t));
         task_cv.notify_all();
