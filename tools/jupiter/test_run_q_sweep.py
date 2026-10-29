@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 import unittest
 from pathlib import Path
 
 from run_q_sweep import (
+    build_cli_command,
     infer_runtime_prompt_tokens,
     make_sweep_plan,
     reconstruct_plan_from_log,
@@ -64,6 +66,23 @@ class JupiterSweepTests(unittest.TestCase):
             "[JUPITER_UBATCH] event=BEGIN chunk=2 slot=0 prefix_tokens=256 tokens=103\n"
         )
         self.assertEqual(infer_runtime_prompt_tokens(path), (359, "ubatch_chain"))
+
+    def test_cli_uses_trace_verbosity_for_jupiter_profiles(self) -> None:
+        # LLAMA_LOG_INFO requires -lv 4 in the current common logging adapter.
+        args = argparse.Namespace(
+            rpc="127.0.0.1:10139",
+            max_chunk=128,
+            batch=512,
+            context=512,
+            threads=8,
+            extra_arg=[],
+        )
+        cmd = build_cli_command(
+            args, Path("llama-cli.exe"), Path("qwen.gguf"), "test prompt"
+        )
+        self.assertIn("-lv", cmd)
+        self.assertEqual(cmd[cmd.index("-lv") + 1], "4")
+        self.assertIn("--single-turn", cmd)
 
     def test_adaptive_chunks_are_valid(self) -> None:
         for total in (358, 359, 371, 401):
