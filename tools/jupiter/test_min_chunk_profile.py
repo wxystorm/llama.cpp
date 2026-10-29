@@ -3,7 +3,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from min_chunk_profile import select_min_chunk
+from min_chunk_profile import partition_feasible, select_min_chunk
 from run_min_chunk_profile import (
     first_chunk_service_times,
     load_pc_layers,
@@ -128,6 +128,30 @@ class MinChunkProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no complete"):
             select_min_chunk([sample(16, 10, 20)], min_samples=2)
 
+
+    def test_full_prompt_feasibility_changes_selected_b(self):
+        # b=128 exceeds the feasible range for 357 tokens / max128.
+        # b=96 barely misses 90% PC throughput, but is the measured
+        # best feasible candidate and must be flagged as below threshold.
+        rows = [
+            sample(64, 74.891, 22.785),
+            sample(96, 89.608, 19.776),
+            sample(128, 106.850, 27.459),
+        ]
+        selected, measured, status = select_min_chunk(
+            rows, threshold=0.90, total_tokens=357, max_chunk=128
+        )
+        self.assertFalse(partition_feasible(357, 128, 128))
+        self.assertTrue(partition_feasible(357, 96, 128))
+        self.assertEqual(selected.tokens, 96)
+        self.assertEqual(status, "NO_FEASIBLE_PLATEAU")
+        self.assertEqual(len(measured), 3)
+
+    def test_reject_entirely_infeasible_calibrated_range(self):
+        rows = [sample(96, 89.608, 19.776),
+                sample(128, 106.850, 27.459)]
+        with self.assertRaisesRegex(ValueError, "no measured minimum b"):
+            select_min_chunk(rows, total_tokens=257, max_chunk=128)
 
 if __name__ == "__main__":
     unittest.main()
