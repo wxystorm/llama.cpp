@@ -1770,6 +1770,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
+    const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_prefill = jupiter_env != NULL && atoi(jupiter_env) != 0;
+    if (parallel && jupiter_prefill) {
+        int window = 2;
+        if (const char * value = getenv("LLAMA_JUPITER_WINDOW")) {
+            window = atoi(value);
+        }
+        window = std::max(1, std::min(window, GGML_SCHED_MAX_COPIES));
+        sched->n_copies = window;
+        GGML_LOG_INFO("[JUPITER_PIPE] scheduler_copies=%d window=%d\n", sched->n_copies, window);
+    }
+
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
