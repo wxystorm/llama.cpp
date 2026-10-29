@@ -7787,6 +7787,97 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ring_mode_env != nullptr && std::atoi(ring_mode_env) != 0 &&
             ring_exit_env != nullptr && std::atoi(ring_exit_env) != 0;
 
+        // Diagnostic-only mapping from a terminal Ring layer to the runtime
+        // stage index.  Sequence-FFN may split one base CPU region into
+        // [CPU-prefix, Sequence, CPU-suffix], so derive the index from the
+        // same layout/environment rather than hard-coding stage 3/6/9.
+        auto ring_runtime_stage_for_layer = [&](int target_layer) -> int {
+            const char * layout_env =
+                std::getenv("LLAMA_HYBRID_REGION_RING_LAYOUT");
+            const std::string layout =
+                layout_env != nullptr && layout_env[0] != '\0' ?
+                    layout_env :
+                    "G4,C7,P5,G4,C7,P5,G3,C8,P5";
+
+            const char * seq_v1_env =
+                std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_V1");
+            const bool seq_v1 =
+                seq_v1_env != nullptr && std::atoi(seq_v1_env) != 0;
+            const char * seq_begin_env =
+                std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_LAYER_BEGIN");
+            const char * seq_end_env =
+                std::getenv("LLAMA_HYBRID_SEQUENCE_FFN_LAYER_END");
+            const int seq_begin =
+                seq_v1 && seq_begin_env != nullptr ?
+                    std::atoi(seq_begin_env) : -1;
+            const int seq_end =
+                seq_v1 ?
+                    (seq_end_env != nullptr && seq_end_env[0] != '\0' ?
+                        std::atoi(seq_end_env) : seq_begin + 1) :
+                    -1;
+
+            int layer_begin = 0;
+            int runtime_stage = 0;
+            size_t pos = 0;
+            while (pos < layout.size()) {
+                const size_t comma = layout.find(',', pos);
+                const std::string token =
+                    layout.substr(
+                        pos,
+                        comma == std::string::npos ?
+                            std::string::npos : comma - pos);
+                if (token.size() < 2) {
+                    return -1;
+                }
+                const int count = std::atoi(token.c_str() + 1);
+                if (count <= 0) {
+                    return -1;
+                }
+                const int layer_end = layer_begin + count;
+
+                const bool seq_inside =
+                    seq_v1 &&
+                    seq_begin >= layer_begin &&
+                    seq_end <= layer_end &&
+                    seq_begin < seq_end;
+
+                if (!seq_inside) {
+                    if (target_layer >= layer_begin &&
+                            target_layer < layer_end) {
+                        return runtime_stage;
+                    }
+                    ++runtime_stage;
+                } else {
+                    if (seq_begin > layer_begin) {
+                        if (target_layer >= layer_begin &&
+                                target_layer < seq_begin) {
+                            return runtime_stage;
+                        }
+                        ++runtime_stage;
+                    }
+                    if (target_layer >= seq_begin &&
+                            target_layer < seq_end) {
+                        return runtime_stage;
+                    }
+                    ++runtime_stage;
+                    if (seq_end < layer_end) {
+                        if (target_layer >= seq_end &&
+                                target_layer < layer_end) {
+                            return runtime_stage;
+                        }
+                        ++runtime_stage;
+                    }
+                }
+
+                layer_begin = layer_end;
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+            return -1;
+        };
+
         if (ring_exit_fix &&
                 n_backends == 2 &&
                 active_count == 1 && active_backend == 1) {
@@ -7853,27 +7944,65 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     auto & dst_backend = backend_ctx->backend_configs[0];
                     const ggml_backend_rpc_fence_t fence =
                         ggml_backend_meta_get_rpc_fence(src_backend.backend);
+
+                    const int64_t fence_begin_us = ggml_time_us();
                     if (fence != nullptr) {
                         fence(src_backend.backend);
                     } else {
                         ggml_backend_synchronize(src_backend.backend);
                     }
+                    const int64_t fence_us =
+                        ggml_time_us() - fence_begin_us;
 
                     const int64_t copy_begin_us = ggml_time_us();
+                    const int64_t copy_submit_begin_us = copy_begin_us;
                     ggml_backend_tensor_copy_async(
                         src_backend.backend, dst_backend.backend,
                         nodes[1], nodes[0]);
+                    const int64_t copy_submit_us =
+                        ggml_time_us() - copy_submit_begin_us;
+
+                    const int64_t dst_sync_begin_us = ggml_time_us();
                     ggml_backend_synchronize(dst_backend.backend);
-                    const int64_t copy_us = ggml_time_us() - copy_begin_us;
+                    const int64_t dst_sync_us =
+                        ggml_time_us() - dst_sync_begin_us;
+                    const int64_t copy_us =
+                        ggml_time_us() - copy_begin_us;
+
                     record_copy_wait(copy_us);
                     record_meta_copy(i, 1, 0, nodes[0], copy_us);
                     record_direct_copy();
                     debug_terminal_handoff_dst = nodes[0];
                     handled = true;
-                    printf("[REGION_RING_EXIT] layer=%d sg=%zu "
+
+                    const int runtime_stage =
+                        ring_runtime_stage_for_layer(ring_layer);
+                    printf(
+                        "[REGION_RING_EXIT_PROFILE] stage=%d layer=%d sg=%zu "
+                        "src_tensor=%s dst_tensor=%s "
+                        "src_backend=%s dst_backend=%s bytes=%zu "
+                        "fence=%s fence_ms=%.3f "
+                        "copy_submit_ms=%.3f dst_sync_ms=%.3f "
+                        "copy_total_ms=%.3f status=OK\n",
+                        runtime_stage,
+                        ring_layer,
+                        i,
+                        nodes[1]->name,
+                        nodes[0]->name,
+                        ggml_backend_name(src_backend.backend),
+                        ggml_backend_name(dst_backend.backend),
+                        ggml_nbytes(nodes[0]),
+                        fence != nullptr ? "RPC_FENCE" : "BACKEND_SYNC",
+                        fence_us / 1000.0,
+                        copy_submit_us / 1000.0,
+                        dst_sync_us / 1000.0,
+                        copy_us / 1000.0);
+                    printf("[REGION_RING_EXIT] stage=%d layer=%d sg=%zu "
                            "action=COPY_COMPUTED_L_OUT bytes=%zu "
-                           "copy_ms=%.3f status=OK\n",
-                           ring_layer, i, ggml_nbytes(nodes[0]),
+                           "fence_ms=%.3f copy_ms=%.3f status=OK\n",
+                           runtime_stage, ring_layer, i,
+                           ggml_nbytes(nodes[0]),
+                           fence_us / 1000.0,
                            copy_us / 1000.0);
                     return GGML_STATUS_SUCCESS;
                 }
