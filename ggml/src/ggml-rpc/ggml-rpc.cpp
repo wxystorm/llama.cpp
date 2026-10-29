@@ -2763,6 +2763,43 @@ static void rpc_serve_client(rpc_server & server,
 
                 break;
             }
+            case RPC_CMD_JUPITER_EVENT_RECORD: {
+                rpc_msg_jupiter_event_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.jupiter_event_record(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_JUPITER_EVENT_WAIT: {
+                rpc_msg_jupiter_event_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_jupiter_rsp response {};
+                if (!server.jupiter_event_wait(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_JUPITER_SYNC: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_jupiter_rsp response {};
+                if (!server.jupiter_sync(response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
