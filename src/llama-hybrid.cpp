@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <iterator>
 #include <mutex>
@@ -9319,7 +9321,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return true;
             };
 
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[REGION_RING_PLAN_PHONE_COST] arch=DENSE "
             "source=RPC_WIRE_DENSE_GRAPH_PROBE "
             "graph_bytes_1=%zu graph_bytes_5=%zu "
@@ -9887,7 +9889,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
     }
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_INFO(
         "[REGION_RING_PLAN_PROFILE] source=HYBRID_AUTO "
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
@@ -9983,7 +9985,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             llama_ring_planner::search_runtime_applicable(
                 model, baseline_regions, baseline_chunk,
                 1, wide_e_margin, wide_min_simulations);
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
@@ -10034,7 +10036,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     c, model.layers, regions)) {
                 continue;
             }
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_DEBUG(
                 "[REGION_RING_PLAN_CANDIDATE] mode=APPLY_WIDE rank=%zu "
                 "layout=%s cycles=%d first_C=%d first_G=%d first_P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
@@ -10220,7 +10222,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // The subsequent optional Tensor pass and final wall ranking stay
         // unchanged.
         if (!forced_ab && best.prefix_cycles > 0) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_PREFIX_SELECTED] "
                 "cycles=%d layout=%s mode=E1_THEN_PREFIX_LOAD "
                 "status=PROFILE_ESTIMATE\n",
@@ -10232,7 +10234,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 const int layers =
                     best_regions[first + 2].layer_end -
                     best_regions[first].layer_begin;
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_PLAN_PREFIX_LOAD] cycle=%d "
                     "cycle_layers=%d W_cpu_mspt=%.6f "
                     "W_gpu_mspt=%.6f W_phone_mspt=%.6f "
@@ -10285,7 +10287,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 for (size_t i = 0;
                         i < boundary.top.size(); ++i) {
                     const auto & choice = boundary.top[i];
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[REGION_RING_BOUNDARY_CANDIDATE] "
                         "rank=%zu mode=%s widths=%s tensor_layers=%d "
                         "layout=%s predicted_ms=%.3f\n",
@@ -10387,7 +10389,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.xc == baseline_chunk &&
             best.xg == baseline_chunk &&
             best.xp == baseline_chunk;
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
             "source=%s layout=%s baseline_layout=%s "
             "cycles=%d first_C=%d first_G=%d first_P=%d XC=%d XG=%d XP=%d "
@@ -10413,6 +10415,70 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.weight_h2d_hidden_ms,
             improvement_pct, min_gain_pct,
             best.ring_error_max);
+
+        // One buffered Planner decision per process, written outside
+        // model compute and without terminal logging. This shares the
+        // experiment JSONL path with the per-ubatch runtime summary.
+        if (const char * metrics_path = std::getenv(
+                "LLAMA_REGION_RING_METRICS_FILE")) {
+            if (*metrics_path != '\0') {
+                std::ofstream metrics(metrics_path, std::ios::app);
+                if (metrics) {
+                    const bool accepted = forced_ab ||
+                        (!identical && improvement_pct >= min_gain_pct);
+                    metrics << std::fixed << std::setprecision(4)
+                            << "{\"type\":\"planner\","
+                            << "\"schema\":1,"
+                            << "\"mode\":\"apply-wide\","
+                            << "\"source\":\""
+                            << (forced_ab ? "forced" :
+                                boundary_tensor_selected ? "tensor" :
+                                "prefix_or_uniform")
+                            << "\","
+                            << "\"selected_layout\":\""
+                            << best_text << "\","
+                            << "\"baseline_layout\":\""
+                            << baseline_text << "\","
+                            << "\"applied\":"
+                            << (accepted ? "true" : "false") << ","
+                            << "\"layers\":" << model.layers << ","
+                            << "\"plan_tokens\":" << model.tokens << ","
+                            << "\"cycles\":" << best.cycles << ","
+                            << "\"xc\":" << best.xc << ","
+                            << "\"xg\":" << best.xg << ","
+                            << "\"xp\":" << best.xp << ","
+                            << "\"tensor_selected\":"
+                            << (boundary_tensor_selected ? "true" : "false")
+                            << ",\"gpu_weight_streaming\":"
+                            << (model.gpu_weight_streaming ? "true" : "false")
+                            << ",\"predicted_ms\":" << best.wall_ms
+                            << ",\"baseline_predicted_ms\":"
+                            << baseline_ms
+                            << ",\"estimated_gain_pct\":"
+                            << improvement_pct
+                            << ",\"e\":" << best.ring_error_max
+                            << ",\"first_cycle_e\":"
+                            << (best.prefix_cycles > 0 ?
+                                best.prefix_error[0] : best.ring_error_max)
+                            << ",\"first_cycle_seeds\":"
+                            << result.first_cycle_selected
+                            << ",\"prefix_completed\":"
+                            << result.prefix_completed
+                            << ",\"weight_h2d_pred_ms\":"
+                            << best.weight_h2d_busy_ms
+                            << ",\"weight_h2d_exposed_pred_ms\":"
+                            << best.weight_h2d_exposed_ms
+                            << ",\"cpu_busy_pred_ms\":"
+                            << best.busy_ms[0]
+                            << ",\"gpu_busy_pred_ms\":"
+                            << best.busy_ms[1]
+                            << ",\"phone_busy_pred_ms\":"
+                            << best.busy_ms[2]
+                            << ",\"prepare_pred_ms\":"
+                            << best.prepare_busy_ms << "}\n";
+                }
+            }
+        }
 
         if (!forced_ab &&
                 (identical || improvement_pct < min_gain_pct)) {
@@ -10519,7 +10585,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
             *selected_layout =
                 llama_region_ring_layout_string(baseline_regions);
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_SELECTED] mode=APPLY_BASELINE "
                 "source=FIXED_RUNTIME layout=%s tokens=%d chunk=%d "
                 "predicted_ms=%.3f status=IDENTICAL_BASELINE\n",
@@ -10675,7 +10741,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 llama_region_ring_layout_string(baseline_regions);
             const std::string best_text =
                 llama_region_ring_layout_string(best_regions);
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_SELECTED] mode=APPLY_CGP "
                 "source=AUTO_FREE_CGP layout=%s "
                 "baseline_layout=%s C=%d G=%d P=%d "
@@ -10805,7 +10871,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
                 *selected_layout =
                     llama_region_ring_layout_string(manual);
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_PLAN_SELECTED] mode=APPLY_SAFE "
                     "source=MANUAL layout=%s tokens=%d chunk=%d "
                     "predicted_ms=%.3f "
@@ -10873,7 +10939,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             llama_region_ring_layout_string(baseline_regions);
         const std::string best_text =
             llama_region_ring_layout_string(best.regions);
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_SAFE "
             "source=AUTO_FIXED_PHONE "
             "layout=%s baseline_layout=%s "
@@ -10958,7 +11024,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         base_ok ? baseline.busy_ms[2] : -1.0,
         base_ok ? "OK" : "NO_PROFILE");
 
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_INFO(
         "[REGION_RING_PLAN_SEARCH] mode=WIDE_PREVIEW "
         "enumerated=%zu profiled=%zu shortlisted=%zu simulated=%zu "
         "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
@@ -10982,7 +11048,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
 
     for (size_t i = 0; i < result.top.size(); ++i) {
         const auto & c = result.top[i];
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_DEBUG(
             "[REGION_RING_PLAN_CANDIDATE] rank=%zu cycles=%d "
             "C=%d G=%d P=%d tail_C=%d tail_G=%d "
             "XC=%d XG=%d XP=%d balance=%.4f wall_ms=%.3f "
@@ -11012,7 +11078,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             c.tasks, c.edges, c.max_live_slots);
     }
     const auto & best = result.selected;
-    LLAMA_LOG_ERROR(
+    LLAMA_LOG_INFO(
         "[REGION_RING_PLAN_SELECTED] mode=DRY_RUN cycles=%d "
         "C=%d G=%d P=%d tail_C=%d tail_G=%d "
         "XC=%d XG=%d XP=%d predicted_ms=%.3f "
