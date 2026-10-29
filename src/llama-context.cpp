@@ -1807,6 +1807,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
+    int jupiter_window = 2;
+    if (const char * value = getenv("LLAMA_JUPITER_WINDOW")) {
+        jupiter_window = std::max(1, atoi(value));
+    }
     const int64_t jupiter_trace_t0_us = jupiter_trace ? ggml_time_us() : 0;
     uint32_t jupiter_chunk_idx = 0;
 
@@ -1815,8 +1819,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (jupiter_trace && n_tokens_all > 1) {
             LLAMA_LOG_INFO(
-                    "[JUPITER_UBATCH] event=BEGIN chunk=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
+                    "[JUPITER_UBATCH] event=BEGIN chunk=%u slot=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
                     jupiter_chunk_idx,
+                    jupiter_chunk_idx % (uint32_t) jupiter_window,
                     (long long) n_tokens_prev,
                     ubatch.n_tokens,
                     (long long) (ggml_time_us() - jupiter_trace_t0_us));
@@ -1845,8 +1850,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         if (jupiter_trace && n_tokens_all > 1 && res != nullptr) {
             LLAMA_LOG_INFO(
-                    "[JUPITER_UBATCH] event=QUEUED chunk=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
+                    "[JUPITER_UBATCH] event=QUEUED chunk=%u slot=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
                     jupiter_chunk_idx,
+                    jupiter_chunk_idx % (uint32_t) jupiter_window,
                     (long long) n_tokens_prev,
                     ubatch.n_tokens,
                     (long long) (ggml_time_us() - jupiter_trace_t0_us));
