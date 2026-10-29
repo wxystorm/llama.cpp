@@ -1,4 +1,5 @@
 #include "llama-hybrid.h"
+#include "llama-hybrid-arch.h"
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
 
@@ -8667,11 +8668,9 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
-    const bool is_qwen3_moe = ml.get_arch() == LLM_ARCH_QWEN3MOE;
-    if (ml.get_arch() != LLM_ARCH_LLAMA &&
-        ml.get_arch() != LLM_ARCH_QWEN2 &&
-        ml.get_arch() != LLM_ARCH_QWEN3 &&
-        !is_qwen3_moe) {
+    const bool is_qwen3_moe =
+        llama_hybrid_arch_is_moe(ml.get_arch());
+    if (!llama_hybrid_arch_supported(ml.get_arch())) {
         LLAMA_LOG_ERROR(
             "%s: hybrid auto does not support architecture %s\n",
             __func__, ml.get_arch_name().c_str());
