@@ -13,6 +13,7 @@ from run_prefill_bench import (
     env_for_mode,
     modes_arg,
     parse_timing,
+    parser,
     read_plan,
 )
 
@@ -78,6 +79,14 @@ class PrefillBenchTests(unittest.TestCase):
         self.assertEqual(dp["LLAMA_JUPITER_PLAN_FILE"], "jupiter.plan")
         self.assertNotIn("LLAMA_JUPITER_SEQUENCE_PLAN", dp)
         self.assertEqual(dp["LLAMA_JUPITER_PROFILE_STAGE"], "0")
+
+    def test_opt_in_async_c2p_flag_is_disabled_by_default(self) -> None:
+        common = [
+            "--exe", "cli.exe", "--model", "test.gguf",
+            "--rpc", "127.0.0.1:10139", "--prompt-file", "prompt.txt",
+        ]
+        self.assertFalse(parser().parse_args(common).async_c2p)
+        self.assertTrue(parser().parse_args(common + ["--async-c2p"]).async_c2p)
 
     def test_formal_cli_uses_lv3_single_turn(self) -> None:
         args = argparse.Namespace(
