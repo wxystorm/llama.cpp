@@ -6221,18 +6221,27 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             return true;
         }
         for (size_t next = sg + 1; next < backend_ctx->n_subgraphs; ++next) {
-            ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
+            ggml_cgraph * graph =
+                backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
             if (graph == nullptr || graph->n_nodes == 0) {
                 continue;
             }
 
-            ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
             int next_chunk = -1;
             int next_layer = -1;
-            const bool is_prefill_chunk =
-                ggml_backend_meta_parse_prefill_norm_chunk(last->name, next_chunk, next_layer) ||
-                ggml_backend_meta_parse_prefill_down_chunk(last->name, next_chunk, next_layer);
-            if (is_prefill_chunk) {
+            ggml_tensor * next_down =
+                get_prefill_down_boundary_node(0, next);
+            const bool has_down =
+                next_down != nullptr &&
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    next_down->name, next_chunk, next_layer);
+
+            ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
+            const bool has_norm =
+                !has_down &&
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    last->name, next_chunk, next_layer);
+            if (has_down || has_norm) {
                 if (next_layer > layer) {
                     return false;
                 }
@@ -6249,17 +6258,22 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         return false;
     };
     auto prefill_is_last_down_chunk = [&](size_t sg, int layer) -> bool {
-        for (size_t next = sg + 1; next < backend_ctx->n_subgraphs; ++next) {
-            ggml_cgraph * graph = backend_ctx->backend_configs[0].cgraphs[next].cgraph_main;
-            if (graph == nullptr || graph->n_nodes == 0) {
+        for (size_t next = sg + 1;
+                next < backend_ctx->n_subgraphs;
+                ++next) {
+            ggml_tensor * next_down =
+                get_prefill_down_boundary_node(0, next);
+            if (next_down == nullptr) {
                 continue;
             }
 
-            ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
             int next_chunk = -1;
             int next_layer = -1;
             if (ggml_backend_meta_parse_prefill_down_chunk(
-                    last->name, next_chunk, next_layer) && next_layer == layer) {
+                    next_down->name,
+                    next_chunk,
+                    next_layer) &&
+                    next_layer == layer) {
                 return false;
             }
         }
