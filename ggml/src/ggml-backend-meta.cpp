@@ -3247,7 +3247,7 @@ struct ggml_backend_meta_cpu_task_executor {
                     stderr,
                     "[CPU_TASK_SCHED] event=PREEMPT_DEFERRED "
                     "id=%" PRIu64 " running_kind=%s "
-                    "requested_urgency=%d reason=NON_PREEMPTIVE_V1\n",
+                    "requested_urgency=%d reason=WAIT_FOR_COOPERATIVE_BOUNDARY_V2\n",
                     id,
                     ggml_backend_meta_cpu_task_kind_name(
                         running_desc.kind),
