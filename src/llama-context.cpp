@@ -5050,6 +5050,36 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
 
+                    // A completed directional C2P island closes the causal
+                    // PC-side continuation for this outer chunk. Dense C2P
+                    // uses the generic Meta graph and therefore does not pass
+                    // through the MoE Router/FFN-specific frontier updates.
+                    //
+                    // Advance the shared CPU task frontier here at the outer
+                    // ownership boundary so CPU_FULL lookahead for chunk N+1
+                    // cannot remain parked forever. MoE paths may already
+                    // have advanced the same frontier; set_frontier() is
+                    // monotonic and makes this idempotent.
+                    if (stage.kind ==
+                            llama_hybrid_runtime_stage_kind::C2P &&
+                            region_ring_meta_cpu_backend != nullptr) {
+                        const int32_t next_frontier =
+                            (int32_t) task.chunk + 1;
+                        (void) ggml_backend_meta_cpu_task_set_frontier(
+                            region_ring_meta_cpu_backend,
+                            next_frontier);
+                        if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                            LLAMA_LOG_ERROR(
+                                "[REGION_RING_C2P_FRONTIER] "
+                                "region=%zu chunk=%zu next=%d "
+                                "source=OUTER_DIRECTIONAL_COMPLETE "
+                                "status=ADVANCED\n",
+                                task.region,
+                                task.chunk,
+                                next_frontier);
+                        }
+                    }
+
                     if (llama_region_ring_tls_p2c_deferred.active) {
                         const auto deferred =
                             llama_region_ring_tls_p2c_deferred;
