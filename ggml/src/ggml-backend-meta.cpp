@@ -5295,20 +5295,29 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             return nullptr;
         }
 
-        ggml_cgraph * graph = backend_ctx->backend_configs[j].cgraphs[sg].cgraph_main;
+        ggml_cgraph * graph =
+            backend_ctx->backend_configs[j].cgraphs[sg].cgraph_main;
         if (graph == nullptr || graph->n_nodes == 0) {
             return nullptr;
         }
 
-        ggml_tensor * node = graph->nodes[graph->n_nodes - 1];
-        int chunk = -1;
-        int layer = -1;
-        if (!ggml_backend_meta_parse_prefill_down_chunk(node->name, chunk, layer) ||
-                !(node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            return nullptr;
+        // Dense directional FFN may append a local residual ADD after the
+        // split FFN partial, so the subgraph terminal can be an anonymous
+        // node_N.  The wire boundary is the named partial itself, not
+        // necessarily graph->nodes[n_nodes - 1].  Scan backwards and return
+        // the latest live prefill_ffn_down_chunk_* compute tensor.
+        for (int k = graph->n_nodes - 1; k >= 0; --k) {
+            ggml_tensor * node = graph->nodes[k];
+            int chunk = -1;
+            int layer = -1;
+            if (ggml_backend_meta_parse_prefill_down_chunk(
+                    node->name, chunk, layer) &&
+                    (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                return node;
+            }
         }
 
-        return node;
+        return nullptr;
     };
 
     auto get_early_graph = [&](size_t j, size_t sg) -> ggml_cgraph * {
@@ -9002,14 +9011,22 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         int c2p_prefill_down_layer_0 = -1;
         int c2p_prefill_down_chunk_1 = -1;
         int c2p_prefill_down_layer_1 = -1;
+        ggml_tensor * c2p_prefill_down_node_0 =
+            n_backends == 2 ?
+                get_prefill_down_boundary_node(0, i) : nullptr;
+        ggml_tensor * c2p_prefill_down_node_1 =
+            n_backends == 2 ?
+                get_prefill_down_boundary_node(1, i) : nullptr;
         const bool c2p_prefill_down_boundary =
             n_backends == 2 &&
+            c2p_prefill_down_node_0 != nullptr &&
+            c2p_prefill_down_node_1 != nullptr &&
             ggml_backend_meta_parse_prefill_down_chunk(
-                nodes[0]->name,
+                c2p_prefill_down_node_0->name,
                 c2p_prefill_down_chunk_0,
                 c2p_prefill_down_layer_0) &&
             ggml_backend_meta_parse_prefill_down_chunk(
-                nodes[1]->name,
+                c2p_prefill_down_node_1->name,
                 c2p_prefill_down_chunk_1,
                 c2p_prefill_down_layer_1) &&
             c2p_prefill_down_chunk_0 == c2p_prefill_down_chunk_1 &&
@@ -9028,8 +9045,8 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 active_count,
                 !!(nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE),
                 !!(nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE),
-                nodes[0]->name,
-                nodes[1]->name);
+                c2p_prefill_down_node_0->name,
+                c2p_prefill_down_node_1->name);
         }
 
         int c2p_decode_layer_0 = -1;
@@ -11182,13 +11199,25 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         int prefill_down_layer_0 = -1;
         int prefill_down_chunk_1 = -1;
         int prefill_down_layer_1 = -1;
+        ggml_tensor * prefill_down_node_0 =
+            n_backends == 2 ?
+                get_prefill_down_boundary_node(0, i) : nullptr;
+        ggml_tensor * prefill_down_node_1 =
+            n_backends == 2 ?
+                get_prefill_down_boundary_node(1, i) : nullptr;
         const bool is_prefill_down_chunk =
             n_backends == 2 &&
             (active_count == 2 || c2p_prefill_down_boundary) &&
+            prefill_down_node_0 != nullptr &&
+            prefill_down_node_1 != nullptr &&
             ggml_backend_meta_parse_prefill_down_chunk(
-                nodes[0]->name, prefill_down_chunk_0, prefill_down_layer_0) &&
+                prefill_down_node_0->name,
+                prefill_down_chunk_0,
+                prefill_down_layer_0) &&
             ggml_backend_meta_parse_prefill_down_chunk(
-                nodes[1]->name, prefill_down_chunk_1, prefill_down_layer_1) &&
+                prefill_down_node_1->name,
+                prefill_down_chunk_1,
+                prefill_down_layer_1) &&
             prefill_down_chunk_0 == prefill_down_chunk_1 &&
             prefill_down_layer_0 == prefill_down_layer_1;
 
@@ -11575,8 +11604,10 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     phone_region_local_main_chunks.end() &&
                 local_main_partial_it->second.submitted;
 
-            ggml_tensor * phone_partial = nodes[j_src];
-            ggml_tensor * pc_partial = nodes[j_dst];
+            ggml_tensor * phone_partial =
+                prefill_down_node_1;
+            ggml_tensor * pc_partial =
+                prefill_down_node_0;
             GGML_ASSERT(ggml_is_contiguous(phone_partial));
             GGML_ASSERT(ggml_is_contiguous(pc_partial));
 
@@ -12644,8 +12675,10 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             constexpr size_t j_dst = 0;
             auto & bcj_src = backend_ctx->backend_configs[j_src];
             auto & bcj_dst = backend_ctx->backend_configs[j_dst];
-            ggml_tensor * node_src = nodes[j_src];
-            ggml_tensor * node_dst = nodes[j_dst];
+            ggml_tensor * node_src =
+                prefill_down_node_1;
+            ggml_tensor * node_dst =
+                prefill_down_node_0;
             GGML_ASSERT(ggml_is_contiguous(node_src));
             GGML_ASSERT(ggml_is_contiguous(node_dst));
 
