@@ -31,6 +31,7 @@ FIELDS = [
     "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
     "n_predict", "gpu_weight_streaming", "predicted_ms", "baseline_predicted_ms",
     "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
+    "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
     "cpu_tasks", "gpu_tasks", "phone_tasks",
     "cpu_compute_range_ms", "gpu_compute_range_ms", "phone_compute_range_ms",
@@ -168,6 +169,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "first_cycle_e": plan.get("first_cycle_e"), "final_e": plan.get("e"),
         "first_cycle_seeds": plan.get("first_cycle_seeds"),
         "prefix_completed": plan.get("prefix_completed"),
+        "prefix_cycles": plan.get("prefix_cycles"),
+        "prefix_e_json": json.dumps(plan.get("prefix_e", [])),
+        "prefix_service_mspt_json": json.dumps(
+            plan.get("prefix_service_mspt", [])),
         "ring_ubatches": len(ring), "ring_tokens": sum(x.get("tokens", 0) for x in ring),
         "ring_wall_ms": total(ring, "wall_ms"),
         "ring_complete": all(x.get("complete", False) for x in ring),
