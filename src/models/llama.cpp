@@ -283,7 +283,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             const llama_hybrid_layer_mode hybrid_mode            = model.hybrid_layer_mode(il);
             const bool                    use_decode_chunked_ffn = !embed && n_tokens == 1 &&
                                                 model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
-                                                llama_hybrid_layer_mode_uses_split_ffn_chunks(hybrid_mode) && n_chunks >= 1 &&
+                                                hybrid_mode == llama_hybrid_layer_mode::TENSOR_SPLIT && n_chunks >= 1 &&
                                                 loras->empty() && cvec->tensor_for(il) == nullptr;
             const int64_t n_ffn_tokens = cur->ne[1];
 
