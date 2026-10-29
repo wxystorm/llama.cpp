@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1277,6 +1278,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    const char * jupiter_env = std::getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_prefill = jupiter_env != nullptr && std::atoi(jupiter_env) != 0;
+    int jupiter_pc_layers = n_layer_all / 2;
+    if (const char * value = std::getenv("LLAMA_JUPITER_PC_LAYERS")) {
+        jupiter_pc_layers = std::atoi(value);
+    }
+
+    ggml_backend_dev_t jupiter_pc_dev = nullptr;
+    ggml_backend_dev_t jupiter_phone_dev = nullptr;
+
+    if (jupiter_prefill) {
+        if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
+            throw std::runtime_error("LLAMA_JUPITER_PREFILL requires --split-mode layer");
+        }
+        if (n_gpu_layers <= n_layer_all) {
+            throw std::runtime_error("LLAMA_JUPITER_PREFILL requires all repeating layers and output offloaded; use -ngl all");
+        }
+        if (jupiter_pc_layers <= 0 || jupiter_pc_layers >= n_layer_all) {
+            throw std::runtime_error(format("invalid LLAMA_JUPITER_PC_LAYERS=%d for %d-layer model",
+                                            jupiter_pc_layers, n_layer_all));
+        }
+
+        for (const auto & dev_info : devices) {
+            ggml_backend_dev_t dev = dev_info.dev;
+            const char * name = ggml_backend_dev_name(dev);
+            const bool is_rpc = name != nullptr && std::strncmp(name, "RPC", 3) == 0;
+            if (is_rpc && jupiter_phone_dev == nullptr) {
+                jupiter_phone_dev = dev;
+            } else if (!is_rpc && jupiter_pc_dev == nullptr) {
+                const auto type = ggml_backend_dev_type(dev);
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    jupiter_pc_dev = dev;
+                }
+            }
+        }
+
+        if (jupiter_pc_dev == nullptr || jupiter_phone_dev == nullptr) {
+            throw std::runtime_error("LLAMA_JUPITER_PREFILL requires one local GPU and one RPC device");
+        }
+
+        LLAMA_LOG_INFO(
+                "[JUPITER_STAGE_PLAN] mode=FIXED pc_device=%s pc_layers=0..%d phone_device=%s phone_layers=%d..%d output=PHONE\n",
+                ggml_backend_dev_name(jupiter_pc_dev), jupiter_pc_layers - 1,
+                ggml_backend_dev_name(jupiter_phone_dev), jupiter_pc_layers, n_layer_all - 1);
+    }
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -1314,6 +1361,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+
+        if (jupiter_prefill) {
+            ggml_backend_dev_t dev = il < jupiter_pc_layers ? jupiter_pc_dev : jupiter_phone_dev;
+            LLAMA_LOG_INFO(
+                    "[JUPITER_STAGE_LAYER] layer=%d stage=%s device=%s output=%d\n",
+                    il,
+                    il < jupiter_pc_layers ? "PC" : "PHONE",
+                    ggml_backend_dev_name(dev),
+                    il == n_layer_all ? 1 : 0);
+            return {dev, &pimpl->gpu_buft_list.at(dev)};
+        }
+
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             LLAMA_LOG_INFO("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
