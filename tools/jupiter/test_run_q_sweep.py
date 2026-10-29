@@ -13,6 +13,7 @@ from run_q_sweep import (
     infer_runtime_prompt_tokens,
     make_sweep_plan,
     reconstruct_plan_from_log,
+    should_echo_runtime_line,
 )
 
 
@@ -67,8 +68,9 @@ class JupiterSweepTests(unittest.TestCase):
         )
         self.assertEqual(infer_runtime_prompt_tokens(path), (359, "ubatch_chain"))
 
-    def test_cli_uses_trace_verbosity_for_jupiter_profiles(self) -> None:
-        # LLAMA_LOG_INFO requires -lv 4 in the current common logging adapter.
+    def test_cli_uses_info_verbosity_for_jupiter_profiles(self) -> None:
+        # LLAMA_JUPITER_Q_SWEEP promotes only the calibration marker records
+        # to INFO in common/log.cpp; other TRACE messages remain suppressed.
         args = argparse.Namespace(
             rpc="127.0.0.1:10139",
             max_chunk=128,
@@ -81,7 +83,7 @@ class JupiterSweepTests(unittest.TestCase):
             args, Path("llama-cli.exe"), Path("qwen.gguf"), "test prompt"
         )
         self.assertIn("-lv", cmd)
-        self.assertEqual(cmd[cmd.index("-lv") + 1], "4")
+        self.assertEqual(cmd[cmd.index("-lv") + 1], "3")
         self.assertIn("--single-turn", cmd)
 
     def test_adaptive_chunks_are_valid(self) -> None:
@@ -91,6 +93,23 @@ class JupiterSweepTests(unittest.TestCase):
                     chunks = make_sweep_plan(total, x, 32, 128)
                     self.assertEqual(sum(chunks), total)
                     self.assertTrue(all(32 <= c <= 128 for c in chunks))
+
+    def test_console_suppresses_stage_noise_but_keeps_plan_and_errors(self) -> None:
+        self.assertFalse(should_echo_runtime_line(
+            "[JUPITER_STAGE_PROFILE] backend=RPC0 compute_ms=12.0"
+        ))
+        self.assertFalse(should_echo_runtime_line(
+            "[JUPITER_UBATCH] event=BEGIN prefix_tokens=0 tokens=32"
+        ))
+        self.assertTrue(should_echo_runtime_line(
+            "[JUPITER_SEQUENCE_PLAN] total=357 k=11 chunks=32,32"
+        ))
+        self.assertTrue(should_echo_runtime_line(
+            "slot print_timing: prompt eval time = 8123 ms / 357 tokens"
+        ))
+        self.assertTrue(should_echo_runtime_line(
+            "Error: model evaluation failed"
+        ))
 
     def test_reconstruction_on_runtime_plan(self) -> None:
         expected = make_sweep_plan(359, 32, 32, 128)
