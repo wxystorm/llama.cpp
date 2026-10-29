@@ -637,41 +637,41 @@ Legacy C2P and synchronized stage measurement are used consistently.
 
 Run on the PC, while Phone RPC is already listening at port 10139:
 
-\`\`\`powershell
+```powershell
 cd E:\llama\llama-jupiter
 git pull --ff-only origin baseline/jupiter-infocom25
 cmake --build build-jupiter --config Release -j
 python -m unittest discover -s .\tools\jupiter -p test_min_chunk_profile.py -v
 
-python .\tools\jupiter\run_min_chunk_profile.py \`
-  --exe .\build-jupiter\bin\Release\llama-cli.exe \`
-  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf \`
-  --rpc 10.39.52.114:10139 \`
-  --prompt-file .\prompt.txt \`
-  --model-plan .\jupiter-model.plan \`
-  --target-tokens 357 \`
-  --candidates 8,16,24,32,48,64,96,128 \`
-  --threshold 0.90 --repeats 2 \`
+python .\tools\jupiter\run_min_chunk_profile.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --model-plan .\jupiter-model.plan `
+  --target-tokens 357 `
+  --candidates 8,16,24,32,48,64,96,128 `
+  --threshold 0.90 --repeats 2 `
   --out-dir .\jupiter-min-chunk
-\`\`\`
+```
 
 If Model Partition did not produce jupiter-model.plan, replace
-\`--model-plan .\jupiter-model.plan\` with \`--pc-layers 20\` (or the selected
+`--model-plan .\jupiter-model.plan` with `--pc-layers 20` (or the selected
 boundary from the model profiling stage). The script validates the actual
 runtime token count and verifies each complete sequence plan was applied.
-\`--resume\` skips completed samples when the configuration matches.
+`--resume` skips completed samples when the configuration matches.
 
 Output files:
 
-- \`jupiter-min-chunk/chunk-samples.csv\`: per-run PC/Phone service times and failures
-- \`jupiter-min-chunk/chunk-summary.csv\`: per-size median throughput and normalized ratios
-- \`jupiter-min-chunk/min-chunk.json\`: selected b and selection status
-- \`jupiter-min-chunk/b-xN-rM.log\`: individual calibration logs
+- `jupiter-min-chunk/chunk-samples.csv`: per-run PC/Phone service times and failures
+- `jupiter-min-chunk/chunk-summary.csv`: per-size median throughput and normalized ratios
+- `jupiter-min-chunk/min-chunk.json`: selected b and selection status
+- `jupiter-min-chunk/b-xN-rM.log`: individual calibration logs
 
 For the next, Sequence DP stage, read the chosen minimum from JSON and pass
 it explicitly to the existing planner. In PowerShell:
 
-\`\`\`powershell
+```powershell
 $b = (Get-Content .\jupiter-min-chunk\min-chunk.json -Raw |
       ConvertFrom-Json).min_chunk
 $xValues = (@(8,16,24,32,48,64,96,128) |
@@ -679,15 +679,15 @@ $xValues = (@(8,16,24,32,48,64,96,128) |
 
 # After the model boundary and b are fixed, recalibrate q(x,y) for that
 # boundary and these feasible sizes; use --min-chunk $b in Sequence DP.
-python .\tools\jupiter\run_q_sweep.py \`
-  --exe .\build-jupiter\bin\Release\llama-cli.exe \`
-  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf \`
-  --rpc 10.39.52.114:10139 \`
-  --prompt-file .\prompt.txt \`
-  --pc-layers 20 \`
-  --x-values $xValues --min-chunk $b --max-chunk 128 \`
+python .\tools\jupiter\run_q_sweep.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --pc-layers 20 `
+  --x-values $xValues --min-chunk $b --max-chunk 128 `
   --repeats 2 --run-dp --plan-output .\jupiter.plan
-\`\`\`
+```
 
 Replace the example PC layer count with the selected Model Partition boundary.
 The chosen b is a heuristic minimum Chunk constraint for q(x,y) Sequence DP,
