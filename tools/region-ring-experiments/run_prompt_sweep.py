@@ -89,7 +89,12 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
     entries = records(folder / "metrics.jsonl")
     plan = next((r for r in reversed(entries) if r.get("type") == "planner"), {})
     perf = next((r for r in reversed(entries) if r.get("type") == "perf"), {})
-    ring = [r for r in entries if r.get("type") == "region_ring"]
+    # The model may execute Region Ring during startup/warmup. Count only
+    # ubatches after the final formal llama_perf_context_reset marker.
+    markers = [i for i, r in enumerate(entries)
+               if r.get("type") == "measurement_start"]
+    measured = entries[markers[-1] + 1:] if markers else entries
+    ring = [r for r in measured if r.get("type") == "region_ring"]
     logs = ""
     for file in ("engine.stderr.log", "output.stdout.txt"):
         path = folder / file
