@@ -4,6 +4,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+#include "llama-jupiter.h"
 
 #include <algorithm>
 #include <cassert>
@@ -704,9 +705,36 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
     do {
         balloc.split_reset();
 
+        // Jupiter's sequence DP is an offline one-shot planner. For an exact
+        // input length, consume the stored non-uniform sub-sequence sizes here.
+        // If no plan exists for this length, preserve llama.cpp's normal split.
+        const auto jupiter_chunks =
+                n_stream == 1
+                ? llama_jupiter::sequence_plan(balloc.get_n_tokens(), n_ubatch)
+                : std::vector<uint32_t> {};
+
+        if (!jupiter_chunks.empty()) {
+            LLAMA_LOG_INFO(
+                    "[JUPITER_SEQUENCE_PLAN] mode=PAPER_DP total=%u k=%zu chunks=%s max_ubatch=%u\n",
+                    balloc.get_n_tokens(),
+                    jupiter_chunks.size(),
+                    llama_jupiter::format_chunks(jupiter_chunks).c_str(),
+                    n_ubatch);
+        }
+
+        size_t jupiter_chunk_idx = 0;
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            llama_ubatch ubatch;
+
+            if (!jupiter_chunks.empty()) {
+                if (jupiter_chunk_idx >= jupiter_chunks.size()) {
+                    break;
+                }
+                ubatch = balloc.split_simple(jupiter_chunks[jupiter_chunk_idx++]);
+            } else {
+                ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            }
 
             if (ubatch.n_tokens == 0) {
                 break;
