@@ -662,6 +662,12 @@ struct jupiter_rpc_comm_worker {
         }
         auto ok = std::make_shared<std::atomic<bool>>(false);
         const uint64_t ticket = enqueue([this, ok]() {
+            // Backend synchronization must cover pending transfer-lane
+            // writes even if no Phone graph has been submitted yet.
+            if (!fence_transfers()) {
+                ok->store(false);
+                return false;
+            }
             const auto sock = compute_socket();
             rpc_msg_jupiter_rsp rsp {};
             const bool success = sock &&
