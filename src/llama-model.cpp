@@ -1738,10 +1738,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         // APPLY-safe rejection a genuine baseline fallback: it does not
         // require stale LLAMA_HYBRID_PC_PCT/PHONE_LAYERS/GPU_PC_LAYERS
         // variables to happen to match the fixed nine-stage Ring.
-        const double pc_pct = has_runtime_plan ?
-            100.0 * runtime_plan.pc_layers / n_layer :
-            ring_layout_owned ?
-                100.0 * (ring_counts[0]+ring_counts[1]) / n_layer :
+        const double pc_pct = ring_layout_owned ?
+            100.0 * (ring_counts[0]+ring_counts[1]) / n_layer :
+            has_runtime_plan ?
+                100.0 * runtime_plan.pc_layers / n_layer :
                 llama_hybrid_pc_pct();
         const int pc_layers = ring_layout_owned ?
             ring_counts[0]+ring_counts[1] :
