@@ -24,6 +24,7 @@ import argparse
 import csv
 import math
 import os
+import re
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -272,6 +273,97 @@ def cmd_sequence(args: argparse.Namespace) -> None:
     _write_plan(args.output, updates)
 
 
+def cmd_extract_q(args: argparse.Namespace) -> None:
+    begin_re = re.compile(
+        r"\[JUPITER_UBATCH\] event=BEGIN .*?prefix_tokens=(\d+) tokens=(\d+)"
+    )
+    queued_re = re.compile(r"\[JUPITER_UBATCH\] event=QUEUED")
+    stage_re = re.compile(
+        r"\[JUPITER_STAGE_PROFILE\] .*?backend=([^ ]+) .*?"
+        r"input_ms=([0-9.]+) compute_ms=([0-9.]+) wall_ms=([0-9.]+)"
+    )
+
+    rows: List[dict] = []
+    current: Tuple[int, int] | None = None
+    stage_sums: Dict[str, Dict[str, float]] = {}
+
+    def flush() -> None:
+        nonlocal current, stage_sums
+        if current is None:
+            return
+        y, x = current
+        if x < args.min_tokens:
+            current = None
+            stage_sums = {}
+            return
+
+        metric = args.metric
+        for backend, values in sorted(stage_sums.items()):
+            latency = values[metric]
+            rows.append({
+                "x": x,
+                "y": y,
+                "latency_ms": latency,
+                "device": backend,
+                "input_ms": values["input_ms"],
+                "compute_ms": values["compute_ms"],
+                "wall_ms": values["wall_ms"],
+            })
+        current = None
+        stage_sums = {}
+
+    with open(args.log, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = begin_re.search(line)
+            if m:
+                flush()
+                current = (int(m.group(1)), int(m.group(2)))
+                stage_sums = {}
+                continue
+
+            if current is None:
+                continue
+
+            m = stage_re.search(line)
+            if m:
+                backend = m.group(1)
+                values = stage_sums.setdefault(
+                    backend,
+                    {"input_ms": 0.0, "compute_ms": 0.0, "wall_ms": 0.0},
+                )
+                values["input_ms"] += float(m.group(2))
+                values["compute_ms"] += float(m.group(3))
+                values["wall_ms"] += float(m.group(4))
+                continue
+
+            if queued_re.search(line):
+                flush()
+
+    flush()
+
+    if not rows:
+        raise SystemExit(
+            "no q samples found; run with LLAMA_JUPITER_PROFILE_STAGE=1 "
+            "and LLAMA_JUPITER_TRACE=1"
+        )
+
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "x", "y", "latency_ms", "device",
+                "input_ms", "compute_ms", "wall_ms",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        f"[JUPITER_Q_EXTRACT] samples={len(rows)} metric={args.metric} "
+        f"output={args.output}"
+    )
+
+
 @dataclass
 class LayerSample:
     time_ms: float
@@ -396,6 +488,21 @@ def build_parser() -> argparse.ArgumentParser:
     seq.add_argument("--smax", type=int, default=4096)
     seq.add_argument("--min-total", type=int, default=None, dest="min_total")
     seq.set_defaults(func=cmd_sequence)
+
+    extract = sub.add_parser(
+        "extract-q",
+        help="extract q(x,y) stage samples from a synchronized calibration log",
+    )
+    extract.add_argument("--log", required=True, help="PC llama-cli calibration log")
+    extract.add_argument("--output", required=True, help="q-profile CSV")
+    extract.add_argument(
+        "--metric",
+        choices=["compute_ms", "wall_ms"],
+        default="compute_ms",
+        help="paper q uses stage inference time; wall_ms additionally includes input handling",
+    )
+    extract.add_argument("--min-tokens", type=int, default=2, dest="min_tokens")
+    extract.set_defaults(func=cmd_extract_q)
 
     model = sub.add_parser("model", help="Eq.(1) model partition DP")
     model.add_argument("--profile", required=True, help="CSV: device,layer,time_ms[,memory_bytes]")
