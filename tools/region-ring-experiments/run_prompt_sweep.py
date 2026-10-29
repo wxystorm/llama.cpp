@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Run each prompt_N.txt exactly once, with quiet stdout/stderr and CSV output.
+
+Example (PowerShell, one line):
+python tools/region-ring-experiments/run_prompt_sweep.py --exe build-tensor-v2/bin/Release/llama-completion.exe --model E:/llama/models/Qwen3-14B-Q4_K_M.gguf --rpc 10.39.52.114:50052 --prompt-dir D:/prima.cpp/prompts
+
+Requires the matching Region Ring C++ JSONL instrumentation and Python 3.9+.
+The newer llama-cli can be a server client; llama-completion is the local GGUF runner.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+FIELDS = [
+    "prompt_file", "prompt_hint", "actual_prefill_tokens", "actual_decode_tokens",
+    "prefill_ms", "prefill_tps", "decode_ms", "decode_tps",
+    "load_ms", "total_llama_ms", "process_wall_ms", "status", "exit_code",
+    "model", "model_size_bytes", "commit", "prompt_sha256",
+    "planner_mode", "plan_applied", "plan_layout", "runtime_layout",
+    "gpu_layers", "cpu_layers", "phone_layers", "tensor_layers",
+    "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
+    "n_predict", "gpu_weight_streaming", "predicted_ms", "baseline_predicted_ms",
+    "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
+    "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
+    "cpu_tasks", "gpu_tasks", "phone_tasks",
+    "cpu_compute_range_ms", "gpu_compute_range_ms", "phone_compute_range_ms",
+    "cpu_lane_active_ms", "gpu_lane_active_ms", "phone_lane_active_ms",
+    "cpu_prepare_ms", "gpu_prepare_ms", "phone_prepare_ms",
+    "cpu_output_sync_ms", "gpu_output_sync_ms", "phone_output_sync_ms",
+    "cpu_ready_wait_ms", "gpu_ready_wait_ms", "phone_ready_wait_ms",
+    "cpu_prepare_wait_ms", "gpu_prepare_wait_ms", "phone_prepare_wait_ms",
+    "cpu_cpu_gate_wait_ms", "gpu_cuda_gate_wait_ms", "pc_phone_overlap_ms",
+    "gpu_bank_refills", "gpu_bank_upload_mib", "gpu_bank_prepare_ms",
+    "gpu_bank_h2d_ms", "gpu_bank_mover_wall_ms", "gpu_bank_wait_ms",
+    "gpu_bank_stage_cpu_copy_ms", "bank_initial_upload_mib",
+    "bank_initial_load_ms", "run_dir",
+]
+NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
+
+
+def records(path: Path):
+    result = []
+    if path.is_file():
+        for i, line in enumerate(path.read_text("utf-8", errors="replace").splitlines(), 1):
+            if line.strip():
+                try:
+                    result.append(json.loads(line))
+                except ValueError:
+                    print(f"Warning: malformed telemetry at {path}:{i}", file=sys.stderr)
+    return result
+
+
+def total(rows, key):
+    return round(sum(float(r.get(key, 0) or 0) for r in rows), 3)
+
+
+def match_last(pattern, string):
+    matches = re.findall(pattern, string, flags=re.I)
+    return matches[-1] if matches else None
+
+
+def count_layers(layout):
+    result = {"G": 0, "C": 0, "P": 0, "C2P": 0, "P2C": 0}
+    for key, n in re.findall(r"(C2P|P2C|G|C|P)(\d+)", layout or ""):
+        result[key] += int(n)
+    return result
+
+
+def git_head(root):
+    try:
+        x = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                           text=True, capture_output=True, timeout=5)
+        return x.stdout.strip() if x.returncode == 0 else ""
+    except OSError:
+        return ""
+
+
+def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
+    entries = records(folder / "metrics.jsonl")
+    plan = next((r for r in reversed(entries) if r.get("type") == "planner"), {})
+    perf = next((r for r in reversed(entries) if r.get("type") == "perf"), {})
+    ring = [r for r in entries if r.get("type") == "region_ring"]
+    logs = ""
+    for file in ("engine.stderr.log", "output.stdout.txt"):
+        path = folder / file
+        if path.is_file():
+            logs += path.read_text(encoding="utf-8", errors="replace") + "\n"
+    number = r"(\d+(?:\.\d+)?)"
+    p = match_last(r"prompt eval time\s*=\s*" + number +
+                   r"\s*ms\s*/\s*(\d+)\s*tokens", logs)
+    d = match_last(r"(?<!prompt )eval time\s*=\s*" + number +
+                   r"\s*ms\s*/\s*(\d+)\s*runs", logs)
+    load = match_last(r"\bload time\s*=\s*" + number + r"\s*ms", logs)
+    pre_ms = perf.get("prefill_ms", float(p[0]) if p else None)
+    pre_n = perf.get("prefill_tokens", int(p[1]) if p else None)
+    dec_ms = perf.get("decode_ms", float(d[0]) if d else None)
+    dec_n = perf.get("decode_tokens", int(d[1]) if d else None)
+    pre_tps = perf.get("prefill_tps")
+    dec_tps = perf.get("decode_tps")
+    if pre_tps is None and pre_ms and pre_n:
+        pre_tps = round(1000 * pre_n / pre_ms, 3)
+    if dec_tps is None and dec_ms and dec_n:
+        dec_tps = round(1000 * dec_n / dec_ms, 3)
+    # The runtime layout (not merely the Planner's proposal) is authoritative.
+    runtime_layout = ring[0].get("layout", "") if ring else ""
+    layout = runtime_layout or (plan.get("selected_layout", "")
+                                if plan.get("applied") else "")
+    layers = count_layers(layout)
+    initial = match_last(r"\[REGION_RING_GPU_BANK_LOAD_SUM\][^\n]*", logs) or ""
+    initial_mib = match_last(r"upload_mib=" + number, initial)
+    initial_ms = match_last(r"wall_ms=" + number, initial)
+    row = {
+        "prompt_file": prompt.name, "prompt_hint": hint,
+        "actual_prefill_tokens": pre_n, "actual_decode_tokens": dec_n,
+        "prefill_ms": pre_ms, "prefill_tps": pre_tps,
+        "decode_ms": dec_ms, "decode_tps": dec_tps,
+        "load_ms": perf.get("load_ms", float(load) if load else None),
+        "total_llama_ms": perf.get("total_ms"),
+        "process_wall_ms": round(elapsed, 3),
+        "status": "PASS" if code == 0 and
+            all(x.get("complete") and x.get("status") == 0 for x in ring)
+            else "FAIL",
+        "exit_code": code,
+        "model": str(args.model), "model_size_bytes": args.model.stat().st_size,
+        "commit": commit,
+        "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
+        "planner_mode": args.planner,
+        "plan_applied": plan.get("applied"),
+        "plan_layout": plan.get("selected_layout"),
+        "runtime_layout": runtime_layout,
+        "gpu_layers": layers["G"], "cpu_layers": layers["C"],
+        "phone_layers": layers["P"],
+        "tensor_layers": layers["C2P"] + layers["P2C"],
+        "xc": ring[0].get("xc") if ring else plan.get("xc"),
+        "xg": ring[0].get("xg") if ring else plan.get("xg"),
+        "xp": ring[0].get("xp") if ring else plan.get("xp"),
+        "context": context, "batch": args.batch, "ubatch": args.ubatch,
+        "threads": args.threads, "seed": args.seed,
+        "n_predict": args.n_predict, "gpu_weight_streaming": args.streaming,
+        "predicted_ms": plan.get("predicted_ms"),
+        "baseline_predicted_ms": plan.get("baseline_predicted_ms"),
+        "first_cycle_e": plan.get("first_cycle_e"), "final_e": plan.get("e"),
+        "first_cycle_seeds": plan.get("first_cycle_seeds"),
+        "prefix_completed": plan.get("prefix_completed"),
+        "ring_ubatches": len(ring), "ring_tokens": sum(x.get("tokens", 0) for x in ring),
+        "ring_wall_ms": total(ring, "wall_ms"),
+        "ring_complete": all(x.get("complete", False) for x in ring),
+        "pc_phone_overlap_ms": total(ring, "pc_phone_overlap_ms"),
+        "gpu_bank_refills": int(total(ring, "bank_refills")),
+        "gpu_bank_upload_mib": total(ring, "bank_upload_mib"),
+        "gpu_bank_prepare_ms": total(ring, "bank_prepare_ms"),
+        "gpu_bank_h2d_ms": total(ring, "bank_h2d_ms"),
+        "gpu_bank_mover_wall_ms": total(ring, "bank_mover_wall_ms"),
+        "gpu_bank_wait_ms": total(ring, "bank_gpu_wait_ms"),
+        "gpu_bank_stage_cpu_copy_ms": total(ring, "bank_stage_cpu_copy_ms"),
+        "bank_initial_upload_mib": float(initial_mib) if initial_mib else None,
+        "bank_initial_load_ms": float(initial_ms) if initial_ms else None,
+        "run_dir": str(folder),
+    }
+    if code == 0 and not perf and not ring:
+        row["status"] = "NO_METRICS"
+    for dev in ("cpu", "gpu", "phone"):
+        for suffix in ("tasks", "compute_range_ms", "lane_active_ms",
+                       "prepare_ms", "output_sync_ms", "ready_wait_ms",
+                       "prepare_wait_ms"):
+            row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
+    row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
+    row["gpu_cuda_gate_wait_ms"] = total(ring, "gpu_cuda_gate_wait_ms")
+    return {field: row.get(field) for field in FIELDS}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--exe", type=Path, required=True)
+    ap.add_argument("--model", type=Path, required=True)
+    ap.add_argument("--rpc", required=True)
+    ap.add_argument("--prompt-dir", type=Path, default=Path(r"D:\prima.cpp\prompts"))
+    ap.add_argument("--out", type=Path, default=Path("region-ring-results"))
+    ap.add_argument("--planner", default="apply-wide")
+    ap.add_argument("--streaming", choices=("on", "off"), default="on")
+    ap.add_argument("--n-predict", type=int, default=32)
+    ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--ubatch", type=int, default=512)
+    ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--min-context", type=int, default=1024)
+    ap.add_argument("--context-padding", type=int, default=256)
+    ap.add_argument("--force-layout", default="")
+    ap.add_argument("--force-xc", type=int)
+    ap.add_argument("--force-xg", type=int)
+    ap.add_argument("--force-xp", type=int)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    args.exe = args.exe.expanduser().resolve()
+    args.model = args.model.expanduser().resolve()
+    args.prompt_dir = args.prompt_dir.expanduser().resolve()
+    if not args.exe.is_file() or not args.model.is_file() or not args.prompt_dir.is_dir():
+        ap.error("--exe, --model and --prompt-dir must exist")
+    if args.batch < args.ubatch or min(args.batch, args.ubatch, args.n_predict) <= 0:
+        ap.error("--batch >= --ubatch > 0 and --n-predict > 0 required")
+    if args.force_layout and None in (args.force_xc, args.force_xg, args.force_xp):
+        ap.error("--force-layout requires all three --force-xc/xg/xp arguments")
+    prompts = []
+    for path in args.prompt_dir.iterdir():
+        m = NAME.fullmatch(path.name)
+        if m and path.is_file():
+            prompts.append((int(m.group(1)), path))
+    prompts.sort(key=lambda x: (x[0], x[1].name))
+    if not prompts:
+        ap.error(f"no prompt_*.txt files found in {args.prompt_dir}")
+    root = Path(__file__).resolve().parents[2]
+    commit = git_head(root)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = (args.out / f"{stamp}-{os.getpid()}").resolve()
+    out.mkdir(parents=True)
+    rows = []
+    for hint, prompt in prompts:
+        folder = out / prompt.stem
+        folder.mkdir(exist_ok=False)
+        ctx = max(args.min_context,
+                  ((hint + args.n_predict + args.context_padding + 255) // 256) * 256)
+        env = os.environ.copy()
+        for key in ("GGML_META_PIPELINE_DEBUG", "LLAMA_HYBRID_REGION_RING_TRACE",
+                    "GGML_CPU_TASK_DEBUG", "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT",
+                    "LLAMA_HYBRID_REGION_RING_FORCE_XC",
+                    "LLAMA_HYBRID_REGION_RING_FORCE_XG",
+                    "LLAMA_HYBRID_REGION_RING_FORCE_XP"):
+            env.pop(key, None)
+        env.update({
+            "LLAMA_HYBRID_REGION_RING_V1": "1",
+            "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
+            "LLAMA_HYBRID_REGION_RING_PLANNER": args.planner,
+            "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(hint),
+            "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM":
+                "1" if args.streaming == "on" else "0",
+            "LLAMA_REGION_RING_METRICS_FILE": str(folder / "metrics.jsonl"),
+        })
+        if args.force_layout:
+            env.update({
+                "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.force_layout,
+                "LLAMA_HYBRID_REGION_RING_FORCE_XC": str(args.force_xc),
+                "LLAMA_HYBRID_REGION_RING_FORCE_XG": str(args.force_xg),
+                "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.force_xp),
+            })
+        command = [
+            str(args.exe), "-m", str(args.model), "--rpc", args.rpc,
+            "--split-mode", "tensor", "--flash-attn", "on",
+            "-c", str(ctx), "-b", str(args.batch), "-ub", str(args.ubatch),
+            "-n", str(args.n_predict), "-t", str(args.threads),
+            "--seed", str(args.seed), "--no-conversation",
+            "-f", str(prompt), "-lv", "1",
+        ]
+        config = {
+            "command": command, "cwd": str(root), "repeat": 1,
+            "prompt_file": str(prompt), "prompt_hint": hint,
+            "commit": commit,
+            "ring_environment": {k: v for k, v in env.items()
+                                 if k.startswith("LLAMA_HYBRID_REGION_RING_")
+                                 or k == "LLAMA_REGION_RING_METRICS_FILE"},
+            "notes": [
+                "Token count from filename is only a hint; record actual prefill tokens.",
+                "Device compute_range/prepare/output sync can overlap. Do not sum to wall_ms.",
+                "Model load and Planner profiling are outside prefill_ms.",
+                "Transfer-only PC/Phone network time needs a separate diagnostic run.",
+            ],
+        }
+        (folder / "config.json").write_text(
+            json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+        exitcode = -1
+        elapsed = 0.0
+        if not args.dry_run:
+            start = time.perf_counter()
+            with (folder / "output.stdout.txt").open("wb") as stdout, \
+                 (folder / "engine.stderr.log").open("wb") as stderr:
+                try:
+                    p = subprocess.run(command, cwd=root, env=env,
+                                       stdin=subprocess.DEVNULL,
+                                       stdout=stdout, stderr=stderr,
+                                       check=False)
+                    exitcode = p.returncode
+                except OSError as exc:
+                    stderr.write(f"LAUNCH_ERROR: {exc}\n".encode("utf-8"))
+            elapsed = 1000.0 * (time.perf_counter() - start)
+        row = result_row(args, folder, prompt, hint, ctx, exitcode, elapsed, commit)
+        if args.dry_run:
+            row["status"], row["exit_code"] = "DRY_RUN", ""
+        (folder / "result.json").write_text(
+            json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
+        rows.append(row)
+        print(f"{prompt.name}: {row['status']}, prefill={row['prefill_tps']} tok/s, "
+              f"decode={row['decode_tps']} tok/s")
+    csv_file = out / "summary.csv"
+    with csv_file.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Summary: {csv_file}")
+    return 0 if args.dry_run or all(row["status"] == "PASS" for row in rows) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
