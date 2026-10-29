@@ -5377,19 +5377,13 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
 
         const bool is_result_norm =
             std::strncmp(node_src->name, "result_norm", 11) == 0;
-        const bool large_directional_copy =
-            n_backends == 2 &&
-            copy_bytes >= (size_t) 1024 * 1024;
-        if (pipeline_debug &&
-                (reduce_copy_detail_count < 4 ||
-                 is_result_norm ||
-                 large_directional_copy)) {
+        if (pipeline_debug && (reduce_copy_detail_count < 4 || is_result_norm)) {
             printf("[META_COPY] sg=%zu %zu->%zu tensor=%s bytes=%zu "
                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] time=%.3f ms\n",
                    i, j_src, j_dst, node_src->name, copy_bytes,
                    node_src->ne[0], node_src->ne[1], node_src->ne[2], node_src->ne[3],
                    copy_us / 1000.0);
-            if (!is_result_norm && !large_directional_copy) {
+            if (!is_result_norm) {
                 ++reduce_copy_detail_count;
             }
         }
@@ -9059,47 +9053,6 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             return backend_ctx->backend_configs[backend_index]
                 .cgraphs[i].directional_boundary;
         };
-
-        // P2C entry ownership is semantic, not inferred from active_count or
-        // transient compute flags.  The activation produced by the Phone Full
-        // layer immediately before a P2C Tensor layer is the input to that
-        // layer's Phone-owned Attention/control path.  It must stay on Phone;
-        // the explicit P2C READY and PARTIAL boundaries are the only two
-        // Phone->PC payloads inside the directional island.
-        int p2c_entry_layer = -1;
-        int p2c_entry_parsed = 0;
-        const bool p2c_entry_keep_phone =
-            n_backends == 2 &&
-            nodes[1] != nullptr &&
-            (nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
-            nodes[1]->ne[1] > 1 &&
-            std::sscanf(
-                nodes[1]->name,
-                "l_out-%d%n",
-                &p2c_entry_layer,
-                &p2c_entry_parsed) == 1 &&
-            nodes[1]->name[p2c_entry_parsed] == '\0' &&
-            ggml_backend_meta_tensor_p2c_layer(
-                backend_ctx, p2c_entry_layer + 1);
-
-        if (p2c_entry_keep_phone) {
-            handled = true;
-            if (pipeline_debug) {
-                printf(
-                    "[REGION_P2C_ENTRY_KEEP_PHONE] sg=%zu "
-                    "active=%zu pc_compute=%d phone_compute=%d "
-                    "l_out_layer=%d p2c_layer=%d tensor=%s "
-                    "action=NO_GENERIC_HANDOFF status=OK\n",
-                    i,
-                    active_count,
-                    !!(nodes[0]->flags & GGML_TENSOR_FLAG_COMPUTE),
-                    !!(nodes[1]->flags & GGML_TENSOR_FLAG_COMPUTE),
-                    p2c_entry_layer,
-                    p2c_entry_layer + 1,
-                    nodes[1]->name);
-            }
-            return GGML_STATUS_SUCCESS;
-        }
 
         // Region Ring Phone->PC terminal bridge (experimental, opt-in).
         // Do not manually ADD at FFN completion: the following l_out graph
