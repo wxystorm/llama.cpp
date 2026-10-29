@@ -8983,6 +8983,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             ggml_backend_meta_parse_prefill_norm_chunk(
                 nodes[active_backend]->name, prefill_norm_chunk, prefill_norm_layer);
 
+        int p2c_prefill_norm_chunk = -1;
+        int p2c_prefill_norm_layer = -1;
+        const bool is_p2c_prefill_norm_input =
+            n_backends == 2 &&
+            active_count == 1 &&
+            active_backend == 1 &&
+            ggml_backend_meta_parse_prefill_norm_chunk(
+                nodes[active_backend]->name,
+                p2c_prefill_norm_chunk,
+                p2c_prefill_norm_layer) &&
+            ggml_backend_meta_tensor_p2c_layer(
+                backend_ctx, p2c_prefill_norm_layer);
+
         if (is_prefill_norm_input) {
             // The optimized prefill input pipeline was originally written for
             // dense FFN graphs, where the norm boundary is followed directly
@@ -10819,6 +10832,31 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         prefill_norm_layer,
                         prefill_norm_chunk,
                         ggml_nbytes(nodes[active_backend]));
+                }
+
+                if (is_p2c_prefill_norm_input &&
+                        active_backend == 1 &&
+                        j_dst == 0) {
+                    if (c2p_self_check) {
+                        directional_wire_parity(
+                            "P2C",
+                            p2c_prefill_norm_layer,
+                            p2c_prefill_norm_chunk,
+                            "FFN_NORM",
+                            active_backend,
+                            j_dst,
+                            nodes[active_backend],
+                            nodes[j_dst]);
+                    }
+                    if (pipeline_debug) {
+                        printf(
+                            "[REGION_P2C_READY] layer=%d chunk=%d bytes=%zu "
+                            "direction=PHONE_TO_PC payload=FFN_NORM "
+                            "path=GENERIC status=OK\n",
+                            p2c_prefill_norm_layer,
+                            p2c_prefill_norm_chunk,
+                            ggml_nbytes(nodes[active_backend]));
+                    }
                 }
 
                 if (pc_full_ffn_to_phone && pipeline_debug) {
