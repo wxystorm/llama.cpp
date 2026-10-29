@@ -3966,6 +3966,27 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     size_t next_device = 0;
     const int64_t begin_us = ggml_time_us();
 
+    // Optional per-ubatch Meta snapshot: one read before and one read after
+    // the worker DAG, never in the hot Chunk loop. These are cumulative
+    // device-boundary service counters, not raw socket timings.
+    ggml_backend_t experiment_meta_backend = nullptr;
+    ggml_backend_meta_tensor_profile experiment_meta_before {};
+    if (pc_phone_overlap) {
+        if (const char * path = std::getenv(
+                "LLAMA_REGION_RING_METRICS_FILE")) {
+            if (*path != '\0') {
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (backend != nullptr &&
+                            ggml_backend_meta_tensor_profile_get(
+                                backend, &experiment_meta_before)) {
+                        experiment_meta_backend = backend;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // GPU-first Ring precomputes the complete token embedding once. This keeps
     // the Q4_K GET_ROWS CPU requirement outside the per-chunk GPU worker and
     // makes stage 0 itself a normal hidden-input CUDA Region.
@@ -5442,6 +5463,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
         }
 
+        ggml_backend_meta_tensor_profile experiment_meta_after {};
+        const bool experiment_meta_valid =
+            experiment_meta_backend != nullptr &&
+            ggml_backend_meta_tensor_profile_get(
+                experiment_meta_backend, &experiment_meta_after);
+        const auto meta_delta_us = [](int64_t before, int64_t after) {
+            return std::max<int64_t>(0, after - before);
+        };
+
         // Optional zero-hot-path experiment telemetry. All fields are
         // already counted by the Region Ring worker/Bank mover. Exactly one
         // JSONL record is appended AFTER workers and transfers have drained.
@@ -5529,7 +5559,41 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << gpu_bank_mover_stats_v.wall_us / 1000.0
                             << ",\"bank_gpu_wait_ms\":"
                             << worker_states[1].weight_bank_wait_us / 1000.0
-                            << "}\n";
+                            << ",\"meta_available\":"
+                            << (experiment_meta_valid ? "true" : "false");
+                    if (experiment_meta_valid) {
+                        const auto & a = experiment_meta_before;
+                        const auto & b = experiment_meta_after;
+                        metrics << ",\"meta_pc_to_phone_copy_ms\":"
+                                << meta_delta_us(a.h2d_us, b.h2d_us) / 1000.0
+                                << ",\"meta_phone_to_pc_copy_ms\":"
+                                << meta_delta_us(a.d2h_us, b.d2h_us) / 1000.0
+                                << ",\"meta_phone_rpc_ms\":"
+                                << meta_delta_us(a.phone_us, b.phone_us) / 1000.0
+                                << ",\"meta_pc_ffn_ms\":"
+                                << meta_delta_us(a.pc_ffn_us, b.pc_ffn_us) / 1000.0
+                                << ",\"meta_attn_ms\":"
+                                << meta_delta_us(a.attn_us, b.attn_us) / 1000.0
+                                << ",\"meta_reduce_ms\":"
+                                << meta_delta_us(a.reduce_us, b.reduce_us) / 1000.0
+                                << ",\"meta_wait_ms\":"
+                                << meta_delta_us(a.wait_us, b.wait_us) / 1000.0
+                                << ",\"meta_pc_backend_ms\":"
+                                << meta_delta_us(
+                                    a.simple_backend_compute_us[0],
+                                    b.simple_backend_compute_us[0]) / 1000.0
+                                << ",\"meta_phone_backend_ms\":"
+                                << meta_delta_us(
+                                    a.simple_backend_compute_us[1],
+                                    b.simple_backend_compute_us[1]) / 1000.0
+                                << ",\"meta_graph_ms\":"
+                                << meta_delta_us(a.graph_total_us,
+                                                 b.graph_total_us) / 1000.0
+                                << ",\"meta_return_payload_mib\":"
+                                << meta_delta_us(a.return_payload_bytes,
+                                                 b.return_payload_bytes) / 1048576.0;
+                    }
+                    metrics << "}\n";
                 }
             }
         }
