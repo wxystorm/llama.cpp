@@ -5377,13 +5377,19 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
 
         const bool is_result_norm =
             std::strncmp(node_src->name, "result_norm", 11) == 0;
-        if (pipeline_debug && (reduce_copy_detail_count < 4 || is_result_norm)) {
+        const bool large_directional_copy =
+            n_backends == 2 &&
+            copy_bytes >= (size_t) 1024 * 1024;
+        if (pipeline_debug &&
+                (reduce_copy_detail_count < 4 ||
+                 is_result_norm ||
+                 large_directional_copy)) {
             printf("[META_COPY] sg=%zu %zu->%zu tensor=%s bytes=%zu "
                    "ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] time=%.3f ms\n",
                    i, j_src, j_dst, node_src->name, copy_bytes,
                    node_src->ne[0], node_src->ne[1], node_src->ne[2], node_src->ne[3],
                    copy_us / 1000.0);
-            if (!is_result_norm) {
+            if (!is_result_norm && !large_directional_copy) {
                 ++reduce_copy_detail_count;
             }
         }
