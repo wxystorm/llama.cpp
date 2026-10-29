@@ -129,6 +129,12 @@ planner first takes the median of repeated measurements for each
 The older `run_q_sweep.ps1` is retained only for compatibility; the Python
 runner is the recommended path.
 
+Offline runner checks (no model or RPC needed):
+
+```powershell
+python -m unittest discover -s .\tools\jupiter -p test_run_q_sweep.py -v
+```
+
 ## Sequence partition DP
 
 Input CSV:
