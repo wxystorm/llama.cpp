@@ -2490,6 +2490,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
+    const bool phone_timeline = jupiter_timeline_enabled();
+    const int64_t phone_start_us = phone_timeline ? ggml_time_us() : 0;
 
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
@@ -2564,8 +2566,20 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 graph_uid, device, n_nodes);
     }
 
+    const int64_t phone_compute_start_us = phone_timeline ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (phone_timeline) {
+        const int64_t phone_done_us = ggml_time_us();
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_TIMELINE] uid=%" PRIu64 " reused=0 device=%u "
+            "nodes=%u graph_prepare_ms=%.3f phone_compute_ms=%.3f "
+            "wall_ms=%.3f phone_t_us=%" PRId64 "\n",
+            graph_uid, device, n_nodes,
+            (phone_compute_start_us - phone_start_us)/1000.0,
+            (phone_done_us - phone_compute_start_us)/1000.0,
+            (phone_done_us - phone_start_us)/1000.0, phone_done_us);
+    }
 
     if (jupiter_trace) {
         GGML_LOG_INFO(
@@ -2582,6 +2596,8 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
+    const bool phone_timeline = jupiter_timeline_enabled();
+    const int64_t phone_start_us = phone_timeline ? ggml_time_us() : 0;
 
     uint32_t device = request.device;
     if (device >= backends.size()) {
@@ -2600,8 +2616,20 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
                 request.graph_uid, device, graph->n_nodes);
     }
 
+    const int64_t phone_compute_start_us = phone_timeline ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (phone_timeline) {
+        const int64_t phone_done_us = ggml_time_us();
+        GGML_LOG_INFO(
+            "[JUPITER_PHONE_TIMELINE] uid=%" PRIu64 " reused=1 device=%u "
+            "nodes=%d graph_prepare_ms=%.3f phone_compute_ms=%.3f "
+            "wall_ms=%.3f phone_t_us=%" PRId64 "\n",
+            request.graph_uid, device, graph->n_nodes,
+            (phone_compute_start_us - phone_start_us)/1000.0,
+            (phone_done_us - phone_compute_start_us)/1000.0,
+            (phone_done_us - phone_start_us)/1000.0, phone_done_us);
+    }
 
     if (jupiter_trace) {
         GGML_LOG_INFO(
