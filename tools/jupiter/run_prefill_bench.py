@@ -311,9 +311,13 @@ def main() -> int:
                     f"{mode} did not execute the asynchronous C2P path; "
                     f"inspect {check_log}"
                 )
+            verified_chunks = (
+                "DEFAULT_RUNTIME" if mode == "default"
+                else ",".join(map(str, wanted))
+            )
             print(
                 f"[JUPITER_BENCH_VERIFY] mode={mode} status=PASS "
-                f"chunks={','.join(map(str, wanted))}",
+                f"chunks={verified_chunks} async_c2p={int(args.async_c2p)}",
                 flush=True,
             )
 
