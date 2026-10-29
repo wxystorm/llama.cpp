@@ -1733,10 +1733,11 @@ inline result search_runtime_applicable(
         double e_margin = 0.08,
         int min_simulations = 32) {
     result out;
-    if (m.layers < 6 || m.tokens <= 0 || baseline_chunk <= 0 ||
-            max_simulations <= 0 || min_simulations < 0 ||
-            !std::isfinite(e_margin) || e_margin < 0.0 ||
-            baseline_regions.empty() ||
+    if (m.layers < 6 || m.tokens <= 0 || m.hidden <= 0 ||
+            !m.compute_ms || !m.transfer_ms ||
+            baseline_chunk <= 0 || max_simulations <= 0 ||
+            min_simulations < 0 || !std::isfinite(e_margin) ||
+            e_margin < 0.0 || baseline_regions.empty() ||
             baseline_regions.back().device != device::PHONE) {
         return out;
     }
