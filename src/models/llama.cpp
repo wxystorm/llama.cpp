@@ -309,7 +309,7 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                     std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
                 LLAMA_LOG_ERROR(
                     "[DENSE_DIRECTIONAL_STAGE] arch=llama layer=%d "
-                    "layers=[%d,%d) tokens=%" PRId64 " outer_chunk=%d "
+                    "layers=[%d,%d) tokens=%lld outer_chunk=%d "
                     "planned_chunk=%d n_prefill_chunks=%d chunked=%d status=READY\n",
                     il, layer_begin, layer_end, n_tokens,
                     params.hybrid_chunk_tokens,
