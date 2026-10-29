@@ -551,3 +551,62 @@ memory budgets. In the current two-stage runtime, the output is
 
 The paper treats planning as an offline one-shot process whose outputs are stored
 and reused across inference requests. This plan-file design follows that model.
+
+## Measured Model Partition profiling (PC GPU + Phone RPC)
+
+The existing `jupiter_planner.py model` command implements the paper's
+per-layer DP for a CSV of independently measured per-layer time/memory.
+For the currently implemented two-stage, contiguous PC-prefix/Phone-suffix
+runtime, `run_model_profile.py` provides a runnable measured-boundary
+alternative: for each candidate layer boundary, run a fresh synchronized
+prefill sample, read PC and Phone stage service times, and minimize
+`max(PC stage service, Phone stage service)` over the *measured* feasible
+boundaries. This is a discrete model-boundary search, not full arbitrary
+per-layer profiling, and untested boundaries are not extrapolated.
+
+The profiling driver uses `LLAMA_JUPITER_PROFILE_STAGE=1`,
+`LLAMA_JUPITER_ASYNC_C2P=0`, `LLAMA_JUPITER_WINDOW=1`, and `-lv 4`.
+These intentionally serialize stage measurements. The normal async
+execution benchmark must leave stage profiling OFF.
+
+On the PC, with the existing Phone RPC server running:
+
+```powershell
+cd E:\\llama\\llama-jupiter
+git pull --ff-only origin baseline/jupiter-infocom25
+cmake --build build-jupiter --config Release -j
+python -m unittest discover -s .\\tools\\jupiter -p test_model_profile.py -v
+
+python .\\tools\\jupiter\\run_model_profile.py `
+  --exe .\\build-jupiter\\bin\\Release\\llama-cli.exe `
+  --model E:\\llama\\models\\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\\prompt.txt `
+  --target-tokens 357 `
+  --boundaries 20,22,24,25,26,28 `
+  --chunk 64 --repeats 2 `
+  --out-dir .\\jupiter-model-profile `
+  --plan-output .\\jupiter-model.plan
+```
+
+The profile uses a 357-token runtime sequence partition (64-token chunks
+with a valid tail), but measures only the first formal 64-token chunk after
+warmup at each boundary. The `--target-tokens` value must match the actual
+prefill decode batch; if not, profiling rejects the run rather than silently
+falling back. Memory columns are the observed sum of logged model and
+compute/KV/output buffer sizes, not an accurate peak free-memory watermark.
+For **hard** memory constraints pass `--pc-budget-mib` and
+`--phone-budget-mib`; any candidate with missing memory data is rejected.
+A successful process load also establishes that the specific partition was
+loadable under the environment's memory conditions.
+
+Outputs:
+- `jupiter-model-profile/model-boundaries.csv`: measurements and rejected runs
+- `jupiter-model-profile/pcN-rM.log`: full per-boundary logs
+- `jupiter-model.plan`: selected `model.pc_layers=N` entry
+
+The optimizer is a measured discrete two-device equivalent of the minimax
+Model Partition objective. Because raw `STAGE_PROFILE compute_ms` can include
+remote host submission/synchronization, it is a calibrated service proxy;
+validate the chosen boundary in the normal asynchronous benchmark. The
+per-layer DP `model` command remains available and unchanged.
