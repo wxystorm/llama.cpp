@@ -594,6 +594,63 @@ extern "C" {
         void * output,
         size_t bytes);
 
+    // Shared PC CPU ready-task executor used by Region Ring. Task type is not
+    // the primary priority key: BLOCKING_REDUCE wins first, then older causal
+    // chunk, then urgency/type. CPU_FULL is intentionally non-preemptive in
+    // V1 so an idle system keeps the original contiguous Region graph.
+    enum ggml_backend_meta_cpu_task_kind {
+        GGML_BACKEND_META_CPU_TASK_CPU_FULL = 0,
+        GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN = 1,
+        GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN = 2,
+    };
+    enum ggml_backend_meta_cpu_task_urgency {
+        GGML_BACKEND_META_CPU_URGENCY_BLOCKING_REDUCE = 0,
+        GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION = 1,
+        GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER = 2,
+        GGML_BACKEND_META_CPU_URGENCY_LOOKAHEAD = 3,
+    };
+    enum ggml_backend_meta_cpu_task_flags {
+        GGML_BACKEND_META_CPU_TASK_FLAG_NONE = 0,
+        // Keep the executor reserved for continuation_group after this task.
+        // Used only for the C2P PC-main Router -> FFN split so a lookahead
+        // CPU_FULL cannot slip between the two halves.
+        GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES = 1u << 0,
+        // This is the final member of continuation_group and releases it.
+        GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL = 1u << 1,
+    };
+    struct ggml_backend_meta_cpu_task_desc {
+        int32_t kind;
+        int32_t urgency;
+        int32_t chunk;
+        int32_t layer;
+        uint32_t flags;
+        uint32_t reserved;
+        uint64_t continuation_group;
+    };
+    typedef enum ggml_status (*ggml_backend_meta_cpu_task_fn_t)(
+        void * user_data, uint64_t task_id);
+
+    GGML_API uint64_t ggml_backend_meta_cpu_task_submit(
+        ggml_backend_t backend,
+        const struct ggml_backend_meta_cpu_task_desc * desc,
+        ggml_backend_meta_cpu_task_fn_t fn,
+        void * user_data);
+    GGML_API enum ggml_status ggml_backend_meta_cpu_task_wait(
+        ggml_backend_t backend, uint64_t task_id);
+    GGML_API bool ggml_backend_meta_cpu_task_is_completed(
+        ggml_backend_t backend, uint64_t task_id);
+    GGML_API bool ggml_backend_meta_cpu_task_promote(
+        ggml_backend_t backend, uint64_t task_id, int32_t urgency);
+    // outer_chunk tags Meta-created PC_MAIN/REMOTE_FFN tasks with the Region
+    // Ring causal chunk instead of the inner directional chunk (which is
+    // commonly local chunk 0 for every macro block).
+    GGML_API bool ggml_backend_meta_cpu_task_set_outer_chunk(
+        ggml_backend_t backend, int32_t outer_chunk);
+    // frontier < 0 disables lookahead gating. With frontier >= 0, CPU_FULL
+    // tasks newer than frontier remain queued until PC_MAIN advances it.
+    GGML_API bool ggml_backend_meta_cpu_task_set_frontier(
+        ggml_backend_t backend, int32_t frontier);
+
     GGML_API bool ggml_backend_meta_tensor_profile_get(
         ggml_backend_t backend, struct ggml_backend_meta_tensor_profile * profile);
 

@@ -2328,6 +2328,7 @@ static ggml_guid_t ggml_backend_meta_guid() {
 
 struct ggml_backend_meta_compute_workers;
 struct ggml_backend_meta_transfer_worker;
+struct ggml_backend_meta_cpu_task_executor;
 
 struct ggml_backend_meta_context;
 static bool ggml_backend_meta_tensor_phone_primary_layer(
@@ -2453,6 +2454,11 @@ struct ggml_backend_meta_context {
 
     ggml_backend_meta_compute_workers * compute_workers = nullptr;
     ggml_backend_meta_transfer_worker * transfer_worker = nullptr;
+    // One physical owner for every PC CPU compute path in Region Ring:
+    // ordinary CPU_FULL callbacks, PC-main Tensor work, and Phone->PC FFN
+    // continuations all enter this executor.
+    ggml_backend_meta_cpu_task_executor * cpu_task_executor = nullptr;
+    std::atomic<int32_t> cpu_task_outer_chunk { -1 };
     // V1 endpoint separation: ordinary PC-primary Tensor FFN work destined
     // for Phone is submitted through its own FIFO instead of borrowing the
     // PC Meta compute-worker control path. Completion is consumed on a
@@ -2462,7 +2468,6 @@ struct ggml_backend_meta_context {
     ggml_backend_meta_transfer_worker * phone_exec_completion_worker = nullptr;
     uint64_t                            next_pc_phone_exec_seq = 1;
     ggml_backend_meta_transfer_worker * prefill_input_worker = nullptr;
-    ggml_backend_meta_transfer_worker * prefill_pc_worker = nullptr;
     std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
         prefill_return_workers { nullptr, nullptr };
     std::vector<std::shared_ptr<std::vector<uint8_t>>>
@@ -2540,6 +2545,310 @@ struct ggml_backend_meta_context {
     ~ggml_backend_meta_context();
 };
 
+
+static const char * ggml_backend_meta_cpu_task_kind_name(int32_t kind) {
+    switch (kind) {
+        case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return "CPU_FULL";
+        case GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN: return "TENSOR_PC_MAIN";
+        case GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN: return "TENSOR_REMOTE_FFN";
+        default: return "UNKNOWN";
+    }
+}
+
+struct ggml_backend_meta_cpu_task_executor {
+    struct task {
+        uint64_t id = 0;
+        ggml_backend_meta_cpu_task_desc desc {};
+        std::function<ggml_status(uint64_t)> run;
+    };
+
+    ggml_backend_meta_context * backend_ctx = nullptr;
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable task_cv;
+    std::condition_variable done_cv;
+    std::vector<task> tasks;
+    std::map<uint64_t, ggml_status> completed;
+    uint64_t submitted = 0;
+    uint64_t running_id = 0;
+    ggml_backend_meta_cpu_task_desc running_desc {};
+    uint64_t sticky_group = 0;
+    int32_t causal_frontier = -1;
+    bool stop = false;
+
+    explicit ggml_backend_meta_cpu_task_executor(
+            ggml_backend_meta_context * ctx) :
+        backend_ctx(ctx),
+        worker([this]() { run_loop(); }) {
+    }
+
+    ~ggml_backend_meta_cpu_task_executor() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+            // Never leave the worker parked behind a sticky continuation when
+            // the owning Meta context is being destroyed.
+            sticky_group = 0;
+        }
+        task_cv.notify_all();
+        done_cv.notify_all();
+        worker.join();
+    }
+
+    static int kind_rank(int32_t kind) {
+        switch (kind) {
+            case GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN: return 0;
+            case GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN: return 1;
+            case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return 2;
+            default: return 3;
+        }
+    }
+
+    static bool blocking(const ggml_backend_meta_cpu_task_desc & d) {
+        return d.urgency ==
+            GGML_BACKEND_META_CPU_URGENCY_BLOCKING_REDUCE;
+    }
+
+    static int32_t normalized_chunk(
+            const ggml_backend_meta_cpu_task_desc & d) {
+        return d.chunk >= 0 ? d.chunk : INT32_MAX;
+    }
+
+    bool eligible_locked(const task & t) const {
+        if (sticky_group != 0 &&
+                t.desc.continuation_group != sticky_group) {
+            return false;
+        }
+        // CPU_FULL lookahead is the only work held behind the causal frontier.
+        // PC_MAIN / REMOTE_FFN are themselves the events that advance/unblock
+        // the frontier and must always be eligible.
+        if (causal_frontier >= 0 &&
+                t.desc.kind == GGML_BACKEND_META_CPU_TASK_CPU_FULL &&
+                t.desc.chunk > causal_frontier) {
+            return false;
+        }
+        return true;
+    }
+
+    static bool better(const task & a, const task & b) {
+        const bool ab = blocking(a.desc);
+        const bool bb = blocking(b.desc);
+        if (ab != bb) {
+            return ab;
+        }
+        const int32_t ac = normalized_chunk(a.desc);
+        const int32_t bc = normalized_chunk(b.desc);
+        if (ac != bc) {
+            return ac < bc;
+        }
+        if (a.desc.urgency != b.desc.urgency) {
+            return a.desc.urgency < b.desc.urgency;
+        }
+        const int ak = kind_rank(a.desc.kind);
+        const int bk = kind_rank(b.desc.kind);
+        if (ak != bk) {
+            return ak < bk;
+        }
+        if (a.desc.layer != b.desc.layer) {
+            return a.desc.layer < b.desc.layer;
+        }
+        return a.id < b.id;
+    }
+
+    size_t best_index_locked() const {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            if (!eligible_locked(tasks[i])) {
+                continue;
+            }
+            if (best == SIZE_MAX ||
+                    better(tasks[i], tasks[best])) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void debug_event(
+            const char * event,
+            const task & t,
+            size_t queued,
+            ggml_status status = GGML_STATUS_SUCCESS) const {
+        if (std::getenv("GGML_CPU_TASK_DEBUG") == nullptr) {
+            return;
+        }
+        std::fprintf(
+            stderr,
+            "[CPU_TASK_SCHED] event=%s id=%" PRIu64
+            " kind=%s urgency=%d chunk=%d layer=%d "
+            "group=%" PRIu64 " flags=0x%x frontier=%d "
+            "queued=%zu status=%d\n",
+            event,
+            t.id,
+            ggml_backend_meta_cpu_task_kind_name(t.desc.kind),
+            t.desc.urgency,
+            t.desc.chunk,
+            t.desc.layer,
+            t.desc.continuation_group,
+            t.desc.flags,
+            causal_frontier,
+            queued,
+            (int) status);
+        std::fflush(stderr);
+    }
+
+    void run_loop() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            task_cv.wait(lock, [&]() {
+                return stop || best_index_locked() != SIZE_MAX;
+            });
+            if (stop && tasks.empty()) {
+                return;
+            }
+            const size_t index = best_index_locked();
+            if (index == SIZE_MAX) {
+                if (stop) {
+                    return;
+                }
+                continue;
+            }
+
+            task current = std::move(tasks[index]);
+            tasks.erase(tasks.begin() + (ptrdiff_t) index);
+            running_id = current.id;
+            running_desc = current.desc;
+            debug_event("START", current, tasks.size());
+
+            lock.unlock();
+            const ggml_status status = current.run(current.id);
+            lock.lock();
+
+            if ((current.desc.flags &
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES) != 0) {
+                GGML_ASSERT(current.desc.continuation_group != 0);
+                sticky_group = current.desc.continuation_group;
+            }
+            if ((current.desc.flags &
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 &&
+                    sticky_group == current.desc.continuation_group) {
+                sticky_group = 0;
+            }
+
+            running_id = 0;
+            running_desc = {};
+            completed[current.id] = status;
+            debug_event("END", current, tasks.size(), status);
+            done_cv.notify_all();
+            task_cv.notify_all();
+        }
+    }
+
+    uint64_t enqueue(
+            const ggml_backend_meta_cpu_task_desc & desc,
+            std::function<ggml_status(uint64_t)> run) {
+        std::lock_guard<std::mutex> lock(mutex);
+        task t;
+        t.id = ++submitted;
+        t.desc = desc;
+        t.run = std::move(run);
+        debug_event("ENQUEUE", t, tasks.size() + 1);
+        tasks.push_back(std::move(t));
+        task_cv.notify_all();
+        return submitted;
+    }
+
+    uint64_t enqueue(std::function<ggml_status(uint64_t)> run) {
+        ggml_backend_meta_cpu_task_desc desc {};
+        desc.kind = GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
+        desc.urgency =
+            GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION;
+        desc.chunk = backend_ctx != nullptr ?
+            backend_ctx->cpu_task_outer_chunk.load(
+                std::memory_order_relaxed) : -1;
+        desc.layer = -1;
+        return enqueue(desc, std::move(run));
+    }
+
+    ggml_status wait(uint64_t id) {
+        std::unique_lock<std::mutex> lock(mutex);
+        done_cv.wait(lock, [&]() {
+            return completed.find(id) != completed.end() || stop;
+        });
+        const auto it = completed.find(id);
+        return it != completed.end() ?
+            it->second : GGML_STATUS_FAILED;
+    }
+
+    bool is_completed(uint64_t id) {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completed.find(id) != completed.end();
+    }
+
+    bool promote(uint64_t id, int32_t urgency) {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (auto & t : tasks) {
+            if (t.id != id) {
+                continue;
+            }
+            if (urgency < t.desc.urgency) {
+                t.desc.urgency = urgency;
+                debug_event("PROMOTE", t, tasks.size());
+                task_cv.notify_all();
+            }
+            return true;
+        }
+        // Running work is deliberately non-preemptive in V1.
+        if (running_id == id) {
+            if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[CPU_TASK_SCHED] event=PREEMPT_DEFERRED "
+                    "id=%" PRIu64 " running_kind=%s "
+                    "requested_urgency=%d reason=NON_PREEMPTIVE_V1\n",
+                    id,
+                    ggml_backend_meta_cpu_task_kind_name(
+                        running_desc.kind),
+                    urgency);
+                std::fflush(stderr);
+            }
+            return true;
+        }
+        return completed.find(id) != completed.end();
+    }
+
+    void set_frontier(int32_t frontier) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (frontier < 0) {
+            causal_frontier = -1;
+        } else {
+            causal_frontier =
+                std::max(causal_frontier, frontier);
+        }
+        task_cv.notify_all();
+        if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+            std::fprintf(
+                stderr,
+                "[CPU_TASK_FRONTIER] frontier=%d queued=%zu "
+                "sticky_group=%" PRIu64 "\n",
+                causal_frontier,
+                tasks.size(),
+                sticky_group);
+            std::fflush(stderr);
+        }
+    }
+};
+
+static ggml_backend_meta_cpu_task_executor *
+ggml_backend_meta_ensure_cpu_task_executor(
+        ggml_backend_meta_context * backend_ctx) {
+    if (backend_ctx->cpu_task_executor == nullptr) {
+        backend_ctx->cpu_task_executor =
+            new ggml_backend_meta_cpu_task_executor(backend_ctx);
+    }
+    return backend_ctx->cpu_task_executor;
+}
+
 struct ggml_backend_meta_compute_workers {
     ggml_backend_meta_context * backend_ctx;
     size_t n_backends;
@@ -2556,6 +2865,8 @@ struct ggml_backend_meta_compute_workers {
     std::vector<size_t> generation;
     std::vector<size_t> completed_generation;
     std::vector<ggml_cgraph *> task_graph;
+    std::vector<uint64_t> cpu_task_id;
+    std::vector<ggml_backend_meta_cpu_task_desc> cpu_task_desc;
     bool stop = false;
 
     ggml_backend_meta_compute_workers(ggml_backend_meta_context * backend_ctx, size_t n_backends) :
@@ -2567,13 +2878,17 @@ struct ggml_backend_meta_compute_workers {
         completed_time_us(n_backends, 0),
         generation(n_backends, 0),
         completed_generation(n_backends, 0),
-        task_graph(n_backends, nullptr) {
+        task_graph(n_backends, nullptr),
+        cpu_task_id(n_backends, 0),
+        cpu_task_desc(n_backends) {
         if (n_backends <= 1) {
             return;
         }
 
-        workers.reserve(n_backends);
-        for (size_t j = 0; j < n_backends; ++j) {
+        workers.reserve(n_backends > 0 ? n_backends - 1 : 0);
+        // Backend 0 is the PC side and is owned by the shared causal CPU
+        // executor. Other backends keep their independent worker threads.
+        for (size_t j = 1; j < n_backends; ++j) {
             workers.emplace_back([this, j]() {
                 size_t seen_generation = 0;
                 std::unique_lock<std::mutex> lock(mutex);
@@ -2641,23 +2956,107 @@ struct ggml_backend_meta_compute_workers {
         return GGML_STATUS_SUCCESS;
     }
 
-    void start(size_t j, size_t i) {
-        start_graph(j, backend_ctx->backend_configs[j].cgraphs[i].cgraph_main);
+    ggml_backend_meta_cpu_task_desc default_pc_desc() const {
+        ggml_backend_meta_cpu_task_desc desc {};
+        desc.kind = GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+        desc.urgency =
+            GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+        desc.chunk = backend_ctx->cpu_task_outer_chunk.load(
+            std::memory_order_relaxed);
+        desc.layer = -1;
+        return desc;
     }
 
-    void start_graph(size_t j, ggml_cgraph * graph) {
+    void start(size_t j, size_t i) {
+        start_graph(
+            j,
+            backend_ctx->backend_configs[j].cgraphs[i].cgraph_main,
+            nullptr);
+    }
+
+    void start_graph(
+            size_t j,
+            ggml_cgraph * graph,
+            const ggml_backend_meta_cpu_task_desc * desc = nullptr) {
+        GGML_ASSERT(graph != nullptr);
+
+        if (j == 0) {
+            ggml_backend_meta_cpu_task_executor * executor =
+                ggml_backend_meta_ensure_cpu_task_executor(backend_ctx);
+            ggml_backend_meta_cpu_task_desc selected =
+                desc != nullptr ? *desc : default_pc_desc();
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                GGML_ASSERT(completed_generation[j] == generation[j]);
+                ++generation[j];
+                cpu_task_desc[j] = selected;
+            }
+
+            auto & bcj = backend_ctx->backend_configs[j];
+            const uint64_t task_id = executor->enqueue(
+                selected,
+                [this, &bcj, graph](uint64_t) -> ggml_status {
+                    const int64_t start_us = ggml_time_us();
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(
+                            bcj.backend, graph);
+                    const int64_t elapsed_us =
+                        ggml_time_us() - start_us;
+                    const int64_t completed_us =
+                        ggml_time_us();
+                    {
+                        std::lock_guard<std::mutex> lock(mutex);
+                        backend_time_us[0] += elapsed_us;
+                        backend_call_count[0] += 1;
+                        completed_time_us[0] = completed_us;
+                    }
+                    return status;
+                });
+
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                cpu_task_id[j] = task_id;
+            }
+            return;
+        }
+
         std::lock_guard<std::mutex> lock(mutex);
         GGML_ASSERT(completed_generation[j] == generation[j]);
-        GGML_ASSERT(graph != nullptr);
         task_graph[j] = graph;
         ++generation[j];
         task_cv.notify_all();
     }
 
     ggml_status wait(size_t j) {
+        if (j == 0) {
+            uint64_t task_id = 0;
+            size_t target_generation = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                task_id = cpu_task_id[j];
+                target_generation = generation[j];
+            }
+            GGML_ASSERT(task_id != 0);
+            ggml_backend_meta_cpu_task_executor * executor =
+                ggml_backend_meta_ensure_cpu_task_executor(backend_ctx);
+            const ggml_status status =
+                executor->wait(task_id);
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                statuses[j] = status;
+                completed_generation[j] = target_generation;
+                cpu_task_id[j] = 0;
+                done_cv.notify_all();
+            }
+            return status;
+        }
+
         std::unique_lock<std::mutex> lock(mutex);
         const size_t target_generation = generation[j];
-        done_cv.wait(lock, [&]() { return completed_generation[j] == target_generation; });
+        done_cv.wait(lock, [&]() {
+            return completed_generation[j] == target_generation;
+        });
         return statuses[j];
     }
 
@@ -3170,10 +3569,10 @@ static ggml_backend_rpc_wait_snapshot_ready_t ggml_backend_meta_get_snapshot_rea
 ggml_backend_meta_context::~ggml_backend_meta_context() {
     delete compute_workers;
     delete transfer_worker;
+    delete cpu_task_executor;
     delete phone_exec_completion_worker;
     delete phone_exec_worker;
     delete prefill_input_worker;
-    delete prefill_pc_worker;
     for (auto * worker : prefill_return_workers) {
         delete worker;
     }
@@ -7158,12 +7557,19 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             GGML_ASSERT(return_worker != nullptr);
 
             const bool pc_ready_before =
-                backend_ctx->prefill_pc_worker != nullptr &&
-                backend_ctx->prefill_pc_worker->is_completed(
+                backend_ctx->cpu_task_executor != nullptr &&
+                backend_ctx->cpu_task_executor->is_completed(
                     branch_it->pc_task);
             const bool return_ready_before =
                 return_worker->is_completed(
                     branch_it->return_task);
+
+            if (return_ready_before && !pc_ready_before &&
+                    backend_ctx->cpu_task_executor != nullptr) {
+                (void) backend_ctx->cpu_task_executor->promote(
+                    branch_it->pc_task,
+                    GGML_BACKEND_META_CPU_URGENCY_BLOCKING_REDUCE);
+            }
 
             // Normal chunk boundaries are opportunistic only.  If the return
             // has not completed, leave this branch pending and let the next
@@ -7313,7 +7719,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
     auto drain_phone_prefill_pc_layer =
         [&](int layer) -> ggml_status {
-            if (backend_ctx->prefill_pc_worker == nullptr) {
+            if (backend_ctx->cpu_task_executor == nullptr) {
                 return GGML_STATUS_SUCCESS;
             }
 
@@ -7325,7 +7731,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     continue;
                 }
                 ++layer_chunk_count;
-                if (backend_ctx->prefill_pc_worker->is_completed(
+                if (backend_ctx->cpu_task_executor->is_completed(
                         branch.pc_task)) {
                     ++pc_ready_at_entry;
                 }
@@ -7422,7 +7828,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             size_t pc_ready_after_phone_fence = 0;
             for (const auto & branch : pending_phone_prefill_pc_branches) {
                 if (branch.layer == layer &&
-                        backend_ctx->prefill_pc_worker->is_completed(
+                        backend_ctx->cpu_task_executor->is_completed(
                             branch.pc_task)) {
                     ++pc_ready_after_phone_fence;
                 }
@@ -7482,7 +7888,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
                     const int64_t pc_wait_begin_us = ggml_time_us();
                     const ggml_status pc_status =
-                        backend_ctx->prefill_pc_worker->wait(
+                        backend_ctx->cpu_task_executor->wait(
                             branch.pc_task);
                     const int64_t pc_wait_us =
                         ggml_time_us() - pc_wait_begin_us;
@@ -7621,7 +8027,7 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     const int64_t wait_begin_us =
                         ggml_time_us();
                     const ggml_status pc_status =
-                        backend_ctx->prefill_pc_worker->wait(
+                        backend_ctx->cpu_task_executor->wait(
                             it->pc_task);
                     const int64_t wait_us =
                         ggml_time_us() - wait_begin_us;
@@ -17301,9 +17707,9 @@ auto prefill_norm_sg_has_prework =
                 return route_stage_status;
             }
 
-            if (backend_ctx->prefill_pc_worker == nullptr) {
-                backend_ctx->prefill_pc_worker =
-                    new ggml_backend_meta_transfer_worker();
+            if (backend_ctx->cpu_task_executor == nullptr) {
+                (void) ggml_backend_meta_ensure_cpu_task_executor(
+                    backend_ctx);
             }
 
             ggml_cgraph * pc_graph =
@@ -17441,8 +17847,22 @@ auto prefill_norm_sg_has_prework =
                         100.0 * (double) phone_ff / (double) total_ff : 0.0);
             }
 
+            ggml_backend_meta_cpu_task_desc remote_desc {};
+            remote_desc.kind =
+                GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
+            remote_desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION;
+            remote_desc.chunk =
+                backend_ctx->cpu_task_outer_chunk.load(
+                    std::memory_order_relaxed);
+            if (remote_desc.chunk < 0) {
+                remote_desc.chunk = prefill_down_chunk;
+            }
+            remote_desc.layer = prefill_down_layer;
+
             const uint64_t pc_task =
-                backend_ctx->prefill_pc_worker->enqueue(
+                backend_ctx->cpu_task_executor->enqueue(
+                    remote_desc,
                     [&, route, pc_graph, pc_backend,
                         pc_return_src, return_payload,
                         prefill_down_layer, prefill_down_chunk, i]
@@ -17645,7 +18065,7 @@ auto prefill_norm_sg_has_prework =
                 }
 
                 ggml_backend_meta_transfer_worker * pc_worker =
-                    backend_ctx->prefill_pc_worker;
+                    backend_ctx->cpu_task_executor;
                 ggml_backend_meta_transfer_worker * return_worker =
                     return_worker_slot;
                 const ggml_backend_rpc_set_tensor_async_return_t
@@ -21125,6 +21545,91 @@ bool ggml_backend_meta_set_tensor_p2c_layer_mask(
             "first=%d last=%d\n",
             n_layers, selected, first, last);
     }
+    return true;
+}
+
+uint64_t ggml_backend_meta_cpu_task_submit(
+        ggml_backend_t backend,
+        const ggml_backend_meta_cpu_task_desc * desc,
+        ggml_backend_meta_cpu_task_fn_t fn,
+        void * user_data) {
+    if (!ggml_backend_is_meta(backend) ||
+            desc == nullptr || fn == nullptr) {
+        return 0;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    auto * executor =
+        ggml_backend_meta_ensure_cpu_task_executor(
+            backend_ctx);
+    return executor->enqueue(
+        *desc,
+        [fn, user_data](uint64_t id) {
+            return fn(user_data, id);
+        });
+}
+
+ggml_status ggml_backend_meta_cpu_task_wait(
+        ggml_backend_t backend,
+        uint64_t task_id) {
+    if (!ggml_backend_is_meta(backend) || task_id == 0) {
+        return GGML_STATUS_FAILED;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->wait(task_id);
+}
+
+bool ggml_backend_meta_cpu_task_is_completed(
+        ggml_backend_t backend,
+        uint64_t task_id) {
+    if (!ggml_backend_is_meta(backend) || task_id == 0) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->is_completed(task_id);
+}
+
+bool ggml_backend_meta_cpu_task_promote(
+        ggml_backend_t backend,
+        uint64_t task_id,
+        int32_t urgency) {
+    if (!ggml_backend_is_meta(backend) || task_id == 0) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    return ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->promote(task_id, urgency);
+}
+
+bool ggml_backend_meta_cpu_task_set_outer_chunk(
+        ggml_backend_t backend,
+        int32_t outer_chunk) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    backend_ctx->cpu_task_outer_chunk.store(
+        outer_chunk,
+        std::memory_order_relaxed);
+    return true;
+}
+
+bool ggml_backend_meta_cpu_task_set_frontier(
+        ggml_backend_t backend,
+        int32_t frontier) {
+    if (!ggml_backend_is_meta(backend)) {
+        return false;
+    }
+    auto * backend_ctx =
+        (ggml_backend_meta_context *) backend->context;
+    ggml_backend_meta_ensure_cpu_task_executor(
+        backend_ctx)->set_frontier(frontier);
     return true;
 }
 
