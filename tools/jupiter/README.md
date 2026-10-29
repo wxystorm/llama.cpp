@@ -319,6 +319,101 @@ and `--resume` rejects an incompatible configuration.
 **Implementation status:** source committed, but the C++ build, on-device
 correctness and throughput A/B must be run on the actual PC+Phone system.
 
+## Jupiter communication and graph timeline (diagnostic only)
+
+To distinguish CPU waiting, GPU readback, socket sends, remote transfer
+fences, graph preparation and slot lifetime waits, build the latest PC
+binary and run diagnostic trials with `--comm-timing`. This sets
+`LLAMA_JUPITER_TIMELINE=1` while leaving
+`LLAMA_JUPITER_PROFILE_STAGE=0` (no per-split forced synchronizations).
+The existing `--async-c2p` flag remains independent and OFF by default.
+
+```powershell
+git fetch origin
+git checkout origin/baseline/jupiter-infocom25 -- `
+  ggml/src/ggml-rpc/ggml-rpc.cpp `
+  ggml/src/ggml-backend.cpp `
+  src/llama-context.cpp `
+  tools/jupiter/run_prefill_bench.py `
+  tools/jupiter/test_run_prefill_bench.py `
+  tools/jupiter/analyze_comm_timeline.py `
+  tools/jupiter/test_analyze_comm_timeline.py
+
+cmake --build build-jupiter --config Release -j
+python -m unittest discover -s .\tools\jupiter -p test_analyze_comm_timeline.py -v
+python -m unittest discover -s .\tools\jupiter -p test_run_prefill_bench.py -v
+```
+
+For a controlled **default-chunk** diagnostic, leave the DP plan unchanged
+and compare Legacy/Async using separate directories, preferably alternating
+the two runs to reduce frequency and temperature drift:
+
+```powershell
+$bench = @(
+  "--exe", ".\build-jupiter\bin\Release\llama-cli.exe",
+  "--model", "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
+  "--rpc", "10.39.52.114:10139",
+  "--prompt-file", ".\prompt.txt",
+  "--plan", ".\jupiter-refined-compute.plan",
+  "--target-tokens", "357",
+  "--pc-layers", "25",
+  "--modes", "default",
+  "--repeats", "1"
+)
+
+python .\tools\jupiter\run_prefill_bench.py @bench `
+  --comm-timing --out-dir .\jupiter-timeline-legacy
+python .\tools\jupiter\run_prefill_bench.py @bench `
+  --comm-timing --async-c2p --out-dir .\jupiter-timeline-async
+```
+
+The PC `default-r1.log` files include, only when timeline is enabled:
+
+- `[JUPITER_UBATCH_TIMELINE]`: chunk, prefix, slot and PC timestamp
+- `[JUPITER_GRAPH_HOST]`: host graph build, allocation, inputs and submit times
+- `[JUPITER_C2P_SYNC_FALLBACK]`: legacy synchronous RPC copy timing
+- `[JUPITER_C2P_STAGE]`: private host allocation, source Backend sync,
+  tensor readback, enqueue wait and total staging (joined by `task`)
+- `[JUPITER_C2P_SEND]`: worker queue wait and client socket-send duration
+- `[JUPITER_TRANSFER_FENCE]`: transfer-lane sync round-trip; prior
+  SET_TENSOR requests have been processed, not merely sent
+- `[JUPITER_GRAPH_PREPARE]`: PC control-lane fence and graph serialization
+- `[JUPITER_GRAPH_DISPATCH]`: worker queue, transfer fence and graph-send times
+- `[JUPITER_BUFFER_DRAIN]`: remote buffer-free/output-read dependency wait
+- `[JUPITER_REMOTE_SYNC]`: backend-wide wait for outstanding work
+
+Summarize the per-task timing report (default ignores prelude transfers
+below 1 MiB; use `--min-bytes 0` to include them):
+
+```powershell
+python .\tools\jupiter\analyze_comm_timeline.py `
+  --pc-log .\jupiter-timeline-async\default-r1.log `
+  --csv .\jupiter-timeline-async\c2p-tasks.csv
+python .\tools\jupiter\analyze_comm_timeline.py `
+  --pc-log .\jupiter-timeline-legacy\default-r1.log
+```
+
+For **Phone-side graph reconstruction and actual device execution**,
+rebuild the updated RPC server on the Phone, and start it with
+`LLAMA_JUPITER_TIMELINE=1` in Termux. Its separate phone-side log emits
+`[JUPITER_PHONE_TIMELINE] uid=... graph_prepare_ms=...
+phone_compute_ms=...`. The Phone computation is timed using
+synchronized `ggml_backend_graph_compute()`, not PC's graph enqueue.
+Correlate PC and Phone records by `uid`, never subtract timestamps
+from different machines. Pass `--phone-log PATH` to the report when available.
+
+The `--comm-timing` run is **diagnostic**, not a clean throughput
+measurement: taking timestamps and printing logs add overhead. For a
+formal A/B comparison rerun the conditions *without* `--comm-timing`
+and use at least three repeats. The benchmark manifest records
+`comm_timing` and prevents resuming incompatible measurements.
+
+**Interpretation:** `gpu_sync_ms` is Backend wait, not pure kernel time;
+`device_read_ms` is API readback; `socket_send_ms` measures client send,
+not Phone GPU readiness; `transfer_fence_ms` includes server round-trip;
+and sums of overlapping durations are not end-to-end Prefill time.
+No scheduling behavior changes when only the timing flag is enabled.
+
 ## Formal prefill A/B benchmark (async, low logging)
 
 After q calibration and DP plan generation, **do not benchmark with
