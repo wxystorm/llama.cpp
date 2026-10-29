@@ -516,12 +516,16 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
 
-    // CUDA backend on the server pads everything to 512 due to CUDA limitations.
-    // Due to bandwidth constraints, we only call the server init tensor functions if necessary.
-    // In particular, only quantized tensors need padding
-    if (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr)) {
-        rpc_msg_init_tensor_req request;
+    // CUDA historically needed INIT_TENSOR only for a subset of quantized tensors.
+    // OpenCL, however, attaches backend metadata through tensor->extra for every
+    // allocated tensor. Jupiter therefore initializes every remote tensor and the
+    // server persists the resulting extra pointer by serialized tensor id.
+    const bool needs_remote_init =
+            jupiter_prefill_enabled() ||
+            (ggml_is_quantized(tensor->type) && (tensor->ne[0] % 512 != 0) && (tensor->view_src == nullptr));
 
+    if (needs_remote_init) {
+        rpc_msg_init_tensor_req request {};
         request.tensor = serialize_tensor(tensor);
 
         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
@@ -1251,9 +1255,23 @@ private:
                               std::unordered_map<uint64_t, struct ggml_tensor*> & tensor_map);
 
 
+    struct remote_tensor_meta {
+        ggml_backend_buffer_t buffer = nullptr;
+        uint64_t data = 0;
+        void * extra = nullptr;
+    };
+
+    void restore_tensor_extra(const rpc_tensor & serialized, ggml_tensor * tensor);
+    void remember_tensor_extra(const rpc_tensor & serialized, const ggml_tensor * tensor);
+    void forget_buffer_tensor_extras(ggml_backend_buffer_t buffer);
+
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
     std::unordered_set<ggml_backend_buffer_t> buffers;
+
+    std::mutex tensor_meta_mutex;
+    std::unordered_map<uint64_t, remote_tensor_meta> tensor_meta;
+
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     //新加的
@@ -1289,6 +1307,57 @@ bool rpc_server::jupiter_sync(rpc_msg_jupiter_rsp & response) {
     // and event marker queued before it on that TCP stream has completed.
     response.ok = 1;
     return true;
+}
+
+void rpc_server::restore_tensor_extra(const rpc_tensor & serialized, ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(tensor_meta_mutex);
+
+    auto it = tensor_meta.find(serialized.id);
+    if (it != tensor_meta.end() &&
+        it->second.buffer == tensor->buffer &&
+        it->second.data == serialized.data) {
+        tensor->extra = it->second.extra;
+        return;
+    }
+
+    // OpenCL views reuse the parent tensor's extra. INIT_TENSOR for a view does
+    // not carry a full server-side view_src object, but the serialized parent id
+    // is stable and has already been initialized.
+    if (serialized.view_src != 0) {
+        auto parent = tensor_meta.find(serialized.view_src);
+        if (parent != tensor_meta.end() &&
+            parent->second.buffer == tensor->buffer) {
+            tensor->extra = parent->second.extra;
+        }
+    }
+}
+
+void rpc_server::remember_tensor_extra(const rpc_tensor & serialized, const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(tensor_meta_mutex);
+    tensor_meta[serialized.id] = remote_tensor_meta {
+        tensor->buffer,
+        serialized.data,
+        tensor->extra,
+    };
+}
+
+void rpc_server::forget_buffer_tensor_extras(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lock(tensor_meta_mutex);
+    for (auto it = tensor_meta.begin(); it != tensor_meta.end();) {
+        if (it->second.buffer == buffer) {
+            it = tensor_meta.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1401,6 +1470,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
     }
+    forget_buffer_tensor_extras(buffer);
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -1463,6 +1533,8 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     result->flags = tensor->flags;
     result->data = reinterpret_cast<void *>(tensor->data);
     ggml_set_name(result, tensor->name);
+
+    restore_tensor_extra(*tensor, result);
     return result;
 }
 
@@ -1518,6 +1590,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
     ggml_backend_tensor_set(tensor, data, offset, size);
+    remember_tensor_extra(*in_tensor, tensor);
     return true;
 }
 
@@ -1579,6 +1652,7 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
         }
     }
     ggml_backend_tensor_set(tensor, cached_file.data(), request.offset, size);
+    remember_tensor_extra(request.tensor, tensor);
     response.result = 1;
     return true;
 }
@@ -1598,21 +1672,37 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
         return false;
     }
     LOG_DBG("[%s] buffer: %p, data: %p\n", __func__, (void*)tensor->buffer, tensor->data);
-    // Call the backend's buffer_init_tensor function
+
     ggml_backend_buffer_t buffer = tensor->buffer;
-    if (buffer && buffer->iface.init_tensor) {
-        buffer->iface.init_tensor(buffer, tensor);
-    } else {
-        if (!buffer) {
-            GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
+    if (!buffer) {
+        GGML_LOG_ERROR("Tensor with null buffer passed to init_tensor function\n");
+        return false;
+    }
+
+    // For a view, OpenCL simply aliases the parent's extra. restore_tensor_extra()
+    // already performed that lookup by serialized view_src id.
+    if (request.tensor.view_src != 0 && tensor->extra != nullptr) {
+        remember_tensor_extra(request.tensor, tensor);
+        return true;
+    }
+
+    if (buffer->iface.init_tensor) {
+        const ggml_status status = buffer->iface.init_tensor(buffer, tensor);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("[%s] backend init_tensor failed for '%s' with status=%d\n",
+                           __func__, request.tensor.name, (int) status);
+            return false;
         }
     }
 
-    if (tensor->extra != nullptr) {
-        // This pointer can either be passed around client/server, or probably better stored server-side and kept track of.
-        // Currently unimplemented.
-        GGML_LOG_ERROR("tensor->extra populated by the backend, this is currently unsupported.\n");
-        return false;
+    // Persist backend-specific metadata (notably OpenCL cl_mem + offset). The
+    // ggml_tensor object above is temporary, but OpenCL owns the extra object in
+    // the backend buffer context, so the pointer remains valid until buffer free.
+    remember_tensor_extra(request.tensor, tensor);
+
+    if (jupiter_trace_enabled()) {
+        GGML_LOG_INFO("[JUPITER_RPC_TENSOR_INIT] id=%" PRIu64 " name='%s' extra=%p view=%" PRIu64 "\n",
+                      request.tensor.id, request.tensor.name, tensor->extra, request.tensor.view_src);
     }
 
     return true;
@@ -2170,6 +2260,8 @@ bool rpc_server::set_tensor_from_local_file(
             static_cast<size_t>(dst_i),
             staging.size());
     }
+
+    remember_tensor_extra(request.tensor, tensor);
 
     GGML_LOG_DEBUG(
         "[%s] loaded local tensor: "
