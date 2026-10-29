@@ -2716,6 +2716,31 @@ static bool ggml_backend_meta_cpu_task_graph_has_l_out(
     return false;
 }
 
+static bool ggml_backend_meta_cpu_task_graph_has_tensor_ffn_terminal(
+        const ggml_cgraph * graph,
+        int layer) {
+    if (graph == nullptr || layer < 0) {
+        return false;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        int parsed_chunk = -1;
+        int parsed_layer = -1;
+        if ((ggml_backend_meta_parse_prefill_down_chunk(
+                 graph->nodes[i]->name,
+                 parsed_chunk,
+                 parsed_layer) ||
+             ggml_backend_meta_parse_decode_ffn_chunk(
+                 graph->nodes[i]->name,
+                 parsed_chunk,
+                 parsed_layer)) &&
+                parsed_layer == layer) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char * ggml_backend_meta_cpu_task_kind_name(int32_t kind) {
     switch (kind) {
         case GGML_BACKEND_META_CPU_TASK_CPU_FULL: return "CPU_FULL";
@@ -3288,12 +3313,43 @@ struct ggml_backend_meta_compute_workers {
             ggml_backend_meta_cpu_task_group(
                 desc.kind, desc.layer, desc.chunk);
 
-        if (c2p &&
-                desc.continuation_group != 0 &&
-                !ggml_backend_meta_cpu_task_graph_has_l_out(
-                    graph, graph_layer)) {
-            desc.flags =
-                GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
+        if (c2p && desc.continuation_group != 0) {
+            const bool c2p_l_out =
+                ggml_backend_meta_cpu_task_graph_has_l_out(
+                    graph, graph_layer);
+            const bool c2p_ffn_terminal =
+                ggml_backend_meta_cpu_task_graph_has_tensor_ffn_terminal(
+                    graph, graph_layer);
+
+            // Dense directional C2P intentionally has no PC-owned l_out:
+            // ownership moves to Phone after the split FFN reduction. Treat
+            // the final dense FFN chunk as the sticky terminator instead of
+            // waiting forever for a PC l_out that must not exist.
+            //
+            // MoE C2P still uses the explicit Router-prefix / FFN-suffix
+            // descriptors below, so its proven sticky lifecycle is preserved.
+            if (c2p_l_out || c2p_ffn_terminal) {
+                desc.flags =
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL;
+            } else {
+                desc.flags =
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
+            }
+
+            if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
+                std::fprintf(
+                    stderr,
+                    "[CPU_TASK_C2P_STICKY] layer=%d chunk=%d "
+                    "l_out=%d ffn_terminal=%d phase=%s\n",
+                    graph_layer,
+                    desc.chunk,
+                    c2p_l_out ? 1 : 0,
+                    c2p_ffn_terminal ? 1 : 0,
+                    (desc.flags &
+                     GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL) != 0 ?
+                        "FINAL" : "CONTINUE");
+                std::fflush(stderr);
+            }
         }
 
         if (output_graph &&
