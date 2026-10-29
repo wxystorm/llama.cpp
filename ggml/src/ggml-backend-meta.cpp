@@ -14552,29 +14552,54 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
                 const int64_t fold_begin_us =
                     ggml_time_us();
-                ggml_backend_synchronize(pc_cfg.backend);
-                ggml_status fold_status =
-                    ggml_backend_graph_compute_async(
-                        pc_cfg.backend, pc_fold_graph);
+                GGML_ASSERT(
+                    backend_ctx->cpu_task_executor != nullptr);
+                ggml_backend_meta_cpu_task_desc fold_desc {};
+                fold_desc.kind =
+                    GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+                fold_desc.urgency =
+                    GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+                fold_desc.chunk =
+                    backend_ctx->cpu_task_outer_chunk.load(
+                        std::memory_order_relaxed);
+                if (fold_desc.chunk < 0) {
+                    fold_desc.chunk = chunk;
+                }
+                fold_desc.layer = layer;
+                fold_desc.continuation_group =
+                    ggml_backend_meta_cpu_task_group(
+                        fold_desc.kind,
+                        fold_desc.layer,
+                        fold_desc.chunk);
+                fold_desc.flags =
+                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_FINAL;
+
+                const ggml_backend_t fold_backend =
+                    pc_cfg.backend;
+                const uint64_t fold_task =
+                    backend_ctx->cpu_task_executor->enqueue(
+                        fold_desc,
+                        [fold_backend, pc_fold_graph]
+                        (uint64_t) -> ggml_status {
+                            const ggml_status status =
+                                ggml_backend_graph_compute_async(
+                                    fold_backend,
+                                    pc_fold_graph);
+                            if (status == GGML_STATUS_SUCCESS) {
+                                ggml_backend_synchronize(
+                                    fold_backend);
+                            }
+                            return status;
+                        });
+                const ggml_status fold_status =
+                    backend_ctx->cpu_task_executor->wait(
+                        fold_task);
                 if (fold_status != GGML_STATUS_SUCCESS) {
-                    if (backend_ctx->cpu_task_executor != nullptr) {
-                        backend_ctx->cpu_task_executor->release_sticky(
-                            ggml_backend_meta_cpu_task_group(
-                                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN,
-                                layer,
-                                backend_ctx->cpu_task_outer_chunk.load(
-                                    std::memory_order_relaxed) >= 0 ?
-                                    backend_ctx->cpu_task_outer_chunk.load(
-                                        std::memory_order_relaxed) :
-                                    chunk),
-                            "C2P_PC_PREP_FOLD_FAILED");
-                    }
                     release_region_c2p_overlap_chunk(
                         layer, chunk,
                         "PC_PARTIAL_FOLD_FAILED");
                     return fold_status;
                 }
-                ggml_backend_synchronize(pc_cfg.backend);
                 state.partial_fold_us =
                     ggml_time_us() - fold_begin_us;
                 state.pc_partial_folded = true;
@@ -14644,18 +14669,6 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             state.pc_prepared = true;
-            if (backend_ctx->cpu_task_executor != nullptr) {
-                backend_ctx->cpu_task_executor->release_sticky(
-                    ggml_backend_meta_cpu_task_group(
-                        GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN,
-                        layer,
-                        backend_ctx->cpu_task_outer_chunk.load(
-                            std::memory_order_relaxed) >= 0 ?
-                            backend_ctx->cpu_task_outer_chunk.load(
-                                std::memory_order_relaxed) :
-                            chunk),
-                    "C2P_PC_PREP_READY");
-            }
 
             if (pipeline_debug) {
                 printf(
@@ -17953,33 +17966,68 @@ auto prefill_norm_sg_has_prework =
                     .cgraphs[i].cgraph_main;
             GGML_ASSERT(pc_graph != nullptr);
 
-            const int64_t stage_copy_begin_us =
-                ggml_time_us();
-            ggml_backend_tensor_copy_async(
-                pc_backend, pc_backend,
-                route.stage_hidden,
-                route.dst_hidden);
-            ggml_backend_tensor_copy_async(
-                pc_backend, pc_backend,
-                route.stage_topk,
-                route.dst_topk);
-            ggml_backend_tensor_copy_async(
-                pc_backend, pc_backend,
-                route.stage_weights,
-                route.dst_weights);
-            ggml_backend_synchronize(pc_backend);
-            const int64_t stage_copy_us =
-                ggml_time_us() -
-                stage_copy_begin_us;
+            GGML_ASSERT(
+                backend_ctx->cpu_task_executor != nullptr);
+            ggml_backend_meta_cpu_task_desc remote_desc {};
+            remote_desc.kind =
+                GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN;
+            remote_desc.urgency =
+                GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION;
+            remote_desc.chunk =
+                backend_ctx->cpu_task_outer_chunk.load(
+                    std::memory_order_relaxed);
+            if (remote_desc.chunk < 0) {
+                remote_desc.chunk = prefill_down_chunk;
+            }
+            remote_desc.layer = prefill_down_layer;
+            remote_desc.continuation_group =
+                ggml_backend_meta_cpu_task_group(
+                    remote_desc.kind,
+                    remote_desc.layer,
+                    remote_desc.chunk);
 
-            const int64_t pc_begin_us =
-                ggml_time_us();
+            int64_t stage_copy_us = 0;
+            int64_t pc_compute_us = 0;
+            const uint64_t pc_task =
+                backend_ctx->cpu_task_executor->enqueue(
+                    remote_desc,
+                    [pc_backend, pc_graph, route,
+                     &stage_copy_us, &pc_compute_us]
+                    (uint64_t) -> ggml_status {
+                        const int64_t stage_copy_begin_us =
+                            ggml_time_us();
+                        ggml_backend_tensor_copy_async(
+                            pc_backend, pc_backend,
+                            route.stage_hidden,
+                            route.dst_hidden);
+                        ggml_backend_tensor_copy_async(
+                            pc_backend, pc_backend,
+                            route.stage_topk,
+                            route.dst_topk);
+                        ggml_backend_tensor_copy_async(
+                            pc_backend, pc_backend,
+                            route.stage_weights,
+                            route.dst_weights);
+                        ggml_backend_synchronize(
+                            pc_backend);
+                        stage_copy_us =
+                            ggml_time_us() -
+                            stage_copy_begin_us;
+
+                        const int64_t pc_begin_us =
+                            ggml_time_us();
+                        const ggml_status status =
+                            ggml_backend_graph_compute(
+                                pc_backend,
+                                pc_graph);
+                        pc_compute_us =
+                            ggml_time_us() -
+                            pc_begin_us;
+                        return status;
+                    });
             compute_status =
-                ggml_backend_graph_compute(
-                    pc_backend, pc_graph);
-            const int64_t pc_compute_us =
-                ggml_time_us() -
-                pc_begin_us;
+                backend_ctx->cpu_task_executor->wait(
+                    pc_task);
             if (compute_status !=
                     GGML_STATUS_SUCCESS) {
                 return compute_status;
