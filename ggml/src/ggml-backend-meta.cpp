@@ -2431,6 +2431,7 @@ struct ggml_backend_meta_context {
     uint64_t                    next_snapshot_seq = 1;
     uint64_t                    next_phone_prefill_route_seq = 1;
     uint64_t                    next_phone_prefill_ffn_seq = 1;
+    uint64_t                    next_p2c_return_seq = 1;
     int                         tensor_phone_first_layer = -1;
     int                         tensor_phone_last_layer  = -1;
     std::vector<uint8_t>        tensor_phone_layer_mask;
@@ -2470,6 +2471,11 @@ struct ggml_backend_meta_context {
     // the PC FFN is still running.
     std::array<ggml_backend_meta_transfer_worker *, 2> phone_region_partial_workers { nullptr,
                                                                                       nullptr };
+    // Directional P2C return lanes. Each lane owns one blocking return-wait
+    // RPC at a time, allowing chunk N+1 to use the other lane without sharing
+    // the Phone compute/control socket.
+    std::array<ggml_backend_meta_transfer_worker *, PREFILL_RETURN_LANES>
+        p2c_return_workers { nullptr, nullptr };
 
     void *                               comm_ctx       = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
@@ -2937,6 +2943,25 @@ ggml_backend_meta_get_wait_ready_seq(ggml_backend_t backend) {
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC));
 }
 
+static ggml_backend_rpc_get_tensor_return_wait_t
+ggml_backend_meta_get_tensor_return_wait(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr) {
+        return nullptr;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+
+    return reinterpret_cast<
+        ggml_backend_rpc_get_tensor_return_wait_t>(
+            ggml_backend_reg_get_proc_address(
+                reg,
+                GGML_BACKEND_RPC_GET_TENSOR_RETURN_WAIT_PROC));
+}
+
 static ggml_backend_rpc_phone_ring_auto_ready_t
 ggml_backend_meta_get_phone_ring_auto_ready(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
@@ -3135,6 +3160,9 @@ ggml_backend_meta_context::~ggml_backend_meta_context() {
         delete worker;
     }
     for (auto * worker : phone_region_partial_workers) {
+        delete worker;
+    }
+    for (auto * worker : p2c_return_workers) {
         delete worker;
     }
     if (comm_ctx != nullptr) {
@@ -10603,7 +10631,64 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
 
             int64_t phone_fold_us = 0;
             ggml_status status = GGML_STATUS_SUCCESS;
+
+            ggml_backend_meta_transfer_worker *
+                p2c_return_worker = nullptr;
+            uint64_t p2c_return_task = 0;
+            uint64_t p2c_return_seq = 0;
+            size_t p2c_return_lane = 0;
+            std::shared_ptr<std::vector<uint8_t>>
+                p2c_return_payload;
+            int64_t p2c_return_submit_us = 0;
+            bool p2c_return_prefetch_used = false;
+
             if (!local_main_partial) {
+                const ggml_backend_rpc_get_tensor_return_wait_t
+                    p2c_return_get =
+                        ggml_backend_meta_get_tensor_return_wait(
+                            phone_cfg.backend);
+                const ggml_backend_rpc_phone_ffn_mark_ready_t
+                    p2c_mark_ready =
+                        ggml_backend_meta_get_phone_ffn_mark_ready(
+                            phone_cfg.backend);
+                p2c_return_lane =
+                    (prefill_down_chunk_0 >= 0 ?
+                        static_cast<size_t>(
+                            prefill_down_chunk_0) : 0) %
+                    ggml_backend_meta_context::PREFILL_RETURN_LANES;
+                const bool p2c_return_capable =
+                    p2c_return_get != nullptr &&
+                    p2c_mark_ready != nullptr &&
+                    p2c_return_get(
+                        phone_cfg.backend,
+                        nullptr,
+                        nullptr,
+                        0,
+                        0,
+                        p2c_return_lane) &&
+                    p2c_mark_ready(
+                        phone_cfg.backend, 0);
+
+                if (p2c_return_capable) {
+                    constexpr uint64_t P2C_RETURN_SEQ_PREFIX =
+                        UINT64_C(0xC000000000000000);
+                    constexpr uint64_t P2C_RETURN_SEQ_MASK =
+                        UINT64_C(0x0FFFFFFFFFFFFFFF);
+                    uint64_t local_seq =
+                        backend_ctx->next_p2c_return_seq++ &
+                        P2C_RETURN_SEQ_MASK;
+                    if (local_seq == 0) {
+                        local_seq =
+                            backend_ctx->next_p2c_return_seq++ &
+                            P2C_RETURN_SEQ_MASK;
+                        if (local_seq == 0) {
+                            local_seq = 1;
+                        }
+                    }
+                    p2c_return_seq =
+                        P2C_RETURN_SEQ_PREFIX | local_seq;
+                }
+
                 const int64_t phone_fold_begin_us =
                     ggml_time_us();
                 ggml_backend_synchronize(phone_cfg.backend);
@@ -10613,6 +10698,112 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 if (status != GGML_STATUS_SUCCESS) {
                     return status;
                 }
+
+                // Publish producer completion on the ordered compute socket.
+                // The independent RETURN lane is allowed to issue its GET
+                // immediately, but the Phone handler cannot read the tensor
+                // until this marker becomes visible after the fold graph.
+                if (p2c_return_capable &&
+                        p2c_mark_ready(
+                            phone_cfg.backend,
+                            p2c_return_seq)) {
+                    auto & worker_slot =
+                        backend_ctx->p2c_return_workers[
+                            p2c_return_lane];
+                    if (worker_slot == nullptr) {
+                        worker_slot =
+                            new ggml_backend_meta_transfer_worker();
+                    }
+                    p2c_return_worker = worker_slot;
+                    p2c_return_payload =
+                        std::make_shared<std::vector<uint8_t>>(
+                            ggml_nbytes(phone_partial));
+                    p2c_return_submit_us = ggml_time_us();
+
+                    const ggml_backend_t phone_backend =
+                        phone_cfg.backend;
+                    const ggml_tensor * return_src =
+                        phone_partial;
+                    const auto return_get =
+                        p2c_return_get;
+                    const auto return_payload =
+                        p2c_return_payload;
+                    const uint64_t return_seq =
+                        p2c_return_seq;
+                    const size_t return_lane =
+                        p2c_return_lane;
+                    const int return_layer =
+                        prefill_down_layer_0;
+                    const int return_chunk =
+                        prefill_down_chunk_0;
+                    p2c_return_task =
+                        p2c_return_worker->enqueue(
+                            [return_get,
+                             phone_backend,
+                             return_src,
+                             return_payload,
+                             return_seq,
+                             return_lane,
+                             return_layer,
+                             return_chunk,
+                             pipeline_debug,
+                             tensor_phone_stage_profile]
+                            (uint64_t task_id) -> ggml_status {
+                                const int64_t begin_us =
+                                    ggml_time_us();
+                                const bool ok =
+                                    return_get(
+                                        phone_backend,
+                                        return_src,
+                                        return_payload->data(),
+                                        return_payload->size(),
+                                        return_seq,
+                                        return_lane);
+                                if (pipeline_debug ||
+                                        tensor_phone_stage_profile ||
+                                        std::getenv(
+                                            "GGML_P2C_RETURN_PROFILE") !=
+                                            nullptr) {
+                                    printf(
+                                        "[REGION_P2C_RETURN_PREFETCH] "
+                                        "layer=%d chunk=%d task=%" PRIu64
+                                        " lane=%zu seq=%" PRIu64
+                                        " bytes=%zu event=TRANSFER_DONE "
+                                        "wall_ms=%.3f status=%s\n",
+                                        return_layer,
+                                        return_chunk,
+                                        task_id,
+                                        return_lane,
+                                        return_seq,
+                                        return_payload->size(),
+                                        (ggml_time_us() - begin_us) /
+                                            1000.0,
+                                        ok ? "OK" : "FAIL");
+                                }
+                                return ok ?
+                                    GGML_STATUS_SUCCESS :
+                                    GGML_STATUS_FAILED;
+                            });
+                    p2c_return_prefetch_used = true;
+
+                    if (pipeline_debug ||
+                            tensor_phone_stage_profile ||
+                            std::getenv(
+                                "GGML_P2C_RETURN_PROFILE") != nullptr) {
+                        printf(
+                            "[REGION_P2C_RETURN_PREFETCH] "
+                            "layer=%d chunk=%d task=%" PRIu64
+                            " lane=%zu seq=%" PRIu64
+                            " bytes=%zu event=QUEUED status=OK\n",
+                            prefill_down_layer_0,
+                            prefill_down_chunk_0,
+                            p2c_return_task,
+                            p2c_return_lane,
+                            p2c_return_seq,
+                            p2c_return_payload->size());
+                    }
+                }
+
                 ggml_backend_synchronize(phone_cfg.backend);
                 phone_fold_us =
                     ggml_time_us() - phone_fold_begin_us;
@@ -10725,6 +10916,51 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                         local_state.partial_prefetch_submit_us > 0 ?
                             (ggml_time_us() -
                                 local_state.partial_prefetch_submit_us) /
+                                1000.0 : 0.0);
+                }
+            } else if (p2c_return_prefetch_used) {
+                GGML_ASSERT(p2c_return_worker != nullptr);
+                GGML_ASSERT(p2c_return_task != 0);
+                GGML_ASSERT(p2c_return_payload != nullptr);
+
+                const int64_t wait_begin_us =
+                    ggml_time_us();
+                const ggml_status return_status =
+                    p2c_return_worker->wait(
+                        p2c_return_task);
+                const int64_t return_wait_us =
+                    ggml_time_us() - wait_begin_us;
+                if (return_status !=
+                        GGML_STATUS_SUCCESS) {
+                    return return_status;
+                }
+
+                ggml_backend_tensor_set(
+                    pc_tmp,
+                    p2c_return_payload->data(),
+                    0,
+                    p2c_return_payload->size());
+                ggml_backend_synchronize(
+                    pc_cfg.backend);
+
+                if (pipeline_debug ||
+                        tensor_phone_stage_profile ||
+                        std::getenv(
+                            "GGML_P2C_RETURN_PROFILE") != nullptr) {
+                    printf(
+                        "[REGION_P2C_RETURN_CONSUMER] "
+                        "layer=%d chunk=%d lane=%zu seq=%" PRIu64
+                        " bytes=%zu wait_ms=%.3f "
+                        "since_submit_ms=%.3f status=OK\n",
+                        prefill_down_layer_0,
+                        prefill_down_chunk_0,
+                        p2c_return_lane,
+                        p2c_return_seq,
+                        p2c_return_payload->size(),
+                        return_wait_us / 1000.0,
+                        p2c_return_submit_us > 0 ?
+                            (ggml_time_us() -
+                                p2c_return_submit_us) /
                                 1000.0 : 0.0);
                 }
             } else {

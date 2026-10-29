@@ -285,6 +285,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_RING_REGISTER,
     RPC_CMD_PHONE_RING_INPUT_READY,
     RPC_CMD_PHONE_RING_WAIT,
+    RPC_CMD_GET_TENSOR_RETURN_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -311,6 +312,7 @@ static_assert(RPC_CMD_GET_PHONE_REGION_PARTIAL == 35, "RPC_CMD_GET_PHONE_REGION_
 static_assert(RPC_CMD_PHONE_RING_REGISTER == 36, "RPC_CMD_PHONE_RING_REGISTER index");
 static_assert(RPC_CMD_PHONE_RING_INPUT_READY == 37, "RPC_CMD_PHONE_RING_INPUT_READY index");
 static_assert(RPC_CMD_PHONE_RING_WAIT == 38, "RPC_CMD_PHONE_RING_WAIT index");
+static_assert(RPC_CMD_GET_TENSOR_RETURN_WAIT == 39, "RPC_CMD_GET_TENSOR_RETURN_WAIT index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -436,6 +438,13 @@ struct rpc_msg_wait_ready_seq_req {
     uint32_t device;
     uint32_t reserved;
     uint64_t seq;
+};
+
+struct rpc_msg_get_tensor_return_wait_req {
+    uint32_t device;
+    uint32_t lane;
+    uint64_t ready_seq;
+    rpc_msg_get_tensor_req get;
 };
 
 struct rpc_msg_set_tensor_async_return_wait_req {
@@ -3199,6 +3208,152 @@ static bool ggml_backend_rpc_phone_ffn_mark_ready(
         sock,
         RPC_CMD_PHONE_FFN_MARK_READY,
         request);
+}
+
+static bool ggml_backend_rpc_get_tensor_return_wait(
+        ggml_backend_t backend_src,
+        const ggml_tensor * src,
+        void * data,
+        size_t size,
+        uint64_t ready_seq,
+        size_t return_lane) {
+    if (backend_src == nullptr || !ggml_backend_is_rpc(backend_src) ||
+            return_lane >= RPC_RETURN_TRANSFER_LANES) {
+        return false;
+    }
+
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend_src->context);
+    auto * rpc_dev_ctx =
+        static_cast<ggml_backend_rpc_device_context *>(
+            ggml_backend_get_device(backend_src)->context);
+    if (rpc_ctx == nullptr || rpc_dev_ctx == nullptr) {
+        return false;
+    }
+
+    auto & return_sock =
+        rpc_dev_ctx->return_transfer_socks[return_lane];
+    if (return_sock == nullptr) {
+        return_sock =
+            get_return_transfer_socket(
+                rpc_ctx->endpoint,
+                return_lane);
+    }
+    if (return_sock == nullptr) {
+        return false;
+    }
+
+    constexpr uint8_t RPC_P2C_RETURN_WAIT_MIN_PATCH = 18;
+    const std::string return_key =
+        rpc_ctx->endpoint +
+        (return_lane == 0 ?
+            "_return_transfer_0" :
+            "_return_transfer_1");
+    if (rpc_get_remote_patch(return_key) <
+            RPC_P2C_RETURN_WAIT_MIN_PATCH) {
+        return false;
+    }
+
+    // Capability/preconnect query used by Meta.
+    if (src == nullptr && data == nullptr &&
+            size == 0 && ready_seq == 0) {
+        return true;
+    }
+
+    if (src == nullptr || data == nullptr ||
+            ready_seq == 0 ||
+            src->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(src->buffer) ||
+            size != ggml_nbytes(src)) {
+        return false;
+    }
+
+    auto * src_buffer_ctx =
+        static_cast<ggml_backend_rpc_buffer_context *>(
+            src->buffer->context);
+    if (src_buffer_ctx == nullptr ||
+            src_buffer_ctx->endpoint != rpc_ctx->endpoint ||
+            src_buffer_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    rpc_msg_get_tensor_return_wait_req request {};
+    request.device = rpc_ctx->device;
+    request.lane = static_cast<uint32_t>(return_lane);
+    request.ready_seq = ready_seq;
+    request.get.tensor = serialize_tensor(src);
+    request.get.offset = 0;
+    request.get.size = size;
+
+    const bool p2c_profile =
+        rpc_p2c_return_profile_enabled() &&
+        rpc_p2c_return_tensor_name(src->name);
+
+    if (!p2c_profile) {
+        return send_rpc_cmd(
+            return_sock,
+            RPC_CMD_GET_TENSOR_RETURN_WAIT,
+            &request,
+            sizeof(request),
+            data,
+            size);
+    }
+
+    const int64_t total_begin_us = ggml_time_us();
+    const int64_t request_begin_us = total_begin_us;
+    bool status = send_rpc_cmd(
+        return_sock,
+        RPC_CMD_GET_TENSOR_RETURN_WAIT,
+        &request,
+        sizeof(request));
+    const int64_t request_done_us = ggml_time_us();
+
+    uint64_t out_size = 0;
+    int64_t header_wait_us = 0;
+    int64_t payload_recv_us = 0;
+    if (status) {
+        const int64_t header_wait_begin_us = ggml_time_us();
+        status = return_sock->recv_data(
+            &out_size, sizeof(out_size));
+        header_wait_us =
+            ggml_time_us() - header_wait_begin_us;
+
+        if (status && out_size == size) {
+            if (size != 0) {
+                const int64_t payload_recv_begin_us =
+                    ggml_time_us();
+                status = return_sock->recv_data(data, size);
+                payload_recv_us =
+                    ggml_time_us() - payload_recv_begin_us;
+            }
+        } else if (status) {
+            status = false;
+        }
+    }
+
+    const int64_t recv_us =
+        header_wait_us + payload_recv_us;
+    const int64_t total_us =
+        ggml_time_us() - total_begin_us;
+    std::fprintf(
+        stderr,
+        "[P2C_PC_RECV_PROFILE] tensor=%s bytes=%zu "
+        "socket=RETURN_TRANSFER lane=%zu seq=%" PRIu64 " "
+        "request_ms=%.3f header_wait_ms=%.3f "
+        "payload_recv_ms=%.3f recv_ms=%.3f "
+        "total_ms=%.3f status=%s\n",
+        src->name,
+        size,
+        return_lane,
+        ready_seq,
+        (request_done_us - request_begin_us) / 1000.0,
+        header_wait_us / 1000.0,
+        payload_recv_us / 1000.0,
+        recv_us / 1000.0,
+        total_us / 1000.0,
+        status ? "OK" : "FAIL");
+    std::fflush(stderr);
+    return status;
 }
 
 static bool ggml_backend_rpc_wait_ready_seq(
@@ -8586,6 +8741,70 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_GET_TENSOR_RETURN_WAIT: {
+                rpc_msg_get_tensor_return_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request)) ||
+                        request.device >= device_count ||
+                        request.lane >= RPC_RETURN_TRANSFER_LANES ||
+                        request.ready_seq == 0) {
+                    return;
+                }
+
+                const bool p2c_profile =
+                    rpc_p2c_return_profile_enabled() &&
+                    rpc_p2c_return_tensor_name(
+                        request.get.tensor.name);
+                const int64_t handler_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
+
+                rpc_msg_wait_ready_seq_req wait_request {};
+                wait_request.device = request.device;
+                wait_request.seq = request.ready_seq;
+                const int64_t ready_wait_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
+                if (!server.wait_ready_seq(wait_request)) {
+                    return;
+                }
+                const int64_t ready_wait_us =
+                    p2c_profile ?
+                        ggml_time_us() - ready_wait_begin_us : 0;
+
+                std::vector<uint8_t> response;
+                if (!server.get_tensor(request.get, response)) {
+                    return;
+                }
+
+                const int64_t send_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
+                if (!send_msg(
+                        sock,
+                        response.data(),
+                        response.size())) {
+                    return;
+                }
+
+                if (p2c_profile) {
+                    const int64_t send_us =
+                        ggml_time_us() - send_begin_us;
+                    const int64_t handler_us =
+                        ggml_time_us() - handler_begin_us;
+                    std::fprintf(
+                        stderr,
+                        "[P2C_PHONE_SOCKET_SEND] tensor=%s bytes=%zu "
+                        "socket=RETURN_TRANSFER lane=%u seq=%" PRIu64 " "
+                        "ready_wait_ms=%.3f send_ms=%.3f "
+                        "handler_ms=%.3f status=OK\n",
+                        request.get.tensor.name,
+                        response.size(),
+                        request.lane,
+                        request.ready_seq,
+                        ready_wait_us / 1000.0,
+                        send_us / 1000.0,
+                        handler_us / 1000.0);
+                    std::fflush(stderr);
+                }
+                break;
+            }
             case RPC_CMD_GET_PHONE_REGION_PARTIAL: {
                 rpc_msg_get_snapshot_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -9006,6 +9225,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_WAIT_READY_SEQ_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_wait_ready_seq);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_TENSOR_RETURN_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_get_tensor_return_wait);
     }
     if (std::strcmp(
             name,
