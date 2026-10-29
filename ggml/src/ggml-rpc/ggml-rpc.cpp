@@ -1929,30 +1929,46 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         const int64_t request_done_us = ggml_time_us();
 
         uint64_t out_size = 0;
-        int64_t recv_us = 0;
+        int64_t header_wait_us = 0;
+        int64_t payload_recv_us = 0;
         if (status) {
-            const int64_t recv_begin_us = ggml_time_us();
+            const int64_t header_wait_begin_us =
+                ggml_time_us();
             status = ctx->sock->recv_data(
                 &out_size, sizeof(out_size));
+            header_wait_us =
+                ggml_time_us() - header_wait_begin_us;
+
             if (status && out_size == size) {
-                status = size == 0 ||
-                    ctx->sock->recv_data(data, size);
+                if (size != 0) {
+                    const int64_t payload_recv_begin_us =
+                        ggml_time_us();
+                    status =
+                        ctx->sock->recv_data(data, size);
+                    payload_recv_us =
+                        ggml_time_us() -
+                        payload_recv_begin_us;
+                }
             } else if (status) {
                 status = false;
             }
-            recv_us = ggml_time_us() - recv_begin_us;
         }
 
+        const int64_t recv_us =
+            header_wait_us + payload_recv_us;
         const int64_t total_us =
             ggml_time_us() - total_begin_us;
         std::fprintf(
             stderr,
             "[P2C_PC_RECV_PROFILE] tensor=%s bytes=%zu "
-            "socket=COMPUTE request_ms=%.3f recv_ms=%.3f "
-            "total_ms=%.3f status=%s\n",
+            "socket=COMPUTE request_ms=%.3f "
+            "header_wait_ms=%.3f payload_recv_ms=%.3f "
+            "recv_ms=%.3f total_ms=%.3f status=%s\n",
             tensor->name,
             size,
             (request_done_us - request_begin_us) / 1000.0,
+            header_wait_us / 1000.0,
+            payload_recv_us / 1000.0,
             recv_us / 1000.0,
             total_us / 1000.0,
             status ? "OK" : "FAIL");
