@@ -6018,7 +6018,8 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                    pc_last->name, pc_chunk, pc_layer) &&
                ggml_backend_meta_parse_prefill_norm_chunk(
                    phone_last->name, phone_chunk, phone_layer) &&
-               pc_chunk == phone_chunk && pc_layer == phone_layer;
+               pc_chunk == phone_chunk && pc_layer == phone_layer &&
+               !ggml_backend_meta_tensor_p2c_layer(backend_ctx, pc_layer);
     };
 
     auto subgraph_is_decode_pc_only_norm = [&](size_t sg) -> bool {
