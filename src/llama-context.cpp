@@ -2733,7 +2733,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     ggml_backend_sched_get_split_prepare_sync_mask(
                         sched_use, split);
             if ((prepare_sync_mask >> 63) != 0) {
-                LLAMA_LOG_INFO(
+                LLAMA_LOG_ERROR(
                     "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
                     "lane=%d split=%d/%d sync_mask=0x%016" PRIx64
                     " status=REJECT reason=UNRESOLVED_SOURCE_BACKEND\n",
@@ -2895,7 +2895,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     p2c_deferred_split = true;
                     all_splits_synchronized = false;
 
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_INFO(
                         "[REGION_RING_P2C_PRODUCER] "
                         "stage=%zu block=%zu ticket=%" PRIu64
                         " bytes=%zu state=P2C_WAITING "
@@ -4230,7 +4230,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 const int64_t refill_begin_us = ggml_time_us();
                 ++gpu_bank_mover_stats_v.started;
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_GPU_BANK_MOVER] event=REFILL_START "
                     "region=%zu bank=%c source_region=%zu tokens=%d "
                     "status=RUNNING\n",
@@ -4365,7 +4365,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 gpu_bank_mover_stats_v.upload_bytes += upload_bytes;
                 ++gpu_bank_mover_stats_v.completed;
 
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_GPU_BANK_MOVER] event=REFILL_DONE "
                     "region=%zu bank=%c source_region=%zu "
                     "upload_mib=%.3f cpu_stage_copy_ms=%.3f "
@@ -4857,7 +4857,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     }
                                     bank.bank_ready = true;
                                 }
-                                LLAMA_LOG_ERROR(
+                                LLAMA_LOG_DEBUG(
                                     "[REGION_RING_GPU_BANK] "
                                     "event=TASK_DONE region=%zu chunk=%zu "
                                     "bank=%c generation=%" PRIu64 " "
@@ -8171,7 +8171,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // fifo-pc-phone = PC CPU+CUDA shared execution, Meta/RPC independent;
             // serial = all chunks of one Region before the next Region.
             // Full-graph mode falls through to the existing ggml path.
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_EXEC] mode=%s ub=%d tokens=%u\n",
                 ring_exec.c_str(), ubatch_id, ubatch.n_tokens);
             if (ring_exec == "serial") {
