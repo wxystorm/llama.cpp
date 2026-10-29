@@ -1960,6 +1960,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
 
         gparams.hybrid_layer_begin   = stage->layer_begin;
         gparams.hybrid_layer_end     = stage->layer_end;
+        gparams.hybrid_chunk_tokens  = stage->macro_tokens;
         gparams.hybrid_hidden_input  =
             stage->layer_begin > 0 || force_hidden_input;
         gparams.hybrid_output_head   =
@@ -9980,6 +9981,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
                 GGML_ASSERT(stage.layer_end <= n_layer);
                 gparams.hybrid_layer_begin = stage.layer_begin;
                 gparams.hybrid_layer_end = stage.layer_end;
+                gparams.hybrid_chunk_tokens = stage.macro_tokens;
                 gparams.hybrid_hidden_input = true;
                 gparams.hybrid_output_head = false;
                 gparams.hybrid_wave_probe = stage.wave_probe;
