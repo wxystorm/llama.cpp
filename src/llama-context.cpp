@@ -2749,13 +2749,22 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
 
             if (directional_meta_stage && block_index == 0) {
+                const bool c2p_island_returns_pc =
+                    stage.kind == llama_hybrid_runtime_stage_kind::C2P &&
+                    stage.layer_end > stage.layer_begin &&
+                    model.hybrid_layer_mode(stage.layer_end - 1) ==
+                        llama_hybrid_layer_mode::TENSOR_P2C;
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_DIRECTIONAL_GATE] stage=%zu kind=%s "
-                    "block=%zu executor=META cpu_gate=HELD "
-                    "ownership=%s status=READY\n",
+                    "layers=[%d,%d) block=%zu executor=META "
+                    "cpu_gate=HELD ownership=%s status=READY\n",
                     stage_index,
                     llama_hybrid_runtime_stage_name(stage.kind),
+                    stage.layer_begin,
+                    stage.layer_end,
                     block_index,
+                    c2p_island_returns_pc ?
+                        "PC_TO_PHONE_TO_PC" :
                     stage.kind == llama_hybrid_runtime_stage_kind::C2P ?
                         "PC_TO_PHONE" : "PHONE_TO_PC");
             }
