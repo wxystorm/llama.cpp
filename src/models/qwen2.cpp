@@ -409,7 +409,15 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
 
         const llama_hybrid_layer_mode hybrid_mode      = model.hybrid_layer_mode(il);
         const int                     n_decode_chunks  = std::min<int64_t>(qwen2_ffn_chunk_count(), n_embd);
-        const int planned_chunk_tokens = llama_hybrid_runtime_prefill_chunk_tokens();
+        // Match the validated MoE directional path: Region Ring stage
+        // graphs carry their own macro chunk and fixed layouts intentionally
+        // may not have a global Tensor runtime plan.  C2P/P2C must therefore
+        // use the stage chunk first, falling back to the legacy global plan
+        // only for non-stage/full-graph execution.
+        const int planned_chunk_tokens =
+            stage_graph && params.hybrid_chunk_tokens > 0 ?
+                params.hybrid_chunk_tokens :
+                llama_hybrid_runtime_prefill_chunk_tokens();
         const int n_prefill_chunks = planned_chunk_tokens > 0 ?
             (cur->ne[1] + planned_chunk_tokens - 1) / planned_chunk_tokens :
             std::min<int64_t>(qwen2_prefill_ffn_chunk_count(), cur->ne[1]);
