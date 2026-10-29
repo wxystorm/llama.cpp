@@ -303,6 +303,9 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
     rows: List[dict] = []
     current: Tuple[int, int] | None = None
     stage_sums: Dict[str, Dict[str, float]] = {}
+    begin_count = 0
+    stage_count = 0
+    queued_count = 0
 
     def flush() -> None:
         nonlocal current, stage_sums
@@ -333,6 +336,7 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
         for line in f:
             m = begin_re.search(line)
             if m:
+                begin_count += 1
                 flush()
                 current = (int(m.group(1)), int(m.group(2)))
                 stage_sums = {}
@@ -343,6 +347,7 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
 
             m = stage_re.search(line)
             if m:
+                stage_count += 1
                 backend = m.group(1)
                 values = stage_sums.setdefault(
                     backend,
@@ -354,14 +359,17 @@ def cmd_extract_q(args: argparse.Namespace) -> None:
                 continue
 
             if queued_re.search(line):
+                queued_count += 1
                 flush()
 
     flush()
 
     if not rows:
         raise SystemExit(
-            "no q samples found; run with LLAMA_JUPITER_PROFILE_STAGE=1 "
-            "and LLAMA_JUPITER_TRACE=1"
+            "no q samples found; "
+            f"matched BEGIN={begin_count} STAGE_PROFILE={stage_count} QUEUED={queued_count}. "
+            "If all counts are zero, update jupiter_planner.py to the latest branch "
+            "version or convert the PowerShell Tee-Object log to UTF-8."
         )
 
     with open(args.output, "w", newline="", encoding="utf-8") as f:
