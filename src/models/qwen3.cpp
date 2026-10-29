@@ -120,6 +120,71 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
     ggml_tensor * inp_out_ids = build_output_head ? build_inp_out_ids() : nullptr;
 
+    // The outer Region Ring already supplies one causal token interval to
+    // this stage.  When it contains one complete C2P -> Phone Full -> P2C
+    // island, expose the Phone layer chain as one device-local RPC graph.
+    // The existing Attention/KV inputs are created once above and reused
+    // for every Phone layer in this interval; no per-layer host bounce.
+    //
+    // Opt in for Dense A/B validation.  Without this switch the previously
+    // validated per-subgraph Dense path is unchanged.
+    const char * dense_region_env =
+        std::getenv("LLAMA_HYBRID_DENSE_PHONE_REGION");
+    const bool dense_region_requested =
+        dense_region_env != nullptr && std::atoi(dense_region_env) != 0;
+    int dense_region_c2p = -1;
+    int dense_region_p2c = -1;
+    bool dense_region_unique = true;
+    if (dense_region_requested && stage_graph) {
+        for (int il = layer_begin; il < layer_end; ++il) {
+            const auto mode = model.hybrid_layer_mode(il);
+            if (mode == llama_hybrid_layer_mode::TENSOR_C2P) {
+                if (dense_region_c2p >= 0) { dense_region_unique = false; }
+                dense_region_c2p = il;
+            } else if (mode == llama_hybrid_layer_mode::TENSOR_P2C) {
+                if (dense_region_p2c >= 0) { dense_region_unique = false; }
+                dense_region_p2c = il;
+            }
+        }
+    }
+    bool dense_region_phone_only =
+        dense_region_unique && dense_region_c2p == layer_begin &&
+        dense_region_p2c > dense_region_c2p + 1 &&
+        dense_region_p2c == layer_end - 1;
+    if (dense_region_phone_only) {
+        for (int il = dense_region_c2p + 1;
+                il < dense_region_p2c; ++il) {
+            dense_region_phone_only =
+                model.hybrid_layer_mode(il) ==
+                    llama_hybrid_layer_mode::PHONE_ONLY &&
+                cvec->tensor_for(il) == nullptr &&
+                (size_t) il < cparams.embeddings_layer_inp.size() &&
+                !cparams.embeddings_layer_inp[(size_t) il] &&
+                dense_region_phone_only;
+        }
+    }
+    const bool dense_region_active =
+        dense_region_requested && stage_graph &&
+        dense_region_phone_only && !build_output_head &&
+        n_tokens > 1 && params.hybrid_chunk_tokens > 0 &&
+        n_tokens <= params.hybrid_chunk_tokens &&
+        ubatch.n_pos == 1 && ubatch.n_seqs_unq == 1 &&
+        (!ubatch.equal_seqs() || ubatch.n_seqs == 1) &&
+        model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+        loras->empty();
+    if (dense_region_requested && stage_graph && n_tokens > 1) {
+        LLAMA_LOG_ERROR(
+            "[DENSE_PHONE_REGION_GRAPH] arch=qwen3 "
+            "c2p=%d phone=[%d,%d) p2c=%d "
+            "tokens=%lld outer_chunk=%d attention_inputs=1 "
+            "kv_input_reuse=1 graph_per_chunk=1 "
+            "status=%s\n",
+            dense_region_c2p, dense_region_c2p + 1,
+            dense_region_p2c, dense_region_p2c,
+            (long long) n_tokens, params.hybrid_chunk_tokens,
+            dense_region_active ? "READY" : "FALLBACK_LEGACY");
+    }
+
     for (int il = layer_begin; il < layer_end; ++il) {
         res->t_layer_inp[il] = inpL;
 
@@ -152,7 +217,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
 
             cur = build_attn(inp_attn, model.layers[il].wo, model.layers[il].wo_b, model.layers[il].wo_s, Qcur, Kcur,
                              Vcur, nullptr, nullptr, nullptr, 1.0f / sqrtf(float(n_embd_head)), il);
-            cb(cur, "attn_out", il);
+            if (dense_region_active &&
+                    il > dense_region_c2p && il < dense_region_p2c) {
+                const std::string name =
+                    "phone_region_attn_chunk_0";
+                cb(cur, name.c_str(), il);
+            } else {
+                cb(cur, "attn_out", il);
+            }
         }
         if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
@@ -275,10 +347,22 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "ffn_out", il);
 
         cur = build_cvec(cur, il);
-        cb(cur, "l_out", il);
-
-        // input for next layer
-        inpL = cur;
+        if (dense_region_active && il == dense_region_p2c - 1) {
+            // Meta recognizes this exact terminal and submits all Phone
+            // Attention/FFN subgraphs for this interval as one RPC graph.
+            // Keep the P2C input as a distinct zero-copy l_out alias: the
+            // following Attention remains Phone-owned, while its READY and
+            // PARTIAL transmissions retain the existing Dense protocol.
+            cb(cur, "phone_region_chunk_end_0", il);
+            ggml_build_forward_expand(gf, cur);
+            ggml_tensor * region_output = ggml_view_2d(
+                ctx0, cur, cur->ne[0], cur->ne[1], cur->nb[1], 0);
+            cb(region_output, "l_out", il);
+            inpL = region_output;
+        } else {
+            cb(cur, "l_out", il);
+            inpL = cur;
+        }
     }
     cur = inpL;
 
