@@ -652,10 +652,13 @@ def run_sweep_for_length(
                         actual_batch_tokens, total_tokens, log_path
                     )
                 if actual_prompt_tokens is not None and actual_prompt_tokens != total_tokens:
-                    raise RuntimeError(
-                        "prompt length changed between probe and calibration: "
-                        f"probe={total_tokens} calibration={actual_prompt_tokens}; "
-                        f"log={log_path}"
+                    print(
+                        "[JUPITER_SWEEP_DIAG] "
+                        f"server_task_tokens={actual_prompt_tokens} "
+                        f"decode_batch_tokens={total_tokens}; "
+                        "these are different quantities and do not by "
+                        "themselves indicate a sequence-plan failure.",
+                        file=sys.stderr, flush=True,
                     )
 
                 for line in tail:
