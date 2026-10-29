@@ -43,7 +43,12 @@ FIELDS = [
     "gpu_bank_refills", "gpu_bank_upload_mib", "gpu_bank_prepare_ms",
     "gpu_bank_h2d_ms", "gpu_bank_mover_wall_ms", "gpu_bank_wait_ms",
     "gpu_bank_stage_cpu_copy_ms", "bank_initial_upload_mib",
-    "bank_initial_load_ms", "run_dir",
+    "bank_initial_load_ms", "meta_available",
+    "meta_pc_to_phone_copy_ms", "meta_phone_to_pc_copy_ms",
+    "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
+    "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
+    "meta_wait_ms", "meta_graph_ms", "meta_return_payload_mib",
+    "run_dir",
 ]
 NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
 
@@ -170,6 +175,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "gpu_bank_stage_cpu_copy_ms": total(ring, "bank_stage_cpu_copy_ms"),
         "bank_initial_upload_mib": float(initial_mib) if initial_mib else None,
         "bank_initial_load_ms": float(initial_ms) if initial_ms else None,
+        "meta_available": any(x.get("meta_available", False) for x in ring),
         "run_dir": str(folder),
     }
     if code == 0 and not perf and not ring:
@@ -179,6 +185,13 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                        "prepare_ms", "output_sync_ms", "ready_wait_ms",
                        "prepare_wait_ms"):
             row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
+    for key in (
+        "meta_pc_to_phone_copy_ms", "meta_phone_to_pc_copy_ms",
+        "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
+        "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
+        "meta_wait_ms", "meta_graph_ms", "meta_return_payload_mib",
+    ):
+        row[key] = total(ring, key) if row["meta_available"] else None
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
     row["gpu_cuda_gate_wait_ms"] = total(ring, "gpu_cuda_gate_wait_ms")
     return {field: row.get(field) for field in FIELDS}
