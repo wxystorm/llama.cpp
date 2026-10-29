@@ -14411,7 +14411,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
 
     // Opt-in V1: reorder only the already-built, already-allocated Meta
     // subgraphs. Each C2P chunk may be followed immediately by its complete
-    // L35-L45 Phone Region graph. This gives PC work on chunk N+1 a chance
+    // Phone Region graph. This gives PC work on chunk N+1 a chance
     // to overlap the asynchronous Phone execution of chunk N. The existing
     // C2P route-copy fence still serializes access before the next Phone FFN;
     // neither KV ordering nor the P2C protocol is changed.
@@ -14577,6 +14577,22 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         ggml_backend_meta_tensor_p2c_layer(
             backend_ctx, region_pipe_p2c_layer);
 
+    if (pipeline_debug &&
+            (region_pipe_c2p_layer >= 0 ||
+             region_pipe_p2c_layer >= 0 ||
+             region_pipe_phone_first_layer >= 0)) {
+        printf(
+            "[PHONE_REGION_DIRECTIONAL_TOPOLOGY] "
+            "c2p=%d phone=[%d,%d] p2c=%d unique=%d "
+            "status=%s\n",
+            region_pipe_c2p_layer,
+            region_pipe_phone_first_layer,
+            region_pipe_phone_last_layer,
+            region_pipe_p2c_layer,
+            region_pipe_topology_unique ? 1 : 0,
+            region_pipe_topology ? "READY" : "REJECT");
+    }
+
     if (region_pipeline_requested && n_backends == 2 &&
             region_pipe_topology &&
             !return_wavefront_graph) {
@@ -14626,6 +14642,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         // never reorder an unknown SG, a missing chunk, or a fragmented region
         // spanning an outer ggml scheduler split.
         bool eligible = region_pipe_chunks.size() >= 2;
+        if (region_pipe_chunks.size() == 1) {
+            // The outer Ring already pipelines this token interval. One local
+            // chunk still uses explicit C2P/Phone/P2C graphs, but there is no
+            // second local chunk to reorder inside this Meta invocation.
+            region_pipe_reason = "SINGLE_OUTER_CHUNK_DIRECT";
+        }
         size_t first_norm = region_pipe_invalid_sg;
         size_t last_down = region_pipe_invalid_sg;
         size_t last_region_end = region_pipe_invalid_sg;
@@ -14661,7 +14683,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                 region_pipe_chunks.at(0).begin_sg == last_down + 1;
         }
 
-        // L46 now exposes an explicit per-chunk Attention begin marker and an
+        // P2C exposes an explicit per-chunk Attention begin marker and an
         // existing per-chunk FFN-down end marker. The dependency walk below is
         // still kept as a correctness guard: every early continuation must
         // depend only on its own completed Region output, never a future one.
@@ -15498,7 +15520,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                             eligible = false;
                             break;
                         }
-                        // The complete L35-L45 graph is fused into begin_sg.
+                        // The complete Phone Region graph is fused into begin_sg.
                         covered[sg] = true;
                     }
                 };
@@ -15779,12 +15801,12 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             continue;
         }
 
-        // Legacy fallback only. Region -> L46 is a Phone-local dependency,
+        // Legacy fallback only. Region -> P2C is a Phone-local dependency,
         // so even this compatibility path must not turn producer completion
         // into a PC wait. In local-MAIN mode this schedule entry is removed
-        // entirely and the server owns Region -> L46 Attention -> FFN.
+        // entirely and the server owns Region -> P2C Attention -> FFN.
         // No wait_ready_seq(), completion worker, REGION_DONE notification,
-        // or START_L46 control round-trip belongs on this edge.
+        // or START_P2C control round-trip belongs on this edge.
         //
         // Completion seqs are retained only by phone_region_scratch_slots for
         // safe N%%2 scratch-buffer reuse. They are memory-lifetime credits,
@@ -19675,7 +19697,7 @@ auto prefill_norm_sg_has_prework =
                 phone_block_last_layer);
         // A fused Phone-only chunk ends at an internal scheduling marker,
         // never at an inter-device reduction/handoff boundary. Its output
-        // remains Phone-resident for the next chunk or L46 Phone Attention.
+        // remains Phone-resident for the next chunk or P2C Phone Attention.
         if (n_backends > 1 && !phone_region_fused &&
                 (communication_sg < backend_ctx->n_subgraphs - 1 || terminal_phone_exit)) {
             const int64_t reduce_start_us = ggml_time_us();
@@ -19861,7 +19883,7 @@ auto prefill_norm_sg_has_prework =
         if (region_pipeline_active && pipeline_debug &&
                 pipeline_stage != nullptr) {
             // PHONE_REGION is a submit boundary. In local-MAIN mode the ACK
-            // only means the server accepted the complete Region->L46 task;
+            // only means the server accepted the complete Region->P2C task;
             // producer completion never returns to the PC scheduler. The next
             // PC-visible events are READY and PARTIAL data delivery.
             printf("[PHONE_REGION_PIPE_STAGE] step=%zu chunk=%d "
