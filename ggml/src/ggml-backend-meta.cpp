@@ -10838,6 +10838,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     phone_fold->data =
                         ggml_backend_buffer_get_base(
                             stage_buf.get());
+                    std::snprintf(
+                        phone_fold->name,
+                        sizeof(phone_fold->name),
+                        "%s",
+                        phone_partial->name);
 
                     p2c_return_src_hold =
                         std::make_shared<ggml_tensor>(
@@ -11012,21 +11017,26 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                     deferred->phone_fold =
                         p2c_return_payload;
 
+                    bool publish_conflict = false;
                     {
                         std::lock_guard<std::mutex> lock(
                             backend_ctx->p2c_deferred_mutex);
-                        if (backend_ctx->
+                        publish_conflict =
+                            backend_ctx->
                                 p2c_deferred_published != 0 ||
-                                backend_ctx->
-                                    p2c_deferred_states.count(
-                                        p2c_return_seq) != 0) {
-                            release_p2c_deferred_lane();
-                            return GGML_STATUS_FAILED;
+                            backend_ctx->
+                                p2c_deferred_states.count(
+                                    p2c_return_seq) != 0;
+                        if (!publish_conflict) {
+                            backend_ctx->p2c_deferred_states[
+                                p2c_return_seq] = deferred;
+                            backend_ctx->p2c_deferred_published =
+                                p2c_return_seq;
                         }
-                        backend_ctx->p2c_deferred_states[
-                            p2c_return_seq] = deferred;
-                        backend_ctx->p2c_deferred_published =
-                            p2c_return_seq;
+                    }
+                    if (publish_conflict) {
+                        release_p2c_deferred_lane();
+                        return GGML_STATUS_FAILED;
                     }
                     p2c_deferred_lane_reserved = false;
 
