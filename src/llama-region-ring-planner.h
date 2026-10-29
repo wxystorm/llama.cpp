@@ -1304,6 +1304,32 @@ inline double relative_ring_mismatch(double lhs, double rhs) {
     return std::abs(lhs - rhs) / denom;
 }
 
+// Minimax load imbalance of the first N cycles. The accumulated service
+// vector contains real per-Chunk CPU/GPU/Phone profiled times divided by XC,
+// XG/XP, including the Phone RPC graph cost. Link times are per-token
+// G->C, C->P, P->G measurements. Multiplication by N preserves the existing
+// cyclic E1 equation for the first cycle. The exact final boundary count,
+// KV dependencies, PREPARE and H2D belong to the full Prompt simulator.
+inline double prefix_cycle_max_error(
+        const std::array<double, 3> & work,
+        const std::array<double, 3> & links,
+        int n_cycles) {
+    if (n_cycles <= 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double scale = (double) n_cycles;
+    const double A = work[(size_t) device::CPU];
+    const double B = work[(size_t) device::GPU];
+    const double D = work[(size_t) device::PHONE];
+    const double e1 = relative_ring_mismatch(
+        B, D + scale * links[0]); // P -> G
+    const double e2 = relative_ring_mismatch(
+        A, B + scale * links[1]); // G -> C
+    const double e3 = relative_ring_mismatch(
+        D, A + scale * links[2]); // C -> P
+    return std::max({e1, e2, e3});
+}
+
 // Evaluate the same local ring equations for a concrete runtime layout whose
 // three cycles need not have identical C/G widths (the fixed baseline ends in
 // G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
@@ -1538,6 +1564,10 @@ struct result {
     size_t e_window_shortlisted = 0;
     size_t nonuniform_profiled = 0;
     size_t nonuniform_simulated = 0;
+    size_t first_cycle_profiled = 0;
+    size_t first_cycle_selected = 0;
+    size_t prefix_expanded = 0;
+    size_t prefix_completed = 0;
     double coarse_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_limit = std::numeric_limits<double>::infinity();
     double shortlist_e_limit = std::numeric_limits<double>::infinity();
