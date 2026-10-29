@@ -164,6 +164,87 @@ Offline runner checks (no model or RPC needed):
 python -m unittest discover -s .\tools\jupiter -p test_run_q_sweep.py -v
 ```
 
+## Sequence DP candidate refinement (targeted q calibration)
+
+A fixed-x q sweep is **not a complete (x,prefix) grid**. Previously the DP
+interpolated x *within each prefix*; if a prefix had only x=48 measured, then
+q(128, that prefix) incorrectly inherited the 48-token cost. Now q first
+interpolates/extrapolates **prefix y at the same chunk size x**, then interpolates
+across measured chunk sizes. It also prints exact sample coverage:
+
+```text
+[JUPITER_SEQUENCE_COVERAGE] total=357 metric=latency_ms measured=... chunks=... missing=128:144;... status=NEEDS_TARGETED_Q
+```
+
+These are still estimates, not new measurements. Before accepting the plan,
+run the iterative point calibration (reuses the full q sweep CSV; no need to
+repeat the seven fixed-x sweeps):
+
+```powershell
+python .\tools\jupiter\refine_sequence_q.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --profile .\jupiter-q-sweep-final-lv3\tokens-357-<config-hash>\q-profile-all.csv `
+  --target-tokens 357 `
+  --pc-layers 25 `
+  --metric compute_ms `
+  --repeats 3 `
+  --max-rounds 3 `
+  --out-dir .\jupiter-refine-compute `
+  --plan-output .\jupiter-refined-compute.plan
+```
+
+Replace `<config-hash>` with the generated folder name (or provide the
+full actual CSV path). For example, in PowerShell:
+
+```powershell
+$profile = (Get-ChildItem .\jupiter-q-sweep-final-lv3 -Filter q-profile-all.csv -Recurse | Select-Object -First 1).FullName
+```
+
+Then pass `--profile "$profile"`. You can use `--metric wall_ms`
+with **the same original CSV** but a different `--out-dir` and
+`--plan-output` to generate a second candidate without a full re-sweep.
+The original CSV remains unchanged.
+
+Each missing `q(x,y)` is measured at **exactly** chunk length `x` and
+prefix `y`, embedded within a complete plan of the observed prompt length.
+The profiler uses `-lv 3`, `LLAMA_JUPITER_Q_SWEEP=1`,
+`LLAMA_JUPITER_PROFILE_STAGE=1`, and `WINDOW=1`. This requires the updated
+PC binary, but **not** a phone rebuild. The tool saves only target-position
+samples to `q-profile-refined.csv`, re-solves DP and repeats if the candidate
+moves to new unmeasured points. Every successful point is committed only
+after all repeats finish.
+
+A fully covered plan prints:
+
+```text
+[JUPITER_REFINE_DONE] status=FULLY_MEASURED ... plan=...
+```
+
+If the DP has not stabilized by `--max-rounds`, the tool exits 2 with
+`[JUPITER_REFINE_INCOMPLETE]`. The intermediate `candidate.plan` and
+`q-profile-refined.csv` remain in the output directory, **but the requested
+final plan is NOT written**. Resume safely with
+`--resume --max-rounds 6`. This never treats an extrapolated candidate as
+a completed experiment.
+
+For manual DP diagnostics, the `sequence` command now accepts
+`--metric compute_ms|wall_ms` and `--require-measured`.
+
+A fully measured *calibration* candidate is **not** a proof of improved
+asynchronous Prefill latency. After refinement, compare it with default
+and fixed64 using `run_prefill_bench.py` with profiling disabled
+(`LLAMA_JUPITER_PROFILE_STAGE=0`). Keep the default policy unless the
+formal asynchronous A/B confirms a reproducible speedup.
+
+Offline tests:
+
+```powershell
+python -m unittest discover -s .\tools\jupiter -p test_refine_sequence_q.py -v
+```
+
 ## Formal prefill A/B benchmark (async, low logging)
 
 After q calibration and DP plan generation, **do not benchmark with
