@@ -35,6 +35,7 @@ runs:
 $env:LLAMA_JUPITER_PREFILL="1"
 $env:LLAMA_JUPITER_PROFILE_STAGE="1"
 $env:LLAMA_JUPITER_TRACE="1"
+$env:LLAMA_JUPITER_Q_SWEEP="1"   # include only required sampling markers at -lv 3
 $env:LLAMA_JUPITER_SEQUENCE_PLAN="64,64,64,64,64,38"
 ```
 
@@ -92,12 +93,16 @@ Each calibration point then starts a fresh `llama-cli` with stdin closed and
 `--single-turn --simple-io`, so one completed prompt exits before the next
 sweep point starts.
 
-The Python runner forces `-lv 4`, not `-lv 3`. In this version,
-`LLAMA_LOG_INFO` goes through `common_log_default_callback` as
-`LOG_LEVEL_TRACE (4)`; at verbosity 3 the `JUPITER_SEQUENCE_PLAN`,
-`JUPITER_UBATCH`, and `JUPITER_STAGE_PROFILE` records are hidden even if
-the runtime applied the plan correctly. A missing record at `-lv 3` is
-therefore not evidence of a plan failure.
+The Python q-sweep runner now uses `-lv 3` (not `-lv 4`) and
+`LLAMA_JUPITER_Q_SWEEP=1`. The PC `common/log.cpp` logging callback
+makes only the four calibration-critical records visible at verbosity 3:
+`JUPITER_SEQUENCE_PLAN`, `JUPITER_SEQUENCE_DECISION`,
+`JUPITER_UBATCH` and `JUPITER_STAGE_PROFILE`. Other trace logs stay
+filtered, and console output is limited to plan checks, timing summaries and
+errors; the complete stage samples still go into the per-run log file.
+**Rebuild the PC llama-cli** after updating `common/log.cpp` or the
+`-lv 3` sweep cannot see those records. This opt-in does not change
+ordinary inference logging.
 
 Example for the current 358-token Qwen3-14B experiment:
 
