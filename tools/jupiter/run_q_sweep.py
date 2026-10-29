@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
 import re
 import subprocess
@@ -29,6 +30,7 @@ UBATCH_RE = re.compile(
     r"prefix_tokens=(\d+).*?tokens=(\d+)"
 )
 TASK_TOKENS_RE = re.compile(r"task\.n_tokens\s*=\s*(\d+)")
+PROMPT_EVAL_RE = re.compile(r"prompt eval time\s*=.*?/\s*(\d+)\s+tokens")
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -211,6 +213,96 @@ def reconstruct_plan_from_log(
     return None, "NONE"
 
 
+def infer_runtime_prompt_tokens(log_path: Path) -> tuple[int, str]:
+    """Read the actual prompt length from llama-cli's output, not a guessed 358."""
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+
+    task_counts = [
+        int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)
+    ]
+    timing_counts = [
+        int(m.group(1)) for m in PROMPT_EVAL_RE.finditer(log_text)
+    ]
+
+    # If the slot and timing logs are unavailable, compute the total from the
+    # longest contiguous JUPITER_UBATCH BEGIN chain. A warmup typically reports
+    # two tokens at prefix=0; the real prefill is a longer separate chain.
+    batches = [
+        (int(m.group(1)), int(m.group(2)))
+        for m in UBATCH_RE.finditer(log_text)
+    ]
+    ubatch_total = 0
+    for i, (prefix, _) in enumerate(batches):
+        if prefix != 0:
+            continue
+        end = 0
+        for pfx, tokens in batches[i:]:
+            if pfx != end or tokens <= 0:
+                break
+            end += tokens
+        ubatch_total = max(ubatch_total, end)
+
+    available = []
+    if task_counts:
+        available.append(("task.n_tokens", task_counts[-1]))
+    if timing_counts:
+        available.append(("prompt_eval", timing_counts[-1]))
+    if ubatch_total > 0:
+        available.append(("ubatch_chain", ubatch_total))
+
+    if not available:
+        raise RuntimeError(
+            "token probe produced no prompt length. Check the probe log: "
+            f"{log_path}; expected task.n_tokens, prompt eval time, "
+            "or JUPITER_UBATCH BEGIN records."
+        )
+
+    # The slot's actual task token count is the authoritative value for the
+    # sequence plan. Timing and UBATCH provide independent diagnostics.
+    source, total = available[0]
+    if total <= 0:
+        raise RuntimeError(f"invalid prompt token count {total}: {log_path}")
+
+    report = " ".join(f"{name}={count}" for name, count in available)
+    print(f"[JUPITER_SWEEP_TOKEN_SOURCES] {report}", flush=True)
+
+    for name, count in available[1:]:
+        if count != total:
+            print(
+                f"[JUPITER_SWEEP_TOKEN_WARNING] "
+                f"{name}={count} differs from {source}={total}; "
+                "the runtime plan will still be checked after execution.",
+                file=sys.stderr, flush=True,
+            )
+    return total, source
+
+
+def build_cli_command(
+    args: argparse.Namespace, exe: Path, model: Path, prompt_text: str
+) -> List[str]:
+    # Same CLI options for the token probe and all measured calibrations.
+    # Close stdin in stream_process and request exactly one generation turn.
+    return [
+        str(exe),
+        "-m", str(model),
+        "--rpc", args.rpc,
+        "--split-mode", "layer",
+        "-ngl", "all",
+        "-ub", str(args.max_chunk),
+        "-b", str(args.batch),
+        "-c", str(args.context),
+        "-n", "1",
+        "-t", str(args.threads),
+        "--flash-attn", "on",
+        "-lv", "3",
+        "--no-conversation",
+        "--single-turn",
+        "--simple-io",
+        "-p", prompt_text,
+        *args.extra_arg,
+    ]
+
+
 def run_checked(cmd: Sequence[str], cwd: Path | None = None) -> None:
     shown = subprocess.list2cmdline(list(cmd)) if os.name == "nt" else " ".join(cmd)
     print(f"[JUPITER_SWEEP_TOOL] {shown}", flush=True)
@@ -254,7 +346,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-file", required=True)
 
-    p.add_argument("--target-tokens", type=int, default=358)
+    p.add_argument(
+        "--target-tokens", type=int, default=None,
+        help="optional hint for a dry run; normal runs use llama-cli's "
+             "actual token count and override any mismatched hint",
+    )
     p.add_argument(
         "--x-values",
         type=parse_int_list,
@@ -318,13 +414,19 @@ def main() -> int:
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    plans = print_sweep_plans(
-        args.target_tokens,
-        args.x_values,
-        args.min_chunk,
-        args.max_chunk,
-    )
+    # Dry-run intentionally does not launch the model. A numeric hint can be
+    # used to preview plans, but real calibration always probes the tokenizer.
     if args.dry_run:
+        if args.target_tokens is None:
+            print(
+                "[JUPITER_SWEEP_DRY_RUN] supply --target-tokens N "
+                "to preview plans; a real run detects N automatically."
+            )
+            return 0
+        print_sweep_plans(
+            args.target_tokens, args.x_values,
+            args.min_chunk, args.max_chunk,
+        )
         return 0
 
     base_env = os.environ.copy()
@@ -334,6 +436,70 @@ def main() -> int:
     base_env["LLAMA_JUPITER_TRACE"] = "1"
     base_env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
+    base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
+
+    # First run once without a sequence override. The model's actual tokenizer
+    # and chat/prompt processing determine the exact prefill length. Without
+    # this probe, a one-token difference silently disables the explicit plan.
+    probe_log = out_dir / "q-token-probe.log"
+    probe_env = base_env.copy()
+    probe_env["LLAMA_JUPITER_PROFILE_STAGE"] = "0"
+
+    cmd = build_cli_command(args, exe, model, prompt_text)
+    print(
+        f"[JUPITER_SWEEP_PROBE] action=BEGIN log={probe_log}",
+        flush=True,
+    )
+    exit_code = stream_process(cmd, probe_env, probe_log)
+    if exit_code != 0:
+        raise RuntimeError(
+            f"token probe failed with exit={exit_code}; log={probe_log}"
+        )
+
+    total_tokens, source = infer_runtime_prompt_tokens(probe_log)
+    print(
+        f"[JUPITER_SWEEP_TOKENS] actual={total_tokens} source={source} "
+        f"requested={args.target_tokens if args.target_tokens is not None else 'auto'}",
+        flush=True,
+    )
+    if args.target_tokens is not None and args.target_tokens != total_tokens:
+        print(
+            f"[JUPITER_SWEEP_TARGET_OVERRIDE] "
+            f"requested={args.target_tokens} actual={total_tokens} "
+            "action=USE_RUNTIME_TOKEN_COUNT",
+            flush=True,
+        )
+
+    if total_tokens > args.context or total_tokens > args.batch:
+        raise RuntimeError(
+            f"actual prompt has {total_tokens} tokens, which exceeds "
+            f"--context={args.context} or --batch={args.batch}; "
+            "increase the limits so the runtime can apply a single "
+            "full-prompt Jupiter sequence plan."
+        )
+
+    plans = print_sweep_plans(
+        total_tokens, args.x_values,
+        args.min_chunk, args.max_chunk,
+    )
+
+    # Segregate artifacts by actual token count and configuration so --resume
+    # will not reuse CSVs from a different prompt, hardware split or length.
+    signature_input = "\\n".join([
+        prompt_text, str(model), args.rpc,
+        str(args.pc_layers), str(args.batch),
+        str(args.context), str(args.threads),
+        str(args.max_chunk), str(args.min_chunk),
+    ])
+    signature = hashlib.sha256(
+        signature_input.encode("utf-8")
+    ).hexdigest()[:12]
+    run_dir = out_dir / f"tokens-{total_tokens}-{signature}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[JUPITER_SWEEP_OUTPUT] dir={run_dir}",
+        flush=True,
+    )
 
     csv_paths: List[Path] = []
 
@@ -342,41 +508,37 @@ def main() -> int:
 
         for repeat in range(1, args.repeats + 1):
             stem = f"q-x{x}-r{repeat}"
-            log_path = out_dir / f"{stem}.log"
-            csv_path = out_dir / f"{stem}.csv"
+            log_path = run_dir / f"{stem}.log"
+            csv_path = run_dir / f"{stem}.csv"
 
             if args.resume and log_path.is_file() and csv_path.is_file():
+                recorded, _ = reconstruct_plan_from_log(
+                    log_path, total_tokens, args.min_chunk,
+                )
+                with csv_path.open(
+                    "r", newline="", encoding="utf-8-sig"
+                ) as existing_csv:
+                    has_samples = next(csv.DictReader(existing_csv), None) is not None
+                if recorded == chunks and has_samples:
+                    print(
+                        f"[JUPITER_SWEEP_RESUME] x={x} "
+                        f"repeat={repeat}/{args.repeats} action=SKIP "
+                        f"csv={csv_path}",
+                        flush=True,
+                    )
+                    csv_paths.append(csv_path)
+                    continue
                 print(
                     f"[JUPITER_SWEEP_RESUME] x={x} "
-                    f"repeat={repeat}/{args.repeats} action=SKIP "
-                    f"csv={csv_path}",
+                    f"repeat={repeat}/{args.repeats} "
+                    "action=RERUN reason=INCOMPLETE_OR_MISMATCHED",
                     flush=True,
                 )
-                csv_paths.append(csv_path)
-                continue
 
             env = base_env.copy()
             env["LLAMA_JUPITER_SEQUENCE_PLAN"] = plan_text
 
-            cmd = [
-                str(exe),
-                "-m", str(model),
-                "--rpc", args.rpc,
-                "--split-mode", "layer",
-                "-ngl", "all",
-                "-ub", str(args.max_chunk),
-                "-b", str(args.batch),
-                "-c", str(args.context),
-                "-n", "1",
-                "-t", str(args.threads),
-                "--flash-attn", "on",
-                "-lv", "3",
-                "--no-conversation",
-                "--single-turn",
-                "--simple-io",
-                "-p", prompt_text,
-            ]
-            cmd.extend(args.extra_arg)
+            cmd = build_cli_command(args, exe, model, prompt_text)
 
             print(
                 f"\n[JUPITER_SWEEP_RUN] x={x} "
@@ -393,7 +555,7 @@ def main() -> int:
 
             actual_chunks, source = reconstruct_plan_from_log(
                 log_path,
-                args.target_tokens,
+                total_tokens,
                 args.min_chunk,
             )
             if actual_chunks is None:
@@ -408,15 +570,15 @@ def main() -> int:
                     print(
                         "[JUPITER_SWEEP_DIAG] "
                         f"runtime_prompt_tokens={actual_prompt_tokens} "
-                        f"target_tokens={args.target_tokens} "
+                        f"target_tokens={total_tokens} "
                         f"plan_sum={sum(chunks)}",
                         file=sys.stderr,
                     )
-                    if actual_prompt_tokens != args.target_tokens:
+                    if actual_prompt_tokens != total_tokens:
                         raise RuntimeError(
                             "prompt token count mismatch: "
                             f"runtime={actual_prompt_tokens}, "
-                            f"--target-tokens={args.target_tokens}. "
+                            f"probed={total_tokens}. "
                             "The explicit Jupiter sequence plan is ignored when "
                             "its chunk sum does not match the runtime prompt batch."
                         )
@@ -457,7 +619,7 @@ def main() -> int:
             ])
             csv_paths.append(csv_path)
 
-    profile_path = out_dir / "q-profile-all.csv"
+    profile_path = run_dir / "q-profile-all.csv"
     rows, unique_xy = merge_csvs(csv_paths, profile_path)
     print(
         f"\n[JUPITER_SWEEP_DONE] rows={rows} unique_xy={unique_xy} "
@@ -476,7 +638,7 @@ def main() -> int:
             "--devices", "2",
             "--min-chunk", str(args.min_chunk),
             "--max-chunk", str(args.max_chunk),
-            "--target-length", str(args.target_tokens),
+            "--target-length", str(total_tokens),
         ])
         print(f"[JUPITER_SWEEP_DP] plan={plan_output}", flush=True)
         print(plan_output.read_text(encoding="utf-8"), end="")
