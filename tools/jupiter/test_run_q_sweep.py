@@ -36,6 +36,20 @@ class JupiterSweepTests(unittest.TestCase):
         self.assertEqual(tokens, 359)
         self.assertEqual(source, "task.n_tokens")
 
+    def test_prefill_batch_overrides_task_token_count(self) -> None:
+        # The sequence plan is matched to llama_context::decode() batch size,
+        # which can be smaller than the outer server task's token count.
+        path = self._write_log(
+            "I slot task.n_tokens = 357\n"
+            "[JUPITER_UBATCH] event=BEGIN chunk=0 slot=0 prefix_tokens=0 tokens=128\n"
+            "[JUPITER_UBATCH] event=BEGIN chunk=1 slot=0 prefix_tokens=128 tokens=128\n"
+            "[JUPITER_UBATCH] event=BEGIN chunk=2 slot=0 prefix_tokens=256 tokens=100\n"
+            "I slot prompt eval time = 8000 ms / 357 tokens\n"
+        )
+        tokens, source = infer_runtime_prompt_tokens(path)
+        self.assertEqual(tokens, 356)
+        self.assertEqual(source, "ubatch_chain")
+
     def test_prompt_eval_fallback(self) -> None:
         path = self._write_log(
             "I slot prompt eval time = 7924.66 ms / 358 tokens\n"
