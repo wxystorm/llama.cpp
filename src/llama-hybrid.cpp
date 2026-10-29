@@ -10213,6 +10213,35 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
+        // First-Cycle minimax seeds are expanded using prefix load, not
+        // uniform layer counts. Keep the chosen trajectory observable:
+        // W_n is the accumulated profiled ms/token on each device and
+        // E_n is its cyclic minimax mismatch after the first n Cycles.
+        // The subsequent optional Tensor pass and final wall ranking stay
+        // unchanged.
+        if (!forced_ab && best.prefix_cycles > 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_PREFIX_SELECTED] "
+                "cycles=%d layout=%s mode=E1_THEN_PREFIX_LOAD "
+                "status=PROFILE_ESTIMATE\n",
+                best.prefix_cycles,
+                llama_region_ring_layout_string(best_regions).c_str());
+            for (int i = 0; i < best.prefix_cycles; ++i) {
+                const auto & w = best.prefix_service[(size_t) i];
+                const size_t first = (size_t) i * 3;
+                const int layers =
+                    best_regions[first + 2].layer_end -
+                    best_regions[first].layer_begin;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_PREFIX_LOAD] cycle=%d "
+                    "cycle_layers=%d W_cpu_mspt=%.6f "
+                    "W_gpu_mspt=%.6f W_phone_mspt=%.6f "
+                    "E_prefix=%.6f status=PROFILE_ESTIMATE\n",
+                    i + 1, layers, w[0], w[1], w[2],
+                    best.prefix_error[(size_t) i]);
+            }
+        }
+
         bool boundary_tensor_selected = false;
         if (!forced_ab) {
             if (boundary_memory_feasible &&
