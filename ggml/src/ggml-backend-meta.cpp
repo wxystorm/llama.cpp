@@ -18454,31 +18454,79 @@ auto prefill_norm_sg_has_prework =
             }
 
             ggml_backend_meta_cpu_task_desc c2p_pc_main_desc {};
-            c2p_pc_main_desc.kind =
-                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
-            c2p_pc_main_desc.urgency =
-                GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
-            c2p_pc_main_desc.chunk =
-                backend_ctx->cpu_task_outer_chunk.load(
-                    std::memory_order_relaxed);
-            if (c2p_pc_main_desc.chunk < 0) {
-                c2p_pc_main_desc.chunk = prefill_down_chunk;
-            }
-            c2p_pc_main_desc.layer = prefill_down_layer;
-            c2p_pc_main_desc.continuation_group =
-                (UINT64_C(0x43525000) << 32) ^
-                (uint64_t) (uint32_t) (prefill_down_layer + 1) << 16 ^
-                (uint64_t) (uint32_t) (c2p_pc_main_desc.chunk + 1);
-            if (c2p_parallel_ready) {
-                c2p_pc_main_desc.flags =
-                    GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
-                compute_workers.start_graph(
-                    0, c2p_pc_prefix_graph,
-                    &c2p_pc_main_desc);
+            if (c2p_prefill_exec) {
+                c2p_pc_main_desc.kind =
+                    GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+                c2p_pc_main_desc.urgency =
+                    GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+                c2p_pc_main_desc.chunk =
+                    backend_ctx->cpu_task_outer_chunk.load(
+                        std::memory_order_relaxed);
+                if (c2p_pc_main_desc.chunk < 0) {
+                    c2p_pc_main_desc.chunk = prefill_down_chunk;
+                }
+                c2p_pc_main_desc.layer = prefill_down_layer;
+                c2p_pc_main_desc.continuation_group =
+                    (UINT64_C(0x43525000) << 32) ^
+                    (uint64_t) (uint32_t) (prefill_down_layer + 1) << 16 ^
+                    (uint64_t) (uint32_t) (c2p_pc_main_desc.chunk + 1);
+                if (c2p_parallel_ready) {
+                    c2p_pc_main_desc.flags =
+                        GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
+                    compute_workers.start_graph(
+                        0, c2p_pc_prefix_graph,
+                        &c2p_pc_main_desc);
+                } else {
+                    GGML_ASSERT(c2p_pc_graph != nullptr);
+                    compute_workers.start_graph(
+                        0, c2p_pc_graph,
+                        &c2p_pc_main_desc);
+                }
             } else {
+                ggml_cgraph * pc_prefill_graph =
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[i].cgraph_main;
+                GGML_ASSERT(pc_prefill_graph != nullptr);
+
+                ggml_backend_meta_cpu_task_desc pc_desc {};
+                const bool p2c_remote_ffn =
+                    ggml_backend_meta_tensor_p2c_layer(
+                        backend_ctx, prefill_down_layer) ||
+                    layer_attention_phone_owned(
+                        prefill_down_layer);
+                pc_desc.kind =
+                    p2c_remote_ffn ?
+                        GGML_BACKEND_META_CPU_TASK_TENSOR_REMOTE_FFN :
+                        GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN;
+                pc_desc.urgency =
+                    p2c_remote_ffn ?
+                        GGML_BACKEND_META_CPU_URGENCY_ACTIVE_CONTINUATION :
+                        GGML_BACKEND_META_CPU_URGENCY_CAUSAL_FRONTIER;
+                pc_desc.chunk =
+                    backend_ctx->cpu_task_outer_chunk.load(
+                        std::memory_order_relaxed);
+                if (pc_desc.chunk < 0) {
+                    pc_desc.chunk = prefill_down_chunk;
+                }
+                pc_desc.layer = prefill_down_layer;
+
                 compute_workers.start_graph(
-                    0, c2p_pc_graph,
-                    &c2p_pc_main_desc);
+                    0, pc_prefill_graph, &pc_desc);
+
+                if (pipeline_debug) {
+                    printf(
+                        "[CPU_TASK_CLASSIFY] "
+                        "layer=%d chunk=%d sg=%zu kind=%s "
+                        "urgency=%d owner=%s status=READY\n",
+                        prefill_down_layer,
+                        prefill_down_chunk,
+                        i,
+                        p2c_remote_ffn ?
+                            "TENSOR_REMOTE_FFN" :
+                            "TENSOR_PC_MAIN",
+                        pc_desc.urgency,
+                        p2c_remote_ffn ? "PHONE_ATTN" : "PC_ATTN");
+                }
             }
 
             if (has_async_prefill_input) {
