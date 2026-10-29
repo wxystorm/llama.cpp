@@ -546,6 +546,21 @@ int main() {
         REQUIRE(result.prefix_completed > 0);
         REQUIRE(result.nonuniform_simulated > 0);
         REQUIRE(!result.selected.concrete_regions.empty());
+        REQUIRE(result.selected.prefix_cycles >= 2);
+        REQUIRE(result.selected.prefix_cycles <= 4);
+        const int final_prefix =
+            result.selected.prefix_cycles - 1;
+        REQUIRE(std::fabs(
+            result.selected.prefix_error[(size_t) final_prefix] -
+            result.selected.ring_error_max) < 1e-8);
+        for (int i = 0; i <= final_prefix; ++i) {
+            REQUIRE(std::isfinite(
+                result.selected.prefix_error[(size_t) i]));
+            for (double w :
+                    result.selected.prefix_service[(size_t) i]) {
+                REQUIRE(std::isfinite(w) && w >= 0.0);
+            }
+        }
         std::vector<llama_region_ring_region> regions;
         REQUIRE(make_regions(result.selected, 48, regions));
         REQUIRE(llama_region_ring_apply_topology_compatible(regions, 48));
