@@ -34,7 +34,7 @@ class JupiterSweepTests(unittest.TestCase):
         )
         tokens, source = infer_runtime_prompt_tokens(path)
         self.assertEqual(tokens, 359)
-        self.assertEqual(source, "task.n_tokens")
+        self.assertEqual(source, "ubatch_chain")
 
     def test_prefill_batch_overrides_task_token_count(self) -> None:
         # The sequence plan is matched to llama_context::decode() batch size,
