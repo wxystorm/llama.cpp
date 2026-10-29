@@ -1724,51 +1724,99 @@ inline result search_runtime_applicable(
     std::vector<candidate> coarse;
 
     for (int cycles = 2; cycles <= 4; ++cycles) {
-        if (m.layers % cycles != 0) {
+        const int width = m.layers / cycles;
+        const int remainder = m.layers % cycles;
+        if (width < 4) {
             continue;
         }
-        const int width = m.layers / cycles;
         for (int p = 2; p <= std::min(8, width - 2); ++p) {
             for (int g = 1; g <= width - p - 1; ++g) {
                 const int c = width - p - g;
                 if (c < 1) {
                     continue;
                 }
-                for (int xc : x_cpu) {
-                    for (int xg : x_gpu) {
-                        for (int xp : x_phone) {
-                            candidate plan;
-                            plan.cycles = cycles;
-                            plan.c = c;
-                            plan.g = g;
-                            plan.p = p;
-                            plan.tail_c = 0;
-                            plan.tail_g = 0;
-                            plan.xc = xc;
-                            plan.xg = xg;
-                            plan.xp = xp;
-                            ++out.enumerated;
+                // A non-dividing model still has 2/3/4 Cycle candidates.
+                // Put the extra layers on G, C, or P in the early Cycles;
+                // full boundary refinement may subsequently move *every*
+                // boundary to any legal position, so these are only seeds.
+                const int variations = remainder == 0 ? 1 : 3;
+                for (int extra_owner = 0;
+                        extra_owner < variations; ++extra_owner) {
+                    for (int xc : x_cpu) {
+                        for (int xg : x_gpu) {
+                            for (int xp : x_phone) {
+                                candidate plan;
+                                plan.cycles = cycles;
+                                plan.c = c;
+                                plan.g = g;
+                                plan.p = p;
+                                plan.tail_c = 0;
+                                plan.tail_g = 0;
+                                plan.xc = xc;
+                                plan.xg = xg;
+                                plan.xp = xp;
+                                ++out.enumerated;
 
-                            std::vector<llama_region_ring_region> regions;
-                            if (!make_regions(plan, m.layers, regions) ||
-                                    !llama_region_ring_apply_topology_compatible(
+                                std::vector<llama_region_ring_region> regions;
+                                if (remainder == 0) {
+                                    if (!make_regions(
+                                            plan, m.layers, regions)) {
+                                        continue;
+                                    }
+                                } else {
+                                    int layer = 0;
+                                    for (int n = 0; n < cycles; ++n) {
+                                        const int extra =
+                                            n < remainder ? 1 : 0;
+                                        const int gg = g +
+                                            (extra_owner == 0 ? extra : 0);
+                                        const int cc = c +
+                                            (extra_owner == 1 ? extra : 0);
+                                        const int pp = p +
+                                            (extra_owner == 2 ? extra : 0);
+                                        regions.emplace_back(
+                                            device::GPU, layer, layer + gg);
+                                        layer += gg;
+                                        regions.emplace_back(
+                                            device::CPU, layer, layer + cc);
+                                        layer += cc;
+                                        regions.emplace_back(
+                                            device::PHONE, layer, layer + pp);
+                                        layer += pp;
+                                    }
+                                    plan.concrete_regions = regions;
+                                }
+                                if (!llama_region_ring_apply_topology_compatible(
                                         regions, m.layers) ||
-                                    regions.back().device != device::PHONE) {
-                                continue;
+                                        regions.back().device !=
+                                            device::PHONE) {
+                                    continue;
+                                }
+                                if ((m.memory_feasible &&
+                                        !m.memory_feasible(plan)) ||
+                                        (m.region_memory_feasible &&
+                                         !m.region_memory_feasible(regions))) {
+                                    ++out.rejected_memory;
+                                    continue;
+                                }
+                                const bool profiled = remainder == 0 ?
+                                    estimate_balance(m, plan) :
+                                    estimate_region_ring_balance(
+                                        m, regions, plan);
+                                if (!profiled) {
+                                    ++out.rejected_profile;
+                                    continue;
+                                }
+                                if (remainder != 0) {
+                                    const auto & a =
+                                        plan.ring_stage_ms_per_token;
+                                    plan.coarse_ms = std::max(
+                                        m.tokens * std::max({a[0],a[1],a[2]}),
+                                        plan.weight_h2d_busy_ms);
+                                }
+                                ++out.profiled;
+                                coarse.push_back(std::move(plan));
                             }
-                            if ((m.memory_feasible &&
-                                    !m.memory_feasible(plan)) ||
-                                    (m.region_memory_feasible &&
-                                     !m.region_memory_feasible(regions))) {
-                                ++out.rejected_memory;
-                                continue;
-                            }
-                            if (!estimate_balance(m, plan)) {
-                                ++out.rejected_profile;
-                                continue;
-                            }
-                            ++out.profiled;
-                            coarse.push_back(std::move(plan));
                         }
                     }
                 }
