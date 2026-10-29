@@ -37,6 +37,12 @@ compare a non-streaming configuration. For a fixed-layout A/B test, use
 `--force-xc 32 --force-xg 64 --force-xp 128` (the example has 48 layers;
 use a layout matching your model).
 
+The CSV parser can be checked without a model or Phone:
+
+```powershell
+python .\tools\region-ring-experiments\test_prompt_sweep.py
+```
+
 A command preview is available with `--dry-run`. Every actual run loads its
 model once, uses the planner selected for that input length (filename token
 number is a hint), and generates up to 32 tokens by default. Context size
