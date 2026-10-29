@@ -24,6 +24,17 @@ enum class llama_region_ring_device : uint8_t {
     PHONE = 2,
 };
 
+// Logical Region stage kind. C2P/P2C are boundary layers, not additional
+// physical executors: both run through the existing Meta/Phone lane while
+// reusing the directional Tensor implementation already present in Meta.
+enum class llama_region_ring_stage_kind : uint8_t {
+    CPU = 0,
+    GPU = 1,
+    PHONE = 2,
+    C2P = 3,
+    P2C = 4,
+};
+
 inline constexpr std::array<llama_region_ring_device, 3>
 LLAMA_REGION_RING_CYCLE_ORDER = {
     llama_region_ring_device::GPU,
@@ -37,10 +48,77 @@ LLAMA_REGION_RING_CYCLE_ORDER = {
 // retained only for deterministic bounded-slot scheduler regression tests.
 inline constexpr size_t LLAMA_REGION_RING_SLOT_POOL_SIZE = 0;
 
+inline llama_region_ring_device llama_region_ring_stage_device(
+        llama_region_ring_stage_kind kind) {
+    switch (kind) {
+        case llama_region_ring_stage_kind::CPU:
+            return llama_region_ring_device::CPU;
+        case llama_region_ring_stage_kind::GPU:
+            return llama_region_ring_device::GPU;
+        case llama_region_ring_stage_kind::PHONE:
+        case llama_region_ring_stage_kind::C2P:
+        case llama_region_ring_stage_kind::P2C:
+            return llama_region_ring_device::PHONE;
+    }
+    throw std::runtime_error("invalid region ring stage kind");
+}
+
+inline llama_region_ring_stage_kind llama_region_ring_device_stage(
+        llama_region_ring_device device) {
+    switch (device) {
+        case llama_region_ring_device::CPU:
+            return llama_region_ring_stage_kind::CPU;
+        case llama_region_ring_device::GPU:
+            return llama_region_ring_stage_kind::GPU;
+        case llama_region_ring_device::PHONE:
+            return llama_region_ring_stage_kind::PHONE;
+    }
+    throw std::runtime_error("invalid region ring device");
+}
+
+inline const char * llama_region_ring_stage_name(
+        llama_region_ring_stage_kind kind) {
+    switch (kind) {
+        case llama_region_ring_stage_kind::CPU:   return "CPU";
+        case llama_region_ring_stage_kind::GPU:   return "GPU";
+        case llama_region_ring_stage_kind::PHONE: return "PHONE";
+        case llama_region_ring_stage_kind::C2P:   return "C2P";
+        case llama_region_ring_stage_kind::P2C:   return "P2C";
+    }
+    return "UNKNOWN";
+}
+
+inline bool llama_region_ring_stage_is_directional(
+        llama_region_ring_stage_kind kind) {
+    return kind == llama_region_ring_stage_kind::C2P ||
+           kind == llama_region_ring_stage_kind::P2C;
+}
+
 struct llama_region_ring_region {
     llama_region_ring_device device;
     int layer_begin;
     int layer_end; // exclusive
+    llama_region_ring_stage_kind kind;
+
+    llama_region_ring_region(
+            llama_region_ring_device device_,
+            int layer_begin_,
+            int layer_end_) :
+        device(device_),
+        layer_begin(layer_begin_),
+        layer_end(layer_end_),
+        kind(llama_region_ring_device_stage(device_)) {
+    }
+
+    llama_region_ring_region(
+            llama_region_ring_stage_kind kind_,
+            int layer_begin_,
+            int layer_end_) :
+        device(llama_region_ring_stage_device(kind_)),
+        layer_begin(layer_begin_),
+        layer_end(layer_end_),
+        kind(kind_) {
+    }
 };
 
 // GPU weight streaming uses two fixed physical Banks. Keep Bank
@@ -93,11 +171,79 @@ inline bool llama_region_ring_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+inline bool llama_region_ring_directional_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer) {
+    if (regions.size() < 6 || n_layer <= 0 ||
+            regions.front().layer_begin != 0 ||
+            regions.back().layer_end != n_layer ||
+            regions.back().kind != llama_region_ring_stage_kind::PHONE) {
+        return false;
+    }
+
+    int next_layer = 0;
+    int phone_regions = 0;
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto & r = regions[i];
+        if (r.layer_begin != next_layer ||
+                r.layer_end <= r.layer_begin ||
+                r.layer_end > n_layer) {
+            return false;
+        }
+        if (llama_region_ring_stage_is_directional(r.kind) &&
+                r.layer_end - r.layer_begin != 1) {
+            return false;
+        }
+        if (r.kind == llama_region_ring_stage_kind::PHONE) {
+            ++phone_regions;
+        }
+
+        if (i + 1 < regions.size()) {
+            const auto next = regions[i + 1].kind;
+            bool ok = false;
+            switch (r.kind) {
+                case llama_region_ring_stage_kind::GPU:
+                    ok = next == llama_region_ring_stage_kind::CPU;
+                    break;
+                case llama_region_ring_stage_kind::CPU:
+                    ok = next == llama_region_ring_stage_kind::PHONE ||
+                         next == llama_region_ring_stage_kind::C2P;
+                    break;
+                case llama_region_ring_stage_kind::C2P:
+                    ok = next == llama_region_ring_stage_kind::PHONE;
+                    break;
+                case llama_region_ring_stage_kind::PHONE:
+                    ok = next == llama_region_ring_stage_kind::GPU ||
+                         next == llama_region_ring_stage_kind::P2C;
+                    break;
+                case llama_region_ring_stage_kind::P2C:
+                    ok = next == llama_region_ring_stage_kind::GPU;
+                    break;
+            }
+            if (!ok) {
+                return false;
+            }
+        }
+        next_layer = r.layer_end;
+    }
+
+    return phone_regions >= 2;
+}
+
+inline bool llama_region_ring_has_directional_stages(
+        const std::vector<llama_region_ring_region> & regions) {
+    return std::any_of(
+        regions.begin(), regions.end(),
+        [](const llama_region_ring_region & r) {
+            return llama_region_ring_stage_is_directional(r.kind);
+        });
+}
+
 inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         const std::string & spec, int n_layer, bool allow_pc_tail = false) {
-    // L0..L47: GPU4 / CPU7 / Phone5 / GPU4 / CPU7 / Phone5 /
-    //          GPU3 / CPU8 / Phone5. Counts: GPU11, CPU22, Phone15.
-    // Phone boundaries remain [11,16), [27,32), [43,48).
+    // Legacy default remains byte-for-byte compatible with the final Ring
+    // baseline. Directional handoffs are opt-in through the layout spelling,
+    // e.g. G4,C6,C2P1,P4,P2C1,...
     const std::string layout = spec.empty() ?
         "G4,C7,P5,G4,C7,P5,G3,C8,P5" : spec;
     if (n_layer <= 0) {
@@ -115,17 +261,28 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         if (pos == layout.size()) {
             break;
         }
-        const char letter = layout[pos++];
-        llama_region_ring_device device;
-        if (letter == 'C') {
-            device = llama_region_ring_device::CPU;
-        } else if (letter == 'G') {
-            device = llama_region_ring_device::GPU;
-        } else if (letter == 'P') {
-            device = llama_region_ring_device::PHONE;
+
+        llama_region_ring_stage_kind kind;
+        if (layout.compare(pos, 3, "C2P") == 0) {
+            kind = llama_region_ring_stage_kind::C2P;
+            pos += 3;
+        } else if (layout.compare(pos, 3, "P2C") == 0) {
+            kind = llama_region_ring_stage_kind::P2C;
+            pos += 3;
         } else {
-            throw std::runtime_error("ring stages must be C, G or P");
+            const char letter = layout[pos++];
+            if (letter == 'C') {
+                kind = llama_region_ring_stage_kind::CPU;
+            } else if (letter == 'G') {
+                kind = llama_region_ring_stage_kind::GPU;
+            } else if (letter == 'P') {
+                kind = llama_region_ring_stage_kind::PHONE;
+            } else {
+                throw std::runtime_error(
+                    "ring stages must be G, C, P, C2P or P2C");
+            }
         }
+
         const size_t num_begin = pos;
         int count = 0;
         while (pos < layout.size() &&
@@ -138,25 +295,24 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         if (num_begin == pos || count == 0 || layer + count > n_layer) {
             throw std::runtime_error("invalid region ring layer count");
         }
-        const auto expected =
-            LLAMA_REGION_RING_CYCLE_ORDER[regions.size() % 3];
-        if (device != expected) {
+        if (llama_region_ring_stage_is_directional(kind) && count != 1) {
             throw std::runtime_error(
-                "region ring must repeat GPU -> CPU -> Phone");
+                "directional C2P/P2C stages must contain exactly one layer");
         }
-        regions.push_back({device, layer, layer + count});
+
+        regions.emplace_back(kind, layer, layer + count);
         layer += count;
+
         while (pos < layout.size() &&
                std::isspace((unsigned char) layout[pos])) {
             ++pos;
         }
-        // Reaching the end after a valid region is normal. Only treat the
-        // end as a trailing comma if we actually consumed a separator.
         if (pos == layout.size()) {
             break;
         }
         if (layout[pos] != ',') {
-            throw std::runtime_error("region ring stages must be comma-separated");
+            throw std::runtime_error(
+                "region ring stages must be comma-separated");
         }
         ++pos;
         while (pos < layout.size() &&
@@ -168,9 +324,37 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         }
     }
 
+    if (layer != n_layer) {
+        throw std::runtime_error(
+            "region ring layout must cover every layer exactly once");
+    }
+
+    const bool directional =
+        llama_region_ring_has_directional_stages(regions);
+    if (directional) {
+        if (allow_pc_tail ||
+                !llama_region_ring_directional_topology_compatible(
+                    regions, n_layer)) {
+            throw std::runtime_error(
+                "directional region topology must follow "
+                "GPU -> CPU -> [C2P] -> Phone -> [P2C] -> GPU, "
+                "end on Phone, and cover every layer");
+        }
+        return regions;
+    }
+
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto expected =
+            LLAMA_REGION_RING_CYCLE_ORDER[i % 3];
+        if (regions[i].device != expected) {
+            throw std::runtime_error(
+                "region ring must repeat GPU -> CPU -> Phone");
+        }
+    }
+
     const size_t full_cycles = regions.size() / 3;
     const size_t pc_tail_stages = regions.size() % 3;
-    if (full_cycles < 2 || layer != n_layer ||
+    if (full_cycles < 2 ||
             (!allow_pc_tail && pc_tail_stages != 0) ||
             (allow_pc_tail && full_cycles > 4)) {
         throw std::runtime_error(
@@ -223,10 +407,13 @@ inline std::string llama_region_ring_layout_string(
     std::string out;
     for (const auto & r : regions) {
         if (!out.empty()) { out += ","; }
-        const char letter =
-            r.device == llama_region_ring_device::CPU ? 'C' :
-            r.device == llama_region_ring_device::GPU ? 'G' : 'P';
-        out += letter;
+        switch (r.kind) {
+            case llama_region_ring_stage_kind::CPU:   out += "C"; break;
+            case llama_region_ring_stage_kind::GPU:   out += "G"; break;
+            case llama_region_ring_stage_kind::PHONE: out += "P"; break;
+            case llama_region_ring_stage_kind::C2P:   out += "C2P"; break;
+            case llama_region_ring_stage_kind::P2C:   out += "P2C"; break;
+        }
         out += std::to_string(r.layer_end - r.layer_begin);
     }
     return out;
@@ -309,10 +496,26 @@ inline std::array<int, 3> llama_region_ring_layer_counts(
         const std::vector<llama_region_ring_region> & regions) {
     std::array<int, 3> counts = {};
     for (const auto & region : regions) {
+        // Directional boundary layers are Tensor layers physically present on
+        // both sides; do not misreport them as ordinary Phone-full layers.
+        if (llama_region_ring_stage_is_directional(region.kind)) {
+            continue;
+        }
         counts[(size_t) region.device] +=
             region.layer_end - region.layer_begin;
     }
     return counts;
+}
+
+inline int llama_region_ring_directional_layer_count(
+        const std::vector<llama_region_ring_region> & regions) {
+    int count = 0;
+    for (const auto & region : regions) {
+        if (llama_region_ring_stage_is_directional(region.kind)) {
+            count += region.layer_end - region.layer_begin;
+        }
+    }
+    return count;
 }
 
 struct llama_region_ring_task {
