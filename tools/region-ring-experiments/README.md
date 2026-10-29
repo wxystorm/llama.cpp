@@ -56,8 +56,15 @@ The experiment data logger is opt-in via
   accumulated CPU/CUDA/Phone compute-range, graph preparation,
   output readback/synchronization, ready/gate waits, overlapped execution,
   GPU Bank refill, H2D and GPU Bank blocking.
+- `type=measurement_start`: emitted after warmup at the official timing
+  reset; the CSV excludes pre-reset/warmup Region Ring ubatches.
 - `type=perf`: native `llama_perf_context` load/prefill/decode time and
   **actual** token counts, written by `llama_perf_context_print`.
+- Meta copy profile: one snapshot at the start and one after all workers join.
+  `meta_pc_to_phone_copy_ms`, `meta_phone_to_pc_copy_ms`,
+  `meta_phone_backend_ms` and `meta_phone_rpc_ms` are measured
+  **cumulative Meta service/copy times**, and may overlap. They do not
+  measure pure TCP socket transfer time or bytes for every boundary.
 
 `-lv 1` suppresses informational/verbose diagnostics, while fatal/error
 messages are saved to `engine.stderr.log`. No raw CLI content or detailed
@@ -72,6 +79,9 @@ per-Chunk traces appear in the terminal.
   and are **not pure device-kernel times**.
 - `output_sync_ms` includes output readback and synchronization; it is
   **not** equivalent to pure socket/network transfer time.
+- `meta_pc_to_phone_copy_ms` and `meta_phone_to_pc_copy_ms` are observed
+  Meta copies (including any underlying RPC work). They are **not** socket-only
+  times, and must not be added to total device service without overlap handling.
 - Per-device busy intervals, Prepare, H2D, output sync and waits overlap.
   **Never add them up to obtain prefill wall time.**
 - GPU Bank A/B preload is included in model/load time, but not in Prefill.
