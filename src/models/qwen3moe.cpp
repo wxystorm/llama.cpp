@@ -1161,25 +1161,38 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
         ggml_tensor * inpSA = inpL;
 
         // In the causal Sequence pipeline the layer container remains Meta so
-        // its FFN expert weights can be fully mirrored to RPC.  Attention,
-        // however, is a PC-only task.  Borrow Meta child0's physical static
-        // tensors directly so a CPU-only scheduler can execute Attention
-        // without involving Meta/RPC at all.  The serial correctness path
-        // keeps the existing Meta graph unchanged.
+        // its FFN expert weights can be fully mirrored to RPC.  Prefill
+        // Attention is a PC-only task, and single-token decode falls back to
+        // the complete PC copy of the Sequence layer.  Borrow Meta child0's
+        // physical static tensors directly so neither path has to execute the
+        // mirrored Meta container.  The serial correctness path keeps the
+        // existing Meta graph unchanged.
         const char * ring_exec_env =
             std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
-        const bool sequence_attention_direct =
-            sequence_ffn_attention_only &&
+        const bool causal_sequence_exec =
             ring_exec_env != nullptr &&
             std::strcmp(
                 ring_exec_env,
                 "fifo-pc-phone-seq") == 0;
+        const bool sequence_attention_direct =
+            sequence_ffn_attention_only &&
+            causal_sequence_exec;
+        const bool sequence_decode_pc_direct =
+            n_tokens == 1 &&
+            model.hybrid_layer_mode(il) ==
+                llama_hybrid_layer_mode::SEQUENCE_FFN &&
+            causal_sequence_exec;
+        const bool sequence_pc_direct =
+            sequence_attention_direct ||
+            sequence_decode_pc_direct;
 
-        llama_layer direct_attn_layer;
+        llama_layer direct_pc_layer;
         const llama_layer * attn_layer =
             &model.layers[il];
-        if (sequence_attention_direct) {
-            direct_attn_layer = model.layers[il];
+        const llama_layer * ffn_layer =
+            &model.layers[il];
+        if (sequence_pc_direct) {
+            direct_pc_layer = model.layers[il];
 
             auto pc_static = [this](ggml_tensor * tensor) -> ggml_tensor * {
                 if (tensor == nullptr) {
@@ -1199,73 +1212,105 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 return physical;
             };
 
-            direct_attn_layer.attn_norm =
-                pc_static(direct_attn_layer.attn_norm);
-            direct_attn_layer.attn_norm_b =
-                pc_static(direct_attn_layer.attn_norm_b);
-            direct_attn_layer.attn_q_norm =
-                pc_static(direct_attn_layer.attn_q_norm);
-            direct_attn_layer.attn_q_norm_b =
-                pc_static(direct_attn_layer.attn_q_norm_b);
-            direct_attn_layer.attn_k_norm =
-                pc_static(direct_attn_layer.attn_k_norm);
-            direct_attn_layer.attn_k_norm_b =
-                pc_static(direct_attn_layer.attn_k_norm_b);
+            direct_pc_layer.attn_norm =
+                pc_static(direct_pc_layer.attn_norm);
+            direct_pc_layer.attn_norm_b =
+                pc_static(direct_pc_layer.attn_norm_b);
+            direct_pc_layer.attn_q_norm =
+                pc_static(direct_pc_layer.attn_q_norm);
+            direct_pc_layer.attn_q_norm_b =
+                pc_static(direct_pc_layer.attn_q_norm_b);
+            direct_pc_layer.attn_k_norm =
+                pc_static(direct_pc_layer.attn_k_norm);
+            direct_pc_layer.attn_k_norm_b =
+                pc_static(direct_pc_layer.attn_k_norm_b);
 
-            direct_attn_layer.wq =
-                pc_static(direct_attn_layer.wq);
-            direct_attn_layer.wq_b =
-                pc_static(direct_attn_layer.wq_b);
-            direct_attn_layer.wq_s =
-                pc_static(direct_attn_layer.wq_s);
-            direct_attn_layer.wq_in_s =
-                pc_static(direct_attn_layer.wq_in_s);
+            direct_pc_layer.wq =
+                pc_static(direct_pc_layer.wq);
+            direct_pc_layer.wq_b =
+                pc_static(direct_pc_layer.wq_b);
+            direct_pc_layer.wq_s =
+                pc_static(direct_pc_layer.wq_s);
+            direct_pc_layer.wq_in_s =
+                pc_static(direct_pc_layer.wq_in_s);
 
-            direct_attn_layer.wk =
-                pc_static(direct_attn_layer.wk);
-            direct_attn_layer.wk_b =
-                pc_static(direct_attn_layer.wk_b);
-            direct_attn_layer.wk_s =
-                pc_static(direct_attn_layer.wk_s);
-            direct_attn_layer.wk_in_s =
-                pc_static(direct_attn_layer.wk_in_s);
+            direct_pc_layer.wk =
+                pc_static(direct_pc_layer.wk);
+            direct_pc_layer.wk_b =
+                pc_static(direct_pc_layer.wk_b);
+            direct_pc_layer.wk_s =
+                pc_static(direct_pc_layer.wk_s);
+            direct_pc_layer.wk_in_s =
+                pc_static(direct_pc_layer.wk_in_s);
 
-            direct_attn_layer.wv =
-                pc_static(direct_attn_layer.wv);
-            direct_attn_layer.wv_b =
-                pc_static(direct_attn_layer.wv_b);
-            direct_attn_layer.wv_s =
-                pc_static(direct_attn_layer.wv_s);
-            direct_attn_layer.wv_in_s =
-                pc_static(direct_attn_layer.wv_in_s);
+            direct_pc_layer.wv =
+                pc_static(direct_pc_layer.wv);
+            direct_pc_layer.wv_b =
+                pc_static(direct_pc_layer.wv_b);
+            direct_pc_layer.wv_s =
+                pc_static(direct_pc_layer.wv_s);
+            direct_pc_layer.wv_in_s =
+                pc_static(direct_pc_layer.wv_in_s);
 
-            direct_attn_layer.wo =
-                pc_static(direct_attn_layer.wo);
-            direct_attn_layer.wo_b =
-                pc_static(direct_attn_layer.wo_b);
-            direct_attn_layer.wo_s =
-                pc_static(direct_attn_layer.wo_s);
-            direct_attn_layer.wo_in_s =
-                pc_static(direct_attn_layer.wo_in_s);
+            direct_pc_layer.wo =
+                pc_static(direct_pc_layer.wo);
+            direct_pc_layer.wo_b =
+                pc_static(direct_pc_layer.wo_b);
+            direct_pc_layer.wo_s =
+                pc_static(direct_pc_layer.wo_s);
+            direct_pc_layer.wo_in_s =
+                pc_static(direct_pc_layer.wo_in_s);
 
-            direct_attn_layer.wqkv =
-                pc_static(direct_attn_layer.wqkv);
-            direct_attn_layer.wqkv_b =
-                pc_static(direct_attn_layer.wqkv_b);
-            direct_attn_layer.wqkv_s =
-                pc_static(direct_attn_layer.wqkv_s);
-            direct_attn_layer.wqkv_in_s =
-                pc_static(direct_attn_layer.wqkv_in_s);
+            direct_pc_layer.wqkv =
+                pc_static(direct_pc_layer.wqkv);
+            direct_pc_layer.wqkv_b =
+                pc_static(direct_pc_layer.wqkv_b);
+            direct_pc_layer.wqkv_s =
+                pc_static(direct_pc_layer.wqkv_s);
+            direct_pc_layer.wqkv_in_s =
+                pc_static(direct_pc_layer.wqkv_in_s);
 
-            attn_layer = &direct_attn_layer;
+            attn_layer = &direct_pc_layer;
+
+            if (sequence_decode_pc_direct) {
+                direct_pc_layer.ffn_norm =
+                    pc_static(direct_pc_layer.ffn_norm);
+                direct_pc_layer.ffn_norm_b =
+                    pc_static(direct_pc_layer.ffn_norm_b);
+                direct_pc_layer.ffn_gate_inp =
+                    pc_static(direct_pc_layer.ffn_gate_inp);
+                direct_pc_layer.ffn_gate_inp_b =
+                    pc_static(direct_pc_layer.ffn_gate_inp_b);
+                direct_pc_layer.ffn_gate_exps =
+                    pc_static(direct_pc_layer.ffn_gate_exps);
+                direct_pc_layer.ffn_up_exps =
+                    pc_static(direct_pc_layer.ffn_up_exps);
+                direct_pc_layer.ffn_down_exps =
+                    pc_static(direct_pc_layer.ffn_down_exps);
+                direct_pc_layer.ffn_gate_exps_s =
+                    pc_static(direct_pc_layer.ffn_gate_exps_s);
+                direct_pc_layer.ffn_up_exps_s =
+                    pc_static(direct_pc_layer.ffn_up_exps_s);
+                direct_pc_layer.ffn_down_exps_s =
+                    pc_static(direct_pc_layer.ffn_down_exps_s);
+                ffn_layer = &direct_pc_layer;
+            }
 
             if (std::getenv(
                     "LLAMA_HYBRID_SEQUENCE_FFN_TRACE") != nullptr) {
-                LLAMA_LOG_ERROR(
-                    "[SEQ_FFN_ATTN_OWNER] layer=%d "
-                    "weights=PC_CHILD0 kv=CPU_DIRECT "
-                    "scheduler=CPU_ONLY status=READY\n",
-                    il);
+                if (sequence_decode_pc_direct) {
+                    LLAMA_LOG_ERROR(
+                        "[SEQ_FFN_DECODE_OWNER] layer=%d "
+                        "weights=PC_CHILD0 attention=PC_CPU ffn=PC_CPU "
+                        "kv=CPU_DIRECT scheduler=CPU_ONLY status=READY\n",
+                        il);
+                } else {
+                    LLAMA_LOG_ERROR(
+                        "[SEQ_FFN_ATTN_OWNER] layer=%d "
+                        "weights=PC_CHILD0 kv=CPU_DIRECT "
+                        "scheduler=CPU_ONLY status=READY\n",
+                        il);
+                }
             }
         }
 
@@ -1346,7 +1391,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
         // MoE branch
         cur = build_norm(ffn_inp,
-                model.layers[il].ffn_norm, NULL,
+                ffn_layer->ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
@@ -1433,7 +1478,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 if (explicit_router) {
                     explicit_routing = build_moe_routing(
                         norm_chunk,
-                        model.layers[il].ffn_gate_inp,
+                        ffn_layer->ffn_gate_inp,
                         nullptr,
                         nullptr,
                         n_expert, n_expert_used,
@@ -1456,10 +1501,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                 ggml_tensor * moe_chunk =
                     build_moe_ffn(
                         norm_chunk,
-                        model.layers[il].ffn_gate_inp,
-                        model.layers[il].ffn_up_exps,
-                        model.layers[il].ffn_gate_exps,
-                        model.layers[il].ffn_down_exps,
+                        ffn_layer->ffn_gate_inp,
+                        ffn_layer->ffn_up_exps,
+                        ffn_layer->ffn_gate_exps,
+                        ffn_layer->ffn_down_exps,
                         nullptr,
                         n_expert, n_expert_used,
                         LLM_FFN_SILU, true,
@@ -1467,9 +1512,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                         il,
                         nullptr, nullptr,
-                        model.layers[il].ffn_up_exps_s,
-                        model.layers[il].ffn_gate_exps_s,
-                        model.layers[il].ffn_down_exps_s,
+                        ffn_layer->ffn_up_exps_s,
+                        ffn_layer->ffn_gate_exps_s,
+                        ffn_layer->ffn_down_exps_s,
                         explicit_routing.selected_experts,
                         1,
                         nullptr,
@@ -1493,7 +1538,7 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             if (explicit_router) {
                 explicit_routing = build_moe_routing(
                     cur,
-                    model.layers[il].ffn_gate_inp,
+                    ffn_layer->ffn_gate_inp,
                     nullptr,
                     nullptr,
                     n_expert, n_expert_used,
@@ -1517,10 +1562,10 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
 
             ggml_tensor * moe_out =
                 build_moe_ffn(cur,
-                        model.layers[il].ffn_gate_inp,
-                        model.layers[il].ffn_up_exps,
-                        model.layers[il].ffn_gate_exps,
-                        model.layers[il].ffn_down_exps,
+                        ffn_layer->ffn_gate_inp,
+                        ffn_layer->ffn_up_exps,
+                        ffn_layer->ffn_gate_exps,
+                        ffn_layer->ffn_down_exps,
                         nullptr,
                         n_expert, n_expert_used,
                         LLM_FFN_SILU, true,
@@ -1528,9 +1573,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                         LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                         il,
                         nullptr, nullptr,
-                        model.layers[il].ffn_up_exps_s,
-                        model.layers[il].ffn_gate_exps_s,
-                        model.layers[il].ffn_down_exps_s,
+                        ffn_layer->ffn_up_exps_s,
+                        ffn_layer->ffn_gate_exps_s,
+                        ffn_layer->ffn_down_exps_s,
                         explicit_routing.selected_experts,
                         use_decode_chunked_moe ? n_decode_chunks : 1,
                         use_decode_chunked_moe ? &decode_down_chunks : nullptr,
