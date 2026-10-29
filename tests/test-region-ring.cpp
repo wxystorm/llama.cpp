@@ -57,6 +57,95 @@ static void test_layout() {
 }
 
 
+static void test_directional_layout() {
+    const char * one_pair =
+        "G4,C6,C2P1,P4,P2C1,G4,C7,P5,G3,C8,P5";
+    const auto regions =
+        llama_region_ring_parse(one_pair, 48);
+
+    check(llama_region_ring_has_directional_stages(regions),
+          "directional layout did not expose boundary stages");
+    check(llama_region_ring_directional_topology_compatible(regions, 48),
+          "valid directional topology rejected");
+    check(regions.size() == 11,
+          "one-pair directional layout stage count");
+    check(regions[2].kind == llama_region_ring_stage_kind::C2P &&
+          regions[2].layer_begin == 10 &&
+          regions[2].layer_end == 11,
+          "C2P boundary placement is wrong");
+    check(regions[4].kind == llama_region_ring_stage_kind::P2C &&
+          regions[4].layer_begin == 15 &&
+          regions[4].layer_end == 16,
+          "P2C boundary placement is wrong");
+    check(regions[2].device == llama_region_ring_device::PHONE &&
+          regions[4].device == llama_region_ring_device::PHONE,
+          "directional stages must use the existing Meta/Phone executor");
+
+    const auto counts = llama_region_ring_layer_counts(regions);
+    check(counts == std::array<int, 3>{21, 11, 14},
+          "directional full-layer counts are wrong");
+    check(llama_region_ring_directional_layer_count(regions) == 2,
+          "directional layer count is wrong");
+    check(llama_region_ring_layout_string(regions) == one_pair,
+          "directional layout serialization changed");
+
+    // Multiple independent handoff pairs are legal; each boundary remains
+    // exactly one layer while the surrounding full regions choose their size.
+    const char * multi_pair =
+        "G4,C6,C2P1,P4,P2C1,G4,C6,C2P1,P4,P2C1,G3,C7,C2P1,P5";
+    const auto multi =
+        llama_region_ring_parse(multi_pair, 48);
+    check(multi.size() == 14,
+          "multi-pair directional layout stage count");
+    check(llama_region_ring_directional_layer_count(multi) == 5,
+          "multi-pair boundary layer count");
+    check(llama_region_ring_layout_string(multi) == multi_pair,
+          "multi-pair layout serialization changed");
+
+    bool wide_boundary_rejected = false;
+    try {
+        (void) llama_region_ring_parse(
+            "G4,C5,C2P2,P4,P2C1,G4,C7,P5,G3,C8,P5", 48);
+    } catch (const std::runtime_error &) {
+        wide_boundary_rejected = true;
+    }
+    check(wide_boundary_rejected,
+          "multi-layer C2P boundary was accepted");
+
+    bool bad_direction_rejected = false;
+    try {
+        (void) llama_region_ring_parse(
+            "G4,C6,P2C1,P4,C2P1,G4,C7,P5,G3,C8,P5", 48);
+    } catch (const std::runtime_error &) {
+        bad_direction_rejected = true;
+    }
+    check(bad_direction_rejected,
+          "reversed directional boundary topology was accepted");
+
+    // The scheduler still has only CPU/GPU/PHONE physical queues. C2P and P2C
+    // must be claimable from the Phone/Meta queue, not from a new worker.
+    llama_region_ring_ready ready(regions, 64, 64);
+    const auto g = ready.try_take(llama_region_ring_device::GPU);
+    check(g && g->region == 0, "directional scheduler missing initial GPU");
+    ready.complete(*g);
+    const auto cpu = ready.try_take(llama_region_ring_device::CPU);
+    check(cpu && cpu->region == 1, "directional scheduler missing CPU stage");
+    ready.complete(*cpu);
+    const auto c2p = ready.try_take(llama_region_ring_device::PHONE);
+    check(c2p && c2p->region == 2,
+          "C2P did not route through the Meta/Phone executor");
+    ready.complete(*c2p);
+    const auto phone = ready.try_take(llama_region_ring_device::PHONE);
+    check(phone && phone->region == 3,
+          "Phone region did not follow C2P");
+    ready.complete(*phone);
+    const auto p2c = ready.try_take(llama_region_ring_device::PHONE);
+    check(p2c && p2c->region == 4,
+          "P2C did not route through the Meta/Phone executor");
+}
+
+
+
 static void test_general_topology() {
     const auto two_cycle_tail = llama_region_ring_parse(
         "G4,C6,P8,G4,C6,P8,G4,C8",48,true);
@@ -734,6 +823,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_directional_layout();
+        std::fprintf(stderr, "[REGION_RING_TEST] directional_layout=PASS\n");
         test_general_topology();
         std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
         test_apply_safe_compatibility();
