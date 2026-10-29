@@ -271,6 +271,8 @@ try {
                 "--flash-attn", "on",
                 "-lv", "3",
                 "--no-conversation",
+                "--single-turn",
+                "--simple-io",
                 "-p", $promptText
             )
             if ($ExtraArgs.Count -gt 0) {
