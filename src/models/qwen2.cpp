@@ -433,9 +433,9 @@ llama_model_qwen2::graph::graph(const llama_model & model, const llm_graph_param
                 std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
             LLAMA_LOG_ERROR(
                 "[DENSE_DIRECTIONAL_STAGE] arch=qwen2 layer=%d "
-                "layers=[%d,%d) tokens=%" PRId64 " outer_chunk=%d "
+                "layers=[%d,%d) tokens=%lld outer_chunk=%d "
                 "planned_chunk=%d n_prefill_chunks=%d chunked=%d status=READY\n",
-                il, layer_begin, layer_end, n_tokens,
+                il, layer_begin, layer_end, (long long) n_tokens,
                 params.hybrid_chunk_tokens,
                 planned_chunk_tokens,
                 n_prefill_chunks,
