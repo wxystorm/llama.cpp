@@ -8825,12 +8825,16 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             LLAMA_LOG_ERROR("%s: dense profiling failed\n", __func__);
             return false;
         }
-        // One-layer and five-layer Dense graphs calibrate RPC submission
-        // size instead of importing an observed Qwen3-MoE P5 constant.
-        // Missing probes keep the old fixed-layout runtime available; the
-        // applying Planner below rejects a missing Dense calibration.
-        if (!llama_hybrid_profile_phone_blocks(
-                profile, attn_desc, ffn_desc, phone.get())) {
+        // Only the Ring Planner needs the extra one/five-layer RPC wire
+        // probes. Leave ordinary Dense --hybrid-auto profiling unchanged.
+        // A missing probe keeps the fixed Ring usable, but APPLY must not
+        // silently replace Dense graph costs with the MoE P5 constant.
+        const bool dense_ring_planner_profile =
+            llama_region_ring_enabled() &&
+            std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER") != nullptr;
+        if (dense_ring_planner_profile &&
+                !llama_hybrid_profile_phone_blocks(
+                    profile, attn_desc, ffn_desc, phone.get())) {
             profile.phone_blocks.clear();
             LLAMA_LOG_WARN(
                 "[HYBRID_PROFILE_DENSE_PHONE_GRAPH] "
