@@ -107,10 +107,12 @@ def targeted_rows(
         if int(row["x"]) == x and int(row["y"]) == y
     ]
     devices = {row["device"] for row in rows}
-    if len(devices) < 2:
+    has_phone = any(d.startswith("RPC") for d in devices)
+    has_pc = any(not d.startswith("RPC") and d != "CPU" for d in devices)
+    if not (has_phone and has_pc):
         raise RuntimeError(
-            f"q({x},{y}) expected at least two backend stage samples, "
-            f"found {sorted(devices)} in {sample_csv}"
+            f"q({x},{y}) requires both PC accelerator and phone RPC stage "
+            f"samples; found {sorted(devices)} in {sample_csv}"
         )
     return rows
 
