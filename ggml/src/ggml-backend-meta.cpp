@@ -16646,7 +16646,7 @@ auto prefill_norm_sg_has_prework =
             route_it != pending_phone_prefill_routes.end();
 
         if (region_local_main_p2c_down) {
-            // Phone MAIN already owns L46 Attention/Router, local FFN and
+            // Phone MAIN already owns P2C Attention/Router, local FFN and
             // residual fold. This SG is now a pure PC consumer: wait only
             // for READY, run the PC FFN shard, then let the ordinary P2C
             // reduction path consume the independently staged PARTIAL.
@@ -18281,6 +18281,7 @@ auto prefill_norm_sg_has_prework =
             first_fused_layer = region_pipe_phone_first_layer;
             // No forced PC handoff here: the following P2C Attention
             // is Phone-owned. The directional boundaries remain managed
+            // by the baseline C2P/P2C protocol.
             phone_block_last_layer = -1;
             timing_first_layer = region_pipe_phone_first_layer;
             timing_last_layer = region_pipe_phone_last_layer;
@@ -18469,8 +18470,7 @@ auto prefill_norm_sg_has_prework =
             if (!output_bound) {
                 printf("[PHONE_REGION_SCRATCH_REJECT] chunk=%d "
                        "reason=OUTPUT_BIND_FAILED action=STOP\n",
-                       phone_region_chunk_id,
-                region_pipe_p2c_layer);
+                       phone_region_chunk_id);
                 return GGML_STATUS_FAILED;
             }
             const size_t slot_index =
@@ -18551,8 +18551,7 @@ auto prefill_norm_sg_has_prework =
             if (chunk_it == region_pipe_chunks.end()) {
                 printf("[PHONE_REGION_MAIN_REJECT] chunk=%d "
                        "reason=CHUNK_PLAN_MISSING action=STOP\n",
-                       phone_region_chunk_id,
-                region_pipe_p2c_layer);
+                       phone_region_chunk_id);
                 return GGML_STATUS_FAILED;
             }
             const auto & entry = chunk_it->second;
@@ -18592,11 +18591,13 @@ auto prefill_norm_sg_has_prework =
             std::snprintf(
                 partial_name, sizeof(partial_name),
                 "prefill_ffn_down_chunk_%d-%d",
-                phone_region_chunk_id);
+                phone_region_chunk_id,
+                region_pipe_p2c_layer);
             std::snprintf(
                 residual_name, sizeof(residual_name),
                 "phone_tensor_ffn_inp_chunk_%d-%d",
-                phone_region_chunk_id);
+                phone_region_chunk_id,
+                region_pipe_p2c_layer);
 
             ggml_tensor * phone_partial =
                 find_sg_named_tensor(
