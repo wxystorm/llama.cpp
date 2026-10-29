@@ -27,6 +27,22 @@ static model mock_profile() {
         ms = layers * (0.3 + per * tokens) + 0.00003 * layers * tokens * kv;
         return true;
     };
+    m.directional_ms =
+        [](llama_region_ring_stage_kind kind,
+           int tokens, int kv, double & ms) {
+            const double per =
+                kind == llama_region_ring_stage_kind::C2P ?
+                    0.050 : 0.060;
+            ms = 0.5 + per * tokens +
+                0.00002 * tokens * kv;
+            return true;
+        };
+    m.directional_prepare_ms =
+        [](llama_region_ring_stage_kind,
+           int, int, double & ms) {
+            ms = 0.1;
+            return true;
+        };
     m.transfer_ms = [](device a, device b, size_t bytes, double & ms) {
         ms = (a == device::PHONE || b == device::PHONE ? 0.4 : 0.05) +
              (double) bytes / (60 * 1024 * 1024) * 1000.0;
@@ -567,6 +583,102 @@ int main() {
     REQUIRE(!search_supported_fixed_phone(
             apply_profile,llama_region_ring_parse(
                 "G6,C11,P7,G5,C11,P8",48),64).valid);
+
+
+    // Boundary Refiner V1: the first-stage Cycle result remains a candidate.
+    // Tensor refinement is odd-width only and alternates ownership direction.
+    {
+        candidate cycle;
+        cycle.cycles = 3;
+        cycle.g = 4;
+        cycle.c = 7;
+        cycle.p = 5;
+        cycle.xc = cycle.xg = cycle.xp = 64;
+
+        std::vector<llama_region_ring_region> cycle_regions;
+        REQUIRE(make_regions(cycle, 48, cycle_regions));
+        const auto anchors = boundary_anchors(cycle_regions);
+        // Three PC->Phone entries and two Phone->PC/GPU exits.
+        REQUIRE(anchors.size() == 5);
+
+        const auto legal = boundary_legal_widths(anchors[0]);
+        REQUIRE(!legal.empty() && legal.front() == 0);
+        for (size_t i = 1; i < legal.size(); ++i) {
+            REQUIRE((legal[i] & 1) != 0);
+        }
+
+        std::vector<int> widths(anchors.size(), 0);
+        widths[0] = 3;
+        std::vector<llama_region_ring_region> t3_regions;
+        REQUIRE(build_boundary_regions(
+            cycle_regions, anchors, widths, 48, t3_regions));
+        REQUIRE(llama_region_ring_has_directional_stages(t3_regions));
+        REQUIRE(llama_region_ring_directional_topology_compatible(
+            t3_regions, 48));
+        REQUIRE(llama_region_ring_layout_string(t3_regions).find(
+            "C2P1,P2C1,C2P1") != std::string::npos);
+
+        // Even width can never complete one net ownership handoff.
+        widths[0] = 2;
+        REQUIRE(!build_boundary_regions(
+            cycle_regions, anchors, widths, 48, t3_regions));
+
+        model no_tensor_profile = mock_profile();
+        no_tensor_profile.region_memory_feasible =
+            [](const std::vector<llama_region_ring_region> &) {
+                return true;
+            };
+        no_tensor_profile.directional_ms =
+            [](llama_region_ring_stage_kind,
+               int, int, double & ms) {
+                ms = 10000.0;
+                return true;
+            };
+        candidate cycle_score = cycle;
+        REQUIRE(simulate(
+            no_tensor_profile, cycle_regions,
+            cycle_score, &reason));
+        const auto no_tensor = refine_optional_boundaries(
+            no_tensor_profile, cycle_regions, cycle_score);
+        REQUIRE(no_tensor.valid && no_tensor.baseline_valid);
+        REQUIRE(no_tensor.selected.tensor_layers == 0);
+        REQUIRE(llama_region_ring_layout_string(
+            no_tensor.selected.regions) ==
+            llama_region_ring_layout_string(cycle_regions));
+
+        model tensor_profile = mock_profile();
+        tensor_profile.region_memory_feasible =
+            [](const std::vector<llama_region_ring_region> &) {
+                return true;
+            };
+        tensor_profile.directional_ms =
+            [](llama_region_ring_stage_kind,
+               int, int, double & ms) {
+                ms = 0.001;
+                return true;
+            };
+        tensor_profile.directional_prepare_ms =
+            [](llama_region_ring_stage_kind,
+               int, int, double & ms) {
+                ms = 0.0;
+                return true;
+            };
+        candidate tensor_cycle_score = cycle;
+        REQUIRE(simulate(
+            tensor_profile, cycle_regions,
+            tensor_cycle_score, &reason));
+        const auto tensor_selected = refine_optional_boundaries(
+            tensor_profile, cycle_regions, tensor_cycle_score);
+        REQUIRE(tensor_selected.valid);
+        REQUIRE(tensor_selected.selected.estimate.wall_ms <=
+                tensor_selected.baseline.estimate.wall_ms + 1e-9);
+        REQUIRE(tensor_selected.selected.tensor_layers > 0);
+        REQUIRE(llama_region_ring_directional_topology_compatible(
+            tensor_selected.selected.regions, 48));
+        for (int width : tensor_selected.selected.widths) {
+            REQUIRE(width == 0 || (width & 1) != 0);
+        }
+    }
 
     std::printf("REGION_RING_PLANNER_TEST status=PASS baseline_ms=%.3f "
                 "hetero_ms=%.3f selected_ms=%.3f "

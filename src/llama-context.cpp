@@ -6656,10 +6656,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
             model.hybrid_ring_plan_mode == "APPLY_CGP";
         const bool apply_wide =
             model.hybrid_ring_plan_mode == "APPLY_WIDE";
+        const bool selected_directional =
+            llama_region_ring_has_directional_stages(
+                ring_runtime_regions);
+        const bool selected_topology_ok =
+            selected_directional ?
+                llama_region_ring_directional_topology_compatible(
+                    ring_runtime_regions, model.hparams.n_layer()) :
+                llama_region_ring_apply_topology_compatible(
+                    ring_runtime_regions, model.hparams.n_layer());
         const bool runtime_shape_ok = (apply_cgp || apply_wide) ?
             ((apply_wide || ring_runtime_regions.size() == 9) &&
-             llama_region_ring_apply_topology_compatible(
-                 ring_runtime_regions, model.hparams.n_layer()) &&
+             selected_topology_ok &&
              ring_runtime_regions.back().device ==
                  llama_region_ring_device::PHONE) :
             llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
@@ -6676,17 +6684,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         for (const auto & r : ring_runtime_regions) {
             for (int il = r.layer_begin; il < r.layer_end; ++il) {
-                const bool phone =
-                    r.device == llama_region_ring_device::PHONE;
-                const bool gpu =
-                    r.device == llama_region_ring_device::GPU;
-                const bool owner_ok = phone ?
-                    model.hybrid_layer_mode(il) ==
-                        llama_hybrid_layer_mode::PHONE_ONLY :
-                    model.hybrid_layer_mode(il) ==
-                        llama_hybrid_layer_mode::PC_ONLY &&
-                    (model.pc_layer_backends[(size_t) il] ==
-                        llama_pc_layer_backend::CUDA) == gpu;
+                bool owner_ok = false;
+                switch (r.kind) {
+                    case llama_region_ring_stage_kind::GPU:
+                        owner_ok =
+                            model.hybrid_layer_mode(il) ==
+                                llama_hybrid_layer_mode::PC_ONLY &&
+                            model.pc_layer_backends[(size_t) il] ==
+                                llama_pc_layer_backend::CUDA;
+                        break;
+                    case llama_region_ring_stage_kind::CPU:
+                        owner_ok =
+                            model.hybrid_layer_mode(il) ==
+                                llama_hybrid_layer_mode::PC_ONLY &&
+                            model.pc_layer_backends[(size_t) il] !=
+                                llama_pc_layer_backend::CUDA;
+                        break;
+                    case llama_region_ring_stage_kind::PHONE:
+                        owner_ok =
+                            model.hybrid_layer_mode(il) ==
+                                llama_hybrid_layer_mode::PHONE_ONLY;
+                        break;
+                    case llama_region_ring_stage_kind::C2P:
+                        owner_ok =
+                            model.hybrid_layer_mode(il) ==
+                                llama_hybrid_layer_mode::TENSOR_C2P;
+                        break;
+                    case llama_region_ring_stage_kind::P2C:
+                        owner_ok =
+                            model.hybrid_layer_mode(il) ==
+                                llama_hybrid_layer_mode::TENSOR_P2C;
+                        break;
+                }
                 if (!owner_ok) {
                     throw std::runtime_error(
                         "Planner Ring runtime/model backend ownership mismatch");

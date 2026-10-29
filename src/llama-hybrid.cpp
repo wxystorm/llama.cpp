@@ -9226,6 +9226,149 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         return llama_hybrid_transfer_cost(points, bytes, cost);
     };
 
+
+    const auto read_boundary_ratio =
+        [](const char * name, float fallback, float & ratio) {
+            const char * raw = std::getenv(name);
+            ratio = raw != nullptr && raw[0] != '\0' ?
+                std::strtof(raw, nullptr) : fallback;
+            return std::isfinite(ratio) &&
+                ratio > 0.0f && ratio < 1.0f;
+        };
+    float c2p_pc_ratio = 1.0f / 3.0f;
+    float p2c_pc_ratio = 1.0f / 3.0f;
+    const bool directional_ratio_ok =
+        read_boundary_ratio(
+            "LLAMA_HYBRID_REGION_C2P_PC_RATIO",
+            1.0f / 3.0f, c2p_pc_ratio) &&
+        read_boundary_ratio(
+            "LLAMA_HYBRID_REGION_P2C_PC_RATIO",
+            1.0f / 3.0f, p2c_pc_ratio);
+
+    if (directional_ratio_ok) {
+        model.directional_ms =
+            [&profile, c2p_pc_ratio, p2c_pc_ratio](
+                    llama_region_ring_stage_kind kind,
+                    int tokens, int kv_tokens,
+                    double & cost) -> bool {
+                const bool c2p =
+                    kind == llama_region_ring_stage_kind::C2P;
+                const bool p2c =
+                    kind == llama_region_ring_stage_kind::P2C;
+                if ((!c2p && !p2c) || tokens <= 0 ||
+                        kv_tokens < tokens) {
+                    return false;
+                }
+
+                const auto & attn_points =
+                    c2p ? profile.cpu_attn : profile.phone_attn;
+                const auto & layer_points =
+                    c2p ? profile.cpu_layer_blocks :
+                          profile.phone_layer_blocks;
+                const auto & primary_ffn =
+                    c2p ? profile.cpu_ffn : profile.phone_ffn;
+                const float ratio =
+                    c2p ? c2p_pc_ratio : p2c_pc_ratio;
+
+                double attn_kv_ms = 0.0;
+                double attn_base_ms = 0.0;
+                double layer_base_ms = 0.0;
+                double full_ffn_ms = 0.0;
+                double pipeline_ms = 0.0;
+                if (!llama_hybrid_attn_cost(
+                        attn_points, tokens, kv_tokens,
+                        attn_kv_ms) ||
+                    !llama_hybrid_attn_cost(
+                        attn_points, tokens, tokens,
+                        attn_base_ms) ||
+                    !llama_hybrid_layer_block_cost(
+                        layer_points, tokens, !c2p,
+                        layer_base_ms) ||
+                    !llama_hybrid_ffn_cost(
+                        primary_ffn, tokens, 1.0f,
+                        full_ffn_ms)) {
+                    return false;
+                }
+
+                const bool pipeline_ok = c2p ?
+                    llama_hybrid_tensor_ffn_cost(
+                        profile, ratio, tokens, tokens,
+                        pipeline_ms, nullptr, 1) :
+                    llama_hybrid_tensor_phone_ffn_cost(
+                        profile, ratio, tokens, tokens,
+                        pipeline_ms, nullptr, 1);
+                if (!pipeline_ok) {
+                    return false;
+                }
+
+                const double misc_ms =
+                    std::max(
+                        0.0,
+                        layer_base_ms -
+                        attn_base_ms -
+                        full_ffn_ms);
+                cost = attn_kv_ms + misc_ms + pipeline_ms;
+                return std::isfinite(cost) && cost >= 0.0;
+            };
+
+        model.directional_prepare_ms =
+            [&profile, c2p_pc_ratio, p2c_pc_ratio](
+                    llama_region_ring_stage_kind kind,
+                    int tokens, int,
+                    double & cost) -> bool {
+                const bool c2p =
+                    kind == llama_region_ring_stage_kind::C2P;
+                const bool p2c =
+                    kind == llama_region_ring_stage_kind::P2C;
+                if ((!c2p && !p2c) || tokens <= 0) {
+                    return false;
+                }
+
+                const auto & primary_layers =
+                    c2p ? profile.cpu_layer_blocks :
+                          profile.phone_layer_blocks;
+                const auto & primary_ffn =
+                    c2p ? profile.cpu_ffn : profile.phone_ffn;
+                const auto & remote_ffn =
+                    c2p ? profile.phone_ffn : profile.cpu_ffn;
+                const float pc_ratio =
+                    c2p ? c2p_pc_ratio : p2c_pc_ratio;
+                const float primary_ratio =
+                    c2p ? pc_ratio : 1.0f - pc_ratio;
+                const float remote_ratio =
+                    c2p ? 1.0f - pc_ratio : pc_ratio;
+
+                double full_prepare = 0.0;
+                double full_ffn_prepare = 0.0;
+                double primary_ffn_prepare = 0.0;
+                double remote_ffn_prepare = 0.0;
+                if (!llama_hybrid_layer_block_prepare_total_cost(
+                        primary_layers, tokens, 1,
+                        full_prepare) ||
+                    !llama_hybrid_ffn_prepare_cost(
+                        primary_ffn, tokens, 1.0f,
+                        full_ffn_prepare) ||
+                    !llama_hybrid_ffn_prepare_cost(
+                        primary_ffn, tokens, primary_ratio,
+                        primary_ffn_prepare) ||
+                    !llama_hybrid_ffn_prepare_cost(
+                        remote_ffn, tokens, remote_ratio,
+                        remote_ffn_prepare)) {
+                    return false;
+                }
+
+                cost =
+                    std::max(0.0, full_prepare - full_ffn_prepare) +
+                    primary_ffn_prepare +
+                    remote_ffn_prepare;
+                return std::isfinite(cost) && cost >= 0.0;
+            };
+    }
+
+    std::function<bool(
+        const std::vector<llama_region_ring_region> &)>
+        boundary_memory_feasible;
+
     const size_t weight_fallback = profile.total_weight_bytes_per_layer;
     const bool have_layer_weights =
         profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
@@ -9347,7 +9490,151 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     }
                 }
                 return true;
+
             };
+        const bool have_directional_weight_split =
+            profile.layer_weight_bytes.size() ==
+                (size_t) profile.n_layer &&
+            profile.layer_attn_forced_bytes.size() ==
+                (size_t) profile.n_layer &&
+            profile.layer_ffn_split_bytes.size() ==
+                (size_t) profile.n_layer &&
+            profile.layer_mirrored_bytes.size() ==
+                (size_t) profile.n_layer;
+        if (have_directional_weight_split &&
+                directional_ratio_ok) {
+            boundary_memory_feasible =
+                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio](
+                    const std::vector<
+                        llama_region_ring_region> & regions) {
+                    std::array<long double, 3> usage {};
+                    usage[(size_t)
+                        llama_region_ring_device::CPU] +=
+                        (long double)
+                            profile.non_layer_weight_bytes;
+
+                    const long double kv_per_layer =
+                        (long double)
+                            profile.kv_bytes_per_token_per_layer *
+                        (model.kv_start + model.tokens);
+
+                    for (const auto & region : regions) {
+                        for (int il = region.layer_begin;
+                                il < region.layer_end; ++il) {
+                            const size_t i = (size_t) il;
+                            const long double total =
+                                profile.layer_weight_bytes[i];
+                            const long double attn =
+                                profile.layer_attn_forced_bytes[i];
+                            const long double ffn =
+                                profile.layer_ffn_split_bytes[i];
+                            const long double mirrored =
+                                profile.layer_mirrored_bytes[i];
+
+                            switch (region.kind) {
+                                case llama_region_ring_stage_kind::GPU:
+                                    if (model.gpu_weight_streaming) {
+                                        usage[(size_t)
+                                            llama_region_ring_device::CPU] +=
+                                            total;
+                                        usage[(size_t)
+                                            llama_region_ring_device::GPU] +=
+                                            kv_per_layer;
+                                    } else {
+                                        usage[(size_t)
+                                            llama_region_ring_device::GPU] +=
+                                            total + kv_per_layer;
+                                    }
+                                    break;
+                                case llama_region_ring_stage_kind::CPU:
+                                    usage[(size_t)
+                                        llama_region_ring_device::CPU] +=
+                                        total + kv_per_layer;
+                                    break;
+                                case llama_region_ring_stage_kind::PHONE:
+                                    usage[(size_t)
+                                        llama_region_ring_device::PHONE] +=
+                                        total + kv_per_layer;
+                                    usage[(size_t)
+                                        llama_region_ring_device::CPU] +=
+                                        mirrored;
+                                    break;
+                                case llama_region_ring_stage_kind::C2P: {
+                                    const long double pc_ffn =
+                                        (long double)
+                                            llama_hybrid_ratio_bytes(
+                                                (size_t) ffn,
+                                                c2p_pc_ratio);
+                                    const long double phone_ffn =
+                                        ffn - pc_ffn;
+                                    usage[(size_t)
+                                        llama_region_ring_device::CPU] +=
+                                        attn + pc_ffn +
+                                        mirrored + kv_per_layer;
+                                    usage[(size_t)
+                                        llama_region_ring_device::PHONE] +=
+                                        phone_ffn + mirrored;
+                                    break;
+                                }
+                                case llama_region_ring_stage_kind::P2C: {
+                                    const long double pc_ffn =
+                                        (long double)
+                                            llama_hybrid_ratio_bytes(
+                                                (size_t) ffn,
+                                                p2c_pc_ratio);
+                                    const long double phone_ffn =
+                                        ffn - pc_ffn;
+                                    usage[(size_t)
+                                        llama_region_ring_device::CPU] +=
+                                        pc_ffn + mirrored;
+                                    usage[(size_t)
+                                        llama_region_ring_device::PHONE] +=
+                                        attn + phone_ffn +
+                                        mirrored + kv_per_layer;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (model.gpu_weight_streaming) {
+                        std::array<size_t, 2> bank_peaks {};
+                        if (!llama_ring_planner::gpu_weight_bank_peaks(
+                                model, regions, bank_peaks)) {
+                            return false;
+                        }
+                        usage[(size_t)
+                            llama_region_ring_device::GPU] +=
+                            (long double) bank_peaks[0] +
+                            (long double) bank_peaks[1];
+                    }
+
+                    const size_t boundary_count =
+                        regions.empty() ? 0 : regions.size() - 1;
+                    usage[(size_t)
+                        llama_region_ring_device::CPU] +=
+                        (long double) boundary_count *
+                        model.tokens * model.hidden *
+                        sizeof(float);
+
+                    const size_t free_bytes[] = {
+                        profile.pc_free_mem,
+                        profile.gpu_free_mem,
+                        profile.phone_free_mem
+                    };
+                    const long double fraction[] = {
+                        0.85L, 0.90L, 0.90L};
+                    for (size_t i = 0; i < 3; ++i) {
+                        if (free_bytes[i] != 0 &&
+                                usage[i] >
+                                    (long double) free_bytes[i] *
+                                    fraction[i]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                };
+        }
     }
 
     LLAMA_LOG_ERROR(
@@ -9693,8 +9980,117 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
-        if (!llama_region_ring_apply_topology_compatible(
-                best_regions, model.layers) ||
+        bool boundary_tensor_selected = false;
+        if (!forced_ab) {
+            if (boundary_memory_feasible &&
+                    model.directional_ms &&
+                    model.directional_prepare_ms) {
+                model.region_memory_feasible =
+                    boundary_memory_feasible;
+                const auto boundary =
+                    llama_ring_planner::refine_optional_boundaries(
+                        model, best_regions, best, 0.05);
+
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_BOUNDARY_SEARCH] "
+                    "mode=APPLY_WIDE source=CYCLE_RANK1 "
+                    "boundaries=%zu enumerated=%zu scored=%zu "
+                    "reject_shape=%zu reject_memory=%zu "
+                    "reject_profile=%zu baseline_ms=%.3f valid=%d\n",
+                    boundary.boundaries,
+                    boundary.enumerated,
+                    boundary.scored,
+                    boundary.rejected_shape,
+                    boundary.rejected_memory,
+                    boundary.rejected_profile,
+                    boundary.baseline_valid ?
+                        boundary.baseline.estimate.wall_ms : -1.0,
+                    boundary.valid ? 1 : 0);
+
+                const auto widths_text =
+                    [](const std::vector<int> & widths) {
+                        std::string text;
+                        for (size_t i = 0; i < widths.size(); ++i) {
+                            if (i != 0) {
+                                text += ",";
+                            }
+                            text += std::to_string(widths[i]);
+                        }
+                        return text.empty() ?
+                            std::string("NONE") : text;
+                    };
+
+                for (size_t i = 0;
+                        i < boundary.top.size(); ++i) {
+                    const auto & choice = boundary.top[i];
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_BOUNDARY_CANDIDATE] "
+                        "rank=%zu mode=%s widths=%s tensor_layers=%d "
+                        "layout=%s predicted_ms=%.3f\n",
+                        i + 1,
+                        choice.tensor_layers == 0 ?
+                            "NO_TENSOR" : "TENSOR_ODD",
+                        widths_text(choice.widths).c_str(),
+                        choice.tensor_layers,
+                        llama_region_ring_layout_string(
+                            choice.regions).c_str(),
+                        choice.estimate.wall_ms);
+                }
+
+                if (boundary.valid &&
+                        boundary.baseline_valid) {
+                    const double boundary_gain_pct =
+                        boundary.baseline.estimate.wall_ms > 0.0 ?
+                            100.0 *
+                            (boundary.baseline.estimate.wall_ms -
+                             boundary.selected.estimate.wall_ms) /
+                            boundary.baseline.estimate.wall_ms :
+                            0.0;
+                    const bool use_tensor =
+                        boundary.selected.tensor_layers > 0 &&
+                        boundary.selected.estimate.wall_ms <
+                            boundary.baseline.estimate.wall_ms - 0.05;
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_BOUNDARY_SELECTED] "
+                        "mode=%s widths=%s tensor_layers=%d "
+                        "baseline_ms=%.3f predicted_ms=%.3f "
+                        "gain_pct=%.3f status=%s\n",
+                        use_tensor ? "TENSOR_ODD" : "NO_TENSOR",
+                        widths_text(
+                            boundary.selected.widths).c_str(),
+                        boundary.selected.tensor_layers,
+                        boundary.baseline.estimate.wall_ms,
+                        boundary.selected.estimate.wall_ms,
+                        boundary_gain_pct,
+                        use_tensor ?
+                            "REPLACE_CYCLE_RANK1" :
+                            "KEEP_CYCLE_RANK1");
+                    if (use_tensor) {
+                        best = boundary.selected.estimate;
+                        best_regions =
+                            boundary.selected.regions;
+                        boundary_tensor_selected = true;
+                    }
+                }
+            } else {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_BOUNDARY_SEARCH] "
+                    "mode=APPLY_WIDE source=CYCLE_RANK1 "
+                    "valid=0 "
+                    "reason=DIRECTIONAL_PROFILE_OR_MEMORY_MISSING "
+                    "status=KEEP_CYCLE_RANK1\n");
+            }
+        }
+
+        const bool best_has_directional =
+            llama_region_ring_has_directional_stages(best_regions);
+        const bool best_topology_ok =
+            best_has_directional ?
+                llama_region_ring_directional_topology_compatible(
+                    best_regions, model.layers) :
+                llama_region_ring_apply_topology_compatible(
+                    best_regions, model.layers);
+        if (!best_topology_ok ||
                 best_regions.back().device !=
                     llama_region_ring_device::PHONE ||
                 best.tail_c != 0 || best.tail_g != 0) {
@@ -9739,7 +10135,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "weight_h2d_exposed=%.3f weight_h2d_hidden=%.3f "
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
-            forced_ab ? "FORCED_AB" : "AUTO_RUNTIME_V2",
+            forced_ab ? "FORCED_AB" :
+            boundary_tensor_selected ?
+                "AUTO_RUNTIME_V2_BOUNDARY" :
+                "AUTO_RUNTIME_V2",
             best_text.c_str(), baseline_text.c_str(),
             best.cycles, best.c, best.g, best.p,
             best.xc, best.xg, best.xp,
@@ -9774,7 +10173,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "phase=PRE_MODEL_LOAD selected=1 source=%s "
             "layout=%s XC=%d XG=%d XP=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
-            forced_ab ? "FORCED_AB" : "AUTO_RUNTIME_V2",
+            forced_ab ? "FORCED_AB" :
+            boundary_tensor_selected ?
+                "AUTO_RUNTIME_V2_BOUNDARY" :
+                "AUTO_RUNTIME_V2",
             selected_layout->c_str(),
             *selected_xc, *selected_xg, *selected_xp);
         return true;

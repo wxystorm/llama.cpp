@@ -1773,10 +1773,18 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 hybrid_ring_plan_mode == "APPLY_CGP";
             const bool apply_wide =
                 hybrid_ring_plan_mode == "APPLY_WIDE";
+            const bool selected_directional =
+                llama_region_ring_has_directional_stages(
+                    ring_regions);
+            const bool selected_topology_ok =
+                selected_directional ?
+                    llama_region_ring_directional_topology_compatible(
+                        ring_regions, n_layer) :
+                    llama_region_ring_apply_topology_compatible(
+                        ring_regions, n_layer);
             const bool ownership_ok = (apply_cgp || apply_wide) ?
                 ((apply_wide || ring_regions.size() == 9) &&
-                 llama_region_ring_apply_topology_compatible(
-                     ring_regions, n_layer) &&
+                 selected_topology_ok &&
                  ring_regions.back().device ==
                      llama_region_ring_device::PHONE) :
                 (llama_region_ring_apply_safe_phone_shape(original) &&
