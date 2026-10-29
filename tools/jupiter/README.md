@@ -64,12 +64,16 @@ Use the Python runner for automated calibration. It avoids PowerShell native
 stderr/interactive-process behavior and works on Windows as well as Unix-like
 hosts.
 
-Each calibration point starts a fresh `llama-cli` with stdin closed and with
+The runner first executes **one unpartitioned token probe** with the same prompt.
+It reads the actual prompt length from `task.n_tokens` (falling back to prompt
+timing or Jupiter UBATCH traces) and builds every calibration partition from
+that runtime value. An optional `--target-tokens N` is only a hint: if the
+model reports a different length, the runner prints
+`[JUPITER_SWEEP_TARGET_OVERRIDE]` and uses the real length.
+
+Each calibration point then starts a fresh `llama-cli` with stdin closed and
 `--single-turn --simple-io`, so one completed prompt exits before the next
 sweep point starts.
-
-The prompt file must contain the same prompt whose tokenized length is supplied
-as `--target-tokens`.
 
 Example for the current 358-token Qwen3-14B experiment:
 
@@ -79,7 +83,6 @@ python .\tools\jupiter\run_q_sweep.py `
   --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
   --rpc 10.39.52.114:10139 `
   --prompt-file .\prompt.txt `
-  --target-tokens 358 `
   --pc-layers 25 `
   --repeats 2 `
   --resume `
@@ -99,17 +102,21 @@ x=112 -> 112,112,67,67
 x=128 -> 128,128,102
 ```
 
-Use `--dry-run` to print the generated paths without inference. Use
-`--x-values 32,64,96,128` for a smaller sweep. `--resume` skips a point
-only when both its log and extracted CSV already exist.
+Use `--dry-run --target-tokens 358` to preview plans without running the
+token probe. Use `--x-values 32,64,96,128` for a smaller sweep.
+`--resume` skips a point only when its log confirms the matching plan and
+the extracted CSV contains rows.
 
-Artifacts are written under `jupiter-q-sweep\` by default:
+Artifacts are isolated by actual prompt length and run configuration under
+`jupiter-q-sweep\`:
 
 ```text
-q-x32-r1.log
-q-x32-r1.csv
-...
-q-profile-all.csv
+q-token-probe.log
+tokens-<actual-token-count>-<config-hash>/
+  q-x32-r1.log
+  q-x32-r1.csv
+  ...
+  q-profile-all.csv
 ```
 
 If `--run-dp` is present, the runner also writes the requested runtime plan.
