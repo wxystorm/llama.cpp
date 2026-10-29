@@ -23,6 +23,41 @@ sequence.358=60,60,60,60,59,59
 `LLAMA_JUPITER_SEQUENCE_PLAN` can override one exact batch when its chunk sum
 matches the batch length.
 
+## q(x,y) calibration
+
+Jupiter profiles sub-sequence latency as q(x,y), where x is the current
+sub-sequence length and y is the total prefix length.
+
+Calibration is intentionally synchronous and must not be used for performance
+runs:
+
+```powershell
+$env:LLAMA_JUPITER_PREFILL="1"
+$env:LLAMA_JUPITER_PROFILE_STAGE="1"
+$env:LLAMA_JUPITER_TRACE="1"
+$env:LLAMA_JUPITER_SEQUENCE_PLAN="64,64,64,64,64,38"
+```
+
+The scheduler then prints one line per stage:
+
+```text
+[JUPITER_STAGE_PROFILE] ... backend=CUDA0 ... input_ms=... compute_ms=... wall_ms=...
+[JUPITER_STAGE_PROFILE] ... backend=RPC0[...] ... input_ms=... compute_ms=... wall_ms=...
+```
+
+Extract q samples from the PC log:
+
+```bash
+python tools/jupiter/jupiter_planner.py extract-q \
+  --log jupiter-calibration.log \
+  --output q-profile.csv \
+  --metric compute_ms
+```
+
+Run several calibration plans so the q(x,y) grid covers the x and y ranges of
+interest. The sequence DP interpolates between measured points, matching the
+paper's offline profiling + interpolation design.
+
 ## Sequence partition DP
 
 Input CSV:
