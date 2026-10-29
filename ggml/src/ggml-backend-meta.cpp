@@ -4768,13 +4768,9 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             return depends_on_delayed ? ii : i;
         }
 
-        int chunk = -1;
-        int layer = -1;
         if (prefill_directional_owner_attn &&
-                ggml_backend_meta_parse_prefill_norm_chunk(
-                    next->name, chunk, layer) &&
-                layer == directional_attn_layer &&
-                chunk == 0) {
+                (next->flags &
+                 GGML_TENSOR_FLAG_META_SEND_READY) != 0) {
             return depends_on_delayed ? ii : i;
         }
 
@@ -4931,30 +4927,52 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 const bool is_prefill_norm_chunk =
                     ggml_backend_meta_parse_prefill_norm_chunk(
                         node->name, prefill_chunk, prefill_layer);
+
                 const bool is_directional_prefill_ready =
-                    is_prefill_norm_chunk &&
-                    (ggml_backend_meta_tensor_c2p_layer(
-                         backend_ctx, prefill_layer) ||
-                     ggml_backend_meta_tensor_p2c_layer(
-                         backend_ctx, prefill_layer));
+                    (node->flags &
+                     GGML_TENSOR_FLAG_META_SEND_READY) != 0;
+                const bool is_directional_prefill_down =
+                    (node->flags &
+                     GGML_TENSOR_FLAG_META_SEND_PARTIAL) != 0;
+                GGML_ASSERT(
+                    !(is_directional_prefill_ready &&
+                      is_directional_prefill_down));
+
+                int directional_ready_chunk = -1;
+                int directional_ready_layer = -1;
+                if (is_directional_prefill_ready) {
+                    GGML_ASSERT(
+                        ggml_backend_meta_parse_prefill_norm_chunk(
+                            node->name,
+                            directional_ready_chunk,
+                            directional_ready_layer));
+                    GGML_ASSERT(
+                        ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, directional_ready_layer) ||
+                        ggml_backend_meta_tensor_p2c_layer(
+                            backend_ctx, directional_ready_layer));
+                }
+
+                int directional_down_chunk = -1;
+                int directional_down_layer = -1;
+                if (is_directional_prefill_down) {
+                    GGML_ASSERT(
+                        ggml_backend_meta_parse_prefill_down_chunk(
+                            node->name,
+                            directional_down_chunk,
+                            directional_down_layer));
+                    GGML_ASSERT(
+                        ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, directional_down_layer) ||
+                        ggml_backend_meta_tensor_p2c_layer(
+                            backend_ctx, directional_down_layer));
+                }
 
                 int phone_route_chunk = -1;
                 int phone_route_layer = -1;
                 const bool is_phone_route_boundary =
                     ggml_backend_meta_parse_phone_route_weights(
                         node->name, phone_route_chunk, phone_route_layer);
-
-                int directional_down_chunk = -1;
-                int directional_down_layer = -1;
-                const bool is_directional_prefill_down =
-                    ggml_backend_meta_parse_prefill_down_chunk(
-                        node->name,
-                        directional_down_chunk,
-                        directional_down_layer) &&
-                    (ggml_backend_meta_tensor_c2p_layer(
-                         backend_ctx, directional_down_layer) ||
-                     ggml_backend_meta_tensor_p2c_layer(
-                         backend_ctx, directional_down_layer));
 
                 int phone_primary_l_out_layer = -1;
                 int phone_primary_l_out_parsed = 0;
@@ -5004,10 +5022,12 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 const int directional_boundary_index = i;
                 const int directional_completion_layer =
                     is_directional_prefill_ready ?
-                        prefill_layer : directional_down_layer;
+                        directional_ready_layer :
+                        directional_down_layer;
                 const int directional_completion_chunk =
                     is_directional_prefill_ready ?
-                        prefill_chunk : directional_down_chunk;
+                        directional_ready_chunk :
+                        directional_down_chunk;
                 const bool directional_completion_c2p =
                     directional_completion_boundary &&
                     ggml_backend_meta_tensor_c2p_layer(
