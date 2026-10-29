@@ -17,12 +17,19 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
 
+static bool jupiter_prefill_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_PREFILL");
+    return value != nullptr && std::atoi(value) != 0;
+}
 
 namespace fs = std::filesystem;
 
@@ -71,12 +78,16 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
-    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE, 
+    RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE,
+    RPC_CMD_JUPITER_EVENT_RECORD,
+    RPC_CMD_JUPITER_EVENT_WAIT,
+    RPC_CMD_JUPITER_SYNC,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
-static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before RPC_CMD_COUNT");
+static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before Jupiter commands");
+static_assert(RPC_CMD_JUPITER_EVENT_RECORD == 18, "Jupiter RPC command layout changed");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -193,6 +204,15 @@ struct rpc_msg_graph_recompute_req {
     uint64_t graph_uid;
 };
 
+struct rpc_msg_jupiter_event_req {
+    uint64_t event_id;
+    uint64_t generation;
+};
+
+struct rpc_msg_jupiter_rsp {
+    uint8_t ok;
+};
+
 struct rpc_msg_set_tensor_from_local_file_rsp {
     // 0:不支持本地文件加载
     // 1:已经成功处理
@@ -253,6 +273,14 @@ struct ggml_backend_rpc_context {
     uint32_t    device;
     std::string name;
 };
+
+struct ggml_backend_rpc_event_context {
+    std::string endpoint;
+    uint64_t event_id;
+    std::atomic<uint64_t> generation {0};
+};
+
+static std::atomic<uint64_t> g_jupiter_event_id {1};
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
@@ -379,12 +407,15 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
-static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+static std::shared_ptr<socket_t> get_socket_lane(const std::string & endpoint, const char * lane) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
-    auto it = sockets.find(endpoint);
+    const std::string lane_name = lane != nullptr ? lane : "control";
+    const std::string key = endpoint + "#" + lane_name;
+
+    auto it = sockets.find(key);
     if (it != sockets.end()) {
         if (auto sock = it->second.lock()) {
             return sock;
@@ -407,9 +438,13 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (!negotiate_hello(sock)) {
         return nullptr;
     }
-    LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+    LOG_DBG("[%s] connected to %s lane=%s\n", __func__, endpoint.c_str(), lane_name.c_str());
+    sockets[key] = sock;
     return sock;
+}
+
+static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+    return get_socket_lane(endpoint, "control");
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
@@ -865,8 +900,16 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 }
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
-    GGML_UNUSED(backend);
-    // this is no-op because we don't have any async operations
+    if (!jupiter_prefill_enabled()) {
+        GGML_UNUSED(backend);
+        return;
+    }
+
+    auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
+    rpc_msg_jupiter_rsp response {};
+    const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0, &response, sizeof(response));
+    RPC_STATUS_ASSERT(status && response.ok == 1);
 }
 
 static void add_tensor(ggml_tensor * tensor, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
@@ -954,14 +997,19 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
 
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
-    bool reuse = rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
-    //新的
-    //reuse = false;
+    bool reuse = !jupiter_prefill_enabled() &&
+                 rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
+    // Jupiter Prefill V1 intentionally serializes the full graph for each slot.
+    // Equal-shape chunks may reuse the llama graph object, but their RPC input buffers
+    // belong to different scheduler copies and therefore must not reuse a remote graph
+    // that captured a previous slot's tensor addresses.
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
-        auto sock = get_socket(rpc_ctx->endpoint);
+        auto sock = jupiter_prefill_enabled()
+                ? get_socket_lane(rpc_ctx->endpoint, "compute")
+                : get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
@@ -977,7 +1025,9 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-        auto sock = get_socket(rpc_ctx->endpoint);
+        auto sock = jupiter_prefill_enabled()
+                ? get_socket_lane(rpc_ctx->endpoint, "compute")
+                : get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
@@ -1001,6 +1051,46 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    auto * rpc_ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto * event_ctx = static_cast<ggml_backend_rpc_event_context *>(event->context);
+    const uint64_t generation = event_ctx->generation.fetch_add(1) + 1;
+
+    rpc_msg_jupiter_event_req request {
+        event_ctx->event_id,
+        generation,
+    };
+
+    auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
+    const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &request, sizeof(request));
+    RPC_STATUS_ASSERT(status);
+}
+
+static void ggml_backend_rpc_wait_event_context(ggml_backend_rpc_event_context * event_ctx) {
+    const uint64_t generation = event_ctx->generation.load();
+    if (generation == 0) {
+        return;
+    }
+
+    rpc_msg_jupiter_event_req request {
+        event_ctx->event_id,
+        generation,
+    };
+    rpc_msg_jupiter_rsp response {};
+
+    auto sock = get_socket(event_ctx->endpoint);
+    const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_WAIT,
+                                     &request, sizeof(request),
+                                     &response, sizeof(response));
+    RPC_STATUS_ASSERT(status && response.ok == 1);
+}
+
+static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_UNUSED(backend);
+    auto * event_ctx = static_cast<ggml_backend_rpc_event_context *>(event->context);
+    ggml_backend_rpc_wait_event_context(event_ctx);
+}
+
 static ggml_backend_i ggml_backend_rpc_interface = {
     /* .get_name                = */ ggml_backend_rpc_name,
     /* .free                    = */ ggml_backend_rpc_free,
@@ -1015,8 +1105,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
-    /* .event_record            = */ NULL,
-    /* .event_wait              = */ NULL,
+    /* .event_record            = */ ggml_backend_rpc_event_record,
+    /* .event_wait              = */ ggml_backend_rpc_event_wait,
     /* .graph_optimize          = */ NULL,
 };
 
@@ -1124,6 +1214,9 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
+    bool jupiter_event_record(const rpc_msg_jupiter_event_req & request);
+    bool jupiter_event_wait(const rpc_msg_jupiter_event_req & request, rpc_msg_jupiter_rsp & response);
+    bool jupiter_sync(rpc_msg_jupiter_rsp & response);
     struct stored_graph {
         std::vector<uint8_t>   buffer;
         ggml_cgraph          * graph;
@@ -1144,7 +1237,38 @@ private:
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
+
+    std::mutex jupiter_event_mutex;
+    std::condition_variable jupiter_event_cv;
+    std::unordered_map<uint64_t, uint64_t> jupiter_event_completed;
 };
+
+bool rpc_server::jupiter_event_record(const rpc_msg_jupiter_event_req & request) {
+    {
+        std::lock_guard<std::mutex> lock(jupiter_event_mutex);
+        uint64_t & completed = jupiter_event_completed[request.event_id];
+        completed = std::max(completed, request.generation);
+    }
+    jupiter_event_cv.notify_all();
+    return true;
+}
+
+bool rpc_server::jupiter_event_wait(const rpc_msg_jupiter_event_req & request, rpc_msg_jupiter_rsp & response) {
+    std::unique_lock<std::mutex> lock(jupiter_event_mutex);
+    jupiter_event_cv.wait(lock, [&]() {
+        auto it = jupiter_event_completed.find(request.event_id);
+        return it != jupiter_event_completed.end() && it->second >= request.generation;
+    });
+    response.ok = 1;
+    return true;
+}
+
+bool rpc_server::jupiter_sync(rpc_msg_jupiter_rsp & response) {
+    // This command is sent on the compute lane. Reaching it means every graph
+    // and event marker queued before it on that TCP stream has completed.
+    response.ok = 1;
+    return true;
+}
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
     response.major = RPC_PROTO_MAJOR_VERSION;
@@ -2306,6 +2430,43 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_JUPITER_EVENT_RECORD: {
+                rpc_msg_jupiter_event_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                if (!server.jupiter_event_record(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_JUPITER_EVENT_WAIT: {
+                rpc_msg_jupiter_event_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_jupiter_rsp response {};
+                if (!server.jupiter_event_wait(request, response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_JUPITER_SYNC: {
+                if (!recv_msg(sock, nullptr, 0)) {
+                    return;
+                }
+                rpc_msg_jupiter_rsp response {};
+                if (!server.jupiter_sync(response)) {
+                    return;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -2316,10 +2477,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 */
 
 //重构
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             socket_ptr sock, const ggml_rpc_local_tensor_source * tensor_source,
-                             std::string model_path, int tp_rank, int tp_size) {
-    rpc_server server(backends, cache_dir, tensor_source);
+static void rpc_serve_client(rpc_server & server,
+                             const std::vector<ggml_backend_t> & backends,
+                             socket_ptr sock) {
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
         return;
@@ -2750,6 +2910,8 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+    rpc_server shared_server(backends, cache_dir, tensor_source);
+
     while (true) {
         auto client_socket = server_socket->accept();   //这个是接收客户端连接的socket
         if (client_socket == nullptr) {
@@ -2758,12 +2920,15 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket,
-                         tensor_source,
-                         model_path ? std::string(model_path) : std::string(),
-                         tp_rank, tp_world_size);
-        printf("Client connection closed\n");
-        fflush(stdout);
+
+        // Jupiter uses a control/data lane and a compute lane. They must share
+        // the same buffer and graph registry, so one rpc_server instance is
+        // shared across connection threads.
+        std::thread([&shared_server, &backends, client_socket]() {
+            rpc_serve_client(shared_server, backends, client_socket);
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
     rpc_transport_shutdown();
     for (auto backend : backends) {
@@ -2801,16 +2966,51 @@ static enum ggml_backend_dev_type ggml_backend_rpc_device_get_type(ggml_backend_
     GGML_UNUSED(dev);
 }
 
+static ggml_backend_event_t ggml_backend_rpc_event_new(ggml_backend_dev_t dev) {
+    if (!jupiter_prefill_enabled()) {
+        return nullptr;
+    }
+
+    auto * dev_ctx = static_cast<ggml_backend_rpc_device_context *>(dev->context);
+    auto * event = new ggml_backend_event {
+        /* .device  = */ dev,
+        /* .context = */ new ggml_backend_rpc_event_context {
+            dev_ctx->endpoint,
+            g_jupiter_event_id.fetch_add(1),
+        },
+    };
+    return event;
+}
+
+static void ggml_backend_rpc_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    if (event == nullptr) {
+        return;
+    }
+    delete static_cast<ggml_backend_rpc_event_context *>(event->context);
+    delete event;
+}
+
+static void ggml_backend_rpc_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    GGML_UNUSED(dev);
+    if (event == nullptr) {
+        return;
+    }
+    auto * event_ctx = static_cast<ggml_backend_rpc_event_context *>(event->context);
+    ggml_backend_rpc_wait_event_context(event_ctx);
+}
+
 static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     props->name        = ggml_backend_rpc_device_get_name(dev);
     props->description = ggml_backend_rpc_device_get_description(dev);
     props->type        = ggml_backend_rpc_device_get_type(dev);
     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
+    const bool jupiter_async = jupiter_prefill_enabled();
     props->caps = {
-        /* .async                 = */ false,
+        /* .async                 = */ jupiter_async,
         /* .host_buffer           = */ false,
         /* .buffer_from_host_ptr  = */ false,
-        /* .events                = */ false,
+        /* .events                = */ jupiter_async,
     };
 }
 
@@ -2859,9 +3059,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
     /* .offload_op           = */ NULL,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_rpc_event_new,
+    /* .event_free           = */ ggml_backend_rpc_event_free,
+    /* .event_synchronize    = */ ggml_backend_rpc_event_synchronize,
 };
 
 // backend reg interface
