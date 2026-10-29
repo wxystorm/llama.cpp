@@ -28,6 +28,7 @@ param(
     [switch] $RunDp,
     [string] $PlanOutput = ".\\jupiter.plan",
     [switch] $DryRun,
+    [switch] $Resume,
 
     [string[]] $ExtraArgs = @()
 )
@@ -254,6 +255,12 @@ try {
             $stem = "q-x{0}-r{1}" -f $plan.X, $repeat
             $logPath = Join-Path $outDirPath "$stem.log"
             $csvPath = Join-Path $outDirPath "$stem.csv"
+
+            if ($Resume -and (Test-Path $logPath) -and (Test-Path $csvPath)) {
+                Write-Host "[JUPITER_SWEEP_RESUME] x=$($plan.X) repeat=$repeat/$Repeats action=SKIP csv=$csvPath"
+                $csvFiles += $csvPath
+                continue
+            }
 
             Write-Host ""
             Write-Host "[JUPITER_SWEEP_RUN] x=$($plan.X) repeat=$repeat/$Repeats chunks=$($plan.Text)"
