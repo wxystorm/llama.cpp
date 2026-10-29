@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -3731,8 +3732,12 @@ private:
             */
            const int tok_idx = slot.i_batch - off;
 
-            // 只打印每个请求的第一个生成 token
-            if (slot.n_decoded == 0) {
+            // Top-10 logits is a debugging aid, not part of the inference
+            // pipeline. Keep it opt-in: sorting the whole vocabulary and
+            // printing the results before the first token distorts timings.
+            const char * logits_top10_env = std::getenv("LLAMA_JUPITER_LOGITS_TOP10");
+            if (slot.n_decoded == 0 &&
+                logits_top10_env != nullptr && std::atoi(logits_top10_env) != 0) {
                 const float * logits =
                     llama_get_logits_ith(slot.ctx_tgt, tok_idx);
 
