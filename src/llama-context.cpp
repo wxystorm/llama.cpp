@@ -48,6 +48,8 @@ static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_k
         case llama_hybrid_runtime_stage_kind::CPU:    return "CPU";
         case llama_hybrid_runtime_stage_kind::TENSOR: return "TENSOR";
         case llama_hybrid_runtime_stage_kind::PHONE:  return "PHONE";
+        case llama_hybrid_runtime_stage_kind::C2P:    return "C2P";
+        case llama_hybrid_runtime_stage_kind::P2C:    return "P2C";
     }
     return "UNKNOWN";
 }
@@ -195,19 +197,58 @@ static std::vector<llama_hybrid_runtime_stage> llama_region_ring_runtime_stages(
         throw std::runtime_error(
             "region ring per-device chunks must be positive");
     }
+
+    auto runtime_kind = [](llama_region_ring_stage_kind kind) {
+        switch (kind) {
+            case llama_region_ring_stage_kind::CPU:
+                return llama_hybrid_runtime_stage_kind::CPU;
+            case llama_region_ring_stage_kind::GPU:
+                return llama_hybrid_runtime_stage_kind::GPU;
+            case llama_region_ring_stage_kind::PHONE:
+                return llama_hybrid_runtime_stage_kind::PHONE;
+            case llama_region_ring_stage_kind::C2P:
+                return llama_hybrid_runtime_stage_kind::C2P;
+            case llama_region_ring_stage_kind::P2C:
+                return llama_hybrid_runtime_stage_kind::P2C;
+        }
+        throw std::runtime_error("invalid Region Ring stage kind");
+    };
+
     std::vector<llama_hybrid_runtime_stage> stages;
     stages.reserve(regions.size());
-    for (const auto & region : regions) {
-        const auto kind =
-            region.device == llama_region_ring_device::CPU ?
-                llama_hybrid_runtime_stage_kind::CPU :
-            region.device == llama_region_ring_device::GPU ?
-                llama_hybrid_runtime_stage_kind::GPU :
-                llama_hybrid_runtime_stage_kind::PHONE;
+
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto & region = regions[i];
+
+        // A C2P boundary finishes with Phone ownership. Execute the following
+        // Phone-full region in the same Meta graph so the activation stays
+        // device-local instead of bouncing Phone -> host -> Phone between two
+        // outer Region tasks. P2C remains its own boundary stage because the
+        // next baseline stage is GPU and already needs a new outer scheduler.
+        if (region.kind == llama_region_ring_stage_kind::C2P &&
+                i + 1 < regions.size() &&
+                regions[i + 1].kind ==
+                    llama_region_ring_stage_kind::PHONE) {
+            const auto & phone = regions[i + 1];
+            if (region.layer_end != phone.layer_begin) {
+                throw std::runtime_error(
+                    "C2P boundary is not contiguous with Phone region");
+            }
+            stages.push_back({
+                llama_hybrid_runtime_stage_kind::C2P,
+                region.layer_begin,
+                phone.layer_end,
+                phone_chunk_tokens,
+                0});
+            ++i;
+            continue;
+        }
+
+        const auto kind = runtime_kind(region.kind);
         const int chunk_tokens =
-            region.device == llama_region_ring_device::CPU ?
+            region.kind == llama_region_ring_stage_kind::CPU ?
                 cpu_chunk_tokens :
-            region.device == llama_region_ring_device::GPU ?
+            region.kind == llama_region_ring_stage_kind::GPU ?
                 gpu_chunk_tokens : phone_chunk_tokens;
         stages.push_back({
             kind, region.layer_begin, region.layer_end, chunk_tokens, 0});
@@ -2618,6 +2659,13 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             const bool target_is_cpu = target == local_cpu;
             const bool target_is_cuda =
                 ring_lane == 1 && target == strict_compute_backend;
+            const bool directional_meta_stage =
+                stage.kind == llama_hybrid_runtime_stage_kind::C2P ||
+                stage.kind == llama_hybrid_runtime_stage_kind::P2C;
+            const bool target_uses_cpu =
+                target_is_cpu ||
+                (ring_lane == 2 && directional_meta_stage &&
+                 ggml_backend_is_meta(target));
 
             const uint64_t prepare_sync_mask =
                 gpu_weight_streaming ?
@@ -2638,7 +2686,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             const bool prepare_needs_cpu =
                 (prepare_sync_mask & cpu_bit) != 0;
 
-            if (target_is_cpu || prepare_needs_cpu) {
+            if (target_uses_cpu || prepare_needs_cpu) {
                 const int64_t wait_begin_us = ggml_time_us();
                 ring_cpu_gate->lock();
                 if (ring_cpu_wait_us != nullptr) {
@@ -2659,6 +2707,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 if (ring_prepare_wait_us != nullptr) {
                     *ring_prepare_wait_us += ggml_time_us() - wait_begin_us;
                 }
+            }
+
+            if (directional_meta_stage && block_index == 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_DIRECTIONAL_GATE] stage=%zu kind=%s "
+                    "block=%zu executor=META cpu_gate=HELD "
+                    "ownership=%s status=READY\n",
+                    stage_index,
+                    llama_hybrid_runtime_stage_name(stage.kind),
+                    block_index,
+                    stage.kind == llama_hybrid_runtime_stage_kind::C2P ?
+                        "PC_TO_PHONE" : "PHONE_TO_PC");
             }
 
             if (block_index == 0 || prepare_needs_cpu ||
@@ -2722,7 +2782,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             }
 
             ring_prepare_gate->unlock();
-            if (!target_is_cpu && ring_cpu_gate->owns_lock()) {
+            if (!target_uses_cpu && ring_cpu_gate->owns_lock()) {
                 ring_cpu_gate->unlock();
             }
 
@@ -2765,7 +2825,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             if (target_is_cuda && ring_cuda_gate->owns_lock()) {
                 ring_cuda_gate->unlock();
             }
-            if (target_is_cpu && ring_cpu_gate->owns_lock()) {
+            if (target_uses_cpu && ring_cpu_gate->owns_lock()) {
                 ring_cpu_gate->unlock();
             }
 
@@ -3197,13 +3257,31 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     std::vector<llama_region_ring_region> regions;
     regions.reserve(stages.size());
     for (const auto & stage : stages) {
-        const auto device =
-            stage.kind == llama_hybrid_runtime_stage_kind::CPU ?
-                llama_region_ring_device::CPU :
-            stage.kind == llama_hybrid_runtime_stage_kind::GPU ?
-                llama_region_ring_device::GPU :
-                llama_region_ring_device::PHONE;
-        regions.push_back({device, stage.layer_begin, stage.layer_end});
+        llama_region_ring_stage_kind kind;
+        switch (stage.kind) {
+            case llama_hybrid_runtime_stage_kind::CPU:
+                kind = llama_region_ring_stage_kind::CPU;
+                break;
+            case llama_hybrid_runtime_stage_kind::GPU:
+                kind = llama_region_ring_stage_kind::GPU;
+                break;
+            case llama_hybrid_runtime_stage_kind::PHONE:
+                kind = llama_region_ring_stage_kind::PHONE;
+                break;
+            case llama_hybrid_runtime_stage_kind::C2P:
+                kind = llama_region_ring_stage_kind::C2P;
+                break;
+            case llama_hybrid_runtime_stage_kind::P2C:
+                kind = llama_region_ring_stage_kind::P2C;
+                break;
+            case llama_hybrid_runtime_stage_kind::TENSOR:
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_STAGE] status=REJECT "
+                    "reason=LEGACY_TENSOR_STAGE_IN_RING\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+        }
+        regions.emplace_back(kind, stage.layer_begin, stage.layer_end);
     }
     // Scheduler/Graph Result ownership differs by device in the experimental
     // isolated mode. Only the scheduler state is independent at this stage:
