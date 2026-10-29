@@ -462,6 +462,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
                     const std::string norm_name = "prefill_ffn_norm_chunk_" + std::to_string(i);
 
+                    if (llama_hybrid_layer_mode_directional_tensor(hybrid_mode)) {
+                        ffn_norm_chunk->flags |= GGML_TENSOR_FLAG_META_SEND_READY;
+                    }
                     cb(ffn_norm_chunk, norm_name.c_str(), il);
 
                     ggml_tensor * down_chunk =
@@ -470,6 +473,9 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                                   model.layers[il].ffn_gate_s, model.layers[il].ffn_down, model.layers[il].ffn_down_b,
                                   model.layers[il].ffn_down_s, NULL, LLM_FFN_SILU, LLM_FFN_PAR, il);
                     const std::string down_name = "prefill_ffn_down_chunk_" + std::to_string(i);
+                    if (llama_hybrid_layer_mode_directional_tensor(hybrid_mode)) {
+                        down_chunk->flags |= GGML_TENSOR_FLAG_META_SEND_PARTIAL;
+                    }
                     cb(down_chunk, down_name.c_str(), il);
                     down_chunks.push_back(down_chunk);
                     token_begin = token_end;
