@@ -45,6 +45,18 @@ The scheduler then prints one line per stage:
 [JUPITER_STAGE_PROFILE] ... backend=RPC0[...] ... input_ms=... compute_ms=... wall_ms=...
 ```
 
+With the updated PC binary and `LLAMA_JUPITER_TRACE=1`, runtime also reports:
+
+```text
+[JUPITER_SEQUENCE_DECISION] batch_tokens=N requested_sum=M requested_k=...
+  requested_max=... max_ubatch=... n_stream=... applied=0|1
+  reason=APPLIED|TOKEN_SUM_MISMATCH|INVALID_CHUNKS|CHUNK_EXCEEDS_UBATCH|MULTIPLE_KV_STREAMS|NO_EXPLICIT_PLAN
+```
+
+This is the decisive check when a server task token count differs from the
+actual prefill decode batch size. The diagnostic is compiled into the PC
+runtime only; the phone RPC server does not need a rebuild.
+
 Extract q samples from the PC log:
 
 ```bash
