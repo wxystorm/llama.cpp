@@ -155,6 +155,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--verbosity", type=int, default=3)
     p.add_argument("--window", type=int, default=2)
+    p.add_argument("--async-c2p", action="store_true",
+                   help="opt in to the Region Ring-style Jupiter RPC transport worker")
     p.add_argument(
         "--skip-verify", action="store_true",
         help="skip the one-time -lv 4 sequence-plan verification before timing",
@@ -215,6 +217,7 @@ def main() -> int:
         "LLAMA_JUPITER_PROFILE_STAGE": "0",
         "LLAMA_JUPITER_TRACE": "0",
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
+        "LLAMA_JUPITER_ASYNC_C2P": "1" if args.async_c2p else "0",
     })
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
@@ -230,6 +233,7 @@ def main() -> int:
         "target_tokens": target,
         "pc_layers": args.pc_layers,
         "window": args.window,
+        "async_c2p": args.async_c2p,
         "profile_stage": 0,
         "trace": 0,
         "logits_top10": 0,
@@ -265,7 +269,8 @@ def main() -> int:
     print(
         f"[JUPITER_BENCH_CONFIG] tokens={target} modes={','.join(args.modes)} "
         f"repeats={args.repeats} lv={args.verbosity} "
-        f"window={args.window} trace=0 profile_stage=0",
+        f"window={args.window} async_c2p={int(args.async_c2p)} "
+        "trace=0 profile_stage=0",
         flush=True,
     )
 
@@ -273,7 +278,7 @@ def main() -> int:
         # Only verification uses TRACE verbosity. It is not included in the
         # formal results and never enables per-stage synchronous profiling.
         for mode in args.modes:
-            if mode == "default":
+            if mode == "default" and not args.async_c2p:
                 continue
             wanted = plans[target] if mode == "dp" else fixed
             check_log = out / f"verify-{mode}.log"
@@ -291,9 +296,19 @@ def main() -> int:
                 (int(m.group(1)), [int(x) for x in m.group(2).split(",")])
                 for m in PLAN_RE.finditer(text)
             ]
-            if not any(length == target and chunks == wanted for length, chunks in matched):
+            if mode != "default" and not any(
+                length == target and chunks == wanted for length, chunks in matched
+            ):
                 raise RuntimeError(
                     f"{mode} did not report the expected Jupiter sequence plan; "
+                    f"inspect {check_log}"
+                )
+            if args.async_c2p and (
+                "[JUPITER_COMM] mode=ASYNC_C2P_NETWORK status=ENABLED" not in text
+                or "[JUPITER_COMM] action=C2P_ENQUEUE" not in text
+            ):
+                raise RuntimeError(
+                    f"{mode} did not execute the asynchronous C2P path; "
                     f"inspect {check_log}"
                 )
             print(
