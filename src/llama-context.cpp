@@ -3237,12 +3237,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
 
-    // Planner runs ONLY in explicit dry-run mode, before the fixed Ring
-    // execution. It reads the measured Hybrid profile, predicts alternative
-    // layer/Chunk layouts and never changes stages, KV or scheduler state.
+    const bool directional_runtime =
+        std::any_of(
+            stages.begin(), stages.end(),
+            [](const llama_hybrid_runtime_stage & stage) {
+                return
+                    stage.kind == llama_hybrid_runtime_stage_kind::C2P ||
+                    stage.kind == llama_hybrid_runtime_stage_kind::P2C;
+            });
+
+    // Planner runs ONLY in explicit dry-run mode for the legacy G/C/P Ring.
+    // Directional C2P/P2C placement is fixed-layout V1; Planner integration is
+    // deliberately deferred until after correctness/performance validation.
     const char * ring_plan_mode =
         std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
-    if (pc_phone_overlap && ring_plan_mode != nullptr &&
+    if (directional_runtime && ring_plan_mode != nullptr) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_DIRECTIONAL_PLAN] planner=DISABLED "
+            "reason=FIXED_LAYOUT_V1 status=READY\n");
+    } else if (pc_phone_overlap && ring_plan_mode != nullptr &&
             std::strcmp(ring_plan_mode, "dry-run") == 0 &&
             ubatch.n_tokens >= 32) {
         const int kv_start =
