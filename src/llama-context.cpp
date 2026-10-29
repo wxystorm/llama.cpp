@@ -243,6 +243,16 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
+        const bool jupiter_prefill = jupiter_env != nullptr && atoi(jupiter_env) != 0;
+        if (jupiter_prefill) {
+            // Jupiter Prefill V1 rotates scheduler copies between sub-sequences.
+            // Reusing one allocated graph would pin every ubatch to the same copy
+            // and force a full synchronization before set_inputs().
+            graph_reuse_disable = true;
+            LLAMA_LOG_INFO("[JUPITER_PIPE] graph_reuse=DISABLED reason=ROTATE_CHUNK_SLOTS\n");
+        }
+
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
@@ -419,6 +429,15 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+            const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
+            if (jupiter_env != nullptr && atoi(jupiter_env) != 0) {
+                LLAMA_LOG_INFO("[JUPITER_PIPE] mode=ASYNC_TWO_STAGE status=ENABLED\n");
+            }
+        } else {
+            const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
+            if (jupiter_env != nullptr && atoi(jupiter_env) != 0) {
+                LLAMA_LOG_ERROR("[JUPITER_PIPE] mode=ASYNC_TWO_STAGE status=DISABLED check=RPC_ASYNC_EVENTS_AND_NGL\n");
+            }
         }
 
         sched_reserve();
