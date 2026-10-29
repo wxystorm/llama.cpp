@@ -303,6 +303,7 @@ struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
     void * base_ptr;
     uint64_t remote_ptr;
+    std::string endpoint;
 
     // Jupiter rebuilds the local llama graph for each ubatch so it can rotate
     // scheduler copies without globally synchronizing. The remote OpenCL tensor
@@ -658,6 +659,40 @@ struct jupiter_rpc_comm_worker {
     }
 };
 
+// Only Jupiter opt-in backends register here. Draining before RPC output reads
+// and remote buffer destruction ensures a queued network send/graph cannot
+// target storage that was freed or read prematurely. Worker threads never
+// acquire this registry mutex, so waiting on their completion is safe.
+static std::mutex g_jupiter_comm_registry_mutex;
+static std::unordered_multimap<std::string, jupiter_rpc_comm_worker *>
+    g_jupiter_comm_registry;
+
+static void jupiter_comm_registry_add(
+        const std::string & endpoint, jupiter_rpc_comm_worker * worker) {
+    std::lock_guard<std::mutex> lock(g_jupiter_comm_registry_mutex);
+    g_jupiter_comm_registry.emplace(endpoint, worker);
+}
+
+static void jupiter_comm_registry_remove(jupiter_rpc_comm_worker * worker) {
+    std::lock_guard<std::mutex> lock(g_jupiter_comm_registry_mutex);
+    for (auto it = g_jupiter_comm_registry.begin();
+         it != g_jupiter_comm_registry.end();) {
+        if (it->second == worker) {
+            it = g_jupiter_comm_registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void jupiter_comm_drain_endpoint(const std::string & endpoint) {
+    std::lock_guard<std::mutex> lock(g_jupiter_comm_registry_mutex);
+    const auto range = g_jupiter_comm_registry.equal_range(endpoint);
+    for (auto it = range.first; it != range.second; ++it) {
+        RPC_STATUS_ASSERT(it->second->synchronize_remote());
+    }
+}
+
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer);
 
 static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
@@ -969,6 +1004,9 @@ static void ggml_backend_rpc_buffer_set_tensor(
 }
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (jupiter_async_c2p_enabled()) {
+        jupiter_comm_drain_endpoint(ctx->endpoint);
+    }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
@@ -977,6 +1015,9 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 
 static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+    if (jupiter_async_c2p_enabled()) {
+        jupiter_comm_drain_endpoint(ctx->endpoint);
+    }
     rpc_msg_get_tensor_req request;
     request.tensor = serialize_tensor(tensor);
     request.offset = offset;
@@ -1044,7 +1085,7 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
     if (response.remote_ptr != 0) {
         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
             ggml_backend_rpc_buffer_interface,
-            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr},
+            new ggml_backend_rpc_buffer_context{sock, nullptr, response.remote_ptr, buft_ctx->endpoint},
             response.remote_size);
         return buffer;
     } else {
@@ -1135,6 +1176,7 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
     ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
     if (rpc_ctx->comm) {
         RPC_STATUS_ASSERT(rpc_ctx->comm->synchronize_remote());
+        jupiter_comm_registry_remove(rpc_ctx->comm.get());
     }
     delete rpc_ctx;
     delete backend;
@@ -1348,6 +1390,7 @@ static bool ggml_backend_rpc_cpy_tensor_async(
         ggml_tensor * dst) {
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend_dst->context);
     if (!ctx->comm || !backend_src || !src || !dst ||
+        ggml_backend_is_rpc(backend_src) ||
         !src->buffer || !dst->buffer ||
         !ggml_backend_buffer_is_rpc(dst->buffer) ||
         !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
@@ -1606,6 +1649,7 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
     };
     if (jupiter_async_c2p_enabled()) {
         ctx->comm = std::make_unique<jupiter_rpc_comm_worker>(ctx->endpoint);
+        jupiter_comm_registry_add(ctx->endpoint, ctx->comm.get());
         GGML_LOG_INFO("[JUPITER_COMM] mode=ASYNC_C2P_NETWORK status=ENABLED "
                       "source_staging=SYNC graph_submit=WORKER max_pending=32\n");
     }
