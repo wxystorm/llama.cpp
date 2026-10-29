@@ -37,10 +37,21 @@ def _positive_number(row: dict, field: str) -> float:
     return value
 
 
+def partition_feasible(total_tokens: int, min_chunk: int, max_chunk: int) -> bool:
+    """Check if total can be tiled by integer chunks in [min_chunk, max_chunk]."""
+    if total_tokens <= 0 or min_chunk <= 0 or max_chunk < min_chunk:
+        return False
+    smallest_k = (total_tokens + max_chunk - 1) // max_chunk
+    largest_k = total_tokens // min_chunk
+    return smallest_k <= largest_k
+
+
 def select_min_chunk(
     rows: Sequence[dict],
     threshold: float = 0.90,
     min_samples: int = 1,
+    total_tokens: int | None = None,
+    max_chunk: int | None = None,
 ) -> tuple[ChunkEfficiency, list[ChunkEfficiency], str]:
     """Pick the smallest chunk where both measured stages have saturated.
 
@@ -52,12 +63,17 @@ def select_min_chunk(
     Use complete synchronized stage measurements at the same prefix (y=0);
     no network transfer or graph-preparation costs are included in the
     throughput proxy. The selected size is a planning heuristic, not a
-    measurement of device occupancy.
+    measurement of device occupancy. When total_tokens/max_chunk are supplied,
+    the full sequence must also admit a strict [b,max_chunk] partition.
     """
     if not 0.0 < threshold <= 1.0 or not math.isfinite(threshold):
         raise ValueError("threshold must be finite and within (0,1]")
     if min_samples <= 0:
         raise ValueError("min_samples must be positive")
+    if (total_tokens is None) != (max_chunk is None):
+        raise ValueError("total_tokens and max_chunk must be supplied together")
+    if total_tokens is not None and (total_tokens <= 0 or max_chunk <= 0):
+        raise ValueError("total_tokens and max_chunk must be positive")
 
     by_size: dict[int, list[dict]] = {}
     for row in rows:
@@ -93,16 +109,34 @@ def select_min_chunk(
         for item in measured
     ]
 
-    eligible = [item for item in normalized
+    feasible = [
+        item for item in normalized
+        if total_tokens is None or
+        partition_feasible(total_tokens, item.tokens, max_chunk)
+    ]
+    if not feasible:
+        raise ValueError(
+            "no measured minimum b permits a legal full-prompt partition "
+            f"(total={total_tokens}, max_chunk={max_chunk})"
+        )
+
+    eligible = [item for item in feasible
                 if item.pc_relative + 1e-12 >= threshold
                 and item.phone_relative + 1e-12 >= threshold]
     if eligible:
         return eligible[0], normalized, "BOTH_STAGES_SATURATED"
 
-    # There is no common plateau in the sampled range. Do not pretend the
-    # minimum b is known: report a deterministic best-compromise candidate.
-    fallback = max(normalized, key=lambda item: (item.minimum_relative, -item.tokens))
-    return fallback, normalized, "NO_COMMON_PLATEAU"
+    # The saturating candidate may be impossible to tile with the current
+    # prompt and ubatch cap (e.g. b=128, total=357, ubatch=128).
+    # Report a feasible, explicitly below-threshold fallback; never emit
+    # an unexecutable DP constraint.
+    fallback = max(feasible, key=lambda item: (item.minimum_relative, -item.tokens))
+    unconstrained_saturated = any(
+        item.pc_relative + 1e-12 >= threshold and
+        item.phone_relative + 1e-12 >= threshold for item in normalized
+    )
+    status = "NO_FEASIBLE_PLATEAU" if unconstrained_saturated else "NO_COMMON_PLATEAU"
+    return fallback, normalized, status
 
 
 def read_sample_csv(path: str) -> list[dict]:
