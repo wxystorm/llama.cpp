@@ -9987,18 +9987,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
+            "nonuniform_profiled=%zu nonuniform_simulated=%zu "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
             "E_margin=%.4f shortlist_floor=%d "
             "filter=E_WINDOW_PLUS_FLOOR exact=FULL_PROMPT_EVENT_SIM "
             "ranking=SIM_WALL sim_cap=NONE "
-            "cycles=2..4 tail=DISABLED final_owner=PHONE "
+            "cycles=2..4 shape=NONUNIFORM_REFINED "
+            "tail=PREVIEW_ONLY final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
             "XC=16,32,64,128 XG=16,32,64,128 "
             "XP=16,32,64,128 baseline_ms=%.3f valid=%d\n",
             result.enumerated, result.profiled,
             result.e_window_shortlisted, result.shortlisted,
-            result.simulated, result.rejected_memory,
+            result.simulated, result.nonuniform_profiled,
+            result.nonuniform_simulated, result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
             result.shortlist_e_limit, wide_e_margin,
@@ -10025,7 +10028,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_CANDIDATE] mode=APPLY_WIDE rank=%zu "
-                "layout=%s cycles=%d C=%d G=%d P=%d "
+                "layout=%s cycles=%d first_C=%d first_G=%d first_P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "cpu_busy=%.3f gpu_busy=%.3f phone_busy=%.3f "
                 "prepare_busy=%.3f weight_prepare=%.3f "
@@ -10135,51 +10138,22 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
 
             const int cycles = (int) forced_regions.size() / 3;
-            const int g =
-                forced_regions[0].layer_end -
-                forced_regions[0].layer_begin;
-            const int c =
-                forced_regions[1].layer_end -
-                forced_regions[1].layer_begin;
-            const int p =
-                forced_regions[2].layer_end -
-                forced_regions[2].layer_begin;
-            bool uniform = cycles >= 2 && cycles <= 4;
-            for (int cycle = 0; uniform && cycle < cycles; ++cycle) {
-                const size_t base = (size_t) cycle * 3;
-                uniform =
-                    forced_regions[base + 0].device ==
-                        llama_region_ring_device::GPU &&
-                    forced_regions[base + 1].device ==
-                        llama_region_ring_device::CPU &&
-                    forced_regions[base + 2].device ==
-                        llama_region_ring_device::PHONE &&
-                    forced_regions[base + 0].layer_end -
-                        forced_regions[base + 0].layer_begin == g &&
-                    forced_regions[base + 1].layer_end -
-                        forced_regions[base + 1].layer_begin == c &&
-                    forced_regions[base + 2].layer_end -
-                        forced_regions[base + 2].layer_begin == p;
-            }
-            if (!uniform) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
-                    "status=REJECT reason=NONUNIFORM_CYCLE "
-                    "layout=%s\n",
-                    force_layout);
-                return false;
-            }
-
             llama_ring_planner::candidate forced;
             forced.cycles = cycles;
-            forced.c = c;
-            forced.g = g;
-            forced.p = p;
+            forced.g = forced_regions[0].layer_end -
+                       forced_regions[0].layer_begin;
+            forced.c = forced_regions[1].layer_end -
+                       forced_regions[1].layer_begin;
+            forced.p = forced_regions[2].layer_end -
+                       forced_regions[2].layer_begin;
             forced.tail_c = 0;
             forced.tail_g = 0;
             forced.xc = force_xc;
             forced.xg = force_xg;
             forced.xp = force_xp;
+            // Existing MoE concrete-region ownership now accepts unequal
+            // Cycle widths for deterministic APPLY_WIDE A/B checks.
+            forced.concrete_regions = forced_regions;
 
             if ((model.memory_feasible &&
                     !model.memory_feasible(forced)) ||
@@ -10214,7 +10188,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
                 "status=ACCEPT source=ENV_AB "
-                "layout=%s cycles=%d C=%d G=%d P=%d "
+                "layout=%s cycles=%d first_C=%d first_G=%d first_P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "prepare_busy=%.3f weight_prepare=%.3f "
                 "weight_h2d_exposed=%.3f E=%.4f\n",
@@ -10379,7 +10353,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
             "source=%s layout=%s baseline_layout=%s "
-            "cycles=%d C=%d G=%d P=%d XC=%d XG=%d XP=%d "
+            "cycles=%d first_C=%d first_G=%d first_P=%d XC=%d XG=%d XP=%d "
             "predicted_ms=%.3f baseline_predicted_ms=%.3f "
             "prepare_busy=%.3f weight_prepare=%.3f "
             "weight_h2d_total=%.3f weight_h2d_startup=%.3f "
