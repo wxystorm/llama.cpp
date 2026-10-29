@@ -116,6 +116,7 @@ def build_cli(
         "--flash-attn", "on",
         "-lv", str(verbosity),
         "--no-conversation", "--single-turn", "--simple-io",
+        "--no-show-timings",  # retain server prompt eval time, hide CLI duplicate
         "-p", prompt,
     ]
 
@@ -220,6 +221,12 @@ def main() -> int:
 
     config = {
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "exe": str(exe),
+        "exe_size": exe.stat().st_size,
+        "exe_mtime_ns": exe.stat().st_mtime_ns,
+        "model": str(model),
+        "model_size": model.stat().st_size,
+        "rpc": args.rpc,
         "target_tokens": target,
         "pc_layers": args.pc_layers,
         "window": args.window,
@@ -236,7 +243,21 @@ def main() -> int:
         "dp_chunks": plans.get(target),
         "fixed64_chunks": fixed,
     }
-    (out / "configuration.json").write_text(
+    config_path = out / "configuration.json"
+    if args.resume and config_path.is_file():
+        previous = json.loads(config_path.read_text(encoding="utf-8"))
+        # Users can resume with a larger repeat count, but never silently mix
+        # measurements from different prompts, binaries, plans or parameters.
+        comparable = {key: value for key, value in config.items() if key != "repeats"}
+        old_comparable = {
+            key: value for key, value in previous.items() if key != "repeats"
+        }
+        if comparable != old_comparable:
+            raise RuntimeError(
+                f"--resume configuration mismatch in {config_path}; "
+                "use a new --out-dir for a new experiment"
+            )
+    config_path.write_text(
         json.dumps(config, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
