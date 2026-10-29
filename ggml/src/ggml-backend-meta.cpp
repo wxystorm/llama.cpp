@@ -2348,8 +2348,27 @@ struct ggml_backend_meta_context {
     static constexpr size_t PREFILL_ROUTE_LANES = 4;
 
     struct cgraph_config {
+        enum directional_completion_action : uint8_t {
+            DIRECTIONAL_COMPLETE_NONE = 0,
+            DIRECTIONAL_COMPLETE_SEND_READY,
+            DIRECTIONAL_COMPLETE_SEND_PARTIAL,
+        };
+
         ggml_cgraph * cgraph_main = nullptr;
         int           offset      = 0; // Node offset vs. original graph
+
+        // Directional Tensor completion contract. This is bound once while
+        // the Meta graph is split, when the original semantic node is still
+        // known. Runtime execution never scans cgraph node names to discover
+        // READY/PARTIAL: the completed subgraph already knows what to send,
+        // where to send it, and which simple tensor is the wire payload.
+        directional_completion_action directional_completion =
+            DIRECTIONAL_COMPLETE_NONE;
+        int directional_layer = -1;
+        int directional_chunk = -1;
+        int directional_src_backend = -1;
+        int directional_dst_backend = -1;
+        ggml_tensor * directional_boundary = nullptr;
 
         std::vector<ggml_cgraph *> cgraphs_aux;
     };
@@ -4912,6 +4931,12 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 const bool is_prefill_norm_chunk =
                     ggml_backend_meta_parse_prefill_norm_chunk(
                         node->name, prefill_chunk, prefill_layer);
+                const bool is_directional_prefill_ready =
+                    is_prefill_norm_chunk &&
+                    (ggml_backend_meta_tensor_c2p_layer(
+                         backend_ctx, prefill_layer) ||
+                     ggml_backend_meta_tensor_p2c_layer(
+                         backend_ctx, prefill_layer));
 
                 int phone_route_chunk = -1;
                 int phone_route_layer = -1;
@@ -4969,7 +4994,36 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     continue;
                 }
 
-                const int i_delayed = get_i_delayed(i);
+                // READY and PARTIAL are task-completion boundaries, not
+                // all-reduce hints. Never delay them into a later anonymous
+                // residual node: the producer task must end exactly where its
+                // wire payload becomes ready.
+                const bool directional_completion_boundary =
+                    is_directional_prefill_ready ||
+                    is_directional_prefill_down;
+                const int directional_boundary_index = i;
+                const int directional_completion_layer =
+                    is_directional_prefill_ready ?
+                        prefill_layer : directional_down_layer;
+                const int directional_completion_chunk =
+                    is_directional_prefill_ready ?
+                        prefill_chunk : directional_down_chunk;
+                const bool directional_completion_c2p =
+                    directional_completion_boundary &&
+                    ggml_backend_meta_tensor_c2p_layer(
+                        backend_ctx, directional_completion_layer);
+                const bool directional_completion_p2c =
+                    directional_completion_boundary &&
+                    ggml_backend_meta_tensor_p2c_layer(
+                        backend_ctx, directional_completion_layer);
+                GGML_ASSERT(
+                    !directional_completion_boundary ||
+                    (directional_completion_c2p !=
+                     directional_completion_p2c));
+
+                const int i_delayed =
+                    directional_completion_boundary ?
+                        i : get_i_delayed(i);
 
                 // If we can delay the AllReduce we need to consider the interaction with zero-sized tensor slices.
                 // A backend with such a slice would normally have valid data after participating in the AllReduce with a node that has
@@ -4990,7 +5044,47 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
 
                 for (size_t j = 0; j < n_backends; j++) {
                     auto & bcj = backend_ctx->backend_configs[j];
-                    bcj.cgraphs[n_subgraphs].offset = i_start;
+                    auto & cfg = bcj.cgraphs[n_subgraphs];
+                    cfg.offset = i_start;
+                    cfg.directional_completion =
+                        !directional_completion_boundary ?
+                            ggml_backend_meta_context::cgraph_config::
+                                DIRECTIONAL_COMPLETE_NONE :
+                        is_directional_prefill_ready ?
+                            ggml_backend_meta_context::cgraph_config::
+                                DIRECTIONAL_COMPLETE_SEND_READY :
+                            ggml_backend_meta_context::cgraph_config::
+                                DIRECTIONAL_COMPLETE_SEND_PARTIAL;
+                    cfg.directional_layer =
+                        directional_completion_boundary ?
+                            directional_completion_layer : -1;
+                    cfg.directional_chunk =
+                        directional_completion_boundary ?
+                            directional_completion_chunk : -1;
+                    cfg.directional_src_backend =
+                        directional_completion_boundary ?
+                            (directional_completion_c2p ? 0 : 1) : -1;
+                    cfg.directional_dst_backend =
+                        directional_completion_boundary ?
+                            (directional_completion_c2p ? 1 : 0) : -1;
+                    cfg.directional_boundary =
+                        directional_completion_boundary ?
+                            bcj.nodes[directional_boundary_index] : nullptr;
+                }
+                if (directional_completion_boundary &&
+                        std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                    printf(
+                        "[REGION_DIRECTIONAL_COMPLETION_BIND] "
+                        "sg=%zu layer=%d chunk=%d action=%s "
+                        "src=%d dst=%d boundary=%s status=READY\n",
+                        n_subgraphs,
+                        directional_completion_layer,
+                        directional_completion_chunk,
+                        is_directional_prefill_ready ?
+                            "SEND_READY" : "SEND_PARTIAL",
+                        directional_completion_c2p ? 0 : 1,
+                        directional_completion_c2p ? 1 : 0,
+                        cgraph->nodes[directional_boundary_index]->name);
                 }
                 n_subgraphs++;
                 i_start = i + 1;
@@ -8894,6 +8988,51 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             }
         }
 
+        const auto & directional_cfg =
+            backend_ctx->backend_configs[0].cgraphs[i];
+        const auto directional_completion =
+            directional_cfg.directional_completion;
+        const int directional_layer =
+            directional_cfg.directional_layer;
+        const int directional_chunk =
+            directional_cfg.directional_chunk;
+        const int directional_src_backend =
+            directional_cfg.directional_src_backend;
+        const int directional_dst_backend =
+            directional_cfg.directional_dst_backend;
+        if (directional_completion !=
+                ggml_backend_meta_context::cgraph_config::
+                    DIRECTIONAL_COMPLETE_NONE) {
+            GGML_ASSERT(n_backends == 2);
+            GGML_ASSERT(
+                directional_src_backend >= 0 &&
+                directional_src_backend < (int) n_backends &&
+                directional_dst_backend >= 0 &&
+                directional_dst_backend < (int) n_backends &&
+                directional_src_backend != directional_dst_backend);
+            for (size_t j = 1; j < n_backends; ++j) {
+                const auto & cfg =
+                    backend_ctx->backend_configs[j].cgraphs[i];
+                GGML_ASSERT(
+                    cfg.directional_completion ==
+                        directional_completion &&
+                    cfg.directional_layer == directional_layer &&
+                    cfg.directional_chunk == directional_chunk &&
+                    cfg.directional_src_backend ==
+                        directional_src_backend &&
+                    cfg.directional_dst_backend ==
+                        directional_dst_backend);
+            }
+        }
+        auto directional_boundary = [&](size_t backend_index)
+                -> ggml_tensor * {
+            if (backend_index >= n_backends) {
+                return nullptr;
+            }
+            return backend_ctx->backend_configs[backend_index]
+                .cgraphs[i].directional_boundary;
+        };
+
         // Region Ring Phone->PC terminal bridge (experimental, opt-in).
         // Do not manually ADD at FFN completion: the following l_out graph
         // already owns the residual ADD.  Keep the FFN output Phone-local,
@@ -9034,75 +9173,33 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             }
         }
 
-        if (pipeline_debug && n_backends == 2) {
-            auto trace_named_partial = [&](size_t backend) {
-                ggml_cgraph * g =
-                    backend_ctx->backend_configs[backend]
-                        .cgraphs[i].cgraph_main;
-                if (g == nullptr) {
-                    return;
-                }
-                for (int k = 0; k < g->n_nodes; ++k) {
-                    int trace_chunk = -1;
-                    int trace_layer = -1;
-                    ggml_tensor * t = g->nodes[k];
-                    if (!ggml_backend_meta_parse_prefill_down_chunk(
-                            t->name,
-                            trace_chunk,
-                            trace_layer)) {
-                        continue;
-                    }
-                    if (!ggml_backend_meta_tensor_c2p_layer(
-                            backend_ctx, trace_layer) &&
-                            !ggml_backend_meta_tensor_p2c_layer(
-                                backend_ctx, trace_layer)) {
-                        continue;
-                    }
-                    printf(
-                        "[REGION_DIRECTIONAL_PARTIAL_SCAN] "
-                        "sg=%zu backend=%s index=%d layer=%d chunk=%d "
-                        "name=%s compute=%d op=%s bytes=%zu\n",
-                        i,
-                        backend == 0 ? "PC" : "PHONE",
-                        k,
-                        trace_layer,
-                        trace_chunk,
-                        t->name,
-                        !!(t->flags & GGML_TENSOR_FLAG_COMPUTE),
-                        ggml_op_name(t->op),
-                        ggml_nbytes(t));
-                }
-            };
-            trace_named_partial(0);
-            trace_named_partial(1);
-        }
-
-        int c2p_prefill_down_chunk_0 = -1;
-        int c2p_prefill_down_layer_0 = -1;
-        int c2p_prefill_down_chunk_1 = -1;
-        int c2p_prefill_down_layer_1 = -1;
-        ggml_tensor * c2p_prefill_down_node_0 =
-            n_backends == 2 ?
-                get_prefill_down_boundary_node(0, i) : nullptr;
-        ggml_tensor * c2p_prefill_down_node_1 =
-            n_backends == 2 ?
-                get_prefill_down_boundary_node(1, i) : nullptr;
         const bool c2p_prefill_down_boundary =
             n_backends == 2 &&
-            c2p_prefill_down_node_0 != nullptr &&
-            c2p_prefill_down_node_1 != nullptr &&
-            ggml_backend_meta_parse_prefill_down_chunk(
-                c2p_prefill_down_node_0->name,
-                c2p_prefill_down_chunk_0,
-                c2p_prefill_down_layer_0) &&
-            ggml_backend_meta_parse_prefill_down_chunk(
-                c2p_prefill_down_node_1->name,
-                c2p_prefill_down_chunk_1,
-                c2p_prefill_down_layer_1) &&
-            c2p_prefill_down_chunk_0 == c2p_prefill_down_chunk_1 &&
-            c2p_prefill_down_layer_0 == c2p_prefill_down_layer_1 &&
+            directional_completion ==
+                ggml_backend_meta_context::cgraph_config::
+                    DIRECTIONAL_COMPLETE_SEND_PARTIAL &&
+            directional_src_backend == 0 &&
+            directional_dst_backend == 1 &&
             ggml_backend_meta_tensor_c2p_layer(
-                backend_ctx, c2p_prefill_down_layer_0);
+                backend_ctx, directional_layer);
+        int c2p_prefill_down_chunk_0 =
+            c2p_prefill_down_boundary ? directional_chunk : -1;
+        int c2p_prefill_down_layer_0 =
+            c2p_prefill_down_boundary ? directional_layer : -1;
+        int c2p_prefill_down_chunk_1 =
+            c2p_prefill_down_chunk_0;
+        int c2p_prefill_down_layer_1 =
+            c2p_prefill_down_layer_0;
+        ggml_tensor * c2p_prefill_down_node_0 =
+            c2p_prefill_down_boundary ?
+                directional_boundary(0) : nullptr;
+        ggml_tensor * c2p_prefill_down_node_1 =
+            c2p_prefill_down_boundary ?
+                directional_boundary(1) : nullptr;
+        GGML_ASSERT(
+            !c2p_prefill_down_boundary ||
+            (c2p_prefill_down_node_0 != nullptr &&
+             c2p_prefill_down_node_1 != nullptr));
 
         if (pipeline_debug && c2p_prefill_down_boundary) {
             printf(
@@ -9273,25 +9370,63 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
 
         int prefill_norm_chunk = -1;
         int prefill_norm_layer = -1;
-        const bool is_prefill_norm_input =
+        bool is_prefill_norm_input = false;
+        const bool directional_c2p_ready =
             n_backends == 2 &&
-            active_count == 1 &&
-            active_backend == 0 &&
-            ggml_backend_meta_parse_prefill_norm_chunk(
-                nodes[active_backend]->name, prefill_norm_chunk, prefill_norm_layer);
+            directional_completion ==
+                ggml_backend_meta_context::cgraph_config::
+                    DIRECTIONAL_COMPLETE_SEND_READY &&
+            directional_src_backend == 0 &&
+            directional_dst_backend == 1 &&
+            ggml_backend_meta_tensor_c2p_layer(
+                backend_ctx, directional_layer);
+        if (directional_c2p_ready) {
+            prefill_norm_chunk = directional_chunk;
+            prefill_norm_layer = directional_layer;
+            is_prefill_norm_input =
+                active_count == 1 && active_backend == 0;
+        } else {
+            // Legacy non-directional prefill keeps the old name-based
+            // compatibility path. Directional Tensor never reaches it.
+            is_prefill_norm_input =
+                n_backends == 2 &&
+                active_count == 1 &&
+                active_backend == 0 &&
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    nodes[active_backend]->name,
+                    prefill_norm_chunk,
+                    prefill_norm_layer);
+        }
 
         int p2c_prefill_norm_chunk = -1;
         int p2c_prefill_norm_layer = -1;
-        const bool is_p2c_prefill_norm_input =
+        bool is_p2c_prefill_norm_input = false;
+        const bool directional_p2c_ready =
             n_backends == 2 &&
-            active_count == 1 &&
-            active_backend == 1 &&
-            ggml_backend_meta_parse_prefill_norm_chunk(
-                nodes[active_backend]->name,
-                p2c_prefill_norm_chunk,
-                p2c_prefill_norm_layer) &&
+            directional_completion ==
+                ggml_backend_meta_context::cgraph_config::
+                    DIRECTIONAL_COMPLETE_SEND_READY &&
+            directional_src_backend == 1 &&
+            directional_dst_backend == 0 &&
             ggml_backend_meta_tensor_p2c_layer(
-                backend_ctx, p2c_prefill_norm_layer);
+                backend_ctx, directional_layer);
+        if (directional_p2c_ready) {
+            p2c_prefill_norm_chunk = directional_chunk;
+            p2c_prefill_norm_layer = directional_layer;
+            is_p2c_prefill_norm_input =
+                active_count == 1 && active_backend == 1;
+        } else {
+            is_p2c_prefill_norm_input =
+                n_backends == 2 &&
+                active_count == 1 &&
+                active_backend == 1 &&
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    nodes[active_backend]->name,
+                    p2c_prefill_norm_chunk,
+                    p2c_prefill_norm_layer) &&
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, p2c_prefill_norm_layer);
+        }
 
         if (is_prefill_norm_input) {
             // The optimized prefill input pipeline was originally written for
@@ -9304,13 +9439,23 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             // path only when the next subgraph actually matches it; otherwise
             // fall through to the generic active_count==1 PC->Phone copy and
             // normal PARTIAL/AllReduce handling below.
-            bool direct_prefill_down = false;
+            const bool directional_ready_task =
+                directional_completion ==
+                    ggml_backend_meta_context::cgraph_config::
+                        DIRECTIONAL_COMPLETE_SEND_READY &&
+                directional_layer == prefill_norm_layer &&
+                directional_chunk == prefill_norm_chunk;
+            bool direct_prefill_down = directional_ready_task;
             ggml_tensor * pc_next_down = nullptr;
             ggml_tensor * phone_next_down = nullptr;
             int next_chunk = -1;
             int next_layer = -1;
 
-            if (i + 1 < backend_ctx->n_subgraphs) {
+            // Compatibility only: legacy non-directional prefill may still
+            // discover the old dense shape. Directional Tensor already has a
+            // completion contract and sends immediately when this task ends.
+            if (!directional_ready_task &&
+                    i + 1 < backend_ctx->n_subgraphs) {
                 pc_next_down = get_prefill_down_boundary_node(0, i + 1);
                 phone_next_down = get_prefill_down_boundary_node(1, i + 1);
                 direct_prefill_down =
@@ -11269,27 +11414,51 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         int prefill_down_layer_0 = -1;
         int prefill_down_chunk_1 = -1;
         int prefill_down_layer_1 = -1;
-        ggml_tensor * prefill_down_node_0 =
-            n_backends == 2 ?
-                get_prefill_down_boundary_node(0, i) : nullptr;
-        ggml_tensor * prefill_down_node_1 =
-            n_backends == 2 ?
-                get_prefill_down_boundary_node(1, i) : nullptr;
-        const bool is_prefill_down_chunk =
+        ggml_tensor * prefill_down_node_0 = nullptr;
+        ggml_tensor * prefill_down_node_1 = nullptr;
+        bool is_prefill_down_chunk = false;
+
+        const bool directional_partial_task =
             n_backends == 2 &&
-            (active_count == 2 || c2p_prefill_down_boundary) &&
-            prefill_down_node_0 != nullptr &&
-            prefill_down_node_1 != nullptr &&
-            ggml_backend_meta_parse_prefill_down_chunk(
-                prefill_down_node_0->name,
-                prefill_down_chunk_0,
-                prefill_down_layer_0) &&
-            ggml_backend_meta_parse_prefill_down_chunk(
-                prefill_down_node_1->name,
-                prefill_down_chunk_1,
-                prefill_down_layer_1) &&
-            prefill_down_chunk_0 == prefill_down_chunk_1 &&
-            prefill_down_layer_0 == prefill_down_layer_1;
+            directional_completion ==
+                ggml_backend_meta_context::cgraph_config::
+                    DIRECTIONAL_COMPLETE_SEND_PARTIAL;
+        if (directional_partial_task) {
+            prefill_down_chunk_0 = directional_chunk;
+            prefill_down_layer_0 = directional_layer;
+            prefill_down_chunk_1 = directional_chunk;
+            prefill_down_layer_1 = directional_layer;
+            prefill_down_node_0 = directional_boundary(0);
+            prefill_down_node_1 = directional_boundary(1);
+            is_prefill_down_chunk =
+                prefill_down_node_0 != nullptr &&
+                prefill_down_node_1 != nullptr;
+            GGML_ASSERT(is_prefill_down_chunk);
+        } else {
+            // Legacy/non-directional compatibility path. Directional Tensor
+            // never scans a completed graph to rediscover its FFN terminal.
+            prefill_down_node_0 =
+                n_backends == 2 ?
+                    get_prefill_down_boundary_node(0, i) : nullptr;
+            prefill_down_node_1 =
+                n_backends == 2 ?
+                    get_prefill_down_boundary_node(1, i) : nullptr;
+            is_prefill_down_chunk =
+                n_backends == 2 &&
+                active_count == 2 &&
+                prefill_down_node_0 != nullptr &&
+                prefill_down_node_1 != nullptr &&
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    prefill_down_node_0->name,
+                    prefill_down_chunk_0,
+                    prefill_down_layer_0) &&
+                ggml_backend_meta_parse_prefill_down_chunk(
+                    prefill_down_node_1->name,
+                    prefill_down_chunk_1,
+                    prefill_down_layer_1) &&
+                prefill_down_chunk_0 == prefill_down_chunk_1 &&
+                prefill_down_layer_0 == prefill_down_layer_1;
+        }
 
         if (is_single_decode_moe_out &&
                 ggml_backend_meta_tensor_c2p_layer(
