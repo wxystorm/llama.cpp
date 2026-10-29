@@ -202,12 +202,12 @@ foreach ($x in $xList) {
     $sum = ($chunks | Measure-Object -Sum).Sum
 
     if ($sum -ne $TargetTokens) {
-        throw "internal plan error for x=$x: sum=$sum target=$TargetTokens"
+        throw "internal plan error for x=${x}: sum=$sum target=$TargetTokens"
     }
 
     foreach ($chunk in $chunks) {
         if ($chunk -lt $MinChunk -or $chunk -gt $MaxChunk) {
-            throw "internal plan error for x=$x: chunk=$chunk outside [$MinChunk,$MaxChunk]"
+            throw "internal plan error for x=${x}: chunk=$chunk outside [$MinChunk,$MaxChunk]"
         }
     }
 
