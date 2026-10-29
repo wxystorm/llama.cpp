@@ -3238,7 +3238,9 @@ struct ggml_backend_meta_cpu_task_executor {
             }
             return true;
         }
-        // Running work is deliberately non-preemptive in V1.
+        // Promotion never interrupts the currently executing layer. A
+        // frontier CPU_FULL observes the new priority at its next cooperative
+        // layer-output checkpoint.
         if (running_id == id) {
             if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
                 std::fprintf(
