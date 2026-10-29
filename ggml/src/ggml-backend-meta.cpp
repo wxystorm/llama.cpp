@@ -18104,7 +18104,7 @@ auto prefill_norm_sg_has_prework =
                     lane1_return_gate = gate;
                 }
 
-                ggml_backend_meta_transfer_worker * pc_worker =
+                ggml_backend_meta_cpu_task_executor * pc_worker =
                     backend_ctx->cpu_task_executor;
                 ggml_backend_meta_transfer_worker * return_worker =
                     return_worker_slot;
