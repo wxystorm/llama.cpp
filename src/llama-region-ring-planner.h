@@ -1855,10 +1855,10 @@ inline result search_runtime_applicable(
         }
     }
 
-    if (coarse.empty()) {
-        return out;
-    }
-
+    // Uniform control candidates may all violate memory, yet a
+    // prefix-compensated nonuniform layout can still fit. Continue into
+    // first-Cycle E search instead of returning an empty result.
+    if (!coarse.empty()) {
     // The minimax ring error is the first-stage physical filter.  Do not
     // let a lower-bound wall estimate or topology-family quota override it:
     // every profile-feasible candidate inside the E window is cheap enough to
@@ -1924,6 +1924,8 @@ inline result search_runtime_applicable(
         ++out.simulated;
         out.top.push_back(std::move(plan));
     }
+
+    } // Optional uniform control candidates
 
     // Two-level nonuniform construction:
     //  1) Optimize the first Cycle with the unchanged minimax E equation;
