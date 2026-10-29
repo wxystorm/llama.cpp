@@ -26,6 +26,8 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <fstream>
+#include <iomanip>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -2731,7 +2733,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     ggml_backend_sched_get_split_prepare_sync_mask(
                         sched_use, split);
             if ((prepare_sync_mask >> 63) != 0) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
                     "lane=%d split=%d/%d sync_mask=0x%016" PRIx64
                     " status=REJECT reason=UNRESOLVED_SOURCE_BACKEND\n",
@@ -2784,7 +2786,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
             if (block_index == 0 || prepare_needs_cpu ||
                     gpu_cpu_embedding_prefix) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_INFO(
                     "[REGION_RING_PREPARE_SYNC] stage=%zu block=%zu "
                     "lane=%d split=%d/%d backend=%s "
                     "sync_mask=0x%016" PRIx64 " cpu_required=%d "
@@ -2830,7 +2832,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                     ggml_backend_sched_get_last_weight_cache_hit_bytes(
                         sched_use);
                 if (block_index == 0 || upload_bytes > 0) {
-                    LLAMA_LOG_ERROR(
+                    LLAMA_LOG_DEBUG(
                         "[REGION_RING_GPU_WEIGHT] event=SPLIT_READY "
                         "stage=%zu block=%zu split=%d/%d "
                         "upload_mib=%.3f cache_hit_mib=%.3f "
@@ -3982,7 +3984,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (!worker_kv_views[0] ||
                 !worker_kv_views[0]->set_stage_range(
                     ubatch_id, 0, ubatch.n_tokens)) {
-            LLAMA_LOG_ERROR(
+            LLAMA_LOG_INFO(
                 "[REGION_RING_EMBED_PRELUDE] phase=BEGIN status=FAIL "
                 "reason=KV_STAGE_RANGE\n");
             ret = GGML_STATUS_FAILED;
@@ -3990,7 +3992,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
 
         const int64_t prelude_begin_us = ggml_time_us();
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=BEGIN tokens=%u hidden=%d "
             "backend=CPU_FULL_BATCH status=RUNNING\n",
             ubatch.n_tokens, n_embd);
@@ -4062,7 +4064,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ring_embedding_prelude = true;
         ring_embedding_prelude_us =
             ggml_time_us() - prelude_begin_us;
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=END tokens=%u bytes=%zu "
             "compute_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
             "handoff=HOST_FULL_BATCH next=CUDA status=READY\n",
@@ -4125,6 +4127,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             int64_t         cpu_wait_us     = 0;
             int64_t         cuda_wait_us    = 0;
             int64_t         backend_exec_us = 0;
+            // Aggregated existing stage timers; no per-Chunk output.
+            // compute_range_us includes backend submission/sync, not
+            // device-only kernel time. output_sync_us may include readback.
+            int64_t         graph_prepare_us = 0;
+            int64_t         compute_range_us = 0;
+            int64_t         output_sync_us = 0;
             ggml_status     status          = GGML_STATUS_SUCCESS;
             llm_graph_result * final_result = nullptr;
             uint64_t        backend_mask    = 0;
@@ -4828,6 +4836,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
+                            state.graph_prepare_us +=
+                                task_timing.prepare_us;
+                            state.compute_range_us +=
+                                task_timing.compute_range_us;
+                            state.output_sync_us +=
+                                task_timing.sync_us;
                             state.weight_stage_us +=
                                 task_timing.weight_stage_us;
                             state.weight_upload_bytes +=
@@ -4922,7 +4936,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     if (task.chunk == 0 ||
                                             (split_mask >> 63) != 0 ||
                                             (target_mask >> 63) != 0) {
-                                        LLAMA_LOG_ERROR(
+                                        LLAMA_LOG_DEBUG(
                                             "[REGION_RING_BACKEND_SPLIT] device=%s "
                                             "region=%zu chunk=%zu split=%d/%d "
                                             "compute=%s resource_mask=0x%016" PRIx64
@@ -4945,7 +4959,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     ((task_mask | task_compute_mask) >> 63) != 0;
                                 state.cross_backend_tasks += cross;
                                 state.unknown_backend_tasks += unresolved;
-                                LLAMA_LOG_ERROR(
+                                LLAMA_LOG_DEBUG(
                                     "[REGION_RING_BACKEND_TASK] device=%s "
                                     "region=%zu chunk=%zu n_splits=%d "
                                     "resource_mask=0x%016" PRIx64
@@ -5069,7 +5083,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             region_ring_meta_cpu_backend,
                             next_frontier);
                         if (std::getenv("GGML_CPU_TASK_DEBUG") != nullptr) {
-                            LLAMA_LOG_ERROR(
+                            LLAMA_LOG_DEBUG(
                                 "[REGION_RING_C2P_FRONTIER] "
                                 "region=%zu chunk=%zu next=%d "
                                 "source=OUTER_DIRECTIONAL_COMPLETE "
@@ -5426,6 +5440,98 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker_states[2].compute_intervals.size(),
                 pc_phone_overlap_us / 1000.0, slot_pool_size,
                 ret == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        }
+
+        // Optional zero-hot-path experiment telemetry. All fields are
+        // already counted by the Region Ring worker/Bank mover. Exactly one
+        // JSONL record is appended AFTER workers and transfers have drained.
+        // Do not print per-Chunk telemetry or include file I/O in wall_ms.
+        if (const char * metrics_path = std::getenv(
+                "LLAMA_REGION_RING_METRICS_FILE")) {
+            if (*metrics_path != '\0') {
+                std::ofstream metrics(metrics_path, std::ios::app);
+                if (!metrics) {
+                    LLAMA_LOG_WARN(
+                        "[REGION_RING_METRICS] output=FAILED "
+                        "reason=OPEN_FILE\n");
+                } else {
+                    metrics << std::fixed << std::setprecision(3);
+                    metrics << "{\"type\":\"region_ring\","
+                            << "\"schema\":1,"
+                            << "\"ubatch\":" << ubatch_id << ","
+                            << "\"tokens\":" << ubatch.n_tokens << ","
+                            << "\"layout\":\""
+                            << llama_region_ring_layout_string(regions)
+                            << "\","
+                            << "\"xc\":" << runtime_xc << ","
+                            << "\"xg\":" << runtime_xg << ","
+                            << "\"xp\":" << runtime_xp << ","
+                            << "\"tasks\":" << ready.total_tasks() << ","
+                            << "\"executed\":" << executed << ","
+                            << "\"status\":" << (int) ret << ","
+                            << "\"complete\":"
+                            << (ready.all_done() ? "true" : "false") << ","
+                            << "\"wall_ms\":"
+                            << (ggml_time_us() - begin_us) / 1000.0 << ","
+                            << "\"embedding_ms\":"
+                            << ring_embedding_prelude_us / 1000.0 << ","
+                            << "\"pc_phone_overlap_ms\":"
+                            << pc_phone_overlap_us / 1000.0 << ","
+                            << "\"gpu_bank_streaming\":"
+                            << (gpu_bank_streaming ? "true" : "false");
+                    static constexpr const char * labels[3] = {
+                        "cpu", "gpu", "phone"
+                    };
+                    for (size_t i = 0; i < worker_states.size(); ++i) {
+                        const auto & w = worker_states[i];
+                        const std::string base = labels[i];
+                        int64_t active_us = 0;
+                        for (const auto & interval : w.compute_intervals) {
+                            active_us += std::max<int64_t>(
+                                0, interval.second - interval.first);
+                        }
+                        metrics << ",\"" << base << "_tasks\":"
+                                << w.completed
+                                << ",\"" << base << "_backend_wall_ms\":"
+                                << w.backend_exec_us / 1000.0
+                                << ",\"" << base << "_compute_range_ms\":"
+                                << w.compute_range_us / 1000.0
+                                << ",\"" << base << "_lane_active_ms\":"
+                                << active_us / 1000.0
+                                << ",\"" << base << "_prepare_ms\":"
+                                << w.graph_prepare_us / 1000.0
+                                << ",\"" << base << "_output_sync_ms\":"
+                                << w.output_sync_us / 1000.0
+                                << ",\"" << base << "_ready_wait_ms\":"
+                                << w.ready_wait_us / 1000.0
+                                << ",\"" << base << "_prepare_wait_ms\":"
+                                << w.prepare_wait_us / 1000.0
+                                << ",\"" << base << "_cpu_gate_wait_ms\":"
+                                << w.cpu_wait_us / 1000.0
+                                << ",\"" << base << "_cuda_gate_wait_ms\":"
+                                << w.cuda_wait_us / 1000.0
+                                << ",\"" << base << "_weight_stage_ms\":"
+                                << w.weight_stage_us / 1000.0
+                                << ",\"" << base << "_weight_upload_mib\":"
+                                << w.weight_upload_bytes / 1048576.0;
+                    }
+                    metrics << ",\"bank_refills\":"
+                            << gpu_bank_mover_stats_v.completed
+                            << ",\"bank_upload_mib\":"
+                            << gpu_bank_mover_stats_v.upload_bytes / 1048576.0
+                            << ",\"bank_stage_cpu_copy_ms\":"
+                            << gpu_bank_mover_stats_v.stage_cpu_copy_us / 1000.0
+                            << ",\"bank_prepare_ms\":"
+                            << gpu_bank_mover_stats_v.prepare_us / 1000.0
+                            << ",\"bank_h2d_ms\":"
+                            << gpu_bank_mover_stats_v.h2d_us / 1000.0
+                            << ",\"bank_mover_wall_ms\":"
+                            << gpu_bank_mover_stats_v.wall_us / 1000.0
+                            << ",\"bank_gpu_wait_ms\":"
+                            << worker_states[1].weight_bank_wait_us / 1000.0
+                            << "}\n";
+                }
+            }
         }
         if (audit_backend_resources) {
             LLAMA_LOG_ERROR(
