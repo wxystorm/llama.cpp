@@ -9021,6 +9021,49 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             }
         }
 
+        if (pipeline_debug && n_backends == 2) {
+            auto trace_named_partial = [&](size_t backend) {
+                ggml_cgraph * g =
+                    backend_ctx->backend_configs[backend]
+                        .cgraphs[i].cgraph_main;
+                if (g == nullptr) {
+                    return;
+                }
+                for (int k = 0; k < g->n_nodes; ++k) {
+                    int trace_chunk = -1;
+                    int trace_layer = -1;
+                    ggml_tensor * t = g->nodes[k];
+                    if (!ggml_backend_meta_parse_prefill_down_chunk(
+                            t->name,
+                            trace_chunk,
+                            trace_layer)) {
+                        continue;
+                    }
+                    if (!ggml_backend_meta_tensor_c2p_layer(
+                            backend_ctx, trace_layer) &&
+                            !ggml_backend_meta_tensor_p2c_layer(
+                                backend_ctx, trace_layer)) {
+                        continue;
+                    }
+                    printf(
+                        "[REGION_DIRECTIONAL_PARTIAL_SCAN] "
+                        "sg=%zu backend=%s index=%d layer=%d chunk=%d "
+                        "name=%s compute=%d op=%s bytes=%zu\n",
+                        i,
+                        backend == 0 ? "PC" : "PHONE",
+                        k,
+                        trace_layer,
+                        trace_chunk,
+                        t->name,
+                        !!(t->flags & GGML_TENSOR_FLAG_COMPUTE),
+                        ggml_op_name(t->op),
+                        ggml_nbytes(t));
+                }
+            };
+            trace_named_partial(0);
+            trace_named_partial(1);
+        }
+
         int c2p_prefill_down_chunk_0 = -1;
         int c2p_prefill_down_layer_0 = -1;
         int c2p_prefill_down_chunk_1 = -1;
