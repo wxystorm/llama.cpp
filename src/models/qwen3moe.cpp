@@ -425,7 +425,8 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             // even a single local chunk still needs the explicit Phone-region
             // and P2C markers so C2P -> Phone -> P2C stays on the validated
             // directional data plane.
-            if (phone_region_chunks.size() > 1 || stage_graph) {
+            if (phone_region_chunks.size() > 1 ||
+                    (stage_graph && n_tokens >= 16)) {
                 phone_region_first = phone_region_c2p + 1;
                 phone_region_end = phone_region_p2c;
             } else {
