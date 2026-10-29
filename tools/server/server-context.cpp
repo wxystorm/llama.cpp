@@ -3735,9 +3735,9 @@ private:
             // Top-10 logits is a debugging aid, not part of the inference
             // pipeline. Keep it opt-in: sorting the whole vocabulary and
             // printing the results before the first token distorts timings.
-            const char * logits_top10_env = std::getenv("LLAMA_JUPITER_LOGITS_TOP10");
-            if (slot.n_decoded == 0 &&
-                logits_top10_env != nullptr && std::atoi(logits_top10_env) != 0) {
+            const char * logits_top10_env =
+                slot.n_decoded == 0 ? std::getenv("LLAMA_JUPITER_LOGITS_TOP10") : nullptr;
+            if (logits_top10_env != nullptr && std::atoi(logits_top10_env) != 0) {
                 const float * logits =
                     llama_get_logits_ith(slot.ctx_tgt, tok_idx);
 
