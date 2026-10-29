@@ -472,6 +472,31 @@ int main() {
                 floor_result.shortlist_e_limit + 1e-12);
     }
 
+    // Unlike the old repeated-width APPLY_WIDE, 40 layers may form three
+    // unequal Cycles. The seed search must not discard 40 % 3 != 0.
+    {
+        model forty = mock_profile();
+        forty.layers = 40;
+        forty.tokens = 64;
+        forty.memory_feasible = [](const candidate & c) {
+            return c.cycles == 3;
+        };
+        const auto forty_base = llama_region_ring_parse(
+            "G6,C6,P8,G6,C6,P8", 40);
+        const auto forty_result =
+            search_runtime_applicable(
+                forty, forty_base, 64, 16, 0.20, 16);
+        REQUIRE(forty_result.valid);
+        REQUIRE(forty_result.selected.cycles == 3);
+        std::vector<llama_region_ring_region> forty_regions;
+        REQUIRE(make_regions(
+            forty_result.selected, 40, forty_regions));
+        REQUIRE(forty_regions.size() == 9);
+        REQUIRE(forty_regions.back().layer_end == 40);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            forty_regions, 40));
+    }
+
     // The manual A/B override uses the same candidate contract as
     // APPLY_WIDE. Keep the concrete G5/C3/P4 x4 experiment scoreable with
     // independent XC/XG/XP so runtime forcing cannot drift from the planner.
