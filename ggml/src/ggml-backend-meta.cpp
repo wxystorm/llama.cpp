@@ -14441,16 +14441,19 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     const char * region_pipe_reason = "DISABLED";
 
     // Discover the directional island from the markers actually present in
-    // this Meta graph. Do not select a global first C2P/P2C layer: a future
-    // Planner may emit multiple islands, each built/executed as its own outer
-    // Region stage. Repeated markers from different chunks must agree on the
-    // same layer.
+    // this Meta graph. C2P/P2C and the terminal Phone marker must identify one
+    // exact layer across repeated chunks. Phone Attention markers are expected
+    // to span multiple consecutive layers, so track their min/max/set instead
+    // of incorrectly requiring every marker to have the same layer.
     int region_pipe_c2p_layer = -1;
     int region_pipe_phone_first_layer = -1;
+    int region_pipe_phone_attn_last_layer = -1;
     int region_pipe_phone_last_layer = -1;
     int region_pipe_p2c_layer = -1;
     bool region_pipe_topology_unique = true;
-    auto record_region_layer =
+    std::set<int> region_pipe_phone_layers;
+
+    auto record_exact_region_layer =
         [&](int & slot, int layer) {
             if (layer < 0) {
                 return;
@@ -14462,6 +14465,22 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
         };
 
+    auto record_phone_region_layer =
+        [&](int layer) {
+            if (layer < 0) {
+                return;
+            }
+            region_pipe_phone_layers.insert(layer);
+            if (region_pipe_phone_first_layer < 0 ||
+                    layer < region_pipe_phone_first_layer) {
+                region_pipe_phone_first_layer = layer;
+            }
+            if (region_pipe_phone_attn_last_layer < 0 ||
+                    layer > region_pipe_phone_attn_last_layer) {
+                region_pipe_phone_attn_last_layer = layer;
+            }
+        };
+
     if (n_backends == 2) {
         for (size_t sg = 0; sg < backend_ctx->n_subgraphs; ++sg) {
             int chunk = -1;
@@ -14470,7 +14489,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     chunk >= 0 &&
                     ggml_backend_meta_tensor_c2p_layer(
                         backend_ctx, layer)) {
-                record_region_layer(
+                record_exact_region_layer(
                     region_pipe_c2p_layer, layer);
             }
             chunk = -1;
@@ -14479,7 +14498,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     chunk >= 0) {
                 if (ggml_backend_meta_tensor_c2p_layer(
                         backend_ctx, layer)) {
-                    record_region_layer(
+                    record_exact_region_layer(
                         region_pipe_c2p_layer, layer);
                 }
                 if (ggml_backend_meta_tensor_p2c_layer(
@@ -14509,9 +14528,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         &parsed) == 2 &&
                         name[parsed] == '\0' &&
                         parsed_chunk >= 0) {
-                    record_region_layer(
-                        region_pipe_phone_first_layer,
-                        parsed_layer);
+                    record_phone_region_layer(parsed_layer);
                 }
 
                 parsed_chunk = -1;
@@ -14525,7 +14542,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         &parsed) == 2 &&
                         name[parsed] == '\0' &&
                         parsed_chunk >= 0) {
-                    record_region_layer(
+                    record_exact_region_layer(
                         region_pipe_phone_last_layer,
                         parsed_layer);
                 }
@@ -14543,7 +14560,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         parsed_chunk >= 0 &&
                         ggml_backend_meta_tensor_p2c_layer(
                             backend_ctx, parsed_layer)) {
-                    record_region_layer(
+                    record_exact_region_layer(
                         region_pipe_p2c_layer,
                         parsed_layer);
                 }
@@ -14555,7 +14572,7 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                         route_chunk >= 0 &&
                         ggml_backend_meta_tensor_p2c_layer(
                             backend_ctx, route_layer)) {
-                    record_region_layer(
+                    record_exact_region_layer(
                         region_pipe_p2c_layer,
                         route_layer);
                 }
@@ -14563,13 +14580,29 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         }
     }
 
+    bool region_pipe_phone_contiguous =
+        !region_pipe_phone_layers.empty() &&
+        region_pipe_phone_first_layer >= 0 &&
+        region_pipe_phone_attn_last_layer >=
+            region_pipe_phone_first_layer;
+    if (region_pipe_phone_contiguous) {
+        for (int layer = region_pipe_phone_first_layer;
+                layer <= region_pipe_phone_attn_last_layer; ++layer) {
+            if (region_pipe_phone_layers.count(layer) == 0) {
+                region_pipe_phone_contiguous = false;
+                break;
+            }
+        }
+    }
+
     const bool region_pipe_topology =
         region_pipe_topology_unique &&
+        region_pipe_phone_contiguous &&
         region_pipe_c2p_layer >= 0 &&
         region_pipe_phone_first_layer ==
             region_pipe_c2p_layer + 1 &&
-        region_pipe_phone_last_layer >=
-            region_pipe_phone_first_layer &&
+        region_pipe_phone_last_layer ==
+            region_pipe_phone_attn_last_layer &&
         region_pipe_p2c_layer ==
             region_pipe_phone_last_layer + 1 &&
         ggml_backend_meta_tensor_c2p_layer(
@@ -14583,13 +14616,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
              region_pipe_phone_first_layer >= 0)) {
         printf(
             "[PHONE_REGION_DIRECTIONAL_TOPOLOGY] "
-            "c2p=%d phone=[%d,%d] p2c=%d unique=%d "
+            "c2p=%d phone=[%d,%d] p2c=%d "
+            "boundary_unique=%d phone_layers=%zu contiguous=%d "
             "status=%s\n",
             region_pipe_c2p_layer,
             region_pipe_phone_first_layer,
             region_pipe_phone_last_layer,
             region_pipe_p2c_layer,
             region_pipe_topology_unique ? 1 : 0,
+            region_pipe_phone_layers.size(),
+            region_pipe_phone_contiguous ? 1 : 0,
             region_pipe_topology ? "READY" : "REJECT");
     }
 
