@@ -529,6 +529,40 @@ int main() {
             forty_regions, 40));
     }
 
+    // The original uniform control can be entirely memory-infeasible.
+    // Prefix E search must still find a complete executable nonuniform
+    // layout rather than returning before its independent first-Cycle pass.
+    {
+        model prefix_only = mock_profile();
+        prefix_only.memory_feasible =
+            [](const candidate & c) {
+                return !c.concrete_regions.empty();
+            };
+        const auto baseline = llama_region_ring_parse("", 48);
+        const auto result = search_runtime_applicable(
+            prefix_only, baseline, 64, 1, 0.08, 0);
+        REQUIRE(result.valid);
+        REQUIRE(result.first_cycle_selected > 0);
+        REQUIRE(result.prefix_completed > 0);
+        REQUIRE(result.nonuniform_simulated > 0);
+        REQUIRE(!result.selected.concrete_regions.empty());
+        std::vector<llama_region_ring_region> regions;
+        REQUIRE(make_regions(result.selected, 48, regions));
+        REQUIRE(llama_region_ring_apply_topology_compatible(regions, 48));
+        int min_width = 48;
+        int max_width = 0;
+        for (size_t i = 0; i < regions.size(); i += 3) {
+            const int width =
+                regions[i + 2].layer_end - regions[i].layer_begin;
+            min_width = std::min(min_width, width);
+            max_width = std::max(max_width, width);
+        }
+        const int cycles = (int) regions.size() / 3;
+        const int average_high = (48 + cycles - 1) / cycles;
+        REQUIRE(max_width - min_width <=
+                std::max(2, (average_high + 3) / 4));
+    }
+
     // The manual A/B override uses the same candidate contract as
     // APPLY_WIDE. Keep the concrete G5/C3/P4 x4 experiment scoreable with
     // independent XC/XG/XP so runtime forcing cannot drift from the planner.
