@@ -610,3 +610,86 @@ Model Partition objective. Because raw `STAGE_PROFILE compute_ms` can include
 remote host submission/synchronization, it is a calibrated service proxy;
 validate the chosen boundary in the normal asynchronous benchmark. The
 per-layer DP `model` command remains available and unchanged.
+
+
+## Minimum efficient prefill Chunk b (stage 2)
+
+Jupiter's paper limits each sequence sub-block to at least b to avoid
+accelerator under-utilization. The precise GPU/NPU occupancy counters are not
+available portably through the current PC/Phone RPC setup. Therefore this
+adaptation chooses a **measured throughput-saturation proxy**, not hardware
+utilization: for candidate first-chunk sizes x, measure synchronized PC
+accelerator and Phone RPC stage compute times at a fixed prefix y=0; compute
+x / time for both stages; select the smallest x where **both** stages reach
+at least a configurable fraction (default 90%) of their own measured best
+throughput. The threshold is an explicit implementation heuristic, not a
+paper-mandated constant. If the stages have no common plateau, output
+NO_COMMON_PLATEAU and the best max-min fallback rather than claiming a
+saturated optimum.
+
+This stage reuses the q-sweep's stage instrumentation and full-prompt
+sequence-plan checks. It profiles a short first block, followed by large
+blocks; unlike a traditional x=8 sweep, the remaining full prompt is NOT
+split into dozens of 8-token blocks. Each run uses exactly the same
+model/partition/prompt and its own fresh process. The 2-token model warmup
+and CPU-only bookkeeping stages are excluded from the throughput proxy.
+Legacy C2P and synchronized stage measurement are used consistently.
+
+Run on the PC, while Phone RPC is already listening at port 10139:
+
+\`\`\`powershell
+cd E:\llama\llama-jupiter
+git pull --ff-only origin baseline/jupiter-infocom25
+cmake --build build-jupiter --config Release -j
+python -m unittest discover -s .\tools\jupiter -p test_min_chunk_profile.py -v
+
+python .\tools\jupiter\run_min_chunk_profile.py \`
+  --exe .\build-jupiter\bin\Release\llama-cli.exe \`
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf \`
+  --rpc 10.39.52.114:10139 \`
+  --prompt-file .\prompt.txt \`
+  --model-plan .\jupiter-model.plan \`
+  --target-tokens 357 \`
+  --candidates 8,16,24,32,48,64,96,128 \`
+  --threshold 0.90 --repeats 2 \`
+  --out-dir .\jupiter-min-chunk
+\`\`\`
+
+If Model Partition did not produce jupiter-model.plan, replace
+\`--model-plan .\jupiter-model.plan\` with \`--pc-layers 20\` (or the selected
+boundary from the model profiling stage). The script validates the actual
+runtime token count and verifies each complete sequence plan was applied.
+\`--resume\` skips completed samples when the configuration matches.
+
+Output files:
+
+- \`jupiter-min-chunk/chunk-samples.csv\`: per-run PC/Phone service times and failures
+- \`jupiter-min-chunk/chunk-summary.csv\`: per-size median throughput and normalized ratios
+- \`jupiter-min-chunk/min-chunk.json\`: selected b and selection status
+- \`jupiter-min-chunk/b-xN-rM.log\`: individual calibration logs
+
+For the next, Sequence DP stage, read the chosen minimum from JSON and pass
+it explicitly to the existing planner. In PowerShell:
+
+\`\`\`powershell
+$b = (Get-Content .\jupiter-min-chunk\min-chunk.json -Raw |
+      ConvertFrom-Json).min_chunk
+$xValues = (@(8,16,24,32,48,64,96,128) |
+            Where-Object { $_ -ge $b }) -join ","
+
+# After the model boundary and b are fixed, recalibrate q(x,y) for that
+# boundary and these feasible sizes; use --min-chunk $b in Sequence DP.
+python .\tools\jupiter\run_q_sweep.py \`
+  --exe .\build-jupiter\bin\Release\llama-cli.exe \`
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf \`
+  --rpc 10.39.52.114:10139 \`
+  --prompt-file .\prompt.txt \`
+  --pc-layers 20 \`
+  --x-values $xValues --min-chunk $b --max-chunk 128 \`
+  --repeats 2 --run-dp --plan-output .\jupiter.plan
+\`\`\`
+
+Replace the example PC layer count with the selected Model Partition boundary.
+The chosen b is a heuristic minimum Chunk constraint for q(x,y) Sequence DP,
+not a new runtime environment variable. Do not treat synchronized calibration
+times as comparable to normal async Prefill benchmarks; rerun those separately.
