@@ -9200,19 +9200,131 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         planner_ring_exec_env != nullptr &&
         std::strcmp(planner_ring_exec_env, "fifo-pc-phone") == 0;
 
-    // Current READY V1 re-registers nearly every distinct Graph UID. Charge
-    // each Phone task for an approximate registration until shape/slot/position
-    // template reuse has been verified; never silently assume a cache hit.
-    double graph_wire_ms = 0.0;
-    constexpr size_t OBSERVED_P5_GRAPH_BYTES = 117676;
-    if (!llama_hybrid_transfer_cost(
-            profile.pc_to_phone, OBSERVED_P5_GRAPH_BYTES,
-            graph_wire_ms)) {
-        LLAMA_LOG_ERROR("[REGION_RING_PLAN_REJECT] reason=NO_PC_TO_PHONE_PROFILE\n");
-        return false;
+    // Phone RPC registration is architecture-specific. MoE keeps the
+    // previously measured P5 compatibility model. Dense instead profiles
+    // real one/five-layer *Dense* graphs and uses their serialized tensor
+    // count to predict the wire cost of the concrete Phone stage.
+    if (profile.is_moe) {
+        double graph_wire_ms = 0.0;
+        constexpr size_t OBSERVED_P5_GRAPH_BYTES = 117676;
+        if (!llama_hybrid_transfer_cost(
+                profile.pc_to_phone, OBSERVED_P5_GRAPH_BYTES,
+                graph_wire_ms)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] reason=NO_PC_TO_PHONE_PROFILE\n");
+            return false;
+        }
+        model.phone_register_ms =
+            std::max(0.0, profile.rpc_submit_ms) + graph_wire_ms;
+    } else {
+        size_t single_wire_bytes = 0;
+        size_t five_wire_bytes = 0;
+        for (const auto & sample : profile.phone_blocks) {
+            if (sample.layers == 1) {
+                single_wire_bytes = sample.rpc_graph_wire_bytes;
+            } else if (sample.layers == 5) {
+                five_wire_bytes = sample.rpc_graph_wire_bytes;
+            }
+        }
+        if (single_wire_bytes == 0 || five_wire_bytes == 0) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] reason=NO_DENSE_PHONE_GRAPH_PROFILE "
+                "samples=%zu status=KEEP_BASELINE\n",
+                profile.phone_blocks.size());
+            return false;
+        }
+        const char * region_fusion =
+            std::getenv("LLAMA_HYBRID_DENSE_PHONE_REGION");
+        const bool dense_region_fusion =
+            profile.dense_phone_region_capable &&
+            region_fusion != nullptr &&
+            std::atoi(region_fusion) != 0;
+        const double single_bytes = (double) single_wire_bytes;
+        const double per_layer_bytes =
+            std::max(0.0,
+                ((double) five_wire_bytes - single_bytes) / 4.0);
+        const double rpc_submit_ms =
+            std::max(0.0, profile.rpc_submit_ms);
+
+        model.phone_registration_cost =
+            [&profile, single_bytes, per_layer_bytes, rpc_submit_ms,
+             dense_region_fusion](
+                    llama_region_ring_stage_kind kind, int layers,
+                    int tokens, bool embedded_directional,
+                    double & cost) -> bool {
+                GGML_UNUSED(tokens);
+                if (layers <= 0) {
+                    return false;
+                }
+                auto cost_of_graph =
+                    [&](double bytes, double & ms) -> bool {
+                        if (!std::isfinite(bytes) ||
+                                bytes <= 0.0 ||
+                                bytes > (double)
+                                    std::numeric_limits<size_t>::max()) {
+                            return false;
+                        }
+                        double wire_ms = 0.0;
+                        if (!llama_hybrid_transfer_cost(
+                                profile.pc_to_phone,
+                                (size_t) std::ceil(bytes),
+                                wire_ms)) {
+                            return false;
+                        }
+                        ms = rpc_submit_ms + wire_ms;
+                        return std::isfinite(ms) && ms >= 0.0;
+                    };
+
+                // A direct Phone Full stage is one RPC graph per outer
+                // Chunk. With an embedded Dense directional island the
+                // device-local region is one graph ONLY when its fused
+                // builder is enabled; the legacy Meta fallback submits
+                // Attention/FFN subgraphs separately.
+                if (kind == llama_region_ring_stage_kind::PHONE) {
+                    if (embedded_directional &&
+                            !dense_region_fusion) {
+                        double one_sg_ms = 0.0;
+                        if (!cost_of_graph(
+                                single_bytes / 2.0,
+                                one_sg_ms)) {
+                            return false;
+                        }
+                        cost = (double) (2 * layers) * one_sg_ms;
+                        return true;
+                    }
+                    return cost_of_graph(
+                        single_bytes +
+                        per_layer_bytes * (layers - 1),
+                        cost);
+                }
+
+                if (kind == llama_region_ring_stage_kind::C2P ||
+                        kind == llama_region_ring_stage_kind::P2C) {
+                    double one_sg_ms = 0.0;
+                    if (!cost_of_graph(
+                            single_bytes / 2.0, one_sg_ms)) {
+                        return false;
+                    }
+                    // Dense C2P sends a Phone FFN shard; P2C executes
+                    // Phone Attention and FFN separately around READY.
+                    cost = (kind == llama_region_ring_stage_kind::C2P ?
+                            1.0 : 2.0) * one_sg_ms;
+                    return true;
+                }
+                cost = 0.0;
+                return true;
+            };
+
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_PHONE_COST] arch=DENSE "
+            "source=RPC_WIRE_DENSE_GRAPH_PROBE "
+            "graph_bytes_1=%zu graph_bytes_5=%zu "
+            "rpc_submit_ms=%.3f fusion=%d "
+            "meta_sgs_per_layer=2 fallback=UNFUSED "
+            "status=CALIBRATED\n",
+            single_wire_bytes, five_wire_bytes,
+            rpc_submit_ms, dense_region_fusion ? 1 : 0);
     }
-    model.phone_register_ms = std::max(0.0, profile.rpc_submit_ms) +
-                              graph_wire_ms;
 
     model.compute_ms = [&profile](
             llama_region_ring_device dev, int layers,
