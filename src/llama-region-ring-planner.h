@@ -37,6 +37,11 @@ struct candidate {
     // Exact ordered full-stage layout for non-uniform cycles. Empty retains
     // the historical uniform (G,C,P)*cycles + optional tail generator.
     std::vector<llama_region_ring_region> concrete_regions;
+    // Complete first-Cycle-seeded prefix trace (not a runtime measurement).
+    // Used to explain how each subsequent Cycle compensates previous load.
+    int prefix_cycles = 0;
+    std::array<double, 4> prefix_error {};
+    std::array<std::array<double, 3>, 4> prefix_service {};
     double balance = 0.0;
     double coarse_ms = 0.0;
     double wall_ms = 0.0;
@@ -2039,6 +2044,8 @@ inline result search_runtime_applicable(
     struct prefix_state {
         std::vector<llama_region_ring_region> regions;
         std::array<double, 3> load {};
+        std::array<double, 4> prefix_error {};
+        std::array<std::array<double, 3>, 4> prefix_service {};
         double prefix_e_sum = 0.0;
         double width_variance = 0.0;
         double rank = 0.0;
@@ -2192,6 +2199,8 @@ inline result search_runtime_applicable(
             initial.regions.emplace_back(
                 device::PHONE, seed.g + seed.c, seed.width);
             initial.load = seed.load;
+            initial.prefix_error[0] = seed.first_e;
+            initial.prefix_service[0] = seed.load;
             initial.prefix_e_sum = seed.first_e;
             initial.rank = seed.first_e;
             initial.min_width = seed.width;
@@ -2266,6 +2275,10 @@ inline result search_runtime_applicable(
                                     continue;
                                 }
                                 next.prefix_e_sum += prefix_e;
+                                next.prefix_error[(size_t) completed] =
+                                    prefix_e;
+                                next.prefix_service[(size_t) completed] =
+                                    next.load;
                                 const double relative_width =
                                     (double) (width - seed.width) /
                                     seed.width;
@@ -2323,6 +2336,9 @@ inline result search_runtime_applicable(
                 proposal.xg = chunks[seed.gi];
                 proposal.xp = chunks[seed.pi];
                 proposal.concrete_regions = state.regions;
+                proposal.prefix_cycles = n_cycles;
+                proposal.prefix_error = state.prefix_error;
+                proposal.prefix_service = state.prefix_service;
                 if (!scored.insert(
                         key_for(proposal, state.regions)).second) {
                     continue;
