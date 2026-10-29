@@ -33,6 +33,19 @@ TASK_TOKENS_RE = re.compile(r"task\.n_tokens\s*=\s*(\d+)")
 PROMPT_EVAL_RE = re.compile(r"prompt eval time\s*=.*?/\s*(\d+)\s+tokens")
 
 
+class PrefillLengthCorrection(Exception):
+    """The calibration prefill batch differs from the initial probe."""
+
+    def __init__(self, actual_tokens: int, expected_tokens: int, log_path: Path):
+        self.actual_tokens = actual_tokens
+        self.expected_tokens = expected_tokens
+        self.log_path = log_path
+        super().__init__(
+            f"prefill batch changed: probe={expected_tokens} "
+            f"calibration={actual_tokens}; log={log_path}"
+        )
+
+
 def parse_int_list(text: str) -> List[int]:
     out: List[int] = []
     for raw in text.split(","):
@@ -489,6 +502,40 @@ def main() -> int:
             "full-prompt Jupiter sequence plan."
         )
 
+    for correction_attempt in range(2):
+        try:
+            return run_sweep_for_length(
+                args, total_tokens, base_env, out_dir,
+                exe, model, prompt_text, planner,
+            )
+        except PrefillLengthCorrection as exc:
+            if correction_attempt != 0:
+                raise RuntimeError(
+                    "prefill token count remained unstable across retries: "
+                    f"{exc}"
+                ) from exc
+            total_tokens = exc.actual_tokens
+            print(
+                "[JUPITER_SWEEP_TOKEN_RETRY] "
+                f"probe={exc.expected_tokens} "
+                f"calibration={total_tokens} "
+                "action=REGENERATE_ALL_PARTITIONS",
+                flush=True,
+            )
+
+    raise RuntimeError("internal error: token correction attempts exhausted")
+
+
+def run_sweep_for_length(
+    args: argparse.Namespace,
+    total_tokens: int,
+    base_env: dict[str, str],
+    out_dir: Path,
+    exe: Path,
+    model: Path,
+    prompt_text: str,
+    planner: Path,
+) -> int:
     plans = print_sweep_plans(
         total_tokens, args.x_values,
         args.min_chunk, args.max_chunk,
@@ -587,17 +634,23 @@ def main() -> int:
                 actual_prompt_tokens = task_tokens[-1] if task_tokens else None
                 actual_eval_tokens = eval_tokens[-1] if eval_tokens else None
 
+                actual_batch_tokens = longest_prefill_ubatch_chain(log_text)
                 print(
                     "[JUPITER_SWEEP_DIAG] "
                     f"probed_tokens={total_tokens} "
                     f"task_tokens={actual_prompt_tokens} "
                     f"prompt_eval_tokens={actual_eval_tokens} "
+                    f"actual_batch_tokens={actual_batch_tokens} "
                     f"plan_sum={sum(chunks)} "
                     f"plan_lines={len(PLAN_RE.findall(log_text))} "
                     f"ubatches={observed_ubatches[:24]} "
                     f"log={log_path}",
                     file=sys.stderr, flush=True,
                 )
+                if actual_batch_tokens > 2 and actual_batch_tokens != total_tokens:
+                    raise PrefillLengthCorrection(
+                        actual_batch_tokens, total_tokens, log_path
+                    )
                 if actual_prompt_tokens is not None and actual_prompt_tokens != total_tokens:
                     raise RuntimeError(
                         "prompt length changed between probe and calibration: "
