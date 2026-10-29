@@ -16,6 +16,7 @@
 #include <queue>
 #include <string>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,9 @@ struct candidate {
     int xc = 64;
     int xg = 64;
     int xp = 64;
+    // Exact ordered full-stage layout for non-uniform cycles. Empty retains
+    // the historical uniform (G,C,P)*cycles + optional tail generator.
+    std::vector<llama_region_ring_region> concrete_regions;
     double balance = 0.0;
     double coarse_ms = 0.0;
     double wall_ms = 0.0;
@@ -209,6 +213,18 @@ inline int chunk_for_region(
 inline bool make_regions(const candidate & c, int total_layers,
                          std::vector<llama_region_ring_region> & regions) {
     regions.clear();
+    if (!c.concrete_regions.empty()) {
+        // The independent Stage widths in each Cycle are authoritative.
+        // Reject invalid ownership/coverage instead of reconstructing a
+        // repeated (G,C,P) geometry from the first Cycle.
+        if (llama_region_ring_has_directional_stages(c.concrete_regions) ||
+                !llama_region_ring_apply_topology_compatible(
+                    c.concrete_regions, total_layers)) {
+            return false;
+        }
+        regions = c.concrete_regions;
+        return true;
+    }
     if (c.cycles < 1 || c.c < 1 || c.g < 1 || c.p < 1 ||
         c.tail_c < 0 || c.tail_g < 0 ||
         c.cycles * (c.c + c.g + c.p) + c.tail_c + c.tail_g != total_layers) {
@@ -1520,6 +1536,8 @@ struct result {
     size_t rejected_deadlock = 0;
     size_t shortlisted = 0;
     size_t e_window_shortlisted = 0;
+    size_t nonuniform_profiled = 0;
+    size_t nonuniform_simulated = 0;
     double coarse_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_limit = std::numeric_limits<double>::infinity();
     double shortlist_e_limit = std::numeric_limits<double>::infinity();
@@ -1828,19 +1846,146 @@ inline result search_runtime_applicable(
         out.top.push_back(std::move(plan));
     }
 
-    std::sort(
-        out.top.begin(), out.top.end(),
-        [](const candidate & a, const candidate & b) {
-            if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
-                return a.wall_ms < b.wall_ms;
-            }
-            if (std::abs(a.ring_error_max -
-                         b.ring_error_max) > 1e-9) {
-                return a.ring_error_max < b.ring_error_max;
-            }
-            return a.ring_error_mean < b.ring_error_mean;
-        });
+    // MoE APPLY_SAFE already evaluates concrete, unequal G/C splits. Bring
+    // that same actual-Region scoring into APPLY_WIDE: starting from the
+    // profiled Cycle/Chunk seeds, move each G/C, C/P or P/G boundary through
+    // every *legal* layer position. A beam of surviving layouts then supplies
+    // seeds for subsequent passes, so different Cycles can independently
+    // grow and shrink without inventing an equal-width constraint.
+    //
+    // This first executable expansion retains Phone final ownership. The
+    // existing WIDE_PREVIEW separately supports GPU/CPU tails, but the
+    // concurrent runtime still binds final logits to Phone MAIN and must
+    // gain a tested PC-final output path before APPLY can select a PC tail.
+    const auto wall_less = [](const candidate & a, const candidate & b) {
+        if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
+            return a.wall_ms < b.wall_ms;
+        }
+        if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-9) {
+            return a.ring_error_max < b.ring_error_max;
+        }
+        return a.ring_error_mean < b.ring_error_mean;
+    };
+    std::unordered_set<std::string> seen;
+    const auto key_for = [](const candidate & v,
+                            const std::vector<llama_region_ring_region> & rs) {
+        return llama_region_ring_layout_string(rs) + "/" +
+            std::to_string(v.xc) + "/" + std::to_string(v.xg) + "/" +
+            std::to_string(v.xp);
+    };
+    for (const auto & v : out.top) {
+        std::vector<llama_region_ring_region> rs;
+        if (make_regions(v, m.layers, rs)) {
+            seen.insert(key_for(v, rs));
+        }
+    }
 
+    constexpr size_t k_refine_beam = 8;
+    constexpr size_t k_refine_simulations = 128;
+    // A boundary may jump directly to *any* legal position. Consecutive
+    // passes allow independent changes across all boundaries, not only
+    // reshuffling one Cycle's original fixed length.
+    constexpr int k_refine_passes = 8;
+    for (int pass = 0; pass < k_refine_passes && !out.top.empty(); ++pass) {
+        std::sort(out.top.begin(), out.top.end(), wall_less);
+        std::vector<candidate> proposals;
+        const size_t beam = std::min(k_refine_beam, out.top.size());
+        for (size_t bi = 0; bi < beam; ++bi) {
+            const auto seed = out.top[bi];
+            std::vector<llama_region_ring_region> rs;
+            if (!make_regions(seed, m.layers, rs)) {
+                continue;
+            }
+            for (size_t i = 0; i + 1 < rs.size(); ++i) {
+                const int width_a =
+                    rs[i].layer_end - rs[i].layer_begin;
+                const int width_b =
+                    rs[i + 1].layer_end - rs[i + 1].layer_begin;
+                const int combined = width_a + width_b;
+                for (int new_a = 1; new_a < combined; ++new_a) {
+                    if (new_a == width_a) {
+                        continue;
+                    }
+                    auto changed = rs;
+                    const int middle = changed[i].layer_begin + new_a;
+                    changed[i].layer_end = middle;
+                    changed[i + 1].layer_begin = middle;
+                    if (!llama_region_ring_apply_topology_compatible(
+                            changed, m.layers)) {
+                        continue;
+                    }
+                    candidate v = seed;
+                    v.concrete_regions = changed;
+                    v.cycles = (int) (changed.size() / 3);
+                    v.g = changed[0].layer_end -
+                          changed[0].layer_begin;
+                    v.c = changed[1].layer_end -
+                          changed[1].layer_begin;
+                    v.p = changed[2].layer_end -
+                          changed[2].layer_begin;
+                    v.tail_g = 0;
+                    v.tail_c = 0;
+                    if (!seen.insert(key_for(v, changed)).second) {
+                        continue;
+                    }
+                    ++out.enumerated;
+                    if ((m.memory_feasible &&
+                            !m.memory_feasible(v)) ||
+                            (m.region_memory_feasible &&
+                             !m.region_memory_feasible(changed))) {
+                        ++out.rejected_memory;
+                        continue;
+                    }
+                    if (!estimate_region_ring_balance(m, changed, v)) {
+                        ++out.rejected_profile;
+                        continue;
+                    }
+                    ++out.profiled;
+                    ++out.nonuniform_profiled;
+                    // Match the original E-window-plus-floor selection.
+                    // A refined candidate still has to meet the same
+                    // effective E limit as its profiled uniform seeds.
+                    if (v.ring_error_max >
+                            out.shortlist_e_limit + 1e-12) {
+                        continue;
+                    }
+                    proposals.push_back(std::move(v));
+                }
+            }
+        }
+        if (proposals.empty()) {
+            break;
+        }
+        std::sort(proposals.begin(), proposals.end(),
+            [](const candidate & a, const candidate & b) {
+                if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-12) {
+                    return a.ring_error_max < b.ring_error_max;
+                }
+                return a.ring_error_mean < b.ring_error_mean;
+            });
+        // The first half follows E, and the second half diversifies across
+        // distinct concrete geometries while keeping the same E budget.
+        const size_t n =
+            std::min(k_refine_simulations, proposals.size());
+        for (size_t i = 0; i < n; ++i) {
+            candidate v = std::move(proposals[i]);
+            std::string why;
+            if (!simulate(m, v.concrete_regions, v, &why)) {
+                ++out.rejected_deadlock;
+                continue;
+            }
+            ++out.simulated;
+            ++out.nonuniform_simulated;
+            ++out.shortlisted;
+            out.top.push_back(std::move(v));
+        }
+        std::sort(out.top.begin(), out.top.end(), wall_less);
+        if (out.top.size() > k_refine_beam * 2) {
+            out.top.resize(k_refine_beam * 2);
+        }
+    }
+
+    std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();
         out.valid = true;
