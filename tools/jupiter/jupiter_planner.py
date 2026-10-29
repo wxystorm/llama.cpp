@@ -25,6 +25,7 @@ import csv
 import math
 import os
 import re
+import statistics
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Sequence, Tuple
 
@@ -87,19 +88,25 @@ def _write_plan(path: str, updates: Dict[str, str]) -> None:
 
 class QProfile:
     def __init__(self, rows: Sequence[dict]):
-        # Multiple devices/stages may report the same (x,y). Jupiter balances
-        # stages; the pipeline bottleneck is therefore the maximum stage latency.
-        grouped: Dict[Tuple[int, int], List[float]] = {}
+        # Calibration sweeps may repeat the same path several times. Collapse
+        # repeats per device with the median first, then use the slowest stage as
+        # q(x,y), which is the service-time bottleneck of the balanced pipeline.
+        grouped_stage: Dict[Tuple[int, int, str], List[float]] = {}
         for row in rows:
             x = int(row["x"])
             y = int(row["y"])
             t = float(row["latency_ms"])
-            grouped.setdefault((x, y), []).append(t)
+            stage = (row.get("device") or row.get("stage") or "stage").strip()
+            grouped_stage.setdefault((x, y, stage), []).append(t)
 
-        if not grouped:
+        if not grouped_stage:
             raise ValueError("q profile is empty")
 
-        self.values = {k: max(v) for k, v in grouped.items()}
+        per_xy: Dict[Tuple[int, int], List[float]] = {}
+        for (x, y, _stage), samples in grouped_stage.items():
+            per_xy.setdefault((x, y), []).append(statistics.median(samples))
+
+        self.values = {k: max(v) for k, v in per_xy.items()}
         self.ys = sorted({y for _, y in self.values})
         self.xs_by_y: Dict[int, List[int]] = {}
         for x, y in self.values:
