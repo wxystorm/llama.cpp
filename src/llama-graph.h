@@ -730,8 +730,9 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    int32_t hybrid_layer_begin = 0;
-    int32_t hybrid_layer_end   = -1;
+    int32_t hybrid_layer_begin  = 0;
+    int32_t hybrid_layer_end    = -1;
+    int32_t hybrid_chunk_tokens = 0;
 
     bool hybrid_hidden_input  = false;
     bool hybrid_output_head   = true;
@@ -778,6 +779,7 @@ struct llm_graph_params {
 
         if (hybrid_layer_begin   != other.hybrid_layer_begin ||
             hybrid_layer_end     != other.hybrid_layer_end   ||
+            hybrid_chunk_tokens  != other.hybrid_chunk_tokens ||
             hybrid_hidden_input  != other.hybrid_hidden_input ||
             hybrid_output_head   != other.hybrid_output_head  ||
             hybrid_wave_probe    != other.hybrid_wave_probe   ||
