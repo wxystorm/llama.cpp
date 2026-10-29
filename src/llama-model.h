@@ -572,6 +572,12 @@ static inline bool llama_hybrid_layer_mode_directional_tensor(
            mode == llama_hybrid_layer_mode::TENSOR_P2C;
 }
 
+static inline bool llama_hybrid_layer_mode_uses_split_ffn_chunks(
+        llama_hybrid_layer_mode mode) {
+    return mode == llama_hybrid_layer_mode::TENSOR_SPLIT ||
+           llama_hybrid_layer_mode_directional_tensor(mode);
+}
+
 enum class llama_pc_layer_backend {
     CPU,
     CUDA,
