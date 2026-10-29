@@ -245,6 +245,80 @@ Offline tests:
 python -m unittest discover -s .\tools\jupiter -p test_refine_sequence_q.py -v
 ```
 
+## Opt-in asynchronous Jupiter C2P socket transport
+
+The Region Ring branches already have independent transfer workers, dedicated
+RPC return lanes and exact per-chunk readiness fences. Jupiter's layer pipeline
+is simpler (PC full layers followed by Phone full layers). Rather than
+copying Tensor/Meta's P2C/FFN mailbox protocol, an **optional** transport path
+in `ggml/src/ggml-rpc/ggml-rpc.cpp` adapts the transfer-worker idea:
+
+- `LLAMA_JUPITER_ASYNC_C2P=1` enables the **PC-side** C2P worker only.
+  The default is OFF, preserving the known-correct Jupiter RPC path.
+- The GGML scheduler calls RPC's `cpy_tensor_async` for eligible C2P
+  backend copies. The PC synchronizes the source Backend and stages the
+  tensor into **private immutable Host storage before returning**.
+  GPU-to-Host staging is still synchronous in this first version.
+- The worker sends these staged bytes through its own transfer connection.
+  Before dispatching a remote graph on its separate compute connection,
+  it fences the transfer lane with `RPC_CMD_JUPITER_SYNC`. Graph commands
+  and their completion-event markers are FIFO-ordered on the worker.
+- A remote RPC output read, buffer release and backend synchronization
+  fence outstanding worker jobs to keep buffer lifetimes safe. There is no
+  new RPC command or model-format change; the existing Jupiter phone
+  server already supports multiple connections sharing one graph/buffer
+  registry.
+- Unsupported copies are left on the pre-existing scheduler fallback.
+  Do not enable this feature globally for general RPC: it is guarded by
+  both `LLAMA_JUPITER_PREFILL=1` and `LLAMA_JUPITER_ASYNC_C2P=1`.
+
+This is an **experimental network-only overlap**. It does **not** eliminate
+GPU readback, all graph allocation synchronization, or guarantee a speedup.
+Validate correctness (generated first token, absence of RPC errors), the
+verification log's `[JUPITER_COMM] action=C2P_ENQUEUE`, and timing with
+repeated runs before adopting it.
+
+Pull the code and rebuild **PC only**:
+
+```powershell
+git fetch origin
+git checkout origin/baseline/jupiter-infocom25 -- `
+  ggml/src/ggml-rpc/ggml-rpc.cpp `
+  tools/jupiter/run_prefill_bench.py `
+  tools/jupiter/test_run_prefill_bench.py
+cmake --build build-jupiter --config Release -j
+python -m unittest discover -s .\tools\jupiter -p test_run_prefill_bench.py -v
+```
+
+Control and experiment use the **same** model/plan/prompt but different
+output folders (repeats remain independent). For example:
+
+```powershell
+$bench = @(
+  "--exe", ".\build-jupiter\bin\Release\llama-cli.exe",
+  "--model", "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
+  "--rpc", "10.39.52.114:10139",
+  "--prompt-file", ".\prompt.txt",
+  "--plan", ".\jupiter-refined-compute.plan",
+  "--target-tokens", "357",
+  "--pc-layers", "25",
+  "--modes", "default,dp",
+  "--repeats", "3"
+)
+
+python .\tools\jupiter\run_prefill_bench.py @bench --out-dir .\jupiter-comm-legacy
+python .\tools\jupiter\run_prefill_bench.py @bench --async-c2p --out-dir .\jupiter-comm-async
+```
+
+The benchmark runner overwrites any inherited `LLAMA_JUPITER_ASYNC_C2P`
+value for reproducibility. The opt-in validation uses TRACE verbosity but
+formal measurements stay at `-lv 3`, `PROFILE_STAGE=0`, `TRACE=0`.
+The output `configuration.json` records the asynchronous-transport flag,
+and `--resume` rejects an incompatible configuration.
+
+**Implementation status:** source committed, but the C++ build, on-device
+correctness and throughput A/B must be run on the actual PC+Phone system.
+
 ## Formal prefill A/B benchmark (async, low logging)
 
 After q calibration and DP plan generation, **do not benchmark with
