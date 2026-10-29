@@ -4452,13 +4452,17 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // TENSOR_PHONE_PRIMARY keeps the activation/control path on Phone:
-        // Attention -> residual (ffn_inp) -> FFN norm -> Router.  PC joins only
-        // after routing is complete, where it receives the normalized hidden
-        // state plus the tiny top-k/weight tensors used by the expert FFN.
+        // Directional Tensor keeps the Attention -> residual (ffn_inp) ->
+        // FFN norm control prefix on the Attention owner.  This is the key
+        // contract that lets READY carry FFN_NORM instead of prematurely
+        // copying attn_out across the wire:
+        //
+        //   C2P: PC owns ffn_inp/ffn_norm, then READY PC -> Phone
+        //   P2C: Phone owns ffn_inp/ffn_norm, then READY Phone -> PC
+        //
+        // TENSOR_PHONE_PRIMARY follows the same Phone-owned rule.
         for (int i = 0; i < cgraph->n_nodes; ++i) {
-            if (n_backends != 2 ||
-                    backend_ctx->tensor_phone_first_layer < 0) {
+            if (n_backends != 2) {
                 break;
             }
 
@@ -4480,20 +4484,32 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
-            if (!ggml_backend_meta_tensor_phone_primary_layer(
-                    backend_ctx, layer)) {
+            const bool c2p_control =
+                ggml_backend_meta_tensor_c2p_layer(
+                    backend_ctx, layer);
+            const bool phone_control =
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, layer) ||
+                ggml_backend_meta_tensor_phone_primary_layer(
+                    backend_ctx, layer);
+            if (!c2p_control && !phone_control) {
                 continue;
             }
 
-            backend_ctx->backend_configs[0].nodes[i]->flags &=
-                ~GGML_TENSOR_FLAG_COMPUTE;
-            backend_ctx->backend_configs[1].nodes[i]->flags |=
+            const size_t owner = c2p_control ? 0 : 1;
+            const size_t other = owner ^ 1u;
+            backend_ctx->backend_configs[owner].nodes[i]->flags |=
                 GGML_TENSOR_FLAG_COMPUTE;
+            backend_ctx->backend_configs[other].nodes[i]->flags &=
+                ~GGML_TENSOR_FLAG_COMPUTE;
 
             if (std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
                 printf(
-                    "[TENSOR_PHONE_CONTROL_OWNER] layer=%d node=%s owner=PHONE\n",
-                    layer, name);
+                    "[REGION_%s_CONTROL_OWNER] layer=%d node=%s owner=%s\n",
+                    c2p_control ? "C2P" : "P2C",
+                    layer,
+                    name,
+                    owner == 0 ? "PC" : "PHONE");
             }
         }
 
@@ -4630,15 +4646,75 @@ for (size_t j = 0; j < n_backends; ++j) {
     }
 }
 
+int directional_attn_layer = -1;
+int directional_attn_parsed = 0;
+const bool directional_attn_name =
+    std::sscanf(
+        node->name,
+        "attn_out-%d%n",
+        &directional_attn_layer,
+        &directional_attn_parsed) == 1 &&
+    node->name[directional_attn_parsed] == '\0';
+
+const bool directional_owner_attn =
+    directional_attn_name &&
+    attn_active_count == 1 &&
+    ((attn_active_backend == 0 &&
+      ggml_backend_meta_tensor_c2p_layer(
+          backend_ctx, directional_attn_layer)) ||
+     (attn_active_backend == 1 &&
+      ggml_backend_meta_tensor_p2c_layer(
+          backend_ctx, directional_attn_layer)));
+
 const bool pc_only_attn =
-    std::strncmp(node->name, "attn_out-", 9) == 0 &&
+    directional_attn_name &&
     attn_active_count == 1 &&
     attn_active_backend == 0;
 
-const bool decode_pc_only_attn = pc_only_attn && node->ne[1] == 1;
-const bool prefill_pc_only_attn = pc_only_attn && node->ne[1] > 1;
+const bool decode_pc_only_attn =
+    pc_only_attn &&
+    !directional_owner_attn &&
+    node->ne[1] == 1;
+const bool prefill_directional_owner_attn =
+    directional_owner_attn &&
+    node->ne[1] > 1;
 
-if (decode_pc_only_attn || prefill_pc_only_attn) {
+auto tensor_fully_owned_by = [&](const ggml_tensor * src,
+                                 size_t owner) -> bool {
+    if (src == nullptr || src->buffer == nullptr ||
+            !ggml_backend_buffer_is_meta(src->buffer) ||
+            owner >= n_backends) {
+        return false;
+    }
+    const auto ss =
+        ggml_backend_meta_get_split_state(src, false);
+    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        return true;
+    }
+    if (ss.axis < GGML_BACKEND_SPLIT_AXIS_0 ||
+            ss.axis > GGML_BACKEND_SPLIT_AXIS_3) {
+        return false;
+    }
+
+    bool owner_has_data = false;
+    for (size_t seg = 0; seg < ss.n_segments; ++seg) {
+        for (size_t j = 0; j < n_backends; ++j) {
+            const int64_t ne =
+                ss.ne[seg * n_backends + j] * ss.nr[seg];
+            if (j == owner) {
+                owner_has_data = owner_has_data || ne > 0;
+            } else if (ne != 0) {
+                return false;
+            }
+        }
+    }
+    return owner_has_data;
+};
+
+if (decode_pc_only_attn || prefill_directional_owner_attn) {
+    const size_t owner =
+        prefill_directional_owner_attn ?
+            attn_active_backend : 0;
     std::set<const ggml_tensor *> delayed_nodes = { node };
 
     for (int ii = id + 1; ii < cgraph->n_nodes; ++ii) {
@@ -4655,7 +4731,11 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
                 continue;
             }
 
-            if (!ggml_backend_meta_tensor_is_mirrored(next->src[s], false)) {
+            if (!ggml_backend_meta_tensor_is_mirrored(
+                    next->src[s], false) &&
+                    !(prefill_directional_owner_attn &&
+                      tensor_fully_owned_by(
+                          next->src[s], owner))) {
                 return i;
             }
         }
@@ -4664,22 +4744,27 @@ if (decode_pc_only_attn || prefill_pc_only_attn) {
             delayed_nodes.insert(next);
         }
 
-        if (decode_pc_only_attn && std::strncmp(next->name, "ffn_norm-", 9) == 0) {
+        if (decode_pc_only_attn &&
+                std::strncmp(next->name, "ffn_norm-", 9) == 0) {
             return depends_on_delayed ? ii : i;
         }
 
         int chunk = -1;
         int layer = -1;
-        if (prefill_pc_only_attn &&
-                ggml_backend_meta_parse_prefill_norm_chunk(next->name, chunk, layer) &&
+        if (prefill_directional_owner_attn &&
+                ggml_backend_meta_parse_prefill_norm_chunk(
+                    next->name, chunk, layer) &&
+                layer == directional_attn_layer &&
                 chunk == 0) {
             return depends_on_delayed ? ii : i;
         }
 
-        if (next->buffer == nullptr || !ggml_backend_buffer_is_meta(next->buffer)) {
+        if (next->buffer == nullptr ||
+                !ggml_backend_buffer_is_meta(next->buffer)) {
             return i;
         }
-        if (ggml_backend_meta_get_split_state(next, false).axis ==
+        if (ggml_backend_meta_get_split_state(
+                next, false).axis ==
                 GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
             return i;
         }
