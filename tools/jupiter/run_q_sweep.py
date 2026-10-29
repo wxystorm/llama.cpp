@@ -28,6 +28,7 @@ UBATCH_RE = re.compile(
     r"\[JUPITER_UBATCH\].*?event=BEGIN.*?"
     r"prefix_tokens=(\d+).*?tokens=(\d+)"
 )
+TASK_TOKENS_RE = re.compile(r"task\.n_tokens\s*=\s*(\d+)")
 
 
 def parse_int_list(text: str) -> List[int]:
@@ -308,7 +309,12 @@ def main() -> int:
     if not planner.is_file():
         raise SystemExit(f"planner not found: {planner}")
 
-    prompt_text = prompt_file.read_text(encoding="utf-8-sig")
+    # Text editors commonly leave a final CR/LF. Passing that newline through
+    # -p can change tokenization versus an interactively pasted prompt, which in
+    # turn makes LLAMA_JUPITER_SEQUENCE_PLAN silently inapplicable because its
+    # chunk sum no longer matches the runtime batch length. Preserve all prompt
+    # content except trailing line terminators.
+    prompt_text = prompt_file.read_text(encoding="utf-8-sig").rstrip("\r\n")
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -391,9 +397,30 @@ def main() -> int:
                 args.min_chunk,
             )
             if actual_chunks is None:
-                tail = log_path.read_text(
+                log_text = log_path.read_text(
                     encoding="utf-8", errors="replace"
-                ).splitlines()[-60:]
+                )
+                tail = log_text.splitlines()[-60:]
+                task_tokens = [int(m.group(1)) for m in TASK_TOKENS_RE.finditer(log_text)]
+
+                if task_tokens:
+                    actual_prompt_tokens = task_tokens[-1]
+                    print(
+                        "[JUPITER_SWEEP_DIAG] "
+                        f"runtime_prompt_tokens={actual_prompt_tokens} "
+                        f"target_tokens={args.target_tokens} "
+                        f"plan_sum={sum(chunks)}",
+                        file=sys.stderr,
+                    )
+                    if actual_prompt_tokens != args.target_tokens:
+                        raise RuntimeError(
+                            "prompt token count mismatch: "
+                            f"runtime={actual_prompt_tokens}, "
+                            f"--target-tokens={args.target_tokens}. "
+                            "The explicit Jupiter sequence plan is ignored when "
+                            "its chunk sum does not match the runtime prompt batch."
+                        )
+
                 print(
                     "[JUPITER_SWEEP_DIAG] no complete plan could be "
                     f"reconstructed; log={log_path}",
