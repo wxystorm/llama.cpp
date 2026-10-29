@@ -95,7 +95,14 @@ struct model {
     // weights are rolled through two persistent Banks. Adjacent GPU Regions
     // may interleave; only same-Bank rank k-2 lifetime is serialized.
     bool gpu_weight_streaming = false;
-    double phone_register_ms = 0.0; // 5-layer reference; conservative per Phone task.
+    double phone_register_ms = 0.0; // Legacy MoE P5 fallback only.
+    // Dense: measured/proxied RPC graph bytes, not a hard-coded P5 graph.
+    // embedded_directional means C2P -> Phone Full -> P2C runs inside Meta.
+    // The callback accounts for one fused graph when that feature is enabled,
+    // or for the actual per-layer Meta SG submissions when it is disabled.
+    std::function<bool(
+        llama_region_ring_stage_kind, int, int, bool, double &)>
+        phone_registration_cost;
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
     // Optional host-side scheduler prepare cost for the same shape. Missing
@@ -123,6 +130,28 @@ struct model {
 
 inline int chunk_for(const candidate & c, device d) {
     return d == device::CPU ? c.xc : d == device::GPU ? c.xg : c.xp;
+}
+
+inline bool phone_registration_cost(
+        const model & m, llama_region_ring_stage_kind kind,
+        int layers, int tokens, bool embedded_directional,
+        double & cost) {
+    if (kind != llama_region_ring_stage_kind::PHONE &&
+            !llama_region_ring_stage_is_directional(kind)) {
+        cost = 0.0;
+        return true;
+    }
+    if (m.phone_registration_cost) {
+        if (!m.phone_registration_cost(
+                kind, layers, tokens, embedded_directional, cost) ||
+                !std::isfinite(cost) || cost < 0.0) {
+            return false;
+        }
+        return true;
+    }
+    // Preserve the historical MoE/fixture model if no Dense probe exists.
+    cost = m.phone_register_ms * (double) layers / 5.0;
+    return std::isfinite(cost) && cost >= 0.0;
 }
 
 inline device region_input_owner(
@@ -398,11 +427,22 @@ inline bool simulate(const model & m,
                 return reject("PREPARE_PROFILE_MISSING");
             }
 
-            // Directional Tensor stages also submit Phone-side graph work.
-            if (d == device::PHONE || directional) {
-                ms += m.phone_register_ms *
-                    (double) layers / 5.0;
+            // Directional stages submit Phone-side work, but only a
+            // C2P/Phone/P2C island uses the Dense Meta fusion graph.
+            const bool embedded_directional =
+                region.kind == llama_region_ring_stage_kind::PHONE &&
+                r > 0 && r + 1 < regions.size() &&
+                regions[r - 1].kind ==
+                    llama_region_ring_stage_kind::C2P &&
+                regions[r + 1].kind ==
+                    llama_region_ring_stage_kind::P2C;
+            double registration_ms = 0.0;
+            if (!phone_registration_cost(
+                    m, region.kind, layers, end - begin,
+                    embedded_directional, registration_ms)) {
+                return reject("PHONE_REGISTRATION_PROFILE_MISSING");
             }
+            ms += registration_ms;
 
             task t;
             t.region = (int) r;
@@ -1264,7 +1304,8 @@ inline bool estimate_region_ring_balance(
     const int kv = m.kv_start + m.tokens / 2;
     std::array<double, 3> stage_sum {};
     std::array<int, 3> stage_count {};
-    for (const auto & region : regions) {
+    for (size_t ri = 0; ri < regions.size(); ++ri) {
+        const auto & region = regions[ri];
         const int d = (int) region.device;
         if (d < 0 || d >= 3) {
             return false;
@@ -1277,9 +1318,20 @@ inline bool estimate_region_ring_balance(
             !std::isfinite(ms) || ms < 0.0) {
             return false;
         }
-        if (region.device == device::PHONE) {
-            ms += m.phone_register_ms * (double) layers / 5.0;
+        const bool embedded_directional =
+            region.kind == llama_region_ring_stage_kind::PHONE &&
+            ri > 0 && ri + 1 < regions.size() &&
+            regions[ri - 1].kind ==
+                llama_region_ring_stage_kind::C2P &&
+            regions[ri + 1].kind ==
+                llama_region_ring_stage_kind::P2C;
+        double registration_ms = 0.0;
+        if (!phone_registration_cost(
+                m, region.kind, layers, x, embedded_directional,
+                registration_ms)) {
+            return false;
         }
+        ms += registration_ms;
         stage_sum[(size_t) d] += ms / x;
         ++stage_count[(size_t) d];
     }
@@ -1345,7 +1397,13 @@ inline bool estimate_balance(const model & m, candidate & c) {
         !m.compute_ms(device::PHONE, c.p, c.xp, kv, tp)) {
         return false;
     }
-    tp += m.phone_register_ms * (double) c.p / 5.0;
+    double registration_ms = 0.0;
+    if (!phone_registration_cost(
+            m, llama_region_ring_stage_kind::PHONE,
+            c.p, c.xp, false, registration_ms)) {
+        return false;
+    }
+    tp += registration_ms;
 
     // G -> C -> P -> G handoff model. Normalize each transfer by the
     // producer's chunk size; XC/XG/XP are independent planner variables.
