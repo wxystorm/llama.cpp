@@ -65,11 +65,16 @@ stderr/interactive-process behavior and works on Windows as well as Unix-like
 hosts.
 
 The runner first executes **one unpartitioned token probe** with the same prompt.
-It reads the actual prompt length from `task.n_tokens` (falling back to prompt
-timing or Jupiter UBATCH traces) and builds every calibration partition from
-that runtime value. An optional `--target-tokens N` is only a hint: if the
-model reports a different length, the runner prints
-`[JUPITER_SWEEP_TARGET_OVERRIDE]` and uses the real length.
+It prefers the longest complete `JUPITER_UBATCH event=BEGIN` chain,
+because the offline sequence plan must match the actual prefill decode batch,
+not necessarily the server-level `task.n_tokens`. Task token count and prompt
+timing remain fallback signals and cross-checks.
+
+If the calibration reports a different batch length from the probe, the runner
+will regenerate all partitions with the observed length and retry once.
+An optional `--target-tokens N` is only a hint: if the model reports a
+different length, the runner prints `[JUPITER_SWEEP_TARGET_OVERRIDE]` and
+uses the runtime length.
 
 Each calibration point then starts a fresh `llama-cli` with stdin closed and
 `--single-turn --simple-io`, so one completed prompt exits before the next
