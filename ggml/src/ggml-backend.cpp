@@ -1562,6 +1562,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const char * jupiter_profile_env = getenv("LLAMA_JUPITER_PROFILE_STAGE");
+    const bool jupiter_profile_stage =
+            jupiter_profile_env != NULL && atoi(jupiter_profile_env) != 0;
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1570,6 +1574,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const int64_t jupiter_stage_t0_us =
+                jupiter_profile_stage ? ggml_time_us() : 0;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
@@ -1694,6 +1701,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t jupiter_stage_inputs_done_us =
+                jupiter_profile_stage ? ggml_time_us() : 0;
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1731,6 +1741,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (jupiter_profile_stage) {
+            // Offline calibration only: serialize the stage so wall time is an
+            // actual service time rather than an async enqueue duration.
+            ggml_backend_synchronize(split_backend);
+            const int64_t jupiter_stage_t1_us = ggml_time_us();
+
+            const double input_ms =
+                    (jupiter_stage_inputs_done_us - jupiter_stage_t0_us) / 1000.0;
+            const double compute_ms =
+                    (jupiter_stage_t1_us - jupiter_stage_inputs_done_us) / 1000.0;
+            const double wall_ms =
+                    (jupiter_stage_t1_us - jupiter_stage_t0_us) / 1000.0;
+
+            GGML_LOG_INFO(
+                    "[JUPITER_STAGE_PROFILE] split=%d backend=%s nodes=%d inputs=%d input_ms=%.3f compute_ms=%.3f wall_ms=%.3f\n",
+                    split_id,
+                    ggml_backend_name(split_backend),
+                    split->graph.n_nodes,
+                    split->n_inputs,
+                    input_ms,
+                    compute_ms,
+                    wall_ms);
         }
 
         // record the event of this copy
