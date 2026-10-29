@@ -116,7 +116,27 @@ def print_sweep_plans(
 ) -> List[tuple[int, List[int]]]:
     plans: List[tuple[int, List[int]]] = []
     for x in xs:
-        chunks = make_sweep_plan(total, x, minimum, maximum)
+        try:
+            chunks = make_sweep_plan(total, x, minimum, maximum)
+        except ValueError:
+            # A repeated-x sweep can leave an impossible tail at high b,
+            # even when a first x-token chunk can be sampled legally.
+            # Keep x exact; balance the following tokens instead.
+            try:
+                if not minimum <= x <= maximum:
+                    raise ValueError("outside configured chunk bounds")
+                chunks = [x] + split_feasible_tail(
+                    total - x, minimum, maximum
+                )
+                print(
+                    f"[JUPITER_SWEEP_PLAN_FALLBACK] x={x} "
+                    "strategy=FIRST_CHUNK_BALANCED_TAIL"
+                )
+            except ValueError:
+                print(
+                    f"[JUPITER_SWEEP_SKIP] x={x} reason=NO_LEGAL_PARTITION"
+                )
+                continue
         if sum(chunks) != total:
             raise RuntimeError(
                 f"internal plan error for x={x}: sum={sum(chunks)} target={total}"
@@ -130,6 +150,11 @@ def print_sweep_plans(
         print(
             f"[JUPITER_SWEEP_PLAN] x={x} total={total} "
             f"chunks={','.join(map(str, chunks))}"
+        )
+    if not plans:
+        raise ValueError(
+            f"no legal q sweep partitions for total={total}, "
+            f"bounds=[{minimum},{maximum}]"
         )
     return plans
 
