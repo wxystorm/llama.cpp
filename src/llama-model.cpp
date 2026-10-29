@@ -4,6 +4,7 @@
 #include "llama-ext.h"
 #include "llama-hparams.h"
 #include "llama-hybrid.h"
+#include "llama-hybrid-arch.h"
 #include "llama-region-ring.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
@@ -1641,10 +1642,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     load_arch_hparams(ml);
 
     const bool hybrid_arch =
-        arch == LLM_ARCH_LLAMA ||
-        arch == LLM_ARCH_QWEN2 ||
-        arch == LLM_ARCH_QWEN3 ||
-        arch == LLM_ARCH_QWEN3MOE;
+        llama_hybrid_arch_supported(arch);
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         const int n_layer = hparams.n_layer();
         llama_hybrid_plan runtime_plan;
@@ -1688,12 +1686,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         hybrid_ring_gpu_weight_streaming =
             ring_gpu_weight_stream_requested &&
             ring_gpu_weight_stream_exec_ok &&
-            arch == LLM_ARCH_QWEN3MOE;
+            llama_hybrid_arch_supports_region_gpu_weight_streaming(arch);
         if (ring_gpu_weight_stream_requested &&
                 !hybrid_ring_gpu_weight_streaming) {
             LLAMA_LOG_WARN(
                 "[REGION_RING_GPU_WEIGHT] phase=CONFIG enabled=0 "
-                "reason=V1_QWEN3MOE_ONLY arch=%s\n",
+                "reason=UNSUPPORTED_HYBRID_ARCH arch=%s\n",
                 arch_name().c_str());
         }
         if (hybrid_ring_gpu_weight_streaming) {
@@ -1715,16 +1713,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             directional_ring ?
                 llama_region_ring_directional_layer_count(ring_regions) : 0;
 
-        // Directional Ring V1 is intentionally fixed-layout only. A later
-        // Planner may emit C2P/P2C stages, but the current model-owned Plan
-        // format still describes only legacy G/C/P ownership.
-        if (directional_ring && !hybrid_ring_plan_layout.empty()) {
-            throw std::runtime_error(
-                "directional Region Ring does not yet accept Planner APPLY; "
-                "use LLAMA_HYBRID_REGION_RING_LAYOUT for fixed validation");
-        }
-
-        // A directional fixed Ring owns placement even when --hybrid-auto has
+        // Directional Ring may be fixed-layout or Planner-owned. The selected
+        // topology is validated below before placement; per-layer C2P/P2C
+        // ownership remains authoritative in either mode.
+        //
+        // A directional Ring owns placement even when --hybrid-auto has
         // published a legacy T=0 runtime plan. The Plan is not allowed to
         // silently overwrite C2P/P2C layer ownership.
         const bool ring_layout_owned =
@@ -1887,7 +1880,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             has_runtime_plan ?
                 runtime_plan.tensor_pc_ratio :
                 0.0f);
-        // Directional boundaries use a physical PC expert-width share.
+        // Directional boundaries use a physical PC FFN-width share.
         // Keep the ratios explicit per direction; performance tuning can change
         // them later without changing the ownership protocol.
         if (llama_hybrid_region_boundary_v1_enabled() ||
