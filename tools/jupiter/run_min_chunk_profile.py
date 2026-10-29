@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 import sys
 
-from min_chunk_profile import select_min_chunk
+from min_chunk_profile import partition_feasible, select_min_chunk
 from run_q_sweep import (
     infer_runtime_prompt_tokens,
     make_sweep_plan,
@@ -46,7 +46,7 @@ SAMPLE_FIELDS = (
 SUMMARY_FIELDS = (
     "chunk_tokens", "samples", "pc_compute_ms", "phone_compute_ms",
     "pc_tokens_per_s", "phone_tokens_per_s", "pc_relative",
-    "phone_relative", "selected",
+    "phone_relative", "dp_feasible", "selected",
 )
 
 
@@ -345,7 +345,8 @@ def main() -> int:
     # Re-write with resumed samples too; preserve all attempted measurements.
     write_csv(sample_path, SAMPLE_FIELDS, samples)
     selected, measured, status = select_min_chunk(
-        samples, args.threshold, min_samples=args.repeats
+        samples, args.threshold, min_samples=args.repeats,
+        total_tokens=total, max_chunk=args.max_chunk
     )
 
     report_rows = []
@@ -358,6 +359,7 @@ def main() -> int:
             "phone_tokens_per_s": f"{item.phone_tokens_per_s:.3f}",
             "pc_relative": f"{item.pc_relative:.4f}",
             "phone_relative": f"{item.phone_relative:.4f}",
+            "dp_feasible": int(partition_feasible(total, item.tokens, args.max_chunk)),
             "selected": 1 if selected.tokens == item.tokens else 0,
         })
         print(f"[JUPITER_B_CANDIDATE] x={item.tokens} "
@@ -376,6 +378,7 @@ def main() -> int:
         "pc_layers": pc_layers,
         "prompt_tokens": total,
         "max_chunk": args.max_chunk,
+        "dp_feasible": partition_feasible(total, selected.tokens, args.max_chunk),
         "candidates": report_rows,
         "note": "Not actual GPU/Phone accelerator utilization; validate against normal Prefill A/B.",
     }
@@ -386,6 +389,11 @@ def main() -> int:
           f"pc_relative={selected.pc_relative:.3f} "
           f"phone_relative={selected.phone_relative:.3f} "
           f"report={out / 'min-chunk.json'}", flush=True)
+    if status != "BOTH_STAGES_SATURATED":
+        print(f"[JUPITER_B_WARNING] b={selected.tokens} status={status} "
+              "meaning=FEASIBLE_BELOW_TARGET_THROUGHPUT; "
+              "the observed throughput threshold is not fully met",
+              flush=True)
     print(f"[JUPITER_B_NEXT] use --min-chunk {selected.tokens} "
           "with jupiter_planner.py sequence and the newly calibrated q(x,y)",
           flush=True)
