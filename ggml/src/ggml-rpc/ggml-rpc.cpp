@@ -32,6 +32,11 @@ static bool jupiter_prefill_enabled() {
     return value != nullptr && std::atoi(value) != 0;
 }
 
+static bool jupiter_trace_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_TRACE");
+    return value != nullptr && std::atoi(value) != 0;
+}
+
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
@@ -1065,6 +1070,11 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
     auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
     const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &request, sizeof(request));
     RPC_STATUS_ASSERT(status);
+
+    if (jupiter_trace_enabled()) {
+        GGML_LOG_INFO("[JUPITER_RPC_EVENT] action=RECORD event=%" PRIu64 " generation=%" PRIu64 "\n",
+                      request.event_id, request.generation);
+    }
 }
 
 static void ggml_backend_rpc_wait_event_context(ggml_backend_rpc_event_context * event_ctx) {
@@ -1079,11 +1089,21 @@ static void ggml_backend_rpc_wait_event_context(ggml_backend_rpc_event_context *
     };
     rpc_msg_jupiter_rsp response {};
 
+    if (jupiter_trace_enabled()) {
+        GGML_LOG_INFO("[JUPITER_RPC_EVENT] action=WAIT_BEGIN event=%" PRIu64 " generation=%" PRIu64 "\n",
+                      request.event_id, request.generation);
+    }
+
     auto sock = get_socket(event_ctx->endpoint);
     const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_WAIT,
                                      &request, sizeof(request),
                                      &response, sizeof(response));
     RPC_STATUS_ASSERT(status && response.ok == 1);
+
+    if (jupiter_trace_enabled()) {
+        GGML_LOG_INFO("[JUPITER_RPC_EVENT] action=WAIT_END event=%" PRIu64 " generation=%" PRIu64 "\n",
+                      request.event_id, request.generation);
+    }
 }
 
 static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
