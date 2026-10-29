@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
+#include "llama-hybrid-arch.h"
 #include "llama-region-ring.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
@@ -3974,8 +3975,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         stages.front().kind == llama_hybrid_runtime_stage_kind::GPU &&
         stages.front().layer_begin == 0;
     const bool embedding_prelude_arch =
-        model.arch == LLM_ARCH_QWEN2 ||
-        model.arch == LLM_ARCH_QWEN3MOE;
+        llama_hybrid_arch_supports_region_embedding_prelude(model.arch);
     if (gpu_first_ring && embedding_prelude_arch &&
             own_stage_resources && isolate_device_resources &&
             ubatch.token != nullptr) {
