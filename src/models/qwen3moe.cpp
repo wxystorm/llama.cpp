@@ -378,6 +378,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
          phone_region_pair &&
          phone_region_stage_shape);
 
+    if (stage_graph) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_REGION_PAIR] layers=[%d,%d) c2p=%d p2c=%d "
+            "unique=%d shape=%d requested=%d chunk=%d\n",
+            layer_begin, layer_end,
+            phone_region_c2p, phone_region_p2c,
+            phone_region_pair_unique ? 1 : 0,
+            phone_region_stage_shape ? 1 : 0,
+            phone_region_requested ? 1 : 0,
+            planned_chunk_tokens);
+    }
+
     int phone_region_first = -1;
     int phone_region_end = -1;  // exclusive Phone-full end == P2C layer
     std::vector<int> phone_region_chunks;
@@ -421,6 +433,18 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
             }
         }
     }
+    if (stage_graph && phone_region_pair) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_REGION_FASTPATH] c2p=%d phone=[%d,%d) p2c=%d "
+            "chunks=%zu enabled=%d\n",
+            phone_region_c2p,
+            phone_region_first,
+            phone_region_end,
+            phone_region_p2c,
+            phone_region_chunks.size(),
+            phone_region_first >= 0 ? 1 : 0);
+    }
+
     if (phone_region_requested) {
         LLAMA_LOG_ERROR(
             "[PHONE_REGION_GRAPH_ELIGIBILITY] tokens=%" PRId64
