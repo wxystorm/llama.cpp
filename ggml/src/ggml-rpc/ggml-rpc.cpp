@@ -34,6 +34,20 @@ static bool rpc_tensor_phone_stage_profile_enabled() {
     return std::getenv("GGML_META_TENSOR_PHONE_STAGE_PROFILE") != nullptr;
 }
 
+static bool rpc_p2c_return_profile_enabled() {
+    const char * env = std::getenv("GGML_P2C_RETURN_PROFILE");
+    return env != nullptr && std::atoi(env) != 0;
+}
+
+static bool rpc_p2c_return_tensor_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+    return std::strstr(name, "prefill_ffn_down_chunk_") != nullptr ||
+           std::strstr(name, "phone_tensor_ffn_inp_chunk_") != nullptr ||
+           std::strstr(name, "ffn_moe_out-") != nullptr;
+}
+
 struct rpc_tensor_phone_graph_stage {
     const char * stage = "graph_compute";
     const char * mode = "unknown";
@@ -1899,13 +1913,59 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         size);
 
 } else {
-    status = send_rpc_cmd(
-        ctx->sock,
-        RPC_CMD_GET_TENSOR,
-        &request,
-        sizeof(request),
-        data,
-        size);
+    const bool p2c_profile =
+        rpc_p2c_return_profile_enabled() &&
+        rpc_p2c_return_tensor_name(tensor->name);
+
+    if (p2c_profile) {
+        const int64_t total_begin_us = ggml_time_us();
+        const int64_t request_begin_us = total_begin_us;
+
+        status = send_rpc_cmd(
+            ctx->sock,
+            RPC_CMD_GET_TENSOR,
+            &request,
+            sizeof(request));
+        const int64_t request_done_us = ggml_time_us();
+
+        uint64_t out_size = 0;
+        int64_t recv_us = 0;
+        if (status) {
+            const int64_t recv_begin_us = ggml_time_us();
+            status = ctx->sock->recv_data(
+                &out_size, sizeof(out_size));
+            if (status && out_size == size) {
+                status = size == 0 ||
+                    ctx->sock->recv_data(data, size);
+            } else if (status) {
+                status = false;
+            }
+            recv_us = ggml_time_us() - recv_begin_us;
+        }
+
+        const int64_t total_us =
+            ggml_time_us() - total_begin_us;
+        std::fprintf(
+            stderr,
+            "[P2C_PC_RECV_PROFILE] tensor=%s bytes=%zu "
+            "socket=COMPUTE request_ms=%.3f recv_ms=%.3f "
+            "total_ms=%.3f status=%s\n",
+            tensor->name,
+            size,
+            (request_done_us - request_begin_us) / 1000.0,
+            recv_us / 1000.0,
+            total_us / 1000.0,
+            status ? "OK" : "FAIL");
+        std::fflush(stderr);
+    } else {
+        status = send_rpc_cmd(
+            ctx->sock,
+            RPC_CMD_GET_TENSOR,
+            &request,
+            sizeof(request),
+            data,
+            size);
+    }
 }
 
     RPC_STATUS_ASSERT(status);
@@ -5611,6 +5671,18 @@ bool rpc_server::get_tensor_into(
         request.size);
     const int64_t get_us = ggml_time_us() - t0;
 
+    if (rpc_p2c_return_profile_enabled() &&
+            rpc_p2c_return_tensor_name(tensor->name)) {
+        std::fprintf(
+            stderr,
+            "[P2C_PHONE_DEVICE_READ] tensor=%s bytes=%" PRIu64
+            " device_read_ms=%.3f status=OK\n",
+            tensor->name,
+            request.size,
+            get_us / 1000.0);
+        std::fflush(stderr);
+    }
+
     if (RPC_DEBUG) {
         GGML_LOG_INFO(
             "[RPC_SERVER_GET] tensor=%s bytes=%" PRIu64
@@ -7807,12 +7879,38 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const bool p2c_profile =
+                    rpc_p2c_return_profile_enabled() &&
+                    rpc_p2c_return_tensor_name(
+                        request.tensor.name);
+                const int64_t handler_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
+
+                const int64_t send_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+
+                if (p2c_profile) {
+                    const int64_t send_us =
+                        ggml_time_us() - send_begin_us;
+                    const int64_t handler_us =
+                        ggml_time_us() - handler_begin_us;
+                    std::fprintf(
+                        stderr,
+                        "[P2C_PHONE_SOCKET_SEND] tensor=%s bytes=%zu "
+                        "send_ms=%.3f handler_ms=%.3f status=OK\n",
+                        request.tensor.name,
+                        response.size(),
+                        send_us / 1000.0,
+                        handler_us / 1000.0);
+                    std::fflush(stderr);
                 }
                 break;
             }
@@ -8090,12 +8188,38 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
+                const bool p2c_profile =
+                    rpc_p2c_return_profile_enabled() &&
+                    rpc_p2c_return_tensor_name(
+                        request.tensor.name);
+                const int64_t handler_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
+
                 std::vector<uint8_t> response;
                 if (!server.get_tensor(request, response)) {
                     return;
                 }
+
+                const int64_t send_begin_us =
+                    p2c_profile ? ggml_time_us() : 0;
                 if (!send_msg(sock, response.data(), response.size())) {
                     return;
+                }
+
+                if (p2c_profile) {
+                    const int64_t send_us =
+                        ggml_time_us() - send_begin_us;
+                    const int64_t handler_us =
+                        ggml_time_us() - handler_begin_us;
+                    std::fprintf(
+                        stderr,
+                        "[P2C_PHONE_SOCKET_SEND] tensor=%s bytes=%zu "
+                        "send_ms=%.3f handler_ms=%.3f status=OK\n",
+                        request.tensor.name,
+                        response.size(),
+                        send_us / 1000.0,
+                        handler_us / 1000.0);
+                    std::fflush(stderr);
                 }
                 break;
             }
