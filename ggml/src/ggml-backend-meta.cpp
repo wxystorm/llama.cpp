@@ -2554,10 +2554,10 @@ static uint64_t ggml_backend_meta_cpu_task_group(
     if (layer < 0 || chunk < 0) {
         return 0;
     }
-    return (UINT64_C(0x43505500) << 32) ^
-        ((uint64_t) (uint32_t) (kind + 1) << 48) ^
-        ((uint64_t) (uint32_t) (layer + 1) << 24) ^
-        (uint64_t) (uint32_t) (chunk + 1);
+    return (UINT64_C(0x4350) << 48) |
+        (((uint64_t) (uint32_t) (kind + 1) & UINT64_C(0xff)) << 40) |
+        (((uint64_t) (uint32_t) (layer + 1) & UINT64_C(0xffff)) << 24) |
+        ((uint64_t) (uint32_t) (chunk + 1) & UINT64_C(0xffffff));
 }
 
 static bool ggml_backend_meta_parse_exact_layer_name(
@@ -2656,6 +2656,25 @@ static bool ggml_backend_meta_cpu_task_graph_identity(
     for (int i = graph->n_nodes - 1; i >= 0; --i) {
         if (ggml_backend_meta_cpu_task_tensor_identity(
                 graph->nodes[i], 2, layer, chunk)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_backend_meta_cpu_task_graph_has_l_out(
+        const ggml_cgraph * graph,
+        int layer) {
+    if (graph == nullptr || layer < 0) {
+        return false;
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        int parsed_layer = -1;
+        if (ggml_backend_meta_parse_exact_layer_name(
+                graph->nodes[i]->name,
+                "l_out-%d%n",
+                parsed_layer) &&
+                parsed_layer == layer) {
             return true;
         }
     }
@@ -3198,7 +3217,10 @@ struct ggml_backend_meta_compute_workers {
             ggml_backend_meta_cpu_task_group(
                 desc.kind, desc.layer, desc.chunk);
 
-        if (c2p && desc.continuation_group != 0) {
+        if (c2p &&
+                desc.continuation_group != 0 &&
+                !ggml_backend_meta_cpu_task_graph_has_l_out(
+                    graph, graph_layer)) {
             desc.flags =
                 GGML_BACKEND_META_CPU_TASK_FLAG_STICKY_CONTINUES;
         }
@@ -14535,6 +14557,18 @@ if (phone_status != GGML_STATUS_SUCCESS) {
                     ggml_backend_graph_compute_async(
                         pc_cfg.backend, pc_fold_graph);
                 if (fold_status != GGML_STATUS_SUCCESS) {
+                    if (backend_ctx->cpu_task_executor != nullptr) {
+                        backend_ctx->cpu_task_executor->release_sticky(
+                            ggml_backend_meta_cpu_task_group(
+                                GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN,
+                                layer,
+                                backend_ctx->cpu_task_outer_chunk.load(
+                                    std::memory_order_relaxed) >= 0 ?
+                                    backend_ctx->cpu_task_outer_chunk.load(
+                                        std::memory_order_relaxed) :
+                                    chunk),
+                            "C2P_PC_PREP_FOLD_FAILED");
+                    }
                     release_region_c2p_overlap_chunk(
                         layer, chunk,
                         "PC_PARTIAL_FOLD_FAILED");
@@ -14610,6 +14644,18 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             }
 
             state.pc_prepared = true;
+            if (backend_ctx->cpu_task_executor != nullptr) {
+                backend_ctx->cpu_task_executor->release_sticky(
+                    ggml_backend_meta_cpu_task_group(
+                        GGML_BACKEND_META_CPU_TASK_TENSOR_PC_MAIN,
+                        layer,
+                        backend_ctx->cpu_task_outer_chunk.load(
+                            std::memory_order_relaxed) >= 0 ?
+                            backend_ctx->cpu_task_outer_chunk.load(
+                                std::memory_order_relaxed) :
+                            chunk),
+                    "C2P_PC_PREP_READY");
+            }
 
             if (pipeline_debug) {
                 printf(
