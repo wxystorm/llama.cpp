@@ -2866,6 +2866,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             const bool p2c_defer_arm =
                 block_tokens > 1 &&
                 ring_lane == 2 &&
+                split + 1 == n_splits &&
                 c2p_island_returns_pc &&
                 ggml_backend_is_meta(target) &&
                 ggml_backend_meta_p2c_deferred_arm(
