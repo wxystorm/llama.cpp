@@ -765,7 +765,12 @@ def run_sweep_for_length(
             "--max-chunk", str(args.max_chunk),
             "--target-length", str(total_tokens),
         ])
-        print(f"[JUPITER_SWEEP_DP] plan={plan_output}", flush=True)
+        # The sequence plan is bound to the exact model boundary used for
+        # profiling. Keep both decisions in the same runtime plan, rather
+        # than silently inheriting an older model.pc_layers value.
+        from jupiter_planner import _write_plan
+        _write_plan(str(plan_output), {"model.pc_layers": str(args.pc_layers)})
+        print(f"[JUPITER_SWEEP_DP] plan={plan_output} pc_layers={args.pc_layers}", flush=True)
         print(plan_output.read_text(encoding="utf-8"), end="")
 
     return 0
