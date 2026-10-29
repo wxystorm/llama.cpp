@@ -9888,7 +9888,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "tokens=%d kv_start=%d cpu_points=%zu gpu_points=%zu "
         "phone_points=%zu h2p_points=%zu p2h_points=%zu "
         "weight_h2d_points=%zu "
-        "register_ms_per_task=%.3f weights=%s "
+        "register_ms_per_task=%.3f phone_cost=%s weights=%s "
         "gpu_weight_stream=%s weight_h2d_profile=%s "
         "network=SHARED_CONSERVATIVE pc_compute=CPU_CUDA_INDEPENDENT "
         "scheduler=DEVICE_FIFO slot_pool=%d action=%s\n",
@@ -9897,6 +9897,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         profile.phone_layer_blocks.size(), profile.pc_to_phone.size(),
         profile.phone_to_pc.size(), profile.gpu_weight_h2d.size(),
         model.phone_register_ms,
+        profile.is_moe ? "MOE_P5_LEGACY" : "DENSE_RPC_GRAPH_WIRE",
         have_layer_weights ? "ESTIMATED" : "UNKNOWN",
         model.gpu_weight_streaming ? "TWO_BANK" : "OFF",
         model.gpu_weight_streaming ?
