@@ -288,14 +288,14 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
             const int64_t n_ffn_tokens = cur->ne[1];
 
             // Match the validated MoE directional path: Region Ring stage
-        // graphs carry their own macro chunk and fixed layouts intentionally
-        // may not have a global Tensor runtime plan.  C2P/P2C must therefore
-        // use the stage chunk first, falling back to the legacy global plan
-        // only for non-stage/full-graph execution.
-        const int planned_chunk_tokens =
-            stage_graph && params.hybrid_chunk_tokens > 0 ?
-                params.hybrid_chunk_tokens :
-                llama_hybrid_runtime_prefill_chunk_tokens();
+            // graphs carry their own macro chunk and fixed layouts intentionally
+            // may not have a global Tensor runtime plan.  C2P/P2C must therefore
+            // use the stage chunk first, falling back to the legacy global plan
+            // only for non-stage/full-graph execution.
+            const int planned_chunk_tokens =
+                stage_graph && params.hybrid_chunk_tokens > 0 ?
+                    params.hybrid_chunk_tokens :
+                    llama_hybrid_runtime_prefill_chunk_tokens();
             const int n_prefill_chunks = planned_chunk_tokens > 0 ?
                 (n_ffn_tokens + planned_chunk_tokens - 1) / planned_chunk_tokens :
                 std::min<int64_t>(llama_prefill_ffn_chunk_count(), n_ffn_tokens);
@@ -304,6 +304,20 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
                 !embed && n_tokens > 1 && n_ffn_tokens > 1 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
                 llama_hybrid_layer_mode_uses_split_ffn_chunks(hybrid_mode) && n_prefill_chunks >= 1 && loras->empty() &&
                 cvec->tensor_for(il) == nullptr;
+            if (stage_graph &&
+                    llama_hybrid_layer_mode_directional_tensor(hybrid_mode) &&
+                    std::getenv("GGML_META_PIPELINE_DEBUG") != nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[DENSE_DIRECTIONAL_STAGE] arch=llama layer=%d "
+                    "layers=[%d,%d) tokens=%" PRId64 " outer_chunk=%d "
+                    "planned_chunk=%d n_prefill_chunks=%d chunked=%d status=READY\n",
+                    il, layer_begin, layer_end, n_tokens,
+                    params.hybrid_chunk_tokens,
+                    planned_chunk_tokens,
+                    n_prefill_chunks,
+                    use_prefill_chunked_ffn ? 1 : 0);
+            }
+
 
             if (use_decode_chunked_ffn) {
                 ggml_tensor * ffn_hidden =
