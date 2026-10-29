@@ -87,6 +87,8 @@ class PrefillBenchTests(unittest.TestCase):
         ]
         self.assertFalse(parser().parse_args(common).async_c2p)
         self.assertTrue(parser().parse_args(common + ["--async-c2p"]).async_c2p)
+        self.assertFalse(parser().parse_args(common).comm_timing)
+        self.assertTrue(parser().parse_args(common + ["--comm-timing"]).comm_timing)
 
     def test_formal_cli_uses_lv3_single_turn(self) -> None:
         args = argparse.Namespace(
