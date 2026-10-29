@@ -90,6 +90,7 @@ class PrefillBenchTests(unittest.TestCase):
         self.assertEqual(command[command.index("-lv") + 1], "3")
         self.assertIn("--single-turn", command)
         self.assertIn("--simple-io", command)
+        self.assertIn("--no-show-timings", command)
         self.assertIn("-n", command)
         self.assertEqual(command[command.index("-n") + 1], "1")
 
