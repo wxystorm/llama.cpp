@@ -10700,6 +10700,19 @@ void llama_context::perf_reset() {
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
     n_reused    = 0;
+
+    // Warmup and Profile may execute graphs before the formal prompt.
+    // Delimit the measured interval so the offline CSV does not accidentally
+    // include those preparatory Region Ring ubatches.
+    if (const char * path = std::getenv(
+            "LLAMA_REGION_RING_METRICS_FILE")) {
+        if (*path != '\0') {
+            std::ofstream out(path, std::ios::app);
+            if (out) {
+                out << "{\"type\":\"measurement_start\",\"schema\":1}\n";
+            }
+        }
+    }
 }
 
 llama_memory_breakdown llama_context::memory_breakdown() const {
