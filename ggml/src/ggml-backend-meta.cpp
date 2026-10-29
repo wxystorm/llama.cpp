@@ -10809,6 +10809,42 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         }
 
         if (active_count == 1 && n_backends == 2 && active_backend == 1) {
+            // Dense/Region P2C entry: the Phone Full layer immediately before
+            // a P2C Tensor layer must remain Phone-resident. The next layer's
+            // Attention is Phone-owned, and its explicit READY boundary will
+            // send only FFN_NORM Phone->PC. Copying l_out-(L-1) here creates
+            // an unnecessary third 1->0 payload before READY/PARTIAL.
+            int p2c_entry_lout_layer = -1;
+            int p2c_entry_parsed = 0;
+            const bool p2c_entry_keep_phone =
+                nodes[1] != nullptr &&
+                nodes[1]->ne[1] > 1 &&
+                std::sscanf(
+                    nodes[1]->name,
+                    "l_out-%d%n",
+                    &p2c_entry_lout_layer,
+                    &p2c_entry_parsed) == 1 &&
+                nodes[1]->name[p2c_entry_parsed] == '\0' &&
+                ggml_backend_meta_tensor_p2c_layer(
+                    backend_ctx, p2c_entry_lout_layer + 1) &&
+                layer_attention_phone_owned(
+                    p2c_entry_lout_layer + 1);
+
+            if (p2c_entry_keep_phone) {
+                handled = true;
+                if (pipeline_debug) {
+                    printf(
+                        "[REGION_P2C_ENTRY_KEEP_PHONE] sg=%zu "
+                        "l_out_layer=%d p2c_layer=%d tensor=%s "
+                        "action=NO_GENERIC_HANDOFF status=OK\n",
+                        i,
+                        p2c_entry_lout_layer,
+                        p2c_entry_lout_layer + 1,
+                        nodes[1]->name);
+                }
+                return GGML_STATUS_SUCCESS;
+            }
+
             const bool pc_needed_next =
                 i + 1 < backend_ctx->n_subgraphs && subgraph_will_execute_pc(i + 1);
             if (c2p_tensor_sg) {
