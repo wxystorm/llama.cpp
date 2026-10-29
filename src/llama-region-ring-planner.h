@@ -1924,17 +1924,18 @@ inline result search_runtime_applicable(
         out.top.push_back(std::move(plan));
     }
 
-    // MoE APPLY_SAFE already evaluates concrete, unequal G/C splits. Bring
-    // that same actual-Region scoring into APPLY_WIDE: starting from the
-    // profiled Cycle/Chunk seeds, move each G/C, C/P or P/G boundary through
-    // every *legal* layer position. A beam of surviving layouts then supplies
-    // seeds for subsequent passes, so different Cycles can independently
-    // grow and shrink without inventing an equal-width constraint.
+    // Two-level nonuniform construction:
+    //  1) Optimize the first Cycle with the unchanged minimax E equation;
+    //     retain a handful of low-E geometries per Cycle count.
+    //  2) For EACH first-Cycle seed, extend the next Cycle according to the
+    //     cumulative CPU/GPU/Phone load of the preceding Cycles.
+    //  3) Score only *complete* layouts with the original memory guards,
+    //     exact full-Prompt DAG simulator and subsequent optional Tensor pass.
+    // The old equal-width candidates above remain explicit A/B baselines.
     //
-    // This first executable expansion retains Phone final ownership. The
-    // existing WIDE_PREVIEW separately supports GPU/CPU tails, but the
-    // concurrent runtime still binds final logits to Phone MAIN and must
-    // gain a tested PC-final output path before APPLY can select a PC tail.
+    // A one-Cycle E estimate does not determine the final wall time:
+    // independent per-device Chunk FIFOs, stage PREPARE, network contention
+    // and GPU two-Bank rolling loads are all charged in simulate().
     const auto wall_less = [](const candidate & a, const candidate & b) {
         if (std::abs(a.wall_ms - b.wall_ms) > 0.05) {
             return a.wall_ms < b.wall_ms;
@@ -1944,122 +1945,395 @@ inline result search_runtime_applicable(
         }
         return a.ring_error_mean < b.ring_error_mean;
     };
-    std::unordered_set<std::string> seen;
     const auto key_for = [](const candidate & v,
                             const std::vector<llama_region_ring_region> & rs) {
         return llama_region_ring_layout_string(rs) + "/" +
             std::to_string(v.xc) + "/" + std::to_string(v.xg) + "/" +
             std::to_string(v.xp);
     };
+    std::unordered_set<std::string> scored;
     for (const auto & v : out.top) {
         std::vector<llama_region_ring_region> rs;
         if (make_regions(v, m.layers, rs)) {
-            seen.insert(key_for(v, rs));
+            scored.insert(key_for(v, rs));
         }
     }
 
-    constexpr size_t k_refine_beam = 8;
-    constexpr size_t k_refine_simulations = 128;
-    // A boundary may jump directly to *any* legal position. Consecutive
-    // passes allow independent changes across all boundaries, not only
-    // reshuffling one Cycle's original fixed length.
-    constexpr int k_refine_passes = 8;
-    for (int pass = 0; pass < k_refine_passes && !out.top.empty(); ++pass) {
-        std::sort(out.top.begin(), out.top.end(), wall_less);
-        std::vector<candidate> proposals;
-        const size_t beam = std::min(k_refine_beam, out.top.size());
-        for (size_t bi = 0; bi < beam; ++bi) {
-            const auto seed = out.top[bi];
-            std::vector<llama_region_ring_region> rs;
-            if (!make_regions(seed, m.layers, rs)) {
+    const std::array<int, 4> chunks {16, 32, 64, 128};
+    const double invalid = std::numeric_limits<double>::infinity();
+    // Cache every measurable Dense/MoE full-stage service time once. The
+    // Hybrid Profile callback depends on (device, layers, X, KV), not on
+    // the logical start layer, so this also keeps prefix expansion cheap.
+    std::array<std::array<std::vector<double>, 4>, 3> service;
+    const int kv = m.kv_start + m.tokens / 2;
+    for (int dev = 0; dev < 3; ++dev) {
+        for (size_t xi = 0; xi < chunks.size(); ++xi) {
+            service[(size_t) dev][xi].assign(
+                (size_t) m.layers + 1, invalid);
+            const int x = chunks[xi];
+            for (int layers = 1; layers <= m.layers; ++layers) {
+                if (dev == (int) device::PHONE && layers > 8) {
+                    break;
+                }
+                double duration_ms = 0.0;
+                if (!m.compute_ms((device) dev, layers, x, kv,
+                                 duration_ms) ||
+                        !std::isfinite(duration_ms) ||
+                        duration_ms < 0.0) {
+                    continue;
+                }
+                if (dev == (int) device::PHONE) {
+                    double reg_ms = 0.0;
+                    if (!phone_registration_cost(
+                            m, llama_region_ring_stage_kind::PHONE,
+                            layers, x, false, reg_ms)) {
+                        continue;
+                    }
+                    duration_ms += reg_ms;
+                }
+                service[(size_t) dev][xi][(size_t) layers] =
+                    duration_ms / x;
+            }
+        }
+    }
+
+    // Links are P->G, G->C, C->P in cyclic E order. Each is measured at
+    // its *source* Chunk size and charged once per conceptual Cycle.
+    std::array<double, 4> pg {}, gc {}, cp {};
+    for (size_t xi = 0; xi < chunks.size(); ++xi) {
+        const int x = chunks[xi];
+        const size_t bytes =
+            (size_t) m.hidden * (size_t) x * sizeof(float);
+        double t = 0.0;
+        pg[xi] = m.transfer_ms(
+            device::PHONE, device::GPU, bytes, t) ? t / x : invalid;
+        t = 0.0;
+        gc[xi] = m.transfer_ms(
+            device::GPU, device::CPU, bytes, t) ? t / x : invalid;
+        t = 0.0;
+        cp[xi] = m.transfer_ms(
+            device::CPU, device::PHONE, bytes, t) ? t / x : invalid;
+    }
+
+    struct first_cycle_seed {
+        int cycles = 0;
+        int g = 0;
+        int c = 0;
+        int p = 0;
+        int width = 0;
+        int width_slack = 0;
+        size_t ci = 0;
+        size_t gi = 0;
+        size_t pi = 0;
+        double first_e = 0.0;
+        std::array<double, 3> load {};
+        std::array<double, 3> links {};
+    };
+    struct prefix_state {
+        std::vector<llama_region_ring_region> regions;
+        std::array<double, 3> load {};
+        double prefix_e_sum = 0.0;
+        double width_variance = 0.0;
+        double rank = 0.0;
+        int min_width = 0;
+        int max_width = 0;
+    };
+    // First Cycle is close to L/N. Subsequent Cycles may differ, but the
+    // maximum spread across Cycles is about 25% of average length. The
+    // squared-length term below is a *soft* preference inside that range.
+    constexpr size_t k_first_seeds_per_n = 12;
+    constexpr size_t k_seed_geometry_diversity = 8;
+    constexpr size_t k_prefix_beam_per_seed = 8;
+    constexpr double k_history_weight = 0.20;
+    constexpr double k_width_weight = 0.20;
+
+    for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+        const int avg_low = m.layers / n_cycles;
+        const int avg_high =
+            (m.layers + n_cycles - 1) / n_cycles;
+        if (avg_low < 4) {
+            continue;
+        }
+        const int spread = std::max(2, (avg_high + 3) / 4);
+        const int width_low = std::max(4, avg_low - spread);
+        const int width_high =
+            std::min(avg_high + spread,
+                     m.layers - (n_cycles - 1) * 4);
+        std::vector<first_cycle_seed> first_seeds;
+        for (int width = width_low; width <= width_high; ++width) {
+            const int remaining = m.layers - width;
+            // Can the remaining Cycles have similar lengths to this one?
+            const int min_other = std::max(
+                width_low, width - spread);
+            const int max_other = std::min(
+                width_high, width + spread);
+            if (remaining < (n_cycles - 1) * min_other ||
+                    remaining > (n_cycles - 1) * max_other) {
                 continue;
             }
-            for (size_t i = 0; i + 1 < rs.size(); ++i) {
-                const int width_a =
-                    rs[i].layer_end - rs[i].layer_begin;
-                const int width_b =
-                    rs[i + 1].layer_end - rs[i + 1].layer_begin;
-                const int combined = width_a + width_b;
-                for (int new_a = 1; new_a < combined; ++new_a) {
-                    if (new_a == width_a) {
-                        continue;
+            for (int p = 2; p <= std::min(8, width - 2); ++p) {
+                for (int g = 1; g < width - p; ++g) {
+                    const int c = width - p - g;
+                    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+                        for (size_t gi = 0; gi < chunks.size(); ++gi) {
+                            for (size_t pi = 0; pi < chunks.size(); ++pi) {
+                                first_cycle_seed seed;
+                                seed.cycles = n_cycles;
+                                seed.g = g;
+                                seed.c = c;
+                                seed.p = p;
+                                seed.width = width;
+                                seed.width_slack = spread;
+                                seed.ci = ci;
+                                seed.gi = gi;
+                                seed.pi = pi;
+                                seed.load = {
+                                    service[(size_t) device::CPU][ci][(size_t) c],
+                                    service[(size_t) device::GPU][gi][(size_t) g],
+                                    service[(size_t) device::PHONE][pi][(size_t) p]
+                                };
+                                seed.links = {pg[pi], gc[gi], cp[ci]};
+                                seed.first_e = prefix_cycle_max_error(
+                                    seed.load, seed.links, 1);
+                                if (!std::isfinite(seed.first_e)) {
+                                    continue;
+                                }
+                                ++out.first_cycle_profiled;
+                                first_seeds.push_back(seed);
+                            }
+                        }
                     }
-                    auto changed = rs;
-                    const int middle = changed[i].layer_begin + new_a;
-                    changed[i].layer_end = middle;
-                    changed[i + 1].layer_begin = middle;
-                    if (!llama_region_ring_apply_topology_compatible(
-                            changed, m.layers)) {
-                        continue;
-                    }
-                    candidate v = seed;
-                    v.concrete_regions = changed;
-                    v.cycles = (int) (changed.size() / 3);
-                    v.g = changed[0].layer_end -
-                          changed[0].layer_begin;
-                    v.c = changed[1].layer_end -
-                          changed[1].layer_begin;
-                    v.p = changed[2].layer_end -
-                          changed[2].layer_begin;
-                    v.tail_g = 0;
-                    v.tail_c = 0;
-                    if (!seen.insert(key_for(v, changed)).second) {
-                        continue;
-                    }
-                    ++out.enumerated;
-                    if ((m.memory_feasible &&
-                            !m.memory_feasible(v)) ||
-                            (m.region_memory_feasible &&
-                             !m.region_memory_feasible(changed))) {
-                        ++out.rejected_memory;
-                        continue;
-                    }
-                    if (!estimate_region_ring_balance(m, changed, v)) {
-                        ++out.rejected_profile;
-                        continue;
-                    }
-                    ++out.profiled;
-                    ++out.nonuniform_profiled;
-                    // Match the original E-window-plus-floor selection.
-                    // A refined candidate still has to meet the same
-                    // effective E limit as its profiled uniform seeds.
-                    if (v.ring_error_max >
-                            out.shortlist_e_limit + 1e-12) {
-                        continue;
-                    }
-                    proposals.push_back(std::move(v));
                 }
             }
         }
-        if (proposals.empty()) {
-            break;
+        if (first_seeds.empty()) {
+            continue;
         }
-        std::sort(proposals.begin(), proposals.end(),
-            [](const candidate & a, const candidate & b) {
-                if (std::abs(a.ring_error_max - b.ring_error_max) > 1e-12) {
-                    return a.ring_error_max < b.ring_error_max;
+        std::sort(first_seeds.begin(), first_seeds.end(),
+            [](const first_cycle_seed & a,
+               const first_cycle_seed & b) {
+                if (std::abs(a.first_e - b.first_e) > 1e-12) {
+                    return a.first_e < b.first_e;
                 }
-                return a.ring_error_mean < b.ring_error_mean;
+                return a.width < b.width;
             });
-        // The first half follows E, and the second half diversifies across
-        // distinct concrete geometries while keeping the same E budget.
-        const size_t n =
-            std::min(k_refine_simulations, proposals.size());
-        for (size_t i = 0; i < n; ++i) {
-            candidate v = std::move(proposals[i]);
-            std::string why;
-            if (!simulate(m, v.concrete_regions, v, &why)) {
-                ++out.rejected_deadlock;
-                continue;
+        const double seed_e_limit =
+            std::min(1.0, first_seeds.front().first_e + e_margin);
+
+        // Keep several low-E first-Cycle *geometries* before filling
+        // remaining slots with alternative Chunk triples. This prevents
+        // the beam from collapsing to one shape with 12 X variations.
+        std::vector<size_t> chosen;
+        std::unordered_set<std::string> chosen_shapes;
+        std::unordered_set<size_t> chosen_indices;
+        for (size_t i = 0; i < first_seeds.size(); ++i) {
+            if (first_seeds[i].first_e > seed_e_limit + 1e-12 ||
+                    chosen.size() >= k_seed_geometry_diversity) {
+                break;
             }
-            ++out.simulated;
-            ++out.nonuniform_simulated;
-            ++out.shortlisted;
-            out.top.push_back(std::move(v));
+            const auto & v = first_seeds[i];
+            const std::string shape =
+                std::to_string(v.g) + "/" + std::to_string(v.c) +
+                "/" + std::to_string(v.p);
+            if (chosen_shapes.insert(shape).second) {
+                chosen.push_back(i);
+                chosen_indices.insert(i);
+            }
         }
-        std::sort(out.top.begin(), out.top.end(), wall_less);
-        if (out.top.size() > k_refine_beam * 2) {
-            out.top.resize(k_refine_beam * 2);
+        for (size_t i = 0; i < first_seeds.size() &&
+                chosen.size() < k_first_seeds_per_n; ++i) {
+            if (first_seeds[i].first_e > seed_e_limit + 1e-12) {
+                break;
+            }
+            if (chosen_indices.insert(i).second) {
+                chosen.push_back(i);
+            }
+        }
+        // A very sharp minimum should not reduce the search to one seed.
+        const size_t floor = std::min(
+            k_seed_geometry_diversity, first_seeds.size());
+        for (size_t i = 0; i < first_seeds.size() &&
+                chosen.size() < floor; ++i) {
+            if (chosen_indices.insert(i).second) {
+                chosen.push_back(i);
+            }
+        }
+
+        out.first_cycle_selected += chosen.size();
+        for (size_t si : chosen) {
+            const auto & seed = first_seeds[si];
+            prefix_state initial;
+            initial.regions.emplace_back(
+                device::GPU, 0, seed.g);
+            initial.regions.emplace_back(
+                device::CPU, seed.g, seed.g + seed.c);
+            initial.regions.emplace_back(
+                device::PHONE, seed.g + seed.c, seed.width);
+            initial.load = seed.load;
+            initial.prefix_e_sum = seed.first_e;
+            initial.rank = seed.first_e;
+            initial.min_width = seed.width;
+            initial.max_width = seed.width;
+            std::vector<prefix_state> beam { std::move(initial) };
+
+            for (int completed = 1;
+                    completed < n_cycles && !beam.empty(); ++completed) {
+                std::vector<prefix_state> expanded;
+                for (const auto & state : beam) {
+                    const int begin = state.regions.back().layer_end;
+                    const int remain = m.layers - begin;
+                    const int later = n_cycles - completed - 1;
+                    const int next_min_width = std::max({
+                        width_low,
+                        state.max_width - seed.width_slack
+                    });
+                    const int next_max_width = std::min({
+                        width_high,
+                        state.min_width + seed.width_slack
+                    });
+                    for (int width = next_min_width;
+                            width <= next_max_width; ++width) {
+                        const int rest = remain - width;
+                        if (rest < later * width_low ||
+                                rest > later * width_high ||
+                                (later == 0 && rest != 0)) {
+                            continue;
+                        }
+                        const int new_min =
+                            std::min(state.min_width, width);
+                        const int new_max =
+                            std::max(state.max_width, width);
+                        if (new_max - new_min > seed.width_slack) {
+                            continue;
+                        }
+                        const int later_min = std::max(
+                            width_low,
+                            new_max - seed.width_slack);
+                        const int later_max = std::min(
+                            width_high,
+                            new_min + seed.width_slack);
+                        if (rest < later * later_min ||
+                                rest > later * later_max) {
+                            continue;
+                        }
+
+                        for (int p = 2;
+                                p <= std::min(8, width - 2); ++p) {
+                            for (int g = 1; g < width - p; ++g) {
+                                const int c = width - p - g;
+                                const std::array<double, 3> extra {{
+                                    service[(size_t) device::CPU][seed.ci][(size_t) c],
+                                    service[(size_t) device::GPU][seed.gi][(size_t) g],
+                                    service[(size_t) device::PHONE][seed.pi][(size_t) p]
+                                }};
+                                if (!std::isfinite(extra[0]) ||
+                                        !std::isfinite(extra[1]) ||
+                                        !std::isfinite(extra[2])) {
+                                    continue;
+                                }
+                                ++out.prefix_expanded;
+                                prefix_state next = state;
+                                for (size_t i = 0; i < 3; ++i) {
+                                    next.load[i] += extra[i];
+                                }
+                                const double prefix_e =
+                                    prefix_cycle_max_error(
+                                        next.load, seed.links,
+                                        completed + 1);
+                                if (!std::isfinite(prefix_e)) {
+                                    continue;
+                                }
+                                next.prefix_e_sum += prefix_e;
+                                const double relative_width =
+                                    (double) (width - seed.width) /
+                                    seed.width;
+                                next.width_variance +=
+                                    relative_width * relative_width;
+                                next.rank = prefix_e +
+                                    k_history_weight *
+                                        next.prefix_e_sum / (completed + 1) +
+                                    k_width_weight *
+                                        next.width_variance / (completed + 1);
+                                next.min_width = new_min;
+                                next.max_width = new_max;
+                                next.regions.emplace_back(
+                                    device::GPU, begin, begin + g);
+                                next.regions.emplace_back(
+                                    device::CPU,
+                                    begin + g, begin + g + c);
+                                next.regions.emplace_back(
+                                    device::PHONE,
+                                    begin + g + c, begin + width);
+                                expanded.push_back(std::move(next));
+                            }
+                        }
+                    }
+                }
+                std::sort(expanded.begin(), expanded.end(),
+                    [](const prefix_state & a,
+                       const prefix_state & b) {
+                        if (std::abs(a.rank - b.rank) > 1e-12) {
+                            return a.rank < b.rank;
+                        }
+                        return a.prefix_e_sum < b.prefix_e_sum;
+                    });
+                if (expanded.size() > k_prefix_beam_per_seed) {
+                    expanded.resize(k_prefix_beam_per_seed);
+                }
+                beam.swap(expanded);
+            }
+
+            for (const auto & state : beam) {
+                if (state.regions.size() !=
+                        (size_t) (3 * n_cycles) ||
+                        state.regions.back().layer_end != m.layers ||
+                        !llama_region_ring_apply_topology_compatible(
+                            state.regions, m.layers)) {
+                    continue;
+                }
+                ++out.prefix_completed;
+                candidate proposal;
+                proposal.cycles = n_cycles;
+                proposal.g = seed.g;
+                proposal.c = seed.c;
+                proposal.p = seed.p;
+                proposal.xc = chunks[seed.ci];
+                proposal.xg = chunks[seed.gi];
+                proposal.xp = chunks[seed.pi];
+                proposal.concrete_regions = state.regions;
+                if (!scored.insert(
+                        key_for(proposal, state.regions)).second) {
+                    continue;
+                }
+                ++out.enumerated;
+                if ((m.memory_feasible &&
+                        !m.memory_feasible(proposal)) ||
+                        (m.region_memory_feasible &&
+                         !m.region_memory_feasible(state.regions))) {
+                    ++out.rejected_memory;
+                    continue;
+                }
+                if (!estimate_region_ring_balance(
+                        m, state.regions, proposal)) {
+                    ++out.rejected_profile;
+                    continue;
+                }
+                ++out.profiled;
+                ++out.nonuniform_profiled;
+                // Do not reject a compensated layout just because its
+                // final E is a little worse than a uniform seed's E.
+                // The complete DAG simulator is the final authority.
+                std::string why;
+                if (!simulate(
+                        m, state.regions, proposal, &why)) {
+                    ++out.rejected_deadlock;
+                    continue;
+                }
+                ++out.simulated;
+                ++out.nonuniform_simulated;
+                ++out.shortlisted;
+                out.top.push_back(std::move(proposal));
+            }
         }
     }
 
