@@ -30,7 +30,8 @@ FIELDS = [
     "gpu_layers", "cpu_layers", "phone_layers", "tensor_layers",
     "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
     "n_predict", "gpu_weight_streaming", "predicted_ms", "baseline_predicted_ms",
-    "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
+    "selected_dag_sim_ms", "final_dag_sim_ms", "final_dag_source",
+    "dag_plan_tokens", "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
     "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
     "cpu_tasks", "gpu_tasks", "phone_tasks",
@@ -177,6 +178,21 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                          if (m := match_last(field + number, line))), 3)
     initial_mib = bank_sum(r"upload_mib=") if bank_summaries else None
     initial_ms = bank_sum(r"wall_ms=") if bank_summaries else None
+    # predicted_ms is the best candidate, which may NOT have been applied.
+    # Record both its DAG makespan and the DAG makespan of the actual plan.
+    selected_dag_sim_ms = plan.get("predicted_ms")
+    baseline_dag_sim_ms = plan.get("baseline_predicted_ms")
+    if plan.get("applied") is True:
+        final_dag_sim_ms = selected_dag_sim_ms
+        final_dag_source = "selected"
+    elif plan.get("applied") is False:
+        final_dag_sim_ms = baseline_dag_sim_ms
+        final_dag_source = "baseline"
+    else:
+        final_dag_sim_ms = None
+        final_dag_source = None
+    if final_dag_sim_ms is None:
+        final_dag_source = None
     row = {
         "prompt_file": prompt.name, "prompt_hint": hint,
         "actual_prefill_tokens": pre_n, "actual_decode_tokens": dec_n,
@@ -211,8 +227,12 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "context": context, "batch": args.batch, "ubatch": args.ubatch,
         "threads": args.threads, "seed": args.seed,
         "n_predict": args.n_predict, "gpu_weight_streaming": args.streaming,
-        "predicted_ms": plan.get("predicted_ms"),
-        "baseline_predicted_ms": plan.get("baseline_predicted_ms"),
+        "predicted_ms": selected_dag_sim_ms,
+        "baseline_predicted_ms": baseline_dag_sim_ms,
+        "selected_dag_sim_ms": selected_dag_sim_ms,
+        "final_dag_sim_ms": final_dag_sim_ms,
+        "final_dag_source": final_dag_source,
+        "dag_plan_tokens": plan.get("plan_tokens"),
         "first_cycle_e": plan.get("first_cycle_e"), "final_e": plan.get("e"),
         "first_cycle_seeds": plan.get("first_cycle_seeds"),
         "prefix_completed": plan.get("prefix_completed"),
@@ -387,7 +407,8 @@ def main():
             json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
         rows.append(row)
         print(f"{prompt.name}: {row['status']}, prefill={row['prefill_tps']} tok/s, "
-              f"decode={row['decode_tps']} tok/s")
+              f"decode={row['decode_tps']} tok/s, "
+              f"final_dag_sim_ms={row['final_dag_sim_ms']}")
     csv_file = out / "summary.csv"
     with csv_file.open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.DictWriter(stream, fieldnames=FIELDS)

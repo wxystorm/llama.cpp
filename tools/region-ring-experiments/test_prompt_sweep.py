@@ -28,6 +28,8 @@ class ExperimentReportTests(unittest.TestCase):
                 {"type": "planner", "applied": True, "selected_layout":
                  "G6,C2,P4,G6,C2,P4,G6,C2,P4,G6,C2,P4", "xc": 32, "xg": 64,
                  "xp": 128, "first_cycle_e": 0.3, "e": 0.2,
+                 "predicted_ms": 195.125, "baseline_predicted_ms": 220.5,
+                 "plan_tokens": 128,
                  "prefix_e": [0.3, 0.25, 0.22, 0.2],
                  "prefix_service_mspt": [[1, 2, 3], [2, 3, 4]]},
                 {"type": "region_ring", "tokens": 512, "complete": True,
@@ -64,6 +66,52 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["phone_layers"], 16)
             self.assertEqual(result["prefix_e_json"],
                              "[0.3, 0.25, 0.22, 0.2]")
+            self.assertEqual(result["selected_dag_sim_ms"], 195.125)
+            self.assertEqual(result["final_dag_sim_ms"], 195.125)
+            self.assertEqual(result["final_dag_source"], "selected")
+            self.assertEqual(result["dag_plan_tokens"], 128)
+            # Token count is a planning hint, not necessarily the true
+            # tokenizer count used by the official performance report.
+            self.assertEqual(result["actual_prefill_tokens"], 127)
+
+    def test_baseline_fallback_records_executed_dag_instead_of_best_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "prompt_64"
+            folder.mkdir()
+            prompt = root / "prompt_64.txt"
+            prompt.write_text("test", encoding="utf-8")
+            model = root / "model.gguf"
+            model.write_bytes(b"stub")
+            records = [
+                {"type": "planner", "applied": False, "selected_layout":
+                 "G6,C2,P4,G6,C2,P4,G6,C2,P4,G6,C2,P4",
+                 "baseline_layout": "G4,C4,P4,G4,C4,P4,G4,C4,P4,G4,C4,P4",
+                 "predicted_ms": 100.0, "baseline_predicted_ms": 120.0,
+                 "plan_tokens": 64},
+                {"type": "measurement_start", "schema": 1},
+                {"type": "region_ring", "tokens": 64, "complete": True,
+                 "status": 0, "wall_ms": 121.0,
+                 "layout": "G4,C4,P4,G4,C4,P4,G4,C4,P4,G4,C4,P4"},
+                {"type": "perf", "prefill_tokens": 64,
+                 "prefill_ms": 121.0, "decode_tokens": 8,
+                 "decode_ms": 100.0},
+            ]
+            (folder / "metrics.jsonl").write_text(
+                "\n".join(json.dumps(r) for r in records) + "\n",
+                encoding="utf-8")
+            args = SimpleNamespace(
+                model=model, planner="apply-wide", streaming="on",
+                batch=512, ubatch=512, threads=8, seed=1234, n_predict=32)
+            row = SWEEP.result_row(
+                args, folder, prompt, 64, 1024, 0, 1000, "deadbeef")
+            self.assertEqual(row["status"], "PASS")
+            self.assertEqual(row["selected_dag_sim_ms"], 100.0)
+            self.assertEqual(row["final_dag_sim_ms"], 120.0)
+            self.assertEqual(row["final_dag_source"], "baseline")
+            self.assertEqual(row["dag_plan_tokens"], 64)
+            self.assertEqual(row["runtime_layout"],
+                             "G4,C4,P4,G4,C4,P4,G4,C4,P4,G4,C4,P4")
 
     def test_activation_estimates_are_full_region_only(self):
         # 64 tokens x 2048 FP32 elements = 0.5 MiB per edge.
@@ -100,6 +148,9 @@ class ExperimentReportTests(unittest.TestCase):
             row = SWEEP.result_row(
                 args, folder, prompt, 64, 1024, 0, 1000, "deadbeef")
             self.assertEqual(row["status"], "NO_RING")
+            self.assertIsNone(row["selected_dag_sim_ms"])
+            self.assertIsNone(row["final_dag_sim_ms"])
+            self.assertIsNone(row["final_dag_source"])
 
     def test_filename_and_layer_parser(self):
         self.assertIsNotNone(SWEEP.NAME.fullmatch("prompt_358.txt"))

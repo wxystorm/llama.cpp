@@ -242,6 +242,28 @@ understand why a uniform base plan or Tensor-boundary refinement won.
 
 ## Results
 
+Each Prompt's completed report now saves the full-Prompt **DAG-predicted
+makespan in milliseconds**, alongside the official measured Prefill result,
+in both `result.json` and the run's `summary.csv`:
+
+- `selected_dag_sim_ms`: predicted DAG wall time of the Planner's best
+  candidate (the existing `predicted_ms` value).
+- `final_dag_sim_ms`: predicted DAG wall time for the layout actually chosen
+  for execution; uses `selected_dag_sim_ms` when `plan_applied=true`,
+  otherwise `baseline_predicted_ms` when `plan_applied=false`.
+- `final_dag_source`: `selected` or `baseline`, to make fallback visible.
+- `dag_plan_tokens`: token count the Planner simulated; this is a planning
+  input and can differ from `actual_prefill_tokens`.
+
+A missing or rejected Planner record leaves the new prediction fields blank;
+it never substitutes the measured Region Ring time as a DAG estimate. The
+terminal also prints `final_dag_sim_ms` on the existing one-line
+per-Prompt summary. These values are **estimated full-Prompt completion
+times**, not how long the simulator software took to execute, and not measured
+inference times. `prefill_ms` remains the official real measurement.
+No additional DAG runs, Profile probes, RPC traffic, or hot-path logging are
+introduced.
+
 ```text
 experiment-results/
   YYYYMMDD-HHMMSS-PID/
