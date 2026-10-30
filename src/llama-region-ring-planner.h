@@ -2080,6 +2080,311 @@ inline result search(
     return out;
 }
 
+// Refine complete, already simulated uniform/prefix plans using their
+// neighboring layer boundaries and Chunk choices. This is read-only:
+// no model execution, no additional device profiling, no live FIFO changes.
+// Keep only a small number of promising neighbors for full DAG simulation;
+// E remains diagnostic, never an eligibility threshold in this phase.
+inline void refine_runtime_local_candidates(
+        const model & m, result & out,
+        std::unordered_set<std::string> & scored) {
+    if (out.top.empty()) {
+        return;
+    }
+    constexpr int k_rounds = 2;
+    constexpr size_t k_simulated_per_round = 24;
+    const auto key_for = [&](const candidate & c) {
+        std::vector<llama_region_ring_region> rs;
+        if (!make_regions(c, m.layers, rs)) {
+            return std::string();
+        }
+        return llama_region_ring_layout_string(rs) + "/" +
+            std::to_string(c.xc) + "/" + std::to_string(c.xg) + "/" +
+            std::to_string(c.xp);
+    };
+    const auto shift_gpu_phone = [](
+            std::vector<llama_region_ring_region> & rs,
+            int cycle, int delta) {
+        const size_t g = (size_t) cycle * 3;
+        if (g + 2 >= rs.size()) {
+            return false;
+        }
+        const int gw = rs[g].layer_end - rs[g].layer_begin;
+        const int pw = rs[g + 2].layer_end - rs[g + 2].layer_begin;
+        if (gw + delta < 1 || pw - delta < 1) {
+            return false;
+        }
+        // Shift BOTH internal boundaries, leaving the CPU layer count fixed.
+        rs[g].layer_end += delta;
+        rs[g + 1].layer_begin += delta;
+        rs[g + 1].layer_end += delta;
+        rs[g + 2].layer_begin += delta;
+        return true;
+    };
+
+    for (int round = 0; round < k_rounds; ++round) {
+        std::vector<size_t> order(out.top.size());
+        for (size_t i = 0; i < order.size(); ++i) {
+            order[i] = i;
+        }
+        std::sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) {
+                return out.top[a].wall_ms < out.top[b].wall_ms;
+            });
+        double best_seen_ms = out.top[order.front()].wall_ms;
+
+        // Retain at least one competitive complete layout per Cycle count
+        // and per search origin. Also keep a few different Chunk triples.
+        std::vector<candidate> anchors;
+        std::unordered_set<std::string> anchor_keys;
+        std::array<std::array<bool, 3>, 5> covered {};
+        const auto family = [](const candidate & c) {
+            return c.local_refined ? 2 : (c.prefix_cycles > 0 ? 1 : 0);
+        };
+        const auto add_anchor = [&](const candidate & c) {
+            const std::string key = key_for(c);
+            if (!key.empty() && anchor_keys.insert(key).second) {
+                anchors.push_back(c);
+            }
+        };
+        for (size_t idx : order) {
+            const auto & c = out.top[idx];
+            if (c.cycles < 2 || c.cycles > 4 ||
+                    !std::isfinite(c.wall_ms)) {
+                continue;
+            }
+            const int f = family(c);
+            if (!covered[(size_t) c.cycles][(size_t) f]) {
+                covered[(size_t) c.cycles][(size_t) f] = true;
+                add_anchor(c);
+            }
+        }
+        std::unordered_set<std::string> covered_chunks;
+        for (const auto & c : anchors) {
+            covered_chunks.insert(std::to_string(c.xc) + "/" +
+                std::to_string(c.xg) + "/" + std::to_string(c.xp));
+        }
+        for (size_t idx : order) {
+            if (anchors.size() >= 12) {
+                break;
+            }
+            const auto & c = out.top[idx];
+            if (c.cycles < 2 || c.cycles > 4) {
+                continue;
+            }
+            const std::string chunk_key = std::to_string(c.xc) + "/" +
+                std::to_string(c.xg) + "/" + std::to_string(c.xp);
+            if (covered_chunks.insert(chunk_key).second) {
+                add_anchor(c);
+            }
+        }
+        out.local_anchors += anchors.size();
+
+        struct local_proposal {
+            candidate plan;
+            double proxy_ms = 0.0;
+            size_t anchor_id = 0;
+        };
+        std::vector<local_proposal> neighbors;
+        std::unordered_set<std::string> generated_keys;
+        const auto consider = [&](const candidate & from,
+                                  size_t anchor_id,
+                                  const std::vector<llama_region_ring_region> & rs,
+                                  int xc, int xg, int xp) {
+            if (xc <= 0 || xg <= 0 || xp <= 0 ||
+                    rs.empty() || rs.size() % 3 != 0 ||
+                    !llama_region_ring_apply_topology_compatible(
+                        rs, m.layers)) {
+                return;
+            }
+            candidate plan;
+            plan.concrete_regions = rs;
+            plan.cycles = (int) rs.size() / 3;
+            plan.g = rs[0].layer_end - rs[0].layer_begin;
+            plan.c = rs[1].layer_end - rs[1].layer_begin;
+            plan.p = rs[2].layer_end - rs[2].layer_begin;
+            plan.xc = xc;
+            plan.xg = xg;
+            plan.xp = xp;
+            plan.local_refined = true;
+            plan.local_from_prefix = from.local_refined ?
+                from.local_from_prefix : from.prefix_cycles > 0;
+            const std::string key = key_for(plan);
+            if (key.empty() || scored.count(key) ||
+                    !generated_keys.insert(key).second) {
+                return;
+            }
+            ++out.local_generated;
+            if (!gpu_prefix_memory_feasible(
+                    m, rs, plan.cycles, xg) ||
+                    (m.memory_feasible && !m.memory_feasible(plan)) ||
+                    (m.region_memory_feasible &&
+                     !m.region_memory_feasible(rs))) {
+                ++out.local_memory_rejected;
+                return;
+            }
+            if (!estimate_region_ring_balance(m, rs, plan)) {
+                ++out.local_profile_rejected;
+                return;
+            }
+            ++out.local_profiled;
+            // Absolute resource demand + a small fill cost. This heuristic
+            // ranks local finalists cheaply; the full simulator decides.
+            const double cycles = (double) plan.cycles;
+            const double tokens = (double) m.tokens;
+            const auto & w = plan.ring_stage_ms_per_token;
+            const double cpu_ms = tokens * cycles *
+                w[(size_t) device::CPU];
+            const double gpu_ms = tokens * cycles *
+                w[(size_t) device::GPU];
+            const double phone_ms = tokens * cycles *
+                w[(size_t) device::PHONE];
+            const double pc_ms = m.pc_compute_gate ?
+                cpu_ms + gpu_ms : std::max(cpu_ms, gpu_ms);
+            const double phone_link_ms = tokens *
+                (cycles * plan.ring_c2p_ms_per_token +
+                 (cycles - 1.0) * plan.ring_p2c_ms_per_token);
+            const double bottleneck_ms = std::max({
+                pc_ms, phone_ms, phone_link_ms, plan.weight_h2d_busy_ms
+            });
+            const double first_chunk_ms =
+                w[(size_t) device::CPU] * std::min(m.tokens, xc) +
+                w[(size_t) device::GPU] * std::min(m.tokens, xg) +
+                w[(size_t) device::PHONE] * std::min(m.tokens, xp);
+            const double proxy = bottleneck_ms + 0.15 * first_chunk_ms +
+                0.02 * plan.weight_h2d_busy_ms;
+            if (!std::isfinite(proxy)) {
+                ++out.local_profile_rejected;
+                return;
+            }
+            plan.coarse_ms = proxy;
+            neighbors.push_back({std::move(plan), proxy, anchor_id});
+        };
+
+        for (size_t ai = 0; ai < anchors.size(); ++ai) {
+            const auto & from = anchors[ai];
+            std::vector<llama_region_ring_region> rs;
+            if (!make_regions(from, m.layers, rs)) {
+                continue;
+            }
+            // Moving an adjacent boundary includes P(i)->G(i+1), which
+            // changes Cycle widths without altering the model's layer count.
+            for (size_t edge = 0; edge + 1 < rs.size(); ++edge) {
+                const int left = rs[edge].layer_end -
+                    rs[edge].layer_begin;
+                const int right = rs[edge + 1].layer_end -
+                    rs[edge + 1].layer_begin;
+                for (int delta : {-2, -1, 1, 2}) {
+                    if (left + delta < 1 || right - delta < 1) {
+                        continue;
+                    }
+                    auto moved = rs;
+                    moved[edge].layer_end += delta;
+                    moved[edge + 1].layer_begin += delta;
+                    consider(from, ai, moved,
+                        from.xc, from.xg, from.xp);
+                }
+            }
+            const int n_cycles = (int) rs.size() / 3;
+            for (int i = 0; i < n_cycles; ++i) {
+                for (int delta : {-2, -1, 1, 2}) {
+                    auto moved = rs;
+                    if (shift_gpu_phone(moved, i, delta)) {
+                        consider(from, ai, moved,
+                            from.xc, from.xg, from.xp);
+                    }
+                }
+                // Shift GPU/Phone work in opposite directions across two
+                // Cycles; useful for different per-Bank GPU weight peaks.
+                for (int j = i + 1; j < n_cycles; ++j) {
+                    for (int delta : {-1, 1}) {
+                        auto moved = rs;
+                        if (shift_gpu_phone(moved, i, delta) &&
+                                shift_gpu_phone(moved, j, -delta)) {
+                            consider(from, ai, moved,
+                                from.xc, from.xg, from.xp);
+                        }
+                    }
+                }
+            }
+            // Change one device Chunk size by one supported grid step.
+            for (int d = 0; d < 3; ++d) {
+                const int old_x = d == 0 ? from.xc :
+                    d == 1 ? from.xg : from.xp;
+                const auto it = std::find(
+                    first_cycle_chunk_candidates.begin(),
+                    first_cycle_chunk_candidates.end(), old_x);
+                if (it == first_cycle_chunk_candidates.end()) {
+                    continue;
+                }
+                const int pos = (int) (it -
+                    first_cycle_chunk_candidates.begin());
+                for (int step : {-1, 1}) {
+                    const int next = pos + step;
+                    if (next < 0 ||
+                            next >= (int) first_cycle_chunk_candidates.size()) {
+                        continue;
+                    }
+                    const int x = first_cycle_chunk_candidates[(size_t) next];
+                    consider(from, ai, rs,
+                        d == 0 ? x : from.xc,
+                        d == 1 ? x : from.xg,
+                        d == 2 ? x : from.xp);
+                }
+            }
+        }
+        if (neighbors.empty()) {
+            break;
+        }
+        std::sort(neighbors.begin(), neighbors.end(),
+            [](const local_proposal & a, const local_proposal & b) {
+                if (a.proxy_ms != b.proxy_ms) {
+                    return a.proxy_ms < b.proxy_ms;
+                }
+                return a.plan.ring_error_max < b.plan.ring_error_max;
+            });
+        std::vector<size_t> shortlist;
+        std::vector<bool> picked(neighbors.size(), false);
+        std::vector<bool> covered_anchor(anchors.size(), false);
+        // Preserve one neighbor from each anchor before filling the rest
+        // with the lowest absolute-work proxy score.
+        for (size_t i = 0; i < neighbors.size() &&
+                shortlist.size() < k_simulated_per_round; ++i) {
+            if (!covered_anchor[neighbors[i].anchor_id]) {
+                covered_anchor[neighbors[i].anchor_id] = true;
+                picked[i] = true;
+                shortlist.push_back(i);
+            }
+        }
+        for (size_t i = 0; i < neighbors.size() &&
+                shortlist.size() < k_simulated_per_round; ++i) {
+            if (!picked[i]) {
+                shortlist.push_back(i);
+            }
+        }
+        for (size_t idx : shortlist) {
+            candidate plan = std::move(neighbors[idx].plan);
+            const std::string key = key_for(plan);
+            if (key.empty() || !scored.insert(key).second) {
+                continue;
+            }
+            ++out.local_shortlisted;
+            std::string reason;
+            if (!simulate(m, plan.concrete_regions, plan, &reason)) {
+                ++out.rejected_deadlock;
+                continue;
+            }
+            if (plan.wall_ms + 0.05 < best_seen_ms) {
+                best_seen_ms = plan.wall_ms;
+                ++out.local_improved;
+            }
+            ++out.local_simulated;
+            ++out.simulated;
+            out.top.push_back(std::move(plan));
+        }
+    }
+}
+
 // Runtime-applicable wide search. Unlike WIDE_PREVIEW, every candidate
 // ends on Phone and has no tail, so the selected topology can be loaded and
 // executed by the current canonical final-output path. C/G/P and XC/XG/XP
