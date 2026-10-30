@@ -10,6 +10,7 @@ a separate normal (non-profiling) inference run.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -19,6 +20,7 @@ import sys
 
 from jupiter_planner import QProfile, _read_csv, sequence_missing_points
 from min_chunk_profile import partition_feasible, select_min_chunk
+from refine_sequence_q import build_resume_config
 from run_prefill_bench import PLAN_RE, build_cli, parse_timing, read_plan, run_one
 
 
@@ -96,6 +98,60 @@ def read_complete_plan(path: Path, total: int, pc_layers: int,
     if missing:
         raise ValueError(f"final plan contains unmeasured q(x,y) points: {missing}")
     return chunks
+
+
+def choose_refinement_workspace(
+    out: Path, expected_config: dict
+) -> tuple[Path, bool, str]:
+    """Preserve stale refinements; resume only matching calibration inputs.
+
+    The q sweep can regenerate a CSV at the same path with different timing
+    samples, which changes profile_sha256. A plain --resume must reject
+    that, but the orchestration layer can safely use a separate workspace
+    for the new calibration without deleting the old targeted samples.
+    """
+    base = out / "refinement"
+
+    def workspace_state(path: Path) -> str:
+        if not path.exists():
+            return "NEW"
+        if not path.is_dir():
+            raise ValueError(f"refinement workspace is not a directory: {path}")
+        state_file = path / "configuration.json"
+        if state_file.is_file():
+            try:
+                current = json.loads(state_file.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                raise ValueError(
+                    f"cannot read refinement configuration {state_file}: {exc}"
+                ) from exc
+            if current == expected_config:
+                return "RESUME"
+        if not any(path.iterdir()):
+            return "NEW"
+        return "CONFLICT"
+
+    state = workspace_state(base)
+    if state == "RESUME":
+        return base, True, "RESUME_MATCH"
+    if state == "NEW":
+        return base, False, "NEW"
+
+    fingerprint = hashlib.sha256(
+        json.dumps(expected_config, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")
+    ).hexdigest()[:12]
+    chosen = out / f"refinement-{fingerprint}"
+    state = workspace_state(chosen)
+    if state == "CONFLICT":
+        raise ValueError(
+            f"hash-specific refinement workspace also has incompatible data: "
+            f"{chosen}; use a different --out-dir"
+        )
+    return chosen, state == "RESUME", (
+        "ISOLATE_OLD_CONFIG_REUSE" if state == "RESUME"
+        else "ISOLATE_OLD_CONFIG_NEW"
+    )
 
 
 def checked(command: list[str]) -> int:
@@ -202,7 +258,6 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
     q_out = out / "q-sweep"
     initial = out / "initial-dp.plan"
-    refine_out = out / "refinement"
 
     old_b = int(summary["min_chunk"])
     if old_b != b:
@@ -230,8 +285,9 @@ def main() -> int:
         "--repeats", str(args.q_repeats), "--run-dp",
         "--plan-output", str(initial), "--out-dir", str(q_out),
     ]
-    if args.resume:
-        q_command.append("--resume")
+    # Existing q-sweep runs already validate the exact sequence plan before
+    # reuse. Keep measured q-profile bytes stable across Stage-3 restarts.
+    q_command.append("--resume")
     if checked(q_command):
         raise RuntimeError("initial q-sweep / Sequence DP failed")
 
@@ -239,6 +295,30 @@ def main() -> int:
     if len(profiles) != 1:
         raise ValueError(f"expected one q profile, found {len(profiles)} in {q_out}")
     q_profile = profiles[0]
+    prompt_text = Path(args.prompt_file).read_text(
+        encoding="utf-8-sig"
+    ).rstrip("\r\n")
+    refine_args = argparse.Namespace(
+        rpc=args.rpc,
+        metric="compute_ms", pc_layers=pc,
+        min_chunk=b, max_chunk=max_chunk,
+        max_subsequences=None, repeats=args.refine_repeats,
+        batch=args.batch, context=args.context,
+        threads=args.threads, extra_arg=[],
+    )
+    expected_config = build_resume_config(
+        refine_args,
+        Path(args.exe).resolve(), Path(args.model).resolve(),
+        prompt_text, q_profile.resolve(), total
+    )
+    refine_out, can_resume, workspace_action = choose_refinement_workspace(
+        out, expected_config
+    )
+    print(
+        f"[JUPITER_STAGE3_REFINEMENT_WORKSPACE] action={workspace_action} "
+        f"path={refine_out} reuse={int(can_resume)}",
+        flush=True,
+    )
     refine_command = [
         sys.executable, str(script_dir / "refine_sequence_q.py"), *common,
         "--profile", str(q_profile),
@@ -249,7 +329,7 @@ def main() -> int:
         "--metric", "compute_ms",
         "--out-dir", str(refine_out), "--plan-output", str(final_plan),
     ]
-    if args.resume:
+    if can_resume:
         refine_command.append("--resume")
     rc = checked(refine_command)
     if rc == 2:
@@ -278,6 +358,7 @@ def main() -> int:
         "initial_b_from_json": old_b,
         "chunks": chunks, "q_points": len(chunks),
         "q_profile": str(refine_out / "q-profile-refined.csv"),
+        "refinement_dir": str(refine_out),
         "plan": str(final_plan),
         "runtime_verification_ms": runtime_latency_ms,
         "note": "Calibration times are synchronized; verify-runtime is not a formal benchmark.",
