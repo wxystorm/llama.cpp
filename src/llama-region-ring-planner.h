@@ -2084,6 +2084,18 @@ inline result search(
     return out;
 }
 
+// Shared fine-Chunk grid for Prefix seeding and local X adjustments.
+static constexpr std::array<int, 17> first_cycle_chunk_candidates {
+    8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112,
+    128, 160, 192
+};
+
+inline bool first_cycle_chunk_supported(int x) {
+    return std::find(first_cycle_chunk_candidates.begin(),
+                     first_cycle_chunk_candidates.end(), x) !=
+           first_cycle_chunk_candidates.end();
+}
+
 // Refine complete, already simulated uniform/prefix plans using their
 // neighboring layer boundaries and Chunk choices. This is read-only:
 // no model execution, no additional device profiling, no live FIFO changes.
@@ -2394,6 +2406,43 @@ inline void refine_runtime_local_candidates(
     }
 }
 
+// Approximate the total resource demand of a completed (G,C,P)*N layout.
+// estimate_region_ring_balance() reports the mean per-Cycle service; unlike
+// the E mismatch, the throughput proxy must charge EVERY Cycle and boundary.
+// Used for Uniform candidates with non-divisible layer counts.
+inline bool estimate_complete_cycle_coarse_ms(
+        const model & m, candidate & plan) {
+    if (plan.cycles <= 0 || m.tokens <= 0) {
+        return false;
+    }
+    const double n = (double) plan.cycles;
+    const auto & w = plan.ring_stage_ms_per_token;
+    const double cpu_total = n * w[(size_t) device::CPU];
+    const double gpu_total = n * w[(size_t) device::GPU];
+    const double phone_total = n * w[(size_t) device::PHONE];
+    double gc_link = 0.0;
+    if (!region_ring_handoff_ms_per_token(
+            m, device::GPU, device::CPU,
+            plan.xg, plan.xc, gc_link)) {
+        return false;
+    }
+    const double phone_links =
+        n * plan.ring_c2p_ms_per_token +
+        (n - 1.0) * plan.ring_p2c_ms_per_token;
+    const double pc_local_links = n * gc_link;
+    const double pc_total = m.pc_compute_gate ?
+        cpu_total + gpu_total : std::max(cpu_total, gpu_total);
+    plan.service_ms_per_token = {cpu_total, gpu_total, phone_total};
+    plan.phone_link_ms_per_token = phone_links;
+    plan.pc_local_link_ms_per_token = pc_local_links;
+    plan.coarse_ms = std::max(
+        m.tokens * std::max({
+            pc_total, phone_total, phone_links, pc_local_links
+        }),
+        plan.weight_h2d_busy_ms);
+    return std::isfinite(plan.coarse_ms) && plan.coarse_ms >= 0.0;
+}
+
 // Runtime-applicable wide search. Unlike WIDE_PREVIEW, every candidate
 // ends on Phone and has no tail, so the selected topology can be loaded and
 // executed by the current canonical final-output path. C/G/P and XC/XG/XP
@@ -2401,17 +2450,6 @@ inline void refine_runtime_local_candidates(
 // The wider interpolated first-Cycle grid is deliberately separate from
 // the legacy 4-point uniform control search. Later prefix cycles do not
 // enumerate X again; every selected first-Cycle seed fixes XC/XG/XP.
-static constexpr std::array<int, 17> first_cycle_chunk_candidates {
-    8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112,
-    128, 160, 192
-};
-
-inline bool first_cycle_chunk_supported(int x) {
-    return std::find(first_cycle_chunk_candidates.begin(),
-                     first_cycle_chunk_candidates.end(), x) !=
-           first_cycle_chunk_candidates.end();
-}
-
 inline result search_runtime_applicable(
         const model & m,
         const std::vector<llama_region_ring_region> & baseline_regions,
@@ -2526,12 +2564,11 @@ inline result search_runtime_applicable(
                                     ++out.rejected_profile;
                                     continue;
                                 }
-                                if (remainder != 0) {
-                                    const auto & a =
-                                        plan.ring_stage_ms_per_token;
-                                    plan.coarse_ms = std::max(
-                                        m.tokens * std::max({a[0],a[1],a[2]}),
-                                        plan.weight_h2d_busy_ms);
+                                if (remainder != 0 &&
+                                        !estimate_complete_cycle_coarse_ms(
+                                            m, plan)) {
+                                    ++out.rejected_profile;
+                                    continue;
                                 }
                                 ++out.profiled;
                                 coarse.push_back(std::move(plan));
@@ -2654,9 +2691,12 @@ inline result search_runtime_applicable(
         }
     }
     for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
-        size_t chosen = 0;
+        size_t attempted = 0;
         std::unordered_set<std::string> chosen_chunks;
         for (size_t i : throughput_order) {
+            if (attempted >= 2) {
+                break;
+            }
             if (coarse[i].cycles != n_cycles) {
                 continue;
             }
@@ -2679,6 +2719,8 @@ inline result search_runtime_applicable(
             if (!make_regions(plan, m.layers, rs)) {
                 continue;
             }
+            // Failed DAG evaluations still consume the two-attempt budget.
+            ++attempted;
             ++out.throughput_shortlisted;
             ++out.shortlisted;
             if (!simulate(m, rs, plan)) {
@@ -2688,9 +2730,6 @@ inline result search_runtime_applicable(
             ++out.throughput_simulated;
             ++out.simulated;
             out.top.push_back(std::move(plan));
-            if (++chosen == 2) {
-                break;
-            }
         }
     }
 

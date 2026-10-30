@@ -338,6 +338,31 @@ int main() {
         REQUIRE(saw_throughput_origin);
     }
 
+    // An unsuccessful DAG attempt must still use a throughput-anchor slot.
+    // PREPARE is invoked only by simulate(), so every coarse candidate is
+    // profile-feasible while every actual DAG evaluation fails immediately.
+    {
+        model failed = mock_profile();
+        failed.layers = 16;
+        failed.tokens = 16;
+        failed.slot_pool = 0;
+        failed.prepare_ms =
+            [](device, int, int, int, double & ms) {
+                ms = 0.0;
+                return false;
+            };
+        const auto baseline = llama_region_ring_parse(
+            "G3,C3,P2,G3,C3,P2", 16);
+        const result attempts = search_runtime_applicable(
+            failed, baseline, 16, 1, 0.0, 0);
+        REQUIRE(!attempts.valid);
+        REQUIRE(attempts.throughput_shortlisted > 0);
+        REQUIRE(attempts.throughput_shortlisted <= 6);
+        REQUIRE(attempts.throughput_simulated == 0);
+        REQUIRE(attempts.rejected_deadlock >=
+                attempts.throughput_shortlisted);
+    }
+
     // APPLY_WIDE may allocate Phone stages of any positive depth.
     // Runtime validation must not silently reject the Planner's candidates.
     {
@@ -967,6 +992,43 @@ int main() {
             REQUIRE(floor_result.selected.ring_error_max <=
                     floor_result.shortlist_e_limit + 1e-12);
         }
+    }
+
+    // A 40-layer three-Cycle layout has unequal Cycle widths. Its
+    // throughput proxy must count total CPU/GPU/Phone work, plus every
+    // link, rather than only the average cost of one Cycle.
+    {
+        model uneven = mock_profile();
+        uneven.layers = 40;
+        uneven.tokens = 64;
+        uneven.slot_pool = 0;
+        candidate plan;
+        plan.cycles = 3;
+        plan.xc = 16;
+        plan.xg = 32;
+        plan.xp = 64;
+        plan.concrete_regions = llama_region_ring_parse(
+            "G5,C4,P4,G5,C4,P4,G6,C4,P4", 40);
+        REQUIRE(estimate_region_ring_balance(
+            uneven, plan.concrete_regions, plan));
+        REQUIRE(estimate_complete_cycle_coarse_ms(uneven, plan));
+        const auto & per = plan.ring_stage_ms_per_token;
+        for (size_t d = 0; d < 3; ++d) {
+            REQUIRE(std::fabs(
+                plan.service_ms_per_token[d] - 3.0 * per[d]) < 1e-9);
+        }
+        REQUIRE(std::fabs(
+            plan.phone_link_ms_per_token -
+            (3.0 * plan.ring_c2p_ms_per_token +
+             2.0 * plan.ring_p2c_ms_per_token)) < 1e-9);
+        REQUIRE(plan.coarse_ms + 1e-9 >=
+            uneven.tokens * std::max({
+                plan.service_ms_per_token[0],
+                plan.service_ms_per_token[1],
+                plan.service_ms_per_token[2],
+                plan.phone_link_ms_per_token,
+                plan.pc_local_link_ms_per_token
+            }));
     }
 
     // Unlike the old repeated-width APPLY_WIDE, 40 layers may form three
