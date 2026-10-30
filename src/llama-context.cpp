@@ -3965,6 +3965,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     size_t executed = 0;
     size_t next_device = 0;
     const int64_t begin_us = ggml_time_us();
+    int64_t experiment_wall_us = -1;
 
     // Optional per-ubatch Meta snapshot: one read before and one read after
     // the worker DAG, never in the hot Chunk loop. These are cumulative
@@ -5431,6 +5432,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 worker_states[0].compute_intervals, worker_states[2].compute_intervals) +
             llama_region_ring_interval_overlap_us(
                 worker_states[1].compute_intervals, worker_states[2].compute_intervals) : 0;
+        // Freeze the critical execution interval before any summary logging
+        // or experiment-file I/O. In particular, writing JSONL must not
+        // inflate the reported Region Ring prefill wall time.
+        experiment_wall_us = ggml_time_us() - begin_us;
         LLAMA_LOG_ERROR(
             "[REGION_RING_WORKERS_SUM] created=%zu joined=%zu "
             "bank_mover_created=%d bank_mover_joined=%d "
@@ -5502,7 +5507,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << "\"complete\":"
                             << (ready.all_done() ? "true" : "false") << ","
                             << "\"wall_ms\":"
-                            << (ggml_time_us() - begin_us) / 1000.0 << ","
+                            << experiment_wall_us / 1000.0 << ","
                             << "\"embedding_ms\":"
                             << ring_embedding_prelude_us / 1000.0 << ","
                             << "\"pc_phone_overlap_ms\":"
@@ -5776,7 +5781,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens, runtime_xc, runtime_xg, runtime_xp,
         stages.size(), ready.n_chunks(), ready.total_tasks(),
         executed, ready.all_done() ? 1 : 0,
-        (ggml_time_us() - begin_us) / 1000.0,
+        (experiment_wall_us >= 0 ?
+            experiment_wall_us : ggml_time_us() - begin_us) / 1000.0,
         ring_embedding_prelude_us / 1000.0,
         pc_phone_overlap ? "DEVICE_FIFO_PC_PHONE_OVERLAP" :
         audit_backend_resources ? "DEVICE_FIFO_BACKEND_AUDIT" :
