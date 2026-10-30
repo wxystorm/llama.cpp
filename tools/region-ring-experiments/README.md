@@ -138,6 +138,36 @@ ranking remains in use. No Chunk re-search occurs after selecting the
 first-Cycle seed. Final choices still come from the complete Prompt event
 simulation and optional Tensor boundary comparison.
 
+### Complete-layout local refinement (profile-only)
+
+After the original uniform and first-Cycle E/prefix paths have produced
+**complete, DAG-simulated** candidates, APPLY_WIDE takes the best contenders
+from both paths for a small **two-round neighborhood refinement**:
+
+- Move one or two layers across any adjacent Region boundary (including the
+  Phone-to-GPU boundary between Cycles).
+- Move one or two layers between GPU and Phone *within* a Cycle while keeping
+  that Cycle's CPU depth fixed, or compensate the shift across two Cycles.
+- Try the immediately adjacent grid value for XC, XG, or XP independently.
+
+Every proposed complete layout passes the same two-Bank GPU peak VRAM and
+full CPU/Phone/GPU memory checks first. The cached Profile is then used for a
+cheap **absolute resource-demand proxy** (not E-min), and each diverse starting
+point gets a chance in the shortlist. At most **24 candidates per round** enter
+the existing full-Prompt **data-only event simulator** (at most **48 additional**
+DAG evaluations). There is **no additional real-model inference, RPC benchmark
+or Profile collection**. Local improvements are accepted only when their
+simulated wall time beats existing candidates; Uniform/Prefix remain available.
+
+`metrics.jsonl` reports `source=local_uniform` or `local_prefix` if a
+locally refined candidate wins, plus `local_refined`, `local_from_prefix`,
+`local_anchors`, `local_generated`, `local_memory_rejected`,
+`local_profile_rejected`, `local_shortlisted`, `local_simulated`, and
+`local_improved`. The same counters appear in the single
+`REGION_RING_PLAN_SEARCH` log line. `planner-first-cycle-top100.csv` is
+unchanged: it still describes the original Prefix first-Cycle seeds, not
+the subsequent local search.
+
 The original four-point uniform repeated-Cycle search stays as a separate
 A/B control, including its historical 2..8 Phone-length sweep.
 The unrestricted Phone search applies to the new first-Cycle prefix path.
