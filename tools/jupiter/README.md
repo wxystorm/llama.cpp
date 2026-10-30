@@ -884,6 +884,17 @@ At the top of the output folder, the script writes:
   Prefill latency, tokens/s, and DP-versus-Default speedup
 - `suite-summary.json`: full experiment settings and status for every prompt
 
+Prompts with no legal `[b,max_chunk]` sequence are automatically
+recorded as `SKIPPED_INELIGIBLE`, with `actual_tokens` and `skip_reason`,
+then the suite proceeds to the next file. For example, a 26-token
+`alpaca.txt` cannot satisfy fixed `b=96`; this is a skipped input,
+not an RPC error. The final summary reports passed/skipped/failed
+separately. If every file is skipped, the suite returns nonzero and
+reports that no eligible prompts were found. Use prompts with multiple
+chunks (for fixed `b=96`, approximately 300+ tokens is a sensible
+experimental starting point) to study pipeline behavior. Do not lower
+`b` ad hoc for just one short prompt and then compare the mixed results.
+
 Only a fully measured and runtime-verified Stage-3 plan advances to the
 Prefill benchmark; benchmark runs use `PROFILE_STAGE=0`, `TRACE=0`,
 `async-c2p=0`, and no per-chunk communication timing. Each process is
