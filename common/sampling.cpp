@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <unordered_map>
 #include <vector>
 
@@ -524,6 +525,18 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
         LOG_INF("%s: unaccounted time = %10.2f ms / %5.1f %%      (total - sampling - prompt eval - eval) / (total)\n", __func__, t_unacc_ms, t_unacc_pc);
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+
+        // llama-completion ends with common_perf_print(), not with
+        // llama_perf_context_print(). Flush optional buffered Region Ring
+        // telemetry here, after inference, so the experiment gets both
+        // per-ubatch records and the official perf JSONL without hot-path I/O.
+        // The C API printer's informational lines are hidden by the sweep's
+        // -lv 1 setting; the existing common stats above remain unchanged.
+        if (const char * path = std::getenv("LLAMA_REGION_RING_METRICS_FILE")) {
+            if (*path != '\0') {
+                llama_perf_context_print(ctx);
+            }
+        }
 
         common_memory_breakdown_print(ctx);
     }
