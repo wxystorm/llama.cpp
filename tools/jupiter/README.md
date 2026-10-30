@@ -889,6 +889,14 @@ Prefill benchmark; benchmark runs use `PROFILE_STAGE=0`, `TRACE=0`,
 `async-c2p=0`, and no per-chunk communication timing. Each process is
 an independent sample, with rotating mode order and medians.
 
+For multi-prompt comparisons, the benchmark has a narrow opt-in
+`--timing-token-tolerance 1` to accommodate the known difference between
+the actual prefill batch token count and the CLI's timing token counter.
+Stage 5 enables it, preserves `tokens` as the actual planned prefill
+count, and writes the unmodified `timing_tokens` separately in each
+benchmark CSV. Differences greater than one token still fail. The
+standalone Stage-4 runner defaults to strict tolerance zero.
+
 The Sequence DP solver now automatically searches enough chunk counts
 for long prompts instead of capping at `4 * devices = 8`; each DP transition
 is restricted to valid chunk sizes and prefix lengths. Example: at
