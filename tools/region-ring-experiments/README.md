@@ -138,11 +138,17 @@ ranking remains in use. No Chunk re-search occurs after selecting the
 first-Cycle seed. Final choices still come from the complete Prompt event
 simulation and optional Tensor boundary comparison.
 
-### Complete-layout local refinement (profile-only)
+### Complete-layout multi-start and local refinement (profile-only)
 
-After the original uniform and first-Cycle E/prefix paths have produced
+The existing Uniform full-layout enumeration also retains **up to two
+low-absolute-work candidates per Cycle count (2/3/4)** outside the E window,
+after the same memory and Profile checks. The cheap `coarse_ms` service-demand
+proxy identifies these six additional data-only DAG candidates. This is
+important when E prefers balanced but absolutely slower stations.
+
+After the Uniform, throughput-guided and first-Cycle E/prefix paths have produced
 **complete, DAG-simulated** candidates, APPLY_WIDE takes the best contenders
-from both paths for a small **two-round neighborhood refinement**:
+from all three paths for a small **two-round neighborhood refinement**:
 
 - Move one or two layers across any adjacent Region boundary (including the
   Phone-to-GPU boundary between Cycles).
@@ -155,12 +161,16 @@ full CPU/Phone/GPU memory checks first. The cached Profile is then used for a
 cheap **absolute resource-demand proxy** (not E-min), and each diverse starting
 point gets a chance in the shortlist. At most **24 candidates per round** enter
 the existing full-Prompt **data-only event simulator** (at most **48 additional**
-DAG evaluations). There is **no additional real-model inference, RPC benchmark
+DAG evaluations), plus at most six global throughput anchor simulations.
+There is **no additional real-model inference, RPC benchmark
 or Profile collection**. Local improvements are accepted only when their
 simulated wall time beats existing candidates; Uniform/Prefix remain available.
 
-`metrics.jsonl` reports `source=local_uniform` or `local_prefix` if a
-locally refined candidate wins, plus `local_refined`, `local_from_prefix`,
+`metrics.jsonl` reports `source=uniform`, `prefix`, `throughput`,
+`local_uniform`, `local_prefix`, or `local_throughput` according to the
+winning candidate (or `tensor` if later boundary refinement wins). It also
+includes `throughput_shortlisted`, `throughput_simulated`,
+`local_refined`, `local_from_prefix`, `local_from_throughput`,
 `local_anchors`, `local_generated`, `local_memory_rejected`,
 `local_profile_rejected`, `local_shortlisted`, `local_simulated`, and
 `local_improved`. The same counters appear in the single
