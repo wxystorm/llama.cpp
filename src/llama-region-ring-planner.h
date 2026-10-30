@@ -1763,6 +1763,10 @@ struct first_cycle_seed_record {
     double best_predicted_ms = std::numeric_limits<double>::infinity();
     double best_final_e = std::numeric_limits<double>::infinity();
     double best_prefix_e = std::numeric_limits<double>::infinity();
+    long double best_bank0_peak_bytes = 0.0L;
+    long double best_bank1_peak_bytes = 0.0L;
+    long double best_gpu_kv_bytes = 0.0L;
+    long double best_gpu_total_bytes = 0.0L;
 };
 
 struct result {
@@ -2932,6 +2936,15 @@ inline result search_runtime_applicable(
                     proposal.prefix_error[(size_t) n_cycles - 1];
                 trace.best_layout =
                     llama_region_ring_layout_string(state.regions);
+                gpu_prefix_memory_bound full_gpu;
+                if (gpu_prefix_memory_feasible(
+                        m, state.regions, n_cycles,
+                        chunks[seed.gi], &full_gpu)) {
+                    trace.best_bank0_peak_bytes = full_gpu.bank0_bytes;
+                    trace.best_bank1_peak_bytes = full_gpu.bank1_bytes;
+                    trace.best_gpu_kv_bytes = full_gpu.gpu_kv_min_bytes;
+                    trace.best_gpu_total_bytes = full_gpu.total_min_bytes;
+                }
             }
             out.top.push_back(std::move(proposal));
         }
