@@ -604,6 +604,38 @@ int main() {
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
         REQUIRE(value_result.first_cycle_selected <= 100);
+        REQUIRE(value_result.first_cycle_selected ==
+                value_result.first_cycle_seeds.size());
+        size_t recorded_completed = 0;
+        size_t recorded_simulated = 0;
+        for (size_t i = 0; i < value_result.first_cycle_seeds.size(); ++i) {
+            const auto & seed = value_result.first_cycle_seeds[i];
+            REQUIRE(seed.selection_rank == i + 1);
+            REQUIRE(!seed.selection_reason.empty());
+            REQUIRE(seed.g > 0 && seed.c > 0 && seed.p > 0);
+            REQUIRE(seed.width == seed.g + seed.c + seed.p);
+            REQUIRE(first_cycle_chunk_supported(seed.xc));
+            REQUIRE(first_cycle_chunk_supported(seed.xg));
+            REQUIRE(first_cycle_chunk_supported(seed.xp));
+            REQUIRE(std::isfinite(seed.first_e));
+            REQUIRE(seed.completed ==
+                    seed.duplicates + seed.rejected_memory +
+                    seed.rejected_profile + seed.rejected_dag +
+                    seed.simulated);
+            recorded_completed += seed.completed;
+            recorded_simulated += seed.simulated;
+            if (seed.simulated > 0) {
+                REQUIRE(!seed.best_layout.empty());
+                REQUIRE(std::isfinite(seed.best_predicted_ms));
+                REQUIRE(std::isfinite(seed.best_final_e));
+                REQUIRE(std::isfinite(seed.best_prefix_e));
+            } else {
+                REQUIRE(seed.best_layout.empty());
+            }
+        }
+        REQUIRE(recorded_completed == value_result.prefix_completed);
+        REQUIRE(recorded_simulated ==
+                value_result.nonuniform_simulated);
         REQUIRE(value_result.prefix_expanded > 0);
         REQUIRE(value_result.prefix_completed > 0);
         REQUIRE(std::isfinite(value_result.first_cycle_e_min));
