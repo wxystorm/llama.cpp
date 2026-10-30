@@ -10001,7 +10001,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "shortlisted=%zu simulated=%zu "
             "nonuniform_profiled=%zu nonuniform_simulated=%zu "
             "first_cycle_profiled=%zu first_cycle_selected=%zu "
+            "gpu_first_pairs_pruned=%zu gpu_first_shapes_pruned=%zu "
             "prefix_expanded=%zu prefix_completed=%zu "
+            "prefix_gpu_pruned=%zu prefix_full_memory_pruned=%zu "
             "first_cycle_E_min=%.4f "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
@@ -10024,8 +10026,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.e_window_shortlisted, result.shortlisted,
             result.simulated, result.nonuniform_profiled,
             result.nonuniform_simulated, result.first_cycle_profiled,
-            result.first_cycle_selected, result.prefix_expanded,
-            result.prefix_completed, result.first_cycle_e_min,
+            result.first_cycle_selected,
+            result.first_cycle_gpu_pairs_pruned,
+            result.first_cycle_gpu_shapes_pruned,
+            result.prefix_expanded, result.prefix_completed,
+            result.prefix_gpu_memory_pruned,
+            result.prefix_full_memory_pruned, result.first_cycle_e_min,
             result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
@@ -10055,6 +10061,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                            "first_cycle_layers,XC,XG,XP,first_E,"
                            "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
                            "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
+                           "gpu_bank0_min_mib,gpu_bank1_min_mib,"
+                           "gpu_kv_min_mib,gpu_peak_min_mib,gpu_budget_mib,"
+                           "prefix_gpu_pruned,prefix_full_memory_pruned,"
                            "prefix_completed,duplicates,memory_rejected,"
                            "profile_rejected,dag_rejected,simulated,"
                            "best_prefix_layout,best_prefix_predicted_ms,"
@@ -10074,6 +10083,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << seed.first_handoff_mspt[0] << ","
                             << seed.first_handoff_mspt[1] << ","
                             << seed.first_handoff_mspt[2] << ","
+                            << (seed.gpu_bank0_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_bank1_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_kv_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_peak_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_budget_bytes / 1048576.0L) << ","
+                            << seed.gpu_prefix_pruned << ","
+                            << seed.memory_prebeam_rejected << ","
                             << seed.completed << ","
                             << seed.duplicates << ","
                             << seed.rejected_memory << ","
@@ -10543,6 +10559,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 best.prefix_error[0] : best.ring_error_max)
                             << ",\"first_cycle_seeds\":"
                             << result.first_cycle_selected
+                            << ",\"gpu_first_pairs_pruned\":"
+                            << result.first_cycle_gpu_pairs_pruned
+                            << ",\"gpu_first_shapes_pruned\":"
+                            << result.first_cycle_gpu_shapes_pruned
+                            << ",\"prefix_gpu_pruned\":"
+                            << result.prefix_gpu_memory_pruned
+                            << ",\"prefix_full_memory_pruned\":"
+                            << result.prefix_full_memory_pruned
+                            << ",\"gpu_memory_budget_mib\":"
+                            << (model.gpu_memory_budget_bytes / 1048576.0L)
                             << ",\"first_cycle_seed_csv\":\""
                             << (first_cycle_seed_csv_saved ?
                                 "planner-first-cycle-top100.csv" : "")
