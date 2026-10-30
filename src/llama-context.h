@@ -612,6 +612,10 @@ private:
     std::vector<std::string> region_ring_experiment_records;
     mutable size_t region_ring_experiment_records_written = 0;
 
+    // The official C API perf printer flushes these buffered records only
+    // after inference; grant that function access without exposing the fields.
+    friend void llama_perf_context_print(const llama_context * ctx);
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
