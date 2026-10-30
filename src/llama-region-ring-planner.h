@@ -2382,6 +2382,10 @@ inline result search_runtime_applicable(
             if (chosen_shapes.insert(shape).second) {
                 chosen.push_back(i);
                 chosen_indices.insert(i);
+                chosen_chunks.insert(
+                    std::to_string(v.ci) + "/" +
+                    std::to_string(v.gi) + "/" +
+                    std::to_string(v.pi));
             }
         }
         // First fill with different XC/XG/XP triples from the E window.
