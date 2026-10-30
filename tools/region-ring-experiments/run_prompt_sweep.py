@@ -107,7 +107,7 @@ def estimated_activation_payloads(ring_rows):
         return None
     for row in ring_rows:
         layout = str(row.get("layout", ""))
-        stages = re.findall(r"(C2P|P2C|G|C|P)(\\d+)", layout)
+        stages = re.findall(r"(C2P|P2C|G|C|P)(\d+)", layout)
         if any(kind in {"C2P", "P2C"} for kind, _ in stages):
             return None
         if not stages or len(stages) < 2:
