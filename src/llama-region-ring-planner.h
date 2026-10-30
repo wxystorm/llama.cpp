@@ -2380,6 +2380,7 @@ inline void refine_runtime_local_candidates(
             }
             ++out.local_simulated;
             ++out.simulated;
+            ++out.shortlisted;
             out.top.push_back(std::move(plan));
         }
     }
