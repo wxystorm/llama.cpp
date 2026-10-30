@@ -219,6 +219,107 @@ int main() {
         REQUIRE(rejected.nonuniform_simulated == 0);
     }
 
+    // Complete-layout local refinement must be allowed to improve a plan
+    // that the first-Cycle E shortlist never generated. No physical model
+    // run occurs: the same mock profile powers all DAG simulations.
+    {
+        model local = mock_profile();
+        local.layers = 12;
+        local.tokens = 64;
+        local.slot_pool = 0;
+        local.compute_ms =
+            [](device d, int layers, int tokens, int, double & ms) {
+                const double per =
+                    d == device::GPU ? 0.003 :
+                    d == device::CPU ? 0.02 : 0.18;
+                ms = 0.02 + per * layers * tokens;
+                return true;
+            };
+        local.transfer_ms =
+            [](device, device, size_t, double & ms) {
+                ms = 0.01;
+                return true;
+            };
+        candidate incumbent;
+        incumbent.cycles = 2;
+        incumbent.g = 3;
+        incumbent.c = 1;
+        incumbent.p = 2;
+        incumbent.xc = 16;
+        incumbent.xg = 16;
+        incumbent.xp = 32;
+        incumbent.concrete_regions = llama_region_ring_parse(
+            "G3,C1,P2,G3,C1,P2", 12);
+        REQUIRE(estimate_region_ring_balance(
+            local, incumbent.concrete_regions, incumbent));
+        REQUIRE(simulate(
+            local, incumbent.concrete_regions, incumbent));
+        const double original_ms = incumbent.wall_ms;
+        result nearby;
+        nearby.top.push_back(incumbent);
+        const auto start_key = llama_region_ring_layout_string(
+            incumbent.concrete_regions) + "/16/16/32";
+        std::unordered_set<std::string> seen {start_key};
+        refine_runtime_local_candidates(local, nearby, seen);
+        REQUIRE(nearby.local_anchors > 0);
+        REQUIRE(nearby.local_generated > 0);
+        REQUIRE(nearby.local_simulated > 0);
+        REQUIRE(nearby.local_shortlisted <= 48);
+        REQUIRE(nearby.local_improved > 0);
+        bool improved = false;
+        for (const auto & c : nearby.top) {
+            if (c.local_refined && c.wall_ms < original_ms - 0.05) {
+                improved = true;
+                REQUIRE(c.prefix_cycles == 0);
+                REQUIRE(!c.local_from_prefix);
+            }
+        }
+        REQUIRE(improved);
+
+        // The same neighborhood search must honor full per-region memory,
+        // even when the unconstrained proxy favors more GPU layers.
+        local.region_memory_feasible =
+            [](const std::vector<llama_region_ring_region> & rs) {
+                for (const auto & region : rs) {
+                    if (region.device == device::GPU &&
+                            region.layer_end - region.layer_begin > 3) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+        result bounded;
+        bounded.top.push_back(incumbent);
+        seen.clear();
+        seen.insert(start_key);
+        refine_runtime_local_candidates(local, bounded, seen);
+        REQUIRE(bounded.local_memory_rejected > 0);
+        REQUIRE(bounded.local_shortlisted <= 48);
+        for (const auto & c : bounded.top) {
+            REQUIRE(local.region_memory_feasible(c.concrete_regions));
+        }
+
+        // Prefix-origin neighbors preserve origin metadata, not stale
+        // prefix E measurements from an already modified full layout.
+        candidate prefix_incumbent = incumbent;
+        prefix_incumbent.prefix_cycles = 2;
+        result from_prefix;
+        from_prefix.top.push_back(prefix_incumbent);
+        seen.clear();
+        seen.insert(start_key);
+        local.region_memory_feasible = {};
+        refine_runtime_local_candidates(local, from_prefix, seen);
+        bool saw_prefix_origin = false;
+        for (const auto & c : from_prefix.top) {
+            if (c.local_refined) {
+                REQUIRE(c.local_from_prefix);
+                REQUIRE(c.prefix_cycles == 0);
+                saw_prefix_origin = true;
+            }
+        }
+        REQUIRE(saw_prefix_origin);
+    }
+
     // APPLY_WIDE may allocate Phone stages of any positive depth.
     // Runtime validation must not silently reject the Planner's candidates.
     {
@@ -888,19 +989,26 @@ int main() {
         REQUIRE(result.prefix_completed > 0);
         REQUIRE(result.nonuniform_simulated > 0);
         REQUIRE(!result.selected.concrete_regions.empty());
-        REQUIRE(result.selected.prefix_cycles >= 2);
-        REQUIRE(result.selected.prefix_cycles <= 4);
-        const int final_prefix =
-            result.selected.prefix_cycles - 1;
-        REQUIRE(std::fabs(
-            result.selected.prefix_error[(size_t) final_prefix] -
-            result.selected.ring_error_max) < 1e-8);
-        for (int i = 0; i <= final_prefix; ++i) {
-            REQUIRE(std::isfinite(
-                result.selected.prefix_error[(size_t) i]));
-            for (double w :
-                    result.selected.prefix_service[(size_t) i]) {
-                REQUIRE(std::isfinite(w) && w >= 0.0);
+        // A locally refined Prefix winner is valid too; its original
+        // per-Cycle E trajectory is intentionally not copied unchanged.
+        if (result.selected.local_refined) {
+            REQUIRE(result.selected.local_from_prefix);
+            REQUIRE(result.selected.prefix_cycles == 0);
+        } else {
+            REQUIRE(result.selected.prefix_cycles >= 2);
+            REQUIRE(result.selected.prefix_cycles <= 4);
+            const int final_prefix =
+                result.selected.prefix_cycles - 1;
+            REQUIRE(std::fabs(
+                result.selected.prefix_error[(size_t) final_prefix] -
+                result.selected.ring_error_max) < 1e-8);
+            for (int i = 0; i <= final_prefix; ++i) {
+                REQUIRE(std::isfinite(
+                    result.selected.prefix_error[(size_t) i]));
+                for (double w :
+                        result.selected.prefix_service[(size_t) i]) {
+                    REQUIRE(std::isfinite(w) && w >= 0.0);
+                }
             }
         }
         std::vector<llama_region_ring_region> regions;
@@ -916,8 +1024,12 @@ int main() {
         }
         const int cycles = (int) regions.size() / 3;
         const int average_high = (48 + cycles - 1) / cycles;
-        REQUIRE(max_width - min_width <=
-                std::max(2, (average_high + 3) / 4));
+        if (!result.selected.local_refined) {
+            // The prefix generator retains its original width bound;
+            // subsequent local boundary adjustment can move beyond it.
+            REQUIRE(max_width - min_width <=
+                    std::max(2, (average_high + 3) / 4));
+        }
     }
 
     // The manual A/B override uses the same candidate contract as
