@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <functional>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -5484,13 +5485,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (const char * metrics_path = std::getenv(
                 "LLAMA_REGION_RING_METRICS_FILE")) {
             if (*metrics_path != '\0') {
-                std::ofstream metrics(metrics_path, std::ios::app);
-                if (!metrics) {
-                    LLAMA_LOG_WARN(
-                        "[REGION_RING_METRICS] output=FAILED "
-                        "reason=OPEN_FILE\n");
-                } else {
-                    metrics << std::fixed << std::setprecision(3);
+                std::ostringstream metrics;
+                metrics << std::fixed << std::setprecision(3);
                     metrics << "{\"type\":\"region_ring\","
                             << "\"schema\":1,"
                             << "\"ubatch\":" << ubatch_id << ","
@@ -5600,7 +5596,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                                  b.return_payload_bytes) / 1048576.0;
                     }
                     metrics << "}\n";
-                }
+                region_ring_experiment_records.push_back(metrics.str());
             }
         }
         if (audit_backend_resources) {
@@ -10767,6 +10763,9 @@ void llama_context::perf_reset() {
         (void) region_ring_load_initial_gpu_banks();
     }
 
+    // Drop warmup records at each official timing reset.
+    region_ring_experiment_records.clear();
+    region_ring_experiment_records_written = 0;
     t_start_us  = ggml_time_us();
     t_eval_us   = n_eval = 0;
     t_p_eval_us = n_p_eval = 0;
@@ -11690,6 +11689,14 @@ void llama_perf_context_print(const llama_context * ctx) {
         if (*path != '\0') {
             std::ofstream out(path, std::ios::app);
             if (out) {
+                // Flush buffered records only after timed inference.
+                for (size_t i =
+                         ctx->region_ring_experiment_records_written;
+                     i < ctx->region_ring_experiment_records.size(); ++i) {
+                    out << ctx->region_ring_experiment_records[i];
+                }
+                ctx->region_ring_experiment_records_written =
+                    ctx->region_ring_experiment_records.size();
                 const double prompt_tps =
                     data.t_p_eval_ms > 0 && data.n_p_eval > 0 ?
                     1000.0 * data.n_p_eval / data.t_p_eval_ms : 0.0;
