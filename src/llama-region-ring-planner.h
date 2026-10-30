@@ -2811,6 +2811,43 @@ inline result search_runtime_applicable(
                             next.regions.emplace_back(
                                 device::PHONE,
                                 begin + g + c, begin + width);
+
+                            // Re-evaluate the two CUDA Bank maxima on every
+                            // prefix before E-ranking the next Beam.
+                            if (!gpu_prefix_memory_feasible(
+                                    m, next.regions, n_cycles,
+                                    chunks[seed.gi])) {
+                                ++out.prefix_gpu_memory_pruned;
+                                ++trace.gpu_prefix_pruned;
+                                continue;
+                            }
+
+                            // The terminal Cycle can be checked against the
+                            // exact CPU/Phone/GPU memory budget BEFORE a
+                            // low-E but impossible layout occupies the Beam.
+                            if (completed == n_cycles - 1 &&
+                                    (m.memory_feasible ||
+                                     m.region_memory_feasible)) {
+                                candidate full;
+                                full.cycles = n_cycles;
+                                full.g = seed.g;
+                                full.c = seed.c;
+                                full.p = seed.p;
+                                full.xc = chunks[seed.ci];
+                                full.xg = chunks[seed.gi];
+                                full.xp = chunks[seed.pi];
+                                full.concrete_regions = next.regions;
+                                if ((m.memory_feasible &&
+                                        !m.memory_feasible(full)) ||
+                                        (m.region_memory_feasible &&
+                                         !m.region_memory_feasible(
+                                             next.regions))) {
+                                    ++out.prefix_full_memory_pruned;
+                                    ++trace.memory_prebeam_rejected;
+                                    continue;
+                                }
+                            }
+
                             // Keep Beam memory bounded even when the
                             // Phone depth is unrestricted.
                             if (expanded.size() < k_prefix_beam_per_seed ||
