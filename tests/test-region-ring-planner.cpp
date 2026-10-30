@@ -54,6 +54,60 @@ static model mock_profile() {
 
 int main() {
     model m = mock_profile();
+
+    // First-cycle fine X candidates are available to deterministic A/B
+    // runs. A subsequent Cycle must keep this selected X triple unchanged.
+    REQUIRE(first_cycle_chunk_candidates.size() == 17);
+    for (int x : {8, 12, 20, 24, 40, 48, 56, 80, 96, 160, 192}) {
+        REQUIRE(first_cycle_chunk_supported(x));
+    }
+    for (int x : {7, 18, 36, 256}) {
+        REQUIRE(!first_cycle_chunk_supported(x));
+    }
+
+    // Handoff cost must match full-Prompt overlap-edge accounting, not
+    // simply cost(source_chunk)/source_chunk. Non-dividing X=40 -> X=24
+    // creates six intersections over 96 tokens (vs four for X=24 -> 24).
+    {
+        model handoff = mock_profile();
+        handoff.tokens = 96;
+        handoff.hidden = 1;
+        handoff.transfer_ms =
+            [](device, device, size_t bytes, double & ms) {
+                ms = 1.0 + (double) bytes / sizeof(float);
+                return true;
+            };
+        double misaligned = 0.0;
+        double aligned = 0.0;
+        REQUIRE(region_ring_handoff_ms_per_token(
+            handoff, device::GPU, device::CPU,
+            40, 24, misaligned));
+        REQUIRE(region_ring_handoff_ms_per_token(
+            handoff, device::GPU, device::CPU,
+            24, 24, aligned));
+        REQUIRE(std::fabs(misaligned - 102.0 / 96.0) < 1e-12);
+        REQUIRE(std::fabs(aligned - 100.0 / 96.0) < 1e-12);
+        REQUIRE(misaligned > aligned);
+
+        candidate fine;
+        fine.cycles = 4;
+        fine.g = 4;
+        fine.c = 4;
+        fine.p = 4;
+        fine.xg = 40;
+        fine.xc = 24;
+        fine.xp = 56;
+        std::vector<llama_region_ring_region> fine_regions;
+        REQUIRE(make_regions(fine, handoff.layers, fine_regions));
+        REQUIRE(estimate_region_ring_balance(
+            handoff, fine_regions, fine));
+        REQUIRE(std::fabs(fine.ring_error[1] -
+            relative_ring_mismatch(
+                fine.ring_stage_ms_per_token[0],
+                fine.ring_stage_ms_per_token[1] + misaligned)) < 1e-12);
+        REQUIRE(simulate(handoff, fine_regions, fine));
+        REQUIRE(fine.wall_ms > 0.0 && fine.tasks > 0);
+    }
     candidate uniform;
     uniform.cycles = 3;
     uniform.c = 7;
@@ -454,7 +508,7 @@ int main() {
         REQUIRE(value_result.shortlisted == value_result.simulated);
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
-        REQUIRE(value_result.first_cycle_selected <= 36);
+        REQUIRE(value_result.first_cycle_selected <= 72);
         REQUIRE(value_result.prefix_expanded > 0);
         REQUIRE(value_result.prefix_completed > 0);
         REQUIRE(std::isfinite(value_result.first_cycle_e_min));
