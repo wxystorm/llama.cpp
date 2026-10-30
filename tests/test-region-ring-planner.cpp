@@ -125,6 +125,37 @@ int main() {
             bank, first, 4, 16, &initial));
         REQUIRE(initial.scratch_bytes == 3072.0L);
         REQUIRE(initial.total_min_bytes == 3817.0L);
+
+        // A one-Cycle lower bound may fit even though every legal
+        // following Cycle MUST place a large layer into Bank 1.
+        // Such a seed must be rejected BEFORE E ranking, not after Beam.
+        model future = mock_profile();
+        future.layers = 32;
+        future.slot_pool = 0;
+        future.gpu_weight_streaming = true;
+        future.gpu_memory_budget_bytes = 800.0L;
+        future.gpu_kv_bytes_per_layer = 5.0L;
+        future.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = 0;
+                for (int layer = begin; layer < end; ++layer) {
+                    bytes += layer < 14 ? 100 : 500;
+                }
+                return true;
+            };
+        REQUIRE(gpu_prefix_memory_feasible(
+            future, first, 4, 16));
+        gpu_prefix_memory_bound min_complete;
+        REQUIRE(!gpu_minimum_complete_first_cycle_memory(
+            future, 6, 1, 1, 4, 6, 10, 2, min_complete));
+        future.gpu_memory_budget_bytes = 1300.0L;
+        REQUIRE(gpu_minimum_complete_first_cycle_memory(
+            future, 6, 1, 1, 4, 6, 10, 2, min_complete));
+        REQUIRE(min_complete.total_min_bytes >= 1145.0L);
+        REQUIRE(min_complete.total_min_bytes < 1300.0L);
     }
 
     // Search must measure E_min only over GPU-viable seed geometries.
@@ -170,6 +201,10 @@ int main() {
             REQUIRE(gpu_prefix_memory_feasible(
                 limited, prefix, seed.cycles, seed.xg));
             REQUIRE(seed.gpu_peak_min_bytes <= seed.gpu_budget_bytes);
+            REQUIRE(seed.gpu_full_possible_min_bytes <=
+                    seed.gpu_budget_bytes);
+            REQUIRE(seed.gpu_full_possible_min_bytes >=
+                    seed.gpu_peak_min_bytes);
             REQUIRE(seed.gpu_budget_bytes == 5000.0L);
         }
         limited.memory_feasible = [](const candidate & c) {
