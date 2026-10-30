@@ -2097,7 +2097,7 @@ inline result search_runtime_applicable(
         size_t ci = 0;
         size_t gi = 0;
         size_t pi = 0;
-        double first_e = 0.0;
+        double first_e = std::numeric_limits<double>::infinity();
         std::array<double, 3> load {};
         std::array<double, 3> links {};
     };
@@ -2133,66 +2133,221 @@ inline result search_runtime_applicable(
         const int width_high =
             std::min(avg_high + spread,
                      m.layers - (n_cycles - 1) * 4);
-        std::vector<first_cycle_seed> first_seeds;
+        struct first_geometry {
+            int width = 0;
+            int g = 0;
+            int c = 0;
+            int p = 0;
+        };
+        std::vector<first_geometry> geometries;
         for (int width = width_low; width <= width_high; ++width) {
             const int remaining = m.layers - width;
-            // Can the remaining Cycles have similar lengths to this one?
             const int min_other = std::max(
                 width_low, width - spread);
             const int max_other = std::min(
                 width_high, width + spread);
             if (remaining < (n_cycles - 1) * min_other ||
-                    remaining > (n_cycles - 1) * max_other) {
+                remaining > (n_cycles - 1) * max_other) {
                 continue;
             }
             for (int p = 2; p <= std::min(8, width - 2); ++p) {
                 for (int g = 1; g < width - p; ++g) {
-                    const int c = width - p - g;
-                    for (size_t ci = 0; ci < chunks.size(); ++ci) {
-                        for (size_t gi = 0; gi < chunks.size(); ++gi) {
-                            for (size_t pi = 0; pi < chunks.size(); ++pi) {
-                                first_cycle_seed seed;
-                                seed.cycles = n_cycles;
-                                seed.g = g;
-                                seed.c = c;
-                                seed.p = p;
-                                seed.width = width;
-                                seed.width_slack = spread;
-                                seed.ci = ci;
-                                seed.gi = gi;
-                                seed.pi = pi;
-                                seed.load = {
-                                    service[(size_t) device::CPU][ci][(size_t) c],
-                                    service[(size_t) device::GPU][gi][(size_t) g],
-                                    service[(size_t) device::PHONE][pi][(size_t) p]
-                                };
-                                seed.links = {pg[pi], gc[gi], cp[ci]};
-                                if (!std::all_of(
-                                        seed.load.begin(), seed.load.end(),
-                                        [](double v) {
-                                            return std::isfinite(v);
-                                        }) ||
-                                        !std::all_of(
-                                            seed.links.begin(), seed.links.end(),
-                                            [](double v) {
-                                                return std::isfinite(v) &&
-                                                       v >= 0.0;
-                                            })) {
-                                    continue;
-                                }
-                                seed.first_e = prefix_cycle_max_error(
-                                    seed.load, seed.links, 1);
-                                if (!std::isfinite(seed.first_e)) {
-                                    continue;
-                                }
-                                ++out.first_cycle_profiled;
-                                first_seeds.push_back(seed);
-                            }
+                    geometries.push_back(
+                        {width, g, width - p - g, p});
+                }
+            }
+        }
+        if (geometries.empty()) {
+            continue;
+        }
+
+        // A 4-point anchor search supplies a *safe* initial E cutoff:
+        // the dense grid contains every anchor, hence its minimum E cannot
+        // be greater than the anchor minimum. No seed in the final
+        // (E_min + margin) window can be pruned by this preliminary bound.
+        std::vector<size_t> anchors;
+        for (int x : {16, 32, 64, 128}) {
+            const auto it = std::find(
+                chunks.begin(), chunks.end(), x);
+            if (it != chunks.end() && x <= m.tokens) {
+                anchors.push_back((size_t) (it - chunks.begin()));
+            }
+        }
+        double anchor_min_e = invalid;
+        for (const auto & shape : geometries) {
+            for (size_t ci : anchors) {
+                const double A =
+                    service[(size_t) device::CPU][ci][(size_t) shape.c];
+                if (!std::isfinite(A)) { continue; }
+                for (size_t gi : anchors) {
+                    const double B =
+                        service[(size_t) device::GPU][gi][(size_t) shape.g];
+                    if (!std::isfinite(B)) { continue; }
+                    for (size_t pi : anchors) {
+                        const double D =
+                            service[(size_t) device::PHONE][pi][(size_t) shape.p];
+                        const std::array<double, 3> load {A, B, D};
+                        const std::array<double, 3> links {
+                            pg[pi][gi], gc[gi][ci], cp[ci][pi]
+                        };
+                        const double E =
+                            prefix_cycle_max_error(load, links, 1);
+                        if (std::isfinite(E)) {
+                            anchor_min_e = std::min(anchor_min_e, E);
                         }
                     }
                 }
             }
         }
+        const double initial_e_limit = std::isfinite(anchor_min_e) ?
+            std::min(1.0, anchor_min_e + e_margin) : 1.0;
+
+        // E1 couples XG/XP, E2 couples XC/XG, E3 couples XP/XC.
+        // Precompute E1/E3 bitsets and intersect them only after E2 passes.
+        // With 17 X choices this fits in one 64-bit word and avoids
+        // materializing thousands of doomed six-dimensional candidates.
+        static constexpr size_t k_best_chunks_per_shape = 3;
+        std::vector<std::vector<first_cycle_seed>> top_by_geometry(
+            geometries.size());
+        const size_t n_x = chunks.size();
+        std::vector<first_cycle_seed> best_by_chunk(
+            n_x * n_x * n_x);
+
+        for (size_t si = 0; si < geometries.size(); ++si) {
+            const auto & shape = geometries[si];
+            std::vector<uint64_t> e1_mask(n_x, 0);
+            std::vector<uint64_t> e3_mask(n_x, 0);
+
+            for (size_t gi = 0; gi < n_x; ++gi) {
+                const double B =
+                    service[(size_t) device::GPU][gi][(size_t) shape.g];
+                if (!std::isfinite(B)) { continue; }
+                for (size_t pi = 0; pi < n_x; ++pi) {
+                    const double D =
+                        service[(size_t) device::PHONE][pi][(size_t) shape.p];
+                    if (std::isfinite(D) && std::isfinite(pg[pi][gi]) &&
+                        relative_ring_mismatch(
+                            B, D + pg[pi][gi]) <= initial_e_limit) {
+                        e1_mask[gi] |= (uint64_t) 1 << pi;
+                    }
+                }
+            }
+            for (size_t ci = 0; ci < n_x; ++ci) {
+                const double A =
+                    service[(size_t) device::CPU][ci][(size_t) shape.c];
+                if (!std::isfinite(A)) { continue; }
+                for (size_t pi = 0; pi < n_x; ++pi) {
+                    const double D =
+                        service[(size_t) device::PHONE][pi][(size_t) shape.p];
+                    if (std::isfinite(D) && std::isfinite(cp[ci][pi]) &&
+                        relative_ring_mismatch(
+                            D, A + cp[ci][pi]) <= initial_e_limit) {
+                        e3_mask[ci] |= (uint64_t) 1 << pi;
+                    }
+                }
+            }
+
+            for (size_t ci = 0; ci < n_x; ++ci) {
+                const double A =
+                    service[(size_t) device::CPU][ci][(size_t) shape.c];
+                if (!std::isfinite(A) || e3_mask[ci] == 0) {
+                    continue;
+                }
+                for (size_t gi = 0; gi < n_x; ++gi) {
+                    const double B =
+                        service[(size_t) device::GPU][gi][(size_t) shape.g];
+                    if (!std::isfinite(B) || e1_mask[gi] == 0 ||
+                        !std::isfinite(gc[gi][ci])) {
+                        continue;
+                    }
+                    const double e2 = relative_ring_mismatch(
+                        A, B + gc[gi][ci]);
+                    if (e2 > initial_e_limit) {
+                        continue;
+                    }
+                    const uint64_t eligible =
+                        e1_mask[gi] & e3_mask[ci];
+                    if (!eligible) {
+                        continue;
+                    }
+
+                    for (size_t pi = 0; pi < n_x; ++pi) {
+                        if ((eligible & ((uint64_t) 1 << pi)) == 0) {
+                            continue;
+                        }
+                        const double D =
+                            service[(size_t) device::PHONE][pi][(size_t) shape.p];
+                        first_cycle_seed seed;
+                        seed.cycles = n_cycles;
+                        seed.g = shape.g;
+                        seed.c = shape.c;
+                        seed.p = shape.p;
+                        seed.width = shape.width;
+                        seed.width_slack = spread;
+                        seed.ci = ci;
+                        seed.gi = gi;
+                        seed.pi = pi;
+                        seed.load = {A, B, D};
+                        seed.links = {pg[pi][gi], gc[gi][ci], cp[ci][pi]};
+                        seed.first_e = prefix_cycle_max_error(
+                            seed.load, seed.links, 1);
+                        if (!std::isfinite(seed.first_e)) {
+                            continue;
+                        }
+                        ++out.first_cycle_profiled;
+                        auto & top = top_by_geometry[si];
+                        if (top.size() < k_best_chunks_per_shape ||
+                            seed.first_e < top.back().first_e) {
+                            top.push_back(seed);
+                            std::sort(
+                                top.begin(), top.end(),
+                                [](const first_cycle_seed & a,
+                                   const first_cycle_seed & b) {
+                                    return a.first_e < b.first_e;
+                                });
+                            if (top.size() > k_best_chunks_per_shape) {
+                                top.pop_back();
+                            }
+                        }
+                        const size_t xkey =
+                            (ci * n_x + gi) * n_x + pi;
+                        if (seed.first_e < best_by_chunk[xkey].first_e) {
+                            best_by_chunk[xkey] = seed;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Keep the best few Chunk triples for every geometry AND the best
+        // geometry for each Chunk triple. This preserves diversity without
+        // storing/sorting the entire 6-D search grid.
+        std::vector<first_cycle_seed> first_seeds;
+        std::unordered_set<std::string> seen_seed_keys;
+        const auto remember = [&](const first_cycle_seed & seed) {
+            if (!std::isfinite(seed.first_e)) {
+                return;
+            }
+            const std::string key =
+                std::to_string(seed.g) + "/" +
+                std::to_string(seed.c) + "/" +
+                std::to_string(seed.p) + "/" +
+                std::to_string(seed.ci) + "/" +
+                std::to_string(seed.gi) + "/" +
+                std::to_string(seed.pi);
+            if (seen_seed_keys.insert(key).second) {
+                first_seeds.push_back(seed);
+            }
+        };
+        for (const auto & top : top_by_geometry) {
+            for (const auto & seed : top) {
+                remember(seed);
+            }
+        }
+        for (const auto & seed : best_by_chunk) {
+            remember(seed);
+        }
+
         if (first_seeds.empty()) {
             continue;
         }
