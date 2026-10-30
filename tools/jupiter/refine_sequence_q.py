@@ -156,6 +156,36 @@ def get_parser() -> argparse.ArgumentParser:
     return p
 
 
+def build_resume_config(
+    args: argparse.Namespace,
+    exe: Path,
+    model: Path,
+    prompt_text: str,
+    source_profile: Path,
+    total: int,
+) -> dict:
+    """Fingerprint all inputs that make targeted q samples reusable.
+
+    Used by the Stage-3 wrapper as well as by this standalone refiner so
+    they cannot disagree about resume eligibility.
+    """
+    return {
+        "exe": str(exe), "exe_size": exe.stat().st_size,
+        "exe_mtime_ns": exe.stat().st_mtime_ns,
+        "model": str(model), "rpc": args.rpc,
+        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "profile": str(source_profile),
+        "profile_sha256": hashlib.sha256(source_profile.read_bytes()).hexdigest(),
+        "total": total, "metric": args.metric,
+        "pc_layers": args.pc_layers,
+        "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
+        "max_subsequences": args.max_subsequences,
+        "repeats": args.repeats,
+        "batch": args.batch, "context": args.context,
+        "threads": args.threads, "extra_arg": args.extra_arg,
+    }
+
+
 def main() -> int:
     args = get_parser().parse_args()
     if (
@@ -196,21 +226,9 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     merged_profile = out / "q-profile-refined.csv"
     state_file = out / "configuration.json"
-    config = {
-        "exe": str(exe), "exe_size": exe.stat().st_size,
-        "exe_mtime_ns": exe.stat().st_mtime_ns,
-        "model": str(model), "rpc": args.rpc,
-        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
-        "profile": str(source_profile),
-        "profile_sha256": hashlib.sha256(source_profile.read_bytes()).hexdigest(),
-        "total": total, "metric": args.metric,
-        "pc_layers": args.pc_layers,
-        "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
-        "max_subsequences": args.max_subsequences,
-        "repeats": args.repeats,
-        "batch": args.batch, "context": args.context,
-        "threads": args.threads, "extra_arg": args.extra_arg,
-    }
+    config = build_resume_config(
+        args, exe, model, prompt_text, source_profile, total
+    )
     if state_file.exists():
         if not args.resume:
             raise RuntimeError(
