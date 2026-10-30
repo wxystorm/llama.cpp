@@ -65,6 +65,125 @@ int main() {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
+    // GPU peak memory is a hard constraint BEFORE first-Cycle E. The
+    // streamed VRAM requirement is max(G0,G2) + max(G1,G3), not the
+    // sum of every GPU Cycle. Future cycles reserve one mandatory GPU
+    // layer at the known next start plus their minimum KV footprint.
+    {
+        model bank = mock_profile();
+        bank.layers = 32;
+        bank.slot_pool = 0;
+        bank.gpu_weight_streaming = true;
+        bank.gpu_memory_budget_bytes = 1425.0L;
+        bank.gpu_kv_bytes_per_layer = 5.0L;
+        bank.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = (size_t) (end - begin) * 100;
+                return true;
+            };
+        const std::vector<llama_region_ring_region> first {
+            {device::GPU, 0, 6}, {device::CPU, 6, 7},
+            {device::PHONE, 7, 8}
+        };
+        const auto all = llama_region_ring_parse(
+            "G6,C1,P1,G7,C1,P1,G5,C1,P1,G6,C1,P1", 32);
+        gpu_prefix_memory_bound initial, completed;
+        REQUIRE(gpu_prefix_memory_feasible(
+            bank, first, 4, 16, &initial));
+        REQUIRE(initial.bank0_bytes == 600.0L);
+        REQUIRE(initial.bank1_bytes == 100.0L);
+        REQUIRE(initial.gpu_kv_min_bytes == 45.0L);
+        REQUIRE(initial.total_min_bytes == 745.0L);
+        REQUIRE(gpu_prefix_memory_feasible(
+            bank, all, 4, 16, &completed));
+        REQUIRE(completed.bank0_bytes == 600.0L);
+        REQUIRE(completed.bank1_bytes == 700.0L);
+        REQUIRE(completed.gpu_kv_min_bytes == 120.0L);
+        REQUIRE(completed.total_min_bytes == 1420.0L);
+        bank.gpu_memory_budget_bytes = 1350.0L;
+        REQUIRE(gpu_prefix_memory_feasible(bank, first, 4, 16));
+        REQUIRE(!gpu_prefix_memory_feasible(bank, all, 4, 16));
+        bank.gpu_memory_budget_bytes = 700.0L;
+        REQUIRE(!gpu_prefix_memory_feasible(bank, first, 4, 16));
+
+        bank.gpu_weight_streaming = false;
+        bank.gpu_memory_budget_bytes = 2520.0L;
+        REQUIRE(gpu_prefix_memory_feasible(
+            bank, all, 4, 16, &completed));
+        REQUIRE(completed.total_min_bytes == 2520.0L);
+        bank.gpu_memory_budget_bytes = 2519.0L;
+        REQUIRE(!gpu_prefix_memory_feasible(bank, all, 4, 16));
+
+        bank.gpu_weight_streaming = true;
+        bank.slot_pool = 2;
+        bank.hidden = 8;
+        bank.gpu_memory_budget_bytes = 4000.0L;
+        REQUIRE(gpu_prefix_memory_feasible(
+            bank, first, 4, 16, &initial));
+        REQUIRE(initial.scratch_bytes == 3072.0L);
+        REQUIRE(initial.total_min_bytes == 3817.0L);
+    }
+
+    // Search must measure E_min only over GPU-viable seed geometries.
+    // Uniform control is unchanged, and terminal Beam states that fail
+    // CPU/Phone memory are removed before the Beam's top-8 truncation.
+    {
+        model limited = mock_profile();
+        limited.layers = 24;
+        limited.tokens = 64;
+        limited.slot_pool = 0;
+        limited.gpu_weight_streaming = true;
+        limited.gpu_memory_budget_bytes = 5000.0L;
+        limited.gpu_kv_bytes_per_layer = 10.0L;
+        limited.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = (size_t) (end - begin) * 1000;
+                return true;
+            };
+        limited.gpu_weight_h2d_ms =
+            [](size_t bytes, double & ms) {
+                ms = (double) bytes / 2000.0;
+                return true;
+            };
+        const auto base = llama_region_ring_parse(
+            "G2,C5,P5,G2,C5,P5", 24);
+        const auto selected = search_runtime_applicable(
+            limited, base, 64, 1, 0.08, 0);
+        REQUIRE(selected.first_cycle_gpu_pairs_pruned > 0);
+        REQUIRE(selected.first_cycle_gpu_shapes_pruned > 0);
+        REQUIRE(selected.first_cycle_selected > 0);
+        REQUIRE(selected.first_cycle_selected <= 100);
+        REQUIRE(selected.first_cycle_selected ==
+                selected.first_cycle_seeds.size());
+        for (const auto & seed : selected.first_cycle_seeds) {
+            const std::vector<llama_region_ring_region> prefix {
+                {device::GPU, 0, seed.g},
+                {device::CPU, seed.g, seed.g + seed.c},
+                {device::PHONE, seed.g + seed.c, seed.width}
+            };
+            REQUIRE(gpu_prefix_memory_feasible(
+                limited, prefix, seed.cycles, seed.xg));
+            REQUIRE(seed.gpu_peak_min_bytes <= seed.gpu_budget_bytes);
+            REQUIRE(seed.gpu_budget_bytes == 5000.0L);
+        }
+        limited.memory_feasible = [](const candidate & c) {
+            // Uniform controls remain feasible; every completed
+            // nonuniform candidate is intentionally impossible.
+            return c.concrete_regions.empty();
+        };
+        const auto rejected = search_runtime_applicable(
+            limited, base, 64, 1, 0.08, 0);
+        REQUIRE(rejected.first_cycle_selected > 0);
+        REQUIRE(rejected.prefix_full_memory_pruned > 0);
+        REQUIRE(rejected.nonuniform_simulated == 0);
+    }
+
     // APPLY_WIDE may allocate Phone stages of any positive depth.
     // Runtime validation must not silently reject the Planner's candidates.
     {
