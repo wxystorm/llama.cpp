@@ -2480,186 +2480,186 @@ inline result search_runtime_applicable(
         const int width_low = std::max(4, avg_low - spread);
         const int width_high =
             std::min(avg_high + spread, m.layers - (n_cycles - 1) * 4);
-            prefix_state initial;
-            initial.regions.emplace_back(
-                device::GPU, 0, seed.g);
-            initial.regions.emplace_back(
-                device::CPU, seed.g, seed.g + seed.c);
-            initial.regions.emplace_back(
-                device::PHONE, seed.g + seed.c, seed.width);
-            initial.load = seed.load;
-            initial.prefix_error[0] = seed.first_e;
-            initial.prefix_service[0] = seed.load;
-            initial.prefix_e_sum = seed.first_e;
-            initial.rank = seed.first_e;
-            initial.min_width = seed.width;
-            initial.max_width = seed.width;
-            std::vector<prefix_state> beam { std::move(initial) };
+        prefix_state initial;
+        initial.regions.emplace_back(
+            device::GPU, 0, seed.g);
+        initial.regions.emplace_back(
+            device::CPU, seed.g, seed.g + seed.c);
+        initial.regions.emplace_back(
+            device::PHONE, seed.g + seed.c, seed.width);
+        initial.load = seed.load;
+        initial.prefix_error[0] = seed.first_e;
+        initial.prefix_service[0] = seed.load;
+        initial.prefix_e_sum = seed.first_e;
+        initial.rank = seed.first_e;
+        initial.min_width = seed.width;
+        initial.max_width = seed.width;
+        std::vector<prefix_state> beam { std::move(initial) };
 
-            for (int completed = 1;
-                    completed < n_cycles && !beam.empty(); ++completed) {
-                std::vector<prefix_state> expanded;
-                for (const auto & state : beam) {
-                    const int begin = state.regions.back().layer_end;
-                    const int remain = m.layers - begin;
-                    const int later = n_cycles - completed - 1;
-                    const int next_min_width = std::max({
+        for (int completed = 1;
+                completed < n_cycles && !beam.empty(); ++completed) {
+            std::vector<prefix_state> expanded;
+            for (const auto & state : beam) {
+                const int begin = state.regions.back().layer_end;
+                const int remain = m.layers - begin;
+                const int later = n_cycles - completed - 1;
+                const int next_min_width = std::max({
+                    width_low,
+                    state.max_width - seed.width_slack
+                });
+                const int next_max_width = std::min({
+                    width_high,
+                    state.min_width + seed.width_slack
+                });
+                for (int width = next_min_width;
+                        width <= next_max_width; ++width) {
+                    const int rest = remain - width;
+                    if (rest < later * width_low ||
+                            rest > later * width_high ||
+                            (later == 0 && rest != 0)) {
+                        continue;
+                    }
+                    const int new_min =
+                        std::min(state.min_width, width);
+                    const int new_max =
+                        std::max(state.max_width, width);
+                    if (new_max - new_min > seed.width_slack) {
+                        continue;
+                    }
+                    const int later_min = std::max(
                         width_low,
-                        state.max_width - seed.width_slack
-                    });
-                    const int next_max_width = std::min({
+                        new_max - seed.width_slack);
+                    const int later_max = std::min(
                         width_high,
-                        state.min_width + seed.width_slack
-                    });
-                    for (int width = next_min_width;
-                            width <= next_max_width; ++width) {
-                        const int rest = remain - width;
-                        if (rest < later * width_low ||
-                                rest > later * width_high ||
-                                (later == 0 && rest != 0)) {
-                            continue;
-                        }
-                        const int new_min =
-                            std::min(state.min_width, width);
-                        const int new_max =
-                            std::max(state.max_width, width);
-                        if (new_max - new_min > seed.width_slack) {
-                            continue;
-                        }
-                        const int later_min = std::max(
-                            width_low,
-                            new_max - seed.width_slack);
-                        const int later_max = std::min(
-                            width_high,
-                            new_min + seed.width_slack);
-                        if (rest < later * later_min ||
-                                rest > later * later_max) {
-                            continue;
-                        }
+                        new_min + seed.width_slack);
+                    if (rest < later * later_min ||
+                            rest > later * later_max) {
+                        continue;
+                    }
 
-                        for (int p = 1; p <= width - 2; ++p) {
-                            for (int g = 1; g < width - p; ++g) {
-                                const int c = width - p - g;
-                                const std::array<double, 3> extra {{
-                                    service[(size_t) device::CPU][seed.ci][(size_t) c],
-                                    service[(size_t) device::GPU][seed.gi][(size_t) g],
-                                    service[(size_t) device::PHONE][seed.pi][(size_t) p]
-                                }};
-                                if (!std::isfinite(extra[0]) ||
-                                        !std::isfinite(extra[1]) ||
-                                        !std::isfinite(extra[2])) {
-                                    continue;
-                                }
-                                ++out.prefix_expanded;
-                                prefix_state next = state;
-                                for (size_t i = 0; i < 3; ++i) {
-                                    next.load[i] += extra[i];
-                                }
-                                const double prefix_e =
-                                    prefix_cycle_max_error(
-                                        next.load, seed.links,
-                                        completed + 1);
-                                if (!std::isfinite(prefix_e)) {
-                                    continue;
-                                }
-                                next.prefix_e_sum += prefix_e;
-                                next.prefix_error[(size_t) completed] =
-                                    prefix_e;
-                                next.prefix_service[(size_t) completed] =
-                                    next.load;
-                                const double relative_width =
-                                    (double) (width - seed.width) /
-                                    seed.width;
-                                next.width_variance +=
-                                    relative_width * relative_width;
-                                next.rank = prefix_e +
-                                    k_history_weight *
-                                        next.prefix_e_sum / (completed + 1) +
-                                    k_width_weight *
-                                        next.width_variance / (completed + 1);
-                                next.min_width = new_min;
-                                next.max_width = new_max;
-                                next.regions.emplace_back(
-                                    device::GPU, begin, begin + g);
-                                next.regions.emplace_back(
-                                    device::CPU,
-                                    begin + g, begin + g + c);
-                                next.regions.emplace_back(
-                                    device::PHONE,
-                                    begin + g + c, begin + width);
-                                // Keep Beam memory bounded even when the
-                                // Phone depth is unrestricted.
-                                if (expanded.size() < k_prefix_beam_per_seed ||
-                                        prefix_less(next, expanded.back())) {
-                                    const auto pos = std::lower_bound(
-                                        expanded.begin(), expanded.end(),
-                                        next, prefix_less);
-                                    expanded.insert(pos, std::move(next));
-                                    if (expanded.size() > k_prefix_beam_per_seed) {
-                                        expanded.pop_back();
-                                    }
+                    for (int p = 1; p <= width - 2; ++p) {
+                        for (int g = 1; g < width - p; ++g) {
+                            const int c = width - p - g;
+                            const std::array<double, 3> extra {{
+                                service[(size_t) device::CPU][seed.ci][(size_t) c],
+                                service[(size_t) device::GPU][seed.gi][(size_t) g],
+                                service[(size_t) device::PHONE][seed.pi][(size_t) p]
+                            }};
+                            if (!std::isfinite(extra[0]) ||
+                                    !std::isfinite(extra[1]) ||
+                                    !std::isfinite(extra[2])) {
+                                continue;
+                            }
+                            ++out.prefix_expanded;
+                            prefix_state next = state;
+                            for (size_t i = 0; i < 3; ++i) {
+                                next.load[i] += extra[i];
+                            }
+                            const double prefix_e =
+                                prefix_cycle_max_error(
+                                    next.load, seed.links,
+                                    completed + 1);
+                            if (!std::isfinite(prefix_e)) {
+                                continue;
+                            }
+                            next.prefix_e_sum += prefix_e;
+                            next.prefix_error[(size_t) completed] =
+                                prefix_e;
+                            next.prefix_service[(size_t) completed] =
+                                next.load;
+                            const double relative_width =
+                                (double) (width - seed.width) /
+                                seed.width;
+                            next.width_variance +=
+                                relative_width * relative_width;
+                            next.rank = prefix_e +
+                                k_history_weight *
+                                    next.prefix_e_sum / (completed + 1) +
+                                k_width_weight *
+                                    next.width_variance / (completed + 1);
+                            next.min_width = new_min;
+                            next.max_width = new_max;
+                            next.regions.emplace_back(
+                                device::GPU, begin, begin + g);
+                            next.regions.emplace_back(
+                                device::CPU,
+                                begin + g, begin + g + c);
+                            next.regions.emplace_back(
+                                device::PHONE,
+                                begin + g + c, begin + width);
+                            // Keep Beam memory bounded even when the
+                            // Phone depth is unrestricted.
+                            if (expanded.size() < k_prefix_beam_per_seed ||
+                                    prefix_less(next, expanded.back())) {
+                                const auto pos = std::lower_bound(
+                                    expanded.begin(), expanded.end(),
+                                    next, prefix_less);
+                                expanded.insert(pos, std::move(next));
+                                if (expanded.size() > k_prefix_beam_per_seed) {
+                                    expanded.pop_back();
                                 }
                             }
                         }
                     }
                 }
-                beam.swap(expanded);
             }
+            beam.swap(expanded);
+        }
 
-            for (const auto & state : beam) {
-                if (state.regions.size() !=
-                        (size_t) (3 * n_cycles) ||
-                        state.regions.back().layer_end != m.layers ||
-                        !llama_region_ring_apply_topology_compatible(
-                            state.regions, m.layers)) {
-                    continue;
-                }
-                ++out.prefix_completed;
-                candidate proposal;
-                proposal.cycles = n_cycles;
-                proposal.g = seed.g;
-                proposal.c = seed.c;
-                proposal.p = seed.p;
-                proposal.xc = chunks[seed.ci];
-                proposal.xg = chunks[seed.gi];
-                proposal.xp = chunks[seed.pi];
-                proposal.concrete_regions = state.regions;
-                proposal.prefix_cycles = n_cycles;
-                proposal.prefix_error = state.prefix_error;
-                proposal.prefix_service = state.prefix_service;
-                if (!scored.insert(
-                        key_for(proposal, state.regions)).second) {
-                    continue;
-                }
-                ++out.enumerated;
-                if ((m.memory_feasible &&
-                        !m.memory_feasible(proposal)) ||
-                        (m.region_memory_feasible &&
-                         !m.region_memory_feasible(state.regions))) {
-                    ++out.rejected_memory;
-                    continue;
-                }
-                if (!estimate_region_ring_balance(
-                        m, state.regions, proposal)) {
-                    ++out.rejected_profile;
-                    continue;
-                }
-                ++out.profiled;
-                ++out.nonuniform_profiled;
-                // Do not reject a compensated layout just because its
-                // final E is a little worse than a uniform seed's E.
-                // The complete DAG simulator is the final authority.
-                std::string why;
-                if (!simulate(
-                        m, state.regions, proposal, &why)) {
-                    ++out.rejected_deadlock;
-                    continue;
-                }
-                ++out.simulated;
-                ++out.nonuniform_simulated;
-                ++out.shortlisted;
-                out.top.push_back(std::move(proposal));
+        for (const auto & state : beam) {
+            if (state.regions.size() !=
+                    (size_t) (3 * n_cycles) ||
+                    state.regions.back().layer_end != m.layers ||
+                    !llama_region_ring_apply_topology_compatible(
+                        state.regions, m.layers)) {
+                continue;
             }
+            ++out.prefix_completed;
+            candidate proposal;
+            proposal.cycles = n_cycles;
+            proposal.g = seed.g;
+            proposal.c = seed.c;
+            proposal.p = seed.p;
+            proposal.xc = chunks[seed.ci];
+            proposal.xg = chunks[seed.gi];
+            proposal.xp = chunks[seed.pi];
+            proposal.concrete_regions = state.regions;
+            proposal.prefix_cycles = n_cycles;
+            proposal.prefix_error = state.prefix_error;
+            proposal.prefix_service = state.prefix_service;
+            if (!scored.insert(
+                    key_for(proposal, state.regions)).second) {
+                continue;
+            }
+            ++out.enumerated;
+            if ((m.memory_feasible &&
+                    !m.memory_feasible(proposal)) ||
+                    (m.region_memory_feasible &&
+                     !m.region_memory_feasible(state.regions))) {
+                ++out.rejected_memory;
+                continue;
+            }
+            if (!estimate_region_ring_balance(
+                    m, state.regions, proposal)) {
+                ++out.rejected_profile;
+                continue;
+            }
+            ++out.profiled;
+            ++out.nonuniform_profiled;
+            // Do not reject a compensated layout just because its
+            // final E is a little worse than a uniform seed's E.
+            // The complete DAG simulator is the final authority.
+            std::string why;
+            if (!simulate(
+                    m, state.regions, proposal, &why)) {
+                ++out.rejected_deadlock;
+                continue;
+            }
+            ++out.simulated;
+            ++out.nonuniform_simulated;
+            ++out.shortlisted;
+            out.top.push_back(std::move(proposal));
+        }
         }
 
     std::sort(out.top.begin(), out.top.end(), wall_less);
