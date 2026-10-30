@@ -2159,7 +2159,8 @@ inline result search_runtime_applicable(
     };
     const auto prefix_less = [](const prefix_state & a,
                                 const prefix_state & b) {
-        if (std::abs(a.rank - b.rank) > 1e-12) {
+        // lower_bound requires a strict ordering for the bounded Beam.
+        if (a.rank != b.rank) {
             return a.rank < b.rank;
         }
         return a.prefix_e_sum < b.prefix_e_sum;
