@@ -9661,6 +9661,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 };
         }
 
+        // Identical GPU accounting to the full-layout memory guard:
+        // two-Bank peak weights + full-Prompt GPU KV + optional slot scratch.
+        // The Planner applies this budget to E seeds and every Beam prefix.
+        model.gpu_memory_budget_bytes =
+            profile.gpu_free_mem == 0 ? 0.0L :
+            (long double) profile.gpu_free_mem * 0.90L;
+        model.gpu_kv_bytes_per_layer =
+            (long double) profile.kv_bytes_per_token_per_layer *
+            (model.kv_start + model.tokens);
+
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes](
                     const llama_ring_planner::candidate & candidate) -> bool {
