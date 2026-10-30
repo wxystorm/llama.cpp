@@ -174,6 +174,19 @@ The CSV records **each of the at most 100 selected first-Cycle seeds**
   `best_prefix_final_E`, `best_prefix_E`: the best fully simulated
   continuation **before** optional Tensor-boundary refinement. These are
   blank if the seed had no successfully simulated continuation.
+- `best_gpu_bank0_peak_mib`, `best_gpu_bank1_peak_mib`,
+  `best_gpu_kv_mib`, `best_gpu_total_mib`: **actual full-layout** peak
+  GPU Bank requirements for this seed's best simulated continuation.
+  Unlike first-Cycle lower bounds, these include every selected Cycle.
+  Blank when no successful continuation or no VRAM budget was measured.
+
+The Planner JSONL record also reports `gpu_first_pairs_pruned`,
+`gpu_first_shapes_pruned`, `prefix_gpu_pruned`,
+`prefix_full_memory_pruned`, and `gpu_memory_budget_mib`. The old
+`memory_rejected` column is now only for full plans that unexpectedly
+fail a final repeat memory check; most memory exclusions happen earlier.
+`prefix_completed` may be **less than 8 × first_cycle_seeds** because
+memory-infeasible continuations no longer occupy the Beam.
 
 The CSV rows are *not* the 100 best full-Prompt layouts: they are the 100
 first-Cycle seeds chosen before prefix compensation. Compare
