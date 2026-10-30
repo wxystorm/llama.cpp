@@ -3415,6 +3415,10 @@ inline result search_runtime_applicable(
         }
         }
 
+    // Compare the best Uniform/Prefix incumbents against complete-layout
+    // neighbors before choosing the final one. Only profile-backed event
+    // simulations are added; no real inference or Profile acquisition.
+    refine_runtime_local_candidates(m, out, scored);
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();
