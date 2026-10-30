@@ -6927,7 +6927,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
         const char * plan_mode = model.hybrid_ring_plan_mode.empty() ?
             "APPLY_SAFE" : model.hybrid_ring_plan_mode.c_str();
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_APPLY] mode=%s "
             "phase=RUNTIME_STAGES applied=1 "
             "layout=%s XC=%d XG=%d XP=%d "
@@ -6938,7 +6938,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             LLAMA_REGION_RING_SLOT_POOL_SIZE);
     }
     if (region_ring_v1) {
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN] regions=%zu XC=%d XG=%d XP=%d "
             "execution=%s status=READY\n",
             runtime_stages.size(),
