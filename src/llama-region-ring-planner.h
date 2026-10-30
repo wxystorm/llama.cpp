@@ -1619,6 +1619,34 @@ inline bool estimate_balance(const model & m, candidate & c) {
            std::isfinite(c.balance);
 }
 
+// Each selected first-Cycle seed is preserved for one-shot experiment
+// diagnostics; only its best completed/simulated continuation is retained.
+struct first_cycle_seed_record {
+    size_t selection_rank = 0;
+    std::string selection_reason;
+    int cycles = 0;
+    int g = 0;
+    int c = 0;
+    int p = 0;
+    int width = 0;
+    int xc = 0;
+    int xg = 0;
+    int xp = 0;
+    double first_e = std::numeric_limits<double>::infinity();
+    std::array<double, 3> first_service_mspt {};
+    std::array<double, 3> first_handoff_mspt {};
+    size_t completed = 0;
+    size_t duplicates = 0;
+    size_t rejected_memory = 0;
+    size_t rejected_profile = 0;
+    size_t rejected_dag = 0;
+    size_t simulated = 0;
+    std::string best_layout;
+    double best_predicted_ms = std::numeric_limits<double>::infinity();
+    double best_final_e = std::numeric_limits<double>::infinity();
+    double best_prefix_e = std::numeric_limits<double>::infinity();
+};
+
 struct result {
     bool valid = false;
     candidate selected;
@@ -1636,6 +1664,7 @@ struct result {
     size_t nonuniform_simulated = 0;
     size_t first_cycle_profiled = 0;
     size_t first_cycle_selected = 0;
+    std::vector<first_cycle_seed_record> first_cycle_seeds;
     size_t prefix_expanded = 0;
     size_t prefix_completed = 0;
     double first_cycle_e_min = std::numeric_limits<double>::infinity();
@@ -2407,6 +2436,7 @@ inline result search_runtime_applicable(
     std::sort(all_first_cycle_seeds.begin(),
               all_first_cycle_seeds.end(), first_seed_less);
     std::vector<size_t> chosen;
+    std::vector<const char *> chosen_reasons;
     std::unordered_set<size_t> chosen_indices;
     std::unordered_set<std::string> chosen_shapes;
     std::unordered_set<std::string> chosen_chunks;
@@ -2420,12 +2450,13 @@ inline result search_runtime_applicable(
         return std::to_string(v.ci) + "/" +
                std::to_string(v.gi) + "/" + std::to_string(v.pi);
     };
-    const auto choose = [&](size_t i) {
+    const auto choose = [&](size_t i, const char * reason) {
         if (chosen.size() >= k_first_seeds_total ||
                 !chosen_indices.insert(i).second) {
             return;
         }
         chosen.push_back(i);
+        chosen_reasons.push_back(reason);
         const auto & v = all_first_cycle_seeds[i];
         if (chosen_shapes.insert(shape_key(v)).second) {
             ++distinct_shapes_per_cycle[(size_t) v.cycles];
@@ -2438,7 +2469,7 @@ inline result search_runtime_applicable(
     for (int n = 2; n <= 4; ++n) {
         for (size_t i = 0; i < all_first_cycle_seeds.size(); ++i) {
             if (all_first_cycle_seeds[i].cycles == n) {
-                choose(i);
+                choose(i, "CYCLE_BEST_E");
                 break;
             }
         }
@@ -2452,7 +2483,7 @@ inline result search_runtime_applicable(
             if (v.cycles == n &&
                     chosen_shapes.find(shape_key(v)) ==
                         chosen_shapes.end()) {
-                choose(i);
+                choose(i, "GEOMETRY_DIVERSITY");
             }
         }
     }
@@ -2462,18 +2493,33 @@ inline result search_runtime_applicable(
             additional_chunk_shapes < k_seed_chunk_diversity; ++i) {
         if (chosen_chunks.find(chunk_key(all_first_cycle_seeds[i])) ==
                 chosen_chunks.end()) {
-            choose(i);
+            choose(i, "CHUNK_DIVERSITY");
             ++additional_chunk_shapes;
         }
     }
     for (size_t i = 0; i < all_first_cycle_seeds.size() &&
             chosen.size() < k_first_seeds_total; ++i) {
-        choose(i);
+        choose(i, "LOW_E_FILL");
     }
     out.first_cycle_selected = chosen.size();
+    out.first_cycle_seeds.reserve(chosen.size());
 
-    for (size_t si : chosen) {
-        const auto & seed = all_first_cycle_seeds[si];
+    for (size_t selected_i = 0; selected_i < chosen.size(); ++selected_i) {
+        const auto & seed = all_first_cycle_seeds[chosen[selected_i]];
+        auto & trace = out.first_cycle_seeds.emplace_back();
+        trace.selection_rank = selected_i + 1;
+        trace.selection_reason = chosen_reasons[selected_i];
+        trace.cycles = seed.cycles;
+        trace.g = seed.g;
+        trace.c = seed.c;
+        trace.p = seed.p;
+        trace.width = seed.width;
+        trace.xc = chunks[seed.ci];
+        trace.xg = chunks[seed.gi];
+        trace.xp = chunks[seed.pi];
+        trace.first_e = seed.first_e;
+        trace.first_service_mspt = seed.load;
+        trace.first_handoff_mspt = seed.links;
         const int n_cycles = seed.cycles;
         const int avg_low = m.layers / n_cycles;
         const int avg_high = (m.layers + n_cycles - 1) / n_cycles;
@@ -2616,6 +2662,7 @@ inline result search_runtime_applicable(
                 continue;
             }
             ++out.prefix_completed;
+            ++trace.completed;
             candidate proposal;
             proposal.cycles = n_cycles;
             proposal.g = seed.g;
@@ -2630,6 +2677,7 @@ inline result search_runtime_applicable(
             proposal.prefix_service = state.prefix_service;
             if (!scored.insert(
                     key_for(proposal, state.regions)).second) {
+                ++trace.duplicates;
                 continue;
             }
             ++out.enumerated;
@@ -2638,11 +2686,13 @@ inline result search_runtime_applicable(
                     (m.region_memory_feasible &&
                      !m.region_memory_feasible(state.regions))) {
                 ++out.rejected_memory;
+                ++trace.rejected_memory;
                 continue;
             }
             if (!estimate_region_ring_balance(
                     m, state.regions, proposal)) {
                 ++out.rejected_profile;
+                ++trace.rejected_profile;
                 continue;
             }
             ++out.profiled;
@@ -2654,11 +2704,21 @@ inline result search_runtime_applicable(
             if (!simulate(
                     m, state.regions, proposal, &why)) {
                 ++out.rejected_deadlock;
+                ++trace.rejected_dag;
                 continue;
             }
             ++out.simulated;
             ++out.nonuniform_simulated;
             ++out.shortlisted;
+            ++trace.simulated;
+            if (proposal.wall_ms < trace.best_predicted_ms) {
+                trace.best_predicted_ms = proposal.wall_ms;
+                trace.best_final_e = proposal.ring_error_max;
+                trace.best_prefix_e =
+                    proposal.prefix_error[(size_t) n_cycles - 1];
+                trace.best_layout =
+                    llama_region_ring_layout_string(state.regions);
+            }
             out.top.push_back(std::move(proposal));
         }
         }
