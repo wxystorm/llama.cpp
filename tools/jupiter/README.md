@@ -748,3 +748,73 @@ python .\tools\jupiter\run_q_sweep.py `
 Do not run Sequence DP with `--min-chunk 128 --max-chunk 128` for
 357 tokens; it has no legal partition. Prefer the fully measured
 `refine_sequence_q.py` result for the final comparison.
+
+## Stage 3: end-to-end q(x,y) -> Sequence DP -> measured final plan
+
+`run_sequence_pipeline.py` is the minimal orchestration layer for the existing
+`run_q_sweep.py`, `jupiter_planner.py` and `refine_sequence_q.py`.
+It does not alter the llama.cpp executor or make any speculative q samples
+count as measured. It reads the Stage-2 JSON, checks whether the selected
+b permits an actual full-prompt partition, and can recompute an effective b
+from the **already measured** stage-2 candidate medians. In particular,
+the original 357-token JSON with `b=128` is automatically corrected to
+`b=96` with `NO_FEASIBLE_PLATEAU` status; no Stage-2 sampling rerun is needed.
+
+For the 357-token, PC20/Phone20 setup, automatic first-chunk seeds are
+`x=101,112,128` (all can appear at prefix 0 in legal three-chunk plans).
+The initial q-sweep creates the candidate DP plan; exact-q refinement then
+samples only missing `(x,prefix)` pairs and resolves DP again. The final
+runtime plan is written only after all chosen points have direct PC CUDA and
+Phone RPC measurements. A final, separate inference run confirms that
+llama.cpp applied the generated sequence without enabling stage profiling.
+
+On Windows with the existing Phone RPC server listening:
+
+```powershell
+cd E:\llama\llama-jupiter
+git pull --ff-only origin baseline/jupiter-infocom25
+python -m unittest discover -s .\tools\jupiter -p test_sequence_pipeline.py -v
+
+python .\tools\jupiter\run_sequence_pipeline.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --min-chunk-json .\jupiter-min-chunk\min-chunk.json `
+  --target-tokens 357 `
+  --q-repeats 2 --refine-repeats 2 --max-rounds 6 `
+  --out-dir .\jupiter-sequence-stage3 `
+  --plan-output .\jupiter-stage3.plan
+```
+
+Outputs:
+
+- `jupiter-sequence-stage3/q-sweep/tokens-357-*/q-profile-all.csv`: initial q samples
+- `jupiter-sequence-stage3/initial-dp.plan`: approximate DP candidate
+- `jupiter-sequence-stage3/refinement/q-profile-refined.csv`: additional exact-q observations
+- `jupiter-stage3.plan`: **final measured model + sequence partition**
+- `jupiter-sequence-stage3/verify-runtime.log`: proof of runtime plan application
+- `jupiter-sequence-stage3/sequence-summary.json`: result and coverage summary
+
+If refinement exits with `JUPITER_STAGE3_INCOMPLETE`, re-run with the same
+arguments plus `--resume`, increasing `--max-rounds` if desired. It will
+reuse completed q-sweep samples and saved targeted measurements. A failed
+or incomplete refinement does not overwrite the previous final plan.
+
+The next stage is the normal, unprofiled Prefill A/B:
+
+```powershell
+python .\tools\jupiter\run_prefill_bench.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file .\prompt.txt `
+  --plan .\jupiter-stage3.plan `
+  --target-tokens 357 --pc-layers 20 `
+  --modes default,fixed64,dp --repeats 3 `
+  --out-dir .\jupiter-stage4-bench
+```
+
+The q-sweep/refinement GPU stage timers deliberately synchronize devices;
+do not interpret them as real overlap or actual throughput. Final runtime
+verification is one trial, not an A/B result.
