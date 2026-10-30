@@ -2639,6 +2639,14 @@ inline result search_runtime_applicable(
             std::to_string(c.xp);
     };
     std::unordered_set<std::string> throughput_seen;
+    // Do not retry candidates already tested in the E window, even when
+    // their DAG simulation failed.
+    for (const auto & c : shortlist) {
+        const std::string key = throughput_key(c);
+        if (!key.empty()) {
+            throughput_seen.insert(key);
+        }
+    }
     for (const auto & c : out.top) {
         const std::string key = throughput_key(c);
         if (!key.empty()) {
