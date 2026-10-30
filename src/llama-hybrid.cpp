@@ -10062,7 +10062,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                            "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
                            "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
                            "gpu_bank0_min_mib,gpu_bank1_min_mib,"
-                           "gpu_kv_min_mib,gpu_peak_min_mib,gpu_budget_mib,"
+                           "gpu_kv_min_mib,gpu_peak_min_mib,"
+                           "gpu_full_possible_min_mib,gpu_budget_mib,"
                            "prefix_gpu_pruned,prefix_full_memory_pruned,"
                            "prefix_completed,duplicates,memory_rejected,"
                            "profile_rejected,dag_rejected,simulated,"
@@ -10089,6 +10090,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << (seed.gpu_bank1_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_kv_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_peak_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_full_possible_min_bytes /
+                                1048576.0L) << ","
                             << (seed.gpu_budget_bytes / 1048576.0L) << ","
                             << seed.gpu_prefix_pruned << ","
                             << seed.memory_prebeam_rejected << ","
