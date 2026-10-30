@@ -15,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -604,6 +605,12 @@ private:
 
     bool has_evaluated_once = false;
     bool hybrid_wave_probe_done = false;
+
+    // Optional experiment records. Store one compact JSON line per ubatch in
+    // memory, and flush only when official perf output is requested, after
+    // prefill/decode timing has already been recorded.
+    std::vector<std::string> region_ring_experiment_records;
+    mutable size_t region_ring_experiment_records_written = 0;
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
