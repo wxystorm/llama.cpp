@@ -13,6 +13,7 @@ from run_prompt_suite import (
     case_folder,
     case_identity,
     discover_prompts,
+    ineligible_prompt_reason,
     main,
     read_benchmark_results,
 )
@@ -80,11 +81,23 @@ class JupiterPromptSuiteTests(unittest.TestCase):
                     p, 357, ["default", "fixed64", "dp"], 2
                 )
 
+    def test_fixed_b_eligibility_and_no_legal_length_gap(self):
+        self.assertIn("fixed_b=96", ineligible_prompt_reason(26, stage2(), 96))
+        self.assertIn("fixed_b=96", ineligible_prompt_reason(257, stage2(), 96))
+        self.assertIsNone(ineligible_prompt_reason(357, stage2(), 96))
+        self.assertIsNone(ineligible_prompt_reason(100, stage2(), 96))
+        self.assertIsNone(ineligible_prompt_reason(357, stage2(), None))
+        self.assertIn(
+            "cannot be partitioned",
+            ineligible_prompt_reason(1, stage2(), None),
+        )
+
     def test_two_prompt_pipeline_and_resume_isolated_by_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             prompts = root / "prompts"
             prompts.mkdir()
+            (prompts / "0alpaca.txt").write_text("synthetic short prompt")
             (prompts / "a357.txt").write_text("synthetic first prompt")
             (prompts / "b1024.txt").write_text("synthetic longer prompt")
             exe = root / "llama-cli.exe"
@@ -99,7 +112,11 @@ class JupiterPromptSuiteTests(unittest.TestCase):
 
             def fake_probe(args, prompt, pc_layers, log, resume):
                 self.assertEqual(pc_layers, 20)
-                return (357 if prompt.stem == "a357" else 1024), "synthetic"
+                return (
+                    26 if prompt.stem == "0alpaca"
+                    else 357 if prompt.stem == "a357"
+                    else 1024
+                ), "synthetic"
 
             def fake_launch(command, log_path, phase):
                 def get(name):
@@ -163,8 +180,14 @@ class JupiterPromptSuiteTests(unittest.TestCase):
                 (out / "suite-results.csv").open(encoding="utf-8")
             ))
             self.assertEqual({row["actual_tokens"] for row in records},
-                             {"357", "1024"})
-            self.assertEqual({row["status"] for row in records}, {"PASS"})
+                             {"26", "357", "1024"})
+            self.assertEqual(
+                {row["status"] for row in records},
+                {"PASS", "SKIPPED_INELIGIBLE"},
+            )
+            skipped = next(row for row in records if row["actual_tokens"] == "26")
+            self.assertIn("fixed_b=96", skipped["skip_reason"])
+            self.assertEqual(skipped["error"], "")
             self.assertEqual(len(commands), 4)
 
             commands.clear()
