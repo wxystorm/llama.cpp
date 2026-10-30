@@ -108,6 +108,88 @@ int main() {
         REQUIRE(simulate(handoff, fine_regions, fine));
         REQUIRE(fine.wall_ms > 0.0 && fine.tasks > 0);
     }
+    // The E1/E3 bitmask join must preserve the exact minimum of the full
+    // fine Chunk grid. Compare it against a small brute-force reference
+    // (which is intentionally used ONLY by this deterministic test).
+    {
+        model small = mock_profile();
+        small.layers = 12;
+        small.tokens = 64;
+        const auto baseline = llama_region_ring_parse(
+            "G2,C2,P2,G2,C2,P2", 12);
+        const result found =
+            search_runtime_applicable(small, baseline, 64, 1, 0.08, 0);
+        REQUIRE(found.valid);
+        REQUIRE(std::isfinite(found.first_cycle_e_min));
+
+        double brute_min = std::numeric_limits<double>::infinity();
+        const int kv = small.kv_start + small.tokens / 2;
+        for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+            const int avg_low = small.layers / n_cycles;
+            const int avg_high =
+                (small.layers + n_cycles - 1) / n_cycles;
+            if (avg_low < 4) { continue; }
+            const int spread = std::max(2, (avg_high + 3) / 4);
+            const int width_low = std::max(4, avg_low - spread);
+            const int width_high = std::min(
+                avg_high + spread,
+                small.layers - (n_cycles - 1) * 4);
+            for (int width = width_low; width <= width_high; ++width) {
+                const int remain = small.layers - width;
+                const int lo = std::max(width_low, width - spread);
+                const int hi = std::min(width_high, width + spread);
+                if (remain < (n_cycles - 1) * lo ||
+                    remain > (n_cycles - 1) * hi) {
+                    continue;
+                }
+                for (int p = 2; p <= std::min(8, width - 2); ++p) {
+                    for (int g = 1; g < width - p; ++g) {
+                        const int layers_c = width - p - g;
+                        for (int xc : first_cycle_chunk_candidates) {
+                            if (xc > small.tokens) { continue; }
+                            double tc = 0.0;
+                            REQUIRE(small.compute_ms(
+                                device::CPU, layers_c, xc, kv, tc));
+                            for (int xg : first_cycle_chunk_candidates) {
+                                if (xg > small.tokens) { continue; }
+                                double tg = 0.0, gc = 0.0;
+                                REQUIRE(small.compute_ms(
+                                    device::GPU, g, xg, kv, tg));
+                                REQUIRE(region_ring_handoff_ms_per_token(
+                                    small, device::GPU, device::CPU,
+                                    xg, xc, gc));
+                                for (int xp : first_cycle_chunk_candidates) {
+                                    if (xp > small.tokens) { continue; }
+                                    double tp = 0.0, pg = 0.0, cp = 0.0;
+                                    REQUIRE(small.compute_ms(
+                                        device::PHONE, p, xp, kv, tp));
+                                    REQUIRE(region_ring_handoff_ms_per_token(
+                                        small, device::PHONE, device::GPU,
+                                        xp, xg, pg));
+                                    REQUIRE(region_ring_handoff_ms_per_token(
+                                        small, device::CPU, device::PHONE,
+                                        xc, xp, cp));
+                                    const std::array<double, 3> load {
+                                        tc / xc, tg / xg, tp / xp
+                                    };
+                                    const std::array<double, 3> links {
+                                        pg, gc, cp
+                                    };
+                                    brute_min = std::min(
+                                        brute_min,
+                                        prefix_cycle_max_error(
+                                            load, links, 1));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        REQUIRE(std::isfinite(brute_min));
+        REQUIRE(std::fabs(brute_min - found.first_cycle_e_min) < 1e-10);
+    }
+
     candidate uniform;
     uniform.cycles = 3;
     uniform.c = 7;
