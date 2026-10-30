@@ -129,6 +129,35 @@ The original four-point uniform repeated-Cycle search is retained as an
 A/B control. Forced XC/XG/XP experiments accept the fine grid above;
 always specify all three values together with a complete --force-layout.
 
+### First-Cycle selected-seed diagnostics
+
+With `--planner apply-wide`, each prompt directory now includes
+`planner-first-cycle-top100.csv`. This is written **once after planning**,
+before model execution, alongside `metrics.jsonl`; no per-task logging or
+terminal output is added. The existing planner JSONL record also contains
+`first_cycle_seed_csv` when the file was successfully written.
+
+The CSV records **each of the at most 100 selected first-Cycle seeds**
+(2/3/4 Cycle counts share the cap), in actual selection order:
+
+- `rank`, `selected_by`: why it survived the global seed cap
+  (`CYCLE_BEST_E`, `GEOMETRY_DIVERSITY`, `CHUNK_DIVERSITY`, `LOW_E_FILL`).
+- `cycles,first_G,first_C,first_P,first_cycle_layers,XC,XG,XP,first_E`:
+  exact initial geometry, independent Chunk choices, and E score.
+- `W_*_mspt`, `T_*_mspt`: first-Cycle profiled station and handoff costs.
+- `prefix_completed`, `duplicates`, `memory_rejected`,
+  `profile_rejected`, `dag_rejected`, `simulated`: how many complete
+  continuations reached each outcome, with all counts scoped to that seed.
+- `best_prefix_layout`, `best_prefix_predicted_ms`,
+  `best_prefix_final_E`, `best_prefix_E`: the best fully simulated
+  continuation **before** optional Tensor-boundary refinement. These are
+  blank if the seed had no successfully simulated continuation.
+
+The CSV rows are *not* the 100 best full-Prompt layouts: they are the 100
+first-Cycle seeds chosen before prefix compensation. Compare
+`best_prefix_predicted_ms` with the Planner JSONL `predicted_ms` to
+understand why a uniform base plan or Tensor-boundary refinement won.
+
 ## Results
 
 ```text
@@ -137,6 +166,7 @@ experiment-results/
     summary.csv
     prompt_64/
       config.json
+      planner-first-cycle-top100.csv
       metrics.jsonl
       engine.stderr.log
       output.stdout.txt
