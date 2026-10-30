@@ -40,6 +40,10 @@ struct candidate {
     // Complete first-Cycle-seeded prefix trace (not a runtime measurement).
     // Used to explain how each subsequent Cycle compensates previous load.
     int prefix_cycles = 0;
+    // Full-layout refinement can start from either a uniform or prefix plan.
+    // It is not a new first-Cycle prefix trajectory.
+    bool local_refined = false;
+    bool local_from_prefix = false;
     std::array<double, 4> prefix_error {};
     std::array<std::array<double, 3>, 4> prefix_service {};
     double balance = 0.0;
@@ -1914,6 +1918,15 @@ struct result {
     size_t prefix_gpu_memory_pruned = 0;
     size_t prefix_full_memory_pruned = 0;
     size_t prefix_completed = 0;
+    // Additional read-only DAG simulation from complete-layout neighbors.
+    size_t local_anchors = 0;
+    size_t local_generated = 0;
+    size_t local_memory_rejected = 0;
+    size_t local_profile_rejected = 0;
+    size_t local_profiled = 0;
+    size_t local_shortlisted = 0;
+    size_t local_simulated = 0;
+    size_t local_improved = 0;
     double first_cycle_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_limit = std::numeric_limits<double>::infinity();
