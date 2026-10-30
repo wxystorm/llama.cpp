@@ -14,6 +14,13 @@ param(
     [int] $Threads = 8,
     [int] $Batch = 512,
     [int] $UBatch = 512,
+    [int] $Seed = 1234,
+    [int] $MinContext = 1024,
+    [int] $ContextPadding = 256,
+    [string] $ForceLayout = "",
+    [int] $ForceXC = 0,
+    [int] $ForceXG = 0,
+    [int] $ForceXP = 0,
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
     [string] $Planner = "apply-wide",
@@ -36,9 +43,23 @@ $callArgs = @(
     "--threads", "$Threads",
     "--batch", "$Batch",
     "--ubatch", "$UBatch",
+    "--seed", "$Seed",
+    "--min-context", "$MinContext",
+    "--context-padding", "$ContextPadding",
     "--streaming", $Streaming,
     "--planner", $Planner
 )
+if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
+    if ($ForceXC -le 0 -or $ForceXG -le 0 -or $ForceXP -le 0) {
+        throw "-ForceLayout requires positive -ForceXC, -ForceXG, and -ForceXP."
+    }
+    $callArgs += @(
+        "--force-layout", $ForceLayout,
+        "--force-xc", "$ForceXC",
+        "--force-xg", "$ForceXG",
+        "--force-xp", "$ForceXP"
+    )
+}
 if ($DryRun) {
     $callArgs += "--dry-run"
 }
