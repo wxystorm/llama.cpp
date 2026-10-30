@@ -2065,9 +2065,6 @@ inline result search_runtime_applicable(
                 continue; // one effective Chunk; larger X is redundant
             }
             for (int layers = 1; layers <= m.layers; ++layers) {
-                if (dev == (int) device::PHONE && layers > 8) {
-                    break;
-                }
                 double duration_ms = 0.0;
                 if (!m.compute_ms((device) dev, layers, x, kv,
                                  duration_ms) ||
@@ -2144,11 +2141,30 @@ inline result search_runtime_applicable(
     // First Cycle is close to L/N. Subsequent Cycles may differ, but the
     // maximum spread across Cycles is about 25% of average length. The
     // squared-length term below is a *soft* preference inside that range.
-    constexpr size_t k_first_seeds_per_n = 24;
-    constexpr size_t k_seed_geometry_diversity = 12;
+    // E is evaluated over every supported first-Cycle X triple. Only
+    // the subsequent prefix search is bounded: 100 seeds across 2/3/4 Cycles.
+    constexpr size_t k_first_seeds_total = 100;
+    constexpr size_t k_seed_geometry_diversity_per_n = 12;
+    constexpr size_t k_seed_chunk_diversity = 36;
     constexpr size_t k_prefix_beam_per_seed = 8;
     constexpr double k_history_weight = 0.20;
     constexpr double k_width_weight = 0.20;
+
+    const auto first_seed_less = [](const first_cycle_seed & a,
+                                    const first_cycle_seed & b) {
+        return std::tie(a.first_e, a.cycles, a.g, a.c, a.p,
+                        a.ci, a.gi, a.pi) <
+               std::tie(b.first_e, b.cycles, b.g, b.c, b.p,
+                        b.ci, b.gi, b.pi);
+    };
+    const auto prefix_less = [](const prefix_state & a,
+                                const prefix_state & b) {
+        if (std::abs(a.rank - b.rank) > 1e-12) {
+            return a.rank < b.rank;
+        }
+        return a.prefix_e_sum < b.prefix_e_sum;
+    };
+    std::vector<first_cycle_seed> all_first_cycle_seeds;
 
     for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
         const int avg_low = m.layers / n_cycles;
@@ -2179,7 +2195,7 @@ inline result search_runtime_applicable(
                 remaining > (n_cycles - 1) * max_other) {
                 continue;
             }
-            for (int p = 2; p <= std::min(8, width - 2); ++p) {
+            for (int p = 1; p <= width - 2; ++p) {
                 for (int g = 1; g < width - p; ++g) {
                     geometries.push_back(
                         {width, g, width - p - g, p});
@@ -2235,12 +2251,15 @@ inline result search_runtime_applicable(
         // Precompute E1/E3 bitsets and intersect them only after E2 passes.
         // With 17 X choices this fits in one 64-bit word and avoids
         // materializing thousands of doomed six-dimensional candidates.
-        static constexpr size_t k_best_chunks_per_shape = 3;
-        std::vector<std::vector<first_cycle_seed>> top_by_geometry(
-            geometries.size());
+        // Bounded streaming summaries, not early per-shape Top-3 pruning.
+        // Every E-admissible six-dimensional combination is inspected.
+        std::vector<first_cycle_seed> best_by_geometry(geometries.size());
         const size_t n_x = chunks.size();
-        std::vector<first_cycle_seed> best_by_chunk(
-            n_x * n_x * n_x);
+        std::vector<first_cycle_seed> best_by_chunk(n_x * n_x * n_x);
+        std::priority_queue<first_cycle_seed,
+                            std::vector<first_cycle_seed>,
+                            decltype(first_seed_less)> best_by_e(first_seed_less);
+        double cycle_e_min = invalid;
 
         for (size_t si = 0; si < geometries.size(); ++si) {
             const auto & shape = geometries[si];
@@ -2324,40 +2343,41 @@ inline result search_runtime_applicable(
                             continue;
                         }
                         ++out.first_cycle_profiled;
-                        auto & top = top_by_geometry[si];
-                        if (top.size() < k_best_chunks_per_shape ||
-                            seed.first_e < top.back().first_e) {
-                            top.push_back(seed);
-                            std::sort(
-                                top.begin(), top.end(),
-                                [](const first_cycle_seed & a,
-                                   const first_cycle_seed & b) {
-                                    return a.first_e < b.first_e;
-                                });
-                            if (top.size() > k_best_chunks_per_shape) {
-                                top.pop_back();
-                            }
+                        cycle_e_min = std::min(cycle_e_min, seed.first_e);
+                        if (first_seed_less(seed, best_by_geometry[si])) {
+                            best_by_geometry[si] = seed;
                         }
-                        const size_t xkey =
-                            (ci * n_x + gi) * n_x + pi;
-                        if (seed.first_e < best_by_chunk[xkey].first_e) {
+                        const size_t xkey = (ci * n_x + gi) * n_x + pi;
+                        if (first_seed_less(seed, best_by_chunk[xkey])) {
                             best_by_chunk[xkey] = seed;
+                        }
+                        // Preserve the global lowest-E candidates as well
+                        // as the best per geometry and per Chunk triple.
+                        if (best_by_e.size() < k_first_seeds_total) {
+                            best_by_e.push(seed);
+                        } else if (first_seed_less(seed, best_by_e.top())) {
+                            best_by_e.pop();
+                            best_by_e.push(seed);
                         }
                     }
                 }
             }
         }
 
-        // Keep the best few Chunk triples for every geometry AND the best
-        // geometry for each Chunk triple. This preserves diversity without
-        // storing/sorting the entire 6-D search grid.
-        std::vector<first_cycle_seed> first_seeds;
+        if (!std::isfinite(cycle_e_min)) {
+            continue;
+        }
+        out.first_cycle_e_min =
+            std::min(out.first_cycle_e_min, cycle_e_min);
+        const double seed_e_limit = std::min(1.0, cycle_e_min + e_margin);
         std::unordered_set<std::string> seen_seed_keys;
         const auto remember = [&](const first_cycle_seed & seed) {
-            if (!std::isfinite(seed.first_e)) {
+            if (!std::isfinite(seed.first_e) ||
+                    seed.first_e > seed_e_limit + 1e-12) {
                 return;
             }
             const std::string key =
+                std::to_string(seed.cycles) + "/" +
                 std::to_string(seed.g) + "/" +
                 std::to_string(seed.c) + "/" +
                 std::to_string(seed.p) + "/" +
@@ -2365,100 +2385,101 @@ inline result search_runtime_applicable(
                 std::to_string(seed.gi) + "/" +
                 std::to_string(seed.pi);
             if (seen_seed_keys.insert(key).second) {
-                first_seeds.push_back(seed);
+                all_first_cycle_seeds.push_back(seed);
             }
         };
-        for (const auto & top : top_by_geometry) {
-            for (const auto & seed : top) {
-                remember(seed);
-            }
+        for (const auto & seed : best_by_geometry) {
+            remember(seed);
         }
         for (const auto & seed : best_by_chunk) {
             remember(seed);
         }
-
-        if (first_seeds.empty()) {
-            continue;
+        while (!best_by_e.empty()) {
+            remember(best_by_e.top());
+            best_by_e.pop();
         }
-        std::sort(first_seeds.begin(), first_seeds.end(),
-            [](const first_cycle_seed & a,
-               const first_cycle_seed & b) {
-                if (std::abs(a.first_e - b.first_e) > 1e-12) {
-                    return a.first_e < b.first_e;
-                }
-                return a.width < b.width;
-            });
-        out.first_cycle_e_min = std::min(
-            out.first_cycle_e_min, first_seeds.front().first_e);
-        const double seed_e_limit =
-            std::min(1.0, first_seeds.front().first_e + e_margin);
+    }
 
-        // Preserve both shape diversity and Chunk-triple diversity.
-        // All selected seeds fix XC/XG/XP across their subsequent cycles.
-        std::vector<size_t> chosen;
-        std::unordered_set<std::string> chosen_shapes;
-        std::unordered_set<std::string> chosen_chunks;
-        std::unordered_set<size_t> chosen_indices;
-        for (size_t i = 0; i < first_seeds.size(); ++i) {
-            if (first_seeds[i].first_e > seed_e_limit + 1e-12 ||
-                    chosen.size() >= k_seed_geometry_diversity) {
+    // Select at most 100 first-Cycle seeds ACROSS all Cycle counts.
+    // E-window filtering happens before this cap. Each candidate has already
+    // been compared against shape, Chunk and global-E alternatives.
+    std::sort(all_first_cycle_seeds.begin(),
+              all_first_cycle_seeds.end(), first_seed_less);
+    std::vector<size_t> chosen;
+    std::unordered_set<size_t> chosen_indices;
+    std::unordered_set<std::string> chosen_shapes;
+    std::unordered_set<std::string> chosen_chunks;
+    std::array<size_t, 5> distinct_shapes_per_cycle {};
+    const auto shape_key = [](const first_cycle_seed & v) {
+        return std::to_string(v.cycles) + "/" +
+               std::to_string(v.g) + "/" +
+               std::to_string(v.c) + "/" + std::to_string(v.p);
+    };
+    const auto chunk_key = [](const first_cycle_seed & v) {
+        return std::to_string(v.ci) + "/" +
+               std::to_string(v.gi) + "/" + std::to_string(v.pi);
+    };
+    const auto choose = [&](size_t i) {
+        if (chosen.size() >= k_first_seeds_total ||
+                !chosen_indices.insert(i).second) {
+            return;
+        }
+        chosen.push_back(i);
+        const auto & v = all_first_cycle_seeds[i];
+        if (chosen_shapes.insert(shape_key(v)).second) {
+            ++distinct_shapes_per_cycle[(size_t) v.cycles];
+        }
+        chosen_chunks.insert(chunk_key(v));
+    };
+
+    // Keep one best-E seed from each available Cycle count, then spread
+    // the remaining budget across different geometries and Chunk triples.
+    for (int n = 2; n <= 4; ++n) {
+        for (size_t i = 0; i < all_first_cycle_seeds.size(); ++i) {
+            if (all_first_cycle_seeds[i].cycles == n) {
+                choose(i);
                 break;
             }
-            const auto & v = first_seeds[i];
-            const std::string shape =
-                std::to_string(v.g) + "/" + std::to_string(v.c) +
-                "/" + std::to_string(v.p);
-            if (chosen_shapes.insert(shape).second) {
-                chosen.push_back(i);
-                chosen_indices.insert(i);
-                chosen_chunks.insert(
-                    std::to_string(v.ci) + "/" +
-                    std::to_string(v.gi) + "/" +
-                    std::to_string(v.pi));
+        }
+    }
+    for (int n = 2; n <= 4; ++n) {
+        for (size_t i = 0; i < all_first_cycle_seeds.size() &&
+                chosen.size() < k_first_seeds_total &&
+                distinct_shapes_per_cycle[(size_t) n] <
+                    k_seed_geometry_diversity_per_n; ++i) {
+            const auto & v = all_first_cycle_seeds[i];
+            if (v.cycles == n &&
+                    chosen_shapes.find(shape_key(v)) ==
+                        chosen_shapes.end()) {
+                choose(i);
             }
         }
-        // First fill with different XC/XG/XP triples from the E window.
-        // A locally less balanced Chunk can outperform the best-E Chunk
-        // after downstream cycles compensate its cumulative load.
-        for (size_t i = 0; i < first_seeds.size() &&
-                chosen.size() < k_first_seeds_per_n; ++i) {
-            const auto & v = first_seeds[i];
-            if (v.first_e > seed_e_limit + 1e-12) {
-                break;
-            }
-            const std::string xkey =
-                std::to_string(v.ci) + "/" +
-                std::to_string(v.gi) + "/" +
-                std::to_string(v.pi);
-            if (chosen_chunks.insert(xkey).second &&
-                chosen_indices.insert(i).second) {
-                chosen.push_back(i);
-            }
+    }
+    size_t additional_chunk_shapes = 0;
+    for (size_t i = 0; i < all_first_cycle_seeds.size() &&
+            chosen.size() < k_first_seeds_total &&
+            additional_chunk_shapes < k_seed_chunk_diversity; ++i) {
+        if (chosen_chunks.find(chunk_key(all_first_cycle_seeds[i])) ==
+                chosen_chunks.end()) {
+            choose(i);
+            ++additional_chunk_shapes;
         }
-        // If there are few distinct triples near E_min, keep alternate
-        // geometries for them rather than shrinking the second-stage beam.
-        for (size_t i = 0; i < first_seeds.size() &&
-                chosen.size() < k_first_seeds_per_n; ++i) {
-            if (first_seeds[i].first_e > seed_e_limit + 1e-12) {
-                break;
-            }
-            if (chosen_indices.insert(i).second) {
-                chosen.push_back(i);
-            }
-        }
-        // A very sharp minimum should not reduce the search to one seed.
-        const size_t floor = std::min(
-            k_seed_geometry_diversity, first_seeds.size());
-        for (size_t i = 0; i < first_seeds.size() &&
-                chosen.size() < floor; ++i) {
-            if (chosen_indices.insert(i).second) {
-                chosen.push_back(i);
-            }
-        }
+    }
+    for (size_t i = 0; i < all_first_cycle_seeds.size() &&
+            chosen.size() < k_first_seeds_total; ++i) {
+        choose(i);
+    }
+    out.first_cycle_selected = chosen.size();
 
-        out.first_cycle_selected += chosen.size();
-        for (size_t si : chosen) {
-            const auto & seed = first_seeds[si];
+    for (size_t si : chosen) {
+        const auto & seed = all_first_cycle_seeds[si];
+        const int n_cycles = seed.cycles;
+        const int avg_low = m.layers / n_cycles;
+        const int avg_high = (m.layers + n_cycles - 1) / n_cycles;
+        const int spread = std::max(2, (avg_high + 3) / 4);
+        const int width_low = std::max(4, avg_low - spread);
+        const int width_high =
+            std::min(avg_high + spread, m.layers - (n_cycles - 1) * 4);
             prefix_state initial;
             initial.regions.emplace_back(
                 device::GPU, 0, seed.g);
@@ -2516,8 +2537,7 @@ inline result search_runtime_applicable(
                             continue;
                         }
 
-                        for (int p = 2;
-                                p <= std::min(8, width - 2); ++p) {
+                        for (int p = 1; p <= width - 2; ++p) {
                             for (int g = 1; g < width - p; ++g) {
                                 const int c = width - p - g;
                                 const std::array<double, 3> extra {{
@@ -2567,21 +2587,21 @@ inline result search_runtime_applicable(
                                 next.regions.emplace_back(
                                     device::PHONE,
                                     begin + g + c, begin + width);
-                                expanded.push_back(std::move(next));
+                                // Keep Beam memory bounded even when the
+                                // Phone depth is unrestricted.
+                                if (expanded.size() < k_prefix_beam_per_seed ||
+                                        prefix_less(next, expanded.back())) {
+                                    const auto pos = std::lower_bound(
+                                        expanded.begin(), expanded.end(),
+                                        next, prefix_less);
+                                    expanded.insert(pos, std::move(next));
+                                    if (expanded.size() > k_prefix_beam_per_seed) {
+                                        expanded.pop_back();
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                std::sort(expanded.begin(), expanded.end(),
-                    [](const prefix_state & a,
-                       const prefix_state & b) {
-                        if (std::abs(a.rank - b.rank) > 1e-12) {
-                            return a.rank < b.rank;
-                        }
-                        return a.prefix_e_sum < b.prefix_e_sum;
-                    });
-                if (expanded.size() > k_prefix_beam_per_seed) {
-                    expanded.resize(k_prefix_beam_per_seed);
                 }
                 beam.swap(expanded);
             }
@@ -2641,7 +2661,6 @@ inline result search_runtime_applicable(
                 out.top.push_back(std::move(proposal));
             }
         }
-    }
 
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
