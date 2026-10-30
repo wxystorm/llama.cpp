@@ -748,6 +748,13 @@ int main() {
                 REQUIRE(std::isfinite(seed.best_predicted_ms));
                 REQUIRE(std::isfinite(seed.best_final_e));
                 REQUIRE(std::isfinite(seed.best_prefix_e));
+                if (seed.gpu_budget_bytes > 0.0L) {
+                    REQUIRE(seed.best_gpu_total_bytes > 0.0L);
+                    REQUIRE(seed.best_gpu_total_bytes <=
+                            seed.gpu_budget_bytes);
+                    REQUIRE(seed.best_bank0_peak_bytes >= 0.0L);
+                    REQUIRE(seed.best_bank1_peak_bytes >= 0.0L);
+                }
             } else {
                 REQUIRE(seed.best_layout.empty());
             }
