@@ -1766,6 +1766,20 @@ inline result search(
 // ends on Phone and has no tail, so the selected topology can be loaded and
 // executed by the current canonical final-output path. C/G/P and XC/XG/XP
 // remain free planner variables.
+// The wider interpolated first-Cycle grid is deliberately separate from
+// the legacy 4-point uniform control search. Later prefix cycles do not
+// enumerate X again; every selected first-Cycle seed fixes XC/XG/XP.
+static constexpr std::array<int, 17> first_cycle_chunk_candidates {
+    8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112,
+    128, 160, 192
+};
+
+inline bool first_cycle_chunk_supported(int x) {
+    return std::find(first_cycle_chunk_candidates.begin(),
+                     first_cycle_chunk_candidates.end(), x) !=
+           first_cycle_chunk_candidates.end();
+}
+
 inline result search_runtime_applicable(
         const model & m,
         const std::vector<llama_region_ring_region> & baseline_regions,
@@ -2004,18 +2018,23 @@ inline result search_runtime_applicable(
         }
     }
 
-    const std::array<int, 4> chunks {16, 32, 64, 128};
+    // Only the first Cycle expands its six-dimensional (G,C,P,XC,XG,XP)
+    // search. Later cycles inherit these X values and modify G/C/P only.
+    const auto & chunks = first_cycle_chunk_candidates;
     const double invalid = std::numeric_limits<double>::infinity();
-    // Cache every measurable Dense/MoE full-stage service time once. The
-    // Hybrid Profile callback depends on (device, layers, X, KV), not on
-    // the logical start layer, so this also keeps prefix expansion cheap.
-    std::array<std::array<std::vector<double>, 4>, 3> service;
+    // Profile interpolation is cached once per (device, depth, X); the
+    // prefix beam never re-profiles or re-enumerates Chunk sizes.
+    std::array<std::vector<std::vector<double>>, 3> service;
     const int kv = m.kv_start + m.tokens / 2;
     for (int dev = 0; dev < 3; ++dev) {
+        service[(size_t) dev].resize(chunks.size());
         for (size_t xi = 0; xi < chunks.size(); ++xi) {
             service[(size_t) dev][xi].assign(
                 (size_t) m.layers + 1, invalid);
             const int x = chunks[xi];
+            if (x > m.tokens) {
+                continue; // one effective Chunk; larger X is redundant
+            }
             for (int layers = 1; layers <= m.layers; ++layers) {
                 if (dev == (int) device::PHONE && layers > 8) {
                     break;
@@ -2042,26 +2061,31 @@ inline result search_runtime_applicable(
         }
     }
 
-    // Links are P->G, G->C, C->P in cyclic E order. Each is measured at
-    // its *source* Chunk size and charged once per conceptual Cycle.
-    std::array<double, 4> pg {}, gc {}, cp {};
-    for (size_t xi = 0; xi < chunks.size(); ++xi) {
-        const int x = chunks[xi];
-        const size_t bytes =
-            (size_t) m.hidden * (size_t) x * sizeof(float);
-        double t = 0.0;
-        pg[xi] = m.transfer_ms(
-            device::PHONE, device::GPU, bytes, t) &&
-            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
-        t = 0.0;
-        gc[xi] = m.transfer_ms(
-            device::GPU, device::CPU, bytes, t) &&
-            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
-        t = 0.0;
-        cp[xi] = m.transfer_ms(
-            device::CPU, device::PHONE, bytes, t) &&
-            std::isfinite(t) && t >= 0.0 ? t / x : invalid;
-    }
+    // For non-multiple Chunk sizes each physical boundary may cross multiple
+    // producer/consumer intervals. Cache its measured/interpolated cost for
+    // each pair of X values, including per-edge startup/serialization.
+    // This is the same overlap accounting used by simulate(), not a
+    // per-producer-Chunk approximation.
+    const auto link_matrix = [&](device src, device dst) {
+        std::vector<std::vector<double>> link(
+            chunks.size(), std::vector<double>(chunks.size(), invalid));
+        for (size_t si = 0; si < chunks.size(); ++si) {
+            for (size_t di = 0; di < chunks.size(); ++di) {
+                if (chunks[si] > m.tokens || chunks[di] > m.tokens) {
+                    continue;
+                }
+                double cost = 0.0;
+                if (region_ring_handoff_ms_per_token(
+                        m, src, dst, chunks[si], chunks[di], cost)) {
+                    link[si][di] = cost;
+                }
+            }
+        }
+        return link;
+    };
+    const auto pg = link_matrix(device::PHONE, device::GPU);
+    const auto gc = link_matrix(device::GPU, device::CPU);
+    const auto cp = link_matrix(device::CPU, device::PHONE);
 
     struct first_cycle_seed {
         int cycles = 0;
@@ -2091,8 +2115,8 @@ inline result search_runtime_applicable(
     // First Cycle is close to L/N. Subsequent Cycles may differ, but the
     // maximum spread across Cycles is about 25% of average length. The
     // squared-length term below is a *soft* preference inside that range.
-    constexpr size_t k_first_seeds_per_n = 12;
-    constexpr size_t k_seed_geometry_diversity = 8;
+    constexpr size_t k_first_seeds_per_n = 24;
+    constexpr size_t k_seed_geometry_diversity = 12;
     constexpr size_t k_prefix_beam_per_seed = 8;
     constexpr double k_history_weight = 0.20;
     constexpr double k_width_weight = 0.20;
