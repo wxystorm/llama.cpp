@@ -11684,6 +11684,7 @@ void llama_perf_context_print(const llama_context * ctx) {
     // Official prefill/decode counters remain available when -lv 1 hides
     // informational timings. This is a single buffered end-of-run record,
     // never a per-token instrumentation point.
+    if (ctx != nullptr) {
     if (const char * path = std::getenv(
             "LLAMA_REGION_RING_METRICS_FILE")) {
         if (*path != '\0') {
@@ -11716,6 +11717,7 @@ void llama_perf_context_print(const llama_context * ctx) {
                     << "\"decode_tps\":" << decode_tps << "}\n";
             }
         }
+    }
     }
 }
 
