@@ -94,6 +94,18 @@ class JupiterInterpolationTests(unittest.TestCase):
             missing, [(112, 32), (128, 144), (85, 272)]
         )
 
+    def test_long_prompt_needs_more_than_eight_chunks(self) -> None:
+        profile = QProfile([
+            row(96, 0, 60), row(128, 0, 75),
+            row(96, 512, 60), row(128, 512, 75),
+        ])
+        plan = solve_sequence(profile, 1536, 2, 96, 128, None)
+        self.assertGreaterEqual(len(plan.chunks), 12)
+        self.assertEqual(sum(plan.chunks), 1536)
+        self.assertTrue(all(96 <= size <= 128 for size in plan.chunks))
+        with self.assertRaisesRegex(ValueError, "no feasible"):
+            solve_sequence(profile, 1536, 2, 96, 128, 8)
+
     def test_dp_returns_valid_partition(self) -> None:
         rows = []
         for x in (32, 64, 96, 128):
