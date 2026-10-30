@@ -5495,6 +5495,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << "\"schema\":1,"
                             << "\"ubatch\":" << ubatch_id << ","
                             << "\"tokens\":" << ubatch.n_tokens << ","
+                            << "\"hidden\":" << n_embd << ","
                             << "\"layout\":\""
                             << llama_region_ring_layout_string(regions)
                             << "\","
