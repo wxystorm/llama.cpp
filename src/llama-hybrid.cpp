@@ -44,9 +44,9 @@ static constexpr int                  LLAMA_HYBRID_REFERENCE_TOKENS        = 128
 static constexpr int                  LLAMA_HYBRID_PROFILE_BLOCK_LAYERS    = 5;
 static constexpr std::array<int, 13>  LLAMA_HYBRID_CHUNK_TOKEN_CANDIDATES = { 4, 8, 12, 16, 20, 24, 32, 48, 64, 96, 128, 192, 256 };
 static constexpr std::array<int, 8>   LLAMA_HYBRID_REGION_CHUNK_CANDIDATES = { 8, 16, 32, 64, 96, 128, 192, 256 };
-static constexpr std::array<int, 9>   LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
-static constexpr std::array<int, 9>   LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 32, 64, 96, 128, 192, 256 };
-static constexpr std::array<int, 8>   LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 32, 64, 128, 192, 256 };
+static constexpr std::array<int, 11>  LLAMA_HYBRID_CPU_LAYER_TOKENS        = { 1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
+static constexpr std::array<int, 11>  LLAMA_HYBRID_PHONE_LAYER_TOKENS      = { 1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
+static constexpr std::array<int, 11>  LLAMA_HYBRID_GPU_LAYER_TOKENS        = { 1, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256 };
 static constexpr int                  LLAMA_HYBRID_MOE_CPU_BLOCK_LAYERS       = 4;
 static constexpr std::array<int, 4>   LLAMA_HYBRID_MOE_CPU_BLOCK_TOKENS       = { 1, 64, 128, 256 };
 static constexpr std::array<int, 4>   LLAMA_HYBRID_LOW_TENSOR_ANCHORS          = { 1, 2, 4, 8 };
@@ -9998,13 +9998,17 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "E_margin=%.4f shortlist_floor=%d "
             "filter=E1_FIRST_CYCLE_PLUS_UNIFORM_CONTROL "
             "exact=FULL_PROMPT_EVENT_SIM ranking=SIM_WALL "
-            "uniform_sim_cap=NONE first_seeds_per_n=12 "
+            "uniform_sim_cap=NONE first_seeds_per_n=24 "
             "prefix_beam_per_seed=8 width_spread_pct=25 "
             "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
+            "handoff=TOKEN_INTERVAL_PAIR_COST "
+            "first_cycle_X=8..192_INTERPOLATED "
+            "later_cycle_X=FIXED_BY_SEED "
             "tail=PREVIEW_ONLY final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
-            "XC=16,32,64,128 XG=16,32,64,128 "
-            "XP=16,32,64,128 baseline_ms=%.3f valid=%d\n",
+            "XC/XG/XP=8,12,16,20,24,28,32,40,48,56,"
+            "64,80,96,112,128,160,192 "
+            "baseline_ms=%.3f valid=%d\n",
             result.enumerated, result.profiled,
             result.e_window_shortlisted, result.shortlisted,
             result.simulated, result.nonuniform_profiled,
@@ -10100,8 +10104,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         return false;
                     }
                     const int chunk = (int) value;
-                    if (chunk != 16 && chunk != 32 &&
-                            chunk != 64 && chunk != 128) {
+                    if (!llama_ring_planner::first_cycle_chunk_supported(chunk)) {
                         return false;
                     }
                     out = chunk;
@@ -10117,7 +10120,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
                     "status=REJECT reason=INVALID_CHUNK "
-                    "allowed=16,32,64,128\n");
+                    "allowed=8,12,16,20,24,28,32,40,48,56,"
+                    "64,80,96,112,128,160,192\n");
                 return false;
             }
 
