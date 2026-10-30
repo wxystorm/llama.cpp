@@ -2,7 +2,7 @@
 
 This runs each `prompt_N.txt` in the specified directory **once** in a fresh
 `llama-completion` process, and saves everything to files. No Region/Chunk-level
-logging is added to the hot path.
+logging is added to the hot path. Cumulative per-ubatch metrics are assembled after the worker DAG finishes, buffered in memory, and flushed at the final official performance report (not written to disk during device computation).
 
 The current `tools/cli/llama-cli` entrypoint may be a **client**. Use the
 local GGUF runner built from `tools/completion`:
@@ -70,10 +70,12 @@ The experiment data logger is opt-in via
 
 - `type=planner`: exact proposed and baseline layouts; E, predicted time,
   selected Chunk sizes and whether the plan was actually applied.
-- `type=region_ring`: **one record per complete ubatch** after workers join;
+- `type=region_ring`: **one in-memory record per complete ubatch** after workers join;
   accumulated CPU/CUDA/Phone compute-range, graph preparation,
   output readback/synchronization, ready/gate waits, overlapped execution,
-  GPU Bank refill, H2D and GPU Bank blocking.
+  GPU Bank refill, H2D and GPU Bank blocking. Records are flushed when the
+  formal `llama_perf_context_print` call occurs. Warmup records are discarded
+  by the official performance reset.
 - `type=measurement_start`: emitted after warmup at the official timing
   reset; the CSV excludes pre-reset/warmup Region Ring ubatches.
 - `type=perf`: native `llama_perf_context` load/prefill/decode time and
@@ -104,6 +106,11 @@ per-Chunk traces appear in the terminal.
   **Never add them up to obtain prefill wall time.**
 - GPU Bank A/B preload is included in model/load time, but not in Prefill.
   Rolling replacement H2D and GPU Bank wait appear separately.
+- `estimated_{gpu_to_cpu,cpu_to_gpu,pc_to_phone,phone_to_pc}_activation_mib`
+  are **modeled** FP32 hidden-state handoff payloads derived from the actual
+  full G/C/P layout and measured ubatch token count. They are not observed
+  socket bytes and exclude all extra graph/control traffic. They are blank
+  for layouts containing Directional C2P/P2C Tensor boundaries.
 - Pure PC-to-Phone socket transmit/receive and Phone GPU device execution
   require a separate detailed RPC-side diagnostic run. This lightweight
   benchmark intentionally does **not** enable per-Chunk Meta tracing.
@@ -112,3 +119,33 @@ The sweep launches exactly one inference process for each matching prompt.
 For a fixed-plan length study, keep the same layout across inputs using
 manual `--force-layout`; for an auto-plan study, let `apply-wide` replan
 per input. Keep these two experiment types separate in the final report.
+
+## Experiment validity checks
+
+The runner marks a row `PASS` only when the subprocess exits normally,
+official `type=perf` data is present, and the measured Region Ring records
+are complete and successful. `NO_PERF`, `NO_RING`, `NO_METRICS`, and
+`INCOMPLETE_RING` are distinct failure statuses; inspect the per-prompt
+`engine.stderr.log` for details. All subprocess stdout/stderr are redirected
+to files, so the terminal only shows a short per-prompt completion line.
+
+The screenshot's `prompt_64.txt` through `prompt_512.txt` fit the default
+`-b 512 -ub 512` input size. For larger prompts, take care: the official
+runner may split prefill across multiple ubatches. Record
+`ring_ubatches` and verify GPU Bank reinitialization/correctness for
+three-or-more GPU Regions before treating multi-ubatch streaming results as
+validated. Increase `-Batch` and `-UBatch` with the PowerShell wrapper
+only when your PC/Phone memory budget supports larger graphs.
+
+To run a reproducible fixed-plan study with the PowerShell wrapper:
+
+```powershell
+.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
+    -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+    -Rpc "10.39.52.114:50052" `
+    -ForceLayout "G6,C2,P4,G6,C2,P4,G6,C2,P4,G6,C2,P4" `
+    -ForceXC 32 -ForceXG 64 -ForceXP 128
+```
+
+The fixed example contains 48 layers; substitute a layout whose counts
+sum to your actual model depth.
