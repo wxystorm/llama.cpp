@@ -65,6 +65,19 @@ int main() {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
+    // APPLY_WIDE may allocate Phone stages of any positive depth.
+    // Runtime validation must not silently reject the Planner's candidates.
+    {
+        const auto deeper_phone = llama_region_ring_parse(
+            "G1,C1,P10,G1,C1,P10", 24);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            deeper_phone, 24));
+        const auto single_phone = llama_region_ring_parse(
+            "G1,C1,P1,G1,C1,P1", 6);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            single_phone, 6));
+    }
+
     // Handoff cost must match full-Prompt overlap-edge accounting, not
     // simply cost(source_chunk)/source_chunk. Non-dividing X=40 -> X=24
     // creates six intersections over 96 tokens (vs four for X=24 -> 24).
@@ -142,7 +155,7 @@ int main() {
                     remain > (n_cycles - 1) * hi) {
                     continue;
                 }
-                for (int p = 2; p <= std::min(8, width - 2); ++p) {
+                for (int p = 1; p <= width - 2; ++p) {
                     for (int g = 1; g < width - p; ++g) {
                         const int layers_c = width - p - g;
                         for (int xc : first_cycle_chunk_candidates) {
@@ -590,7 +603,7 @@ int main() {
         REQUIRE(value_result.shortlisted == value_result.simulated);
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
-        REQUIRE(value_result.first_cycle_selected <= 72);
+        REQUIRE(value_result.first_cycle_selected <= 100);
         REQUIRE(value_result.prefix_expanded > 0);
         REQUIRE(value_result.prefix_completed > 0);
         REQUIRE(std::isfinite(value_result.first_cycle_e_min));
