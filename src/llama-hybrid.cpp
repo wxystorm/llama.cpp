@@ -10004,6 +10004,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "gpu_first_pairs_pruned=%zu gpu_first_shapes_pruned=%zu "
             "prefix_expanded=%zu prefix_completed=%zu "
             "prefix_gpu_pruned=%zu prefix_full_memory_pruned=%zu "
+            "local_anchors=%zu local_generated=%zu local_memory_reject=%zu "
+            "local_profile_reject=%zu local_profiled=%zu "
+            "local_shortlisted=%zu local_simulated=%zu local_improved=%zu "
             "first_cycle_E_min=%.4f "
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
@@ -10031,7 +10034,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.first_cycle_gpu_shapes_pruned,
             result.prefix_expanded, result.prefix_completed,
             result.prefix_gpu_memory_pruned,
-            result.prefix_full_memory_pruned, result.first_cycle_e_min,
+            result.prefix_full_memory_pruned,
+            result.local_anchors, result.local_generated,
+            result.local_memory_rejected, result.local_profile_rejected,
+            result.local_profiled, result.local_shortlisted,
+            result.local_simulated, result.local_improved,
+            result.first_cycle_e_min,
             result.rejected_memory,
             result.rejected_profile, result.rejected_deadlock,
             result.coarse_e_min, result.coarse_e_limit,
