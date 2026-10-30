@@ -99,13 +99,31 @@ fine-grid minimum. The search retains the best few X choices for each
 Cycle geometry and the best geometry for each X triple, avoiding a giant
 materialized six-dimensional candidate array.
 
-Up to **24 diverse first-Cycle seeds per Cycle count** enter the existing
-prefix compensation beam (width **8**). Each seed fixes **XC/XG/XP for
-every subsequent Cycle**. Later Cycles adjust only G/C/P, using the original
-cumulative prefix E + history + Cycle-width soft-penalty ranking. No Chunk
+The first-Cycle E screen evaluates **every** six-dimensional combination
+within the 17-choice X grid that passes the E1/E2/E3 bitmask filter.
+There is no per-geometry Top-3 cutoff. The initial anchor-derived
+E limit is only a conservative screening bound; actual seed eligibility is
+checked against the exact per-Cycle-count `E_min + margin` after the scan.
+Streaming summaries retain the best combinations by geometry, by X triple,
+and by global E so that millions of screened combinations do not need to be
+materialized.
+
+Up to **100 diverse first-Cycle seeds in total, shared across the 2/3/4
+Cycle counts**, enter the prefix compensation beam (width **8**).
+Selection retains a best seed for each feasible Cycle count, then diverse
+geometries, diverse X triples and the remaining lowest-E seeds.
+Each seed fixes **XC/XG/XP for every subsequent Cycle**.
+Later Cycles adjust only G/C/P; a Phone stage can have any positive number
+of layers subject to topology, profiled-cost and memory-feasibility checks,
+rather than an arbitrary 8-layer limit. The original cumulative prefix E,
+history and Cycle-width soft-penalty ranking remains in use. No Chunk
 re-search occurs after selecting the first-Cycle seed. Final choices still
 come from the complete Prompt event simulation and optional Tensor
 boundary comparison.
+
+The original four-point uniform repeated-Cycle search stays as a separate
+A/B control, including its historical 2..8 Phone-length sweep.
+The unrestricted Phone search applies to the new first-Cycle prefix path.
 
 The original four-point uniform repeated-Cycle search is retained as an
 A/B control. Forced XC/XG/XP experiments accept the fine grid above;
