@@ -49,6 +49,8 @@ FIELDS = [
     "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
     "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
     "meta_wait_ms", "meta_graph_ms", "meta_return_payload_mib",
+    "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
+    "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
     "run_dir",
 ]
 NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
@@ -80,6 +82,45 @@ def count_layers(layout):
     for key, n in re.findall(r"(C2P|P2C|G|C|P)(\d+)", layout or ""):
         result[key] += int(n)
     return result
+
+
+def estimated_activation_payloads(ring_rows):
+    """Lower-bound FP32 hidden-state handoffs for full G/C/P-only layouts.
+
+    These are modeled activation bytes, NOT socket TCP bytes. Meta/RPC may
+    transfer extra tensors. Directional islands use READY/PARTIAL payloads
+    with a different shape, so leave their estimates blank.
+    """
+    keys = (
+        "gpu_to_cpu", "cpu_to_gpu", "pc_to_phone", "phone_to_pc",
+    )
+    totals = {k: 0.0 for k in keys}
+    edge_types = {
+        ("G", "C"): ("gpu_to_cpu",),
+        ("C", "G"): ("cpu_to_gpu",),
+        ("C", "P"): ("pc_to_phone",),
+        ("P", "C"): ("phone_to_pc",),
+        ("G", "P"): ("gpu_to_cpu", "pc_to_phone"),
+        ("P", "G"): ("phone_to_pc", "cpu_to_gpu"),
+    }
+    if not ring_rows:
+        return None
+    for row in ring_rows:
+        layout = str(row.get("layout", ""))
+        stages = re.findall(r"(C2P|P2C|G|C|P)(\\d+)", layout)
+        if any(kind in {"C2P", "P2C"} for kind, _ in stages):
+            return None
+        if not stages or len(stages) < 2:
+            continue
+        tokens = int(row.get("tokens", 0) or 0)
+        hidden = int(row.get("hidden", 0) or 0)
+        if tokens <= 0 or hidden <= 0:
+            return None
+        mib = tokens * hidden * 4 / (1024.0 * 1024.0)
+        for (left, _), (right, _) in zip(stages, stages[1:]):
+            for direction in edge_types.get((left, right), ()):
+                totals[direction] += mib
+    return {key: round(value, 3) for key, value in totals.items()}
 
 
 def git_head(root):
@@ -144,9 +185,15 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "load_ms": perf.get("load_ms", float(load) if load else None),
         "total_llama_ms": perf.get("total_ms"),
         "process_wall_ms": round(elapsed, 3),
-        "status": "PASS" if code == 0 and
-            all(x.get("complete") and x.get("status") == 0 for x in ring)
-            else "FAIL",
+        "status": (
+            "FAIL" if code != 0 else
+            "NO_METRICS" if not perf and not ring else
+            "NO_PERF" if not perf else
+            "NO_RING" if not ring else
+            "INCOMPLETE_RING" if any(
+                not x.get("complete") or x.get("status") != 0
+                for x in ring) else "PASS"
+        ),
         "exit_code": code,
         "model": str(args.model), "model_size_bytes": args.model.stat().st_size,
         "commit": commit,
@@ -189,8 +236,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "meta_available": any(x.get("meta_available", False) for x in ring),
         "run_dir": str(folder),
     }
-    if code == 0 and not perf and not ring:
-        row["status"] = "NO_METRICS"
+    payload = estimated_activation_payloads(ring)
+    if payload is not None:
+        for direction, mib in payload.items():
+            row[f"estimated_{direction}_activation_mib"] = mib
     for dev in ("cpu", "gpu", "phone"):
         for suffix in ("tasks", "compute_range_ms", "lane_active_ms",
                        "prepare_ms", "output_sync_ms", "ready_wait_ms",
