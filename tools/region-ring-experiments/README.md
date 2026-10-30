@@ -102,12 +102,15 @@ materialized six-dimensional candidate array.
 The first-Cycle E screen evaluates **every** six-dimensional combination
 within the 17-choice X grid that passes the E1/E2/E3 bitmask filter.
 Before calculating the anchor E minimum, it now **rejects geometries that
-cannot fit the GPU peak-memory budget**. With two-Bank weight streaming, the
-safe first-Cycle bound uses the exact first GPU Region weight in Bank 0,
-at least one mandatory next-Cycle GPU layer in Bank 1, GPU KV for all known
-GPU layers plus one for each future Cycle, and optional GPU slot scratch.
+cannot fit the GPU peak-memory budget**. With two-Bank weight streaming,
+it evaluates Bank0/Bank1 peaks across the legal later-Cycle width range:
+for the GPU-memory-only existence test, a one-layer GPU Region in each
+future Cycle minimizes unavoidable GPU weights and GPU KV. If *no* legal
+width sequence can fit that GPU-only minimum plus the optional XG slot
+scratch, the entire first-Cycle seed is removed **before E ranking**.
 The budget matches the final guard: **90% of measured free GPU memory**.
-This check is a lower bound, not a prediction that the full layout fits.
+This proves GPU feasibility of at least one possible completion, but not
+full CPU/Phone feasibility or fast end-to-end runtime.
 
 There is no per-geometry Top-3 cutoff. The initial anchor-derived
 E limit is a conservative screening bound **over GPU-viable candidates**;
@@ -159,10 +162,14 @@ The CSV records **each of the at most 100 selected first-Cycle seeds**
   exact initial geometry, independent Chunk choices, and E score.
 - `W_*_mspt`, `T_*_mspt`: first-Cycle profiled station and handoff costs.
 - `gpu_bank0_min_mib`, `gpu_bank1_min_mib`,
-  `gpu_kv_min_mib`, `gpu_peak_min_mib`, `gpu_budget_mib`:
-  lower-bound GPU VRAM accounting used *before* seed selection, including
-  each Bank's minimum unavoidable peak. These are not full-plan peaks
-  until the final Cycle is known.
+  `gpu_kv_min_mib`, `gpu_peak_min_mib`:
+  optimistic first-Cycle GPU VRAM lower bounds (first CUDA Region, at
+  least one mandatory second-Cycle GPU layer, and minimum future KV).
+- `gpu_full_possible_min_mib`, `gpu_budget_mib`: the tightest full-Cycle
+  **GPU-only** requirement attainable over legally sized later Cycles
+  when their GPU Regions have one layer each, and the measured allowed
+  GPU VRAM. The 100 seeds are selected only after this feasibility check.
+  These are still not the actual sizes of a high-E/larger-G completion.
 - `prefix_gpu_pruned`, `prefix_full_memory_pruned`: continuations
   eliminated *before* the Beam is limited to eight. The first covers GPU
   Bank/KV memory on every Cycle; the second covers full memory on the
