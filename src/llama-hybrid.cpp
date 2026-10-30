@@ -10067,7 +10067,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                            "prefix_completed,duplicates,memory_rejected,"
                            "profile_rejected,dag_rejected,simulated,"
                            "best_prefix_layout,best_prefix_predicted_ms,"
-                           "best_prefix_final_E,best_prefix_E\n";
+                           "best_prefix_final_E,best_prefix_E,"
+                           "best_gpu_bank0_peak_mib,best_gpu_bank1_peak_mib,"
+                           "best_gpu_kv_mib,best_gpu_total_mib\n";
                     csv << std::fixed << std::setprecision(6);
                     for (const auto & seed : result.first_cycle_seeds) {
                         csv << seed.selection_rank << ","
@@ -10107,6 +10109,19 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         csv << ",";
                         if (std::isfinite(seed.best_prefix_e)) {
                             csv << seed.best_prefix_e;
+                        }
+                        if (seed.simulated > 0 &&
+                                seed.gpu_budget_bytes > 0.0L) {
+                            csv << ","
+                                << (seed.best_bank0_peak_bytes / 1048576.0L)
+                                << ","
+                                << (seed.best_bank1_peak_bytes / 1048576.0L)
+                                << ","
+                                << (seed.best_gpu_kv_bytes / 1048576.0L)
+                                << ","
+                                << (seed.best_gpu_total_bytes / 1048576.0L);
+                        } else {
+                            csv << ",,,,";
                         }
                         csv << "\n";
                     }
