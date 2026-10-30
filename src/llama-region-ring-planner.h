@@ -491,19 +491,28 @@ inline bool simulate(const model & m,
         const int lane = a == device::PHONE ?
             (m.shared_phone_link ? 1 : 2) :
             b == device::PHONE ? 1 : 0;
-        for (int src : by_region[r]) {
-            for (int dst : by_region[r + 1]) {
-                const int overlap = std::min(tasks[(size_t) src].end,
-                                             tasks[(size_t) dst].end) -
-                                    std::max(tasks[(size_t) src].begin,
-                                             tasks[(size_t) dst].begin);
-                if (overlap <= 0) { continue; }
+        // Both regions partition the same ordered token interval. Merge
+        // their interval streams instead of testing every source/destination
+        // pair: O(Nsrc + Ndst), even for small non-multiple Chunk sizes.
+        // The emitted intersecting EDGE order is the same as src-major
+        // enumeration, preserving the event simulator's link FIFO policy.
+        size_t si = 0;
+        size_t di = 0;
+        while (si < by_region[r].size() &&
+               di < by_region[r + 1].size()) {
+            const int src = by_region[r][si];
+            const int dst = by_region[r + 1][di];
+            const auto & producer = tasks[(size_t) src];
+            const auto & consumer = tasks[(size_t) dst];
+            const int overlap =
+                std::min(producer.end, consumer.end) -
+                std::max(producer.begin, consumer.begin);
+            if (overlap > 0) {
                 const size_t bytes =
                     (size_t) overlap * (size_t) m.hidden * sizeof(float);
                 double ms = 0.0;
-                // Same-owner adjacency is a device-local dependency. The
-                // directional callback has already charged internal network
-                // traffic, so never add another fake boundary transfer.
+                // Same-owner adjacency is device-local. Directional stage
+                // timing has already charged its internal network traffic.
                 if (a != b &&
                         (!m.transfer_ms(a, b, bytes, ms) ||
                          !std::isfinite(ms) || ms < 0.0)) {
@@ -512,6 +521,12 @@ inline bool simulate(const model & m,
                 edges.push_back({src, dst, lane, ms});
                 ++tasks[(size_t) src].outputs;
                 ++tasks[(size_t) dst].inputs;
+            }
+            if (producer.end <= consumer.end) {
+                ++si;
+            }
+            if (consumer.end <= producer.end) {
+                ++di;
             }
         }
     }
