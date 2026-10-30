@@ -10,6 +10,7 @@ from pathlib import Path
 
 from run_prefill_bench import (
     build_cli,
+    compatible_timing_tokens,
     env_for_mode,
     modes_arg,
     parse_timing,
@@ -89,6 +90,23 @@ class PrefillBenchTests(unittest.TestCase):
         self.assertTrue(parser().parse_args(common + ["--async-c2p"]).async_c2p)
         self.assertFalse(parser().parse_args(common).comm_timing)
         self.assertTrue(parser().parse_args(common + ["--comm-timing"]).comm_timing)
+
+    def test_timing_token_tolerance_is_opt_in_and_bounded(self) -> None:
+        common = [
+            "--exe", "cli.exe", "--model", "test.gguf",
+            "--rpc", "127.0.0.1:10139", "--prompt-file", "prompt.txt",
+        ]
+        strict = parser().parse_args(common)
+        self.assertEqual(strict.timing_token_tolerance, 0)
+        self.assertTrue(compatible_timing_tokens(357, 357, 0))
+        self.assertFalse(compatible_timing_tokens(358, 357, 0))
+        tolerant = parser().parse_args(
+            common + ["--timing-token-tolerance", "1"]
+        )
+        self.assertEqual(tolerant.timing_token_tolerance, 1)
+        self.assertTrue(compatible_timing_tokens(358, 357, 1))
+        self.assertTrue(compatible_timing_tokens(356, 357, 1))
+        self.assertFalse(compatible_timing_tokens(359, 357, 1))
 
     def test_formal_cli_uses_lv3_single_turn(self) -> None:
         args = argparse.Namespace(
