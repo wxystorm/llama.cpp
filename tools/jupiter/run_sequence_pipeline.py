@@ -24,7 +24,11 @@ from refine_sequence_q import build_resume_config
 from run_prefill_bench import PLAN_RE, build_cli, parse_timing, read_plan, run_one
 
 
-def resolve_stage2(summary: dict) -> tuple[int, int, int, int, str]:
+def resolve_stage2(
+    summary: dict,
+    target_tokens: int | None = None,
+    fixed_min_chunk: int | None = None,
+) -> tuple[int, int, int, int, str]:
     """Recheck b against the full prompt, including old stage-2 reports.
 
     The first stage-2 script could report b=128 for a 357-token prompt even
@@ -32,7 +36,8 @@ def resolve_stage2(summary: dict) -> tuple[int, int, int, int, str]:
     medians instead of asking the user to repeat expensive device profiling.
     """
     pc_layers = int(summary["pc_layers"])
-    total = int(summary["prompt_tokens"])
+    total = int(target_tokens if target_tokens is not None
+                else summary["prompt_tokens"])
     max_chunk = int(summary["max_chunk"])
     threshold = float(summary["threshold"])
     if pc_layers <= 0 or total <= 0 or max_chunk <= 0:
@@ -49,6 +54,15 @@ def resolve_stage2(summary: dict) -> tuple[int, int, int, int, str]:
         }
         for item in candidates if int(item.get("samples", 0)) > 0
     ]
+    if fixed_min_chunk is not None:
+        # Fixed b is an explicit cross-prompt ablation, not a claim that
+        # the 90% saturation threshold holds for this exact prompt.
+        if not partition_feasible(total, fixed_min_chunk, max_chunk):
+            raise ValueError(
+                f"fixed b={fixed_min_chunk} cannot partition total={total} "
+                f"with max_chunk={max_chunk}"
+            )
+        return pc_layers, total, fixed_min_chunk, max_chunk, "FIXED_B_OVERRIDE"
     chosen, _all, status = select_min_chunk(
         rows, threshold=threshold, total_tokens=total, max_chunk=max_chunk
     )
@@ -207,6 +221,16 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--pc-layers", type=int, default=None,
                    help="override only when it equals stage-2 PC layer count")
     p.add_argument("--target-tokens", type=int, default=None)
+    p.add_argument(
+        "--reuse-b-profile-for-new-length", action="store_true",
+        help="reuse Stage-2 model/device chunk throughput curve at a different "
+             "verified prompt length; do not claim b was remeasured",
+    )
+    p.add_argument(
+        "--min-chunk", type=int, default=None,
+        help="optional fixed minimum b across prompts (explicit ablation, "
+             "rather than automatic throughput-threshold selection)",
+    )
     p.add_argument("--x-values", default=None,
                    help="comma-separated first-chunk seeds; auto if omitted")
     p.add_argument("--q-repeats", type=int, default=2)
@@ -229,11 +253,28 @@ def main() -> int:
     if not source.is_file():
         raise ValueError(f"stage-2 min-chunk JSON not found: {source}")
     summary = json.loads(source.read_text(encoding="utf-8-sig"))
-    pc, total, b, max_chunk, status = resolve_stage2(summary)
+    measured_prompt_tokens = int(summary["prompt_tokens"])
+    if (args.target_tokens is not None and
+            args.target_tokens != measured_prompt_tokens and
+            not args.reuse_b_profile_for_new_length):
+        raise ValueError(
+            "target tokens differ from Stage-2 calibration; pass "
+            "--reuse-b-profile-for-new-length to reuse the measured "
+            "hardware chunk-efficiency curve explicitly"
+        )
+    pc, total, b, max_chunk, status = resolve_stage2(
+        summary,
+        target_tokens=args.target_tokens,
+        fixed_min_chunk=args.min_chunk,
+    )
     if args.pc_layers is not None and args.pc_layers != pc:
         raise ValueError("PC layer override mismatches calibrated stage-2 result")
-    if args.target_tokens is not None and args.target_tokens != total:
-        raise ValueError("target tokens mismatch stage-2 calibration")
+    if total != measured_prompt_tokens:
+        print(
+            f"[JUPITER_STAGE3_B_PROFILE_REUSE] profile_tokens={measured_prompt_tokens} "
+            f"actual_prompt_tokens={total} status=REUSE_HARDWARE_CURVE",
+            flush=True,
+        )
     if (args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 1 or
             args.ubatch < max_chunk or args.batch < args.ubatch or
             args.context < args.batch):
@@ -356,6 +397,8 @@ def main() -> int:
         "pc_layers": pc, "prompt_tokens": total, "min_chunk": b,
         "max_chunk": max_chunk, "min_chunk_status": status,
         "initial_b_from_json": old_b,
+        "b_profile_prompt_tokens": measured_prompt_tokens,
+        "reused_b_profile_at_new_length": total != measured_prompt_tokens,
         "chunks": chunks, "q_points": len(chunks),
         "q_profile": str(refine_out / "q-profile-refined.csv"),
         "refinement_dir": str(refine_out),
