@@ -10025,6 +10025,71 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
 
+        // Experiment-only artifact: a single small CSV after planning has
+        // finished. No per-candidate file writes or terminal logging.
+        // The prompt sweep sets this path to prompt_N/metrics.jsonl.
+        bool first_cycle_seed_csv_saved = false;
+        if (const char * metrics_path = std::getenv(
+                "LLAMA_REGION_RING_METRICS_FILE")) {
+            if (*metrics_path != '\0' &&
+                    !result.first_cycle_seeds.empty()) {
+                const std::string metrics_file(metrics_path);
+                const size_t split = metrics_file.find_last_of("/\\");
+                const std::string output_file =
+                    (split == std::string::npos ? std::string() :
+                     metrics_file.substr(0, split + 1)) +
+                    "planner-first-cycle-top100.csv";
+                std::ofstream csv(output_file, std::ios::trunc);
+                if (csv) {
+                    csv << "rank,selected_by,cycles,first_G,first_C,first_P,"
+                           "first_cycle_layers,XC,XG,XP,first_E,"
+                           "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
+                           "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
+                           "prefix_completed,duplicates,memory_rejected,"
+                           "profile_rejected,dag_rejected,simulated,"
+                           "best_prefix_layout,best_prefix_predicted_ms,"
+                           "best_prefix_final_E,best_prefix_E\n";
+                    csv << std::fixed << std::setprecision(6);
+                    for (const auto & seed : result.first_cycle_seeds) {
+                        csv << seed.selection_rank << ","
+                            << seed.selection_reason << ","
+                            << seed.cycles << ","
+                            << seed.g << "," << seed.c << "," << seed.p
+                            << "," << seed.width << ","
+                            << seed.xc << "," << seed.xg << ","
+                            << seed.xp << "," << seed.first_e << ","
+                            << seed.first_service_mspt[0] << ","
+                            << seed.first_service_mspt[1] << ","
+                            << seed.first_service_mspt[2] << ","
+                            << seed.first_handoff_mspt[0] << ","
+                            << seed.first_handoff_mspt[1] << ","
+                            << seed.first_handoff_mspt[2] << ","
+                            << seed.completed << ","
+                            << seed.duplicates << ","
+                            << seed.rejected_memory << ","
+                            << seed.rejected_profile << ","
+                            << seed.rejected_dag << ","
+                            << seed.simulated << ",\""
+                            << seed.best_layout << "\",";
+                        if (std::isfinite(seed.best_predicted_ms)) {
+                            csv << seed.best_predicted_ms;
+                        }
+                        csv << ",";
+                        if (std::isfinite(seed.best_final_e)) {
+                            csv << seed.best_final_e;
+                        }
+                        csv << ",";
+                        if (std::isfinite(seed.best_prefix_e)) {
+                            csv << seed.best_prefix_e;
+                        }
+                        csv << "\n";
+                    }
+                    csv.flush();
+                    first_cycle_seed_csv_saved = csv.good();
+                }
+            }
+        }
+
         if (!result.valid || !result.baseline_valid ||
                 !(result.baseline.wall_ms > 0.0)) {
             LLAMA_LOG_ERROR(
@@ -10468,6 +10533,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 best.prefix_error[0] : best.ring_error_max)
                             << ",\"first_cycle_seeds\":"
                             << result.first_cycle_selected
+                            << ",\"first_cycle_seed_csv\":\""
+                            << (first_cycle_seed_csv_saved ?
+                                "planner-first-cycle-top100.csv" : "")
+                            << "\""
                             << ",\"prefix_completed\":"
                             << result.prefix_completed
                             << ",\"weight_h2d_pred_ms\":"
