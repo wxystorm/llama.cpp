@@ -101,12 +101,20 @@ materialized six-dimensional candidate array.
 
 The first-Cycle E screen evaluates **every** six-dimensional combination
 within the 17-choice X grid that passes the E1/E2/E3 bitmask filter.
+Before calculating the anchor E minimum, it now **rejects geometries that
+cannot fit the GPU peak-memory budget**. With two-Bank weight streaming, the
+safe first-Cycle bound uses the exact first GPU Region weight in Bank 0,
+at least one mandatory next-Cycle GPU layer in Bank 1, GPU KV for all known
+GPU layers plus one for each future Cycle, and optional GPU slot scratch.
+The budget matches the final guard: **90% of measured free GPU memory**.
+This check is a lower bound, not a prediction that the full layout fits.
+
 There is no per-geometry Top-3 cutoff. The initial anchor-derived
-E limit is only a conservative screening bound; actual seed eligibility is
-checked against the exact per-Cycle-count `E_min + margin` after the scan.
-Streaming summaries retain the best combinations by geometry, by X triple,
-and by global E so that millions of screened combinations do not need to be
-materialized.
+E limit is a conservative screening bound **over GPU-viable candidates**;
+actual seed eligibility is checked against the exact per-Cycle-count
+`E_min + margin` after the scan. Streaming summaries retain the best
+combinations by geometry, by X triple, and by global E so that millions of
+screened combinations do not need to be materialized.
 
 Up to **100 diverse first-Cycle seeds in total, shared across the 2/3/4
 Cycle counts**, enter the prefix compensation beam (width **8**).
@@ -115,19 +123,24 @@ geometries, diverse X triples and the remaining lowest-E seeds.
 Each seed fixes **XC/XG/XP for every subsequent Cycle**.
 Later Cycles adjust only G/C/P; a Phone stage can have any positive number
 of layers subject to topology, profiled-cost and memory-feasibility checks,
-rather than an arbitrary 8-layer limit. The original cumulative prefix E,
-history and Cycle-width soft-penalty ranking remains in use. No Chunk
-re-search occurs after selecting the first-Cycle seed. Final choices still
-come from the complete Prompt event simulation and optional Tensor
-boundary comparison.
+rather than an arbitrary 8-layer limit. On each subsequent Cycle, the Planner recomputes the **maximum GPU Region
+weight for each physical Bank** (even-Cycle and odd-Cycle GPU regions),
+adds GPU KV, and prunes memory-impossible Beam expansions. Once the last
+Cycle has been appended, the original full CPU/Phone/GPU memory feasibility
+check runs **before** E-ranked Beam truncation, so low-E but impossible
+layouts cannot occupy all eight Beam slots.
+
+The original cumulative prefix E, history and Cycle-width soft-penalty
+ranking remains in use. No Chunk re-search occurs after selecting the
+first-Cycle seed. Final choices still come from the complete Prompt event
+simulation and optional Tensor boundary comparison.
 
 The original four-point uniform repeated-Cycle search stays as a separate
 A/B control, including its historical 2..8 Phone-length sweep.
 The unrestricted Phone search applies to the new first-Cycle prefix path.
 
-The original four-point uniform repeated-Cycle search is retained as an
-A/B control. Forced XC/XG/XP experiments accept the fine grid above;
-always specify all three values together with a complete --force-layout.
+Forced XC/XG/XP experiments accept the fine grid above; always specify
+all three values together with a complete --force-layout.
 
 ### First-Cycle selected-seed diagnostics
 
@@ -145,6 +158,15 @@ The CSV records **each of the at most 100 selected first-Cycle seeds**
 - `cycles,first_G,first_C,first_P,first_cycle_layers,XC,XG,XP,first_E`:
   exact initial geometry, independent Chunk choices, and E score.
 - `W_*_mspt`, `T_*_mspt`: first-Cycle profiled station and handoff costs.
+- `gpu_bank0_min_mib`, `gpu_bank1_min_mib`,
+  `gpu_kv_min_mib`, `gpu_peak_min_mib`, `gpu_budget_mib`:
+  lower-bound GPU VRAM accounting used *before* seed selection, including
+  each Bank's minimum unavoidable peak. These are not full-plan peaks
+  until the final Cycle is known.
+- `prefix_gpu_pruned`, `prefix_full_memory_pruned`: continuations
+  eliminated *before* the Beam is limited to eight. The first covers GPU
+  Bank/KV memory on every Cycle; the second covers full memory on the
+  terminal Cycle, including PC and Phone.
 - `prefix_completed`, `duplicates`, `memory_rejected`,
   `profile_rejected`, `dag_rejected`, `simulated`: how many complete
   continuations reached each outcome, with all counts scoped to that seed.
