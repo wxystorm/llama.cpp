@@ -1867,6 +1867,9 @@ struct first_cycle_seed_record {
     long double gpu_bank1_min_bytes = 0.0L;
     long double gpu_kv_min_bytes = 0.0L;
     long double gpu_peak_min_bytes = 0.0L;
+    // Best achievable full-GPU-only footprint over legal later widths,
+    // taking a one-layer GPU Region in each subsequent Cycle.
+    long double gpu_full_possible_min_bytes = 0.0L;
     long double gpu_budget_bytes = 0.0L;
     size_t gpu_prefix_pruned = 0;
     size_t memory_prebeam_rejected = 0;
@@ -2480,26 +2483,36 @@ inline result search_runtime_applicable(
             continue;
         }
 
-        // Memory-first E search: evaluate the streamed CUDA Bank0 peak and
-        // mandatory next-cycle Bank1 floor for EVERY G/C/P geometry before
-        // the anchor E minimum. For slot pools, XG influences GPU scratch.
+        // Memory-first E search: a legal later-width completion must exist
+        // whose alternating GPU Bank maxima plus KV fit the GPU budget.
+        // For GPU memory, G=1 for all later Cycles is always optimal; find
+        // the minimum over the SAME width limits used by the real Beam.
+        // No six-dimensional E candidate is scored until this GPU check.
         const size_t n_x = chunks.size();
         std::vector<uint8_t> first_gpu_ok(
             geometries.size() * n_x, (uint8_t) 0);
         for (size_t si = 0; si < geometries.size(); ++si) {
             const auto & shape = geometries[si];
-            const std::vector<llama_region_ring_region> first_regions {
-                {device::GPU, 0, shape.g},
-                {device::CPU, shape.g, shape.g + shape.c},
-                {device::PHONE, shape.g + shape.c, shape.width}
-            };
+            gpu_prefix_memory_bound min_full_gpu;
+            const bool gpu_continuation_possible =
+                gpu_minimum_complete_first_cycle_memory(
+                    m, shape.g, shape.c, shape.p, n_cycles,
+                    width_low, width_high, spread, min_full_gpu);
             bool any_gpu_xg = false;
             for (size_t gi = 0; gi < n_x; ++gi) {
                 if (chunks[gi] > m.tokens) {
                     continue;
                 }
-                if (gpu_prefix_memory_feasible(
-                        m, first_regions, n_cycles, chunks[gi])) {
+                const long double scratch =
+                    m.slot_pool > 0 ?
+                    (long double) m.slot_pool * chunks[gi] *
+                        m.hidden * sizeof(float) * 3 : 0.0L;
+                const bool fits =
+                    gpu_continuation_possible &&
+                    (m.gpu_memory_budget_bytes <= 0.0L ||
+                     min_full_gpu.total_min_bytes + scratch <=
+                         m.gpu_memory_budget_bytes);
+                if (fits) {
                     first_gpu_ok[si * n_x + gi] = 1;
                     any_gpu_xg = true;
                 } else {
@@ -2818,6 +2831,23 @@ inline result search_runtime_applicable(
             trace.gpu_kv_min_bytes = bound.gpu_kv_min_bytes;
             trace.gpu_peak_min_bytes = bound.total_min_bytes;
             trace.gpu_budget_bytes = bound.budget_bytes;
+            const int avg_low_for_gpu = m.layers / n_cycles;
+            const int avg_high_for_gpu =
+                (m.layers + n_cycles - 1) / n_cycles;
+            const int width_low_for_gpu =
+                std::max(4, avg_low_for_gpu - seed.width_slack);
+            const int width_high_for_gpu =
+                std::min(avg_high_for_gpu + seed.width_slack,
+                         m.layers - (n_cycles - 1) * 4);
+            gpu_prefix_memory_bound best_gpu_only;
+            if (gpu_minimum_complete_first_cycle_memory(
+                    m, seed.g, seed.c, seed.p, n_cycles,
+                    width_low_for_gpu, width_high_for_gpu,
+                    seed.width_slack, best_gpu_only)) {
+                trace.gpu_full_possible_min_bytes =
+                    best_gpu_only.total_min_bytes +
+                    bound.scratch_bytes;
+            }
         }
         const int avg_low = m.layers / n_cycles;
         const int avg_high = (m.layers + n_cycles - 1) / n_cycles;
