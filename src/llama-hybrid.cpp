@@ -10004,6 +10004,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "gpu_first_pairs_pruned=%zu gpu_first_shapes_pruned=%zu "
             "prefix_expanded=%zu prefix_completed=%zu "
             "prefix_gpu_pruned=%zu prefix_full_memory_pruned=%zu "
+            "throughput_shortlisted=%zu throughput_simulated=%zu "
             "local_anchors=%zu local_generated=%zu local_memory_reject=%zu "
             "local_profile_reject=%zu local_profiled=%zu "
             "local_shortlisted=%zu local_simulated=%zu local_improved=%zu "
@@ -10035,6 +10036,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.prefix_expanded, result.prefix_completed,
             result.prefix_gpu_memory_pruned,
             result.prefix_full_memory_pruned,
+            result.throughput_shortlisted, result.throughput_simulated,
             result.local_anchors, result.local_generated,
             result.local_memory_rejected, result.local_profile_rejected,
             result.local_profiled, result.local_shortlisted,
@@ -10456,9 +10458,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         // the local origin observable even when it wins.
                         const bool was_local = best.local_refined;
                         const bool from_prefix = best.local_from_prefix;
+                        const bool from_throughput =
+                            best.local_from_throughput;
+                        const bool throughput_seed = best.throughput_seed;
                         best = boundary.selected.estimate;
                         best.local_refined = was_local;
                         best.local_from_prefix = from_prefix;
+                        best.local_from_throughput = from_throughput;
+                        best.throughput_seed = throughput_seed;
                         best_regions =
                             boundary.selected.regions;
                         boundary_tensor_selected = true;
@@ -10531,6 +10538,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
             best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
+            best.throughput_seed ? "AUTO_RUNTIME_V2_THROUGHPUT" :
                 "AUTO_RUNTIME_V2",
             best_text.c_str(), baseline_text.c_str(),
             best.cycles, best.c, best.g, best.p,
@@ -10564,9 +10572,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 boundary_tensor_selected ? "tensor" :
                                 best.local_refined ?
                                     (best.local_from_prefix ?
-                                        "local_prefix" : "local_uniform") :
-                                best.prefix_cycles > 0 ?
-                                    "prefix" : "uniform")
+                                        "local_prefix" :
+                                     best.local_from_throughput ?
+                                        "local_throughput" : "local_uniform") :
+                                best.prefix_cycles > 0 ? "prefix" :
+                                best.throughput_seed ? "throughput" :
+                                    "uniform")
                             << "\","
                             << "\"selected_layout\":\""
                             << best_text << "\","
@@ -10597,6 +10608,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << (best.local_refined ? "true" : "false")
                             << ",\"local_from_prefix\":"
                             << (best.local_from_prefix ? "true" : "false")
+                            << ",\"local_from_throughput\":"
+                            << (best.local_from_throughput ? "true" : "false")
+                            << ",\"throughput_seed\":"
+                            << (best.throughput_seed ? "true" : "false")
+                            << ",\"throughput_shortlisted\":"
+                            << result.throughput_shortlisted
+                            << ",\"throughput_simulated\":"
+                            << result.throughput_simulated
                             << ",\"local_anchors\":" << result.local_anchors
                             << ",\"local_generated\":" << result.local_generated
                             << ",\"local_memory_rejected\":"
@@ -10691,6 +10710,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
             best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
+            best.throughput_seed ? "AUTO_RUNTIME_V2_THROUGHPUT" :
                 "AUTO_RUNTIME_V2",
             selected_layout->c_str(),
             *selected_xc, *selected_xg, *selected_xp);
