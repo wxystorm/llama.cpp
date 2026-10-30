@@ -52,6 +52,23 @@ class JupiterStage3Tests(unittest.TestCase):
         self.assertEqual((pc, total, b, max_chunk), (20, 357, 96, 128))
         self.assertEqual(status, "NO_FEASIBLE_PLATEAU")
 
+    def test_reuse_chunk_curve_for_new_prompt_length(self):
+        # N=1024 can be partitioned with b=128; the calibrated
+        # first-chunk curve may be reused without claiming a new b profile.
+        pc, total, b, maximum, status = resolve_stage2(
+            stage2_report(), target_tokens=1024
+        )
+        self.assertEqual((pc, total, b, maximum), (20, 1024, 128, 128))
+        self.assertEqual(status, "BOTH_STAGES_SATURATED")
+
+        pc, total, b, maximum, status = resolve_stage2(
+            stage2_report(), target_tokens=1536, fixed_min_chunk=96
+        )
+        self.assertEqual((pc, total, b, maximum), (20, 1536, 96, 128))
+        self.assertEqual(status, "FIXED_B_OVERRIDE")
+        with self.assertRaisesRegex(ValueError, "cannot partition"):
+            resolve_stage2(stage2_report(), target_tokens=357, fixed_min_chunk=128)
+
     def test_legal_first_chunk_seeds_and_invalid_total(self):
         self.assertEqual(first_chunk_candidates(357, 96, 128), [101, 112, 128])
         with self.assertRaisesRegex(ValueError, "no legal"):
