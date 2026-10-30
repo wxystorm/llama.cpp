@@ -10452,7 +10452,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             "REPLACE_CYCLE_RANK1" :
                             "KEEP_CYCLE_RANK1");
                     if (use_tensor) {
+                        // Tensor refinement is a later optional pass. Keep
+                        // the local origin observable even when it wins.
+                        const bool was_local = best.local_refined;
+                        const bool from_prefix = best.local_from_prefix;
                         best = boundary.selected.estimate;
+                        best.local_refined = was_local;
+                        best.local_from_prefix = from_prefix;
                         best_regions =
                             boundary.selected.regions;
                         boundary_tensor_selected = true;
