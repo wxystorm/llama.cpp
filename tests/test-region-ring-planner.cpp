@@ -307,7 +307,7 @@ int main() {
         from_prefix.top.push_back(prefix_incumbent);
         seen.clear();
         seen.insert(start_key);
-        local.region_memory_feasible = {};
+        local.region_memory_feasible = nullptr;
         refine_runtime_local_candidates(local, from_prefix, seen);
         bool saw_prefix_origin = false;
         for (const auto & c : from_prefix.top) {
