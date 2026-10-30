@@ -28,6 +28,7 @@ from run_q_sweep import (
     stream_process,
 )
 from run_prefill_bench import read_plan
+from min_chunk_profile import partition_feasible
 from run_sequence_pipeline import resolve_stage2
 
 
@@ -36,8 +37,46 @@ SUMMARY_FIELDS = [
     "min_chunk_status", "chunk_count", "dp_chunks",
     "default_median_ms", "fixed64_median_ms", "dp_median_ms",
     "default_tok_s", "dp_tok_s", "speedup_vs_default",
-    "sample_count", "case_dir", "final_plan", "error",
+    "sample_count", "case_dir", "final_plan", "skip_reason", "error",
 ]
+
+
+class IneligiblePrompt(Exception):
+    """The prompt cannot be legally partitioned with this experiment's b."""
+
+
+def ineligible_prompt_reason(
+    total: int, stage2: dict, fixed_b: int | None
+) -> str | None:
+    """Return a reason to skip a prompt with no feasible Jupiter DP partition.
+
+    A 26-token prompt cannot satisfy b=96. This is a valid *input* that
+    cannot be used in this particular experiment, not a runtime failure.
+    """
+    maximum = int(stage2["max_chunk"])
+    if fixed_b is not None:
+        if not partition_feasible(total, fixed_b, maximum):
+            return (
+                f"actual_tokens={total} cannot be partitioned with "
+                f"fixed_b={fixed_b} and max_chunk={maximum}"
+            )
+        return None
+
+    candidates = [
+        int(item["chunk_tokens"])
+        for item in stage2.get("candidates", [])
+        if int(item.get("samples", 0)) > 0
+    ]
+    if not candidates:
+        # Preserve the true configuration error in resolve_stage2.
+        return None
+    if not any(partition_feasible(total, b, maximum) for b in candidates):
+        return (
+            f"actual_tokens={total} cannot be partitioned with any "
+            f"measured minimum b={sorted(set(candidates))} "
+            f"and max_chunk={maximum}"
+        )
+    return None
 
 
 def discover_prompts(
@@ -323,6 +362,7 @@ def main() -> int:
 
     rows: list[dict] = []
     failures = 0
+    skipped = 0
     for index, prompt in enumerate(prompts, 1):
         identity = case_identity(prompt, args, source, pc)
         case = case_folder(out, prompt, identity)
@@ -353,6 +393,11 @@ def main() -> int:
             row["actual_tokens"] = actual
             if actual > args.batch or actual > args.context:
                 raise ValueError(f"tokens {actual} exceed batch/context")
+            reason = ineligible_prompt_reason(
+                actual, source_data, args.min_chunk
+            )
+            if reason is not None:
+                raise IneligiblePrompt(reason)
             _, _, b, _, b_status = resolve_stage2(
                 source_data, target_tokens=actual,
                 fixed_min_chunk=args.min_chunk
@@ -441,6 +486,16 @@ def main() -> int:
                   f"dp_ms={row['dp_median_ms']:.3f} "
                   f"speedup={row['speedup_vs_default']:.4f}x",
                   flush=True)
+        except IneligiblePrompt as exc:
+            skipped += 1
+            row["status"] = "SKIPPED_INELIGIBLE"
+            row["min_chunk"] = args.min_chunk if args.min_chunk is not None else ""
+            row["skip_reason"] = str(exc)
+            print(
+                f"[JUPITER_SUITE_SKIP] prompt={prompt.name} "
+                f"tokens={row.get('actual_tokens', 'unknown')} reason={exc}",
+                flush=True,
+            )
         except (ValueError, RuntimeError, OSError, KeyError) as exc:
             failures += 1
             row["status"] = "FAILED"
@@ -449,13 +504,21 @@ def main() -> int:
                   f"reason={str(exc)[:500]}", file=sys.stderr, flush=True)
         rows.append(row)
         save_suite(out, rows, suite_config)
-        if row["status"] != "PASS" and not args.continue_on_error:
+        if row["status"] == "FAILED" and not args.continue_on_error:
             break
 
-    print(f"[JUPITER_SUITE_DONE] passed={sum(r['status']=='PASS' for r in rows)} "
-          f"failed={failures} total={len(prompts)} "
+    passed = sum(r["status"] == "PASS" for r in rows)
+    print(f"[JUPITER_SUITE_DONE] passed={passed} skipped={skipped} "
+          f"failed={failures} processed={len(rows)}/{len(prompts)} "
           f"results={out / 'suite-results.csv'}", flush=True)
-    return 1 if failures else 0
+    if passed == 0 and failures == 0:
+        print(
+            "[JUPITER_SUITE_NO_ELIGIBLE_PROMPTS] "
+            "All prompts were too short or incompatible with the chosen b; "
+            "supply longer prompts or explicitly run a different experiment.",
+            file=sys.stderr, flush=True,
+        )
+    return 1 if failures or passed == 0 else 0
 
 
 if __name__ == "__main__":
