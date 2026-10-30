@@ -485,6 +485,7 @@ inline bool simulate(const model & m,
     }
 
     std::vector<edge> edges;
+    std::vector<std::vector<int>> outgoing_edges(tasks.size());
     for (size_t r = 0; r + 1 < regions.size(); ++r) {
         const auto a = region_output_owner(regions[r]);
         const auto b = region_input_owner(regions[r + 1]);
@@ -518,7 +519,9 @@ inline bool simulate(const model & m,
                          !std::isfinite(ms) || ms < 0.0)) {
                     return reject("TRANSFER_PROFILE_MISSING");
                 }
+                const int edge_id = (int) edges.size();
                 edges.push_back({src, dst, lane, ms});
+                outgoing_edges[(size_t) src].push_back(edge_id);
                 ++tasks[(size_t) src].outputs;
                 ++tasks[(size_t) dst].inputs;
             }
@@ -587,6 +590,11 @@ inline bool simulate(const model & m,
 
     std::priority_queue<event> events;
     std::array<std::deque<int>, 3> ready_queues;
+    // Min edge-id per lane replicates the old src-major full scan order.
+    // Producers enqueue only their own edges at completion; no global
+    // O(total_edges) polling on every simulated event.
+    std::array<std::priority_queue<
+        int, std::vector<int>, std::greater<int>>, 3> ready_links;
     std::array<bool, 3> device_busy {}, link_busy {};
     bool pc_compute_gate_busy = false;
     int next_pc_device = 0;
@@ -724,18 +732,20 @@ inline bool simulate(const model & m,
             scheduled = true;
         }
 
-        // Producer completion makes its output transferable immediately.
-        // Phone directions share one conservative Wi-Fi lane.
-        for (size_t e = 0; e < edges.size(); ++e) {
-            auto & it = edges[e];
-            if (it.started || !tasks[(size_t) it.producer].done ||
-                link_busy[(size_t) it.lane]) {
+        // Producer completion makes intersecting edges transferable.
+        // Select the lowest ready edge-id on each independent link lane,
+        // exactly as the previous src-major global scan did.
+        for (size_t lane = 0; lane < ready_links.size(); ++lane) {
+            if (link_busy[lane] || ready_links[lane].empty()) {
                 continue;
             }
+            const int edge_id = ready_links[lane].top();
+            ready_links[lane].pop();
+            auto & it = edges[(size_t) edge_id];
             it.started = true;
-            link_busy[(size_t) it.lane] = true;
-            transfer_busy_ms[(size_t) it.lane] += it.duration;
-            events.push({now + it.duration, (int) e, event_kind::EDGE});
+            link_busy[lane] = true;
+            transfer_busy_ms[lane] += it.duration;
+            events.push({now + it.duration, edge_id, event_kind::EDGE});
             scheduled = true;
         }
 
@@ -880,6 +890,10 @@ inline bool simulate(const model & m,
                 return reject("DUPLICATE_TASK_DONE");
             }
             t.done = true;
+            for (int edge_id : outgoing_edges[(size_t) current.id]) {
+                const int lane = edges[(size_t) edge_id].lane;
+                ready_links[(size_t) lane].push(edge_id);
+            }
             for (int resource = 0; resource < 3; ++resource) {
                 if ((t.resource_mask &
                         (1u << (unsigned) resource)) != 0) {
