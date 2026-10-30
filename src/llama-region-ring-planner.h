@@ -2613,6 +2613,79 @@ inline result search_runtime_applicable(
         out.top.push_back(std::move(plan));
     }
 
+    // Full-layout throughput anchors: E is a relative mismatch and can
+    // discard a much faster plan with a less balanced first Cycle. Preserve
+    // just two memory-feasible low-absolute-work layouts per Cycle count
+    // outside the existing E shortlist. They reuse the SAME Profile and
+    // data-only event simulator; this does not launch model inference.
+    std::vector<size_t> throughput_order(coarse.size());
+    for (size_t i = 0; i < coarse.size(); ++i) {
+        throughput_order[i] = i;
+    }
+    std::sort(throughput_order.begin(), throughput_order.end(),
+        [&](size_t a, size_t b) {
+            if (coarse[a].coarse_ms != coarse[b].coarse_ms) {
+                return coarse[a].coarse_ms < coarse[b].coarse_ms;
+            }
+            return coarse[a].ring_error_max < coarse[b].ring_error_max;
+        });
+    const auto throughput_key = [&](const candidate & c) {
+        std::vector<llama_region_ring_region> rs;
+        if (!make_regions(c, m.layers, rs)) {
+            return std::string();
+        }
+        return llama_region_ring_layout_string(rs) + "/" +
+            std::to_string(c.xc) + "/" + std::to_string(c.xg) + "/" +
+            std::to_string(c.xp);
+    };
+    std::unordered_set<std::string> throughput_seen;
+    for (const auto & c : out.top) {
+        const std::string key = throughput_key(c);
+        if (!key.empty()) {
+            throughput_seen.insert(key);
+        }
+    }
+    for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+        size_t chosen = 0;
+        std::unordered_set<std::string> chosen_chunks;
+        for (size_t i : throughput_order) {
+            if (coarse[i].cycles != n_cycles) {
+                continue;
+            }
+            const auto & source = coarse[i];
+            const std::string chunk_key =
+                std::to_string(source.xc) + "/" +
+                std::to_string(source.xg) + "/" +
+                std::to_string(source.xp);
+            if (chosen_chunks.count(chunk_key)) {
+                continue;
+            }
+            const std::string key = throughput_key(source);
+            if (key.empty() || !throughput_seen.insert(key).second) {
+                continue;
+            }
+            chosen_chunks.insert(chunk_key);
+            candidate plan = source;
+            plan.throughput_seed = true;
+            std::vector<llama_region_ring_region> rs;
+            if (!make_regions(plan, m.layers, rs)) {
+                continue;
+            }
+            ++out.throughput_shortlisted;
+            ++out.shortlisted;
+            if (!simulate(m, rs, plan)) {
+                ++out.rejected_deadlock;
+                continue;
+            }
+            ++out.throughput_simulated;
+            ++out.simulated;
+            out.top.push_back(std::move(plan));
+            if (++chosen == 2) {
+                break;
+            }
+        }
+    }
+
     } // Optional uniform control candidates
 
     // Two-level nonuniform construction:
