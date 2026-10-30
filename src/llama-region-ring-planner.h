@@ -2364,11 +2364,11 @@ inline result search_runtime_applicable(
         const double seed_e_limit =
             std::min(1.0, first_seeds.front().first_e + e_margin);
 
-        // Keep several low-E first-Cycle *geometries* before filling
-        // remaining slots with alternative Chunk triples. This prevents
-        // the beam from collapsing to one shape with 12 X variations.
+        // Preserve both shape diversity and Chunk-triple diversity.
+        // All selected seeds fix XC/XG/XP across their subsequent cycles.
         std::vector<size_t> chosen;
         std::unordered_set<std::string> chosen_shapes;
+        std::unordered_set<std::string> chosen_chunks;
         std::unordered_set<size_t> chosen_indices;
         for (size_t i = 0; i < first_seeds.size(); ++i) {
             if (first_seeds[i].first_e > seed_e_limit + 1e-12 ||
@@ -2384,6 +2384,26 @@ inline result search_runtime_applicable(
                 chosen_indices.insert(i);
             }
         }
+        // First fill with different XC/XG/XP triples from the E window.
+        // A locally less balanced Chunk can outperform the best-E Chunk
+        // after downstream cycles compensate its cumulative load.
+        for (size_t i = 0; i < first_seeds.size() &&
+                chosen.size() < k_first_seeds_per_n; ++i) {
+            const auto & v = first_seeds[i];
+            if (v.first_e > seed_e_limit + 1e-12) {
+                break;
+            }
+            const std::string xkey =
+                std::to_string(v.ci) + "/" +
+                std::to_string(v.gi) + "/" +
+                std::to_string(v.pi);
+            if (chosen_chunks.insert(xkey).second &&
+                chosen_indices.insert(i).second) {
+                chosen.push_back(i);
+            }
+        }
+        // If there are few distinct triples near E_min, keep alternate
+        // geometries for them rather than shrinking the second-stage beam.
         for (size_t i = 0; i < first_seeds.size() &&
                 chosen.size() < k_first_seeds_per_n; ++i) {
             if (first_seeds[i].first_e > seed_e_limit + 1e-12) {
