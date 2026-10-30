@@ -818,3 +818,82 @@ python .\tools\jupiter\run_prefill_bench.py `
 The q-sweep/refinement GPU stage timers deliberately synchronize devices;
 do not interpret them as real overlap or actual throughput. Final runtime
 verification is one trial, not an A/B result.
+
+## Stage 5: multiple prompt lengths with separate calibrated Jupiter plans
+
+The 357-token one-prompt result alone cannot establish a benefit at longer
+sequences. `run_prompt_suite.py` profiles and benchmarks each supplied prompt
+**independently**: actual prefill token probe, initial q(x,y), Sequence DP,
+exact-q refinement, runtime plan verification, then the ordinary unprofiled
+`default,fixed64,dp` Prefill A/B. The script only orchestrates existing
+runners; it does **not** modify the inference executor.
+
+Provide a directory of real UTF-8 `.txt` prompts, ideally spanning roughly
+350, 700, 1000 and 1500+ tokens (these are intended groups, **not** assumed
+token counts). Names and character lengths are not authoritative; every
+case is tokenized by the actual `llama-cli` configuration before planning.
+Longer prompts require a sufficient batch and context, and some larger
+contexts may not fit the PC/Phone memory budgets.
+
+Start with one model and the PC 20 / Phone 20 placement used in Stage 1.
+The Stage-2 `min-chunk.json` contains an efficiency curve measured on the
+original 357-token prompt. Reuse that curve only for the **same model and
+devices**. The Stage-3 log explicitly marks reuse at a new prompt length.
+With auto b, different lengths may select different feasible minimum chunk
+sizes; a prompt length divisible by 128 can choose b=128 and hence force
+fixed 128-token chunks (no DP degrees of freedom). To compare prompt
+lengths with one common constraint, use `--min-chunk 96`, a documented
+**fixed-b ablation**, not a claim that this value strictly reached the
+90% saturation threshold. This example uses fixed b=96.
+
+```powershell
+cd E:\llama\llama-jupiter
+git pull --ff-only origin baseline/jupiter-infocom25
+python -m unittest discover -s .\tools\jupiter -p test_run_prompt_suite.py -v
+python -m unittest discover -s .\tools\jupiter -p test_sequence_pipeline.py -v
+python -m unittest discover -s .\tools\jupiter -p test_refine_sequence_q.py -v
+
+python .\tools\jupiter\run_prompt_suite.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompts-dir .\jupiter-prompts `
+  --min-chunk-json .\jupiter-min-chunk\min-chunk.json `
+  --min-chunk 96 `
+  --pc-layers 20 --ubatch 128 `
+  --batch 2048 --context 2048 --threads 8 `
+  --q-repeats 2 --refine-repeats 2 --max-rounds 6 `
+  --bench-repeats 7 --modes default,fixed64,dp `
+  --window 2 `
+  --out-dir .\jupiter-prompt-suite `
+  --resume
+```
+
+You may also pass `--prompt-file path` multiple times instead of
+`--prompts-dir`. `--dry-run` previews case directories without launching
+the model. The pipeline uses fixed per-prompt configuration fingerprints,
+supports `--resume` to preserve finished work, and optionally
+`--continue-on-error` to record one failed prompt while moving on to others.
+
+Each case directory holds `token-probe.log`, `stage3-run.log`,
+`stage3/q-sweep/`, `stage3/refinement*/`, `final.plan`, `bench-run.log`,
+`bench/results.csv`, `bench/summary.txt` and the exact case configuration.
+At the top of the output folder, the script writes:
+
+- `suite-results.csv`: actual token counts, per-prompt DP chunks, median
+  Prefill latency, tokens/s, and DP-versus-Default speedup
+- `suite-summary.json`: full experiment settings and status for every prompt
+
+Only a fully measured and runtime-verified Stage-3 plan advances to the
+Prefill benchmark; benchmark runs use `PROFILE_STAGE=0`, `TRACE=0`,
+`async-c2p=0`, and no per-chunk communication timing. Each process is
+an independent sample, with rotating mode order and medians.
+
+The Sequence DP solver now automatically searches enough chunk counts
+for long prompts instead of capping at `4 * devices = 8`; each DP transition
+is restricted to valid chunk sizes and prefix lengths. Example: at
+`max_chunk=128`, a 1536-token prompt needs **at least 12 chunks**.
+
+A successful suite establishes measured results for these prompts, not
+faithfulness of all Jupiter system components. If the DP variant remains
+slower, report that finding rather than changing the original baseline.
