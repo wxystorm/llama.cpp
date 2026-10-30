@@ -78,6 +78,11 @@ def parse_timing(path: Path) -> tuple[float, int]:
     return ms, tokens
 
 
+def compatible_timing_tokens(actual: int, target: int, tolerance: int) -> bool:
+    """Allow the known optional one-token CLI timing counter convention."""
+    return actual > 0 and target > 0 and abs(actual - target) <= tolerance
+
+
 def run_one(
     command: list[str],
     env: dict[str, str],
@@ -345,7 +350,7 @@ def main() -> int:
             if args.resume and log_path.exists():
                 try:
                     ms, n_tokens = parse_timing(log_path)
-                    if abs(n_tokens - target) > args.timing_token_tolerance:
+                    if not compatible_timing_tokens(n_tokens, target, args.timing_token_tolerance):
                         raise ValueError("cached prompt length differs")
                     print(
                         f"[JUPITER_BENCH_RESUME] mode={mode} repeat={repeat} "
@@ -370,7 +375,7 @@ def main() -> int:
                 )
                 ms, n_tokens = parse_timing(log_path)
 
-            if abs(n_tokens - target) > args.timing_token_tolerance:
+            if not compatible_timing_tokens(n_tokens, target, args.timing_token_tolerance):
                 raise RuntimeError(
                     f"mode={mode} repeat={repeat}: CLI timing tokens "
                     f"{n_tokens}, actual prefill batch tokens {target}; log={log_path}"
