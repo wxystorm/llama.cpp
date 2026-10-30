@@ -318,6 +318,24 @@ int main() {
             }
         }
         REQUIRE(saw_prefix_origin);
+
+        // Throughput-origin neighbors retain a separate source label.
+        candidate throughput_incumbent = incumbent;
+        throughput_incumbent.throughput_seed = true;
+        result from_throughput;
+        from_throughput.top.push_back(throughput_incumbent);
+        seen.clear();
+        seen.insert(start_key);
+        refine_runtime_local_candidates(local, from_throughput, seen);
+        bool saw_throughput_origin = false;
+        for (const auto & c : from_throughput.top) {
+            if (c.local_refined) {
+                REQUIRE(c.local_from_throughput);
+                REQUIRE(!c.local_from_prefix);
+                saw_throughput_origin = true;
+            }
+        }
+        REQUIRE(saw_throughput_origin);
     }
 
     // APPLY_WIDE may allocate Phone stages of any positive depth.
@@ -856,6 +874,10 @@ int main() {
             value_profile, value_baseline, 64, 16, 0.50, 0);
         REQUIRE(value_result.valid);
         REQUIRE(value_result.shortlisted == value_result.simulated);
+        REQUIRE(value_result.throughput_shortlisted <= 6);
+        REQUIRE(value_result.throughput_shortlisted ==
+                value_result.throughput_simulated);
+        REQUIRE(value_result.local_shortlisted <= 48);
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
         REQUIRE(value_result.first_cycle_selected <= 100);
@@ -907,7 +929,8 @@ int main() {
         // Only the uniform control is subject to the original E floor.
         // Prefix-generated layouts are selected by full DAG wall time.
         REQUIRE(std::isfinite(value_result.selected.ring_error_max));
-        if (value_result.selected.concrete_regions.empty()) {
+        if (value_result.selected.concrete_regions.empty() &&
+                !value_result.selected.throughput_seed) {
             REQUIRE(value_result.selected.ring_error_max <=
                     value_result.shortlist_e_limit + 1e-12);
         }
@@ -939,7 +962,8 @@ int main() {
         REQUIRE(floor_result.prefix_completed > 0);
         REQUIRE(floor_result.nonuniform_profiled > 0);
         REQUIRE(std::isfinite(floor_result.selected.ring_error_max));
-        if (floor_result.selected.concrete_regions.empty()) {
+        if (floor_result.selected.concrete_regions.empty() &&
+                !floor_result.selected.throughput_seed) {
             REQUIRE(floor_result.selected.ring_error_max <=
                     floor_result.shortlist_e_limit + 1e-12);
         }
