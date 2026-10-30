@@ -130,6 +130,11 @@ struct model {
     // measured/proxied host->CUDA transfer time for those bytes.
     std::function<bool(int, int, size_t &)> gpu_region_weight_bytes;
     std::function<bool(size_t, double &)> gpu_weight_h2d_ms;
+    // APPLY_WIDE GPU memory budget and per-GPU-layer KV cost, in bytes.
+    // The same 90% free-VRAM allowance and full-Prompt KV size used by
+    // memory_feasible(candidate). Zero budget disables early GPU filtering.
+    long double gpu_memory_budget_bytes = 0.0L;
+    long double gpu_kv_bytes_per_layer = 0.0L;
     std::function<bool(const candidate &)> memory_feasible;
     // Unlike memory_feasible(candidate), this callback accepts per-cycle
     // C/G boundaries. It is used ONLY by the real APPLY-safe search.
@@ -294,6 +299,112 @@ inline bool gpu_weight_bank_peaks(
         ++gpu_ordinal;
     }
     return true;
+}
+
+// A safe GPU-memory lower bound for a prefix of completed G/C/P Cycles.
+// On a streamed GPU, each cycle's GPU Region occupies alternating Banks;
+// peaks of BOTH Banks coexist, so VRAM weights = max(even-cycle regions)
+// + max(odd-cycle regions), never the sum of all logical GPU weights.
+// The following Cycle must begin with at least one GPU layer at
+// prefix.back().layer_end, which is included BEFORE picking an E seed.
+// Future GPU KV allocations are bounded below by one layer per missing
+// Cycle. This test may accept a prefix that later fails, but never rejects a
+// full plan that passes the original GPU part of memory_feasible().
+struct gpu_prefix_memory_bound {
+    long double bank0_bytes = 0.0L;
+    long double bank1_bytes = 0.0L;
+    long double gpu_kv_min_bytes = 0.0L;
+    long double scratch_bytes = 0.0L;
+    long double total_min_bytes = 0.0L;
+    long double budget_bytes = 0.0L;
+};
+
+inline bool gpu_prefix_memory_feasible(
+        const model & m,
+        const std::vector<llama_region_ring_region> & prefix,
+        int total_cycles,
+        int xg,
+        gpu_prefix_memory_bound * bound = nullptr) {
+    gpu_prefix_memory_bound estimate;
+    estimate.budget_bytes = m.gpu_memory_budget_bytes;
+    if (estimate.budget_bytes <= 0.0L) {
+        if (bound) { *bound = estimate; }
+        return true; // Unknown VRAM profile; retain existing full-plan gate.
+    }
+    if (!m.gpu_region_weight_bytes || total_cycles < 2 ||
+            total_cycles > 4 || xg <= 0 || prefix.empty() ||
+            prefix.back().layer_end > m.layers ||
+            prefix.back().device != device::PHONE ||
+            prefix.size() % 3 != 0) {
+        return false;
+    }
+    const int known_cycles = (int) prefix.size() / 3;
+    if (known_cycles < 1 || known_cycles > total_cycles) {
+        return false;
+    }
+    size_t known_gpu_layers = 0;
+    long double unstreamed_weights = 0.0L;
+    int gpu_rank = 0;
+    for (const auto & region : prefix) {
+        if (region.device != device::GPU) {
+            continue;
+        }
+        size_t weight_bytes = 0;
+        if (!m.gpu_region_weight_bytes(
+                region.layer_begin, region.layer_end, weight_bytes) ||
+                weight_bytes == 0) {
+            return false;
+        }
+        if (m.gpu_weight_streaming) {
+            long double & bank = gpu_rank % 2 == 0 ?
+                estimate.bank0_bytes : estimate.bank1_bytes;
+            bank = std::max(bank, (long double) weight_bytes);
+        } else {
+            unstreamed_weights += (long double) weight_bytes;
+        }
+        known_gpu_layers += (size_t) (region.layer_end - region.layer_begin);
+        ++gpu_rank;
+    }
+    if (gpu_rank != known_cycles) {
+        return false;
+    }
+    const int remaining_cycles = total_cycles - known_cycles;
+    if (remaining_cycles > 0) {
+        // Next GPU Region starts exactly at the end of this Phone Region.
+        const int next_begin = prefix.back().layer_end;
+        if (next_begin >= m.layers) {
+            return false;
+        }
+        size_t one_layer_bytes = 0;
+        if (!m.gpu_region_weight_bytes(
+                next_begin, next_begin + 1, one_layer_bytes) ||
+                one_layer_bytes == 0) {
+            return false;
+        }
+        if (m.gpu_weight_streaming) {
+            long double & bank = gpu_rank % 2 == 0 ?
+                estimate.bank0_bytes : estimate.bank1_bytes;
+            bank = std::max(bank, (long double) one_layer_bytes);
+        } else {
+            unstreamed_weights += (long double) one_layer_bytes;
+        }
+    }
+    estimate.gpu_kv_min_bytes = std::max(0.0L, m.gpu_kv_bytes_per_layer) *
+        (known_gpu_layers + (size_t) remaining_cycles);
+    if (m.slot_pool > 0) {
+        estimate.scratch_bytes =
+            (long double) m.slot_pool * xg * m.hidden * sizeof(float) * 3;
+    }
+    estimate.total_min_bytes =
+        (m.gpu_weight_streaming ?
+            estimate.bank0_bytes + estimate.bank1_bytes :
+            unstreamed_weights) +
+        estimate.gpu_kv_min_bytes + estimate.scratch_bytes;
+    if (bound) {
+        *bound = estimate;
+    }
+    return std::isfinite(estimate.total_min_bytes) &&
+        estimate.total_min_bytes <= estimate.budget_bytes;
 }
 
 inline bool gpu_weight_h2d_total(
