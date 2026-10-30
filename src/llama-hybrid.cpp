@@ -10524,6 +10524,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             forced_ab ? "FORCED_AB" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
+            best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
                 "AUTO_RUNTIME_V2",
             best_text.c_str(), baseline_text.c_str(),
             best.cycles, best.c, best.g, best.p,
@@ -10555,6 +10556,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "\"source\":\""
                             << (forced_ab ? "forced" :
                                 boundary_tensor_selected ? "tensor" :
+                                best.local_refined ?
+                                    (best.local_from_prefix ?
+                                        "local_prefix" : "local_uniform") :
                                 best.prefix_cycles > 0 ?
                                     "prefix" : "uniform")
                             << "\","
@@ -10583,6 +10587,22 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"first_cycle_e\":"
                             << (best.prefix_cycles > 0 ?
                                 best.prefix_error[0] : best.ring_error_max)
+                            << ",\"local_refined\":"
+                            << (best.local_refined ? "true" : "false")
+                            << ",\"local_from_prefix\":"
+                            << (best.local_from_prefix ? "true" : "false")
+                            << ",\"local_anchors\":" << result.local_anchors
+                            << ",\"local_generated\":" << result.local_generated
+                            << ",\"local_memory_rejected\":"
+                            << result.local_memory_rejected
+                            << ",\"local_profile_rejected\":"
+                            << result.local_profile_rejected
+                            << ",\"local_shortlisted\":"
+                            << result.local_shortlisted
+                            << ",\"local_simulated\":"
+                            << result.local_simulated
+                            << ",\"local_improved\":"
+                            << result.local_improved
                             << ",\"first_cycle_seeds\":"
                             << result.first_cycle_selected
                             << ",\"gpu_first_pairs_pruned\":"
@@ -10664,6 +10684,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             forced_ab ? "FORCED_AB" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
+            best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
                 "AUTO_RUNTIME_V2",
             selected_layout->c_str(),
             *selected_xc, *selected_xg, *selected_xp);
