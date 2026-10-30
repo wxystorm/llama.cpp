@@ -147,6 +147,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--target-tokens", type=int)
     p.add_argument("--pc-layers", type=int, default=25)
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument(
+        "--timing-token-tolerance", type=int, choices=[0, 1], default=0,
+        help="allow at most one token difference between runtime prefill "
+             "batch size and CLI timing count (raw count is recorded separately)",
+    )
     p.add_argument("--modes", type=modes_arg, default=list(MODES))
     p.add_argument("--out-dir", default="jupiter-bench-formal")
     p.add_argument("--ubatch", type=int, default=128)
@@ -251,6 +256,10 @@ def main() -> int:
         "dp_chunks": plans.get(target),
         "fixed64_chunks": fixed,
     }
+    # Keep strict default configs backwards-compatible with earlier runs;
+    # an opt-in tolerance must be visible in the experiment identity.
+    if args.timing_token_tolerance:
+        config["timing_token_tolerance"] = args.timing_token_tolerance
     config_path = out / "configuration.json"
     if args.resume and config_path.is_file():
         previous = json.loads(config_path.read_text(encoding="utf-8"))
@@ -336,7 +345,7 @@ def main() -> int:
             if args.resume and log_path.exists():
                 try:
                     ms, n_tokens = parse_timing(log_path)
-                    if n_tokens != target:
+                    if abs(n_tokens - target) > args.timing_token_tolerance:
                         raise ValueError("cached prompt length differs")
                     print(
                         f"[JUPITER_BENCH_RESUME] mode={mode} repeat={repeat} "
@@ -361,14 +370,22 @@ def main() -> int:
                 )
                 ms, n_tokens = parse_timing(log_path)
 
-            if n_tokens != target:
+            if abs(n_tokens - target) > args.timing_token_tolerance:
                 raise RuntimeError(
-                    f"mode={mode} repeat={repeat}: actual prompt tokens "
-                    f"{n_tokens}, expected {target}; log={log_path}"
+                    f"mode={mode} repeat={repeat}: CLI timing tokens "
+                    f"{n_tokens}, actual prefill batch tokens {target}; log={log_path}"
                 )
-            speed = n_tokens * 1000.0 / ms
+            if n_tokens != target:
+                print(
+                    f"[JUPITER_BENCH_TOKEN_CONVENTION] mode={mode} "
+                    f"repeat={repeat} planned_prefill_tokens={target} "
+                    f"cli_timing_tokens={n_tokens} difference={n_tokens - target}",
+                    flush=True,
+                )
+            speed = target * 1000.0 / ms
             rows.append({
-                "mode": mode, "repeat": repeat, "tokens": n_tokens,
+                "mode": mode, "repeat": repeat, "tokens": target,
+                "timing_tokens": n_tokens,
                 "prefill_ms": round(ms, 3),
                 "prefill_tok_s": round(speed, 3),
                 "log": str(log_path),
@@ -383,8 +400,8 @@ def main() -> int:
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["mode", "repeat", "tokens", "prefill_ms",
-                        "prefill_tok_s", "log"],
+            fieldnames=["mode", "repeat", "tokens", "timing_tokens",
+                        "prefill_ms", "prefill_tok_s", "log"],
         )
         writer.writeheader()
         writer.writerows(rows)
