@@ -69,6 +69,48 @@ number is a hint), and generates up to 32 tokens by default. Context size
 grows with the filename token hint; increase `--context-padding` if the
 tokenizer produces more tokens than expected.
 
+### APPLY_WIDE first-Cycle Chunk search (fine-grid E + fixed-X prefix)
+
+The apply-wide first-Cycle search considers six variables:
+(G,C,P,XG,XC,XP). Its Chunk candidate set for **each device** is:
+
+    8,12,16,20,24,28,32,40,48,56,64,80,96,112,128,160,192
+
+Chunks larger than the evaluated Prompt are not separately searched in this
+first-Cycle pass. Layer compute and Prepare times for intermediate Chunk
+sizes are interpolated from the Hybrid Profile; additional direct full-layer
+probes at 24 and 48 tokens (and 96 on CUDA) improve that interpolation.
+
+The existing minimax **E=max(e1,e2,e3)** remains the first-stage objective.
+Its CPU/CUDA/Phone service terms are evaluated from cached per-device
+Profile curves. The inter-device handoff terms explicitly account for
+**overlapping absolute token intervals** for both producer and consumer X.
+For example, G40 -> C24 incurs two intersections for the first G40
+producer; any fixed transfer startup cost is charged for each simulated
+overlap edge. The first-stage E handoff is a sum of those per-edge
+estimated costs divided by Prompt tokens, consistent with the complete
+event simulator's transfer model. These are estimates, not measured socket
+timings; compare against real runs when evaluating performance.
+
+The first-Cycle **E1(XG,XP)**, **E2(XC,XG)** and **E3(XP,XC)** constraints
+allow exact pairwise bitmask screening. An initial E cutoff is derived from
+the original four anchor sizes {16,32,64,128} and refined against the
+fine-grid minimum. The search retains the best few X choices for each
+Cycle geometry and the best geometry for each X triple, avoiding a giant
+materialized six-dimensional candidate array.
+
+Up to **24 diverse first-Cycle seeds per Cycle count** enter the existing
+prefix compensation beam (width **8**). Each seed fixes **XC/XG/XP for
+every subsequent Cycle**. Later Cycles adjust only G/C/P, using the original
+cumulative prefix E + history + Cycle-width soft-penalty ranking. No Chunk
+re-search occurs after selecting the first-Cycle seed. Final choices still
+come from the complete Prompt event simulation and optional Tensor
+boundary comparison.
+
+The original four-point uniform repeated-Cycle search is retained as an
+A/B control. Forced XC/XG/XP experiments accept the fine grid above;
+always specify all three values together with a complete --force-layout.
+
 ## Results
 
 ```text
