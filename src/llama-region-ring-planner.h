@@ -1746,6 +1746,13 @@ struct first_cycle_seed_record {
     double first_e = std::numeric_limits<double>::infinity();
     std::array<double, 3> first_service_mspt {};
     std::array<double, 3> first_handoff_mspt {};
+    long double gpu_bank0_min_bytes = 0.0L;
+    long double gpu_bank1_min_bytes = 0.0L;
+    long double gpu_kv_min_bytes = 0.0L;
+    long double gpu_peak_min_bytes = 0.0L;
+    long double gpu_budget_bytes = 0.0L;
+    size_t gpu_prefix_pruned = 0;
+    size_t memory_prebeam_rejected = 0;
     size_t completed = 0;
     size_t duplicates = 0;
     size_t rejected_memory = 0;
@@ -1774,9 +1781,14 @@ struct result {
     size_t nonuniform_profiled = 0;
     size_t nonuniform_simulated = 0;
     size_t first_cycle_profiled = 0;
+    // Geometry/XG pairs rejected before E anchors or bitsets are built.
+    size_t first_cycle_gpu_pairs_pruned = 0;
+    size_t first_cycle_gpu_shapes_pruned = 0;
     size_t first_cycle_selected = 0;
     std::vector<first_cycle_seed_record> first_cycle_seeds;
     size_t prefix_expanded = 0;
+    size_t prefix_gpu_memory_pruned = 0;
+    size_t prefix_full_memory_pruned = 0;
     size_t prefix_completed = 0;
     double first_cycle_e_min = std::numeric_limits<double>::infinity();
     double coarse_e_min = std::numeric_limits<double>::infinity();
@@ -2347,6 +2359,37 @@ inline result search_runtime_applicable(
             continue;
         }
 
+        // Memory-first E search: evaluate the streamed CUDA Bank0 peak and
+        // mandatory next-cycle Bank1 floor for EVERY G/C/P geometry before
+        // the anchor E minimum. For slot pools, XG influences GPU scratch.
+        const size_t n_x = chunks.size();
+        std::vector<uint8_t> first_gpu_ok(
+            geometries.size() * n_x, (uint8_t) 0);
+        for (size_t si = 0; si < geometries.size(); ++si) {
+            const auto & shape = geometries[si];
+            const std::vector<llama_region_ring_region> first_regions {
+                {device::GPU, 0, shape.g},
+                {device::CPU, shape.g, shape.g + shape.c},
+                {device::PHONE, shape.g + shape.c, shape.width}
+            };
+            bool any_gpu_xg = false;
+            for (size_t gi = 0; gi < n_x; ++gi) {
+                if (chunks[gi] > m.tokens) {
+                    continue;
+                }
+                if (gpu_prefix_memory_feasible(
+                        m, first_regions, n_cycles, chunks[gi])) {
+                    first_gpu_ok[si * n_x + gi] = 1;
+                    any_gpu_xg = true;
+                } else {
+                    ++out.first_cycle_gpu_pairs_pruned;
+                }
+            }
+            if (!any_gpu_xg) {
+                ++out.first_cycle_gpu_shapes_pruned;
+            }
+        }
+
         // A 4-point anchor search supplies a *safe* initial E cutoff:
         // the dense grid contains every anchor, hence its minimum E cannot
         // be greater than the anchor minimum. No seed in the final
@@ -2360,12 +2403,16 @@ inline result search_runtime_applicable(
             }
         }
         double anchor_min_e = invalid;
-        for (const auto & shape : geometries) {
+        for (size_t si = 0; si < geometries.size(); ++si) {
+            const auto & shape = geometries[si];
             for (size_t ci : anchors) {
                 const double A =
                     service[(size_t) device::CPU][ci][(size_t) shape.c];
                 if (!std::isfinite(A)) { continue; }
                 for (size_t gi : anchors) {
+                    if (!first_gpu_ok[si * n_x + gi]) {
+                        continue;
+                    }
                     const double B =
                         service[(size_t) device::GPU][gi][(size_t) shape.g];
                     if (!std::isfinite(B)) { continue; }
@@ -2395,7 +2442,6 @@ inline result search_runtime_applicable(
         // Bounded streaming summaries, not early per-shape Top-3 pruning.
         // Every E-admissible six-dimensional combination is inspected.
         std::vector<first_cycle_seed> best_by_geometry(geometries.size());
-        const size_t n_x = chunks.size();
         std::vector<first_cycle_seed> best_by_chunk(n_x * n_x * n_x);
         std::priority_queue<first_cycle_seed,
                             std::vector<first_cycle_seed>,
@@ -2408,6 +2454,9 @@ inline result search_runtime_applicable(
             std::vector<uint64_t> e3_mask(n_x, 0);
 
             for (size_t gi = 0; gi < n_x; ++gi) {
+                if (!first_gpu_ok[si * n_x + gi]) {
+                    continue;
+                }
                 const double B =
                     service[(size_t) device::GPU][gi][(size_t) shape.g];
                 if (!std::isfinite(B)) { continue; }
@@ -2443,6 +2492,9 @@ inline result search_runtime_applicable(
                     continue;
                 }
                 for (size_t gi = 0; gi < n_x; ++gi) {
+                    if (!first_gpu_ok[si * n_x + gi]) {
+                        continue;
+                    }
                     const double B =
                         service[(size_t) device::GPU][gi][(size_t) shape.g];
                     if (!std::isfinite(B) || e1_mask[gi] == 0 ||
@@ -2632,6 +2684,20 @@ inline result search_runtime_applicable(
         trace.first_service_mspt = seed.load;
         trace.first_handoff_mspt = seed.links;
         const int n_cycles = seed.cycles;
+        const std::vector<llama_region_ring_region> first_regions {
+            {device::GPU, 0, seed.g},
+            {device::CPU, seed.g, seed.g + seed.c},
+            {device::PHONE, seed.g + seed.c, seed.width}
+        };
+        gpu_prefix_memory_bound bound;
+        if (gpu_prefix_memory_feasible(
+                m, first_regions, n_cycles, chunks[seed.gi], &bound)) {
+            trace.gpu_bank0_min_bytes = bound.bank0_bytes;
+            trace.gpu_bank1_min_bytes = bound.bank1_bytes;
+            trace.gpu_kv_min_bytes = bound.gpu_kv_min_bytes;
+            trace.gpu_peak_min_bytes = bound.total_min_bytes;
+            trace.gpu_budget_bytes = bound.budget_bytes;
+        }
         const int avg_low = m.layers / n_cycles;
         const int avg_high = (m.layers + n_cycles - 1) / n_cycles;
         const int spread = std::max(2, (avg_high + 3) / 4);
