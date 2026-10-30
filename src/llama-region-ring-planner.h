@@ -407,6 +407,123 @@ inline bool gpu_prefix_memory_feasible(
         estimate.total_min_bytes <= estimate.budget_bytes;
 }
 
+// Exact minimum GPU VRAM required by any legal completion of a first
+// G/C/P Cycle, considering the same later-Cycle width limits as the Beam.
+// For GPU memory alone, later GPU Regions of length one are optimal:
+// additional GPU layers can only increase both weight bytes and KV bytes.
+// Thus searching subsequent Cycle WIDTHS with G=1 is an existential test,
+// not a heuristic restriction on later G during the real Planner search.
+// Returns a lower bound across complete Cycle layouts, WITHOUT XG scratch.
+inline bool gpu_minimum_complete_first_cycle_memory(
+        const model & m,
+        int first_g, int first_c, int first_p, int n_cycles,
+        int width_low, int width_high, int width_spread,
+        gpu_prefix_memory_bound & best) {
+    best = {};
+    best.budget_bytes = m.gpu_memory_budget_bytes;
+    if (m.gpu_memory_budget_bytes <= 0.0L) {
+        return true;
+    }
+    if (!m.gpu_region_weight_bytes || n_cycles < 2 ||
+            n_cycles > 4 || first_g < 1 || first_c < 1 ||
+            first_p < 1 || width_spread < 0) {
+        return false;
+    }
+    const int first_width = first_g + first_c + first_p;
+    if (first_width < width_low || first_width > width_high ||
+            first_width >= m.layers) {
+        return false;
+    }
+    size_t first_weight = 0;
+    if (!m.gpu_region_weight_bytes(0, first_g, first_weight) ||
+            first_weight == 0) {
+        return false;
+    }
+    const long double gpu_kv_floor =
+        std::max(0.0L, m.gpu_kv_bytes_per_layer) *
+        (first_g + n_cycles - 1);
+    best.total_min_bytes = std::numeric_limits<long double>::infinity();
+
+    std::function<void(int, int, int, int,
+                       long double, long double, long double)> walk;
+    walk = [&](int completed, int begin, int min_width, int max_width,
+               long double bank0, long double bank1,
+               long double unstreamed) {
+        if (completed == n_cycles) {
+            if (begin != m.layers) {
+                return;
+            }
+            const long double bytes =
+                (m.gpu_weight_streaming ? bank0 + bank1 :
+                 unstreamed) + gpu_kv_floor;
+            if (bytes < best.total_min_bytes) {
+                best.bank0_bytes = m.gpu_weight_streaming ? bank0 : 0.0L;
+                best.bank1_bytes = m.gpu_weight_streaming ? bank1 : 0.0L;
+                best.gpu_kv_min_bytes = gpu_kv_floor;
+                best.total_min_bytes = bytes;
+            }
+            return;
+        }
+        const int later = n_cycles - completed - 1;
+        const int next_low = std::max(
+            width_low, max_width - width_spread);
+        const int next_high = std::min(
+            width_high, min_width + width_spread);
+        for (int width = next_low; width <= next_high; ++width) {
+            const int rest = m.layers - (begin + width);
+            if (rest < later * width_low ||
+                    rest > later * width_high ||
+                    (later == 0 && rest != 0)) {
+                continue;
+            }
+            const int new_min = std::min(min_width, width);
+            const int new_max = std::max(max_width, width);
+            if (new_max - new_min > width_spread) {
+                continue;
+            }
+            const int later_low = std::max(
+                width_low, new_max - width_spread);
+            const int later_high = std::min(
+                width_high, new_min + width_spread);
+            if (rest < later * later_low ||
+                    rest > later * later_high) {
+                continue;
+            }
+            // A future Cycle always begins with a positive CUDA Region.
+            // G=1, C=1, P=width-2 is a valid minimal-GPU completion.
+            size_t layer_weight = 0;
+            if (begin < 0 || begin >= m.layers ||
+                    !m.gpu_region_weight_bytes(
+                        begin, begin + 1, layer_weight) ||
+                    layer_weight == 0) {
+                continue;
+            }
+            const long double bytes = (long double) layer_weight;
+            const long double b0 =
+                m.gpu_weight_streaming && completed % 2 == 0 ?
+                    std::max(bank0, bytes) : bank0;
+            const long double b1 =
+                m.gpu_weight_streaming && completed % 2 != 0 ?
+                    std::max(bank1, bytes) : bank1;
+            const long double all = unstreamed +
+                (m.gpu_weight_streaming ? 0.0L : bytes);
+            const long double gpu_lower =
+                (m.gpu_weight_streaming ? b0 + b1 : all) +
+                gpu_kv_floor;
+            if (gpu_lower > best.budget_bytes ||
+                    gpu_lower >= best.total_min_bytes) {
+                continue;
+            }
+            walk(completed + 1, begin + width,
+                 new_min, new_max, b0, b1, all);
+        }
+    };
+    walk(1, first_width, first_width, first_width,
+         m.gpu_weight_streaming ? (long double) first_weight : 0.0L,
+         0.0L, (long double) first_weight);
+    return std::isfinite(best.total_min_bytes);
+}
+
 inline bool gpu_weight_h2d_total(
         const model & m,
         const std::vector<llama_region_ring_region> & regions,
