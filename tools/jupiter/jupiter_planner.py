@@ -246,15 +246,24 @@ def solve_sequence(
     max_chunk: int | None,
     max_k: int | None,
 ) -> SequenceSolution:
-    if total <= 0:
-        raise ValueError("total must be positive")
-    if devices <= 0:
-        raise ValueError("devices must be positive")
+    if total <= 0 or devices <= 0 or min_chunk <= 0:
+        raise ValueError("total, devices and min_chunk must be positive")
+    if max_chunk is not None and max_chunk < min_chunk:
+        raise ValueError("max_chunk must be >= min_chunk")
+    if max_k is not None and max_k <= 0:
+        raise ValueError("max_subsequences must be positive")
 
-    max_k = max_k or 4 * devices
-    max_k = min(max_k, total // min_chunk)
-    if max_k <= 0:
-        raise ValueError("no feasible partition: total < min_chunk")
+    # A fixed 4*devices cap fails for longer prompts: e.g. at N=1536,
+    # max_chunk=128, at least 12 chunks are mandatory even for two devices.
+    # Allow all feasible k by default; callers can explicitly cap k.
+    min_k = (total + max_chunk - 1) // max_chunk if max_chunk else 1
+    max_k = min(max_k if max_k is not None else total // min_chunk,
+                total // min_chunk)
+    if max_k < min_k:
+        raise ValueError(
+            f"no feasible partition for total={total} under "
+            f"min_chunk={min_chunk}, max_chunk={max_chunk}, max_k={max_k}"
+        )
 
     # W[y][k] and predecessor cut l.
     W = [[INF] * (max_k + 1) for _ in range(total + 1)]
@@ -266,17 +275,19 @@ def solve_sequence(
             cut[y][1] = 0
 
     for k in range(2, max_k + 1):
-        for y in range(1, total + 1):
-            # Need at least min_chunk tokens in all k pieces.
-            l_min = (k - 1) * min_chunk
-            l_max = y - min_chunk
+        # Only states that can be tiled with k legal chunks are reachable.
+        y_min = k * min_chunk
+        y_max = min(total, k * max_chunk) if max_chunk else total
+        for y in range(y_min, y_max + 1):
+            l_min = max((k - 1) * min_chunk,
+                        y - max_chunk if max_chunk else 0)
+            l_max = min(y - min_chunk,
+                        (k - 1) * max_chunk if max_chunk else y - min_chunk)
             if l_min > l_max:
                 continue
 
             for l in range(l_min, l_max + 1):
                 x = y - l
-                if max_chunk is not None and x > max_chunk:
-                    continue
                 prev = W[l][k - 1]
                 if not math.isfinite(prev):
                     continue
