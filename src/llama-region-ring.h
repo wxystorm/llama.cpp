@@ -455,11 +455,9 @@ inline bool llama_region_ring_apply_topology_compatible(
                 r.layer_end <= r.layer_begin || r.layer_end > n_layer) {
             return false;
         }
-        if (expected == llama_region_ring_device::PHONE &&
-                (r.layer_end - r.layer_begin < 2 ||
-                 r.layer_end - r.layer_begin > 8)) {
-            return false;
-        }
+        // Do not impose an arbitrary Phone stage depth limit here:
+        // positive lengths are checked above; the Planner separately
+        // validates profiled cost and runtime memory feasibility.
         next_layer = r.layer_end;
     }
     return next_layer == n_layer;
