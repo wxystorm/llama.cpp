@@ -272,6 +272,7 @@ def main():
     ap.add_argument("--ubatch", type=int, default=512)
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--baseline-chunk-tokens", type=int, default=64)
     ap.add_argument("--min-context", type=int, default=1024)
     ap.add_argument("--context-padding", type=int, default=256)
     ap.add_argument("--force-layout", default="")
@@ -287,6 +288,8 @@ def main():
         ap.error("--exe, --model and --prompt-dir must exist")
     if args.batch < args.ubatch or min(args.batch, args.ubatch, args.n_predict) <= 0:
         ap.error("--batch >= --ubatch > 0 and --n-predict > 0 required")
+    if args.baseline_chunk_tokens <= 0:
+        ap.error("--baseline-chunk-tokens must be positive")
     if args.force_layout and None in (args.force_xc, args.force_xg, args.force_xp):
         ap.error("--force-layout requires all three --force-xc/xg/xp arguments")
     prompts = []
@@ -310,7 +313,10 @@ def main():
                   ((hint + args.n_predict + args.context_padding + 255) // 256) * 256)
         env = os.environ.copy()
         for key in ("GGML_META_PIPELINE_DEBUG", "LLAMA_HYBRID_REGION_RING_TRACE",
-                    "GGML_CPU_TASK_DEBUG", "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT",
+                    "GGML_CPU_TASK_DEBUG",
+                    "LLAMA_HYBRID_REGION_RING_LAYOUT",
+                    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS",
+                    "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XC",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XG",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XP"):
@@ -320,6 +326,8 @@ def main():
             "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
             "LLAMA_HYBRID_REGION_RING_PLANNER": args.planner,
             "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(hint),
+            "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS":
+                str(args.baseline_chunk_tokens),
             "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM":
                 "1" if args.streaming == "on" else "0",
             "LLAMA_REGION_RING_METRICS_FILE": str(folder / "metrics.jsonl"),
@@ -348,6 +356,8 @@ def main():
                                  or k == "LLAMA_REGION_RING_METRICS_FILE"},
             "notes": [
                 "Token count from filename is only a hint; record actual prefill tokens.",
+                "Default Ring layout uses actual GGUF depth; inherited layouts are cleared.",
+                "Baseline Chunk size applies only without Planner-selected XC/XG/XP.",
                 "Device compute_range/prepare/output sync can overlap. Do not sum to wall_ms.",
                 "Model load and Planner profiling are outside prefill_ms.",
                 "Transfer-only PC/Phone network time needs a separate diagnostic run.",

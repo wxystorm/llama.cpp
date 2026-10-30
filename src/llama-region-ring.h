@@ -267,13 +267,50 @@ inline bool llama_region_ring_has_directional_stages(
         });
 }
 
+// Choose a model-depth-specific baseline, not a universal 48-layer layout.
+// The Planner may replace this with a measured, memory-feasible candidate.
+inline std::string llama_region_ring_default_layout(int n_layer) {
+    if (n_layer == 48) {
+        return "G4,C7,P5,G4,C7,P5,G3,C8,P5";
+    }
+    if (n_layer == 40) {
+        return "G4,C10,C2P1,P8,P2C1,G4,C7,P5";
+    }
+    if (n_layer < 8) {
+        throw std::runtime_error(
+            "automatic region ring baseline requires at least eight layers");
+    }
+
+    // For uncalibrated model depths, produce only a conservative, structurally
+    // legal G/C/P seed: 2-4 cycles, positive G/C, 2-8 Phone layers per cycle.
+    // Model/profile memory constraints are still enforced by the Planner.
+    const int cycles = n_layer >= 80 ? 4 : n_layer >= 18 ? 3 : 2;
+    std::string layout;
+    for (int i = 0; i < cycles; ++i) {
+        const int width = n_layer / cycles + (i < n_layer % cycles ? 1 : 0);
+        const int phone = std::clamp(width / 3, 2, 8);
+        const int gpu = std::clamp(width / 4, 1, 4);
+        const int cpu = width - gpu - phone;
+        if (cpu < 1) {
+            throw std::runtime_error(
+                "automatic region ring baseline has no CPU layers");
+        }
+        if (!layout.empty()) {
+            layout += ",";
+        }
+        layout += "G" + std::to_string(gpu) +
+                  ",C" + std::to_string(cpu) +
+                  ",P" + std::to_string(phone);
+    }
+    return layout;
+}
+
 inline std::vector<llama_region_ring_region> llama_region_ring_parse(
         const std::string & spec, int n_layer, bool allow_pc_tail = false) {
-    // Legacy default remains byte-for-byte compatible with the final Ring
-    // baseline. Directional handoffs are opt-in through the layout spelling,
-    // e.g. G4,C6,C2P1,P4,P2C1,...
+    // Explicit layouts stay strict; only an empty specification uses the
+    // model-aware baseline and directional stages stay opt-in otherwise.
     const std::string layout = spec.empty() ?
-        "G4,C7,P5,G4,C7,P5,G3,C8,P5" : spec;
+        llama_region_ring_default_layout(n_layer) : spec;
     if (n_layer <= 0) {
         throw std::runtime_error("region ring requires a positive layer count");
     }

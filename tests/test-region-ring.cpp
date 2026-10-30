@@ -57,6 +57,40 @@ static void test_layout() {
 }
 
 
+static void test_model_aware_default_layout() {
+    const auto dense = llama_region_ring_parse("", 40);
+    check(llama_region_ring_layout_string(dense) ==
+          "G4,C10,C2P1,P8,P2C1,G4,C7,P5",
+          "40-layer Dense baseline changed");
+    check(llama_region_ring_directional_topology_compatible(dense, 40),
+          "40-layer Dense baseline is not an executable directional ring");
+
+    // A generic baseline must cover the actual model depth, end on Phone,
+    // and satisfy all full-stage runtime topology constraints.
+    for (int layers : {8, 12, 28, 32, 64, 80, 96}) {
+        const auto regions = llama_region_ring_parse("", layers);
+        const auto counts = llama_region_ring_layer_counts(regions);
+        check(counts[0] + counts[1] + counts[2] == layers,
+              "automatic Ring baseline did not cover all model layers");
+        check(!llama_region_ring_has_directional_stages(regions),
+              "generic Ring fallback must contain only full regions");
+        check(llama_region_ring_apply_topology_compatible(regions, layers),
+              "automatic Ring baseline violates runtime stage constraints");
+        check(regions.back().device == llama_region_ring_device::PHONE,
+              "automatic Ring baseline must end on Phone");
+    }
+
+    // Explicit overrides must remain strict, even if they have stale counts.
+    bool rejected = false;
+    try {
+        (void) llama_region_ring_parse(
+            "G4,C7,P5,G4,C7,P5,G3,C8,P5", 40);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    check(rejected, "stale explicit layout was silently accepted");
+}
+
 static void test_directional_layout() {
     const char * one_pair =
         "G4,C6,C2P1,P4,P2C1,G4,C7,P5,G3,C8,P5";
@@ -896,6 +930,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_model_aware_default_layout();
+        std::fprintf(stderr, "[REGION_RING_TEST] model_aware_layout=PASS\n");
         test_directional_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] directional_layout=PASS\n");
         test_general_topology();

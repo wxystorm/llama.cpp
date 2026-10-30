@@ -30,6 +30,26 @@ For the shorter PowerShell entrypoint, use:
 The wrapper defaults to `build-tensor-v2\bin\Release\llama-completion.exe`
 and saves `summary.csv` under `region-ring-results`.
 
+### Automatic per-model Region Ring baseline
+
+An unset `LLAMA_HYBRID_REGION_RING_LAYOUT` is now resolved **inside the
+C++ model loader** from the actual GGUF layer count (not the model filename).
+The 40-layer Dense baseline is `G4,C10,C2P1,P8,P2C1,G4,C7,P5`; the
+48-layer MoE baseline remains `G4,C7,P5,G4,C7,P5,G3,C8,P5`. For other
+depths of at least eight layers, a conservative valid G/C/P baseline is
+generated with 2-4 cycles. Its structural validity does not guarantee
+runtime memory feasibility or good performance; the measured Planner can
+replace it with a better candidate.
+
+The sweep **clears inherited** `LLAMA_HYBRID_REGION_RING_LAYOUT` so a
+stale PowerShell override from a different model cannot contaminate runs.
+An explicit `--force-layout` continues to control a Planner A/B candidate.
+
+`-BaselineChunkTokens 64` is the default PowerShell setting and is
+passed as `LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS`. This is the common
+fallback Region Ring Chunk size, **not** Batch, UBatch, or context. When
+`apply-wide` applies a Plan, its `XC/XG/XP` take precedence.
+
 Replace the model filename, executable path and RPC address as appropriate.
 The Phone `ggml-rpc-server` must be running. Set `--streaming off` to
 compare a non-streaming configuration. For a fixed-layout A/B test, use
