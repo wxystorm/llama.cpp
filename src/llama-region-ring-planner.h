@@ -42,8 +42,10 @@ struct candidate {
     int prefix_cycles = 0;
     // Full-layout refinement can start from either a uniform or prefix plan.
     // It is not a new first-Cycle prefix trajectory.
+    bool throughput_seed = false;
     bool local_refined = false;
     bool local_from_prefix = false;
+    bool local_from_throughput = false;
     std::array<double, 4> prefix_error {};
     std::array<std::array<double, 3>, 4> prefix_service {};
     double balance = 0.0;
@@ -1919,6 +1921,8 @@ struct result {
     size_t prefix_full_memory_pruned = 0;
     size_t prefix_completed = 0;
     // Additional read-only DAG simulation from complete-layout neighbors.
+    size_t throughput_shortlisted = 0;
+    size_t throughput_simulated = 0;
     size_t local_anchors = 0;
     size_t local_generated = 0;
     size_t local_memory_rejected = 0;
@@ -2137,9 +2141,11 @@ inline void refine_runtime_local_candidates(
         // and per search origin. Also keep a few different Chunk triples.
         std::vector<candidate> anchors;
         std::unordered_set<std::string> anchor_keys;
-        std::array<std::array<bool, 3>, 5> covered {};
+        std::array<std::array<bool, 4>, 5> covered {};
         const auto family = [](const candidate & c) {
-            return c.local_refined ? 2 : (c.prefix_cycles > 0 ? 1 : 0);
+            return c.local_refined ? 3 :
+                c.prefix_cycles > 0 ? 2 :
+                c.throughput_seed ? 1 : 0;
         };
         const auto add_anchor = [&](const candidate & c) {
             const std::string key = key_for(c);
@@ -2209,6 +2215,8 @@ inline void refine_runtime_local_candidates(
             plan.local_refined = true;
             plan.local_from_prefix = from.local_refined ?
                 from.local_from_prefix : from.prefix_cycles > 0;
+            plan.local_from_throughput = from.local_refined ?
+                from.local_from_throughput : from.throughput_seed;
             const std::string key = key_for(plan);
             if (key.empty() || scored.count(key) ||
                     !generated_keys.insert(key).second) {
