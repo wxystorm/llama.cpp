@@ -65,6 +65,22 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["prefix_e_json"],
                              "[0.3, 0.25, 0.22, 0.2]")
 
+    def test_activation_estimates_are_full_region_only(self):
+        # 64 tokens x 2048 FP32 elements = 0.5 MiB per edge.
+        layout = "G6,C2,P4,G6,C2,P4"
+        sizes = SWEEP.estimated_activation_payloads([
+            {"tokens": 64, "hidden": 2048, "layout": layout},
+        ])
+        self.assertIsNotNone(sizes)
+        self.assertEqual(sizes["gpu_to_cpu"], 1.0)
+        self.assertEqual(sizes["pc_to_phone"], 1.0)
+        self.assertEqual(sizes["phone_to_pc"], 0.5)
+        self.assertEqual(sizes["cpu_to_gpu"], 0.5)
+        self.assertIsNone(SWEEP.estimated_activation_payloads([
+            {"tokens": 64, "hidden": 2048,
+             "layout": "G4,C2,C2P1,P5,P2C1,G3"},
+        ]))
+
     def test_filename_and_layer_parser(self):
         self.assertIsNotNone(SWEEP.NAME.fullmatch("prompt_358.txt"))
         self.assertIsNone(SWEEP.NAME.fullmatch("something-358.txt"))
