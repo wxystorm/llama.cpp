@@ -81,6 +81,26 @@ class ExperimentReportTests(unittest.TestCase):
              "layout": "G4,C2,C2P1,P5,P2C1,G3"},
         ]))
 
+    def test_perf_without_region_ring_is_not_a_valid_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "prompt_64"
+            folder.mkdir()
+            prompt = root / "prompt_64.txt"
+            prompt.write_text("test", encoding="utf-8")
+            model = root / "model.gguf"
+            model.write_bytes(b"stub")
+            (folder / "metrics.jsonl").write_text(
+                json.dumps({"type": "perf", "prefill_tokens": 64,
+                            "prefill_ms": 125, "decode_tokens": 8,
+                            "decode_ms": 100}) + "\n", encoding="utf-8")
+            args = SimpleNamespace(
+                model=model, planner="apply-wide", streaming="on",
+                batch=512, ubatch=512, threads=8, seed=1234, n_predict=32)
+            row = SWEEP.result_row(
+                args, folder, prompt, 64, 1024, 0, 1000, "deadbeef")
+            self.assertEqual(row["status"], "NO_RING")
+
     def test_filename_and_layer_parser(self):
         self.assertIsNotNone(SWEEP.NAME.fullmatch("prompt_358.txt"))
         self.assertIsNone(SWEEP.NAME.fullmatch("something-358.txt"))
