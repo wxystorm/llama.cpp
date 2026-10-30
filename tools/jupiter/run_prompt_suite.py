@@ -95,6 +95,7 @@ def case_identity(
         "modes": args.modes,
         "async_c2p": False,
         "profile_stage_for_benchmark": False,
+        "timing_token_tolerance": 1,
     }
 
 
@@ -311,6 +312,7 @@ def main() -> int:
         "threads": args.threads, "modes": modes,
         "profile_stage_for_benchmark": 0,
         "async_c2p_for_benchmark": 0,
+        "timing_token_tolerance": 1,
     }
     if args.dry_run:
         for prompt in prompts:
@@ -422,6 +424,7 @@ def main() -> int:
                 "--batch", str(args.batch), "--context", str(args.context),
                 "--threads", str(args.threads), "--window", str(args.window),
                 "--verbosity", str(args.verbosity),
+                "--timing-token-tolerance", "1",
                 "--out-dir", str(case / "bench"), "--resume",
             ]
             # Deliberately NO --async-c2p or --comm-timing here: all
