@@ -1339,6 +1339,52 @@ inline double prefix_cycle_max_error(
 // three cycles need not have identical C/G widths (the fixed baseline ends in
 // G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
 // service rates; aggregate service demand is kept separately.
+// Cost the *actual intersecting token intervals* at a device boundary.
+// This matches simulate()'s per-overlap EDGE events, including fixed
+// transfer/setup costs when two independently chosen Chunk grids misalign.
+// The producer's full Chunk must finish before any intersecting edge starts.
+// The full Prompt simulator still owns the final ordering/overlap decision.
+inline bool region_ring_handoff_ms_per_token(
+        const model & m, device source, device target,
+        int source_chunk, int target_chunk, double & per_token_ms) {
+    per_token_ms = 0.0;
+    if (m.tokens <= 0 || m.hidden <= 0 ||
+        source_chunk <= 0 || target_chunk <= 0 ||
+        !m.transfer_ms) {
+        return false;
+    }
+    double total_ms = 0.0;
+    int source_begin = 0;
+    int target_begin = 0;
+    while (source_begin < m.tokens && target_begin < m.tokens) {
+        const int source_end =
+            source_begin + std::min(source_chunk, m.tokens - source_begin);
+        const int target_end =
+            target_begin + std::min(target_chunk, m.tokens - target_begin);
+        const int overlap =
+            std::min(source_end, target_end) -
+            std::max(source_begin, target_begin);
+        if (overlap > 0) {
+            double edge_ms = 0.0;
+            const size_t bytes = (size_t) overlap *
+                (size_t) m.hidden * sizeof(float);
+            if (!m.transfer_ms(source, target, bytes, edge_ms) ||
+                !std::isfinite(edge_ms) || edge_ms < 0.0) {
+                return false;
+            }
+            total_ms += edge_ms;
+        }
+        if (source_end <= target_end) {
+            source_begin = source_end;
+        }
+        if (target_end <= source_end) {
+            target_begin = target_end;
+        }
+    }
+    per_token_ms = total_ms / m.tokens;
+    return std::isfinite(per_token_ms) && per_token_ms >= 0.0;
+}
+
 inline bool estimate_region_ring_balance(
         const model & m,
         const std::vector<llama_region_ring_region> & regions,
@@ -1391,23 +1437,19 @@ inline bool estimate_region_ring_balance(
     const double B = stage_sum[1] / stage_count[1];
     const double D = stage_sum[2] / stage_count[2];
 
-    double p2g_ms = 0.0;
-    double c2p_ms = 0.0;
-    double g2c_ms = 0.0;
-    const size_t p2g_bytes =
-        (size_t) m.hidden * (size_t) c.xp * sizeof(float);
-    const size_t c2p_bytes =
-        (size_t) m.hidden * (size_t) c.xc * sizeof(float);
-    const size_t g2c_bytes =
-        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
-    if (!m.transfer_ms(device::PHONE, device::GPU, p2g_bytes, p2g_ms) ||
-        !m.transfer_ms(device::CPU, device::PHONE, c2p_bytes, c2p_ms) ||
-        !m.transfer_ms(device::GPU, device::CPU, g2c_bytes, g2c_ms)) {
+    double TP2G = 0.0;
+    double TC2P = 0.0;
+    double TG2C = 0.0;
+    // E uses the same interval-overlap transfers as the full DAG simulator.
+    // Non-multiple XC/XG/XP can create several boundary edges per Chunk.
+    if (!region_ring_handoff_ms_per_token(
+            m, device::PHONE, device::GPU, c.xp, c.xg, TP2G) ||
+        !region_ring_handoff_ms_per_token(
+            m, device::CPU, device::PHONE, c.xc, c.xp, TC2P) ||
+        !region_ring_handoff_ms_per_token(
+            m, device::GPU, device::CPU, c.xg, c.xc, TG2C)) {
         return false;
     }
-    const double TP2G = p2g_ms / c.xp;
-    const double TC2P = c2p_ms / c.xc;
-    const double TG2C = g2c_ms / c.xg;
 
     const double e1 = relative_ring_mismatch(B, D + TP2G);
     const double e2 = relative_ring_mismatch(A, B + TG2C);
@@ -1452,29 +1494,23 @@ inline bool estimate_balance(const model & m, candidate & c) {
     }
     tp += registration_ms;
 
-    // G -> C -> P -> G handoff model. Normalize each transfer by the
-    // producer's chunk size; XC/XG/XP are independent planner variables.
-    double p2g_ms = 0.0;
-    double c2p_ms = 0.0;
-    double local_ms = 0.0;
-    const size_t p2g_bytes =
-        (size_t) m.hidden * (size_t) c.xp * sizeof(float);
-    const size_t c2p_bytes =
-        (size_t) m.hidden * (size_t) c.xc * sizeof(float);
-    const size_t local_bytes =
-        (size_t) m.hidden * (size_t) c.xg * sizeof(float);
-    if (!m.transfer_ms(device::PHONE, device::GPU, p2g_bytes, p2g_ms) ||
-        !m.transfer_ms(device::CPU, device::PHONE, c2p_bytes, c2p_ms) ||
-        !m.transfer_ms(device::GPU, device::CPU, local_bytes, local_ms)) {
+    // Same E equations as before; the link terms now account for the
+    // producer/consumer interval intersections, including non-multiple X.
+    double TP2G = 0.0;
+    double TC2P = 0.0;
+    double TLOCAL = 0.0;
+    if (!region_ring_handoff_ms_per_token(
+            m, device::PHONE, device::GPU, c.xp, c.xg, TP2G) ||
+        !region_ring_handoff_ms_per_token(
+            m, device::CPU, device::PHONE, c.xc, c.xp, TC2P) ||
+        !region_ring_handoff_ms_per_token(
+            m, device::GPU, device::CPU, c.xg, c.xc, TLOCAL)) {
         return false;
     }
 
     const double A = tc / c.xc;
     const double B = tg / c.xg;
     const double D = tp / c.xp;
-    const double TP2G = p2g_ms / c.xp;
-    const double TC2P = c2p_ms / c.xc;
-    const double TLOCAL = local_ms / c.xg;
     if (!(A > 0.0) || !(B > 0.0) || !(D > 0.0) ||
         TP2G < 0.0 || TC2P < 0.0 || TLOCAL < 0.0 ||
         !std::isfinite(A) || !std::isfinite(B) || !std::isfinite(D) ||
