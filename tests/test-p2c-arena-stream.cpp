@@ -15,11 +15,11 @@
 
 namespace {
 
-// Unlike REQUIRE(), this always evaluates its expression in MSVC Release
+// Unlike assert(), this always evaluates its expression in MSVC Release
 // builds (which define NDEBUG). Test setup must never be compiled out.
 #define REQUIRE(expr) do { \
     if (!(expr)) { \
-        std::fprintf(stderr, "[P2C_TEST_FAIL] %s:%d: %s\\n", \
+        std::fprintf(stderr, "[P2C_TEST_FAIL] %s:%d: %s\n", \
                      __FILE__, __LINE__, #expr); \
         std::fflush(stderr); \
         std::abort(); \
@@ -187,10 +187,10 @@ void test_framing_and_partial_receive_failure() {
 }
 
 int main() {
-    std::fprintf(stderr, "[P2C_TEST] arena publication and FIFO order\\n");
+    std::fprintf(stderr, "[P2C_TEST] arena publication and FIFO order\n");
     test_arena_publication_and_send_order();
-    std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\\n");
+    std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\n");
     test_framing_and_partial_receive_failure();
-    std::fprintf(stderr, "[P2C_TEST] PASS\\n");
+    std::fprintf(stderr, "[P2C_TEST] PASS\n");
     return 0;
 }
