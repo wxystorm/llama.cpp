@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    19
+#define RPC_PROTO_PATCH_VERSION    20
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -83,6 +83,15 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC \
     "ggml_backend_rpc_get_graph_profile"
+
+// Experimental Region Ring stream: one Phone-side sender, one PC-side receiver.
+// All snapshot captures are published only after the GPU->Host read completes.
+#define GGML_BACKEND_RPC_P2C_STREAM_START_PROC \
+    "ggml_backend_rpc_p2c_stream_start"
+#define GGML_BACKEND_RPC_P2C_STREAM_CAPTURE_PROC \
+    "ggml_backend_rpc_p2c_stream_capture"
+#define GGML_BACKEND_RPC_P2C_STREAM_STOP_PROC \
+    "ggml_backend_rpc_p2c_stream_stop"
     
 #define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
     "ggml_backend_rpc_prepare_fused_ffn_input"
@@ -335,6 +344,60 @@ using ggml_backend_rpc_get_graph_profile_t = bool (*)(
         ggml_backend_t backend,
         uint64_t graph_uid,
         struct ggml_backend_rpc_graph_profile * profile);
+
+// This is a logical frame header: no remote pointer or Arena address is sent.
+// The receiver resolves (run_id, seq, region_id, chunk_id) to its own host
+// output buffer before reading exactly payload_bytes bytes.
+struct ggml_backend_rpc_p2c_frame {
+    uint64_t run_id;
+    uint64_t seq;
+    uint32_t region_id;
+    uint32_t chunk_id;
+    uint32_t token_begin;
+    uint32_t n_tokens;
+    uint32_t kind;
+    uint32_t reserved;
+    uint64_t payload_bytes;
+};
+enum {
+    GGML_BACKEND_RPC_P2C_FULL = 1,
+    GGML_BACKEND_RPC_P2C_TENSOR = 2,
+    GGML_BACKEND_RPC_P2C_END = 0xFFFFFFFFu,
+    GGML_BACKEND_RPC_P2C_ERROR = 0xFFFFFFFEu,
+};
+
+// resolve() must return a stable PC destination with capacity payload_bytes.
+// complete() is called only after a full successful recv, or with ok=false on
+// stream errors. Neither callback may synchronously wait for the sender.
+using ggml_backend_rpc_p2c_resolve_t = void * (*)(
+        void * userdata,
+        const struct ggml_backend_rpc_p2c_frame * frame);
+using ggml_backend_rpc_p2c_complete_t = void (*)(
+        void * userdata,
+        const struct ggml_backend_rpc_p2c_frame * frame,
+        bool ok);
+
+using ggml_backend_rpc_p2c_stream_start_t = void * (*)(
+        ggml_backend_t backend,
+        uint64_t run_id,
+        uint32_t n_regions,
+        uint32_t n_tokens,
+        uint32_t n_embd,
+        ggml_backend_rpc_p2c_resolve_t resolve,
+        ggml_backend_rpc_p2c_complete_t complete,
+        void * userdata);
+using ggml_backend_rpc_p2c_stream_capture_t = bool (*)(
+        ggml_backend_t backend,
+        const ggml_tensor * tensor,
+        uint64_t run_id,
+        uint64_t seq,
+        uint32_t region_id,
+        uint32_t chunk_id,
+        uint32_t token_begin,
+        uint32_t n_tokens);
+using ggml_backend_rpc_p2c_stream_stop_t = bool (*)(
+        ggml_backend_t backend,
+        void * stream_handle);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
