@@ -15,6 +15,8 @@ struct socket_t {
 
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    // Abort blocking socket reads during P2C stream cancellation.
+    void interrupt();
 
     socket_ptr accept();
 
