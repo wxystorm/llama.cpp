@@ -322,6 +322,26 @@ A consecutive READY Chunk does not guarantee topology reuse: the native
 Graph check can still reject it. No extra real model evaluations or
 per-Chunk telemetry were added.
 
+### GPU Bank peak reservations during model loading
+
+Streaming GPU ranks alternate physical Bank A/B. A Region layout with
+G10/G10/G11 needs Bank A to grow when rank2 replaces rank0. Doing this during
+prefill while Bank B computes may hit CUDA allocation or synchronization
+problems. The loader now builds and allocates later GPU rank graphs in their
+respective Banks BEFORE priming G0/G1, without uploading future weights.
+Each Scheduler's weight-cache capacity is retained across graph resets.
+This moves any necessary peak allocations out of the timed prefill.
+The change does NOT prove allocation is the root cause of CUDA failure.
+
+`LLAMA_HYBRID_REGION_RING_GPU_BANK_PEAK_RESERVE=0` disables the new step
+(default ON), for an unchanged-path A/B test. The load emits
+`[REGION_RING_GPU_BANK_PEAK]` per later rank and
+`[REGION_RING_GPU_BANK_PEAK_SUM]` with both cache capacities.
+`[REGION_RING_GPU_BANK_CAPACITY] event=RUNTIME_GROW` is emitted only if
+a runtime refill still increases the cache size. A CUDA fatal path now
+flushes a single `[CUDA_FATAL]` line containing the CUDA error string,
+offending CUDA call and function, even with `-lv 1`.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted

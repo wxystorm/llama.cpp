@@ -100,6 +100,12 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
+    // A Windows abort can terminate before queued GGML error logs flush.
+    // Emit one synchronous error record only on the fatal CUDA path.
+    std::fprintf(stderr,
+        "[CUDA_FATAL] device=%d error=%s call=%s function=%s at=%s:%d\n",
+        id, msg, stmt, func, file, line);
+    std::fflush(stderr);
     // abort with GGML_ABORT to get a stack trace
     GGML_ABORT(GGML_CUDA_NAME " error");
 }

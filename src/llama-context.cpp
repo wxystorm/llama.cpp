@@ -4306,6 +4306,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                 ggml_status refill_status = GGML_STATUS_SUCCESS;
                 llm_graph_result * refill_result = nullptr;
+                const size_t weight_capacity_before =
+                    ggml_backend_sched_get_weight_cache_buffer_size(
+                        bank.sched.get());
                 const int64_t prepare_begin_us = ggml_time_us();
                 {
                     std::unique_lock<std::mutex> prepare_gate(
@@ -4329,6 +4332,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
                 const int64_t prepare_us =
                     ggml_time_us() - prepare_begin_us;
+                const size_t weight_capacity_after =
+                    ggml_backend_sched_get_weight_cache_buffer_size(
+                        bank.sched.get());
+                if (weight_capacity_after > weight_capacity_before) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_GPU_BANK_CAPACITY] "
+                        "event=RUNTIME_GROW region=%zu bank=%c "
+                        "before_mib=%.3f after_mib=%.3f status=WARNING\n",
+                        region, bank_index == 0 ? 'A' : 'B',
+                        weight_capacity_before / 1048576.0,
+                        weight_capacity_after / 1048576.0);
+                }
                 if (refill_result == nullptr ||
                         refill_status != GGML_STATUS_SUCCESS) {
                     return fail_refill(
@@ -10875,6 +10890,94 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             return true;
         };
 
+
+    // Reserve each Bank's peak future-region weight capacity before the
+    // initial pair of streamed GPU Regions is loaded. Rebinding Bank A from
+    // G10 to G11 during prefill could otherwise resize/free its CUDA buffer
+    // while Bank B computes. This phase allocates graphs but uploads NO weights.
+    // The persistent weight cache survives ggml_backend_sched_reset().
+    const char * peak_reserve_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_GPU_BANK_PEAK_RESERVE");
+    const bool peak_reserve_enabled =
+        peak_reserve_env == nullptr || std::atoi(peak_reserve_env) != 0;
+    size_t peak_reserve_graphs = 0;
+    int64_t peak_reserve_us = 0;
+    const auto reserve_future_bank_graph =
+        [&](size_t gpu_rank) -> bool {
+            const size_t region = gpu_regions[gpu_rank];
+            const size_t bank_index =
+                llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
+            auto & bank = region_ring_worker_resources[bank_index + 1];
+            const auto & stage = stages[region];
+            ggml_status status = GGML_STATUS_SUCCESS;
+            const int64_t reserve_begin_us = ggml_time_us();
+            {
+                std::unique_lock<std::mutex> prepare_gate(
+                    region_ring_prepare_mutex);
+                ggml_backend_sched_synchronize(bank.sched.get());
+                bank.res->reset();
+                ggml_backend_sched_reset(bank.sched.get());
+                ggml_backend_sched_set_weight_cache(bank.sched.get(), true);
+                ggml_backend_sched_set_eval_callback(
+                    bank.sched.get(), cparams.cb_eval,
+                    cparams.cb_eval_user_data);
+
+                auto gparams = graph_params(
+                    bank.res.get(), load_ubatch, full_mctx.get(),
+                    ctx_type_to_graph_type(cparams.ctx_type),
+                    bank.sched.get(), 0);
+                gparams.hybrid_layer_begin = stage.layer_begin;
+                gparams.hybrid_layer_end = stage.layer_end;
+                gparams.hybrid_chunk_tokens = stage.macro_tokens;
+                gparams.hybrid_hidden_input = true;
+                gparams.hybrid_output_head = false;
+                gparams.hybrid_wave_probe = stage.wave_probe;
+                gparams.hybrid_embedding_only = false;
+
+                ggml_cgraph * graph = model.build_graph(gparams);
+                if (graph == nullptr) {
+                    status = GGML_STATUS_FAILED;
+                } else if (!ggml_backend_sched_alloc_graph(
+                               bank.sched.get(), graph)) {
+                    status = GGML_STATUS_ALLOC_FAILED;
+                }
+            }
+            const int64_t elapsed_us = ggml_time_us() - reserve_begin_us;
+            peak_reserve_us += elapsed_us;
+            total_prepare_us += elapsed_us;
+            if (status != GGML_STATUS_SUCCESS) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_BANK_PEAK] phase=LOAD_TIME "
+                    "rank=%zu region=%zu bank=%c status=FAIL "
+                    "reason=GRAPH_ALLOC code=%d\n",
+                    gpu_rank, region, bank_index == 0 ? 'A' : 'B',
+                    (int) status);
+                return false;
+            }
+            ++peak_reserve_graphs;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_BANK_PEAK] phase=LOAD_TIME "
+                "rank=%zu region=%zu bank=%c layers=[%d,%d) "
+                "capacity_mib=%.3f prepare_ms=%.3f status=RESERVED\n",
+                gpu_rank, region, bank_index == 0 ? 'A' : 'B',
+                stage.layer_begin, stage.layer_end,
+                ggml_backend_sched_get_weight_cache_buffer_size(
+                    bank.sched.get()) / 1048576.0,
+                elapsed_us / 1000.0);
+            return true;
+        };
+
+    if (peak_reserve_enabled) {
+        for (size_t rank = 2; rank < gpu_regions.size(); ++rank) {
+            if (!reserve_future_bank_graph(rank)) {
+                region_ring_initial_banks_loaded = false;
+                bank_a.bank_ready = false;
+                bank_b.bank_ready = false;
+                return false;
+            }
+        }
+    }
+
     region_ring_initial_banks_loaded = false;
     const bool ok_a = load_one(0, bank_a);
     const bool ok_b = ok_a && load_one(1, bank_b);
@@ -10883,6 +10986,16 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         bank_a.bank_ready && bank_b.bank_ready &&
         bank_a.bank_region == gpu_regions[0] &&
         bank_b.bank_region == gpu_regions[1];
+
+    LLAMA_LOG_ERROR(
+        "[REGION_RING_GPU_BANK_PEAK_SUM] phase=LOAD_TIME "
+        "enabled=%d future_graphs=%zu prepare_ms=%.3f "
+        "capacity_a_mib=%.3f capacity_b_mib=%.3f status=%s\n",
+        peak_reserve_enabled ? 1 : 0, peak_reserve_graphs,
+        peak_reserve_us / 1000.0,
+        ggml_backend_sched_get_weight_cache_buffer_size(bank_a.sched.get()) / 1048576.0,
+        ggml_backend_sched_get_weight_cache_buffer_size(bank_b.sched.get()) / 1048576.0,
+        region_ring_initial_banks_loaded ? "READY" : "FAIL");
 
     LLAMA_LOG_ERROR(
         "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
