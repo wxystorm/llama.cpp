@@ -118,6 +118,7 @@ struct socket_t::impl {
     ~impl();
     bool send_data(const void * data, size_t size);
     bool recv_data(void * data, size_t size);
+    void interrupt();
     void get_caps(uint8_t * local_caps);
     void update_caps(const uint8_t * remote_caps);
 
@@ -136,6 +137,18 @@ struct socket_t::impl {
     bool     use_rdma;
     sockfd_t fd;
 };
+
+void socket_t::impl::interrupt() {
+#ifdef _WIN32
+    if (fd != INVALID_SOCKET) {
+        (void) ::shutdown(fd, SD_BOTH);
+    }
+#else
+    if (fd >= 0) {
+        (void) ::shutdown(fd, SHUT_RDWR);
+    }
+#endif
+}
 
 socket_t::impl::~impl() {
 #ifdef GGML_RPC_RDMA
@@ -568,6 +581,10 @@ bool socket_t::send_data(const void * data, size_t size) {
 
 bool socket_t::recv_data(void * data, size_t size) {
     return pimpl->recv_data(data, size);
+}
+
+void socket_t::interrupt() {
+    pimpl->interrupt();
 }
 
 void socket_t::get_caps(uint8_t * local_caps) {
