@@ -22276,6 +22276,12 @@ auto prefill_norm_sg_has_prework =
     int64_t return_ready_wait_us = 0;
     int64_t return_recv_payload_us = 0;
     int64_t return_rpc_total_us = 0;
+    int64_t rpc_tensor_get_count = 0;
+    int64_t rpc_tensor_get_bytes = 0;
+    int64_t rpc_tensor_get_request_us = 0;
+    int64_t rpc_tensor_get_header_wait_us = 0;
+    int64_t rpc_tensor_get_payload_recv_us = 0;
+    int64_t rpc_tensor_get_total_us = 0;
     if (have_rpc_snapshot_stats &&
         rpc_snapshot_stats_getter(
             backend_ctx->backend_configs[1].backend,
@@ -22298,6 +22304,24 @@ auto prefill_norm_sg_has_prework =
         return_rpc_total_us =
             rpc_snapshot_stats_end.total_us -
             rpc_snapshot_stats_begin.total_us;
+        rpc_tensor_get_count = (int64_t) (
+            rpc_snapshot_stats_end.tensor_get_count -
+            rpc_snapshot_stats_begin.tensor_get_count);
+        rpc_tensor_get_bytes = (int64_t) (
+            rpc_snapshot_stats_end.tensor_get_bytes -
+            rpc_snapshot_stats_begin.tensor_get_bytes);
+        rpc_tensor_get_request_us =
+            rpc_snapshot_stats_end.tensor_get_request_us -
+            rpc_snapshot_stats_begin.tensor_get_request_us;
+        rpc_tensor_get_header_wait_us =
+            rpc_snapshot_stats_end.tensor_get_header_wait_us -
+            rpc_snapshot_stats_begin.tensor_get_header_wait_us;
+        rpc_tensor_get_payload_recv_us =
+            rpc_snapshot_stats_end.tensor_get_payload_recv_us -
+            rpc_snapshot_stats_begin.tensor_get_payload_recv_us;
+        rpc_tensor_get_total_us =
+            rpc_snapshot_stats_end.tensor_get_total_us -
+            rpc_snapshot_stats_begin.tensor_get_total_us;
     }
 
     const int64_t explicit_return_wait_us =
@@ -22430,6 +22454,16 @@ auto prefill_norm_sg_has_prework =
             return_recv_payload_us;
         backend_ctx->tensor_profile.return_rpc_total_us +=
             return_rpc_total_us;
+        backend_ctx->tensor_profile.rpc_tensor_get_count += rpc_tensor_get_count;
+        backend_ctx->tensor_profile.rpc_tensor_get_bytes += rpc_tensor_get_bytes;
+        backend_ctx->tensor_profile.rpc_tensor_get_request_us +=
+            rpc_tensor_get_request_us;
+        backend_ctx->tensor_profile.rpc_tensor_get_header_wait_us +=
+            rpc_tensor_get_header_wait_us;
+        backend_ctx->tensor_profile.rpc_tensor_get_payload_recv_us +=
+            rpc_tensor_get_payload_recv_us;
+        backend_ctx->tensor_profile.rpc_tensor_get_total_us +=
+            rpc_tensor_get_total_us;
         backend_ctx->tensor_profile.graph_compute_count += 1;
         backend_ctx->tensor_profile.graph_total_us += meta_graph_total_all_us;
         backend_ctx->tensor_profile.graph_rebuild_us += meta_rebuild_us;

@@ -553,6 +553,15 @@ extern "C" {
         int64_t return_ready_wait_us;
         int64_t return_recv_payload_us;
         int64_t return_rpc_total_us;
+
+        // Ordinary RPC GET_TENSOR receive timing inside Meta graph compute.
+        // First response/header wait can include Phone compute completion.
+        int64_t rpc_tensor_get_count;
+        int64_t rpc_tensor_get_bytes;
+        int64_t rpc_tensor_get_request_us;
+        int64_t rpc_tensor_get_header_wait_us;
+        int64_t rpc_tensor_get_payload_recv_us;
+        int64_t rpc_tensor_get_total_us;
     };
 
     // Read-only inspection of Meta's separately instantiated inner Backends.

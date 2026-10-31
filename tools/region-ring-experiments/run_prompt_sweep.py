@@ -61,6 +61,11 @@ FIELDS = [
     "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
     "meta_graph_execute_ms", "meta_graph_other_ms",
     "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
+    "phone_result_get_count", "phone_result_get_mib",
+    "phone_result_request_ms", "phone_result_response_wait_ms",
+    "phone_result_payload_recv_ms", "phone_result_rpc_total_ms",
+    "phone_snapshot_return_count", "phone_snapshot_ready_wait_ms",
+    "phone_snapshot_payload_recv_ms",
     "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
     "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
     "run_dir",
@@ -300,8 +305,17 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
         "meta_graph_execute_ms", "meta_graph_other_ms",
         "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
+        "phone_result_get_count", "phone_result_get_mib",
+        "phone_result_request_ms", "phone_result_response_wait_ms",
+        "phone_result_payload_recv_ms", "phone_result_rpc_total_ms",
+        "phone_snapshot_return_count", "phone_snapshot_ready_wait_ms",
+        "phone_snapshot_payload_recv_ms",
     ):
-        row[key] = total(ring, key) if row["meta_available"] else None
+        row[key] = (
+            total(ring, key)
+            if row["meta_available"] and any(key in x for x in ring)
+            else None
+        )
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
     row["gpu_cuda_gate_wait_ms"] = total(ring, "gpu_cuda_gate_wait_ms")
     return {field: row.get(field) for field in FIELDS}

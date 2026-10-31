@@ -39,6 +39,15 @@ class ExperimentReportTests(unittest.TestCase):
                  "status": 0, "wall_ms": 100.0, "cpu_compute_range_ms": 8.0,
                  "meta_available": True, "meta_pc_to_phone_copy_ms": 7.0,
                  "meta_phone_to_pc_copy_ms": 3.0,
+                  "phone_result_get_count": 12,
+                  "phone_result_get_mib": 8.0,
+                  "phone_result_request_ms": 4.0,
+                  "phone_result_response_wait_ms": 1200.0,
+                  "phone_result_payload_recv_ms": 130.0,
+                  "phone_result_rpc_total_ms": 1334.0,
+                  "phone_snapshot_return_count": 2,
+                  "phone_snapshot_ready_wait_ms": 9.0,
+                  "phone_snapshot_payload_recv_ms": 3.0,
                  "cpu_full_meta_queue": False,
                  "phone_graph_cache": False, "phone_graph_slots": 0,
                  "phone_graph_slot_revisits": 0, "phone_graph_reuses": 3,
@@ -81,6 +90,12 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["ring_wall_ms"], 100)
             self.assertEqual(result["cpu_compute_range_ms"], 8)
             self.assertEqual(result["meta_pc_to_phone_copy_ms"], 7)
+            self.assertEqual(result["phone_result_get_count"], 12)
+            self.assertEqual(result["phone_result_get_mib"], 8)
+            self.assertEqual(result["phone_result_response_wait_ms"], 1200)
+            self.assertEqual(result["phone_result_payload_recv_ms"], 130)
+            self.assertEqual(result["phone_snapshot_ready_wait_ms"], 9)
+            self.assertEqual(result["phone_snapshot_payload_recv_ms"], 3)
             self.assertFalse(result["cpu_full_meta_queue"])
             self.assertFalse(result["phone_graph_cache"])
             self.assertEqual(result["phone_graph_slots"], 0)

@@ -5796,7 +5796,34 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 << std::max<int64_t>(0, b.graph_rebuild_count - a.graph_rebuild_count)
                                 << ",\"meta_return_payload_mib\":"
                                 << meta_delta_us(a.return_payload_bytes,
-                                                 b.return_payload_bytes) / 1048576.0;
+                                                 b.return_payload_bytes) / 1048576.0
+                                << ",\"phone_result_get_count\":"
+                                << meta_delta_us(a.rpc_tensor_get_count,
+                                                 b.rpc_tensor_get_count)
+                                << ",\"phone_result_get_mib\":"
+                                << meta_delta_us(a.rpc_tensor_get_bytes,
+                                                 b.rpc_tensor_get_bytes) / 1048576.0
+                                << ",\"phone_result_request_ms\":"
+                                << meta_delta_us(a.rpc_tensor_get_request_us,
+                                                 b.rpc_tensor_get_request_us) / 1000.0
+                                << ",\"phone_result_response_wait_ms\":"
+                                << meta_delta_us(a.rpc_tensor_get_header_wait_us,
+                                                 b.rpc_tensor_get_header_wait_us) / 1000.0
+                                << ",\"phone_result_payload_recv_ms\":"
+                                << meta_delta_us(a.rpc_tensor_get_payload_recv_us,
+                                                 b.rpc_tensor_get_payload_recv_us) / 1000.0
+                                << ",\"phone_result_rpc_total_ms\":"
+                                << meta_delta_us(a.rpc_tensor_get_total_us,
+                                                 b.rpc_tensor_get_total_us) / 1000.0
+                                << ",\"phone_snapshot_return_count\":"
+                                << meta_delta_us(a.return_transfer_count,
+                                                 b.return_transfer_count)
+                                << ",\"phone_snapshot_ready_wait_ms\":"
+                                << meta_delta_us(a.return_ready_wait_us,
+                                                 b.return_ready_wait_us) / 1000.0
+                                << ",\"phone_snapshot_payload_recv_ms\":"
+                                << meta_delta_us(a.return_recv_payload_us,
+                                                 b.return_recv_payload_us) / 1000.0;
                     }
                     metrics << "}\n";
                 region_ring_experiment_records.push_back(metrics.str());

@@ -356,6 +356,30 @@ Split Prepare overlaps `phone_compute_range_ms`. Do not add their
 totals to `phone_backend_wall_ms`. Graph caches, scheduling and GPU
 Bank lifetime remain unchanged.
 
+### RPC return-phase split (ordinary GET_TENSOR vs Snapshot)
+
+For a PC process with `LLAMA_REGION_RING_METRICS_FILE` enabled,
+ordinary `RPC_CMD_GET_TENSOR` uses the already supported two-step
+request/response receive sequence. It now accumulates atomic counters,
+without per-Chunk printing, into `phone_result_get_count`,
+`phone_result_get_mib`, `phone_result_request_ms`,
+`phone_result_response_wait_ms`, `phone_result_payload_recv_ms`,
+and `phone_result_rpc_total_ms`. Only transfers observed *inside*
+Meta graph execution are included; staged/other RPC paths may be omitted.
+
+**Response/header wait is not pure Phone compute time or TCP time.**
+It can include remote execution completion, server queuing and device
+read. Payload receive includes socket and local host-memory copy.
+Snapshot returns remain separately measured by
+`phone_snapshot_return_count`, `phone_snapshot_ready_wait_ms`,
+and `phone_snapshot_payload_recv_ms`. Do not sum these overlapping
+metrics with `meta_phone_to_pc_copy_ms` or `phone_backend_wall_ms`.
+
+No server RPC protocol or Phone execution behavior is changed. Outside
+the opt-in experiment the original `send_rpc_cmd()` path is unchanged.
+Both return paths are summarized once per UBatch; prior CSVs without
+these columns produce `None`, not invented zero measurements.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted

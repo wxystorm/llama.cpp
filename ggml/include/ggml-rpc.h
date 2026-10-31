@@ -292,6 +292,15 @@ struct ggml_backend_rpc_snapshot_stats {
     int64_t  ready_first_byte_us;
     int64_t  recv_payload_us;
     int64_t  total_us;
+
+    // Ordinary GET_TENSOR, not Snapshot. Header wait includes remote
+    // producer/queue/device-read time, not just TCP latency.
+    uint64_t tensor_get_count;
+    uint64_t tensor_get_bytes;
+    int64_t  tensor_get_request_us;
+    int64_t  tensor_get_header_wait_us;
+    int64_t  tensor_get_payload_recv_us;
+    int64_t  tensor_get_total_us;
 };
 
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
