@@ -591,6 +591,9 @@ struct rpc_msg_p2c_stream_subscribe_rsp {
 struct rpc_msg_p2c_stream_finish_req {
     uint64_t run_id;
 };
+struct rpc_msg_p2c_stream_capture_rsp {
+    uint8_t captured;
+};
 struct rpc_msg_p2c_stream_capture_req {
     uint32_t device;
     uint32_t region_id;
@@ -2992,8 +2995,12 @@ static bool ggml_backend_rpc_p2c_stream_capture(
     req.n_tokens = n_tokens;
     req.tensor = serialize_tensor(tensor);
     auto sock = get_socket(ctx->endpoint);
-    return sock != nullptr && send_rpc_cmd_compact_small(
-        sock, RPC_CMD_P2C_STREAM_CAPTURE, req);
+    rpc_msg_p2c_stream_capture_rsp rsp {};
+    // A small control ACK fences the GPU->Host snapshot. The Phone can then
+    // reuse its graph buffers, while the large TCP payload remains in flight.
+    return sock != nullptr && send_rpc_cmd(
+        sock, RPC_CMD_P2C_STREAM_CAPTURE, &req, sizeof(req),
+        &rsp, sizeof(rsp)) && rsp.captured != 0;
 }
 
 static bool ggml_backend_rpc_p2c_stream_stop(
@@ -9188,8 +9195,12 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             }
             case RPC_CMD_P2C_STREAM_CAPTURE: {
                 rpc_msg_p2c_stream_capture_req request {};
-                if (!recv_msg(sock, &request, sizeof(request)) ||
-                        !server.capture_p2c_stream(request)) {
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_p2c_stream_capture_rsp rsp {};
+                rsp.captured = server.capture_p2c_stream(request) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) {
                     return;
                 }
                 break;
