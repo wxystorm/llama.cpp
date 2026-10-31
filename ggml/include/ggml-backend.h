@@ -569,6 +569,9 @@ extern "C" {
     GGML_API bool           ggml_backend_is_meta(ggml_backend_t backend);
     GGML_API size_t         ggml_backend_meta_n_backends(ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
+    // Non-owning per-device tensor view. Returns nullptr if no simple
+    // allocation exists, rather than assuming Phone owns the output.
+    GGML_API ggml_tensor * ggml_backend_meta_simple_tensor(const ggml_tensor * tensor, size_t index);
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
