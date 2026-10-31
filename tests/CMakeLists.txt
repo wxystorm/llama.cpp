@@ -346,7 +346,9 @@ endif()
 
 # Opt-in RPC P2C framing/Arena regression: no live Phone required.
 if (GGML_RPC)
+    find_package(Threads REQUIRED)
     add_executable(test-p2c-arena-stream test-p2c-arena-stream.cpp)
+    target_link_libraries(test-p2c-arena-stream PRIVATE Threads::Threads)
     target_include_directories(test-p2c-arena-stream PRIVATE
         ${PROJECT_SOURCE_DIR}/ggml/include
         ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
