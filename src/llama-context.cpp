@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 //
@@ -79,6 +80,120 @@ struct llama_region_ring_p2c_deferred {
 
 static thread_local llama_region_ring_p2c_deferred
     llama_region_ring_tls_p2c_deferred;
+
+// The producer uses this only for non-final Phone Full Region outputs.
+// A successful capture ACK means the Phone has completed GPU->host staging,
+// NOT that the PC has received the payload.
+struct llama_region_ring_phone_full_stream_tls {
+    bool enabled = false;
+    bool deferred = false;
+    ggml_backend_t rpc_backend = nullptr;
+    ggml_backend_rpc_p2c_stream_capture_t capture = nullptr;
+    uint64_t run_id = 0;
+    uint32_t region_id = 0;
+    uint32_t chunk_id = 0;
+    uint32_t token_begin = 0;
+    uint32_t n_tokens = 0;
+};
+static thread_local llama_region_ring_phone_full_stream_tls
+    llama_region_ring_tls_phone_full_stream;
+
+struct llama_region_ring_phone_full_return_job {
+    llama_region_ring_task task;
+    float * destination = nullptr;
+    size_t bytes = 0;
+    bool deferred = false;
+    bool received = false;
+};
+
+struct llama_region_ring_phone_full_stream_session {
+    uint64_t run_id = 0;
+    llama_region_ring_ready * ready = nullptr;
+    std::mutex mutex;
+    std::unordered_map<uint64_t, llama_region_ring_phone_full_return_job> pending;
+    std::atomic<bool> failed { false };
+    std::atomic<size_t> completed { 0 };
+};
+
+static uint64_t llama_region_ring_phone_full_return_key(
+        size_t region, size_t chunk) {
+    return (uint64_t(region) << 32) | uint64_t(chunk);
+}
+
+static void * llama_region_ring_phone_full_stream_resolve(
+        void * userdata, const ggml_backend_rpc_p2c_frame * frame) {
+    auto * session =
+        static_cast<llama_region_ring_phone_full_stream_session *>(userdata);
+    if (session == nullptr || frame == nullptr ||
+            frame->run_id != session->run_id ||
+            frame->kind != GGML_BACKEND_RPC_P2C_FULL) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(session->mutex);
+    const auto it = session->pending.find(
+        llama_region_ring_phone_full_return_key(
+            frame->region_id, frame->chunk_id));
+    if (it == session->pending.end() ||
+            it->second.received ||
+            frame->token_begin != uint32_t(it->second.task.token_begin) ||
+            frame->n_tokens != uint32_t(it->second.task.n_tokens) ||
+            frame->payload_bytes != it->second.bytes) {
+        return nullptr;
+    }
+    return it->second.destination;
+}
+
+static void llama_region_ring_phone_full_stream_complete(
+        void * userdata, const ggml_backend_rpc_p2c_frame * frame,
+        bool ok) {
+    auto * session =
+        static_cast<llama_region_ring_phone_full_stream_session *>(userdata);
+    if (session == nullptr || session->ready == nullptr) {
+        return;
+    }
+    if (!ok || frame == nullptr) {
+        session->failed.store(true, std::memory_order_relaxed);
+        session->ready->cancel();
+        return;
+    }
+
+    llama_region_ring_task task;
+    bool publish = false;
+    bool valid = false;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        const auto it = session->pending.find(
+            llama_region_ring_phone_full_return_key(
+                frame->region_id, frame->chunk_id));
+        if (it != session->pending.end() && !it->second.received &&
+                frame->run_id == session->run_id &&
+                frame->payload_bytes == it->second.bytes &&
+                frame->token_begin == uint32_t(it->second.task.token_begin) &&
+                frame->n_tokens == uint32_t(it->second.task.n_tokens)) {
+            it->second.received = true;
+            valid = true;
+            if (it->second.deferred) {
+                task = it->second.task;
+                publish = true;
+                session->pending.erase(it);
+            }
+        }
+    }
+    if (!valid) {
+        session->failed.store(true, std::memory_order_relaxed);
+        session->ready->cancel();
+        return;
+    }
+    if (publish && !session->ready->failed()) {
+        try {
+            session->ready->complete_deferred(task);
+            session->completed.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+            session->failed.store(true, std::memory_order_relaxed);
+            session->ready->cancel();
+        }
+    }
+}
 
 static void llama_hybrid_log_formal_prepare_prediction(
         uint32_t tokens,
@@ -3000,6 +3115,37 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         return result;
     }
 
+    if (llama_region_ring_tls_phone_full_stream.enabled) {
+        auto & stream = llama_region_ring_tls_phone_full_stream;
+        ggml_tensor * stage_tensor = result->get_stage_output();
+        ggml_tensor * phone_tensor =
+            ggml_backend_meta_simple_tensor(stage_tensor, 1);
+        const size_t expected =
+            size_t(block_tokens) * model.hparams.n_embd * sizeof(float);
+        if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE ||
+                stage_output == nullptr || stage_tensor == nullptr ||
+                stage_tensor->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(stage_tensor) ||
+                ggml_nbytes(stage_tensor) != expected ||
+                phone_tensor == nullptr ||
+                !ggml_is_contiguous(phone_tensor) ||
+                ggml_nbytes(phone_tensor) != expected ||
+                stream.capture == nullptr ||
+                !stream.capture(stream.rpc_backend, phone_tensor,
+                                stream.run_id, stream.region_id,
+                                stream.chunk_id, stream.token_begin,
+                                stream.n_tokens)) {
+            LLAMA_LOG_ERROR(
+                "[P2C_ARENA_CAPTURE] region=%u chunk=%u "
+                "status=FAIL reason=OUTPUT_MAPPING_OR_CAPTURE\n",
+                stream.region_id, stream.chunk_id);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        stream.deferred = true;
+        return result;
+    }
+
     if (stage_output != nullptr) {
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
         if (!copy_hybrid_stage_output(
@@ -4236,6 +4382,74 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
             }
         }
+        // Opt-in A/B path. Keep the legacy GET and directional Tensor
+        // return routes untouched until Full Phone correctness is proven.
+        const char * stream_env = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
+        const bool phone_stream_requested =
+            stream_env != nullptr && std::atoi(stream_env) != 0;
+        llama_region_ring_phone_full_stream_session phone_stream_session;
+        void * phone_stream_handle = nullptr;
+        ggml_backend_rpc_p2c_stream_capture_t phone_stream_capture = nullptr;
+        ggml_backend_rpc_p2c_stream_stop_t phone_stream_stop = nullptr;
+        if (phone_stream_requested) {
+            if (!pc_phone_overlap || directional_runtime ||
+                    phone_rpc_backend == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[P2C_STREAM] status=REJECT "
+                    "reason=REQUIRES_NON_DIRECTIONAL_PC_PHONE_RPC\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            ggml_backend_dev_t rpc_dev =
+                ggml_backend_get_device(phone_rpc_backend);
+            ggml_backend_reg_t rpc_reg =
+                rpc_dev != nullptr ? ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+            auto start = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_p2c_stream_start_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_P2C_STREAM_START_PROC)) : nullptr;
+            phone_stream_capture = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_p2c_stream_capture_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_P2C_STREAM_CAPTURE_PROC)) : nullptr;
+            phone_stream_stop = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_p2c_stream_stop_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_P2C_STREAM_STOP_PROC)) : nullptr;
+            if (start == nullptr || phone_stream_capture == nullptr ||
+                    phone_stream_stop == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[P2C_STREAM] status=REJECT reason=RPC_PROCS_MISSING\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            static std::atomic<uint64_t> next_phone_stream_run_id { 1 };
+            phone_stream_session.run_id =
+                next_phone_stream_run_id.fetch_add(
+                    1, std::memory_order_relaxed);
+            phone_stream_session.ready = &ready;
+            phone_stream_handle = start(
+                phone_rpc_backend,
+                phone_stream_session.run_id,
+                uint32_t(stages.size()),
+                uint32_t(ubatch.n_tokens),
+                uint32_t(n_embd),
+                llama_region_ring_phone_full_stream_resolve,
+                llama_region_ring_phone_full_stream_complete,
+                &phone_stream_session);
+            if (phone_stream_handle == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[P2C_STREAM] status=FAIL reason=SUBSCRIBE\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            LLAMA_LOG_INFO(
+                "[P2C_STREAM] phase=START run=%" PRIu64
+                " regions=%zu tokens=%u policy=PHONE_FULL_OPT_IN status=READY\n",
+                phone_stream_session.run_id, stages.size(), ubatch.n_tokens);
+        }
+
         const std::array<llama_region_ring_device, 3> devices = {
             llama_region_ring_device::CPU,
             llama_region_ring_device::GPU,
@@ -4796,6 +5010,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                     const auto task = *next;
                     active_task = task;
+                    llama_region_ring_tls_phone_full_stream = {};
                     const bool target_phone_shape =
                         dev == (size_t) llama_region_ring_device::PHONE &&
                         task.region == phone_affinity_region &&
@@ -4997,6 +5212,47 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         if (ready.failed()) {
                             cancelled_before_compute = true;
                         } else {
+                            // Register before sending the capture command: a fast
+                            // network return can arrive before ready.defer().
+                            if (phone_stream_handle != nullptr &&
+                                    dev == (size_t)
+                                        llama_region_ring_device::PHONE &&
+                                    stage.kind ==
+                                        llama_hybrid_runtime_stage_kind::PHONE &&
+                                    !last) {
+                                if (output == nullptr) {
+                                    throw std::runtime_error(
+                                        "missing Phone stream output buffer");
+                                }
+                                const uint64_t key =
+                                    llama_region_ring_phone_full_return_key(
+                                        task.region, task.chunk);
+                                llama_region_ring_phone_full_return_job job;
+                                job.task = task;
+                                job.destination = output;
+                                job.bytes = size_t(task.n_tokens) *
+                                            n_embd * sizeof(float);
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        phone_stream_session.mutex);
+                                    if (!phone_stream_session.pending.emplace(
+                                            key, job).second) {
+                                        throw std::runtime_error(
+                                            "duplicate Phone stream task");
+                                    }
+                                }
+                                auto & tls =
+                                    llama_region_ring_tls_phone_full_stream;
+                                tls.enabled = true;
+                                tls.rpc_backend = phone_rpc_backend;
+                                tls.capture = phone_stream_capture;
+                                tls.run_id = phone_stream_session.run_id;
+                                tls.region_id = uint32_t(task.region);
+                                tls.chunk_id = uint32_t(task.chunk);
+                                tls.token_begin = uint32_t(task.token_begin);
+                                tls.n_tokens = uint32_t(task.n_tokens);
+                            }
+
                             ggml_backend_rpc_snapshot_stats phone_rpc_before {};
                             const bool sample_phone_rpc =
                                 dev == (size_t) llama_region_ring_device::PHONE &&
@@ -5323,6 +5579,39 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         break;
                     }
 
+                    if (llama_region_ring_tls_phone_full_stream.deferred) {
+                        llama_region_ring_tls_phone_full_stream = {};
+                        // Allow next Phone chunk to run once its output is
+                        // safely staged; keep downstream blocked until PC
+                        // Receiver has copied the entire TCP frame.
+                        ready.defer(task);
+                        bool received = false;
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                phone_stream_session.mutex);
+                            auto it = phone_stream_session.pending.find(
+                                llama_region_ring_phone_full_return_key(
+                                    task.region, task.chunk));
+                            if (it == phone_stream_session.pending.end()) {
+                                throw std::runtime_error(
+                                    "missing Phone stream return task");
+                            }
+                            it->second.deferred = true;
+                            received = it->second.received;
+                            if (received) {
+                                phone_stream_session.pending.erase(it);
+                            }
+                        }
+                        if (received && !ready.failed()) {
+                            ready.complete_deferred(task);
+                            phone_stream_session.completed.fetch_add(
+                                1, std::memory_order_relaxed);
+                        }
+                        active_task.reset();
+                        continue;
+                    }
+                    llama_region_ring_tls_phone_full_stream = {};
+
                     // A completed directional C2P island closes the causal
                     // PC-side continuation for this outer chunk. Dense C2P
                     // uses the generic Meta graph and therefore does not pass
@@ -5574,6 +5863,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ++joined;
             }
         }
+        if (phone_stream_handle != nullptr) {
+            const bool stream_ok = phone_stream_stop(
+                phone_rpc_backend, phone_stream_handle);
+            if (!stream_ok ||
+                    phone_stream_session.failed.load(
+                        std::memory_order_relaxed) ||
+                    !phone_stream_session.pending.empty()) {
+                LLAMA_LOG_ERROR(
+                    "[P2C_STREAM] phase=STOP recv=%zu "
+                    "pending=%zu status=FAIL\n",
+                    phone_stream_session.completed.load(
+                        std::memory_order_relaxed),
+                    phone_stream_session.pending.size());
+                if (ret == GGML_STATUS_SUCCESS) {
+                    ret = GGML_STATUS_FAILED;
+                }
+            } else {
+                LLAMA_LOG_INFO(
+                    "[P2C_STREAM] phase=STOP recv=%zu "
+                    "pending=0 status=OK\n",
+                    phone_stream_session.completed.load(
+                        std::memory_order_relaxed));
+            }
+            phone_stream_handle = nullptr;
+        }
+
         if (p2c_join_requested) {
             {
                 std::lock_guard<std::mutex> lock(
@@ -5656,6 +5971,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = worker_states[dev].status;
             }
         }
+        executed +=
+            phone_stream_session.completed.load(std::memory_order_relaxed);
         executed +=
             p2c_join_completed.load(
                 std::memory_order_relaxed);
