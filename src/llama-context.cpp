@@ -4498,6 +4498,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_BANK_MOVER] event=INIT "
                     "status=FAIL reason=KV_STAGE_VIEW\n");
+                if (phone_stream_handle != nullptr) {
+                    (void) phone_stream_stop(phone_rpc_backend, phone_stream_handle);
+                    phone_stream_handle = nullptr;
+                }
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
@@ -4816,6 +4820,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "status=FAIL\n");
             }
             if (!gpu_bank_mover_started) {
+                if (phone_stream_handle != nullptr) {
+                    (void) phone_stream_stop(phone_rpc_backend, phone_stream_handle);
+                    phone_stream_handle = nullptr;
+                }
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
