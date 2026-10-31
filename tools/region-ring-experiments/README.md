@@ -287,6 +287,11 @@ not merely cache-slot selection. Compare `phone_prepare_ms`,
 `meta_graph_rebuild_ms`, `ring_wall_ms`, results and device memory with
 a forced identical layout and cache off vs. on. Default is OFF until the
 PC and Termux RPC builds have passed correctness and memory tests.
+When a remote tensor buffer is released, the Phone server evicts all
+registered graphs referencing that allocation, and the PC invalidates
+the corresponding cached UID assumptions. An RPC compute-socket reconnect
+also invalidates cached UIDs. This prevents using dangling graph bindings
+after scheduler reset or connection replacement.
 No additional model runs or per-Chunk logs are introduced by this cache.
 
 ## Results

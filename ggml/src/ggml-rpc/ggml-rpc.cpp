@@ -660,6 +660,7 @@ struct ggml_backend_rpc_device_context {
     // Synchronize registration with remote buffer destruction.
     std::mutex graph_cache_mutex;
     std::unordered_set<uint64_t> graph_uids;
+    const socket_t * graph_cache_socket = nullptr;
 
     std::mutex ring_auto_cache_mutex;
     std::unordered_set<uint64_t> ring_auto_graph_uids;
@@ -4102,6 +4103,15 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     // The same RPC device may free graph-owned buffers on a different
     // thread. A full-cache lookup and remote submission form one lease.
     std::lock_guard<std::mutex> cache_lock(rpc_dev_ctx->graph_cache_mutex);
+    auto compute_sock = get_socket(rpc_ctx->endpoint);
+    if (compute_sock == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+    // A reconnect starts with an empty Phone-side graph registry.
+    if (rpc_dev_ctx->graph_cache_socket != compute_sock.get()) {
+        rpc_dev_ctx->graph_cache_socket = compute_sock.get();
+        rpc_dev_ctx->graph_uids.clear();
+    }
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     const bool cacheable = cgraph->uid != 0;
