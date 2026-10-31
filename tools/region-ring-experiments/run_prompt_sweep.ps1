@@ -26,7 +26,7 @@ param(
     [string] $Streaming = "on",
     [string] $Planner = "apply-wide",
     [ValidateRange(0, 5)]
-    [int] $LogVerbosity = 3,
+    [int] $LogVerbosity = 4,
     [switch] $DryRun
 )
 $ErrorActionPreference = "Stop"
