@@ -363,9 +363,9 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("region-ring-results"))
     ap.add_argument("--planner", default="apply-wide")
     ap.add_argument("--streaming", choices=("on", "off"), default="on")
-    ap.add_argument("--log-verbosity", type=int, choices=range(0, 6), default=3,
+    ap.add_argument("--log-verbosity", type=int, choices=range(0, 6), default=4,
                     metavar="{0,1,2,3,4,5}",
-                    help="llama -lv level (default: 3 = INFO; 4 = TRACE; 5 = DEBUG)")
+                    help="llama -lv threshold (default: 4, required for GGML/LLAMA INFO logs; 5 enables DEBUG)")
     ap.add_argument("--n-predict", type=int, default=32)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--ubatch", type=int, default=512)
