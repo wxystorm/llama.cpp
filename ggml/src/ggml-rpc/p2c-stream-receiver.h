@@ -7,6 +7,7 @@
 #include "ggml-rpc.h"
 #include "transport.h"
 
+#include <chrono>
 #include <cstdint>
 #include <limits>
 
@@ -19,6 +20,10 @@ public:
         : run_id_(run_id), n_regions_(n_regions), n_tokens_(n_tokens),
           n_embd_(n_embd), resolve_(resolve),
           complete_(complete), userdata_(userdata) {}
+
+    uint64_t frames_received() const { return frames_; }
+    uint64_t payload_bytes_received() const { return payload_bytes_; }
+    int64_t payload_recv_us() const { return payload_recv_us_; }
 
     // Runs only on the independent network thread. The caller owns the
     // socket, session lifecycle and cancellation policy.
@@ -60,8 +65,17 @@ public:
                 complete_(userdata_, &frame, false);
                 return false;
             }
+            const auto recv_begin = std::chrono::steady_clock::now();
             const bool ok = socket->recv_data(
                 destination, size_t(frame.payload_bytes));
+            const auto recv_end = std::chrono::steady_clock::now();
+            payload_recv_us_ +=
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    recv_end - recv_begin).count();
+            if (ok) {
+                ++frames_;
+                payload_bytes_ += frame.payload_bytes;
+            }
             complete_(userdata_, &frame, ok);
             if (!ok) {
                 return false;
@@ -79,4 +93,7 @@ private:
     ggml_backend_rpc_p2c_resolve_t resolve_;
     ggml_backend_rpc_p2c_complete_t complete_;
     void * userdata_;
+    uint64_t frames_ = 0;
+    uint64_t payload_bytes_ = 0;
+    int64_t payload_recv_us_ = 0;
 };
