@@ -6,6 +6,7 @@
 // waits for the TCP sender to drain this queue.
 #include "ggml-rpc.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -130,6 +131,26 @@ public:
     bool take(item & out) {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] { return finishing_ || !queue_.empty(); });
+        if (in_flight_ || failed_ || queue_.empty()) {
+            return false;
+        }
+        out.frame = queue_.front();
+        queue_.pop_front();
+        out.data = arena_.data() +
+            size_t(out.frame.region_id) * stride_ +
+            size_t(out.frame.token_begin) * n_embd_ * sizeof(float);
+        in_flight_ = true;
+        return true;
+    }
+
+    // Bounded equivalent for tests and diagnostics. The production Sender
+    // retains take(), which waits until a READY frame or FINISH.
+    bool take_for(item & out, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout,
+                          [&] { return finishing_ || failed_ || !queue_.empty(); })) {
+            return false;
+        }
         if (in_flight_ || failed_ || queue_.empty()) {
             return false;
         }
