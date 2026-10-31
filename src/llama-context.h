@@ -71,6 +71,7 @@ struct llama_hybrid_stage_timing {
     int64_t weight_stage_us  = 0;
     size_t  weight_upload_bytes    = 0;
     size_t  weight_cache_hit_bytes = 0;
+    bool    graph_reused = false;
 };
 
 struct llama_context {
@@ -358,7 +359,8 @@ private:
                                       int32_t                  outputs_override = -1,
                                       bool                     force_hidden_input = false,
                                       bool                     embedding_only = false,
-                                      bool                     preserve_weight_cache_on_reset = false);
+                                      bool                     preserve_weight_cache_on_reset = false,
+                                      bool *                   graph_reused_out = nullptr);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,

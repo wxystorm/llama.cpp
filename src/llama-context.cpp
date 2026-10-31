@@ -1930,7 +1930,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  int32_t                  outputs_override,
                                                  bool                     force_hidden_input,
                                                  bool                     embedding_only,
-                                                 bool                     preserve_weight_cache_on_reset) {
+                                                 bool                     preserve_weight_cache_on_reset,
+                                                 bool *                   graph_reused_out) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -1990,6 +1991,9 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
 
     const int64_t reuse_check_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     const bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
+    if (graph_reused_out != nullptr) {
+        *graph_reused_out = can_reuse_graph;
+    }
     if (log_prepare_breakdown) {
         reuse_check_us = ggml_time_us() - reuse_check_begin_us;
     }
@@ -2520,7 +2524,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
         &stage, task_local_graph_outputs ? block_outputs : -1,
         stage_input != nullptr, false,
-        preserve_weight_cache_on_graph_reset);
+        preserve_weight_cache_on_graph_reset,
+        timing != nullptr ? &timing->graph_reused : nullptr);
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -4154,6 +4159,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // compute_range_us includes backend submission/sync, not
             // device-only kernel time. output_sync_us may include readback.
             int64_t         graph_prepare_us = 0;
+            size_t          graph_reuses = 0;
             int64_t         compute_range_us = 0;
             int64_t         output_sync_us = 0;
             ggml_status     status          = GGML_STATUS_SUCCESS;
@@ -4628,6 +4634,66 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             cpu_full_meta_queue ? "META_TASK_QUEUE" : "DIRECT_WORKER",
             directional_runtime ? 1 : 0);
 
+        // The Phone RPC backend caches graphs by UID. Keep the PC graph
+        // instances stable across interleaved Phone Regions so remote
+        // GRAPH_RECOMPUTE can reuse registered server-side graphs.
+        // The final Phone Region MUST use the canonical output scheduler.
+        const char * phone_graph_cache_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_CACHE");
+        const bool phone_graph_cache =
+            pc_phone_overlap && isolate_device_resources &&
+            threaded_execution && !directional_runtime &&
+            phone_graph_cache_env != nullptr &&
+            std::atoi(phone_graph_cache_env) != 0;
+        struct phone_graph_template_slot {
+            size_t region = 0;
+            int tokens = 0;
+            ggml_backend_sched_ptr sched;
+            llm_graph_result_ptr res;
+            size_t uses = 0;
+        };
+        std::vector<phone_graph_template_slot> phone_graph_templates;
+        size_t phone_graph_template_revisits = 0;
+        if (phone_graph_cache) {
+            const size_t max_nodes =
+                graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+            // At most two shapes per intermediate Phone Region: XP and tail.
+            for (size_t r = 0; r + 1 < stages.size(); ++r) {
+                if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                    continue;
+                }
+                const int regular_tokens = stages[r].macro_tokens;
+                const int tail_tokens = (int) ubatch.n_tokens % regular_tokens;
+                for (const int tokens : {regular_tokens, tail_tokens}) {
+                    if (tokens <= 0 || tokens > (int) ubatch.n_tokens) {
+                        continue;
+                    }
+                    phone_graph_template_slot entry;
+                    entry.region = r;
+                    entry.tokens = tokens;
+                    entry.sched.reset(ggml_backend_sched_new(
+                        backend_ptrs.data(), backend_buft.data(),
+                        (int) backend_ptrs.size(), max_nodes, false,
+                        cparams.op_offload));
+                    if (!entry.sched) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PHONE_GRAPH_CACHE] "
+                            "event=INIT_FAIL region=%zu tokens=%d "
+                            "reason=SCHED_ALLOC\n", r, tokens);
+                        ret = GGML_STATUS_ALLOC_FAILED;
+                        return nullptr;
+                    }
+                    entry.res.reset(new llm_graph_result(max_nodes));
+                    phone_graph_templates.emplace_back(std::move(entry));
+                }
+            }
+        }
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PHONE_GRAPH_CACHE] enabled=%d slots=%zu "
+            "policy=REGION_EXACT_TOKENS final_owner=MAIN "
+            "remote=RPC_UID_CACHE status=READY\n",
+            phone_graph_cache ? 1 : 0, phone_graph_templates.size());
+
         auto run_worker = [&](size_t dev) {
             auto & state = worker_states[dev];
             const auto device = devices[dev];
@@ -4702,6 +4768,26 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ring_sched[dev];
                     llm_graph_result * task_res =
                         ring_res[dev];
+                    if (dev == (size_t) llama_region_ring_device::PHONE &&
+                            phone_graph_cache && !last) {
+                        bool found = false;
+                        for (auto & entry : phone_graph_templates) {
+                            if (entry.region == task.region &&
+                                    entry.tokens == task.n_tokens) {
+                                task_sched = entry.sched.get();
+                                task_res = entry.res.get();
+                                if (entry.uses++ > 0) {
+                                    ++phone_graph_template_revisits;
+                                }
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) {
+                            throw std::runtime_error(
+                                "Phone graph cache missing stage/token slot");
+                        }
+                    }
                     int gpu_bank = -1;
                     int64_t gpu_bank_wait_us = 0;
                     bool gpu_bank_resident = false;
@@ -4874,6 +4960,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 compute_end_us - compute_begin_us;
                             state.graph_prepare_us +=
                                 task_timing.prepare_us;
+                            state.graph_reuses += task_timing.graph_reused ? 1 : 0;
                             state.compute_range_us +=
                                 task_timing.compute_range_us;
                             state.output_sync_us +=
@@ -5514,6 +5601,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << "\"xp\":" << runtime_xp << ","
                             << "\"cpu_full_meta_queue\":"
                             << (cpu_full_meta_queue ? "true" : "false") << ","
+                            << "\"phone_graph_cache\":"
+                            << (phone_graph_cache ? "true" : "false") << ","
+                            << "\"phone_graph_slots\":"
+                            << phone_graph_templates.size() << ","
+                            << "\"phone_graph_slot_revisits\":"
+                            << phone_graph_template_revisits << ","
+                            << "\"phone_graph_reuses\":"
+                            << worker_states[2].graph_reuses << ","
                             << "\"tasks\":" << ready.total_tasks() << ","
                             << "\"executed\":" << executed << ","
                             << "\"status\":" << (int) ret << ","
