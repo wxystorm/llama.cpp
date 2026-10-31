@@ -802,8 +802,13 @@ public:
             std::nullopt : take_device_locked(dev);
     }
 
+    // Optional preference is applied ONLY to already-ready work. Never wait
+    // for a preferred Phone Region while another claimable task exists:
+    // causal FIFO progress and device utilization must stay intact.
     std::optional<llama_region_ring_task> wait_take(
-            llama_region_ring_device device) {
+            llama_region_ring_device device,
+            size_t preferred_region = std::numeric_limits<size_t>::max(),
+            int preferred_tokens = -1) {
         const size_t dev = device_index(device);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] {
@@ -813,7 +818,7 @@ public:
         if (failed_ || all_done_locked()) {
             return std::nullopt;
         }
-        return take_device_locked(dev);
+        return take_device_locked(dev, preferred_region, preferred_tokens);
     }
 
     void complete(const llama_region_ring_task & task) {
@@ -1095,13 +1100,28 @@ private:
     }
 
     std::optional<llama_region_ring_task>
-    take_device_locked(size_t dev) {
+    take_device_locked(
+            size_t dev,
+            size_t preferred_region = std::numeric_limits<size_t>::max(),
+            int preferred_tokens = -1) {
         auto & queue = queues_[dev];
-        const auto it = std::find_if(
-            queue.begin(), queue.end(),
-            [this](const auto & task) {
-                return claimable_locked(task);
-            });
+        auto it = queue.end();
+        if (preferred_region < regions_.size() && preferred_tokens > 0) {
+            it = std::find_if(
+                queue.begin(), queue.end(),
+                [this, preferred_region, preferred_tokens](const auto & task) {
+                    return task.region == preferred_region &&
+                           task.n_tokens == preferred_tokens &&
+                           claimable_locked(task);
+                });
+        }
+        if (it == queue.end()) {
+            it = std::find_if(
+                queue.begin(), queue.end(),
+                [this](const auto & task) {
+                    return claimable_locked(task);
+                });
+        }
         if (it == queue.end()) {
             return std::nullopt;
         }

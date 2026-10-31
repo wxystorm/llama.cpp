@@ -42,6 +42,13 @@ class ExperimentReportTests(unittest.TestCase):
                  "cpu_full_meta_queue": False,
                  "phone_graph_cache": False, "phone_graph_slots": 0,
                  "phone_graph_slot_revisits": 0, "phone_graph_reuses": 3,
+                 "phone_graph_affinity": True,
+                 "phone_graph_affinity_region": 2,
+                 "phone_graph_affinity_tokens": 96,
+                 "phone_target_graph_tasks": 4,
+                 "phone_target_consecutive": 2,
+                 "phone_target_graph_reuses": 2,
+                 "phone_target_consecutive_reuses": 2,
                  "meta_graph_ms": 100.0, "meta_graph_rebuild_ms": 31.0,
                  "meta_graph_execute_ms": 65.0, "meta_graph_other_ms": 4.0,
                  "meta_graph_calls": 2, "meta_graph_rebuilds": 1,
@@ -72,6 +79,13 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["phone_graph_slots"], 0)
             self.assertEqual(result["phone_graph_slot_revisits"], 0)
             self.assertEqual(result["phone_graph_reuses"], 3)
+            self.assertTrue(result["phone_graph_affinity"])
+            self.assertEqual(result["phone_graph_affinity_region"], 2)
+            self.assertEqual(result["phone_graph_affinity_tokens"], 96)
+            self.assertEqual(result["phone_target_graph_tasks"], 4)
+            self.assertEqual(result["phone_target_consecutive"], 2)
+            self.assertEqual(result["phone_target_graph_reuses"], 2)
+            self.assertEqual(result["phone_target_consecutive_reuses"], 2)
             self.assertEqual(result["meta_graph_rebuild_ms"], 31)
             self.assertEqual(result["meta_graph_execute_ms"], 65)
             self.assertEqual(result["meta_graph_other_ms"], 4)
@@ -167,6 +181,8 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertIsNone(row["cpu_full_meta_queue"])
             self.assertIsNone(row["phone_graph_cache"])
             self.assertIsNone(row["phone_graph_slots"])
+            self.assertIsNone(row["phone_graph_affinity"])
+            self.assertIsNone(row["phone_target_graph_reuses"])
             self.assertIsNone(row["meta_graph_rebuild_ms"])
             self.assertIsNone(row["selected_dag_sim_ms"])
             self.assertIsNone(row["final_dag_sim_ms"])

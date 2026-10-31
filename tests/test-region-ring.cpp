@@ -911,6 +911,59 @@ static void test_gpu_weight_two_bank_policy() {
           "last two GPU ranks must not refill past the Region list");
 }
 
+static void test_phone_single_graph_ready_affinity() {
+    // Both regions use the same Phone device. After region0/chunk0,
+    // region1/chunk0 is offered BEFORE region0/chunk1 by normal FIFO.
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::PHONE, 0, 1},
+        {llama_region_ring_device::PHONE, 1, 2},
+    };
+    llama_region_ring_ready fifo(regions, 150, 64);
+    auto first_fifo = fifo.try_take(llama_region_ring_device::PHONE);
+    check(first_fifo && first_fifo->region == 0 && first_fifo->chunk == 0,
+          "phone affinity baseline missing initial task");
+    fifo.complete(*first_fifo);
+    auto fifo_next = fifo.try_take(llama_region_ring_device::PHONE);
+    check(fifo_next && fifo_next->region == 1 && fifo_next->chunk == 0,
+          "default FIFO order must remain unchanged");
+
+    llama_region_ring_ready affinity(regions, 150, 64);
+    auto first = affinity.try_take(llama_region_ring_device::PHONE);
+    check(first && first->region == 0 && first->chunk == 0,
+          "phone affinity missing first task");
+    affinity.complete(*first);
+    auto preferred = affinity.wait_take(
+        llama_region_ring_device::PHONE, 0, 64);
+    check(preferred && preferred->region == 0 &&
+          preferred->chunk == 1 && preferred->n_tokens == 64,
+          "ready same-graph Phone Chunk was not preferred");
+    affinity.complete(*preferred);
+
+    // Desired region/shape is NOT ready (the final Region0 Chunk has 22
+    // tokens). The scheduler must immediately choose the normal FIFO
+    // task; it must never wait for an unavailable cached graph shape.
+    auto fallback = affinity.wait_take(
+        llama_region_ring_device::PHONE, 0, 64);
+    check(fallback && fallback->region == 1 &&
+          fallback->chunk == 0 && fallback->n_tokens == 64,
+          "unavailable Phone preference must fall back to FIFO");
+    affinity.complete(*fallback);
+    auto tail = affinity.wait_take(
+        llama_region_ring_device::PHONE, 0, 22);
+    check(tail && tail->region == 0 &&
+          tail->chunk == 2 && tail->n_tokens == 22,
+          "Phone affinity must compare actual token shape");
+    affinity.complete(*tail);
+
+    while (!affinity.all_done()) {
+        auto task = affinity.try_take(llama_region_ring_device::PHONE);
+        check(task.has_value(), "Phone affinity left a blocked task");
+        affinity.complete(*task);
+    }
+    check(affinity.finished() == affinity.total_tasks(),
+          "Phone affinity must preserve every causal task");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -962,6 +1015,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_same_bank_lifetime_scheduler=PASS\n");
         test_gpu_weight_two_bank_policy();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
+        test_phone_single_graph_ready_affinity();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_single_graph_ready_affinity=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");

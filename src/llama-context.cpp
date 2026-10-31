@@ -4160,6 +4160,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // device-only kernel time. output_sync_us may include readback.
             int64_t         graph_prepare_us = 0;
             size_t          graph_reuses = 0;
+            size_t          phone_target_graph_tasks = 0;
+            size_t          phone_target_consecutive = 0;
+            size_t          phone_target_graph_reuses = 0;
+            size_t          phone_target_consecutive_reuses = 0;
             int64_t         compute_range_us = 0;
             int64_t         output_sync_us = 0;
             ggml_status     status          = GGML_STATUS_SUCCESS;
@@ -4656,12 +4660,45 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "policy=LEGACY_MAIN_SCHEDULER status=READY\n");
         }
 
+        // Single-graph proof: reuse the CURRENT Phone Scheduler and graph.
+        // Prefer another READY Chunk of the same first Phone Full Region and
+        // token shape, without allocating an extra Scheduler or pinning any
+        // long-lived Meta KV Views. The standard can_reuse()/set_inputs()
+        // contract is still the sole authority over actual graph reuse.
+        const char * phone_affinity_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_AFFINITY");
+        const bool phone_affinity_requested =
+            phone_affinity_env != nullptr && std::atoi(phone_affinity_env) != 0;
+        size_t phone_affinity_region = stages.size();
+        for (size_t r = 0; r + 1 < stages.size(); ++r) {
+            if (stages[r].kind == llama_hybrid_runtime_stage_kind::PHONE) {
+                phone_affinity_region = r;
+                break;
+            }
+        }
+        const int phone_affinity_tokens =
+            phone_affinity_region < stages.size() ?
+                stages[phone_affinity_region].macro_tokens : 0;
+        const bool phone_affinity =
+            phone_affinity_requested && pc_phone_overlap &&
+            threaded_execution && !directional_runtime &&
+            phone_affinity_region < stages.size() &&
+            phone_affinity_tokens > 0;
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PHONE_GRAPH_AFFINITY] requested=%d enabled=%d "
+            "region=%zu tokens=%d policy=READY_ONLY "
+            "scheduler=MAIN status=READY\n",
+            phone_affinity_requested ? 1 : 0, phone_affinity ? 1 : 0,
+            phone_affinity_region, phone_affinity_tokens);
+
         auto run_worker = [&](size_t dev) {
             auto & state = worker_states[dev];
             const auto device = devices[dev];
             const char * name = llama_region_ring_device_name(device);
             bool worker_apply_mctx = false; // canonical KV ubatch was applied once above
             std::optional<llama_region_ring_task> active_task;
+            size_t previous_phone_region = stages.size();
+            int previous_phone_tokens = -1;
             LLAMA_LOG_INFO(
                 "[REGION_RING_WORKER] device=%s event=START "
                 "scheduler=%p result=%p kv_view=%p\n",
@@ -4670,7 +4707,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             try {
                 while (true) {
                     const int64_t wait_begin_us = ggml_time_us();
-                    const auto next = ready.wait_take(device);
+                    const bool prefer_phone_graph =
+                        phone_affinity &&
+                        dev == (size_t) llama_region_ring_device::PHONE &&
+                        previous_phone_region == phone_affinity_region &&
+                        previous_phone_tokens == phone_affinity_tokens;
+                    const auto next = ready.wait_take(
+                        device,
+                        prefer_phone_graph ? phone_affinity_region : stages.size(),
+                        prefer_phone_graph ? phone_affinity_tokens : -1);
                     state.ready_wait_us += ggml_time_us() - wait_begin_us;
                     if (!next) {
                         break; // all done, or cancelled by another worker
@@ -4678,6 +4723,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                     const auto task = *next;
                     active_task = task;
+                    const bool target_phone_shape =
+                        dev == (size_t) llama_region_ring_device::PHONE &&
+                        task.region == phone_affinity_region &&
+                        task.n_tokens == phone_affinity_tokens;
+                    const bool consecutive_phone_shape =
+                        target_phone_shape &&
+                        previous_phone_region == phone_affinity_region &&
+                        previous_phone_tokens == phone_affinity_tokens;
                     const bool first = task.region == 0;
                     const bool last = task.region + 1 == stages.size();
                     const auto & stage = stages[task.region];
@@ -4903,6 +4956,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             state.graph_prepare_us +=
                                 task_timing.prepare_us;
                             state.graph_reuses += task_timing.graph_reused ? 1 : 0;
+                            if (target_phone_shape &&
+                                    task_result != nullptr &&
+                                    task_status == GGML_STATUS_SUCCESS) {
+                                ++state.phone_target_graph_tasks;
+                                state.phone_target_consecutive +=
+                                    consecutive_phone_shape ? 1 : 0;
+                                state.phone_target_graph_reuses +=
+                                    task_timing.graph_reused ? 1 : 0;
+                                state.phone_target_consecutive_reuses +=
+                                    consecutive_phone_shape &&
+                                    task_timing.graph_reused ? 1 : 0;
+                            }
                             state.compute_range_us +=
                                 task_timing.compute_range_us;
                             state.output_sync_us +=
@@ -5234,6 +5299,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     }
 
                     ready.complete(task);
+                    if (dev == (size_t) llama_region_ring_device::PHONE) {
+                        previous_phone_region = task.region;
+                        previous_phone_tokens = task.n_tokens;
+                    }
                     const bool gpu_region_drained =
                         dev == 1 && gpu_bank_streaming &&
                         ready.region_done(task.region);
@@ -5551,6 +5620,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << phone_graph_template_revisits << ","
                             << "\"phone_graph_reuses\":"
                             << worker_states[2].graph_reuses << ","
+                            << "\"phone_graph_affinity\":"
+                            << (phone_affinity ? "true" : "false") << ","
+                            << "\"phone_graph_affinity_region\":"
+                            << (phone_affinity_region < stages.size() ?
+                                (int64_t) phone_affinity_region : -1) << ","
+                            << "\"phone_graph_affinity_tokens\":"
+                            << phone_affinity_tokens << ","
+                            << "\"phone_target_graph_tasks\":"
+                            << worker_states[2].phone_target_graph_tasks << ","
+                            << "\"phone_target_consecutive\":"
+                            << worker_states[2].phone_target_consecutive << ","
+                            << "\"phone_target_graph_reuses\":"
+                            << worker_states[2].phone_target_graph_reuses << ","
+                            << "\"phone_target_consecutive_reuses\":"
+                            << worker_states[2].phone_target_consecutive_reuses << ","
                             << "\"tasks\":" << ready.total_tasks() << ","
                             << "\"executed\":" << executed << ","
                             << "\"status\":" << (int) ret << ","

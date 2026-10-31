@@ -290,6 +290,38 @@ of dynamic Tensor View mappings, lifetime-safe invalidation and tests of
 interleaved Region, varying Chunk and KV writes. No extra Planner simulations
 or inference runs are introduced by this guard.
 
+### Single Phone Graph: ready-only Region affinity (opt-in, low risk)
+
+Set `LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_AFFINITY=1` to test one fixed
+Phone Region with an **unchanged** PC GGML Scheduler/Graph. The selected target
+is the first nonfinal full Phone Region (usually Region index 2), at its
+regular `XP` token shape. After successfully running that shape, if another
+Chunk of the **same Region and actual token count** is already READY, the Phone
+worker prefers it over earlier-enqueued Phone tasks. If not ready, the
+scheduler immediately falls back to normal FIFO, without blocking.
+The exact per-Region causal/KV dependencies are still verified by the
+existing READY scheduler, and the option is disabled for directional Tensor.
+
+The existing `llm_graph_result::can_reuse()` remains the correctness gate:
+if the KV mask dimensions, output mode, or other graph params change, the
+normal `model.build_graph()` path runs. Compatible Graphs use existing
+`set_inputs()` to update Chunk hidden states, positions, KV indices and
+attention masks; the RPC backend can use `GRAPH_RECOMPUTE` after a stable
+graph UID has been registered. No additional Scheduler, Meta dynamic
+Tensor-view pinning, Phone-side model graph builder, or persistent cache
+allocation is introduced. This is **not** initialization-time pre-registration
+and is independent of the unsafe `PHONE_GRAPH_CACHE=1` guard above.
+
+Each end-of-UBatch JSONL/CSV now reports `phone_graph_affinity`,
+`phone_graph_affinity_region`, `phone_graph_affinity_tokens`,
+`phone_target_graph_tasks`, `phone_target_consecutive`,
+`phone_target_graph_reuses`, and `phone_target_consecutive_reuses`.
+Compare the same forced layout, on/off, for actual graph reuse,
+`phone_prepare_ms`, `meta_graph_rebuild_ms`, `wall_ms`, and correctness.
+A consecutive READY Chunk does not guarantee topology reuse: the native
+Graph check can still reject it. No extra real model evaluations or
+per-Chunk telemetry were added.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted
