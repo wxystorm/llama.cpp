@@ -95,7 +95,15 @@ def discover_prompts(
         if not path.is_file():
             raise ValueError(f"prompt is not a file: {path}")
         unique[str(path)] = path
-    return sorted(unique.values(), key=lambda p: str(p).lower())
+    def prompt_sort_key(path: Path) -> tuple[int, int, str]:
+        # Numeric order is easier to inspect for a length experiment:
+        # prompt_64, prompt_128, ... prompt_1024.
+        match = re.fullmatch(r"prompt[_-](\d+)", path.stem, re.IGNORECASE)
+        if match:
+            return (0, int(match.group(1)), str(path).lower())
+        return (1, 0, str(path).lower())
+
+    return sorted(unique.values(), key=prompt_sort_key)
 
 
 def sha256_bytes(content: bytes) -> str:
@@ -202,24 +210,65 @@ def probe_tokens(
     return n, source
 
 
+# A full 1K-token Jupiter profile repeats the whole prompt per q-sweep seed
+# and per missing q(x,prefix) point. Echo phase progress without flooding the
+# console with llama.cpp's many per-chunk runtime lines.
+ECHO_PROGRESS_PREFIXES = (
+    "[JUPITER_STAGE3_CONFIG]",
+    "[JUPITER_STAGE3_TOOL]",
+    "[JUPITER_STAGE3_REFINEMENT_WORKSPACE]",
+    "[JUPITER_STAGE3_VERIFY]",
+    "[JUPITER_STAGE3_DONE]",
+    "[JUPITER_STAGE3_INCOMPLETE]",
+    "[JUPITER_STAGE3_ERROR]",
+    "[JUPITER_SWEEP_PLAN]",
+    "[JUPITER_SWEEP_RUN]",
+    "[JUPITER_SWEEP_RESUME]",
+    "[JUPITER_SWEEP_DONE]",
+    "[JUPITER_SWEEP_DP]",
+    "[JUPITER_REFINE_CANDIDATE]",
+    "[JUPITER_REFINE_SAMPLE]",
+    "[JUPITER_REFINE_MEASURED]",
+    "[JUPITER_REFINE_DONE]",
+    "[JUPITER_REFINE_INCOMPLETE]",
+    "[JUPITER_BENCH_VERIFY]",
+    "[JUPITER_BENCH_RUN]",
+    "[JUPITER_BENCH_RESULT]",
+    "[JUPITER_BENCH_SUMMARY]",
+    "[JUPITER_BENCH_DONE]",
+)
+
+
 def launch_logged(command: list[str], log_path: Path, phase: str) -> None:
     print(f"[JUPITER_SUITE_PHASE] phase={phase} action=START "
           f"log={log_path}", flush=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", newline="\n") as handle:
-        result = subprocess.run(
-            command, stdin=subprocess.DEVNULL, stdout=handle,
-            stderr=subprocess.STDOUT, check=False,
-        )
-    if result.returncode:
+        with subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        ) as process:
+            assert process.stdout is not None
+            for line in process.stdout:
+                handle.write(line)
+                if line.startswith(ECHO_PROGRESS_PREFIXES):
+                    print(line.rstrip("\r\n"), flush=True)
+            rc = process.wait()
+    if rc:
         tail = "\n".join(
             log_path.read_text(encoding="utf-8", errors="replace")
             .splitlines()[-18:]
         )
         raise RuntimeError(
-            f"{phase} exited {result.returncode}; log={log_path}\n{tail}"
+            f"{phase} exited {rc}; log={log_path}\n{tail}"
         )
     print(f"[JUPITER_SUITE_PHASE] phase={phase} action=DONE", flush=True)
-
 
 def read_benchmark_results(
     csv_path: Path, total: int, modes: list[str], repeats: int
