@@ -26,6 +26,15 @@
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
+// Experiment-only counters; no added RPC traffic or hot-path file writes.
+static bool rpc_region_ring_metrics_enabled() {
+    static const bool enabled = []() {
+        const char * path = std::getenv("LLAMA_REGION_RING_METRICS_FILE");
+        return path != nullptr && *path != '\0';
+    }();
+    return enabled;
+}
+
 static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 static constexpr size_t RPC_RETURN_TRANSFER_LANES = 2;
 static constexpr size_t RPC_SNAPSHOT_SLOTS = 4;
@@ -651,6 +660,14 @@ struct rpc_snapshot_client_stats {
     std::atomic<int64_t> total_us { 0 };
 };
 
+struct rpc_region_ring_command_stats {
+    std::atomic<uint64_t> set_tensor_count { 0 };
+    std::atomic<uint64_t> set_tensor_bytes { 0 };
+    std::atomic<uint64_t> graph_compute_count { 0 };
+    std::atomic<uint64_t> graph_recompute_count { 0 };
+    std::atomic<uint64_t> graph_snapshot_count { 0 };
+};
+
 struct ggml_backend_rpc_device_context {
     std::string endpoint;
     uint32_t    device;
@@ -670,6 +687,7 @@ struct ggml_backend_rpc_device_context {
     rpc_snapshot_ready_context snapshot_ready;
     rpc_snapshot_client_stats snapshot_client_stats;
     rpc_snapshot_client_stats tensor_get_client_stats;
+    rpc_region_ring_command_stats region_ring_command_stats;
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
 };
@@ -1011,6 +1029,17 @@ static bool ggml_backend_rpc_get_snapshot_stats(
         ctx->tensor_get_client_stats.recv_payload_us.load(std::memory_order_relaxed);
     stats->tensor_get_total_us =
         ctx->tensor_get_client_stats.total_us.load(std::memory_order_relaxed);
+    const auto & commands = ctx->region_ring_command_stats;
+    stats->set_tensor_count =
+        commands.set_tensor_count.load(std::memory_order_relaxed);
+    stats->set_tensor_bytes =
+        commands.set_tensor_bytes.load(std::memory_order_relaxed);
+    stats->graph_compute_count =
+        commands.graph_compute_count.load(std::memory_order_relaxed);
+    stats->graph_recompute_count =
+        commands.graph_recompute_count.load(std::memory_order_relaxed);
+    stats->graph_snapshot_count =
+        commands.graph_snapshot_count.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -1763,6 +1792,11 @@ static void ggml_backend_rpc_buffer_set_tensor(
         input.size());
 
     RPC_STATUS_ASSERT(status);
+    if (status && rpc_region_ring_metrics_enabled() && ctx->device_ctx != nullptr) {
+        auto & commands = ctx->device_ctx->region_ring_command_stats;
+        commands.set_tensor_count.fetch_add(1, std::memory_order_relaxed);
+        commands.set_tensor_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
 
     if (rpc_opencl_extra_debug_enabled() &&
         rpc_is_k_quant_type(tensor->type)) {
@@ -1926,6 +1960,8 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
             ctx->transfer_sock != nullptr);
     }
 
+    const int64_t staged_start_us =
+        rpc_region_ring_metrics_enabled() ? ggml_time_us() : 0;
     status = send_rpc_cmd_staged(
         ctx->transfer_sock,
         RPC_CMD_GET_TENSOR,
@@ -1933,6 +1969,14 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         sizeof(request),
         data,
         size);
+    if (status && rpc_region_ring_metrics_enabled() && ctx->device_ctx != nullptr) {
+        auto & stats = ctx->device_ctx->tensor_get_client_stats;
+        stats.transfer_count.fetch_add(1, std::memory_order_relaxed);
+        stats.payload_bytes.fetch_add(size, std::memory_order_relaxed);
+        stats.total_us.fetch_add(
+            ggml_time_us() - staged_start_us, std::memory_order_relaxed);
+        // Staged GET has no separately timed header/payload phases.
+    }
 
 } else {
     const bool p2c_profile =
@@ -1940,8 +1984,7 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
         rpc_p2c_return_tensor_name(tensor->name);
     // Reuse the already-established two-phase GET_TENSOR receive path in
     // the experiment only. Without metrics, retain the original call.
-    const bool record_tensor_get =
-        std::getenv("LLAMA_REGION_RING_METRICS_FILE") != nullptr;
+    const bool record_tensor_get = rpc_region_ring_metrics_enabled();
 
     if (p2c_profile || record_tensor_get) {
         const int64_t total_begin_us = ggml_time_us();
@@ -4101,7 +4144,14 @@ static bool rpc_flush_pending_fused_input(
 
     auto sock = get_socket(rpc_dev_ctx->endpoint);
     RPC_STATUS_ASSERT(sock != nullptr);
-    return send_rpc_cmd(sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    const bool status = send_rpc_cmd(
+        sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+    if (status && rpc_region_ring_metrics_enabled()) {
+        auto & commands = rpc_dev_ctx->region_ring_command_stats;
+        commands.set_tensor_count.fetch_add(1, std::memory_order_relaxed);
+        commands.set_tensor_bytes.fetch_add(pending.data_size, std::memory_order_relaxed);
+    }
+    return status;
 }
 
 static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
@@ -4180,6 +4230,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 fused_input.packet.data(),
                 fused_input.packet.size());
             RPC_STATUS_ASSERT(status);
+            if (status && rpc_region_ring_metrics_enabled()) {
+                rpc_dev_ctx->region_ring_command_stats.graph_snapshot_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
 
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
@@ -4207,6 +4261,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
                 RPC_CMD_GRAPH_RECOMPUTE_SNAPSHOT,
                 request);
             RPC_STATUS_ASSERT(status);
+            if (status && rpc_region_ring_metrics_enabled()) {
+                rpc_dev_ctx->region_ring_command_stats.graph_snapshot_count.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
 
             auto & prepared = rpc_ctx->graph_snapshot;
             std::lock_guard<std::mutex> lock(prepared.mutex);
@@ -4234,6 +4292,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             cgraph->n_nodes,
             sizeof(request));
         RPC_STATUS_ASSERT(status);
+        if (status && rpc_region_ring_metrics_enabled()) {
+            rpc_dev_ctx->region_ring_command_stats.graph_recompute_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
     } else {
         RPC_STATUS_ASSERT(rpc_flush_pending_fused_input(rpc_dev_ctx));
 
@@ -4251,6 +4313,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
         auto sock = get_socket(rpc_ctx->endpoint);
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        if (status && rpc_region_ring_metrics_enabled()) {
+            rpc_dev_ctx->region_ring_command_stats.graph_compute_count.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {

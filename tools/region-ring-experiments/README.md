@@ -240,6 +240,47 @@ first-Cycle seeds chosen before prefix compensation. Compare
 `best_prefix_predicted_ms` with the Planner JSONL `predicted_ms` to
 understand why a uniform base plan or Tensor-boundary refinement won.
 
+### Phone Full Region RPC command counters (experiment only)
+
+When `LLAMA_REGION_RING_METRICS_FILE` is set and a threaded, overlapping,
+**all-Full G/C/P** layout is used, the Phone worker reads the existing RPC
+client statistics immediately before and after each Phone Full Chunk. Counters
+are summed by Region and written **only after the UBatch finishes**. The
+`region_ring` JSONL record includes `phone_rpc_available` and
+`phone_rpc_regions`, with `region`, `layer_begin` (inclusive),
+`layer_end` (exclusive), `chunks`, `set_tensor_count`,
+`set_tensor_bytes`, `graph_compute_count`,
+`graph_recompute_count`, `graph_snapshot_count`,
+`get_tensor_count`, and `get_tensor_bytes`.
+
+The `summary.csv` adds a `phone_rpc_regions_json` column preserving
+UBatch/Region identity and flattened `phone_rpc_*` totals.
+`set_tensor_*` counts successful **ordinary RPC_CMD_SET_TENSOR**
+commands and their *tensor data payload*, excluding command framing,
+hash-elided writes and fused snapshot commands.
+`graph_snapshot_count` covers the two snapshot-recompute variants;
+it is separate from plain `GRAPH_RECOMPUTE`.
+`get_tensor_*` covers ordinary `GET_TENSOR` (including staged GET),
+not READY/PARTIAL mailbox or Snapshot returns. Staged GET has no split
+header/payload phase timing, only the existing total counter.
+
+This is a **client-only** measurement: the Phone server protocol does not
+change. No per-Chunk terminal output, no new RPC messages, no changed
+Planner/Graph/Bank scheduling. Directional Tensor layouts are intentionally
+excluded because their independent return workers can overlap and make
+per-Region RPC snapshot attribution ambiguous. Missing statistics are marked
+unavailable instead of reporting false zeros.
+
+In PowerShell, after running the usual prompt sweep, inspect:
+
+```powershell
+Get-Content "$dir\metrics.jsonl" |
+    ForEach-Object { $_ | ConvertFrom-Json } |
+    Where-Object { $_.type -eq "region_ring" -and $_.tokens -eq 358 } |
+    ForEach-Object { $_.phone_rpc_regions } |
+    Format-Table region,layer_begin,layer_end,chunks,set_tensor_count,set_tensor_bytes,graph_compute_count,graph_recompute_count,graph_snapshot_count,get_tensor_count,get_tensor_bytes -AutoSize
+```
+
 ### Runtime cleanup: Full-only CPU scheduling and Meta graph measurement
 
 For layouts containing only G/C/P Full regions (no C2P/P2C Tensor),

@@ -33,12 +33,27 @@ class ExperimentReportTests(unittest.TestCase):
                  "prefix_e": [0.3, 0.25, 0.22, 0.2],
                  "prefix_service_mspt": [[1, 2, 3], [2, 3, 4]]},
                 {"type": "region_ring", "tokens": 512, "complete": True,
-                 "status": 0, "wall_ms": 900, "layout": "G4,C4,P4"},
+                 "status": 0, "wall_ms": 900, "layout": "G4,C4,P4",
+                 "phone_rpc_available": True, "phone_rpc_regions": [
+                     {"region": 2, "set_tensor_count": 999}]},
                 {"type": "measurement_start", "schema": 1},
                 {"type": "region_ring", "tokens": 126, "complete": True,
                  "status": 0, "wall_ms": 100.0, "cpu_compute_range_ms": 8.0,
                  "meta_available": True, "meta_pc_to_phone_copy_ms": 7.0,
                  "meta_phone_to_pc_copy_ms": 3.0,
+                  "phone_rpc_available": True,
+                  "ubatch": 0,
+                  "phone_rpc_regions": [
+                      {"region": 2, "layer_begin": 8, "layer_end": 12,
+                       "chunks": 2, "set_tensor_count": 6,
+                       "set_tensor_bytes": 8192, "graph_compute_count": 1,
+                       "graph_recompute_count": 1, "graph_snapshot_count": 0,
+                       "get_tensor_count": 2, "get_tensor_bytes": 4096},
+                      {"region": 5, "layer_begin": 20, "layer_end": 24,
+                       "chunks": 1, "set_tensor_count": 3,
+                       "set_tensor_bytes": 4096, "graph_compute_count": 1,
+                       "graph_recompute_count": 0, "graph_snapshot_count": 0,
+                       "get_tensor_count": 1, "get_tensor_bytes": 2048}],
                   "phone_result_get_count": 12,
                   "phone_result_get_mib": 8.0,
                   "phone_result_request_ms": 4.0,
@@ -91,6 +106,19 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["cpu_compute_range_ms"], 8)
             self.assertEqual(result["meta_pc_to_phone_copy_ms"], 7)
             self.assertEqual(result["phone_result_get_count"], 12)
+            self.assertTrue(result["phone_rpc_available"])
+            self.assertEqual(result["phone_rpc_set_tensor_count"], 9)
+            self.assertEqual(result["phone_rpc_set_tensor_bytes"], 12288)
+            self.assertEqual(result["phone_rpc_graph_compute_count"], 2)
+            self.assertEqual(result["phone_rpc_graph_recompute_count"], 1)
+            self.assertEqual(result["phone_rpc_graph_snapshot_count"], 0)
+            self.assertEqual(result["phone_rpc_get_tensor_count"], 3)
+            self.assertEqual(result["phone_rpc_get_tensor_bytes"], 6144)
+            region_records = json.loads(result["phone_rpc_regions_json"])
+            self.assertEqual(len(region_records), 1)
+            self.assertEqual(region_records[0]["ubatch"], 0)
+            self.assertEqual(len(region_records[0]["regions"]), 2)
+            self.assertEqual(region_records[0]["regions"][0]["layer_begin"], 8)
             self.assertEqual(result["phone_result_get_mib"], 8)
             self.assertEqual(result["phone_result_response_wait_ms"], 1200)
             self.assertEqual(result["phone_result_payload_recv_ms"], 130)
@@ -207,6 +235,9 @@ class ExperimentReportTests(unittest.TestCase):
             row = SWEEP.result_row(
                 args, folder, prompt, 64, 1024, 0, 1000, "deadbeef")
             self.assertEqual(row["status"], "NO_RING")
+            self.assertIsNone(row["phone_rpc_available"])
+            self.assertIsNone(row["phone_rpc_regions_json"])
+            self.assertIsNone(row["phone_rpc_set_tensor_count"])
             self.assertIsNone(row["cpu_full_meta_queue"])
             self.assertIsNone(row["phone_graph_cache"])
             self.assertIsNone(row["phone_graph_slots"])

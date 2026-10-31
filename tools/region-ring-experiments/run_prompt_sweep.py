@@ -66,6 +66,11 @@ FIELDS = [
     "phone_result_payload_recv_ms", "phone_result_rpc_total_ms",
     "phone_snapshot_return_count", "phone_snapshot_ready_wait_ms",
     "phone_snapshot_payload_recv_ms",
+    "phone_rpc_available", "phone_rpc_regions_json",
+    "phone_rpc_set_tensor_count", "phone_rpc_set_tensor_bytes",
+    "phone_rpc_graph_compute_count", "phone_rpc_graph_recompute_count",
+    "phone_rpc_graph_snapshot_count",
+    "phone_rpc_get_tensor_count", "phone_rpc_get_tensor_bytes",
     "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
     "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
     "run_dir",
@@ -316,6 +321,29 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             if row["meta_available"] and any(key in x for x in ring)
             else None
         )
+    # Region-level Phone Full RPC counters are recorded only for threaded
+    # all-Full layouts. Keep the individual UBatch/Region identities in CSV.
+    phone_rpc_rows = [
+        r for r in ring
+        if r.get("phone_rpc_available") is True and
+        isinstance(r.get("phone_rpc_regions"), list)
+    ]
+    row["phone_rpc_available"] = bool(phone_rpc_rows) if ring else None
+    if phone_rpc_rows:
+        row["phone_rpc_regions_json"] = json.dumps(
+            [{"ubatch": r.get("ubatch"), "regions": r["phone_rpc_regions"]}
+             for r in phone_rpc_rows], separators=(",", ":"))
+        for key in (
+            "set_tensor_count", "set_tensor_bytes",
+            "graph_compute_count", "graph_recompute_count",
+            "graph_snapshot_count", "get_tensor_count", "get_tensor_bytes",
+        ):
+            row[f"phone_rpc_{key}"] = sum(
+                int(region.get(key, 0) or 0)
+                for record in phone_rpc_rows
+                for region in record["phone_rpc_regions"]
+                if isinstance(region, dict)
+            )
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
     row["gpu_cuda_gate_wait_ms"] = total(ring, "gpu_cuda_gate_wait_ms")
     return {field: row.get(field) for field in FIELDS}

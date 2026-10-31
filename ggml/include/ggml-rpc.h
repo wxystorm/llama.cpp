@@ -301,6 +301,15 @@ struct ggml_backend_rpc_snapshot_stats {
     int64_t  tensor_get_header_wait_us;
     int64_t  tensor_get_payload_recv_us;
     int64_t  tensor_get_total_us;
+
+    // Client-side Region Ring RPC command accounting; all values are
+    // cumulative and sampled by the Phone Full worker at Chunk boundaries.
+    // SET_TENSOR bytes exclude protocol headers, hash hits and fused commands.
+    uint64_t set_tensor_count;
+    uint64_t set_tensor_bytes;
+    uint64_t graph_compute_count;
+    uint64_t graph_recompute_count;
+    uint64_t graph_snapshot_count;
 };
 
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(

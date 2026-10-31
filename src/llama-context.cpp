@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-rpc.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
@@ -4196,6 +4197,41 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             std::vector<std::pair<int64_t, int64_t>> compute_intervals;
         };
         std::array<ring_worker_state, 3> worker_states;
+        struct phone_rpc_region_counter {
+            uint64_t chunks = 0;
+            uint64_t set_tensor_count = 0;
+            uint64_t set_tensor_bytes = 0;
+            uint64_t graph_compute_count = 0;
+            uint64_t graph_recompute_count = 0;
+            uint64_t graph_snapshot_count = 0;
+            uint64_t get_tensor_count = 0;
+            uint64_t get_tensor_bytes = 0;
+        };
+        std::vector<phone_rpc_region_counter> phone_rpc_regions(stages.size());
+        ggml_backend_t phone_rpc_backend = nullptr;
+        ggml_backend_rpc_get_snapshot_stats_t phone_rpc_getter = nullptr;
+        // One Phone Full FIFO owns these snapshots. Directional Tensor mode
+        // has independent return workers, so skip attribution in that mode.
+        if (!directional_runtime && pc_phone_overlap &&
+                experiment_meta_backend != nullptr &&
+                ggml_backend_meta_n_backends(experiment_meta_backend) > 1) {
+            ggml_backend_t candidate =
+                ggml_backend_meta_simple_backend(experiment_meta_backend, 1);
+            ggml_backend_dev_t rpc_dev =
+                candidate != nullptr ? ggml_backend_get_device(candidate) : nullptr;
+            ggml_backend_reg_t rpc_reg =
+                rpc_dev != nullptr ? ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+            if (rpc_reg != nullptr) {
+                auto getter = reinterpret_cast<ggml_backend_rpc_get_snapshot_stats_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC));
+                ggml_backend_rpc_snapshot_stats probe {};
+                if (getter != nullptr && getter(candidate, &probe)) {
+                    phone_rpc_backend = candidate;
+                    phone_rpc_getter = getter;
+                }
+            }
+        }
         const std::array<llama_region_ring_device, 3> devices = {
             llama_region_ring_device::CPU,
             llama_region_ring_device::GPU,
@@ -4957,6 +4993,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         if (ready.failed()) {
                             cancelled_before_compute = true;
                         } else {
+                            ggml_backend_rpc_snapshot_stats phone_rpc_before {};
+                            const bool sample_phone_rpc =
+                                dev == (size_t) llama_region_ring_device::PHONE &&
+                                stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+                                phone_rpc_getter != nullptr &&
+                                phone_rpc_getter(phone_rpc_backend, &phone_rpc_before);
                             const int64_t compute_begin_us = ggml_time_us();
                             int64_t lane_compute_begin_us = 0;
                             int64_t lane_compute_end_us = 0;
@@ -4986,6 +5028,37 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             const int64_t compute_end_us = ggml_time_us();
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
+                            if (sample_phone_rpc) {
+                                ggml_backend_rpc_snapshot_stats phone_rpc_after {};
+                                if (phone_rpc_getter(phone_rpc_backend, &phone_rpc_after)) {
+                                    auto & counts = phone_rpc_regions[task.region];
+                                    const auto delta = [](uint64_t before, uint64_t after) {
+                                        return after >= before ? after - before : UINT64_C(0);
+                                    };
+                                    ++counts.chunks;
+                                    counts.set_tensor_count += delta(
+                                        phone_rpc_before.set_tensor_count,
+                                        phone_rpc_after.set_tensor_count);
+                                    counts.set_tensor_bytes += delta(
+                                        phone_rpc_before.set_tensor_bytes,
+                                        phone_rpc_after.set_tensor_bytes);
+                                    counts.graph_compute_count += delta(
+                                        phone_rpc_before.graph_compute_count,
+                                        phone_rpc_after.graph_compute_count);
+                                    counts.graph_recompute_count += delta(
+                                        phone_rpc_before.graph_recompute_count,
+                                        phone_rpc_after.graph_recompute_count);
+                                    counts.graph_snapshot_count += delta(
+                                        phone_rpc_before.graph_snapshot_count,
+                                        phone_rpc_after.graph_snapshot_count);
+                                    counts.get_tensor_count += delta(
+                                        phone_rpc_before.tensor_get_count,
+                                        phone_rpc_after.tensor_get_count);
+                                    counts.get_tensor_bytes += delta(
+                                        phone_rpc_before.tensor_get_bytes,
+                                        phone_rpc_after.tensor_get_bytes);
+                                }
+                            }
                             state.graph_prepare_us +=
                                 task_timing.prepare_us;
                             state.graph_reuse_check_us += task_timing.graph_reuse_check_us;
@@ -5824,6 +5897,35 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 << ",\"phone_snapshot_payload_recv_ms\":"
                                 << meta_delta_us(a.return_recv_payload_us,
                                                  b.return_recv_payload_us) / 1000.0;
+                    }
+                    metrics << ",\"phone_rpc_available\":"
+                            << (phone_rpc_getter != nullptr ? "true" : "false");
+                    if (phone_rpc_getter != nullptr) {
+                        metrics << ",\"phone_rpc_regions\":[";
+                        bool first_rpc_region = true;
+                        for (size_t r = 0; r < stages.size(); ++r) {
+                            if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                                continue;
+                            }
+                            if (!first_rpc_region) {
+                                metrics << ",";
+                            }
+                            first_rpc_region = false;
+                            const auto & c = phone_rpc_regions[r];
+                            metrics << "{\"region\":" << r
+                                    << ",\"layer_begin\":" << stages[r].layer_begin
+                                    << ",\"layer_end\":" << stages[r].layer_end
+                                    << ",\"chunks\":" << c.chunks
+                                    << ",\"set_tensor_count\":" << c.set_tensor_count
+                                    << ",\"set_tensor_bytes\":" << c.set_tensor_bytes
+                                    << ",\"graph_compute_count\":" << c.graph_compute_count
+                                    << ",\"graph_recompute_count\":" << c.graph_recompute_count
+                                    << ",\"graph_snapshot_count\":" << c.graph_snapshot_count
+                                    << ",\"get_tensor_count\":" << c.get_tensor_count
+                                    << ",\"get_tensor_bytes\":" << c.get_tensor_bytes
+                                    << "}";
+                        }
+                        metrics << "]";
                     }
                     metrics << "}\n";
                 region_ring_experiment_records.push_back(metrics.str());
