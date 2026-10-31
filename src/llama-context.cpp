@@ -1931,7 +1931,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  bool                     force_hidden_input,
                                                  bool                     embedding_only,
                                                  bool                     preserve_weight_cache_on_reset,
-                                                 bool *                   graph_reused_out) {
+                                                 bool *                   graph_reused_out,
+                                                 llama_hybrid_stage_timing * stage_timing_out) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -1939,7 +1940,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
     const bool log_stage_prepare =
         ubatch.n_tokens > 1 &&
         stage != nullptr;
-    const bool log_prepare_breakdown = log_formal_prepare || log_stage_prepare;
+    const bool log_prepare_breakdown =
+        log_formal_prepare || log_stage_prepare || stage_timing_out != nullptr;
 
     const int64_t prepare_total_begin_us = log_prepare_breakdown ? ggml_time_us() : 0;
     int64_t apply_mctx_us    = 0;
@@ -2068,6 +2070,14 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         if (log_prepare_breakdown) {
             set_inputs_us = ggml_time_us() - set_inputs_begin_us;
         }
+    }
+
+    if (stage_timing_out != nullptr) {
+        stage_timing_out->graph_reuse_check_us += reuse_check_us;
+        stage_timing_out->graph_reset_us += graph_reset_us;
+        stage_timing_out->graph_build_us += graph_build_us;
+        stage_timing_out->graph_alloc_us += graph_alloc_us;
+        stage_timing_out->input_set_us += set_inputs_us;
     }
 
     if (log_prepare_breakdown) {
@@ -2525,7 +2535,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         &stage, task_local_graph_outputs ? block_outputs : -1,
         stage_input != nullptr, false,
         preserve_weight_cache_on_graph_reset,
-        timing != nullptr ? &timing->graph_reused : nullptr);
+        timing != nullptr ? &timing->graph_reused : nullptr,
+        timing);
     if (timing != nullptr) {
         timing->prepare_us += ggml_time_us() - prepare_begin_us;
     }
@@ -2810,6 +2821,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 const int64_t split_prepare_us =
                     ggml_time_us() - split_prepare_begin_us;
                 timing->prepare_us += split_prepare_us;
+                timing->split_prepare_us += split_prepare_us;
                 if (gpu_weight_streaming) {
                     timing->weight_stage_us += split_prepare_us;
                 }
@@ -4159,6 +4171,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // compute_range_us includes backend submission/sync, not
             // device-only kernel time. output_sync_us may include readback.
             int64_t         graph_prepare_us = 0;
+            int64_t         graph_reuse_check_us = 0;
+            int64_t         graph_reset_us = 0;
+            int64_t         graph_build_us = 0;
+            int64_t         graph_alloc_us = 0;
+            int64_t         input_set_us = 0;
+            int64_t         split_prepare_us = 0;
             size_t          graph_reuses = 0;
             size_t          phone_target_graph_tasks = 0;
             size_t          phone_target_consecutive = 0;
@@ -4970,6 +4988,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 compute_end_us - compute_begin_us;
                             state.graph_prepare_us +=
                                 task_timing.prepare_us;
+                            state.graph_reuse_check_us += task_timing.graph_reuse_check_us;
+                            state.graph_reset_us += task_timing.graph_reset_us;
+                            state.graph_build_us += task_timing.graph_build_us;
+                            state.graph_alloc_us += task_timing.graph_alloc_us;
+                            state.input_set_us += task_timing.input_set_us;
+                            state.split_prepare_us += task_timing.split_prepare_us;
                             state.graph_reuses += task_timing.graph_reused ? 1 : 0;
                             if (target_phone_shape &&
                                     task_result != nullptr &&
@@ -5635,6 +5659,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << phone_graph_template_revisits << ","
                             << "\"phone_graph_reuses\":"
                             << worker_states[2].graph_reuses << ","
+                            << "\"phone_graph_reuse_count\":"
+                            << worker_states[2].graph_reuses << ","
+                            << "\"phone_graph_reuse_check_ms\":"
+                            << worker_states[2].graph_reuse_check_us / 1000.0 << ","
+                            << "\"phone_graph_reset_ms\":"
+                            << worker_states[2].graph_reset_us / 1000.0 << ","
+                            << "\"phone_graph_build_ms\":"
+                            << worker_states[2].graph_build_us / 1000.0 << ","
+                            << "\"phone_graph_alloc_ms\":"
+                            << worker_states[2].graph_alloc_us / 1000.0 << ","
+                            << "\"phone_input_set_ms\":"
+                            << worker_states[2].input_set_us / 1000.0 << ","
+                            << "\"phone_split_prepare_ms\":"
+                            << worker_states[2].split_prepare_us / 1000.0 << ","
                             << "\"phone_graph_affinity\":"
                             << (phone_affinity ? "true" : "false") << ","
                             << "\"phone_graph_affinity_region\":"

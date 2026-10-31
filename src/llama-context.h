@@ -66,6 +66,13 @@ struct llama_hybrid_runtime_stage {
 
 struct llama_hybrid_stage_timing {
     int64_t prepare_us       = 0;
+    // Stage graph and split preparation, aggregated only after the UBatch.
+    int64_t graph_reuse_check_us = 0;
+    int64_t graph_reset_us = 0;
+    int64_t graph_build_us = 0;
+    int64_t graph_alloc_us = 0;
+    int64_t input_set_us = 0;
+    int64_t split_prepare_us = 0;
     int64_t compute_range_us = 0;
     int64_t sync_us          = 0;
     int64_t weight_stage_us  = 0;
@@ -360,7 +367,8 @@ private:
                                       bool                     force_hidden_input = false,
                                       bool                     embedding_only = false,
                                       bool                     preserve_weight_cache_on_reset = false,
-                                      bool *                   graph_reused_out = nullptr);
+                                      bool *                   graph_reused_out = nullptr,
+                                      llama_hybrid_stage_timing * stage_timing_out = nullptr);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,

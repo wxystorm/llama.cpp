@@ -42,6 +42,13 @@ class ExperimentReportTests(unittest.TestCase):
                  "cpu_full_meta_queue": False,
                  "phone_graph_cache": False, "phone_graph_slots": 0,
                  "phone_graph_slot_revisits": 0, "phone_graph_reuses": 3,
+                  "phone_graph_reuse_count": 3,
+                  "phone_graph_reuse_check_ms": 1.5,
+                  "phone_graph_reset_ms": 3.5,
+                  "phone_graph_build_ms": 90.0,
+                  "phone_graph_alloc_ms": 180.0,
+                  "phone_input_set_ms": 40.0,
+                  "phone_split_prepare_ms": 850.0,
                  "phone_graph_affinity": True,
                  "phone_graph_affinity_region": 2,
                  "phone_graph_affinity_tokens": 96,
@@ -79,6 +86,13 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["phone_graph_slots"], 0)
             self.assertEqual(result["phone_graph_slot_revisits"], 0)
             self.assertEqual(result["phone_graph_reuses"], 3)
+            self.assertEqual(result["phone_graph_reuse_count"], 3)
+            self.assertEqual(result["phone_graph_reuse_check_ms"], 1.5)
+            self.assertEqual(result["phone_graph_reset_ms"], 3.5)
+            self.assertEqual(result["phone_graph_build_ms"], 90)
+            self.assertEqual(result["phone_graph_alloc_ms"], 180)
+            self.assertEqual(result["phone_input_set_ms"], 40)
+            self.assertEqual(result["phone_split_prepare_ms"], 850)
             self.assertTrue(result["phone_graph_affinity"])
             self.assertEqual(result["phone_graph_affinity_region"], 2)
             self.assertEqual(result["phone_graph_affinity_tokens"], 96)

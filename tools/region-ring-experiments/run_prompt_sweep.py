@@ -36,6 +36,9 @@ FIELDS = [
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
     "cpu_full_meta_queue", "phone_graph_cache", "phone_graph_slots",
     "phone_graph_slot_revisits", "phone_graph_reuses",
+    "phone_graph_reuse_count", "phone_graph_reuse_check_ms",
+    "phone_graph_reset_ms", "phone_graph_build_ms", "phone_graph_alloc_ms",
+    "phone_input_set_ms", "phone_split_prepare_ms",
     "phone_graph_affinity", "phone_graph_affinity_region",
     "phone_graph_affinity_tokens", "phone_target_graph_tasks",
     "phone_target_consecutive", "phone_target_graph_reuses",
@@ -255,6 +258,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "phone_graph_slots": ring[0].get("phone_graph_slots") if ring else None,
         "phone_graph_slot_revisits": sum(x.get("phone_graph_slot_revisits", 0) for x in ring) if ring else None,
         "phone_graph_reuses": sum(x.get("phone_graph_reuses", 0) for x in ring) if ring else None,
+        "phone_graph_reuse_count": total(ring, "phone_graph_reuse_count") if any("phone_graph_reuse_count" in x for x in ring) else None,
         "phone_graph_affinity": ring[0].get("phone_graph_affinity") if ring else None,
         "phone_graph_affinity_region": ring[0].get("phone_graph_affinity_region") if ring else None,
         "phone_graph_affinity_tokens": ring[0].get("phone_graph_affinity_tokens") if ring else None,
@@ -285,6 +289,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                        "prepare_ms", "output_sync_ms", "ready_wait_ms",
                        "prepare_wait_ms"):
             row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
+    for key in ("phone_graph_reuse_check_ms", "phone_graph_reset_ms",
+                "phone_graph_build_ms", "phone_graph_alloc_ms",
+                "phone_input_set_ms", "phone_split_prepare_ms"):
+        row[key] = total(ring, key) if any(key in x for x in ring) else None
     for key in (
         "meta_pc_to_phone_copy_ms", "meta_phone_to_pc_copy_ms",
         "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",

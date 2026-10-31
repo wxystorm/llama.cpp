@@ -342,6 +342,20 @@ a runtime refill still increases the cache size. A CUDA fatal path now
 flushes a single `[CUDA_FATAL]` line containing the CUDA error string,
 offending CUDA call and function, even with `-lv 1`.
 
+### Phone Graph and Split Prepare phase metrics
+
+The Region Ring records `phone_graph_reuse_check_ms`,
+`phone_graph_reset_ms`, `phone_graph_build_ms`,
+`phone_graph_alloc_ms`, `phone_input_set_ms`,
+`phone_split_prepare_ms` and `phone_graph_reuse_count`
+in the per-UBatch JSONL and per-Prompt CSV. These are aggregated from
+already-existing preparation timers, with no new execution-time logs.
+
+The Graph phases and Split Prepare are subsets of `phone_prepare_ms`;
+Split Prepare overlaps `phone_compute_range_ms`. Do not add their
+totals to `phone_backend_wall_ms`. Graph caches, scheduling and GPU
+Bank lifetime remain unchanged.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted
