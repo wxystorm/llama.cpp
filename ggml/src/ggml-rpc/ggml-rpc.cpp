@@ -4,6 +4,8 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
+#include "p2c-arena-queue.h"
+#include "p2c-stream-receiver.h"
 
 #include <array>
 #include <deque>
@@ -296,6 +298,9 @@ enum rpc_cmd {
     RPC_CMD_PHONE_RING_WAIT,
     RPC_CMD_GET_TENSOR_RETURN_WAIT,
     RPC_CMD_GET_GRAPH_PROFILE,
+    RPC_CMD_P2C_STREAM_SUBSCRIBE,
+    RPC_CMD_P2C_STREAM_CAPTURE,
+    RPC_CMD_P2C_STREAM_FINISH,
     RPC_CMD_COUNT,
 };
 
@@ -571,6 +576,30 @@ struct rpc_msg_get_snapshot_req {
     uint32_t slot;
     uint64_t seq;
     uint64_t size;
+};
+
+struct rpc_msg_p2c_stream_subscribe_req {
+    uint32_t device;
+    uint32_t n_regions;
+    uint32_t n_tokens;
+    uint32_t n_embd;
+    uint64_t run_id;
+};
+struct rpc_msg_p2c_stream_subscribe_rsp {
+    uint8_t accepted;
+};
+struct rpc_msg_p2c_stream_finish_req {
+    uint64_t run_id;
+};
+struct rpc_msg_p2c_stream_capture_req {
+    uint32_t device;
+    uint32_t region_id;
+    uint32_t chunk_id;
+    uint32_t token_begin;
+    uint32_t n_tokens;
+    uint32_t reserved;
+    uint64_t run_id;
+    rpc_tensor tensor;
 };
 
 struct rpc_msg_phone_region_local_submit_req {
@@ -1254,6 +1283,7 @@ enum class rpc_socket_role {
     PHONE_REGION_PARTIAL_0,
     PHONE_REGION_PARTIAL_1,
     COMPLETION_WAIT,
+    P2C_STREAM,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1300,6 +1330,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::COMPLETION_WAIT:
             suffix = "_completion_wait";
+            break;
+        case rpc_socket_role::P2C_STREAM:
+            suffix = "_p2c_stream";
             break;
     }
     std::string key = endpoint + suffix;
@@ -2865,6 +2898,129 @@ static bool ggml_backend_rpc_get_tensor_batch3(
     }
 
     return true;
+}
+
+struct rpc_p2c_client_stream {
+    socket_ptr socket;
+    std::thread receiver;
+    std::atomic<bool> received_ok { false };
+    uint64_t run_id = 0;
+    ggml_backend_rpc_p2c_complete_t complete = nullptr;
+    void * userdata = nullptr;
+};
+
+static void * ggml_backend_rpc_p2c_stream_start(
+        ggml_backend_t backend,
+        uint64_t run_id, uint32_t n_regions, uint32_t n_tokens,
+        uint32_t n_embd, ggml_backend_rpc_p2c_resolve_t resolve,
+        ggml_backend_rpc_p2c_complete_t complete, void * userdata) {
+    if (!ggml_backend_is_rpc(backend) || run_id == 0 ||
+            !resolve || !complete || !n_regions || !n_tokens || !n_embd) {
+        return nullptr;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::P2C_STREAM);
+    if (!sock) {
+        return nullptr;
+    }
+    rpc_msg_p2c_stream_subscribe_req req {};
+    req.device = ctx->device;
+    req.run_id = run_id;
+    req.n_regions = n_regions;
+    req.n_tokens = n_tokens;
+    req.n_embd = n_embd;
+    rpc_msg_p2c_stream_subscribe_rsp rsp {};
+    if (!send_rpc_cmd(sock, RPC_CMD_P2C_STREAM_SUBSCRIBE,
+                      &req, sizeof(req), &rsp, sizeof(rsp)) ||
+            !rsp.accepted) {
+        return nullptr;
+    }
+    auto * stream = new rpc_p2c_client_stream();
+    stream->socket = sock;
+    stream->run_id = run_id;
+    stream->complete = complete;
+    stream->userdata = userdata;
+    try {
+        stream->receiver = std::thread(
+            [stream, n_regions, n_tokens, n_embd, resolve]() {
+                ggml_rpc_p2c_stream_receiver receiver(
+                    stream->run_id, n_regions, n_tokens, n_embd,
+                    resolve, stream->complete, stream->userdata);
+                const bool ok = receiver.receive(stream->socket);
+                stream->received_ok.store(ok, std::memory_order_release);
+                if (!ok) {
+                    stream->complete(stream->userdata, nullptr, false);
+                }
+            });
+    } catch (...) {
+        rpc_msg_p2c_stream_finish_req finish {};
+        finish.run_id = run_id;
+        auto control = get_socket(ctx->endpoint);
+        if (control) {
+            (void) send_rpc_cmd_compact_small(
+                control, RPC_CMD_P2C_STREAM_FINISH, finish);
+        }
+        delete stream;
+        return nullptr;
+    }
+    return stream;
+}
+
+static bool ggml_backend_rpc_p2c_stream_capture(
+        ggml_backend_t backend, const ggml_tensor * tensor,
+        uint64_t run_id, uint32_t region_id, uint32_t chunk_id,
+        uint32_t token_begin, uint32_t n_tokens) {
+    if (!ggml_backend_is_rpc(backend) || !tensor || !tensor->buffer ||
+            !ggml_backend_buffer_is_rpc(tensor->buffer) ||
+            tensor->type != GGML_TYPE_F32 ||
+            tensor->ne[1] != n_tokens || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto * buf = static_cast<ggml_backend_rpc_buffer_context *>(
+        tensor->buffer->context);
+    if (!ctx || !buf || buf->device != ctx->device ||
+            buf->endpoint != ctx->endpoint) {
+        return false;
+    }
+    rpc_msg_p2c_stream_capture_req req {};
+    req.device = ctx->device;
+    req.run_id = run_id;
+    req.region_id = region_id;
+    req.chunk_id = chunk_id;
+    req.token_begin = token_begin;
+    req.n_tokens = n_tokens;
+    req.tensor = serialize_tensor(tensor);
+    auto sock = get_socket(ctx->endpoint);
+    return sock != nullptr && send_rpc_cmd_compact_small(
+        sock, RPC_CMD_P2C_STREAM_CAPTURE, req);
+}
+
+static bool ggml_backend_rpc_p2c_stream_stop(
+        ggml_backend_t backend, void * handle) {
+    auto * stream = static_cast<rpc_p2c_client_stream *>(handle);
+    if (!stream) {
+        return true;
+    }
+    bool requested = false;
+    if (ggml_backend_is_rpc(backend)) {
+        auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+        auto sock = get_socket(ctx->endpoint);
+        rpc_msg_p2c_stream_finish_req req {};
+        req.run_id = stream->run_id;
+        requested = sock != nullptr && send_rpc_cmd_compact_small(
+            sock, RPC_CMD_P2C_STREAM_FINISH, req);
+    }
+    if (!requested) {
+        stream->socket->interrupt();
+    }
+    if (stream->receiver.joinable()) {
+        stream->receiver.join();
+    }
+    const bool ok = requested &&
+        stream->received_ok.load(std::memory_order_acquire);
+    delete stream;
+    return ok;
 }
 
 static bool ggml_backend_rpc_snapshot_arm(
@@ -4715,6 +4871,10 @@ public:
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
     bool snapshot_tensor_direct(uint32_t device, uint32_t slot, uint64_t seq, ggml_tensor * tensor, uint64_t offset, uint64_t size);
     bool send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock);
+    bool send_p2c_stream(const rpc_msg_p2c_stream_subscribe_req & request,
+                         socket_ptr sock);
+    bool capture_p2c_stream(const rpc_msg_p2c_stream_capture_req & request);
+    bool finish_p2c_stream(const rpc_msg_p2c_stream_finish_req & request);
     bool phone_region_partial_publish(
         const rpc_msg_snapshot_tensor_req & request);
     bool send_phone_region_partial(
@@ -4813,6 +4973,13 @@ private:
         route_snapshot_devices;
     std::vector<std::unique_ptr<rpc_snapshot_device>>
         phone_region_partial_devices;
+
+    // One Phone-owned stream, with a full-ubatch Arena per Region. The
+    // accepted connection's RPC handler is its only Sender Worker.
+    ggml_rpc_p2c_arena_queue p2c_arena;
+    std::mutex p2c_stream_mutex;
+    bool p2c_stream_active = false;
+    uint64_t p2c_stream_run_id = 0;
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
@@ -7545,6 +7712,131 @@ bool rpc_server::get_graph_profile(
     return true;
 }
 
+// The P2C stream connection switches from RPC command parsing to a
+// dedicated Phone->PC frame sender after SUBSCRIBE. This runs on the
+// server's already independent per-client thread, not on Phone Compute.
+bool rpc_server::send_p2c_stream(
+        const rpc_msg_p2c_stream_subscribe_req & request,
+        socket_ptr sock) {
+    rpc_msg_p2c_stream_subscribe_rsp rsp {};
+    {
+        std::lock_guard<std::mutex> lock(p2c_stream_mutex);
+        if (request.device < backends.size() &&
+                !p2c_stream_active &&
+                p2c_arena.initialize(request.run_id, request.n_regions,
+                                     request.n_tokens, request.n_embd)) {
+            p2c_stream_active = true;
+            p2c_stream_run_id = request.run_id;
+            rsp.accepted = 1;
+        }
+    }
+    if (!send_msg(sock, &rsp, sizeof(rsp))) {
+        if (rsp.accepted) {
+            p2c_arena.finish();
+            p2c_arena.shutdown();
+            std::lock_guard<std::mutex> lock(p2c_stream_mutex);
+            p2c_stream_active = false;
+        }
+        return false;
+    }
+    if (!rsp.accepted) {
+        return false;
+    }
+    GGML_LOG_INFO(
+        "[P2C_STREAM] side=PHONE phase=START run=%" PRIu64
+        " regions=%u tokens=%u hidden=%u status=READY\n",
+        request.run_id, request.n_regions, request.n_tokens, request.n_embd);
+
+    bool sent_ok = true;
+    size_t frames = 0;
+    ggml_rpc_p2c_arena_queue::item item;
+    while (p2c_arena.take(item)) {
+        const bool ok =
+            sock->send_data(&item.frame, sizeof(item.frame)) &&
+            sock->send_data(item.data, size_t(item.frame.payload_bytes));
+        p2c_arena.complete_send(ok);
+        if (!ok) {
+            sent_ok = false;
+            break;
+        }
+        ++frames;
+    }
+
+    const bool failed = !sent_ok || p2c_arena.failed();
+    ggml_backend_rpc_p2c_frame end {};
+    end.run_id = request.run_id;
+    end.seq = p2c_arena.last_seq() + 1;
+    end.kind = failed ? GGML_BACKEND_RPC_P2C_ERROR :
+                        GGML_BACKEND_RPC_P2C_END;
+    if (sent_ok) {
+        sent_ok = sock->send_data(&end, sizeof(end));
+    }
+    {
+        std::lock_guard<std::mutex> lock(p2c_stream_mutex);
+        p2c_arena.shutdown();
+        p2c_stream_active = false;
+        p2c_stream_run_id = 0;
+    }
+    GGML_LOG_INFO(
+        "[P2C_STREAM] side=PHONE phase=STOP run=%" PRIu64
+        " frames=%zu status=%s\n",
+        request.run_id, frames, (!failed && sent_ok) ? "OK" : "FAIL");
+    return !failed && sent_ok;
+}
+
+bool rpc_server::capture_p2c_stream(
+        const rpc_msg_p2c_stream_capture_req & request) {
+    {
+        std::lock_guard<std::mutex> lock(p2c_stream_mutex);
+        if (!p2c_stream_active || p2c_stream_run_id != request.run_id ||
+                request.device >= backends.size() ||
+                request.tensor.type != GGML_TYPE_F32) {
+            return false;
+        }
+    }
+    ggml_backend_rpc_p2c_frame frame {};
+    frame.run_id = request.run_id;
+    frame.region_id = request.region_id;
+    frame.chunk_id = request.chunk_id;
+    frame.token_begin = request.token_begin;
+    frame.n_tokens = request.n_tokens;
+    frame.kind = GGML_BACKEND_RPC_P2C_FULL;
+    frame.payload_bytes = uint64_t(request.n_tokens) *
+                          uint64_t(request.tensor.ne[0]) * sizeof(float);
+    if (request.tensor.ne[1] != request.n_tokens ||
+            request.tensor.ne[2] != 1 || request.tensor.ne[3] != 1) {
+        return false;
+    }
+    rpc_msg_get_tensor_req get {};
+    get.tensor = request.tensor;
+    get.offset = 0;
+    get.size = frame.payload_bytes;
+    // The capture command follows GRAPH_COMPUTE on the same compute socket.
+    // get_tensor_into synchronizes the device->host read *before* publishing
+    // Arena READY, so the next graph cannot overwrite the live output.
+    const bool ok = p2c_arena.capture(frame, [&](uint8_t * dst, size_t bytes) {
+        return bytes == get.size && get_tensor_into(get, dst);
+    });
+    if (!ok) {
+        GGML_LOG_ERROR(
+            "[P2C_ARENA_CAPTURE] run=%" PRIu64 " region=%u chunk=%u "
+            "tokens=%u status=FAIL\n", request.run_id, request.region_id,
+            request.chunk_id, request.n_tokens);
+        p2c_arena.finish();
+    }
+    return ok;
+}
+
+bool rpc_server::finish_p2c_stream(
+        const rpc_msg_p2c_stream_finish_req & request) {
+    std::lock_guard<std::mutex> lock(p2c_stream_mutex);
+    if (!p2c_stream_active || request.run_id != p2c_stream_run_id) {
+        return false;
+    }
+    p2c_arena.finish();
+    return true;
+}
+
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
@@ -8886,6 +9178,30 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_P2C_STREAM_SUBSCRIBE: {
+                rpc_msg_p2c_stream_subscribe_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                (void) server.send_p2c_stream(request, sock);
+                return; // dedicated socket: never parse ordinary RPC again
+            }
+            case RPC_CMD_P2C_STREAM_CAPTURE: {
+                rpc_msg_p2c_stream_capture_req request {};
+                if (!recv_msg(sock, &request, sizeof(request)) ||
+                        !server.capture_p2c_stream(request)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_P2C_STREAM_FINISH: {
+                rpc_msg_p2c_stream_finish_req request {};
+                if (!recv_msg(sock, &request, sizeof(request)) ||
+                        !server.finish_p2c_stream(request)) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_SNAPSHOT: {
                 rpc_msg_get_snapshot_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -9381,6 +9697,15 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_FENCE_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_fence);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_P2C_STREAM_START_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_p2c_stream_start);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_P2C_STREAM_CAPTURE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_p2c_stream_capture);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_P2C_STREAM_STOP_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_p2c_stream_stop);
     }
     if (std::strcmp(
             name,
