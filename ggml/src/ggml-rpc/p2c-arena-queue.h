@@ -102,14 +102,22 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (ok && !failed_) {
-                auto & marks = marks_[frame.region_id];
-                for (uint32_t i = frame.token_begin;
-                     i < frame.token_begin + frame.n_tokens; ++i) {
-                    marks[i] = 2; // READY, immutable until stream shutdown
+                frame.seq = last_seq_ + 1; // assign publication order
+                try {
+                    queue_.push_back(frame);
+                    last_seq_ = frame.seq;
+                    auto & marks = marks_[frame.region_id];
+                    for (uint32_t i = frame.token_begin;
+                         i < frame.token_begin + frame.n_tokens; ++i) {
+                        marks[i] = 2; // READY, immutable until stream shutdown
+                    }
+                } catch (...) {
+                    ok = false;
+                    failed_ = true;
+                    finishing_ = true;
                 }
-                frame.seq = ++last_seq_; // assign *publication* order
-                queue_.push_back(frame);
             } else {
+                ok = false;
                 failed_ = true;
                 finishing_ = true;
             }
