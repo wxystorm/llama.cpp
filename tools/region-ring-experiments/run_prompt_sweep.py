@@ -70,6 +70,8 @@ FIELDS = [
     "phone_rpc_set_tensor_count", "phone_rpc_set_tensor_bytes",
     "phone_rpc_graph_compute_count", "phone_rpc_graph_recompute_count",
     "phone_rpc_graph_snapshot_count",
+    "phone_rpc_graph_multi_count", "phone_rpc_graph_multi_nodes",
+    "phone_rpc_graph_single_add_count", "phone_rpc_graph_single_other_count",
     "phone_rpc_get_tensor_count", "phone_rpc_get_tensor_bytes",
     "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
     "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
@@ -336,7 +338,9 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         for key in (
             "set_tensor_count", "set_tensor_bytes",
             "graph_compute_count", "graph_recompute_count",
-            "graph_snapshot_count", "get_tensor_count", "get_tensor_bytes",
+            "graph_snapshot_count", "graph_multi_count", "graph_multi_nodes",
+            "graph_single_add_count", "graph_single_other_count",
+            "get_tensor_count", "get_tensor_bytes",
         ):
             row[f"phone_rpc_{key}"] = sum(
                 int(region.get(key, 0) or 0)

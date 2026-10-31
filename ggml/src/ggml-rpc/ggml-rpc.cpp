@@ -677,6 +677,10 @@ struct rpc_region_ring_command_stats {
     std::atomic<uint64_t> graph_compute_count { 0 };
     std::atomic<uint64_t> graph_recompute_count { 0 };
     std::atomic<uint64_t> graph_snapshot_count { 0 };
+    std::atomic<uint64_t> graph_multi_count { 0 };
+    std::atomic<uint64_t> graph_multi_nodes { 0 };
+    std::atomic<uint64_t> graph_single_add_count { 0 };
+    std::atomic<uint64_t> graph_single_other_count { 0 };
 };
 
 struct ggml_backend_rpc_device_context {
@@ -702,6 +706,28 @@ struct ggml_backend_rpc_device_context {
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
 };
+
+// Classify the concrete client CGraph that was submitted to Phone.
+// It does not add RPCs, synchronizations, or per-Chunk logging.
+static void rpc_region_ring_classify_graph(
+        ggml_backend_rpc_device_context * ctx,
+        const ggml_cgraph * graph) {
+    if (!rpc_region_ring_metrics_enabled() || ctx == nullptr ||
+            graph == nullptr) {
+        return;
+    }
+    auto & stats = ctx->region_ring_command_stats;
+    if (graph->n_nodes > 1) {
+        stats.graph_multi_count.fetch_add(1, std::memory_order_relaxed);
+        stats.graph_multi_nodes.fetch_add(
+            (uint64_t) graph->n_nodes, std::memory_order_relaxed);
+    } else if (graph->n_nodes == 1 && graph->nodes[0] != nullptr &&
+               graph->nodes[0]->op == GGML_OP_ADD) {
+        stats.graph_single_add_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        stats.graph_single_other_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
 
 struct ggml_backend_rpc_buffer_type_context {
     std::string endpoint;
@@ -1051,6 +1077,14 @@ static bool ggml_backend_rpc_get_snapshot_stats(
         commands.graph_recompute_count.load(std::memory_order_relaxed);
     stats->graph_snapshot_count =
         commands.graph_snapshot_count.load(std::memory_order_relaxed);
+    stats->graph_multi_count =
+        commands.graph_multi_count.load(std::memory_order_relaxed);
+    stats->graph_multi_nodes =
+        commands.graph_multi_nodes.load(std::memory_order_relaxed);
+    stats->graph_single_add_count =
+        commands.graph_single_add_count.load(std::memory_order_relaxed);
+    stats->graph_single_other_count =
+        commands.graph_single_other_count.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -4270,6 +4304,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             if (status && rpc_region_ring_metrics_enabled()) {
                 rpc_dev_ctx->region_ring_command_stats.graph_snapshot_count.fetch_add(
                     1, std::memory_order_relaxed);
+                rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
             }
 
             auto & prepared = rpc_ctx->graph_snapshot;
@@ -4301,6 +4336,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             if (status && rpc_region_ring_metrics_enabled()) {
                 rpc_dev_ctx->region_ring_command_stats.graph_snapshot_count.fetch_add(
                     1, std::memory_order_relaxed);
+                rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
             }
 
             auto & prepared = rpc_ctx->graph_snapshot;
@@ -4332,6 +4368,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         if (status && rpc_region_ring_metrics_enabled()) {
             rpc_dev_ctx->region_ring_command_stats.graph_recompute_count.fetch_add(
                 1, std::memory_order_relaxed);
+            rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
         }
     } else {
         RPC_STATUS_ASSERT(rpc_flush_pending_fused_input(rpc_dev_ctx));
@@ -4353,6 +4390,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         if (status && rpc_region_ring_metrics_enabled()) {
             rpc_dev_ctx->region_ring_command_stats.graph_compute_count.fetch_add(
                 1, std::memory_order_relaxed);
+            rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
         }
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);

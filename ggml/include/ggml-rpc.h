@@ -313,6 +313,10 @@ struct ggml_backend_rpc_snapshot_stats {
     uint64_t graph_compute_count;
     uint64_t graph_recompute_count;
     uint64_t graph_snapshot_count;
+    uint64_t graph_multi_count;
+    uint64_t graph_multi_nodes;
+    uint64_t graph_single_add_count;
+    uint64_t graph_single_other_count;
 };
 
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(

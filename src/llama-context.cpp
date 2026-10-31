@@ -4204,6 +4204,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t graph_compute_count = 0;
             uint64_t graph_recompute_count = 0;
             uint64_t graph_snapshot_count = 0;
+            uint64_t graph_multi_count = 0;
+            uint64_t graph_multi_nodes = 0;
+            uint64_t graph_single_add_count = 0;
+            uint64_t graph_single_other_count = 0;
             uint64_t get_tensor_count = 0;
             uint64_t get_tensor_bytes = 0;
         };
@@ -5051,6 +5055,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     counts.graph_snapshot_count += delta(
                                         phone_rpc_before.graph_snapshot_count,
                                         phone_rpc_after.graph_snapshot_count);
+                                    counts.graph_multi_count += delta(
+                                        phone_rpc_before.graph_multi_count,
+                                        phone_rpc_after.graph_multi_count);
+                                    counts.graph_multi_nodes += delta(
+                                        phone_rpc_before.graph_multi_nodes,
+                                        phone_rpc_after.graph_multi_nodes);
+                                    counts.graph_single_add_count += delta(
+                                        phone_rpc_before.graph_single_add_count,
+                                        phone_rpc_after.graph_single_add_count);
+                                    counts.graph_single_other_count += delta(
+                                        phone_rpc_before.graph_single_other_count,
+                                        phone_rpc_after.graph_single_other_count);
                                     counts.get_tensor_count += delta(
                                         phone_rpc_before.tensor_get_count,
                                         phone_rpc_after.tensor_get_count);
@@ -5921,6 +5937,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     << ",\"graph_compute_count\":" << c.graph_compute_count
                                     << ",\"graph_recompute_count\":" << c.graph_recompute_count
                                     << ",\"graph_snapshot_count\":" << c.graph_snapshot_count
+                                    << ",\"graph_multi_count\":" << c.graph_multi_count
+                                    << ",\"graph_multi_nodes\":" << c.graph_multi_nodes
+                                    << ",\"graph_single_add_count\":" << c.graph_single_add_count
+                                    << ",\"graph_single_other_count\":" << c.graph_single_other_count
                                     << ",\"get_tensor_count\":" << c.get_tensor_count
                                     << ",\"get_tensor_bytes\":" << c.get_tensor_bytes
                                     << "}";

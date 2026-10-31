@@ -48,11 +48,15 @@ class ExperimentReportTests(unittest.TestCase):
                        "chunks": 2, "set_tensor_count": 6,
                        "set_tensor_bytes": 8192, "graph_compute_count": 1,
                        "graph_recompute_count": 1, "graph_snapshot_count": 0,
+                       "graph_multi_count": 1, "graph_multi_nodes": 130,
+                       "graph_single_add_count": 1, "graph_single_other_count": 0,
                        "get_tensor_count": 2, "get_tensor_bytes": 4096},
                       {"region": 5, "layer_begin": 20, "layer_end": 24,
                        "chunks": 1, "set_tensor_count": 3,
                        "set_tensor_bytes": 4096, "graph_compute_count": 1,
                        "graph_recompute_count": 0, "graph_snapshot_count": 0,
+                       "graph_multi_count": 1, "graph_multi_nodes": 85,
+                       "graph_single_add_count": 0, "graph_single_other_count": 0,
                        "get_tensor_count": 1, "get_tensor_bytes": 2048}],
                   "phone_result_get_count": 12,
                   "phone_result_get_mib": 8.0,
@@ -112,6 +116,10 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["phone_rpc_graph_compute_count"], 2)
             self.assertEqual(result["phone_rpc_graph_recompute_count"], 1)
             self.assertEqual(result["phone_rpc_graph_snapshot_count"], 0)
+            self.assertEqual(result["phone_rpc_graph_multi_count"], 2)
+            self.assertEqual(result["phone_rpc_graph_multi_nodes"], 215)
+            self.assertEqual(result["phone_rpc_graph_single_add_count"], 1)
+            self.assertEqual(result["phone_rpc_graph_single_other_count"], 0)
             self.assertEqual(result["phone_rpc_get_tensor_count"], 3)
             self.assertEqual(result["phone_rpc_get_tensor_bytes"], 6144)
             region_records = json.loads(result["phone_rpc_regions_json"])

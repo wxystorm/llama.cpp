@@ -270,6 +270,25 @@ Get-Content "$dir\metrics.jsonl" |
     Format-Table kind,tokens,layers,phone_server_ms,pc_wall_ms,pc_compute_est_ms -AutoSize
 ```
 
+### Phone Full graph shape vs boundary residual ADD
+
+Each successful Phone RPC Graph Compute/Recompute (including snapshot
+variants) is classified from its actual client-side `ggml_cgraph`:
+`graph_multi_count` and `graph_multi_nodes` (graphs with more than
+one node, and their summed node counts), `graph_single_add_count`
+(exactly one ADD node), and `graph_single_other_count`.
+Per-Region JSONL and the sweep CSV contain these four new counters.
+The categories should sum to the existing Graph command counts.
+No changes to the execution graph, Phone server protocol, or timing critical
+path are made by this diagnostic.
+
+For example, 6 multi-node graphs plus 6 single-node ADDs in a 6-Chunk
+Phone Region would explain the observed 12 Graph commands without implying
+the Transformer was split into 12 Phone graph executions. Check layer
+coverage before claiming that the multi-node graph spans all n layers.
+ADD fusion is **not enabled** until correctness and boundary ownership
+are validated for variable P1/P2/Pn Dense layouts.
+
 ### Phone Full Region RPC command counters (experiment only)
 
 When `LLAMA_REGION_RING_METRICS_FILE` is set and a threaded, overlapping,
