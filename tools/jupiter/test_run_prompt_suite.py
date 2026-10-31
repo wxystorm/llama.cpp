@@ -1,7 +1,9 @@
 """Offline tests for the Jupiter multi-prompt length experiment runner."""
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import json
 from pathlib import Path
 import sys
@@ -14,6 +16,7 @@ from run_prompt_suite import (
     case_identity,
     discover_prompts,
     ineligible_prompt_reason,
+    launch_logged,
     main,
     read_benchmark_results,
 )
@@ -47,6 +50,37 @@ class JupiterPromptSuiteTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "not found"):
                 discover_prompts(root / "missing", [], "*.txt", False)
+
+    def test_prompt_lengths_sort_numerically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("prompt_1024.txt", "prompt_64.txt", "prompt_128.txt"):
+                (root / name).write_text("sample", encoding="utf-8")
+            found = discover_prompts(root, [], "prompt_*.txt", False)
+            self.assertEqual(
+                [p.name for p in found],
+                ["prompt_64.txt", "prompt_128.txt", "prompt_1024.txt"],
+            )
+
+    def test_live_phase_progress_is_echoed_but_runtime_noise_is_hidden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "stage3-run.log"
+            code = (
+                "print('[JUPITER_SWEEP_RUN] x=64 repeat=1/1', flush=True);"
+                "print('[JUPITER_SEQUENCE_DECISION] noisy', flush=True);"
+                "print('[JUPITER_REFINE_SAMPLE] target=72:240', flush=True);"
+                "print('[JUPITER_REFINE_DONE] status=FULLY_MEASURED', flush=True)"
+            )
+            visible = io.StringIO()
+            with contextlib.redirect_stdout(visible):
+                launch_logged([sys.executable, "-c", code], log, "STAGE3")
+            shown = visible.getvalue()
+            full_log = log.read_text(encoding="utf-8")
+            self.assertIn("[JUPITER_SWEEP_RUN]", shown)
+            self.assertIn("[JUPITER_REFINE_SAMPLE]", shown)
+            self.assertIn("[JUPITER_REFINE_DONE]", shown)
+            self.assertNotIn("[JUPITER_SEQUENCE_DECISION]", shown)
+            self.assertIn("[JUPITER_SEQUENCE_DECISION]", full_log)
 
     def test_summary_checks_complete_repeat_sets(self):
         with tempfile.TemporaryDirectory() as tmp:
