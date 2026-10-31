@@ -263,36 +263,32 @@ from Phone execution, without any new hot-path measurements, RPC requests
 or model runs. They overlap with other measured intervals and must not
 be added to `ring_wall_ms`.
 
-### Opt-in Phone multi-graph template cache (Region Ring Full)
+### Phone multi-graph cache: disabled for Meta view-lifetime safety
 
-Set `LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_CACHE=1` to keep independent
-PC-side GGML graph and scheduler slots for each intermediate Phone Region
-and each actual token shape (full `XP` and its tail). The final Phone Region
-still uses the canonical main graph/scheduler for logits extraction. Only
-G/C/P Full layouts use the cache; directional Tensor keeps its original path.
+The initial Phone cache experiment kept PC GGML Graph/Scheduler instances
+for each Phone Region and Chunk shape. With an interleaved Dense Qwen3 run,
+the Meta backend failed with `META_MISSING_SIMPLE` for
+`cache_k_l11 (view)` / `SET_ROWS` (assertion in ggml-backend-meta.cpp).
+This is a **runtime correctness failure**, not a Planner cost error.
 
-The existing Phone RPC server holds multiple registered graphs by UID and
-supports `GRAPH_RECOMPUTE`. Keeping the PC graph instance stable across
-interleaved Regions lets the remote UID cache be used instead of transmitting
-a newly built graph on every Region switch. The initial registration still
-occurs on first execution of a template: this first version does NOT yet
-move graph construction or registration entirely outside official prefill.
-The PC Meta backend's single-active-UID rebuild also remains unchanged.
+Meta's temporary simple-tensor view mappings rotate across three
+`stc_compute` generations. Multiple long-lived Scheduler graphs may hold
+Tensor references beyond that rotation. The existing Phone RPC UID cache does
+not guarantee validity of the PC-side Meta mappings. Simply enlarging the
+rotation count is not a complete fix.
 
-At the end of each measured ubatch, existing `metrics.jsonl` and the
-processed `result.json`/`summary.csv` include `phone_graph_cache`,
-`phone_graph_slots`, `phone_graph_slot_revisits`, and
-`phone_graph_reuses`. The last field counts **actual** GGML graph reuse,
-not merely cache-slot selection. Compare `phone_prepare_ms`,
-`meta_graph_rebuild_ms`, `ring_wall_ms`, results and device memory with
-a forced identical layout and cache off vs. on. Default is OFF until the
-PC and Termux RPC builds have passed correctness and memory tests.
-When a remote tensor buffer is released, the Phone server evicts all
-registered graphs referencing that allocation, and the PC invalidates
-the corresponding cached UID assumptions. An RPC compute-socket reconnect
-also invalidates cached UIDs. This prevents using dangling graph bindings
-after scheduler reset or connection replacement.
-No additional model runs or per-Chunk logs are introduced by this cache.
+The opt-in `LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_CACHE=1` now **fails
+closed** and reports `[REGION_RING_PHONE_GRAPH_CACHE] event=FALLBACK
+reason=META_DYNAMIC_VIEW_LIFETIME`. Runtime uses the established main
+Phone Scheduler; the JSONL/CSV fields `phone_graph_cache=false`,
+`phone_graph_slots=0`, `phone_graph_slot_revisits=0` reflect that.
+`phone_graph_reuses` still counts original GGML graph reuse.
+
+RPC client/server code is restored to the pre-experiment baseline.
+To retry multi-graph caching, Meta first needs per-graph pinning/ownership
+of dynamic Tensor View mappings, lifetime-safe invalidation and tests of
+interleaved Region, varying Chunk and KV writes. No extra Planner simulations
+or inference runs are introduced by this guard.
 
 ## Results
 

@@ -40,8 +40,8 @@ class ExperimentReportTests(unittest.TestCase):
                  "meta_available": True, "meta_pc_to_phone_copy_ms": 7.0,
                  "meta_phone_to_pc_copy_ms": 3.0,
                  "cpu_full_meta_queue": False,
-                 "phone_graph_cache": True, "phone_graph_slots": 4,
-                 "phone_graph_slot_revisits": 3, "phone_graph_reuses": 3,
+                 "phone_graph_cache": False, "phone_graph_slots": 0,
+                 "phone_graph_slot_revisits": 0, "phone_graph_reuses": 3,
                  "meta_graph_ms": 100.0, "meta_graph_rebuild_ms": 31.0,
                  "meta_graph_execute_ms": 65.0, "meta_graph_other_ms": 4.0,
                  "meta_graph_calls": 2, "meta_graph_rebuilds": 1,
@@ -68,9 +68,9 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["cpu_compute_range_ms"], 8)
             self.assertEqual(result["meta_pc_to_phone_copy_ms"], 7)
             self.assertFalse(result["cpu_full_meta_queue"])
-            self.assertTrue(result["phone_graph_cache"])
-            self.assertEqual(result["phone_graph_slots"], 4)
-            self.assertEqual(result["phone_graph_slot_revisits"], 3)
+            self.assertFalse(result["phone_graph_cache"])
+            self.assertEqual(result["phone_graph_slots"], 0)
+            self.assertEqual(result["phone_graph_slot_revisits"], 0)
             self.assertEqual(result["phone_graph_reuses"], 3)
             self.assertEqual(result["meta_graph_rebuild_ms"], 31)
             self.assertEqual(result["meta_graph_execute_ms"], 65)

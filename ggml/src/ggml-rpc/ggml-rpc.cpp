@@ -656,11 +656,7 @@ struct ggml_backend_rpc_device_context {
     uint32_t    device;
     std::string name;
     std::string description;
-    // Graph UIDs are valid only while their RPC buffers remain resident.
-    // Synchronize registration with remote buffer destruction.
-    std::mutex graph_cache_mutex;
     std::unordered_set<uint64_t> graph_uids;
-    const socket_t * graph_cache_socket = nullptr;
 
     std::mutex ring_auto_cache_mutex;
     std::unordered_set<uint64_t> ring_auto_graph_uids;
@@ -1800,24 +1796,6 @@ static bool ggml_backend_rpc_init_zero_tensor(ggml_tensor * tensor) {
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
-    // Freeing any device allocation may invalidate a cached graph's input,
-    // scratch, output or weight tensor. Invalidate the client-side UID caches
-    // before the server releases it; a future execution must register anew.
-    if (ctx->device_ctx != nullptr) {
-        auto * cache = ctx->device_ctx;
-        {
-            std::lock_guard<std::mutex> lock(cache->graph_cache_mutex);
-            cache->graph_uids.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(cache->ring_auto_cache_mutex);
-            cache->ring_auto_graph_uids.clear();
-        }
-        {
-            std::lock_guard<std::mutex> lock(cache->fused_set_graph_cache_mutex);
-            cache->fused_set_graph_uids.clear();
-        }
-    }
     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
     RPC_STATUS_ASSERT(status);
@@ -4100,18 +4078,6 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_dev_t rpc_dev = ggml_backend_get_device(backend);
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
-    // The same RPC device may free graph-owned buffers on a different
-    // thread. A full-cache lookup and remote submission form one lease.
-    std::lock_guard<std::mutex> cache_lock(rpc_dev_ctx->graph_cache_mutex);
-    auto compute_sock = get_socket(rpc_ctx->endpoint);
-    if (compute_sock == nullptr) {
-        return GGML_STATUS_FAILED;
-    }
-    // A reconnect starts with an empty Phone-side graph registry.
-    if (rpc_dev_ctx->graph_cache_socket != compute_sock.get()) {
-        rpc_dev_ctx->graph_cache_socket = compute_sock.get();
-        rpc_dev_ctx->graph_uids.clear();
-    }
     GGML_ASSERT(cgraph->n_nodes > 0);
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     const bool cacheable = cgraph->uid != 0;
@@ -4587,11 +4553,8 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
     struct stored_graph {
-        std::vector<uint8_t> buffer;
-        ggml_cgraph * graph = nullptr;
-        // Remote device buffers referenced by this graph's tensor metadata.
-        // A buffer release invalidates this entry before its address is reused.
-        std::unordered_set<uint64_t> buffer_handles;
+        std::vector<uint8_t>   buffer;
+        ggml_cgraph          * graph;
     };
 private:
     void phone_region_main_loop();
@@ -5102,29 +5065,10 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
-    // Phone MAIN and RPC request handlers can access stored graphs on
-    // different threads. Never leave a Graph UID pointing at freed tensors.
-    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
         return false;
-    }
-    size_t evicted = 0;
-    for (auto & device_graphs : stored_graphs) {
-        for (auto it = device_graphs.begin(); it != device_graphs.end();) {
-            if (it->second.buffer_handles.count(request.remote_ptr) != 0) {
-                it = device_graphs.erase(it);
-                ++evicted;
-            } else {
-                ++it;
-            }
-        }
-    }
-    if (evicted != 0) {
-        GGML_LOG_DEBUG("[RPC_GRAPH_CACHE] event=BUFFER_INVALIDATE "
-                       "graphs=%zu buffer=%" PRIu64 "\n",
-                       evicted, request.remote_ptr);
     }
     erase_opencl_tensor_extras_for_buffer(buffer);
     ggml_backend_buffer_free(buffer);
@@ -7271,12 +7215,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     }
     const rpc_tensor * tensors = (const rpc_tensor *)src;
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, graph_uid, n_nodes, n_tensors);
-    std::unordered_set<uint64_t> graph_buffers;
-    for (uint32_t i = 0; i < n_tensors; ++i) {
-        if (tensors[i].buffer != 0) {
-            graph_buffers.insert(tensors[i].buffer);
-        }
-    }
 
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
     stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
@@ -7313,7 +7251,6 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             return false;
         }
     }   //恢复原来的计算图
-    graph_entry.buffer_handles = std::move(graph_buffers);
     if (register_only) {
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
