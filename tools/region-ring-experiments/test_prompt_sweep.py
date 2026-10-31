@@ -39,6 +39,10 @@ class ExperimentReportTests(unittest.TestCase):
                  "status": 0, "wall_ms": 100.0, "cpu_compute_range_ms": 8.0,
                  "meta_available": True, "meta_pc_to_phone_copy_ms": 7.0,
                  "meta_phone_to_pc_copy_ms": 3.0,
+                 "cpu_full_meta_queue": False,
+                 "meta_graph_ms": 100.0, "meta_graph_rebuild_ms": 31.0,
+                 "meta_graph_execute_ms": 65.0, "meta_graph_other_ms": 4.0,
+                 "meta_graph_calls": 2, "meta_graph_rebuilds": 1,
                  "layout": "G6,C2,P4,G6,C2,P4,G6,C2,P4,G6,C2,P4",
                  "xc": 32, "xg": 64, "xp": 128},
                 {"type": "perf", "prefill_tokens": 127, "decode_tokens": 8,
@@ -61,6 +65,12 @@ class ExperimentReportTests(unittest.TestCase):
             self.assertEqual(result["ring_wall_ms"], 100)
             self.assertEqual(result["cpu_compute_range_ms"], 8)
             self.assertEqual(result["meta_pc_to_phone_copy_ms"], 7)
+            self.assertFalse(result["cpu_full_meta_queue"])
+            self.assertEqual(result["meta_graph_rebuild_ms"], 31)
+            self.assertEqual(result["meta_graph_execute_ms"], 65)
+            self.assertEqual(result["meta_graph_other_ms"], 4)
+            self.assertEqual(result["meta_graph_calls"], 2)
+            self.assertEqual(result["meta_graph_rebuilds"], 1)
             self.assertEqual(result["gpu_layers"], 24)
             self.assertEqual(result["cpu_layers"], 8)
             self.assertEqual(result["phone_layers"], 16)
@@ -148,6 +158,8 @@ class ExperimentReportTests(unittest.TestCase):
             row = SWEEP.result_row(
                 args, folder, prompt, 64, 1024, 0, 1000, "deadbeef")
             self.assertEqual(row["status"], "NO_RING")
+            self.assertIsNone(row["cpu_full_meta_queue"])
+            self.assertIsNone(row["meta_graph_rebuild_ms"])
             self.assertIsNone(row["selected_dag_sim_ms"])
             self.assertIsNone(row["final_dag_sim_ms"])
             self.assertIsNone(row["final_dag_source"])

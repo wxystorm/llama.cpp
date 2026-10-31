@@ -240,6 +240,29 @@ first-Cycle seeds chosen before prefix compensation. Compare
 `best_prefix_predicted_ms` with the Planner JSONL `predicted_ms` to
 understand why a uniform base plan or Tensor-boundary refinement won.
 
+### Runtime cleanup: Full-only CPU scheduling and Meta graph measurement
+
+For layouts containing only G/C/P Full regions (no C2P/P2C Tensor),
+CPU Full chunks now run directly in the Region CPU worker rather than being
+submitted to a second Meta CPU executor and immediately waited on. The
+existing task dependencies, PREPARE lock, CPU execution gate and output
+synchronization are retained. Directional Tensor layouts still use the
+original Meta CPU task queue. To restore the old path for A/B tests on
+an all-Full layout, set
+`LLAMA_HYBRID_REGION_RING_CPU_FULL_META_QUEUE=1`.
+
+The selected mode is saved as `cpu_full_meta_queue`. Successful per-Chunk
+GPU Bank-use and weight-cache-preservation diagnostics are now DEBUG,
+instead of unconditional ERROR logs; failures and summaries remain.
+
+End-of-UBatch telemetry also saves existing Meta backend counters:
+`meta_graph_rebuild_ms`, `meta_graph_execute_ms`,
+`meta_graph_other_ms`, `meta_graph_calls`, and
+`meta_graph_rebuilds`. These help distinguish Phone graph rebuild costs
+from Phone execution, without any new hot-path measurements, RPC requests
+or model runs. They overlap with other measured intervals and must not
+be added to `ring_wall_ms`.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted

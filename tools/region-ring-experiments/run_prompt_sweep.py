@@ -34,6 +34,7 @@ FIELDS = [
     "dag_plan_tokens", "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
     "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
+    "cpu_full_meta_queue",
     "cpu_tasks", "gpu_tasks", "phone_tasks",
     "cpu_compute_range_ms", "gpu_compute_range_ms", "phone_compute_range_ms",
     "cpu_lane_active_ms", "gpu_lane_active_ms", "phone_lane_active_ms",
@@ -49,7 +50,9 @@ FIELDS = [
     "meta_pc_to_phone_copy_ms", "meta_phone_to_pc_copy_ms",
     "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
     "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
-    "meta_wait_ms", "meta_graph_ms", "meta_return_payload_mib",
+    "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
+    "meta_graph_execute_ms", "meta_graph_other_ms",
+    "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
     "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
     "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
     "run_dir",
@@ -242,6 +245,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             plan.get("prefix_service_mspt", [])),
         "ring_ubatches": len(ring), "ring_tokens": sum(x.get("tokens", 0) for x in ring),
         "ring_wall_ms": total(ring, "wall_ms"),
+        "cpu_full_meta_queue": ring[0].get("cpu_full_meta_queue") if ring else None,
         "ring_complete": all(x.get("complete", False) for x in ring),
         "pc_phone_overlap_ms": total(ring, "pc_phone_overlap_ms"),
         "gpu_bank_refills": int(total(ring, "bank_refills")),
@@ -269,7 +273,9 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "meta_pc_to_phone_copy_ms", "meta_phone_to_pc_copy_ms",
         "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
         "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
-        "meta_wait_ms", "meta_graph_ms", "meta_return_payload_mib",
+        "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
+    "meta_graph_execute_ms", "meta_graph_other_ms",
+    "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
     ):
         row[key] = total(ring, key) if row["meta_available"] else None
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")

@@ -2017,7 +2017,7 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
             ggml_backend_sched_reset_preserve_weight_cache(
                 sched_use);
             if (stage != nullptr) {
-                LLAMA_LOG_ERROR(
+                LLAMA_LOG_DEBUG(
                     "[REGION_RING_GPU_WEIGHT] event=GRAPH_REBUILD_KEEP_CACHE "
                     "layers=[%d,%d) tokens=%u status=PRESERVED\n",
                     stage->layer_begin, stage->layer_end,
@@ -4615,6 +4615,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "FAIL" : "DONE");
         };
 
+        // Pure Full G/C/P plans have no Tensor CPU tasks to arbitrate.
+        // Avoid an extra CPU_FULL Meta queue submission and blocking wait.
+        // A/B fallback: LLAMA_HYBRID_REGION_RING_CPU_FULL_META_QUEUE=1.
+        const char * cpu_meta_queue_env =
+            std::getenv("LLAMA_HYBRID_REGION_RING_CPU_FULL_META_QUEUE");
+        const bool cpu_full_meta_queue =
+            directional_runtime ||
+            (cpu_meta_queue_env != nullptr && std::atoi(cpu_meta_queue_env) != 0);
+        LLAMA_LOG_INFO(
+            "[REGION_RING_CPU_FULL_EXEC] mode=%s directional=%d status=READY\n",
+            cpu_full_meta_queue ? "META_TASK_QUEUE" : "DIRECT_WORKER",
+            directional_runtime ? 1 : 0);
+
         auto run_worker = [&](size_t dev) {
             auto & state = worker_states[dev];
             const auto device = devices[dev];
@@ -4766,7 +4779,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         task_res = selected.res.get();
                         gpu_bank = (int) bank_index;
 
-                        LLAMA_LOG_ERROR(
+                        LLAMA_LOG_DEBUG(
                             "[REGION_RING_GPU_BANK] event=USE "
                             "region=%zu chunk=%zu rank=%d bank=%c "
                             "generation=%" PRIu64 " wait_ms=%.3f "
@@ -5004,7 +5017,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                     if (dev ==
                             (size_t) llama_region_ring_device::CPU &&
-                            region_ring_meta_cpu_backend != nullptr) {
+                            region_ring_meta_cpu_backend != nullptr &&
+                            cpu_full_meta_queue) {
                         ggml_backend_meta_cpu_task_desc cpu_desc {};
                         cpu_desc.kind =
                             GGML_BACKEND_META_CPU_TASK_CPU_FULL;
@@ -5498,6 +5512,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << "\"xc\":" << runtime_xc << ","
                             << "\"xg\":" << runtime_xg << ","
                             << "\"xp\":" << runtime_xp << ","
+                            << "\"cpu_full_meta_queue\":"
+                            << (cpu_full_meta_queue ? "true" : "false") << ","
                             << "\"tasks\":" << ready.total_tasks() << ","
                             << "\"executed\":" << executed << ","
                             << "\"status\":" << (int) ret << ","
@@ -5591,6 +5607,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 << ",\"meta_graph_ms\":"
                                 << meta_delta_us(a.graph_total_us,
                                                  b.graph_total_us) / 1000.0
+                                << ",\"meta_graph_rebuild_ms\":"
+                                << meta_delta_us(a.graph_rebuild_us,
+                                                 b.graph_rebuild_us) / 1000.0
+                                << ",\"meta_graph_execute_ms\":"
+                                << meta_delta_us(a.graph_execute_us,
+                                                 b.graph_execute_us) / 1000.0
+                                << ",\"meta_graph_other_ms\":"
+                                << meta_delta_us(a.graph_other_us,
+                                                 b.graph_other_us) / 1000.0
+                                << ",\"meta_graph_calls\":"
+                                << std::max<int64_t>(0, b.graph_compute_count - a.graph_compute_count)
+                                << ",\"meta_graph_rebuilds\":"
+                                << std::max<int64_t>(0, b.graph_rebuild_count - a.graph_rebuild_count)
                                 << ",\"meta_return_payload_mib\":"
                                 << meta_delta_us(a.return_payload_bytes,
                                                  b.return_payload_bytes) / 1048576.0;
