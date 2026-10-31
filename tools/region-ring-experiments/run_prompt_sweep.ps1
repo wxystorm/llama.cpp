@@ -25,6 +25,8 @@ param(
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
     [string] $Planner = "apply-wide",
+    [ValidateRange(0, 5)]
+    [int] $LogVerbosity = 3,
     [switch] $DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -49,7 +51,8 @@ $callArgs = @(
     "--min-context", "$MinContext",
     "--context-padding", "$ContextPadding",
     "--streaming", $Streaming,
-    "--planner", $Planner
+    "--planner", $Planner,
+    "--log-verbosity", "$LogVerbosity"
 )
 if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
     if ($ForceXC -le 0 -or $ForceXG -le 0 -or $ForceXP -le 0) {
