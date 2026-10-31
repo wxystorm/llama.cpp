@@ -32,6 +32,11 @@ constexpr uint32_t hidden = 4;
 constexpr uint32_t tokens = 8;
 constexpr uint32_t regions = 2;
 
+static void step(const char * label) {
+    std::fprintf(stderr, "[P2C_TEST_STEP] %s\n", label);
+    std::fflush(stderr);
+}
+
 frame make_frame(uint32_t region, uint32_t chunk,
                  uint32_t begin, uint32_t n_tokens, uint64_t seq = 0) {
     frame f {};
@@ -49,6 +54,7 @@ frame make_frame(uint32_t region, uint32_t chunk,
 void test_arena_publication_and_send_order() {
     ggml_rpc_p2c_arena_queue arena;
     REQUIRE(arena.initialize(run_id, regions, tokens, hidden));
+    step("arena initialized");
     float a[8] = { 10, 11, 12, 13, 14, 15, 16, 17 };
     float b[8] = { 20, 21, 22, 23, 24, 25, 26, 27 };
 
@@ -76,18 +82,21 @@ void test_arena_publication_and_send_order() {
         std::unique_lock<std::mutex> lock(mutex);
         REQUIRE(cv.wait_for(lock, std::chrono::seconds(5), [&]() { return inside_a; }));
     }
+    step("chunk A reserved, attempting chunk B");
     REQUIRE(arena.capture(make_frame(1, 0, 0, 2),
         [&](uint8_t * out, size_t bytes) {
             REQUIRE(bytes == sizeof(b));
             std::memcpy(out, b, bytes);
             return true;
         }));
+    step("chunk B captured");
     ggml_rpc_p2c_arena_queue::item item;
-    REQUIRE(arena.take(item));
+    REQUIRE(arena.take_for(item, std::chrono::milliseconds(2000)));
     REQUIRE(item.frame.region_id == 1);
     REQUIRE(item.frame.seq == 1);
     REQUIRE(std::memcmp(item.data, b, sizeof(b)) == 0);
     arena.complete_send(true);
+    step("chunk B dequeued; testing duplicate rejection");
 
     // The same token interval must not be captured twice.
     REQUIRE(!arena.capture(make_frame(1, 1, 1, 1),
@@ -99,12 +108,14 @@ void test_arena_publication_and_send_order() {
     }
     cv.notify_one();
     producer_a.join();
+    step("chunk A capture finished");
     REQUIRE(a_ok);
-    REQUIRE(arena.take(item));
+    REQUIRE(arena.take_for(item, std::chrono::milliseconds(2000)));
     REQUIRE(item.frame.region_id == 0);
     REQUIRE(item.frame.seq == 2);
     REQUIRE(std::memcmp(item.data, a, sizeof(a)) == 0);
     arena.complete_send(true);
+    step("chunk A dequeued; draining stream");
     arena.finish();
     REQUIRE(!arena.take(item));
     arena.shutdown();
@@ -186,7 +197,12 @@ void test_framing_and_partial_receive_failure() {
 }
 }
 
-int main() {
+int main(int argc, char ** argv) {
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::fprintf(stderr, "[P2C_TEST_BUILD] 20261031-bounded-queue-v2\n");
+    if (argc == 2 && std::strcmp(argv[1], "--version") == 0) {
+        return 0;
+    }
     std::fprintf(stderr, "[P2C_TEST] arena publication and FIFO order\n");
     test_arena_publication_and_send_order();
     std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\n");
