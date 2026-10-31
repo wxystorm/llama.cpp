@@ -258,6 +258,7 @@ def launch_logged(command: list[str], log_path: Path, phase: str) -> None:
             for line in process.stdout:
                 handle.write(line)
                 if line.startswith(ECHO_PROGRESS_PREFIXES):
+                    handle.flush()
                     print(line.rstrip("\r\n"), flush=True)
             rc = process.wait()
     if rc:
