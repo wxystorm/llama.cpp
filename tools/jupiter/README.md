@@ -916,3 +916,32 @@ is restricted to valid chunk sizes and prefix lengths. Example: at
 A successful suite establishes measured results for these prompts, not
 faithfulness of all Jupiter system components. If the DP variant remains
 slower, report that finding rather than changing the original baseline.
+
+### Stage-5 progress on 1K+ token prompts
+
+A single Stage-3 profile for a 1K-token prompt includes multiple *full*
+prompt passes: one for each initial q-sweep chunk size, and potentially
+multiple targeted q(x,prefix) calibrations across up to --max-rounds DP
+iterations. --q-repeats 1 means one run *per q-sweep seed*, not one run
+for the entire experiment. The targeted plan
+120,120,72,120,120,120,120,120,120 (1032 total) is an example of a
+legal calibration layout, not necessarily the final DP layout.
+
+The multi-prompt runner now echoes compact live progress from its child
+processes, including [JUPITER_SWEEP_RUN], [JUPITER_SWEEP_RESUME],
+[JUPITER_REFINE_CANDIDATE], [JUPITER_REFINE_SAMPLE] and
+[JUPITER_BENCH_RESULT]. Full runtime logs still go into stage3-run.log
+and bench-run.log. The six prompt_<N>.txt inputs are processed in
+numeric order (64,128,256,358,512,1024), instead of lexicographic order.
+
+To inspect a running legacy Stage-3 invocation from a second
+PowerShell window, run:
+
+```powershell
+Get-Content '.\jupiter-prompt-suite-once\prompt_1024-955e7f01fe12\stage3-run.log' -Tail 40 -Wait
+```
+
+A forced Ctrl+C can make the wrapper report STAGE3 exited 1; the last
+completed [JUPITER_SEQUENCE_PLAN] record does not by itself establish
+a crash. Restart the same command with --resume: completed x/repeat
+q-sweep samples and fully committed targeted q samples will be reused.
