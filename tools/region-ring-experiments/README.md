@@ -263,6 +263,32 @@ from Phone execution, without any new hot-path measurements, RPC requests
 or model runs. They overlap with other measured intervals and must not
 be added to `ring_wall_ms`.
 
+### Opt-in Phone multi-graph template cache (Region Ring Full)
+
+Set `LLAMA_HYBRID_REGION_RING_PHONE_GRAPH_CACHE=1` to keep independent
+PC-side GGML graph and scheduler slots for each intermediate Phone Region
+and each actual token shape (full `XP` and its tail). The final Phone Region
+still uses the canonical main graph/scheduler for logits extraction. Only
+G/C/P Full layouts use the cache; directional Tensor keeps its original path.
+
+The existing Phone RPC server holds multiple registered graphs by UID and
+supports `GRAPH_RECOMPUTE`. Keeping the PC graph instance stable across
+interleaved Regions lets the remote UID cache be used instead of transmitting
+a newly built graph on every Region switch. The initial registration still
+occurs on first execution of a template: this first version does NOT yet
+move graph construction or registration entirely outside official prefill.
+The PC Meta backend's single-active-UID rebuild also remains unchanged.
+
+At the end of each measured ubatch, existing `metrics.jsonl` and the
+processed `result.json`/`summary.csv` include `phone_graph_cache`,
+`phone_graph_slots`, `phone_graph_slot_revisits`, and
+`phone_graph_reuses`. The last field counts **actual** GGML graph reuse,
+not merely cache-slot selection. Compare `phone_prepare_ms`,
+`meta_graph_rebuild_ms`, `ring_wall_ms`, results and device memory with
+a forced identical layout and cache off vs. on. Default is OFF until the
+PC and Termux RPC builds have passed correctness and memory tests.
+No additional model runs or per-Chunk logs are introduced by this cache.
+
 ## Results
 
 Each Prompt's completed report now saves the full-Prompt **DAG-predicted
