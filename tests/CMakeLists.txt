@@ -342,3 +342,14 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+
+# Opt-in RPC P2C framing/Arena regression: no live Phone required.
+if (GGML_RPC)
+    add_executable(test-p2c-arena-stream test-p2c-arena-stream.cpp)
+    target_include_directories(test-p2c-arena-stream PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/include
+        ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+    target_compile_features(test-p2c-arena-stream PRIVATE cxx_std_17)
+    add_test(NAME test-p2c-arena-stream COMMAND test-p2c-arena-stream)
+endif()
