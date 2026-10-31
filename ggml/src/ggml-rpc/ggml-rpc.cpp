@@ -2950,6 +2950,14 @@ static void * ggml_backend_rpc_p2c_stream_start(
                     stream->run_id, n_regions, n_tokens, n_embd,
                     resolve, stream->complete, stream->userdata);
                 const bool ok = receiver.receive(stream->socket);
+                GGML_LOG_INFO(
+                    "[P2C_STREAM] side=PC phase=RECEIVER_DONE run=%" PRIu64
+                    " frames=%" PRIu64 " bytes=%" PRIu64
+                    " payload_recv_ms=%.3f status=%s\n",
+                    stream->run_id, receiver.frames_received(),
+                    receiver.payload_bytes_received(),
+                    receiver.payload_recv_us() / 1000.0,
+                    ok ? "OK" : "FAIL");
                 stream->received_ok.store(ok, std::memory_order_release);
                 if (!ok) {
                     stream->complete(stream->userdata, nullptr, false);
@@ -4987,6 +4995,8 @@ private:
     std::mutex p2c_stream_mutex;
     bool p2c_stream_active = false;
     uint64_t p2c_stream_run_id = 0;
+    std::atomic<uint64_t> p2c_capture_bytes { 0 };
+    std::atomic<int64_t> p2c_capture_us { 0 };
 
     std::mutex async_return_payload_mutex;
     std::unordered_map<
@@ -7734,6 +7744,8 @@ bool rpc_server::send_p2c_stream(
                                      request.n_tokens, request.n_embd)) {
             p2c_stream_active = true;
             p2c_stream_run_id = request.run_id;
+            p2c_capture_bytes.store(0, std::memory_order_relaxed);
+            p2c_capture_us.store(0, std::memory_order_relaxed);
             rsp.accepted = 1;
         }
     }
@@ -7756,16 +7768,21 @@ bool rpc_server::send_p2c_stream(
 
     bool sent_ok = true;
     size_t frames = 0;
+    uint64_t sent_bytes = 0;
+    int64_t send_us = 0;
     ggml_rpc_p2c_arena_queue::item item;
     while (p2c_arena.take(item)) {
+        const int64_t t0 = ggml_time_us();
         const bool ok =
             sock->send_data(&item.frame, sizeof(item.frame)) &&
             sock->send_data(item.data, size_t(item.frame.payload_bytes));
+        send_us += ggml_time_us() - t0;
         p2c_arena.complete_send(ok);
         if (!ok) {
             sent_ok = false;
             break;
         }
+        sent_bytes += item.frame.payload_bytes;
         ++frames;
     }
 
@@ -7786,8 +7803,14 @@ bool rpc_server::send_p2c_stream(
     }
     GGML_LOG_INFO(
         "[P2C_STREAM] side=PHONE phase=STOP run=%" PRIu64
-        " frames=%zu status=%s\n",
-        request.run_id, frames, (!failed && sent_ok) ? "OK" : "FAIL");
+        " frames=%zu bytes=%" PRIu64
+        " capture_bytes=%" PRIu64 " capture_ms=%.3f"
+        " send_ms=%.3f status=%s\n",
+        request.run_id, frames, sent_bytes,
+        p2c_capture_bytes.load(std::memory_order_relaxed),
+        p2c_capture_us.load(std::memory_order_relaxed) / 1000.0,
+        send_us / 1000.0,
+        (!failed && sent_ok) ? "OK" : "FAIL");
     return !failed && sent_ok;
 }
 
@@ -7821,9 +7844,15 @@ bool rpc_server::capture_p2c_stream(
     // The capture command follows GRAPH_COMPUTE on the same compute socket.
     // get_tensor_into synchronizes the device->host read *before* publishing
     // Arena READY, so the next graph cannot overwrite the live output.
+    const int64_t capture_begin_us = ggml_time_us();
     const bool ok = p2c_arena.capture(frame, [&](uint8_t * dst, size_t bytes) {
         return bytes == get.size && get_tensor_into(get, dst);
     });
+    if (ok) {
+        p2c_capture_bytes.fetch_add(frame.payload_bytes, std::memory_order_relaxed);
+        p2c_capture_us.fetch_add(
+            ggml_time_us() - capture_begin_us, std::memory_order_relaxed);
+    }
     if (!ok) {
         GGML_LOG_ERROR(
             "[P2C_ARENA_CAPTURE] run=%" PRIu64 " region=%u chunk=%u "
