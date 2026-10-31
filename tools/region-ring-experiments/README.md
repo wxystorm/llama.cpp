@@ -292,6 +292,24 @@ no downstream Phone compute; enough Graph capacity; and no terminal
 **retain the original standalone ADD and output handoff**. Tensor
 C2P/P2C and the separate MoE P5 fusion path are not modified.
 
+A common Full Region is already **one Phone-only Meta subgraph**,
+typically about 34 Graph nodes for P1 or 69 for P2. The first version
+of this experiment accidentally required `phone_block_fused`, which is
+only set when *multiple* Meta subgraphs are concatenated. As a result
+the normal already-whole-Graph P1/P2 path never entered the experimental
+fusion.
+
+This version includes single-SG Phone Full Regions. It copies the existing
+Phone graph into the reusable fused-graph arena before appending the ADD;
+the cached original graph remains unchanged across Chunks. The final
+residual, Phone output buffer alias and PC destination must still pass
+the original safety guards. Other layouts continue on the baseline
+ADD path.
+
+The sweep writes `phone_full_add_fusion_requested` to each
+`prompt_*/config.json`. Check this value to confirm the opt-in flag
+was actually inherited. An unset flag is equivalent to `0`.
+
 The fused RPC Graph has its own UID, ensuring an old unfused cached graph
 cannot be mistaken for the new node sequence. There are **zero extra
 network commands**: PC still prepares and sends the initial input/Graph,
@@ -313,7 +331,8 @@ python .\tools\region-ring-experiments\check_phone_full_add_fusion.py `
 The check enforces equal layout/Chunk identity and unchanged GET count
 and bytes. It displays `graph_single_add_count` reductions and elapsed
 wall differences. **It is a communication/graph-structure check, not
-numerical parity**: compare output tensors/logits or run the existing
+numerical parity**: a sweep `PASS` confirms the process finished, NOT
+that its logits match baseline. Compare output tensors/logits or run the existing
 numeric parity suite separately before enabling this in the default
 Planner. A final Phone Region may have extra output graphs; it is never
 force-merged by this optimization.

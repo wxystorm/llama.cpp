@@ -449,7 +449,11 @@ def main():
             "commit": commit,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
-                                 or k == "LLAMA_REGION_RING_METRICS_FILE"},
+                                 or k == "LLAMA_REGION_RING_METRICS_FILE"
+                                 or k in ("GGML_META_PHONE_FULL_ADD_FUSION",
+                                          "GGML_META_RING_PHONE_FUSION")},
+            "phone_full_add_fusion_requested":
+                env.get("GGML_META_PHONE_FULL_ADD_FUSION", "0") == "1",
             "notes": [
                 "Token count from filename is only a hint; record actual prefill tokens.",
                 "Default Ring layout uses actual GGUF depth; inherited layouts are cleared.",

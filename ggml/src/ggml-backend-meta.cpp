@@ -20618,26 +20618,50 @@ auto prefill_norm_sg_has_prework =
         }
         communication_sg = phone_block_fused ? phone_block_end : i;
 
+        // Full Regions are often already ONE Phone SG (P1: ~34 nodes,
+        // P2: ~69 nodes). find_phone_block() only recognizes the older
+        // ATTN-SG + FFN-SG pair form, so requiring phone_block_fused here
+        // accidentally excluded the common single-SG Full Region path.
+        const bool phone_single_sg =
+            n_backends == 2 && !phone_block_fused &&
+            is_phone_only_sg &&
+            !phone_region_fused;
         if (phone_full_add_enabled && n_backends == 2 &&
-                phone_block_fused && !phone_region_fused &&
-                !ring_phone_fusion && phone_block_last_layer >= 0 &&
-                !layer_is_tensor_phone_primary(phone_block_last_layer)) {
-            const size_t exit_sg = phone_block_end;
-            const int exit_layer = phone_block_last_layer;
+                (phone_block_fused || phone_single_sg) &&
+                !phone_region_fused &&
+                (!ring_phone_fusion || phone_single_sg)) {
+            const size_t exit_sg = phone_block_fused ? phone_block_end : i;
+            int exit_layer = phone_block_fused ? phone_block_last_layer : -1;
+            ggml_tensor * residual =
+                phone_block_fused ?
+                    find_recent_ffn_inp(1, exit_sg, exit_layer) :
+                    find_recent_ffn_inp_layer(1, exit_sg, exit_layer);
             const size_t next_sg = exit_sg + 1;
             ggml_cgraph * tail_graph =
                 backend_ctx->backend_configs[1].cgraphs[exit_sg].cgraph_main;
             ggml_tensor * terminal =
                 tail_graph != nullptr && tail_graph->n_nodes > 0 ?
                     tail_graph->nodes[tail_graph->n_nodes - 1] : nullptr;
-            ggml_tensor * residual =
-                find_recent_ffn_inp(1, exit_sg, exit_layer);
-            ggml_tensor * dst_l_out =
-                find_layer_output(0, exit_layer);
+            bool residual_in_single_sg = phone_block_fused;
+            if (!phone_block_fused && tail_graph != nullptr) {
+                for (int k = 0; k < tail_graph->n_nodes; ++k) {
+                    residual_in_single_sg |= tail_graph->nodes[k] == residual;
+                }
+            }
+            char l_out_name[64];
+            std::snprintf(l_out_name, sizeof(l_out_name),
+                          "l_out-%d", exit_layer);
+            ggml_tensor * dst_l_out = exit_layer >= 0 ?
+                find_exact_named_tensor(0, l_out_name) : nullptr;
 
             // Match precisely the legacy Phone-owner exit, not the l_out
             // bridge which already contains a complete residual result.
+            // The older fused-block exit may defer to an already-final
+            // l_out bridge. A single SG does NOT take that deferral path;
+            // its original specialized_communication() runs its own ADD
+            // even when a subsequent exact l_out bridge is present.
             const bool existing_l_out =
+                phone_block_fused &&
                 next_sg < backend_ctx->n_subgraphs &&
                 subgraph_is_exact_l_out_bridge(next_sg, exit_layer);
             const bool continues_on_phone =
@@ -20649,6 +20673,8 @@ auto prefill_norm_sg_has_prework =
                 subgraph_is_decode_pc_only_norm(next_sg) ||
                 has_layer_output_producer(0, next_sg, exit_layer);
             const bool output_ok =
+                exit_layer >= 0 && residual_in_single_sg &&
+                !layer_is_tensor_phone_primary(exit_layer) &&
                 terminal != nullptr && residual != nullptr &&
                 dst_l_out != nullptr && terminal != residual &&
                 (terminal->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
@@ -20666,6 +20692,13 @@ auto prefill_norm_sg_has_prework =
 
             if (!existing_l_out && !continues_on_phone &&
                     pc_exit && output_ok && graph_ok) {
+                // A single-SG Full Region already has a complete Phone main
+                // graph; clone it before injecting nodes so Meta's cached
+                // original cgraph_main stays unchanged for later Chunks.
+                // The copy carries exactly the same nodes and buffer aliases.
+                if (phone_single_sg) {
+                    phone_graph = build_phone_block_graph(i, i);
+                }
                 // Exactly the same aliasing ADD as the output-bridge fallback,
                 // but as the LAST NODE of the main Phone Graph. The RPC server
                 // executes it in order with the previous n complete layers.
