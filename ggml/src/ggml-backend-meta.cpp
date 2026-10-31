@@ -8994,6 +8994,10 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
             }
         };
 
+    // The Phone Full graph may already contain its terminal residual ADD.
+    // Keep the exact terminal output descriptor to prevent double-folding
+    // at the subsequent Phone->PC output bridge.
+    std::unordered_map<size_t, std::pair<int, ggml_tensor *>> phone_full_add_in_graph;
     auto specialized_communication = [&](size_t i, bool & handled, bool & next_compute_complete,
                                          bool force_phone_block_exit,
                                          int force_phone_block_layer) -> ggml_status {
@@ -11073,31 +11077,52 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                            (wait_end_us - wait_begin_us) / 1000.0);
                 }
 
-                if (pipeline_debug) {
-                    meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE BEFORE_ADD");
-                }
+                const auto full_add_it = phone_full_add_in_graph.find(i);
+                const bool already_folded =
+                    full_add_it != phone_full_add_in_graph.end() &&
+                    full_add_it->second.first == layer &&
+                    full_add_it->second.second == nodes[1];
 
-                ggml_tensor * node_layer = get_node_aux(nodes[1]);
-                node_layer->view_src = nodes[1]->view_src == nullptr ? nodes[1] : nodes[1]->view_src;
-                node_layer->view_offs = nodes[1]->view_offs;
-                node_layer->op = GGML_OP_ADD;
-                node_layer->src[0] = nodes[1];
-                node_layer->src[1] = src_residual;
-                node_layer->flags |= GGML_TENSOR_FLAG_COMPUTE;
-                ggml_backend_view_init(node_layer);
-
-                ggml_cgraph * layer_graph = get_cgraph_aux();
-                layer_graph->nodes[0] = node_layer;
-                layer_graph->n_nodes = 1;
-                const ggml_status status =
-                    ggml_backend_graph_compute_async(bcj_src.backend, layer_graph);
-                if (status != GGML_STATUS_SUCCESS) {
-                    return status;
-                }
-                fence_src();
-
-                if (pipeline_debug) {
-                    meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE POST_ADD");
+                if (already_folded) {
+                    // The main Phone graph already executed the identical
+                    // in-place ADD. The fence above is the only final fence:
+                    // no intermediate PC command, no separate ADD Graph.
+                    phone_full_add_in_graph.erase(full_add_it);
+                    if (pipeline_debug) {
+                        printf("[PHONE_FULL_ADD_FUSION] event=OUTPUT_READY "
+                               "sg=%zu layer=%d extra_graphs=0 status=OK\n",
+                               i, layer);
+                        meta_debug_tensor(
+                            bcj_src.backend, nodes[1], "PHONE POST_FUSED_ADD");
+                    }
+                } else {
+                    // Original, numerically validated standalone ADD path.
+                    if (pipeline_debug) {
+                        meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE BEFORE_ADD");
+                    }
+    
+                    ggml_tensor * node_layer = get_node_aux(nodes[1]);
+                    node_layer->view_src = nodes[1]->view_src == nullptr ? nodes[1] : nodes[1]->view_src;
+                    node_layer->view_offs = nodes[1]->view_offs;
+                    node_layer->op = GGML_OP_ADD;
+                    node_layer->src[0] = nodes[1];
+                    node_layer->src[1] = src_residual;
+                    node_layer->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    ggml_backend_view_init(node_layer);
+    
+                    ggml_cgraph * layer_graph = get_cgraph_aux();
+                    layer_graph->nodes[0] = node_layer;
+                    layer_graph->n_nodes = 1;
+                    const ggml_status status =
+                        ggml_backend_graph_compute_async(bcj_src.backend, layer_graph);
+                    if (status != GGML_STATUS_SUCCESS) {
+                        return status;
+                    }
+                    fence_src();
+    
+                    if (pipeline_debug) {
+                        meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE POST_ADD");
+                    }
                 }
 
                 auto & bcj_dst = backend_ctx->backend_configs[0];
@@ -15489,6 +15514,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // change the server protocol or fabricate a phone-side GGUF graph.
     const char * ring_exec = std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
     const char * ring_fuse = std::getenv("GGML_META_RING_PHONE_FUSION");
+    // Opt-in until the new Phone Full in-place ADD has passed numerical
+    // parity on all target models. The unmodified path remains the baseline.
+    const char * phone_full_add_env =
+        std::getenv("GGML_META_PHONE_FULL_ADD_FUSION");
+    const bool phone_full_add_enabled =
+        phone_full_add_env != nullptr &&
+        std::strcmp(phone_full_add_env, "1") == 0;
     const bool ring_phone_fusion =
         n_backends == 2 && ring_exec != nullptr && ring_fuse != nullptr &&
         std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
@@ -20585,6 +20617,104 @@ auto prefill_norm_sg_has_prework =
                 ggml_time_us() - phone_region_build_begin_us;
         }
         communication_sg = phone_block_fused ? phone_block_end : i;
+
+        if (phone_full_add_enabled && n_backends == 2 &&
+                phone_block_fused && !phone_region_fused &&
+                !ring_phone_fusion && phone_block_last_layer >= 0 &&
+                !layer_is_tensor_phone_primary(phone_block_last_layer)) {
+            const size_t exit_sg = phone_block_end;
+            const int exit_layer = phone_block_last_layer;
+            const size_t next_sg = exit_sg + 1;
+            ggml_cgraph * tail_graph =
+                backend_ctx->backend_configs[1].cgraphs[exit_sg].cgraph_main;
+            ggml_tensor * terminal =
+                tail_graph != nullptr && tail_graph->n_nodes > 0 ?
+                    tail_graph->nodes[tail_graph->n_nodes - 1] : nullptr;
+            ggml_tensor * residual =
+                find_recent_ffn_inp(1, exit_sg, exit_layer);
+            ggml_tensor * dst_l_out =
+                find_layer_output(0, exit_layer);
+
+            // Match precisely the legacy Phone-owner exit, not the l_out
+            // bridge which already contains a complete residual result.
+            const bool existing_l_out =
+                next_sg < backend_ctx->n_subgraphs &&
+                subgraph_is_exact_l_out_bridge(next_sg, exit_layer);
+            const bool continues_on_phone =
+                next_sg < backend_ctx->n_subgraphs &&
+                subgraph_will_execute_phone(next_sg);
+            const bool pc_exit =
+                next_sg >= backend_ctx->n_subgraphs ||
+                subgraph_is_prefill_pc_only(next_sg) ||
+                subgraph_is_decode_pc_only_norm(next_sg) ||
+                has_layer_output_producer(0, next_sg, exit_layer);
+            const bool output_ok =
+                terminal != nullptr && residual != nullptr &&
+                dst_l_out != nullptr && terminal != residual &&
+                (terminal->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                terminal->buffer != nullptr && residual->buffer != nullptr &&
+                terminal->type == GGML_TYPE_F32 &&
+                terminal->ne[1] > 1 && // Prefill only until decode parity
+                residual->type == terminal->type &&
+                dst_l_out->type == terminal->type &&
+                ggml_are_same_layout(terminal, residual) &&
+                ggml_nbytes(terminal) == ggml_nbytes(dst_l_out);
+            const bool graph_ok =
+                phone_graph != nullptr && phone_graph->n_nodes > 0 &&
+                phone_graph->nodes[phone_graph->n_nodes - 1] == terminal &&
+                phone_graph->n_nodes < phone_graph->size;
+
+            if (!existing_l_out && !continues_on_phone &&
+                    pc_exit && output_ok && graph_ok) {
+                // Exactly the same aliasing ADD as the output-bridge fallback,
+                // but as the LAST NODE of the main Phone Graph. The RPC server
+                // executes it in order with the previous n complete layers.
+                ggml_tensor * fold = get_node_aux(terminal);
+                fold->view_src = terminal->view_src == nullptr ?
+                    terminal : terminal->view_src;
+                fold->view_offs = terminal->view_offs;
+                fold->op = GGML_OP_ADD;
+                fold->src[0] = terminal;
+                fold->src[1] = residual;
+                fold->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(fold);
+                if (fold->buffer == terminal->buffer &&
+                        fold->data == terminal->data) {
+                    const size_t slot =
+                        ggml_hash_insert(&phone_graph->visited_hash_set, fold);
+                    phone_graph->nodes[phone_graph->n_nodes++] = fold;
+                    phone_graph->use_counts[slot] = 1;
+
+                    // Existing RPC caching uses Graph UID; do not reuse the
+                    // unfused UID for this different Graph node sequence.
+                    phone_graph->uid ^= UINT64_C(0x50464f4c445f4144);
+                    phone_graph->uid ^=
+                        (uint64_t) (exit_layer + 1) *
+                        UINT64_C(0x9e3779b97f4a7c15);
+                    if (phone_graph->uid == 0) {
+                        phone_graph->uid = 1;
+                    }
+                    phone_full_add_in_graph[exit_sg] =
+                        { exit_layer, terminal };
+                    if (pipeline_debug) {
+                        printf("[PHONE_FULL_ADD_FUSION] event=GRAPH_READY "
+                               "sg=%zu layer=%d nodes=%d status=OK\n",
+                               exit_sg, exit_layer, phone_graph->n_nodes);
+                    }
+                } else if (pipeline_debug) {
+                    printf("[PHONE_FULL_ADD_FUSION] event=FALLBACK "
+                           "sg=%zu layer=%d reason=OUTPUT_ALIAS_MISMATCH\n",
+                           exit_sg, exit_layer);
+                }
+            } else if (pipeline_debug) {
+                printf("[PHONE_FULL_ADD_FUSION] event=FALLBACK "
+                       "sg=%zu layer=%d l_out_bridge=%d next_phone=%d "
+                       "pc_exit=%d output_ok=%d graph_ok=%d\n",
+                       exit_sg, exit_layer, existing_l_out ? 1 : 0,
+                       continues_on_phone ? 1 : 0, pc_exit ? 1 : 0,
+                       output_ok ? 1 : 0, graph_ok ? 1 : 0);
+            }
+        }
 
         int direct_route_chunk = -1;
         int direct_route_layer = -1;

@@ -270,6 +270,57 @@ Get-Content "$dir\metrics.jsonl" |
     Format-Table kind,tokens,layers,phone_server_ms,pc_wall_ms,pc_compute_est_ms -AutoSize
 ```
 
+### Experimental Phone Full in-graph residual ADD
+
+For Full (non-directional) Phone blocks, the Meta backend can append the
+same in-place final residual ADD used by its legacy Phone->PC output bridge
+as the **last node of the already fused Phone main Graph**.
+
+This is **opt-in until numerical parity is checked on the target models**:
+
+```powershell
+$env:GGML_META_PHONE_FULL_ADD_FUSION = "1" # fused test
+# or
+$env:GGML_META_PHONE_FULL_ADD_FUSION = "0" # original baseline
+```
+
+Eligibility is decided by structural checks, not a fixed layer number:
+Phone-only block; final Phone-owned F32 output; a matching Phone residual
+`ffn_inp-L`; the expected PC `l_out-L` destination; identical shapes;
+no downstream Phone compute; enough Graph capacity; and no terminal
+`l_out` bridge which already completed the residual. Unsupported chunks
+**retain the original standalone ADD and output handoff**. Tensor
+C2P/P2C and the separate MoE P5 fusion path are not modified.
+
+The fused RPC Graph has its own UID, ensuring an old unfused cached graph
+cannot be mistaken for the new node sequence. There are **zero extra
+network commands**: PC still prepares and sends the initial input/Graph,
+but after that Phone executes its full n-layer Graph **and residual ADD**
+in one Graph before PC fetches the completed output. This removes one
+ADD Graph command and its intermediate Phone Fence per eligible Chunk;
+the final output-ready Fence and PC-directed GET are still needed.
+
+To verify a proposed optimization, run **the same prompt, layout,
+tokenization, seed and device build** once each with the flag 0 and 1.
+Give the resulting JSONL files to:
+
+```powershell
+python .\tools\region-ring-experiments\check_phone_full_add_fusion.py `
+    "path\to\baseline\metrics.jsonl" `
+    "path\to\fused\metrics.jsonl"
+```
+
+The check enforces equal layout/Chunk identity and unchanged GET count
+and bytes. It displays `graph_single_add_count` reductions and elapsed
+wall differences. **It is a communication/graph-structure check, not
+numerical parity**: compare output tensors/logits or run the existing
+numeric parity suite separately before enabling this in the default
+Planner. A final Phone Region may have extra output graphs; it is never
+force-merged by this optimization.
+
+For detailed fallback reasons only (not in timed experiments), enable
+`GGML_META_PIPELINE_DEBUG=1` and filter `[PHONE_FULL_ADD_FUSION]`.
+
 ### Phone Full graph shape vs boundary residual ADD
 
 Each successful Phone RPC Graph Compute/Recompute (including snapshot
