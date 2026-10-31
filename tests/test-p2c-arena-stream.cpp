@@ -2,7 +2,9 @@
 #include "../ggml/src/ggml-rpc/p2c-stream-receiver.h"
 
 #include <algorithm>
-#include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +14,17 @@
 #include <vector>
 
 namespace {
+
+// Unlike REQUIRE(), this always evaluates its expression in MSVC Release
+// builds (which define NDEBUG). Test setup must never be compiled out.
+#define REQUIRE(expr) do { \
+    if (!(expr)) { \
+        std::fprintf(stderr, "[P2C_TEST_FAIL] %s:%d: %s\\n", \
+                     __FILE__, __LINE__, #expr); \
+        std::fflush(stderr); \
+        std::abort(); \
+    } \
+} while (false)
 
 using frame = ggml_backend_rpc_p2c_frame;
 constexpr uint64_t run_id = 73;
@@ -35,7 +48,7 @@ frame make_frame(uint32_t region, uint32_t chunk,
 
 void test_arena_publication_and_send_order() {
     ggml_rpc_p2c_arena_queue arena;
-    assert(arena.initialize(run_id, regions, tokens, hidden));
+    REQUIRE(arena.initialize(run_id, regions, tokens, hidden));
     float a[8] = { 10, 11, 12, 13, 14, 15, 16, 17 };
     float b[8] = { 20, 21, 22, 23, 24, 25, 26, 27 };
 
@@ -52,32 +65,32 @@ void test_arena_publication_and_send_order() {
                 std::unique_lock<std::mutex> lock(mutex);
                 inside_a = true;
                 cv.notify_one();
-                cv.wait(lock, [&]() { return permit_a; });
+                REQUIRE(cv.wait_for(lock, std::chrono::seconds(5), [&]() { return permit_a; }));
                 lock.unlock();
-                assert(bytes == sizeof(a));
+                REQUIRE(bytes == sizeof(a));
                 std::memcpy(out, a, bytes);
                 return true;
             });
     });
     {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [&]() { return inside_a; });
+        REQUIRE(cv.wait_for(lock, std::chrono::seconds(5), [&]() { return inside_a; }));
     }
-    assert(arena.capture(make_frame(1, 0, 0, 2),
+    REQUIRE(arena.capture(make_frame(1, 0, 0, 2),
         [&](uint8_t * out, size_t bytes) {
-            assert(bytes == sizeof(b));
+            REQUIRE(bytes == sizeof(b));
             std::memcpy(out, b, bytes);
             return true;
         }));
     ggml_rpc_p2c_arena_queue::item item;
-    assert(arena.take(item));
-    assert(item.frame.region_id == 1);
-    assert(item.frame.seq == 1);
-    assert(std::memcmp(item.data, b, sizeof(b)) == 0);
+    REQUIRE(arena.take(item));
+    REQUIRE(item.frame.region_id == 1);
+    REQUIRE(item.frame.seq == 1);
+    REQUIRE(std::memcmp(item.data, b, sizeof(b)) == 0);
     arena.complete_send(true);
 
     // The same token interval must not be captured twice.
-    assert(!arena.capture(make_frame(1, 1, 1, 1),
+    REQUIRE(!arena.capture(make_frame(1, 1, 1, 1),
         [](uint8_t *, size_t) { return true; }));
 
     {
@@ -86,14 +99,14 @@ void test_arena_publication_and_send_order() {
     }
     cv.notify_one();
     producer_a.join();
-    assert(a_ok);
-    assert(arena.take(item));
-    assert(item.frame.region_id == 0);
-    assert(item.frame.seq == 2);
-    assert(std::memcmp(item.data, a, sizeof(a)) == 0);
+    REQUIRE(a_ok);
+    REQUIRE(arena.take(item));
+    REQUIRE(item.frame.region_id == 0);
+    REQUIRE(item.frame.seq == 2);
+    REQUIRE(std::memcmp(item.data, a, sizeof(a)) == 0);
     arena.complete_send(true);
     arena.finish();
-    assert(!arena.take(item));
+    REQUIRE(!arena.take(item));
     arena.shutdown();
 }
 
@@ -156,11 +169,11 @@ void test_framing_and_partial_receive_failure() {
     receive_context ctx;
     ggml_rpc_p2c_stream_receiver receiver(
         run_id, regions, tokens, hidden, resolve, complete, &ctx);
-    assert(receiver.receive(sock));
-    assert((ctx.completed == std::vector<uint64_t>{ 1, 2 }));
-    assert(!ctx.failed);
-    assert(std::memcmp(ctx.outputs[1] + 2 * hidden, a, sizeof(a)) == 0);
-    assert(std::memcmp(ctx.outputs[0], b, sizeof(b)) == 0);
+    REQUIRE(receiver.receive(sock));
+    REQUIRE((ctx.completed == std::vector<uint64_t>{ 1, 2 }));
+    REQUIRE(!ctx.failed);
+    REQUIRE(std::memcmp(ctx.outputs[1] + 2 * hidden, a, sizeof(a)) == 0);
+    REQUIRE(std::memcmp(ctx.outputs[0], b, sizeof(b)) == 0);
 
     auto broken = std::make_shared<fake_socket>();
     append(broken->bytes, &fa, sizeof(fa));
@@ -168,13 +181,16 @@ void test_framing_and_partial_receive_failure() {
     receive_context failed_ctx;
     ggml_rpc_p2c_stream_receiver broken_receiver(
         run_id, regions, tokens, hidden, resolve, complete, &failed_ctx);
-    assert(!broken_receiver.receive(broken));
-    assert(failed_ctx.failed);
+    REQUIRE(!broken_receiver.receive(broken));
+    REQUIRE(failed_ctx.failed);
 }
 }
 
 int main() {
+    std::fprintf(stderr, "[P2C_TEST] arena publication and FIFO order\\n");
     test_arena_publication_and_send_order();
+    std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\\n");
     test_framing_and_partial_receive_failure();
+    std::fprintf(stderr, "[P2C_TEST] PASS\\n");
     return 0;
 }
