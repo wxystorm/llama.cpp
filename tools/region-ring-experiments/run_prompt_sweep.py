@@ -274,8 +274,8 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "meta_phone_rpc_ms", "meta_pc_backend_ms", "meta_phone_backend_ms",
         "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
         "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
-    "meta_graph_execute_ms", "meta_graph_other_ms",
-    "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
+        "meta_graph_execute_ms", "meta_graph_other_ms",
+        "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
     ):
         row[key] = total(ring, key) if row["meta_available"] else None
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
