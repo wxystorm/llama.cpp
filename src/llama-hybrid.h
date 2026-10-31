@@ -81,6 +81,8 @@ struct llama_hybrid_layer_compute_point {
     double compute_est_ms = 0.0;
     // Total prepare time for this profiled block, excluding lock wait.
     double prepare_ms     = 0.0;
+    // Measured by the Phone RPC server, includes device synchronization.
+    double phone_server_ms = 0.0;
 };
 
 struct llama_hybrid_attn_compute_point {
@@ -111,6 +113,7 @@ struct llama_hybrid_phone_block_point {
     // The value is obtained from the actual graph's reachable tensors,
     // not from a fixed five-layer Qwen3-MoE graph.
     size_t rpc_graph_wire_bytes = 0;
+    double phone_server_ms = 0.0;
 };
 
 struct llama_hybrid_attn_desc {

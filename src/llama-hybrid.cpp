@@ -591,6 +591,7 @@ struct llama_hybrid_graph_timing {
     double wall_ms        = 0.0;
     double compute_est_ms = 0.0;
     double prepare_ms     = 0.0;
+    double phone_server_ms = 0.0;
     size_t rpc_graph_wire_bytes = 0;
 };
 
@@ -750,6 +751,16 @@ static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backen
     if (rpc_fence != nullptr) {
         result.rpc_graph_wire_bytes =
             llama_hybrid_rpc_graph_wire_bytes(graph);
+        // This query happens AFTER the existing 1 warmup + 3 measured runs.
+        // Their device-synchronized intervals were timestamped on the Phone.
+        const auto getter = reinterpret_cast<ggml_backend_rpc_get_graph_profile_t>(
+            llama_hybrid_rpc_get_proc_address(
+                backend, GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC));
+        ggml_backend_rpc_graph_profile phone_profile {};
+        if (getter != nullptr && graph->uid != 0 &&
+                getter(backend, graph->uid, &phone_profile)) {
+            result.phone_server_ms = phone_profile.server_median_us / 1000.0;
+        }
     }
     return true;
 }
@@ -873,8 +884,10 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
             const double compute_per_layer = point.layers > 0 ? point.compute_est_ms / point.layers : 0.0;
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block tokens=%d layers=%d "
-                "wall_ms=%.3f compute_est_ms=%.3f wall_per_layer_ms=%.3f compute_per_layer_ms=%.3f\n",
-                backend, point.tokens, point.layers, point.wall_ms, point.compute_est_ms,
+                "wall_ms=%.3f compute_est_ms=%.3f phone_server_ms=%.3f "
+                "wall_per_layer_ms=%.3f compute_per_layer_ms=%.3f\n",
+                backend, point.tokens, point.layers, point.wall_ms,
+                point.compute_est_ms, point.phone_server_ms,
                 wall_per_layer, compute_per_layer);
         }
     };
@@ -885,8 +898,9 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
         const double per_layer_est_ms = point.layers > 0 ? point.compute_est_ms / point.layers : 0.0;
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=PHONE kind=phone_block layers=%d tokens=%d kv_tokens=%d "
-            "wall_ms=%.3f compute_est_ms=%.3f per_layer_est_ms=%.3f\n",
-            point.layers, point.tokens, point.kv_tokens, point.wall_ms, point.compute_est_ms, per_layer_est_ms);
+            "wall_ms=%.3f compute_est_ms=%.3f phone_server_ms=%.3f per_layer_est_ms=%.3f\n",
+            point.layers, point.tokens, point.kv_tokens, point.wall_ms,
+            point.compute_est_ms, point.phone_server_ms, per_layer_est_ms);
     }
     LLAMA_LOG_INFO("[HYBRID_PROFILE] cpu attn_ms=%.3f full_layer_ms=%.3f\n", profile.cpu_attn_ms,
                    profile.cpu_full_layer_ms);
@@ -8584,7 +8598,8 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
         }
         profile.phone_layer_blocks.push_back({
             tokens, block_layers, phone_timing.wall_ms,
-            phone_timing.compute_est_ms, phone_timing.prepare_ms
+            phone_timing.compute_est_ms, phone_timing.prepare_ms,
+            phone_timing.phone_server_ms
         });
         LLAMA_LOG_INFO(
             "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d wall_ms=%.3f "
@@ -8677,14 +8692,16 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
 
         profile.phone_blocks.push_back({
             n_layers, tokens, tokens, timing.wall_ms,
-            timing.compute_est_ms, timing.rpc_graph_wire_bytes
+            timing.compute_est_ms, timing.rpc_graph_wire_bytes,
+            timing.phone_server_ms
         });
         LLAMA_LOG_ERROR(
             "[HYBRID_PROFILE_DENSE_PHONE_GRAPH] layers=%d tokens=%d "
             "rpc_graph_bytes=%zu wall_ms=%.3f compute_est_ms=%.3f "
-            "status=%s\n",
+            "phone_server_ms=%.3f status=%s\n",
             n_layers, tokens, timing.rpc_graph_wire_bytes,
             timing.wall_ms, timing.compute_est_ms,
+            timing.phone_server_ms,
             timing.rpc_graph_wire_bytes > 0 ? "READY" : "NO_WIRE_SHAPE");
     }
 
@@ -8845,6 +8862,36 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     }
 
     llama_hybrid_profile_print(profile);
+
+    // Startup-only native Phone GPU graph timing. Runs are already complete;
+    // writing the experiment file does not affect Phone graph measurements.
+    if (const char * path = std::getenv("LLAMA_REGION_RING_METRICS_FILE")) {
+        if (*path != '\0') {
+            std::ofstream file(path, std::ios::app);
+            if (file) {
+                file << std::fixed << std::setprecision(6);
+                for (const auto & p : profile.phone_layer_blocks) {
+                    file << "{\"type\":\"phone_native_profile\",\"schema\":1,"
+                         << "\"kind\":\"layer_block\",\"tokens\":" << p.tokens
+                         << ",\"layers\":" << p.layers
+                         << ",\"phone_server_ms\":" << p.phone_server_ms
+                         << ",\"pc_wall_ms\":" << p.wall_ms
+                         << ",\"pc_compute_est_ms\":" << p.compute_est_ms
+                         << ",\"prepare_ms\":" << p.prepare_ms << "}\n";
+                }
+                for (const auto & p : profile.phone_blocks) {
+                    file << "{\"type\":\"phone_native_profile\",\"schema\":1,"
+                         << "\"kind\":\"dense_phone_graph\",\"tokens\":" << p.tokens
+                         << ",\"layers\":" << p.layers
+                         << ",\"phone_server_ms\":" << p.phone_server_ms
+                         << ",\"pc_wall_ms\":" << p.wall_ms
+                         << ",\"pc_compute_est_ms\":" << p.compute_est_ms
+                         << ",\"rpc_graph_wire_bytes\":" << p.rpc_graph_wire_bytes
+                         << "}\n";
+                }
+            }
+        }
+    }
 
     // The Region Ring dry-run search requires measured compute/transfer
     // samples, not a feasible legacy Hybrid placement. Cache the independent

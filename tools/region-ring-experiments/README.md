@@ -240,6 +240,36 @@ first-Cycle seeds chosen before prefix compensation. Compare
 `best_prefix_predicted_ms` with the Planner JSONL `predicted_ms` to
 understand why a uniform base plan or Tensor-boundary refinement won.
 
+### Phone-native graph timing in synthetic Profile
+
+A Phone RPC Server now retains the last three complete, device-synchronized
+`ggml_backend_graph_compute()` timings for each graph UID. After the usual
+1 warmup and 3 measured runs, PC makes **one additional read-only query**.
+That query is outside the Phone-measured interval. The native timestamp spans
+one **entire n-layer graph** on Phone, without per-layer PC interaction. It
+includes Phone graph execution + local GPU sync; it excludes graph
+deserialization, RPC transport and separate SET_TENSOR input uploads.
+
+For Dense Qwen3, the native figure is stored independently as
+`phone_server_ms` alongside the existing PC `wall_ms` and
+`compute_est_ms` for 5-layer block probes at multiple token sizes,
+plus 1-layer and 5-layer Dense wire-size probes. The Planner **still uses**
+its existing PC-derived cost, not the new diagnostic value.
+
+The startup `metrics.jsonl` contains `type=phone_native_profile` rows
+with `kind`, `layers`, `tokens`, `phone_server_ms`,
+`pc_wall_ms`, and `pc_compute_est_ms`. A zero
+`phone_server_ms` means *unavailable*, not zero compute.
+RPC protocol patch increased from 18 to 19. **Both the PC and Phone RPC
+server must be rebuilt from this same commit** or HELLO rejects the pair.
+
+```powershell
+Get-Content "$dir\metrics.jsonl" |
+    ConvertFrom-Json |
+    Where-Object { $_.type -eq "phone_native_profile" } |
+    Format-Table kind,tokens,layers,phone_server_ms,pc_wall_ms,pc_compute_est_ms -AutoSize
+```
+
 ### Phone Full Region RPC command counters (experiment only)
 
 When `LLAMA_REGION_RING_METRICS_FILE` is set and a threaded, overlapping,

@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    18
+#define RPC_PROTO_PATCH_VERSION    19
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -80,6 +80,9 @@ struct ggml_rpc_local_tensor_source {
 
 #define GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC \
     "ggml_backend_rpc_get_snapshot_stats"
+
+#define GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC \
+    "ggml_backend_rpc_get_graph_profile"
     
 #define GGML_BACKEND_RPC_PREPARE_FUSED_FFN_INPUT_PROC \
     "ggml_backend_rpc_prepare_fused_ffn_input"
@@ -315,6 +318,19 @@ struct ggml_backend_rpc_snapshot_stats {
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
         ggml_backend_t backend,
         struct ggml_backend_rpc_snapshot_stats * stats);
+
+// Native Phone clock, timed around one full graph with device sync.
+// Query only after the normal warmup/measurement loop has finished.
+struct ggml_backend_rpc_graph_profile {
+    uint32_t samples = 0;
+    uint32_t n_nodes = 0;
+    int64_t server_median_us = 0;
+};
+
+using ggml_backend_rpc_get_graph_profile_t = bool (*)(
+        ggml_backend_t backend,
+        uint64_t graph_uid,
+        struct ggml_backend_rpc_graph_profile * profile);
 // backend API
 GGML_BACKEND_API ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device);
 GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);

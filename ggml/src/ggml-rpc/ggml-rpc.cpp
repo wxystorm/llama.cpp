@@ -295,6 +295,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_RING_INPUT_READY,
     RPC_CMD_PHONE_RING_WAIT,
     RPC_CMD_GET_TENSOR_RETURN_WAIT,
+    RPC_CMD_GET_GRAPH_PROFILE,
     RPC_CMD_COUNT,
 };
 
@@ -322,6 +323,7 @@ static_assert(RPC_CMD_PHONE_RING_REGISTER == 36, "RPC_CMD_PHONE_RING_REGISTER in
 static_assert(RPC_CMD_PHONE_RING_INPUT_READY == 37, "RPC_CMD_PHONE_RING_INPUT_READY index");
 static_assert(RPC_CMD_PHONE_RING_WAIT == 38, "RPC_CMD_PHONE_RING_WAIT index");
 static_assert(RPC_CMD_GET_TENSOR_RETURN_WAIT == 39, "RPC_CMD_GET_TENSOR_RETURN_WAIT index");
+static_assert(RPC_CMD_GET_GRAPH_PROFILE == 40, "RPC_CMD_GET_GRAPH_PROFILE index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -519,6 +521,15 @@ struct rpc_msg_get_device_memory_rsp {
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
     uint64_t graph_uid;
+};
+struct rpc_msg_get_graph_profile_req {
+    uint32_t device;
+    uint64_t graph_uid;
+};
+struct rpc_msg_get_graph_profile_rsp {
+    uint32_t samples;
+    uint32_t n_nodes;
+    int64_t server_median_us;
 };
 
 struct rpc_msg_graph_recompute_snapshot_req {
@@ -2341,6 +2352,32 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
 
 static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
+}
+
+static bool ggml_backend_rpc_get_graph_profile(
+        ggml_backend_t backend, uint64_t graph_uid,
+        ggml_backend_rpc_graph_profile * profile) {
+    if (backend == nullptr || graph_uid == 0 || profile == nullptr) {
+        return false;
+    }
+    *profile = {};
+    const auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) {
+        return false;
+    }
+    const rpc_msg_get_graph_profile_req request { ctx->device, graph_uid };
+    rpc_msg_get_graph_profile_rsp response {};
+    const auto sock = get_socket(ctx->endpoint);
+    const bool ok = sock != nullptr && send_rpc_cmd(
+        sock, RPC_CMD_GET_GRAPH_PROFILE,
+        &request, sizeof(request), &response, sizeof(response));
+    if (!ok || response.samples != 3 || response.server_median_us <= 0) {
+        return false;
+    }
+    profile->samples = response.samples;
+    profile->n_nodes = response.n_nodes;
+    profile->server_median_us = response.server_median_us;
+    return true;
 }
 
 static void ggml_backend_rpc_fence(ggml_backend_t backend) {
@@ -4632,6 +4669,9 @@ public:
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input, bool register_only = false);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool get_graph_profile(
+        const rpc_msg_get_graph_profile_req & request,
+        rpc_msg_get_graph_profile_rsp & response);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -4650,8 +4690,11 @@ public:
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
     struct stored_graph {
-        std::vector<uint8_t>   buffer;
-        ggml_cgraph          * graph;
+        std::vector<uint8_t> buffer;
+        ggml_cgraph * graph = nullptr;
+        // One warmup + three measured synthetic runs: retain last three.
+        std::array<int64_t, 3> recent_compute_wall_us {};
+        uint64_t compute_samples = 0;
     };
 private:
     void phone_region_main_loop();
@@ -7348,6 +7391,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             return false;
         }
     }   //恢复原来的计算图
+    graph_entry.compute_samples = 0;
+    graph_entry.recent_compute_wall_us = {};
     if (register_only) {
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
@@ -7366,6 +7411,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             graph);
 
     const int64_t t1 = ggml_time_us();
+    if (status == GGML_STATUS_SUCCESS) {
+        auto & g = graph_entry;
+        g.recent_compute_wall_us[
+            g.compute_samples % g.recent_compute_wall_us.size()] = t1 - t0;
+        ++g.compute_samples;
+    }
 
     rpc_tensor_phone_log_graph_compute(
         "compute",
@@ -7408,6 +7459,12 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
             graph);
 
     const int64_t t1 = ggml_time_us();
+    if (status == GGML_STATUS_SUCCESS) {
+        auto & g = it->second;
+        g.recent_compute_wall_us[
+            g.compute_samples % g.recent_compute_wall_us.size()] = t1 - t0;
+        ++g.compute_samples;
+    }
 
     rpc_tensor_phone_log_graph_compute(
         "recompute",
@@ -7426,6 +7483,27 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
         fflush(stdout);
     }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    return true;
+}
+
+bool rpc_server::get_graph_profile(
+        const rpc_msg_get_graph_profile_req & request,
+        rpc_msg_get_graph_profile_rsp & response) {
+    response = {};
+    std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
+    if (request.device >= stored_graphs.size()) {
+        return true;
+    }
+    const auto it = stored_graphs[request.device].find(request.graph_uid);
+    if (it == stored_graphs[request.device].end() ||
+            it->second.graph == nullptr || it->second.compute_samples < 3) {
+        return true;
+    }
+    auto samples = it->second.recent_compute_wall_us;
+    std::sort(samples.begin(), samples.end());
+    response.samples = 3;
+    response.n_nodes = (uint32_t) it->second.graph->n_nodes;
+    response.server_median_us = samples[1];
     return true;
 }
 
@@ -8679,6 +8757,18 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 break;
             }
+            case RPC_CMD_GET_GRAPH_PROFILE: {
+                rpc_msg_get_graph_profile_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_get_graph_profile_rsp response {};
+                if (!server.get_graph_profile(request, response) ||
+                        !send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_GET_DEVICE_MEMORY: {
                 rpc_msg_get_device_memory_req request;
                 if (!recv_msg(sock, &request, sizeof(request))) {
@@ -9278,6 +9368,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_get_snapshot_stats);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_get_graph_profile);
     }
     if (std::strcmp(
             name,
