@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    19
+#define RPC_PROTO_PATCH_VERSION    20
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -359,6 +359,10 @@ struct ggml_backend_rpc_p2c_frame {
     uint32_t reserved;
     uint64_t payload_bytes;
 };
+#ifdef __cplusplus
+static_assert(sizeof(ggml_backend_rpc_p2c_frame) == 48,
+    "P2C frame wire header must be 48 bytes");
+#endif
 enum {
     GGML_BACKEND_RPC_P2C_FULL = 1,
     GGML_BACKEND_RPC_P2C_TENSOR = 2,
@@ -390,7 +394,6 @@ using ggml_backend_rpc_p2c_stream_capture_t = bool (*)(
         ggml_backend_t backend,
         const ggml_tensor * tensor,
         uint64_t run_id,
-        uint64_t seq,
         uint32_t region_id,
         uint32_t chunk_id,
         uint32_t token_begin,
