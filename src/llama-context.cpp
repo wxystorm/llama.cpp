@@ -5607,6 +5607,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             phone_stream_session.completed.fetch_add(
                                 1, std::memory_order_relaxed);
                         }
+                        previous_phone_region = task.region;
+                        previous_phone_tokens = task.n_tokens;
                         active_task.reset();
                         continue;
                     }
