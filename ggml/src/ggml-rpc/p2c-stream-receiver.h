@@ -22,7 +22,8 @@ public:
 
     // Runs only on the independent network thread. The caller owns the
     // socket, session lifecycle and cancellation policy.
-    bool receive(socket_ptr socket) {
+    template <typename SocketPtr>
+    bool receive(SocketPtr socket) {
         if (!socket || !resolve_ || !complete_ ||
             n_regions_ == 0 || n_tokens_ == 0 || n_embd_ == 0) {
             return false;
