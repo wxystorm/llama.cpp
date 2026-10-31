@@ -1,16 +1,15 @@
 #pragma once
 
-// Region Ring P2C stream staging. A completed producer publishes a full
-// immutable chunk before it becomes visible to the single network sender.
-// This component does not own a socket; the RPC transport sends a header
-// followed by exactly payload_bytes bytes, then calls complete_send().
+// A whole-prefill, per-Region Phone host Arena. Every token interval is
+// written once, and becomes sendable ONLY after GPU->host read completes.
+// One network sender serializes all ready frames. GPU/Phone compute never
+// waits for the TCP sender to drain this queue.
 #include "ggml-rpc.h"
 
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <deque>
-#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -23,116 +22,170 @@ public:
 
     bool initialize(uint64_t run_id, uint32_t n_regions,
                     uint32_t n_tokens, uint32_t n_embd) {
-        if (!n_regions || !n_tokens || !n_embd) {
+        if (run_id == 0 || n_regions == 0 || n_tokens == 0 || n_embd == 0) {
             return false;
         }
-        const uint64_t stride = uint64_t(n_tokens) * n_embd * sizeof(float);
-        if (stride > SIZE_MAX / n_regions) {
+        const uint64_t bytes_per_region =
+            uint64_t(n_tokens) * n_embd * sizeof(float);
+        if (bytes_per_region > SIZE_MAX / n_regions ||
+            bytes_per_region > SIZE_MAX) {
             return false;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        if (active_ || in_flight_) {
+        if (active_) {
             return false;
         }
-        arena_.assign(size_t(stride) * n_regions, 0);
-        published_.assign(n_regions, std::vector<uint8_t>(n_tokens, 0));
-        region_stride_ = size_t(stride);
+        try {
+            arena_.assign(size_t(bytes_per_region) * n_regions, 0);
+            marks_.assign(n_regions, std::vector<uint8_t>(n_tokens, 0));
+        } catch (...) {
+            return false;
+        }
+        queue_.clear();
+        stride_ = size_t(bytes_per_region);
         n_tokens_ = n_tokens;
         n_embd_ = n_embd;
         run_id_ = run_id;
         last_seq_ = 0;
-        stopped_ = false;
+        in_flight_ = false;
+        finishing_ = false;
+        failed_ = false;
         active_ = true;
         return true;
     }
 
-    // Caller must have completed the device->host read before publishing.
-    // Copying into disjoint Arena intervals and enqueueing the descriptor are
-    // one atomic publication operation. The sender cannot see partial data.
-    bool publish(const ggml_backend_rpc_p2c_frame & frame,
-                 const void * completed_host_data, size_t size) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!active_ || stopped_ || completed_host_data == nullptr ||
-            frame.run_id != run_id_ || frame.seq <= last_seq_ ||
-            frame.region_id >= published_.size() ||
-            frame.n_tokens == 0 ||
-            frame.token_begin > n_tokens_ ||
-            frame.n_tokens > n_tokens_ - frame.token_begin ||
-            frame.payload_bytes != size ||
-            size != size_t(frame.n_tokens) * n_embd_ * sizeof(float) ||
-            frame.kind != GGML_BACKEND_RPC_P2C_FULL) {
-            return false;
-        }
-        auto & marks = published_[frame.region_id];
-        for (uint32_t t = frame.token_begin;
-             t < frame.token_begin + frame.n_tokens; ++t) {
-            if (marks[t]) {
+    // Read directly into the preallocated Arena. The reservation lock is
+    // released before the device read, so an earlier READY chunk may be sent
+    // concurrently. The reader MUST complete the GPU->host read synchronously.
+    template<typename Reader>
+    bool capture(ggml_backend_rpc_p2c_frame frame, Reader reader) {
+        uint8_t * destination = nullptr;
+        size_t size = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!active_ || finishing_ || failed_ ||
+                frame.run_id != run_id_ ||
+                frame.region_id >= marks_.size() ||
+                frame.kind != GGML_BACKEND_RPC_P2C_FULL ||
+                frame.reserved != 0 ||
+                frame.n_tokens == 0 ||
+                frame.token_begin > n_tokens_ ||
+                frame.n_tokens > n_tokens_ - frame.token_begin ||
+                frame.payload_bytes !=
+                    uint64_t(frame.n_tokens) * n_embd_ * sizeof(float)) {
                 return false;
             }
+            auto & marks = marks_[frame.region_id];
+            for (uint32_t i = frame.token_begin;
+                 i < frame.token_begin + frame.n_tokens; ++i) {
+                if (marks[i] != 0) {
+                    return false;
+                }
+            }
+            for (uint32_t i = frame.token_begin;
+                 i < frame.token_begin + frame.n_tokens; ++i) {
+                marks[i] = 1; // FILLING, never visible to Sender
+            }
+            size = size_t(frame.payload_bytes);
+            destination = arena_.data() +
+                size_t(frame.region_id) * stride_ +
+                size_t(frame.token_begin) * n_embd_ * sizeof(float);
         }
-        const size_t offset = size_t(frame.region_id) * region_stride_ +
-                              size_t(frame.token_begin) * n_embd_ * sizeof(float);
-        std::memcpy(arena_.data() + offset, completed_host_data, size);
-        for (uint32_t t = frame.token_begin;
-             t < frame.token_begin + frame.n_tokens; ++t) {
-            marks[t] = 1;
+
+        bool ok = false;
+        try {
+            ok = reader(destination, size);
+        } catch (...) {
+            ok = false;
         }
-        last_seq_ = frame.seq;
-        pending_.push_back(frame);
-        cv_.notify_one();
-        return true;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (ok && !failed_) {
+                auto & marks = marks_[frame.region_id];
+                for (uint32_t i = frame.token_begin;
+                     i < frame.token_begin + frame.n_tokens; ++i) {
+                    marks[i] = 2; // READY, immutable until stream shutdown
+                }
+                frame.seq = ++last_seq_; // assign *publication* order
+                queue_.push_back(frame);
+            } else {
+                failed_ = true;
+                finishing_ = true;
+            }
+        }
+        cv_.notify_all();
+        return ok;
     }
 
-    // Exactly one sender calls take() and complete_send().
-    // A returned data pointer remains stable until complete_send() because
-    // initialize/reset is forbidden while the stream is active.
+    // Called by ONE Sender thread. Returns false after FINISH and drain.
     bool take(item & out) {
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return stopped_ || !pending_.empty(); });
-        if (in_flight_ || pending_.empty()) {
+        cv_.wait(lock, [&] { return finishing_ || !queue_.empty(); });
+        if (in_flight_ || failed_ || queue_.empty()) {
             return false;
         }
-        out.frame = pending_.front();
-        pending_.pop_front();
+        out.frame = queue_.front();
+        queue_.pop_front();
         out.data = arena_.data() +
-                   size_t(out.frame.region_id) * region_stride_ +
-                   size_t(out.frame.token_begin) * n_embd_ * sizeof(float);
+            size_t(out.frame.region_id) * stride_ +
+            size_t(out.frame.token_begin) * n_embd_ * sizeof(float);
         in_flight_ = true;
         return true;
     }
 
-    void complete_send(bool success) {
+    void complete_send(bool ok) {
         std::lock_guard<std::mutex> lock(mutex_);
         in_flight_ = false;
-        if (!success) {
-            stopped_ = true;
+        if (!ok) {
+            failed_ = true;
+            finishing_ = true;
         }
         cv_.notify_all();
     }
 
-    void stop() {
+    void finish() {
         std::lock_guard<std::mutex> lock(mutex_);
-        stopped_ = true;
+        finishing_ = true;
         cv_.notify_all();
     }
 
-    bool drained() const {
+    bool failed() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return pending_.empty() && !in_flight_;
+        return failed_;
+    }
+
+    uint64_t last_seq() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_seq_;
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Caller owns the single Sender and has joined/drained it first.
+        active_ = false;
+        queue_.clear();
+        marks_.clear();
+        arena_.clear();
+        in_flight_ = false;
+        finishing_ = false;
+        failed_ = false;
+        cv_.notify_all();
     }
 
 private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::vector<uint8_t> arena_;
-    std::vector<std::vector<uint8_t>> published_;
-    std::deque<ggml_backend_rpc_p2c_frame> pending_;
-    size_t region_stride_ = 0;
+    std::vector<std::vector<uint8_t>> marks_;
+    std::deque<ggml_backend_rpc_p2c_frame> queue_;
+    size_t stride_ = 0;
     uint64_t run_id_ = 0;
     uint64_t last_seq_ = 0;
     uint32_t n_tokens_ = 0;
     uint32_t n_embd_ = 0;
     bool active_ = false;
-    bool stopped_ = false;
+    bool finishing_ = false;
+    bool failed_ = false;
     bool in_flight_ = false;
 };
