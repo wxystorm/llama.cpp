@@ -8,6 +8,7 @@
 #include "p2c-stream-receiver.h"
 
 #include <array>
+#include <chrono>
 #include <deque>
 #include <atomic>
 #include <cinttypes>
@@ -2906,6 +2907,9 @@ static bool ggml_backend_rpc_get_tensor_batch3(
 struct rpc_p2c_client_stream {
     socket_ptr socket;
     std::thread receiver;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool receiver_done = false;
     std::atomic<bool> received_ok { false };
     uint64_t run_id = 0;
     ggml_backend_rpc_p2c_complete_t complete = nullptr;
@@ -2962,6 +2966,11 @@ static void * ggml_backend_rpc_p2c_stream_start(
                 if (!ok) {
                     stream->complete(stream->userdata, nullptr, false);
                 }
+                {
+                    std::lock_guard<std::mutex> lock(stream->mutex);
+                    stream->receiver_done = true;
+                }
+                stream->cv.notify_all();
             });
     } catch (...) {
         rpc_msg_p2c_stream_finish_req finish {};
@@ -3025,6 +3034,15 @@ static bool ggml_backend_rpc_p2c_stream_stop(
         req.run_id = stream->run_id;
         requested = sock != nullptr && send_rpc_cmd_compact_small(
             sock, RPC_CMD_P2C_STREAM_FINISH, req);
+    }
+    if (requested) {
+        std::unique_lock<std::mutex> lock(stream->mutex);
+        const bool received_end = stream->cv.wait_for(
+            lock, std::chrono::seconds(5),
+            [&]() { return stream->receiver_done; });
+        if (!received_end) {
+            requested = false;
+        }
     }
     if (!requested) {
         stream->socket->interrupt();
