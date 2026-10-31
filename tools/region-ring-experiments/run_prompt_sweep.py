@@ -363,6 +363,9 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("region-ring-results"))
     ap.add_argument("--planner", default="apply-wide")
     ap.add_argument("--streaming", choices=("on", "off"), default="on")
+    ap.add_argument("--log-verbosity", type=int, choices=range(0, 6), default=3,
+                    metavar="{0,1,2,3,4,5}",
+                    help="llama -lv level (default: 3 = INFO; 4 = TRACE; 5 = DEBUG)")
     ap.add_argument("--n-predict", type=int, default=32)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--ubatch", type=int, default=512)
@@ -441,12 +444,12 @@ def main():
             "-c", str(ctx), "-b", str(args.batch), "-ub", str(args.ubatch),
             "-n", str(args.n_predict), "-t", str(args.threads),
             "--seed", str(args.seed), "--no-conversation",
-            "-f", str(prompt), "-lv", "1",
+            "-f", str(prompt), "-lv", str(args.log_verbosity),
         ]
         config = {
             "command": command, "cwd": str(root), "repeat": 1,
             "prompt_file": str(prompt), "prompt_hint": hint,
-            "commit": commit,
+            "commit": commit, "log_verbosity": args.log_verbosity,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k == "LLAMA_REGION_RING_METRICS_FILE"
