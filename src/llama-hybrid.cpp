@@ -10241,6 +10241,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         llama_ring_planner::candidate best = result.selected;
         std::vector<llama_region_ring_region> best_regions;
         bool forced_ab = false;
+        bool forced_single_cycle = false;
 
         const char * force_layout = std::getenv(
             "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
@@ -10303,7 +10304,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             std::vector<llama_region_ring_region> forced_regions;
             try {
                 forced_regions =
-                    llama_region_ring_parse(force_layout, model.layers);
+                    llama_region_ring_parse_apply_wide_layout(
+                        force_layout, model.layers);
             } catch (const std::exception & e) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
@@ -10312,29 +10314,53 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return false;
             }
 
-            if (!llama_region_ring_apply_topology_compatible(
-                    forced_regions, model.layers) ||
+            const bool single_cycle =
+                llama_region_ring_single_cycle_topology_compatible(
+                    forced_regions, model.layers);
+            const bool multi_cycle =
+                llama_region_ring_apply_topology_compatible(
+                    forced_regions, model.layers) &&
+                forced_regions.size() % 3 == 0;
+            const auto forced_counts =
+                llama_region_ring_layer_counts(forced_regions);
+            const int zero_devices =
+                (forced_counts[0] == 0 ? 1 : 0) +
+                (forced_counts[1] == 0 ? 1 : 0) +
+                (forced_counts[2] == 0 ? 1 : 0);
+            if ((!single_cycle && !multi_cycle) ||
                     forced_regions.empty() ||
                     forced_regions.back().device !=
                         llama_region_ring_device::PHONE ||
-                    forced_regions.size() % 3 != 0) {
+                    (single_cycle && zero_devices > 1)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
                     "status=REJECT reason=TOPOLOGY_CONTRACT "
-                    "layout=%s\n",
-                    force_layout);
+                    "layout=%s single_cycle=%d zero_devices=%d "
+                    "final_owner=%s\n",
+                    force_layout, single_cycle ? 1 : 0, zero_devices,
+                    forced_regions.empty() ? "NONE" :
+                        llama_region_ring_device_name(
+                            forced_regions.back().device));
                 return false;
             }
 
-            const int cycles = (int) forced_regions.size() / 3;
+            forced_single_cycle = single_cycle;
+            const int cycles = single_cycle ?
+                1 : (int) forced_regions.size() / 3;
             llama_ring_planner::candidate forced;
             forced.cycles = cycles;
-            forced.g = forced_regions[0].layer_end -
-                       forced_regions[0].layer_begin;
-            forced.c = forced_regions[1].layer_end -
-                       forced_regions[1].layer_begin;
-            forced.p = forced_regions[2].layer_end -
-                       forced_regions[2].layer_begin;
+            forced.g = single_cycle ?
+                forced_counts[(size_t) llama_region_ring_device::GPU] :
+                forced_regions[0].layer_end -
+                    forced_regions[0].layer_begin;
+            forced.c = single_cycle ?
+                forced_counts[(size_t) llama_region_ring_device::CPU] :
+                forced_regions[1].layer_end -
+                    forced_regions[1].layer_begin;
+            forced.p = single_cycle ?
+                forced_counts[(size_t) llama_region_ring_device::PHONE] :
+                forced_regions[2].layer_end -
+                    forced_regions[2].layer_begin;
             forced.tail_c = 0;
             forced.tail_g = 0;
             forced.xc = force_xc;
@@ -10357,8 +10383,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
 
             std::string force_reason;
-            if (!llama_ring_planner::estimate_region_ring_balance(
-                    model, forced_regions, forced) ||
+            bool balance_ok = true;
+            if (!(single_cycle && zero_devices == 1)) {
+                balance_ok =
+                    llama_ring_planner::estimate_region_ring_balance(
+                        model, forced_regions, forced);
+            } else {
+                // E=max(e1,e2,e3) is a three-device cyclic-balance metric.
+                // A forced two-device single pass has no closed G/C/P ring,
+                // so rank it only by the exact event DAG and memory guards.
+                forced.ring_error = {-1.0, -1.0, -1.0};
+                forced.ring_error_max = -1.0;
+                forced.ring_error_mean = -1.0;
+                forced.balance = -1.0;
+            }
+            if (!balance_ok ||
                     !llama_ring_planner::simulate(
                         model, forced_regions, forced, &force_reason)) {
                 LLAMA_LOG_ERROR(
@@ -10546,6 +10585,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best_has_directional ?
                 llama_region_ring_directional_topology_compatible(
                     best_regions, model.layers) :
+            forced_ab && forced_single_cycle ?
+                llama_region_ring_single_cycle_topology_compatible(
+                    best_regions, model.layers) :
                 llama_region_ring_apply_topology_compatible(
                     best_regions, model.layers);
         if (!best_topology_ok ||
@@ -10562,7 +10604,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         const std::string baseline_text =
             llama_region_ring_layout_string(baseline_regions);
         const std::string best_text =
-            llama_region_ring_layout_string(best_regions);
+            forced_ab && forced_single_cycle ?
+                std::string(force_layout) :
+                llama_region_ring_layout_string(best_regions);
         const double baseline_ms = result.baseline.wall_ms;
         const double improvement_pct =
             100.0 * (baseline_ms - best.wall_ms) / baseline_ms;
