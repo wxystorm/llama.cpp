@@ -7867,9 +7867,14 @@ void rpc_server::phone_stage_binding_preflight(
             256, static_cast<uint32_t>(i), last_use});
     }
     ggml_phone_stage::template_plan plan;
+    const int64_t tokens = graph->nodes[0]->ne[1];
+    if (tokens <= 0 || static_cast<uint64_t>(tokens) > UINT32_MAX ||
+        max_layer < first_layer || max_layer >= 10000) {
+        return;
+    }
     plan.layer_begin = static_cast<uint32_t>(first_layer);
     plan.layer_end = static_cast<uint32_t>(max_layer + 1);
-    plan.tokens = static_cast<uint32_t>(graph->nodes[0]->ne[1]);
+    plan.tokens = static_cast<uint32_t>(tokens);
     plan.output_kind =
         std::strstr(last->name, "result") != nullptr ? 1 : 0;
     plan.topology_signature = graph_uid;
@@ -7895,7 +7900,7 @@ void rpc_server::phone_stage_binding_preflight(
             "layer=%d..%d tokens=%u nodes=%d "
             "transient=%zu slot_bytes=%zu total_two_slots=%zu "
             "mode=PLAN_ONLY status=OK\n",
-            first_layer, max_layer, graph->nodes[0]->ne[1],
+            first_layer, max_layer, static_cast<unsigned>(plan.tokens),
             graph->n_nodes, transient.size(),
             pool.bytes_per_slot(),
             pool.bytes_per_slot() * 2);
