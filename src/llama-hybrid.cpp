@@ -8909,7 +8909,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     LLAMA_LOG_INFO(
         "[REGION_RING_PLAN_CPU_PROFILE_THREADS] profile_threads=%d "
         "batch_threads_requested=%d source=%s "
-        "threadpool=REUSED_MODEL_LOAD status=APPLIED\n
+        "threadpool=REUSED_MODEL_LOAD status=APPLIED\n",
         profile_cpu_threads, params.hybrid_profile_n_threads_batch,
         params.hybrid_profile_n_threads_batch > 0 ?
             "BATCH_ARGUMENT" : "BACKEND_DEFAULT");
