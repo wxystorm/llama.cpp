@@ -10831,6 +10831,50 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
+        // Diagnostic A/B ONLY: keep the existing conservative serial
+        // prediction as the sole Planner ranking score. Re-simulate the
+        // selected layout with two independent phone links, then with the
+        // measured duplex contention curve if one was opted in at startup.
+        // These are event DAG runs, never additional real executions.
+        llama_ring_planner::candidate independent_link = best;
+        llama_ring_planner::candidate contended_link = best;
+        bool independent_link_ok = false;
+        bool contended_link_ok = false;
+        std::string link_ab_reason;
+        if (!best_has_directional) {
+            auto independent_model = model;
+            independent_model.shared_phone_link = false;
+            independent_model.duplex_phone_contention = false;
+            independent_link_ok = llama_ring_planner::simulate(
+                independent_model, best_regions, independent_link,
+                &link_ab_reason);
+            if (independent_link_ok && model.duplex_slowdown) {
+                independent_model.duplex_phone_contention = true;
+                link_ab_reason.clear();
+                contended_link_ok = llama_ring_planner::simulate(
+                    independent_model, best_regions, contended_link,
+                    &link_ab_reason);
+            }
+        }
+        const char * link_ab_status =
+            best_has_directional ? "DIRECTIONAL_UNMODELED" :
+            !independent_link_ok ? "INDEPENDENT_DAG_FAILED" :
+            !model.duplex_slowdown ? "NO_DUPLEX_PROFILE" :
+            !contended_link_ok ? "CONTENDED_DAG_FAILED" : "READY";
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PLAN_LINK_AB] mode=APPLY_WIDE "
+            "serial_ms=%.3f independent_ms=%.3f "
+            "contended_ms=%.3f overlap_ms=%.3f "
+            "profile_points=%zu link_model=DYNAMIC_REMAINING_WORK "
+            "legacy_get=PRODUCER_FRAME pc_to_phone=DESTINATION_FRAME "
+            "scoring=SERIAL_ONLY status=%s reason=%s\n",
+            best.wall_ms,
+            independent_link_ok ? independent_link.wall_ms : -1.0,
+            contended_link_ok ? contended_link.wall_ms : -1.0,
+            contended_link_ok ? contended_link.duplex_overlap_ms : 0.0,
+            profile.duplex_phone_link.size(), link_ab_status,
+            link_ab_reason.empty() ? "NONE" : link_ab_reason.c_str());
+
         const std::string baseline_text =
             llama_region_ring_layout_string(baseline_regions);
         const std::string best_text =
@@ -10867,12 +10911,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "sender=%s dependencies=%s transfer_curve=PHONE_TO_PC_PROXY "
             "arena_capture=UNCALIBRATED status=MODELED\n",
             model.phone_full_return_stream ?
-                "PHONE_FULL_ARENA_FRAME" : "LEGACY_INTERVAL_GET",
+                "PHONE_FULL_ARENA_FRAME" : "LEGACY_PRODUCER_GET",
             best.phone_full_stream_frames, best.phone_full_stream_bytes,
             model.phone_full_return_stream ?
                 "PUBLICATION_FIFO_SINGLE_LANE" : "LEGACY_EDGE_ORDER",
             model.phone_full_return_stream ?
-                "RELEASE_ON_COMPLETE_FRAME" : "INTERVAL_EDGE_COMPLETION");
+                "RELEASE_ON_COMPLETE_FRAME" : "GET_BLOCKS_PHONE_WORKER");
         LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_TRANSFER_DIAG] mode=APPLY_WIDE "
             "directions=PC_LOCAL,PC_TO_PHONE,PHONE_TO_PC "
@@ -10967,6 +11011,20 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"gpu_weight_streaming\":"
                             << (model.gpu_weight_streaming ? "true" : "false")
                             << ",\"predicted_ms\":" << best.wall_ms
+                            << ",\"link_ab_serial_ms\":" << best.wall_ms
+                            << ",\"link_ab_independent_ms\":"
+                            << (independent_link_ok ?
+                                independent_link.wall_ms : -1.0)
+                            << ",\"link_ab_contended_ms\":"
+                            << (contended_link_ok ?
+                                contended_link.wall_ms : -1.0)
+                            << ",\"link_ab_overlap_ms\":"
+                            << (contended_link_ok ?
+                                contended_link.duplex_overlap_ms : 0.0)
+                            << ",\"duplex_profile_points\":"
+                            << profile.duplex_phone_link.size()
+                            << ",\"link_ab_status\":\""
+                            << link_ab_status << "\""
                             << ",\"baseline_predicted_ms\":"
                             << baseline_ms
                             << ",\"estimated_gain_pct\":"
