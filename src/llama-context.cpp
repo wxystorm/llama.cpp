@@ -3531,7 +3531,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool pc_phone_overlap,
         ggml_status & ret) {
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
-    if (kv_mctx == nullptr || stages.size() < 6) {
+    // Automatic Region Ring still searches 2..4 G/C/P Cycles (>= 6 stages),
+    // but deterministic APPLY_WIDE A/B may execute one logical Cycle. After
+    // zero-count devices are omitted, a collaborative single Cycle has either
+    // two or three executable stages. Reject only an invalid memory context
+    // or a degenerate single-device execution here; topology legality was
+    // already validated against the model-owned Plan before dispatch.
+    if (kv_mctx == nullptr || stages.size() < 2) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_EXEC] status=REJECT reason=INVALID_STAGE_COUNT "
+            "stages=%zu minimum=2\n",
+            stages.size());
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
