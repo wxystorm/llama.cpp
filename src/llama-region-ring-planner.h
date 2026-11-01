@@ -244,7 +244,7 @@ inline bool make_regions(const candidate & c, int total_layers,
         if (llama_region_ring_has_directional_stages(c.concrete_regions) ||
                 (!llama_region_ring_apply_topology_compatible(
                      c.concrete_regions, total_layers) &&
-                 !llama_region_ring_single_cycle_topology_compatible(
+                 !llama_region_ring_single_cycle_force_compatible(
                      c.concrete_regions, total_layers))) {
             return false;
         }
