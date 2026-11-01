@@ -3761,8 +3761,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        // CPU and GPU Bank A always have independent worker resources.
+        // Bank B is needed only when a second GPU Region is executable.
         const size_t ring_pc_resource_count =
-            gpu_weight_streaming ? 3 : 2;
+            gpu_weight_streaming && gpu_region_order.size() >= 2 ? 3 : 2;
 
         for (size_t resource_id = 0;
              resource_id < ring_pc_resource_count; ++resource_id) {
@@ -3910,11 +3912,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
 
         if (gpu_weight_streaming) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_GPU_BANK] phase=INIT banks=2 "
+            const size_t active_banks =
+                llama_region_ring_gpu_initial_bank_count(
+                    gpu_region_order.size());
+            LLAMA_LOG_INFO(
+                "[REGION_RING_GPU_BANK] phase=INIT banks=%zu "
                 "mapping=FIXED_PARITY canonical=CPU destination=CUDA "
                 "mover=%s min_tokens=%d status=READY\n",
-                gpu_bank_streaming ? "CPU_SINGLE" : "INACTIVE_SMALL_BATCH",
+                active_banks,
+                gpu_bank_streaming ? "CPU_SINGLE" :
+                active_banks == 1 ? "SINGLE_BANK_NO_REFILL" :
+                active_banks == 0 ? "NO_GPU_REGION" :
+                                    "INACTIVE_SMALL_BATCH",
                 gpu_bank_min_tokens);
         }
 
@@ -5175,8 +5184,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             gpu_bank == 0 ? 'A' : 'B',
                             selected.bank_generation,
                             gpu_bank_wait_us / 1000.0,
-                            gpu_bank_streaming ?
-                                "REFILL" : "SMALL_BATCH_DEMAND");
+                            gpu_bank_streaming ? "REFILL" :
+                            gpu_region_order.size() == 1 ?
+                                (gpu_bank_resident ?
+                                    "SINGLE_BANK_RESIDENT" :
+                                    "SINGLE_BANK_DEMAND") :
+                                "SMALL_BATCH_DEMAND");
                     }
 
                     ggml_status task_status = GGML_STATUS_SUCCESS;
