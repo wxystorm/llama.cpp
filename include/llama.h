@@ -305,6 +305,9 @@ extern "C" {
         bool     hybrid_auto;
         uint32_t hybrid_target_ctx;
         uint32_t hybrid_target_ubatch_tokens;
+        // Batch/prefill CPU threads for model-load Hybrid/Region Ring profile.
+        // 0 uses the backend default for direct API callers.
+        int32_t  hybrid_profile_n_threads_batch;
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;

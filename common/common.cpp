@@ -1621,6 +1621,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.hybrid_auto     = params.hybrid_auto;
+    // The Planner profiles during model load, before context creation.
+    // Match the effective prefill -tb thread count, falling back to -t.
+    const int profile_batch_threads = params.cpuparams_batch.n_threads == -1 ?
+        params.cpuparams.n_threads : params.cpuparams_batch.n_threads;
+    mparams.hybrid_profile_n_threads_batch =
+        profile_batch_threads > 0 ? profile_batch_threads : 0;
     mparams.tensor_split    = params.tensor_split;
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;

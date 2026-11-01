@@ -8873,6 +8873,34 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
 
+    // Model-load profiling precedes llama_context initialization. The
+    // synthetic CPU backend otherwise uses GGML_DEFAULT_N_THREADS (4),
+    // even when prefill was configured with -t/-tb 8.
+    const int profile_cpu_threads =
+        params.hybrid_profile_n_threads_batch > 0 ?
+            params.hybrid_profile_n_threads_batch : GGML_DEFAULT_N_THREADS;
+    ggml_backend_reg_t cpu_reg =
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(cpu.get()));
+    const auto set_cpu_threads = cpu_reg != nullptr ?
+        reinterpret_cast<ggml_backend_set_n_threads_t>(
+            ggml_backend_reg_get_proc_address(
+                cpu_reg, "ggml_backend_set_n_threads")) : nullptr;
+    if (set_cpu_threads == nullptr) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_CPU_PROFILE_THREADS] requested=%d "
+            "status=REJECT reason=CPU_SET_THREADS_UNAVAILABLE\n",
+            profile_cpu_threads);
+        return false;
+    }
+    set_cpu_threads(cpu.get(), profile_cpu_threads);
+    LLAMA_LOG_INFO(
+        "[REGION_RING_PLAN_CPU_PROFILE_THREADS] profile_threads=%d "
+        "batch_threads_requested=%d source=%s "
+        "threadpool=NONE_MODEL_LOAD status=APPLIED\n",
+        profile_cpu_threads, params.hybrid_profile_n_threads_batch,
+        params.hybrid_profile_n_threads_batch > 0 ?
+            "BATCH_ARGUMENT" : "BACKEND_DEFAULT");
+
     const bool is_qwen3_moe =
         llama_hybrid_arch_is_moe(ml.get_arch());
     if (!llama_hybrid_arch_supported(ml.get_arch())) {
