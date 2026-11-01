@@ -819,7 +819,12 @@ inline bool simulate(const model & m,
         const bool destination_frame =
             (a != b && b == device::PHONE) ||
             (a == device::CPU && b == device::GPU);
-        if (source_frame) {
+        // Bounded slot pools are only retained for historical regression
+        // tests. Preserve interval-level producer credits there: folding
+        // several producers into one wire packet would otherwise orphan
+        // the earlier producers' artificial slot reservations. Production
+        // uses slot_pool=0 and the physical frame model below.
+        if (source_frame && m.slot_pool == 0) {
             size_t di = 0;
             for (const int src : by_region[r]) {
                 const auto & producer = tasks[(size_t) src];
@@ -877,7 +882,7 @@ inline bool simulate(const model & m,
             continue;
         }
 
-        if (destination_frame) {
+        if (destination_frame && m.slot_pool == 0) {
             size_t si = 0;
             for (const int dst : by_region[r + 1]) {
                 const auto & consumer = tasks[(size_t) dst];
