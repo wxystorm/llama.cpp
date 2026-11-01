@@ -41,6 +41,9 @@ int main() {
     assert(a.resolve(0x100000, a.required_bytes - 1, bound) ==
         status::out_of_memory);
     assert(bound == saved); // Failed binding leaves prior result intact
+    assert(a.resolve(std::numeric_limits<size_t>::max() - 100,
+                     a.required_bytes, bound) == status::overflow);
+    assert(bound == saved); // Overflow also leaves prior result intact
 
     binding_layout invalid;
     assert(invalid.build({{1, 64, 0, 0, 0}}, {}) == status::invalid);
