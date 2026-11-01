@@ -289,9 +289,8 @@ int main() {
     }
 
     // Match the observed 358-token forced A/B: G32/C128/P128.
-    // Legacy interval GET charges four P->G edges for one P128
-    // producer, while the runtime materializes one P128 host output.
-    // The comparison counters are diagnostic only: do not change scores.
+    // Both legacy GET and Arena Stream charge a single complete P128
+    // frame per producing Chunk. They differ only in Phone worker ownership.
     {
         model transport = mock_profile();
         transport.layers = 40;
@@ -308,7 +307,7 @@ int main() {
         REQUIRE(legacy.stage_copy_call_proxy_count[0] == 36);
         REQUIRE(legacy.transfer_event_count[1] == 9);
         REQUIRE(legacy.stage_copy_call_proxy_count[1] == 9);
-        REQUIRE(legacy.transfer_event_count[2] == 24);
+        REQUIRE(legacy.transfer_event_count[2] == 6);
         REQUIRE(legacy.stage_copy_call_proxy_count[2] == 6);
         REQUIRE(legacy.transfer_service_ms[2] > 0.0);
 
@@ -325,7 +324,7 @@ int main() {
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
     // regardless of the following GPU/CPU Chunk size. The PC Receiver
     // releases every intersecting downstream task only when that whole
-    // frame is delivered. Legacy GET stays interval-based with flag off.
+    // frame is delivered. Legacy GET uses identical frames but blocks Phone.
     {
         model stream = mock_profile();
         stream.layers = 40;
@@ -368,10 +367,12 @@ int main() {
         REQUIRE(simulate(legacy, layout, get_plan, &why));
         REQUIRE(get_plan.phone_full_stream_frames == 0);
         REQUIRE(get_plan.phone_full_stream_bytes == 0);
-        // 12 GPU Chunks per P->G crossing with legacy interval-edge
-        // splitting, versus 3 full frames per crossing with Arena Stream.
-        REQUIRE(phone_to_gpu_payloads.size() == 24);
-        REQUIRE(get_plan.edges == frame_plan.edges + 18);
+        // The wire frame count and payload must now agree with the
+        // producer-owned Phone GET; only Phone worker timing differs.
+        REQUIRE(phone_to_gpu_payloads.size() == 6);
+        REQUIRE(get_plan.edges == frame_plan.edges);
+        REQUIRE(get_plan.transfer_event_count[2] == 6);
+        REQUIRE(get_plan.wall_ms + 1e-6 >= frame_plan.wall_ms);
 
         // The user's follow-up A/B shape: same 40-layer Full layout,
         // XC=XG=XP=64. The two middle Phone regions each produce 6 frames.
@@ -432,9 +433,9 @@ int main() {
         synthetic.phone_full_return_stream = false;
         candidate get = frame;
         REQUIRE(simulate(synthetic, two_regions, get));
-        REQUIRE(get.edges == 4);
+        REQUIRE(get.edges == 1);
         REQUIRE(get.phone_full_stream_frames == 0);
-        REQUIRE(std::fabs(get.wall_ms - 41.0) < 1e-6);
+        REQUIRE(std::fabs(get.wall_ms - 11.0) < 1e-6);
 
         synthetic.phone_full_return_stream = true;
         candidate gather;
@@ -455,7 +456,7 @@ int main() {
         REQUIRE(region_ring_handoff_ms_per_token(
             synthetic, device::PHONE, device::GPU, 128, 32, old_interval));
         REQUIRE(std::fabs(streamed - 10.0 / 128.0) < 1e-10);
-        REQUIRE(std::fabs(old_interval - 40.0 / 128.0) < 1e-10);
+        REQUIRE(std::fabs(old_interval - 10.0 / 128.0) < 1e-10);
     }
 
     // The Stream switch must not silently reinterpret directional Tensor
@@ -799,9 +800,9 @@ int main() {
             single_phone, 6));
     }
 
-    // Handoff cost must match full-Prompt overlap-edge accounting, not
-    // simply cost(source_chunk)/source_chunk. Non-dividing X=40 -> X=24
-    // creates six intersections over 96 tokens (vs four for X=24 -> 24).
+    // Handoff cost follows real producer-owned GPU GET frames rather than
+    // token interval intersections. Non-dividing X=40 -> X=24
+    // sends three producer frames over 96 tokens.
     {
         model handoff = mock_profile();
         handoff.tokens = 96;
@@ -819,9 +820,9 @@ int main() {
         REQUIRE(region_ring_handoff_ms_per_token(
             handoff, device::GPU, device::CPU,
             24, 24, aligned));
-        REQUIRE(std::fabs(misaligned - 102.0 / 96.0) < 1e-12);
+        REQUIRE(std::fabs(misaligned - 99.0 / 96.0) < 1e-12);
         REQUIRE(std::fabs(aligned - 100.0 / 96.0) < 1e-12);
-        REQUIRE(misaligned > aligned);
+        REQUIRE(misaligned < aligned);
 
         candidate fine;
         fine.cycles = 4;
