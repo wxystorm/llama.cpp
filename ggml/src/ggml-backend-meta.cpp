@@ -38,6 +38,21 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+// The outer Region Ring Phone worker owns this scope. Never derive it from
+// a process-global environment variable: other worker threads and decode
+// must continue to execute ordinary Meta output handoffs.
+static thread_local int ggml_meta_phone_full_stream_return_layer = -1;
+
+int ggml_backend_meta_set_phone_full_stream_return_layer(int last_layer) {
+    const int previous = ggml_meta_phone_full_stream_return_layer;
+    ggml_meta_phone_full_stream_return_layer = last_layer;
+    return previous;
+}
+
+bool ggml_backend_meta_phone_full_stream_return_layer_matches(int layer) {
+    return layer >= 0 && ggml_meta_phone_full_stream_return_layer == layer;
+}
+
 static void meta_debug_tensor_data(const ggml_tensor * tensor, const char * tag) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
         return;
@@ -9144,6 +9159,18 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                         ggml_backend_synchronize(src_backend.backend);
                     }
 
+                    // The outer Phone Full Arena capture will publish this
+                    // exact completed l_out. Keep the Phone fence above, but
+                    // avoid a redundant synchronous GET_TENSOR to the PC.
+                    if (ggml_backend_meta_phone_full_stream_return_layer_matches(ring_layer)) {
+                        handled = true;
+                        GGML_LOG_DEBUG(
+                            "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
+                            "path=RING_EXIT action=SKIP_GET\n",
+                            ring_layer, i);
+                        return GGML_STATUS_SUCCESS;
+                    }
+
                     const int64_t copy_begin_us = ggml_time_us();
                     ggml_backend_tensor_copy_async(
                         src_backend.backend, dst_backend.backend,
@@ -11123,6 +11150,18 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     if (pipeline_debug) {
                         meta_debug_tensor(bcj_src.backend, nodes[1], "PHONE POST_ADD");
                     }
+                }
+
+                // Keep the Phone residual ADD and device fence above, then
+                // hand the Phone-resident output directly to the outer Arena
+                // capture. Internal Phone->PC handoffs are never suppressed.
+                if (phone_owner_exit && external_backend_handoff &&
+                        ggml_backend_meta_phone_full_stream_return_layer_matches(layer)) {
+                    GGML_LOG_DEBUG(
+                        "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
+                        "path=PHONE_OWNER_EXIT action=SKIP_GET\n",
+                        layer, i);
+                    return GGML_STATUS_SUCCESS;
                 }
 
                 auto & bcj_dst = backend_ctx->backend_configs[0];

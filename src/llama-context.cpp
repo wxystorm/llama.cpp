@@ -2661,6 +2661,25 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         return nullptr;
     }
 
+    // The Meta graph still performs its Phone-side terminal residual ADD,
+    // but an active non-final Phone Full Region returns the completed l_out
+    // through the dedicated Arena stream rather than a synchronous GET.
+    // Scope this to the executing worker thread and restore on every exit.
+    struct meta_phone_full_stream_return_scope {
+        int previous_layer;
+
+        explicit meta_phone_full_stream_return_scope(int layer) :
+            previous_layer(ggml_backend_meta_set_phone_full_stream_return_layer(layer)) {}
+
+        ~meta_phone_full_stream_return_scope() {
+            (void) ggml_backend_meta_set_phone_full_stream_return_layer(previous_layer);
+        }
+    };
+    const meta_phone_full_stream_return_scope meta_stream_scope(
+        llama_region_ring_tls_phone_full_stream.enabled &&
+        stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        stage_output != nullptr ? stage.layer_end - 1 : -1);
+
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     const bool gpu_weight_streaming =
         ring_lane == 1 &&

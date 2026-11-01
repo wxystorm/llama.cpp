@@ -573,6 +573,13 @@ extern "C" {
     // allocation exists, rather than assuming Phone owns the output.
     GGML_API struct ggml_tensor * ggml_backend_meta_simple_tensor(const struct ggml_tensor * tensor, size_t index);
 
+    // Thread-local, non-final Phone Full Arena return. -1 disables the mode.
+    // Returns the previous layer so a worker can restore its prior scope.
+    // Only the completed terminal l_out GET may be skipped; internal Meta
+    // copies and the final Phone Region retain their normal behavior.
+    GGML_API int  ggml_backend_meta_set_phone_full_stream_return_layer(int last_layer);
+    GGML_API bool ggml_backend_meta_phone_full_stream_return_layer_matches(int layer);
+
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(
         ggml_backend_t backend, int first_layer, int last_layer);

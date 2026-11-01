@@ -336,6 +336,13 @@ set_target_properties(test-region-ring-planner PROPERTIES
 target_include_directories(test-region-ring-planner PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring-planner)
 
+# The Arena return opt-in must not leak into adjacent Phone stages or
+# parallel CPU/GPU workers. The mode test needs no model or live RPC server.
+add_executable(test-meta-phone-full-stream-mode test-meta-phone-full-stream-mode.cpp)
+target_link_libraries(test-meta-phone-full-stream-mode PRIVATE ggml Threads::Threads)
+target_compile_features(test-meta-phone-full-stream-mode PRIVATE cxx_std_17)
+llama_test(test-meta-phone-full-stream-mode)
+
 
 llama_build_and_test(test-meta-return-stall-profile.cpp)
 if (TARGET gguf-model-data)
