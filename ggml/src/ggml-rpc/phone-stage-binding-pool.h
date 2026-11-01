@@ -61,6 +61,36 @@ inline bool may_overlap(size_t a, size_t a_bytes, size_t b, size_t b_bytes) {
     return a < b_end && b < a_end;
 }
 
+// A fail-closed summary of ALL tensors in the original Stage activation
+// arena. The high-water end offset is a conservative allocation requirement
+// if original buffer-relative offsets are preserved when rebinding. This is
+// deliberately distinct from the compact scratch lifetime estimator.
+struct arena_extent {
+    size_t first_offset = std::numeric_limits<size_t>::max();
+    size_t last_offset = 0;
+    size_t tensor_count = 0;
+
+    bool add(size_t base, size_t capacity, size_t address, size_t bytes) {
+        if (!bytes || address < base || bytes > capacity) { return false; }
+        const size_t offset = address - base;
+        if (offset > capacity - bytes) { return false; }
+        const size_t end = offset + bytes; // checked by capacity bound
+        first_offset = std::min(first_offset, offset);
+        last_offset = std::max(last_offset, end);
+        ++tensor_count;
+        return true;
+    }
+
+    bool valid() const {
+        return tensor_count != 0 &&
+            first_offset != std::numeric_limits<size_t>::max() &&
+            last_offset >= first_offset;
+    }
+    size_t span_bytes() const {
+        return valid() ? last_offset - first_offset : 0;
+    }
+};
+
 // An immutable layout. Only *private, transient* compute roots are included;
 // weights, KV, graph inputs, outputs, persistent SET_ROWS and all their aliases
 // MUST be excluded by the registering runtime before calling build().
