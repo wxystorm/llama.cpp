@@ -20794,159 +20794,175 @@ auto prefill_norm_sg_has_prework =
                     }
                 }
             } else if (!phone_block_fused) {
-                // The terminal P1 prefill often has an Attention SG followed
-                // by an FFN/output SG, even though both are Phone-local.
+                // Dense Phone Full may have one Meta split between Attention
+                // and FFN: e.g. norm-39 ... attn_out-39 (27 nodes), followed
+                // by node_27 ... node_35 (9 nodes). Both SGs are submitted
+                // exclusively to Phone, even when the PC-side *mirror* has
+                // COMPUTE flags that are never executed. Verify the mirrored
+                // operations rather than rejecting every PC COMPUTE flag.
+                //
+                // This does not merge READY/PARTIAL, Tensor split stages,
+                // distinct layer boundaries, result/output nodes, or any
+                // SG that actually requires a PC computation or handoff.
                 ggml_cgraph * first_graph =
                     backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
                 int first_layer = -1;
-                int parsed = 0;
+                int last_attn_layer = -1;
+                int parsed_first = 0;
+                int parsed_last = 0;
                 const bool starts_full_prefill =
                     first_graph != nullptr && first_graph->n_nodes > 0 &&
                     first_graph->nodes[0]->ne[1] > 1 &&
                     std::sscanf(first_graph->nodes[0]->name,
-                                "norm-%d%n", &first_layer, &parsed) == 1 &&
-                    first_graph->nodes[0]->name[parsed] == '\0' &&
-                    first_layer >= 0;
-                if (starts_full_prefill) {
-                    size_t last_safe = i;
-                    // Stage 1 only: merge the immediately adjacent final
-                    // Attention/FFN pair.  Never absorb further result/output
-                    // SGs or silently cross a separate scheduling boundary.
-                    const size_t stop_sg =
-                        std::min(backend_ctx->n_subgraphs, i + 2);
-                    for (size_t sg = i; sg < stop_sg; ++sg) {
+                                "norm-%d%n", &first_layer, &parsed_first) == 1 &&
+                    first_graph->nodes[0]->name[parsed_first] == '\0' &&
+                    std::sscanf(
+                        first_graph->nodes[first_graph->n_nodes - 1]->name,
+                        "attn_out-%d%n",
+                        &last_attn_layer, &parsed_last) == 1 &&
+                    first_graph->nodes[
+                        first_graph->n_nodes - 1]->name[parsed_last] == '\0' &&
+                    first_layer >= 0 && first_layer == last_attn_layer &&
+                    !layer_is_tensor_phone_primary(first_layer);
+                if (starts_full_prefill && i + 1 < backend_ctx->n_subgraphs) {
+                    const size_t next_sg = i + 1;
+                    const auto & pc0 =
+                        backend_ctx->backend_configs[0].cgraphs[i];
+                    const auto & pc1 =
+                        backend_ctx->backend_configs[0].cgraphs[next_sg];
+                    const auto & phone0 =
+                        backend_ctx->backend_configs[1].cgraphs[i];
+                    const auto & phone1 =
+                        backend_ctx->backend_configs[1].cgraphs[next_sg];
+                    const bool contiguous =
+                        pc0.offset + pc0.cgraph_main->n_nodes ==
+                            pc1.offset &&
+                        phone0.offset + phone0.cgraph_main->n_nodes ==
+                            phone1.offset;
+                    const auto no_directional =
+                        ggml_backend_meta_context::cgraph_config::
+                            DIRECTIONAL_COMPLETE_NONE;
+                    const char * reject_reason = nullptr;
+                    size_t rejected_sg = i;
+                    int rejected_node = -1;
+                    size_t mirrored_pc_nodes = 0;
+                    size_t phone_compute_nodes = 0;
+                    if (!contiguous) {
+                        reject_reason = "NOT_CONTIGUOUS";
+                    } else if (pc0.directional_completion != no_directional ||
+                               pc1.directional_completion != no_directional ||
+                               phone0.directional_completion != no_directional ||
+                               phone1.directional_completion != no_directional) {
+                        reject_reason = "DIRECTIONAL_BOUNDARY";
+                    }
+
+                    // Stage 1 only: exactly the next SG, not the final
+                    // model-output graph or an arbitrary chain of Phone SGs.
+                    for (size_t sg = i;
+                            sg <= next_sg && reject_reason == nullptr;
+                            ++sg) {
                         ggml_cgraph * pc =
                             backend_ctx->backend_configs[0]
                                 .cgraphs[sg].cgraph_main;
                         ggml_cgraph * phone =
                             backend_ctx->backend_configs[1]
                                 .cgraphs[sg].cgraph_main;
-                        if (!subgraph_is_phone_only(sg) ||
-                                pc == nullptr || phone == nullptr ||
-                                phone->n_nodes == 0 ||
+                        if (pc == nullptr || phone == nullptr ||
                                 pc->n_nodes != phone->n_nodes ||
-                                phone->nodes[0]->ne[1] <= 1 ||
-                                (sg > i && phone->n_nodes == 1 &&
-                                 std::strncmp(phone->nodes[0]->name,
-                                              "l_out-", 6) == 0)) {
+                                phone->n_nodes == 0 ||
+                                !subgraph_is_phone_only(sg)) {
+                            reject_reason = "NOT_PHONE_OWNED";
+                            rejected_sg = sg;
                             break;
                         }
-                        bool safe = true;
+                        bool has_phone_compute = false;
                         for (int k = 0; k < phone->n_nodes; ++k) {
-                            ggml_tensor * pc_node = pc->nodes[k];
-                            ggml_tensor * phone_node = phone->nodes[k];
-                            if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 ||
-                                    (phone_node->flags &
+                            const ggml_tensor * p = pc->nodes[k];
+                            const ggml_tensor * t = phone->nodes[k];
+                            const bool phone_compute =
+                                (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                            const bool pc_compute =
+                                (p->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+                            rejected_sg = sg;
+                            rejected_node = k;
+
+                            if (t->ne[1] <= 1 ||
+                                    (t->flags &
                                      (GGML_TENSOR_FLAG_META_SEND_READY |
                                       GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0 ||
                                     ggml_backend_meta_get_split_state(
-                                        phone_node, false).axis ==
+                                        t, false).axis ==
                                         GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                safe = false;
+                                reject_reason = "SPLIT_OR_DECODE_NODE";
                                 break;
                             }
+                            if (sg == next_sg &&
+                                    (std::strncmp(t->name, "result_", 7) == 0 ||
+                                     std::strncmp(t->name, "norm-", 5) == 0 ||
+                                     std::strncmp(t->name, "attn_norm-", 10) == 0)) {
+                                reject_reason = "NEXT_LAYER_OR_OUTPUT";
+                                break;
+                            }
+                            if (pc_compute) {
+                                bool identical_mirror =
+                                    phone_compute &&
+                                    p->op == t->op && p->type == t->type;
+                                for (int d = 0;
+                                        d < GGML_MAX_DIMS && identical_mirror;
+                                        ++d) {
+                                    identical_mirror =
+                                        p->ne[d] == t->ne[d];
+                                }
+                                if (!identical_mirror) {
+                                    reject_reason = "PC_COMPUTE_NOT_PHONE_MIRROR";
+                                    break;
+                                }
+                                ++mirrored_pc_nodes;
+                            }
+                            has_phone_compute |= phone_compute;
+                            phone_compute_nodes += phone_compute ? 1 : 0;
                         }
-                        if (!safe) {
-                            break;
+                        if (!has_phone_compute &&
+                                reject_reason == nullptr) {
+                            reject_reason = "NO_PHONE_COMPUTE";
                         }
-                        last_safe = sg;
                     }
-                    if (last_safe > i) {
+                    if (reject_reason == nullptr) {
                         phone_block_fused = true;
-                        phone_block_end = last_safe;
+                        phone_block_end = next_sg;
                         first_fused_layer = first_layer;
-                        phone_block_last_layer = -1; // no forced l_out handoff
-                        full_region_graph_end = last_safe;
+                        // No forced Phone->PC handoff: the output/next SG
+                        // keeps the old specialized_communication contract.
+                        phone_block_last_layer = -1;
+                        full_region_graph_end = next_sg;
                         full_region_graph_ready = true;
                         timing_first_layer = first_layer;
                         timing_last_layer = first_layer;
+                        GGML_LOG_INFO(
+                            "[PHONE_FULL_REGION_GRAPH] event=PAIR_VALIDATED "
+                            "sg=%zu..%zu layer=%d phone_compute=%zu "
+                            "pc_mirror=%zu action=FUSE status=OK\n",
+                            i, next_sg, first_layer,
+                            phone_compute_nodes, mirrored_pc_nodes);
                     } else if (pipeline_debug) {
-                        printf("[PHONE_FULL_REGION_GRAPH] event=FALLBACK "
-                               "form=PHONE_LOCAL sg=%zu layer=%d "
-                               "reason=NO_SAFE_CONTIGUOUS_SGS\n",
-                               i, first_layer);
+                        ggml_cgraph * rejected =
+                            backend_ctx->backend_configs[1]
+                                .cgraphs[rejected_sg].cgraph_main;
+                        const char * rejected_name =
+                            rejected != nullptr && rejected_node >= 0 &&
+                            rejected_node < rejected->n_nodes ?
+                                rejected->nodes[rejected_node]->name :
+                                "(none)";
+                        printf(
+                            "[PHONE_FULL_REGION_GRAPH] event=FALLBACK "
+                            "form=PHONE_LOCAL sg=%zu..%zu layer=%d "
+                            "failed_sg=%zu node=%d name=%s reason=%s\n",
+                            i, next_sg, first_layer,
+                            rejected_sg, rejected_node,
+                            rejected_name, reject_reason);
                     }
                 }
-            }
-        }
-        const int64_t phone_region_build_begin_us =
-            phone_region_fused ? ggml_time_us() : 0;
-        if (phone_region_fused) {
-            phone_region_pre_graph_us =
-                phone_region_build_begin_us - layer_wall_start_us;
-        }
-        ggml_cgraph * phone_graph = full_region_graph_ready ?
-            build_phone_block_graph(i, full_region_graph_end) :
-            phone_block_fused ?
-                build_phone_block_graph(i, phone_block_end) :
-                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
-        if (full_region_graph_ready) {
-            GGML_LOG_INFO(
-                "[PHONE_FULL_REGION_GRAPH] event=READY form=%s "
-                "sg=%zu..%zu compute_end=%zu layer=%d nodes=%d "
-                "uid=%" PRIu64 " rpc_graphs=1 status=OK\n",
-                full_region_graph_has_l_out ? "TERMINAL_L_OUT" : "PHONE_LOCAL",
-                i, full_region_graph_end, phone_block_end,
-                phone_block_last_layer, phone_graph->n_nodes, phone_graph->uid);
-        }
-        if (phone_region_fused) {
-            phone_region_graph_build_us =
-                ggml_time_us() - phone_region_build_begin_us;
-        }
-        communication_sg = phone_block_fused ? phone_block_end : i;
-
-        // Full Regions are often already ONE Phone SG (P1: ~34 nodes,
-        // P2: ~69 nodes). find_phone_block() only recognizes the older
-        // ATTN-SG + FFN-SG pair form, so requiring phone_block_fused here
-        // accidentally excluded the common single-SG Full Region path.
-        const bool phone_single_sg =
-            n_backends == 2 && !phone_block_fused &&
-            is_phone_only_sg &&
-            !phone_region_fused;
-        if (phone_full_add_enabled && !full_region_graph_ready &&
-                n_backends == 2 &&
-                (phone_block_fused || phone_single_sg) &&
-                !phone_region_fused &&
-                (!ring_phone_fusion || phone_single_sg)) {
-            const size_t exit_sg = phone_block_fused ? phone_block_end : i;
-            int exit_layer = phone_block_fused ? phone_block_last_layer : -1;
-            ggml_tensor * residual =
-                phone_block_fused ?
-                    find_recent_ffn_inp(1, exit_sg, exit_layer) :
-                    find_recent_ffn_inp_layer(1, exit_sg, exit_layer);
-            const size_t next_sg = exit_sg + 1;
-            ggml_cgraph * tail_graph =
-                backend_ctx->backend_configs[1].cgraphs[exit_sg].cgraph_main;
-            ggml_tensor * terminal =
-                tail_graph != nullptr && tail_graph->n_nodes > 0 ?
-                    tail_graph->nodes[tail_graph->n_nodes - 1] : nullptr;
-            bool residual_in_single_sg = phone_block_fused;
-            if (!phone_block_fused && tail_graph != nullptr) {
-                for (int k = 0; k < tail_graph->n_nodes; ++k) {
-                    residual_in_single_sg |= tail_graph->nodes[k] == residual;
-                }
-            }
-            char l_out_name[64];
-            std::snprintf(l_out_name, sizeof(l_out_name),
-                          "l_out-%d", exit_layer);
-            ggml_tensor * dst_l_out = exit_layer >= 0 ?
-                find_exact_named_tensor(0, l_out_name) : nullptr;
-
-            // Match precisely the legacy Phone-owner exit, not the l_out
-            // bridge which already contains a complete residual result.
-            // The older fused-block exit may defer to an already-final
-            // l_out bridge. A single SG does NOT take that deferral path;
-            // its original specialized_communication() runs its own ADD
-            // even when a subsequent exact l_out bridge is present.
-            const bool existing_l_out =
-                phone_block_fused &&
-                next_sg < backend_ctx->n_subgraphs &&
-                subgraph_is_exact_l_out_bridge(next_sg, exit_layer);
-            const bool continues_on_phone =
-                next_sg < backend_ctx->n_subgraphs &&
-                subgraph_will_execute_phone(next_sg);
-            const bool pc_exit =
-                next_sg >= backend_ctx->n_subgraphs ||
+            }|
                 subgraph_is_prefill_pc_only(next_sg) ||
                 subgraph_is_decode_pc_only_norm(next_sg) ||
                 has_layer_output_producer(0, next_sg, exit_layer);
