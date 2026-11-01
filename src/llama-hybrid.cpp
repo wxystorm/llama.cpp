@@ -917,111 +917,6 @@ void llama_hybrid_profile_print(const llama_hybrid_profile & profile) {
     llama_hybrid_transfer_print("gpu_to_pc", profile.gpu_to_pc);
     llama_hybrid_transfer_print(
         "gpu_weight_h2d", profile.gpu_weight_h2d);
-    if (duplex_requested && !duplex_available) {
-        LLAMA_LOG_WARN(
-            "[HYBRID_PROFILE_RPC_DUPLEX] "
-            "status=UNSUPPORTED reason=RPC_CLIENT_PROBE_UNAVAILABLE "
-            "action=KEEP_SERIAL_DAG\n");
-    } else if (duplex_available) {
-        profile.duplex_phone_link.reserve(chunk_tokens.size());
-        LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_RPC_DUPLEX] phase=BEGIN "
-            "sizes=%zu socket_mode=INDEPENDENT "
-            "commands=SET_TENSOR_ACK_AND_GET_TENSOR "
-            "sampling=MEDIAN5 status=READY\n",
-            chunk_tokens.size());
-        bool all_ok = true;
-        for (size_t i = 0; i < chunk_tokens.size(); ++i) {
-            const size_t bytes = ggml_nbytes(phone_tensors[i]);
-            // The Phone source is populated before the timing starts.
-            // SET and GET access distinct tensors, so there is no
-            // server-side read/write race during the concurrent sample.
-            std::fill_n(source_data.begin(), bytes,
-                        static_cast<uint8_t>(0x60 + (i & 0x0f)));
-            ggml_backend_tensor_set(
-                phone_tensors[i], source_data.data(), 0, bytes);
-            rpc_fence(phone_backend);
-            ggml_rpc_duplex_profile measurement {};
-            if (!duplex_probe(
-                    phone_backend, duplex_upload_phone[i],
-                    phone_tensors[i], bytes, &measurement)) {
-                LLAMA_LOG_WARN(
-                    "[HYBRID_PROFILE_RPC_DUPLEX] "
-                    "bytes=%zu status=FAILED "
-                    "action=KEEP_SERIAL_DAG\n", bytes);
-                all_ok = false;
-                break;
-            }
-
-            llama_hybrid_duplex_transfer_point p {};
-            p.bytes = bytes;
-            p.c2p_solo_ms = measurement.c2p_solo_ms;
-            p.p2c_solo_ms = measurement.p2c_solo_ms;
-            p.c2p_concurrent_ms = measurement.c2p_concurrent_ms;
-            p.p2c_concurrent_ms = measurement.p2c_concurrent_ms;
-            p.concurrent_wall_ms = measurement.concurrent_wall_ms;
-            p.concurrent_overlap_ms = measurement.concurrent_overlap_ms;
-            profile.duplex_phone_link.push_back(p);
-
-            const double c2p_factor = p.c2p_solo_ms > 0.0 ?
-                p.c2p_concurrent_ms / p.c2p_solo_ms : 0.0;
-            const double p2c_factor = p.p2c_solo_ms > 0.0 ?
-                p.p2c_concurrent_ms / p.p2c_solo_ms : 0.0;
-            const double c2p_mib_s = p.c2p_concurrent_ms > 0.0 ?
-                bytes / 1048576.0 * 1000.0 /
-                    p.c2p_concurrent_ms : 0.0;
-            const double p2c_mib_s = p.p2c_concurrent_ms > 0.0 ?
-                bytes / 1048576.0 * 1000.0 /
-                    p.p2c_concurrent_ms : 0.0;
-            LLAMA_LOG_INFO(
-                "[HYBRID_PROFILE_RPC_DUPLEX] "
-                "bytes=%zu solo_c2p_ms=%.3f solo_p2c_ms=%.3f "
-                "both_c2p_ms=%.3f both_p2c_ms=%.3f "
-                "wall_ms=%.3f overlap_ms=%.3f "
-                "c2p_slowdown=%.3f p2c_slowdown=%.3f "
-                "c2p_mib_s=%.3f p2c_mib_s=%.3f "
-                "status=MEASURED\n",
-                bytes, p.c2p_solo_ms, p.p2c_solo_ms,
-                p.c2p_concurrent_ms, p.p2c_concurrent_ms,
-                p.concurrent_wall_ms, p.concurrent_overlap_ms,
-                c2p_factor, p2c_factor,
-                c2p_mib_s, p2c_mib_s);
-
-            // Small buffered metadata record; no per-chunk logging.
-            if (const char * metrics_path = std::getenv(
-                    "LLAMA_REGION_RING_METRICS_FILE")) {
-                if (*metrics_path != '\0') {
-                    std::ofstream metrics(metrics_path, std::ios::app);
-                    if (metrics) {
-                        metrics << std::fixed << std::setprecision(4)
-                            << "{\"type\":\"rpc_duplex_profile\","
-                            << "\"schema\":1,"
-                            << "\"bytes\":" << bytes
-                            << ",\"c2p_solo_ms\":" << p.c2p_solo_ms
-                            << ",\"p2c_solo_ms\":" << p.p2c_solo_ms
-                            << ",\"c2p_concurrent_ms\":"
-                            << p.c2p_concurrent_ms
-                            << ",\"p2c_concurrent_ms\":"
-                            << p.p2c_concurrent_ms
-                            << ",\"concurrent_wall_ms\":"
-                            << p.concurrent_wall_ms
-                            << ",\"concurrent_overlap_ms\":"
-                            << p.concurrent_overlap_ms
-                            << ",\"c2p_slowdown\":" << c2p_factor
-                            << ",\"p2c_slowdown\":" << p2c_factor
-                            << "}\n";
-                    }
-                }
-            }
-        }
-        LLAMA_LOG_INFO(
-            "[HYBRID_PROFILE_RPC_DUPLEX] phase=END "
-            "measured=%zu requested=%zu status=%s "
-            "planner_scoring=UNCHANGED\n",
-            profile.duplex_phone_link.size(),
-            chunk_tokens.size(), all_ok ? "READY" : "PARTIAL");
-    }
-
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
     llama_hybrid_transfer_print("snapshot_phone_to_pc", profile.snapshot_phone_to_pc);
     llama_hybrid_transfer_print("phone_to_pc", profile.phone_to_pc);
@@ -6584,6 +6479,111 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
                 llama_hybrid_rpc_median(dual_samples),
             });
         }
+    }
+
+    if (duplex_requested && !duplex_available) {
+        LLAMA_LOG_WARN(
+            "[HYBRID_PROFILE_RPC_DUPLEX] "
+            "status=UNSUPPORTED reason=RPC_CLIENT_PROBE_UNAVAILABLE "
+            "action=KEEP_SERIAL_DAG\n");
+    } else if (duplex_available) {
+        profile.duplex_phone_link.reserve(chunk_tokens.size());
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_RPC_DUPLEX] phase=BEGIN "
+            "sizes=%zu socket_mode=INDEPENDENT "
+            "commands=SET_TENSOR_ACK_AND_GET_TENSOR "
+            "sampling=MEDIAN5 status=READY\n",
+            chunk_tokens.size());
+        bool all_ok = true;
+        for (size_t i = 0; i < chunk_tokens.size(); ++i) {
+            const size_t bytes = ggml_nbytes(phone_tensors[i]);
+            // The Phone source is populated before the timing starts.
+            // SET and GET access distinct tensors, so there is no
+            // server-side read/write race during the concurrent sample.
+            std::fill_n(source_data.begin(), bytes,
+                        static_cast<uint8_t>(0x60 + (i & 0x0f)));
+            ggml_backend_tensor_set(
+                phone_tensors[i], source_data.data(), 0, bytes);
+            rpc_fence(phone_backend);
+            ggml_rpc_duplex_profile measurement {};
+            if (!duplex_probe(
+                    phone_backend, duplex_upload_phone[i],
+                    phone_tensors[i], bytes, &measurement)) {
+                LLAMA_LOG_WARN(
+                    "[HYBRID_PROFILE_RPC_DUPLEX] "
+                    "bytes=%zu status=FAILED "
+                    "action=KEEP_SERIAL_DAG\n", bytes);
+                all_ok = false;
+                break;
+            }
+
+            llama_hybrid_duplex_transfer_point p {};
+            p.bytes = bytes;
+            p.c2p_solo_ms = measurement.c2p_solo_ms;
+            p.p2c_solo_ms = measurement.p2c_solo_ms;
+            p.c2p_concurrent_ms = measurement.c2p_concurrent_ms;
+            p.p2c_concurrent_ms = measurement.p2c_concurrent_ms;
+            p.concurrent_wall_ms = measurement.concurrent_wall_ms;
+            p.concurrent_overlap_ms = measurement.concurrent_overlap_ms;
+            profile.duplex_phone_link.push_back(p);
+
+            const double c2p_factor = p.c2p_solo_ms > 0.0 ?
+                p.c2p_concurrent_ms / p.c2p_solo_ms : 0.0;
+            const double p2c_factor = p.p2c_solo_ms > 0.0 ?
+                p.p2c_concurrent_ms / p.p2c_solo_ms : 0.0;
+            const double c2p_mib_s = p.c2p_concurrent_ms > 0.0 ?
+                bytes / 1048576.0 * 1000.0 /
+                    p.c2p_concurrent_ms : 0.0;
+            const double p2c_mib_s = p.p2c_concurrent_ms > 0.0 ?
+                bytes / 1048576.0 * 1000.0 /
+                    p.p2c_concurrent_ms : 0.0;
+            LLAMA_LOG_INFO(
+                "[HYBRID_PROFILE_RPC_DUPLEX] "
+                "bytes=%zu solo_c2p_ms=%.3f solo_p2c_ms=%.3f "
+                "both_c2p_ms=%.3f both_p2c_ms=%.3f "
+                "wall_ms=%.3f overlap_ms=%.3f "
+                "c2p_slowdown=%.3f p2c_slowdown=%.3f "
+                "c2p_mib_s=%.3f p2c_mib_s=%.3f "
+                "status=MEASURED\n",
+                bytes, p.c2p_solo_ms, p.p2c_solo_ms,
+                p.c2p_concurrent_ms, p.p2c_concurrent_ms,
+                p.concurrent_wall_ms, p.concurrent_overlap_ms,
+                c2p_factor, p2c_factor,
+                c2p_mib_s, p2c_mib_s);
+
+            // Small buffered metadata record; no per-chunk logging.
+            if (const char * metrics_path = std::getenv(
+                    "LLAMA_REGION_RING_METRICS_FILE")) {
+                if (*metrics_path != '\0') {
+                    std::ofstream metrics(metrics_path, std::ios::app);
+                    if (metrics) {
+                        metrics << std::fixed << std::setprecision(4)
+                            << "{\"type\":\"rpc_duplex_profile\","
+                            << "\"schema\":1,"
+                            << "\"bytes\":" << bytes
+                            << ",\"c2p_solo_ms\":" << p.c2p_solo_ms
+                            << ",\"p2c_solo_ms\":" << p.p2c_solo_ms
+                            << ",\"c2p_concurrent_ms\":"
+                            << p.c2p_concurrent_ms
+                            << ",\"p2c_concurrent_ms\":"
+                            << p.p2c_concurrent_ms
+                            << ",\"concurrent_wall_ms\":"
+                            << p.concurrent_wall_ms
+                            << ",\"concurrent_overlap_ms\":"
+                            << p.concurrent_overlap_ms
+                            << ",\"c2p_slowdown\":" << c2p_factor
+                            << ",\"p2c_slowdown\":" << p2c_factor
+                            << "}\n";
+                    }
+                }
+            }
+        }
+        LLAMA_LOG_INFO(
+            "[HYBRID_PROFILE_RPC_DUPLEX] phase=END "
+            "measured=%zu requested=%zu status=%s "
+            "planner_scoring=UNCHANGED\n",
+            profile.duplex_phone_link.size(),
+            chunk_tokens.size(), all_ok ? "READY" : "PARTIAL");
     }
 
     llama_hybrid_transfer_print("pc_to_phone", profile.pc_to_phone);
