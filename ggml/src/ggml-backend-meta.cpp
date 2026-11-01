@@ -20985,7 +20985,86 @@ auto prefill_norm_sg_has_prework =
                             rejected_name, reject_reason);
                     }
                 }
-            }|
+            }
+        }
+        const int64_t phone_region_build_begin_us =
+            phone_region_fused ? ggml_time_us() : 0;
+        if (phone_region_fused) {
+            phone_region_pre_graph_us =
+                phone_region_build_begin_us - layer_wall_start_us;
+        }
+        ggml_cgraph * phone_graph = full_region_graph_ready ?
+            build_phone_block_graph(i, full_region_graph_end) :
+            phone_block_fused ?
+                build_phone_block_graph(i, phone_block_end) :
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (full_region_graph_ready) {
+            GGML_LOG_INFO(
+                "[PHONE_FULL_REGION_GRAPH] event=READY form=%s "
+                "sg=%zu..%zu compute_end=%zu layer=%d nodes=%d "
+                "uid=%" PRIu64 " rpc_graphs=1 status=OK\n",
+                full_region_graph_has_l_out ? "TERMINAL_L_OUT" : "PHONE_LOCAL",
+                i, full_region_graph_end, phone_block_end,
+                phone_block_last_layer, phone_graph->n_nodes, phone_graph->uid);
+        }
+        if (phone_region_fused) {
+            phone_region_graph_build_us =
+                ggml_time_us() - phone_region_build_begin_us;
+        }
+        communication_sg = phone_block_fused ? phone_block_end : i;
+
+        // Full Regions are often already ONE Phone SG (P1: ~34 nodes,
+        // P2: ~69 nodes). find_phone_block() only recognizes the older
+        // ATTN-SG + FFN-SG pair form, so requiring phone_block_fused here
+        // accidentally excluded the common single-SG Full Region path.
+        const bool phone_single_sg =
+            n_backends == 2 && !phone_block_fused &&
+            is_phone_only_sg &&
+            !phone_region_fused;
+        if (phone_full_add_enabled && !full_region_graph_ready &&
+                n_backends == 2 &&
+                (phone_block_fused || phone_single_sg) &&
+                !phone_region_fused &&
+                (!ring_phone_fusion || phone_single_sg)) {
+            const size_t exit_sg = phone_block_fused ? phone_block_end : i;
+            int exit_layer = phone_block_fused ? phone_block_last_layer : -1;
+            ggml_tensor * residual =
+                phone_block_fused ?
+                    find_recent_ffn_inp(1, exit_sg, exit_layer) :
+                    find_recent_ffn_inp_layer(1, exit_sg, exit_layer);
+            const size_t next_sg = exit_sg + 1;
+            ggml_cgraph * tail_graph =
+                backend_ctx->backend_configs[1].cgraphs[exit_sg].cgraph_main;
+            ggml_tensor * terminal =
+                tail_graph != nullptr && tail_graph->n_nodes > 0 ?
+                    tail_graph->nodes[tail_graph->n_nodes - 1] : nullptr;
+            bool residual_in_single_sg = phone_block_fused;
+            if (!phone_block_fused && tail_graph != nullptr) {
+                for (int k = 0; k < tail_graph->n_nodes; ++k) {
+                    residual_in_single_sg |= tail_graph->nodes[k] == residual;
+                }
+            }
+            char l_out_name[64];
+            std::snprintf(l_out_name, sizeof(l_out_name),
+                          "l_out-%d", exit_layer);
+            ggml_tensor * dst_l_out = exit_layer >= 0 ?
+                find_exact_named_tensor(0, l_out_name) : nullptr;
+
+            // Match precisely the legacy Phone-owner exit, not the l_out
+            // bridge which already contains a complete residual result.
+            // The older fused-block exit may defer to an already-final
+            // l_out bridge. A single SG does NOT take that deferral path;
+            // its original specialized_communication() runs its own ADD
+            // even when a subsequent exact l_out bridge is present.
+            const bool existing_l_out =
+                phone_block_fused &&
+                next_sg < backend_ctx->n_subgraphs &&
+                subgraph_is_exact_l_out_bridge(next_sg, exit_layer);
+            const bool continues_on_phone =
+                next_sg < backend_ctx->n_subgraphs &&
+                subgraph_will_execute_phone(next_sg);
+            const bool pc_exit =
+                next_sg >= backend_ctx->n_subgraphs ||
                 subgraph_is_prefill_pc_only(next_sg) ||
                 subgraph_is_decode_pc_only_norm(next_sg) ||
                 has_layer_output_producer(0, next_sg, exit_layer);
