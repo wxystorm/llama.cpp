@@ -8021,6 +8021,82 @@ void rpc_server::phone_stage_binding_preflight(
     plan.output_kind =
         std::strstr(last->name, "result") != nullptr ? 1 : 0;
     plan.topology_signature = structural_sig;
+
+    // Capacity-only audit. Scratch allocation undercounts aliases to the
+    // Stage input and final output (observed: 15,990,784 scratch bytes but
+    // 17,368,320 bytes of actual 64-token Stage address span). A safe
+    // future relocation must preserve every tensor's existing offset in
+    // the original activation arena, including these input/output aliases.
+    //
+    // The model weight arena and KV cache are never part of this span.
+    // If graph input and output do not share a single original backend
+    // buffer, fail closed: a multi-buffer binding layout is not yet defined.
+    const ggml_backend_buffer_t stage_buffer = graph->nodes[0]->buffer;
+    if (stage_buffer == nullptr || last->buffer != stage_buffer) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+            "layer=%d tokens=%u reason=MULTI_OR_NULL_STAGE_BUFFER "
+            "status=SAFE\n",
+            first_layer, plan.tokens);
+        return;
+    }
+    const size_t stage_buffer_base = reinterpret_cast<size_t>(
+        ggml_backend_buffer_get_base(stage_buffer));
+    const size_t stage_buffer_bytes =
+        ggml_backend_buffer_get_size(stage_buffer);
+    size_t stage_first = SIZE_MAX;
+    size_t stage_last = 0;
+    size_t stage_tensor_count = 0;
+    size_t stage_kv_ops = 0;
+    size_t stage_quant_weights = 0;
+    bool stage_bounds_ok = stage_buffer_bytes != 0;
+    for (const ggml_tensor * t : visited) {
+        if (t == nullptr || t->buffer != stage_buffer ||
+            t->data == nullptr || ggml_is_empty(t)) {
+            continue;
+        }
+        ++stage_tensor_count;
+        if (t->op == GGML_OP_SET_ROWS) {
+            ++stage_kv_ops;
+        }
+        if (t->op == GGML_OP_NONE &&
+            (t->type == GGML_TYPE_Q4_K ||
+             t->type == GGML_TYPE_Q5_K ||
+             t->type == GGML_TYPE_Q6_K)) {
+            ++stage_quant_weights;
+        }
+        const size_t address = reinterpret_cast<size_t>(t->data);
+        const size_t bytes = std::max(
+            ggml_nbytes(t),
+            ggml_backend_buffer_get_alloc_size(stage_buffer, t));
+        if (address < stage_buffer_base ||
+            bytes > stage_buffer_bytes ||
+            address - stage_buffer_base > stage_buffer_bytes - bytes) {
+            stage_bounds_ok = false;
+            break;
+        }
+        const size_t offset = address - stage_buffer_base;
+        stage_first = std::min(stage_first, offset);
+        stage_last = std::max(stage_last, offset + bytes);
+    }
+    if (!stage_bounds_ok || stage_tensor_count == 0 ||
+        stage_first == SIZE_MAX || stage_kv_ops != 0 ||
+        stage_quant_weights != 0 || stage_last == 0) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+            "layer=%d tokens=%u reason=INVALID_STAGE_SPAN "
+            "bounds_ok=%d stage_tensors=%zu kv_ops=%zu "
+            "quant_weights=%zu status=SAFE\n",
+            first_layer, plan.tokens, stage_bounds_ok ? 1 : 0,
+            stage_tensor_count, stage_kv_ops, stage_quant_weights);
+        return;
+    }
+    // Use the original buffer-relative END offset, not (end-start).
+    // This preserves original tensor offsets if the activation arena begins
+    // after a reserved prefix; capacity is deliberately an upper bound.
+    plan.stage_arena_required_bytes = stage_last;
+    const size_t stage_used_span = stage_last - stage_first;
+
     const auto status = plan.scratch.build(transient, {});
     if (status != ggml_phone_stage::status::ok ||
         transient.empty() || !plan.tokens) {
