@@ -20987,10 +20987,46 @@ auto prefill_norm_sg_has_prework =
                             }
                             kept_internal_partial |=
                                 can_keep_phone_partial;
+                            // Final-layer output selection can leave a
+                            // nine-node Phone-only FFN tail after Attention:
+                            // GET_ROWS(attn_out-L), GET_ROWS(residual),
+                            // ffn_inp-L, norm-L, ... , FFN down. This norm-L
+                            // is a same-layer FFN norm, not the start of the
+                            // next transformer layer. Accept it ONLY when
+                            // the exact Phone-owned, single-output topology
+                            // and the Attention dependency are proven.
+                            // All other norm/result markers remain barriers.
+                            int same_norm_layer = -1;
+                            int same_norm_chars = 0;
+                            char expected_ffn_inp[64];
+                            std::snprintf(expected_ffn_inp,
+                                sizeof(expected_ffn_inp),
+                                "ffn_inp-%d", first_layer);
+                            const bool same_layer_final_ffn_norm =
+                                sg == next_sg && phone->n_nodes == 9 &&
+                                k == 3 && t->op == GGML_OP_RMS_NORM &&
+                                t->ne[1] == 1 &&
+                                phone_compute && pc_compute &&
+                                std::sscanf(t->name, "norm-%d%n",
+                                    &same_norm_layer, &same_norm_chars) == 1 &&
+                                t->name[same_norm_chars] == '\0' &&
+                                same_norm_layer == first_layer &&
+                                subgraph_is_phone_only(next_sg) &&
+                                phone->nodes[0]->op == GGML_OP_GET_ROWS &&
+                                phone->nodes[1]->op == GGML_OP_GET_ROWS &&
+                                phone->nodes[0]->src[0] == attn_output &&
+                                phone->nodes[2]->op == GGML_OP_ADD &&
+                                std::strcmp(phone->nodes[2]->name,
+                                    expected_ffn_inp) == 0 &&
+                                phone->nodes[2]->src[0] == phone->nodes[0] &&
+                                phone->nodes[2]->src[1] == phone->nodes[1] &&
+                                t->src[0] == phone->nodes[2] &&
+                                t->src[1] == nullptr;
                             if (sg == next_sg &&
                                     (std::strncmp(t->name, "result_", 7) == 0 ||
                                      std::strncmp(t->name, "norm-", 5) == 0 ||
-                                     std::strncmp(t->name, "attn_norm-", 10) == 0)) {
+                                     std::strncmp(t->name, "attn_norm-", 10) == 0) &&
+                                    !same_layer_final_ffn_norm) {
                                 // A norm-L in the second SG may be a
                                 // same-layer dependency/mirror rather than
                                 // proof of a new layer. Diagnose its actual
@@ -21268,7 +21304,9 @@ auto prefill_norm_sg_has_prework =
                 "uid=%" PRIu64 " rpc_graphs=1 status=OK\n",
                 full_region_graph_has_l_out ? "TERMINAL_L_OUT" : "PHONE_LOCAL",
                 i, full_region_graph_end, phone_block_end,
-                phone_block_last_layer, phone_graph->n_nodes, phone_graph->uid);
+                full_region_graph_has_l_out ?
+                    phone_block_last_layer : first_fused_layer,
+                phone_graph->n_nodes, phone_graph->uid);
         }
         if (phone_region_fused) {
             phone_region_graph_build_us =
