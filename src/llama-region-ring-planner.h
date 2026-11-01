@@ -619,6 +619,9 @@ struct edge {
     // A single Phone Full frame may satisfy several smaller PC Chunks.
     // All consumers are released at the SAME frame-receive completion event.
     std::vector<int> extra_consumers;
+    // Synchronous legacy GET returns from the Phone worker; unlike Arena
+    // Stream, it keeps that worker occupied until the full TCP frame arrives.
+    bool release_phone_worker_on_complete = false;
 };
 enum class event_kind : uint8_t {
     TASK = 0,
@@ -781,17 +784,26 @@ inline bool simulate(const model & m,
                     by_region[r].size() : by_region[r + 1].size());
         }
 
-        // The new Phone Full return does NOT transfer one packet per token
-        // intersection. The Phone captures [begin,end) as one immutable Arena
-        // slab, and a single Sender sends ONE full-frame TCP payload. Only
-        // after PC Receiver receives the complete payload does the runtime
-        // complete_deferred() and publish ALL intersecting PC dependencies.
-        // The final Phone Region has no outgoing edge, hence no P2C frame.
-        const bool whole_phone_frame =
-            m.phone_full_return_stream &&
+        // Cross-backend transfers are charged at the actual materialization
+        // granularity, NOT once per producer/consumer token intersection.
+        //
+        //  * Phone->PC GET: one complete producer Phone Chunk, which can
+        //    release several smaller consumer Chunks after one receive.
+        //  * GPU->CPU GET: likewise one producer GPU Chunk staged to host.
+        //  * PC->Phone SET / CPU->GPU SET: one destination Chunk; all
+        //    overlapping producers must have written their host output.
+        //
+        // The Phone Arena Stream and legacy synchronous GET have the same
+        // frame/byte count, but different worker ownership while receiving.
+        const bool phone_output =
             regions[r].kind == llama_region_ring_stage_kind::PHONE &&
             a == device::PHONE && b != device::PHONE;
-        if (whole_phone_frame) {
+        const bool source_frame =
+            phone_output || (a == device::GPU && b == device::CPU);
+        const bool destination_frame =
+            (a != b && b == device::PHONE) ||
+            (a == device::CPU && b == device::GPU);
+        if (source_frame) {
             size_t di = 0;
             for (const int src : by_region[r]) {
                 const auto & producer = tasks[(size_t) src];
@@ -806,13 +818,14 @@ inline bool simulate(const model & m,
                 double ms = 0.0;
                 if (!m.transfer_ms(a, b, bytes, ms) ||
                         !std::isfinite(ms) || ms < 0.0) {
-                    return reject("STREAM_FRAME_TRANSFER_PROFILE_MISSING");
+                    return reject("SOURCE_FRAME_TRANSFER_PROFILE_MISSING");
                 }
-
                 edge frame;
                 frame.producer = src;
                 frame.lane = lane;
                 frame.duration = ms;
+                frame.release_phone_worker_on_complete =
+                    phone_output && !m.phone_full_return_stream;
                 for (size_t j = di; j < by_region[r + 1].size(); ++j) {
                     const int dst = by_region[r + 1][j];
                     const auto & consumer = tasks[(size_t) dst];
@@ -831,7 +844,7 @@ inline bool simulate(const model & m,
                     ++tasks[(size_t) dst].inputs;
                 }
                 if (frame.consumer < 0) {
-                    return reject("STREAM_FRAME_WITHOUT_CONSUMER");
+                    return reject("SOURCE_FRAME_WITHOUT_CONSUMER");
                 }
                 const int edge_id = (int) edges.size();
                 edges.push_back(std::move(frame));
@@ -839,14 +852,61 @@ inline bool simulate(const model & m,
                 ++c.transfer_event_count[direction];
                 c.transfer_service_ms[direction] += ms;
                 c.transfer_payload_bytes[direction] += (uint64_t) bytes;
-                ++c.phone_full_stream_frames;
-                c.phone_full_stream_bytes += (uint64_t) bytes;
+                if (phone_output && m.phone_full_return_stream) {
+                    ++c.phone_full_stream_frames;
+                    c.phone_full_stream_bytes += (uint64_t) bytes;
+                }
             }
             continue;
         }
 
-        // Legacy GET / other boundaries: transfer each actual intersecting
-        // token interval. This is intentionally unchanged with Stream off.
+        if (destination_frame) {
+            size_t si = 0;
+            for (const int dst : by_region[r + 1]) {
+                const auto & consumer = tasks[(size_t) dst];
+                while (si < by_region[r].size() &&
+                        tasks[(size_t) by_region[r][si]].end <=
+                            consumer.begin) {
+                    ++si;
+                }
+                int last_src = -1;
+                for (size_t j = si; j < by_region[r].size(); ++j) {
+                    const int src = by_region[r][j];
+                    const auto & producer = tasks[(size_t) src];
+                    if (producer.begin >= consumer.end) {
+                        break;
+                    }
+                    if (producer.end > consumer.begin) {
+                        // Intra-region Chunk FIFO ensures every earlier
+                        // overlapping producer has completed by last_src.
+                        last_src = src;
+                    }
+                }
+                if (last_src < 0) {
+                    return reject("DESTINATION_FRAME_WITHOUT_PRODUCER");
+                }
+                const size_t bytes =
+                    (size_t) (consumer.end - consumer.begin) *
+                    (size_t) m.hidden * sizeof(float);
+                double ms = 0.0;
+                if (!m.transfer_ms(a, b, bytes, ms) ||
+                        !std::isfinite(ms) || ms < 0.0) {
+                    return reject("DESTINATION_FRAME_TRANSFER_PROFILE_MISSING");
+                }
+                const int edge_id = (int) edges.size();
+                edges.push_back({last_src, dst, lane, ms});
+                outgoing_edges[(size_t) last_src].push_back(edge_id);
+                ++tasks[(size_t) last_src].outputs;
+                ++tasks[(size_t) dst].inputs;
+                ++c.transfer_event_count[direction];
+                c.transfer_service_ms[direction] += ms;
+                c.transfer_payload_bytes[direction] += (uint64_t) bytes;
+            }
+            continue;
+        }
+
+        // Same-owner and directional-only boundaries retain exact token
+        // intersections, but do NOT represent additional network packets.
         size_t si = 0;
         size_t di = 0;
         while (si < by_region[r].size() &&
