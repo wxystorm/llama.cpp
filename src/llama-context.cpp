@@ -7548,7 +7548,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ring_runtime_regions);
         const bool selected_single_cycle =
             apply_wide && !selected_directional &&
-            llama_region_ring_single_cycle_topology_compatible(
+            llama_region_ring_single_cycle_force_compatible(
                 ring_runtime_regions, model.hparams.n_layer());
         const bool selected_topology_ok =
             selected_directional ?
