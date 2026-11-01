@@ -204,6 +204,29 @@ int main() {
         REQUIRE(forced_three.weight_h2d_startup_ms == 0.0);
         REQUIRE(forced_three.weight_h2d_exposed_ms == 0.0);
 
+        // H2D curve is optional when there are at most two GPU Regions.
+        // It remains mandatory for an actual rank2+ rolling replacement.
+        single_model.gpu_weight_h2d_ms = {};
+        REQUIRE(gpu_weight_h2d_total(
+            single_model, single, prompt_h2d));
+        REQUIRE(prompt_h2d == 0.0);
+        REQUIRE(simulate(single_model, single, forced_three));
+        REQUIRE(forced_three.weight_h2d_busy_ms == 0.0);
+
+        const auto three_gpu_regions = llama_region_ring_parse(
+            "G5,C2,P5,G5,C2,P5,G10,C2,P4", 40);
+        REQUIRE(!gpu_weight_h2d_total(
+            single_model, three_gpu_regions, prompt_h2d));
+        candidate rolling_without_profile;
+        rolling_without_profile.xc = 64;
+        rolling_without_profile.xg = 64;
+        rolling_without_profile.xp = 64;
+        std::string missing_weight_profile;
+        REQUIRE(!simulate(
+            single_model, three_gpu_regions,
+            rolling_without_profile, &missing_weight_profile));
+        REQUIRE(missing_weight_profile == "WEIGHT_PROFILE_MISSING");
+
         std::array<size_t, 2> no_gpu_bank_peaks {};
         REQUIRE(gpu_weight_bank_peaks(
             single_model, no_gpu, no_gpu_bank_peaks));
