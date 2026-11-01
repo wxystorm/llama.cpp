@@ -433,6 +433,146 @@ inline std::vector<llama_region_ring_region> llama_region_ring_parse(
     return regions;
 }
 
+// APPLY_WIDE forced A/B may deliberately test one non-repeating G/C/P pass.
+// Keep the legacy parser strict for fixed layouts and automatic Planner
+// candidates; only this helper accepts a single logical Cycle. Zero-count
+// stages are syntax-only and are omitted from the executable Region list so
+// no scheduler/profile path ever sees a zero-length Region.
+inline std::vector<llama_region_ring_region>
+llama_region_ring_parse_single_cycle_force(
+        const std::string & spec, int n_layer) {
+    if (n_layer <= 0) {
+        throw std::runtime_error(
+            "single-cycle region ring requires a positive layer count");
+    }
+
+    size_t pos = 0;
+    int layer = 0;
+    std::vector<llama_region_ring_region> regions;
+    const std::array<std::pair<char, llama_region_ring_device>, 3> stages {{
+        {'G', llama_region_ring_device::GPU},
+        {'C', llama_region_ring_device::CPU},
+        {'P', llama_region_ring_device::PHONE},
+    }};
+
+    auto skip_ws = [&]() {
+        while (pos < spec.size() &&
+               std::isspace((unsigned char) spec[pos])) {
+            ++pos;
+        }
+    };
+
+    for (size_t i = 0; i < stages.size(); ++i) {
+        skip_ws();
+        if (pos >= spec.size() || spec[pos] != stages[i].first) {
+            throw std::runtime_error(
+                "single-cycle force layout must be exactly G#,C#,P#");
+        }
+        ++pos;
+
+        const size_t num_begin = pos;
+        int count = 0;
+        while (pos < spec.size() &&
+               std::isdigit((unsigned char) spec[pos])) {
+            count = count * 10 + (spec[pos++] - '0');
+            if (count > n_layer) {
+                throw std::runtime_error(
+                    "single-cycle force layout layer count overflow");
+            }
+        }
+        if (num_begin == pos || layer + count > n_layer) {
+            throw std::runtime_error(
+                "invalid single-cycle force layout layer count");
+        }
+
+        if (count > 0) {
+            regions.emplace_back(
+                stages[i].second, layer, layer + count);
+        }
+        layer += count;
+
+        skip_ws();
+        if (i + 1 < stages.size()) {
+            if (pos >= spec.size() || spec[pos] != ',') {
+                throw std::runtime_error(
+                    "single-cycle force layout must be exactly G#,C#,P#");
+            }
+            ++pos;
+        }
+    }
+
+    skip_ws();
+    if (pos != spec.size()) {
+        throw std::runtime_error(
+            "single-cycle force layout must be exactly G#,C#,P#");
+    }
+    if (layer != n_layer || regions.empty()) {
+        throw std::runtime_error(
+            "single-cycle force layout must cover every layer exactly once");
+    }
+    return regions;
+}
+
+// Executable topology for a single logical G/C/P Cycle after zero-count
+// stages have been omitted. The remaining devices must be an ordered
+// subsequence of GPU -> CPU -> Phone and cover the model exactly once.
+inline bool llama_region_ring_single_cycle_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer) {
+    if (regions.empty() || regions.size() > 3 ||
+            n_layer <= 0 || regions.front().layer_begin != 0 ||
+            regions.back().layer_end != n_layer ||
+            llama_region_ring_has_directional_stages(regions)) {
+        return false;
+    }
+
+    const std::array<llama_region_ring_device, 3> order = {
+        llama_region_ring_device::GPU,
+        llama_region_ring_device::CPU,
+        llama_region_ring_device::PHONE,
+    };
+    int previous_rank = -1;
+    int next_layer = 0;
+    for (const auto & r : regions) {
+        int rank = -1;
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (r.device == order[i]) {
+                rank = (int) i;
+                break;
+            }
+        }
+        if (rank <= previous_rank ||
+                r.layer_begin != next_layer ||
+                r.layer_end <= r.layer_begin ||
+                r.layer_end > n_layer) {
+            return false;
+        }
+        previous_rank = rank;
+        next_layer = r.layer_end;
+    }
+    return next_layer == n_layer;
+}
+
+// Parse a model-owned APPLY_WIDE layout. Normal multi-Cycle layouts keep the
+// legacy strict parser; only a failed strict parse gets the single-Cycle A/B
+// fallback above.
+inline std::vector<llama_region_ring_region>
+llama_region_ring_parse_apply_wide_layout(
+        const std::string & spec, int n_layer) {
+    try {
+        return llama_region_ring_parse(spec, n_layer);
+    } catch (const std::exception & strict_error) {
+        try {
+            return llama_region_ring_parse_single_cycle_force(
+                spec, n_layer);
+        } catch (const std::exception & single_error) {
+            throw std::runtime_error(
+                std::string(strict_error.what()) +
+                "; single-cycle override: " + single_error.what());
+        }
+    }
+}
+
 // Enforce the general Plan contract before allocating any weights. The
 // legacy parser intentionally remains strict unless allow_pc_tail is set.
 inline bool llama_region_ring_apply_topology_compatible(
