@@ -232,6 +232,22 @@ int main() {
             single_model, no_gpu, no_gpu_bank_peaks));
         REQUIRE(no_gpu_bank_peaks[0] == 0);
         REQUIRE(no_gpu_bank_peaks[1] == 0);
+
+        // With G0 there is no CUDA weight bank at all: no GPU weight-size
+        // callback or H2D curve may be required by a forced CPU->Phone DAG.
+        model zero_gpu_profile = single_model;
+        zero_gpu_profile.gpu_region_weight_bytes = {};
+        REQUIRE(gpu_weight_bank_peaks(
+            zero_gpu_profile, no_gpu, no_gpu_bank_peaks));
+        REQUIRE(no_gpu_bank_peaks[0] == 0);
+        REQUIRE(no_gpu_bank_peaks[1] == 0);
+        candidate zero_gpu_plan;
+        zero_gpu_plan.cycles = 1;
+        zero_gpu_plan.xc = zero_gpu_plan.xg = zero_gpu_plan.xp = 64;
+        zero_gpu_plan.concrete_regions = no_gpu;
+        REQUIRE(simulate(zero_gpu_profile, no_gpu, zero_gpu_plan));
+        REQUIRE(zero_gpu_plan.tasks == 12);
+        REQUIRE(zero_gpu_plan.weight_h2d_busy_ms == 0.0);
     }
 
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
