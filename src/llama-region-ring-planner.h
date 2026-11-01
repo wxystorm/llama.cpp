@@ -76,6 +76,16 @@ struct candidate {
     double phone_link_ms_per_token = 0.0;
     double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
+    // Read-only diagnostics: [PC_LOCAL, PC_TO_PHONE, PHONE_TO_PC].
+    // The current DAG charges one transfer per overlapping token interval,
+    // except when Phone Full Arena Stream publishes one frame per producer.
+    // A real outer-stage transfer happens once per output GET or input SET,
+    // not necessarily once per consumer/producer intersection. Keep both
+    // counts visible without silently changing Planner ranking.
+    std::array<int, 3> transfer_event_count {};
+    std::array<int, 3> stage_copy_call_proxy_count {};
+    std::array<double, 3> transfer_service_ms {};
+    std::array<uint64_t, 3> transfer_payload_bytes {};
     // Shared host-side graph/split preparation lane. This is service time,
     // not lock wait; queueing is reconstructed by simulate().
     double prepare_busy_ms = 0.0;
@@ -654,6 +664,10 @@ inline bool simulate(const model & m,
     }
     c.phone_full_stream_frames = 0;
     c.phone_full_stream_bytes = 0;
+    c.transfer_event_count = {};
+    c.stage_copy_call_proxy_count = {};
+    c.transfer_service_ms = {};
+    c.transfer_payload_bytes = {};
 
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
@@ -751,6 +765,20 @@ inline bool simulate(const model & m,
         const int lane = a == device::PHONE ?
             (m.shared_phone_link ? 1 : 2) :
             b == device::PHONE ? 1 : 0;
+        // Direction identity is independent of physical lane sharing.
+        const size_t direction = a == device::PHONE ? 2 :
+            b == device::PHONE ? 1 : 0;
+        if (a != b) {
+            // Comparison basis, not a corrected transport prediction:
+            // PHONE and GPU stage outputs are materialized once per
+            // producing chunk; input SET happens once per destination chunk.
+            // Internal Meta subgraph transfers are not represented here.
+            const bool source_owned_copy =
+                a == device::PHONE || a == device::GPU;
+            c.stage_copy_call_proxy_count[direction] +=
+                (int) (source_owned_copy ?
+                    by_region[r].size() : by_region[r + 1].size());
+        }
 
         // The new Phone Full return does NOT transfer one packet per token
         // intersection. The Phone captures [begin,end) as one immutable Arena
@@ -807,6 +835,9 @@ inline bool simulate(const model & m,
                 const int edge_id = (int) edges.size();
                 edges.push_back(std::move(frame));
                 outgoing_edges[(size_t) src].push_back(edge_id);
+                ++c.transfer_event_count[direction];
+                c.transfer_service_ms[direction] += ms;
+                c.transfer_payload_bytes[direction] += (uint64_t) bytes;
                 ++c.phone_full_stream_frames;
                 c.phone_full_stream_bytes += (uint64_t) bytes;
             }
@@ -840,6 +871,11 @@ inline bool simulate(const model & m,
                 const int edge_id = (int) edges.size();
                 edges.push_back({src, dst, lane, ms});
                 outgoing_edges[(size_t) src].push_back(edge_id);
+                if (a != b) {
+                    ++c.transfer_event_count[direction];
+                    c.transfer_service_ms[direction] += ms;
+                    c.transfer_payload_bytes[direction] += (uint64_t) bytes;
+                }
                 ++tasks[(size_t) src].outputs;
                 ++tasks[(size_t) dst].inputs;
             }
