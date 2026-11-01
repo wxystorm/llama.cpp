@@ -20909,12 +20909,58 @@ auto prefill_norm_sg_has_prework =
                                 ggml_backend_meta_get_split_state(
                                     outer, false).axis ==
                                     GGML_BACKEND_SPLIT_AXIS_PARTIAL;
-                            if ((t->flags &
+                            const bool directional =
+                                ((outer->flags | t->flags) &
                                  (GGML_TENSOR_FLAG_META_SEND_READY |
-                                  GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0 ||
-                                    partial) {
-                                reject_reason = "DIRECTIONAL_OR_PARTIAL_NODE";
+                                  GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0;
+                            if (directional) {
+                                reject_reason = "DIRECTIONAL_NODE";
                                 break;
+                            }
+
+                            // A PARTIAL Meta marker normally ends a SG to
+                            // allow a reduction.  There is one safe internal
+                            // Phone-only case: attn_out-L is the terminal
+                            // node of the first SG, the next SG is the same
+                            // Phone Full layer, and the legacy Meta
+                            // communication would take META_KEEP_PHONE
+                            // instead of a cross-backend reduce/copy.
+                            //
+                            // Do NOT generalize this to other PARTIAL nodes:
+                            // those may require a real PC contribution.
+                            int attn_layer = -1;
+                            int parsed_attn = 0;
+                            const bool is_terminal_attention =
+                                sg == i && k == phone->n_nodes - 1 &&
+                                std::sscanf(
+                                    t->name, "attn_out-%d%n",
+                                    &attn_layer, &parsed_attn) == 1 &&
+                                t->name[parsed_attn] == '\0' &&
+                                attn_layer == first_layer &&
+                                t->ne[1] > 1;
+                            const bool can_keep_phone_partial =
+                                partial && is_terminal_attention &&
+                                phone_compute && !pc_compute &&
+                                subgraph_is_phone_only(i) &&
+                                subgraph_is_phone_only(next_sg) &&
+                                !subgraph_will_execute_pc(next_sg) &&
+                                subgraph_will_execute_phone(next_sg) &&
+                                !ggml_backend_meta_tensor_c2p_layer(
+                                    backend_ctx, first_layer) &&
+                                !ggml_backend_meta_tensor_p2c_layer(
+                                    backend_ctx, first_layer) &&
+                                !layer_is_tensor_phone_primary(first_layer);
+                            if (partial && !can_keep_phone_partial) {
+                                reject_reason = "PARTIAL_REQUIRES_BOUNDARY";
+                                break;
+                            }
+                            if (can_keep_phone_partial) {
+                                GGML_LOG_INFO(
+                                    "[PHONE_FULL_REGION_GRAPH] "
+                                    "event=KEEP_PHONE_PARTIAL sg=%zu "
+                                    "layer=%d node=%s next_sg=%zu "
+                                    "action=SKIP_INTERNAL_REDUCE status=OK\n",
+                                    sg, first_layer, t->name, next_sg);
                             }
                             if (sg == next_sg &&
                                     (std::strncmp(t->name, "result_", 7) == 0 ||
