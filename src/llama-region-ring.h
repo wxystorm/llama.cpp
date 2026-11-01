@@ -550,10 +550,53 @@ inline bool llama_region_ring_apply_safe_phone_shape(
     return true;
 }
 
+// Convert the implicit model-aware directional baseline into a pure Full
+// G/C/P ring when Phone Full Arena Stream is enabled. C2P starts on the CPU
+// and P2C starts on the Phone: assign those one-layer handoffs to their input
+// owner, then merge adjoining Full stages. The original default remains
+// unchanged for legacy GET and Tensor experiments.
+inline std::vector<llama_region_ring_region>
+llama_region_ring_full_only_baseline(
+        const std::vector<llama_region_ring_region> & original,
+        int n_layer) {
+    if (!llama_region_ring_has_directional_stages(original)) {
+        return original;
+    }
+    std::vector<llama_region_ring_region> full;
+    for (const auto & region : original) {
+        const auto owner =
+            region.kind == llama_region_ring_stage_kind::C2P ?
+                llama_region_ring_device::CPU :
+            region.kind == llama_region_ring_stage_kind::P2C ?
+                llama_region_ring_device::PHONE : region.device;
+        if (!full.empty() && full.back().device == owner) {
+            full.back().layer_end = region.layer_end;
+        } else {
+            full.emplace_back(owner, region.layer_begin, region.layer_end);
+        }
+    }
+    if (!llama_region_ring_apply_topology_compatible(full, n_layer)) {
+        throw std::runtime_error(
+            "cannot convert directional baseline to a Full-only ring");
+    }
+    return full;
+}
+
 inline std::vector<llama_region_ring_region> llama_region_ring_from_env(
         int n_layer) {
     const char * spec = std::getenv("LLAMA_HYBRID_REGION_RING_LAYOUT");
-    return llama_region_ring_parse(spec != nullptr ? spec : "", n_layer);
+    const bool explicit_layout = spec != nullptr && *spec != '\0';
+    const auto regions = llama_region_ring_parse(
+        explicit_layout ? spec : "", n_layer);
+    // Only adapt the implicit default. Never silently change an explicit
+    // directional layout chosen by the user.
+    const char * stream = std::getenv(
+        "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
+    if (!explicit_layout && stream != nullptr && std::atoi(stream) != 0 &&
+            llama_region_ring_has_directional_stages(regions)) {
+        return llama_region_ring_full_only_baseline(regions, n_layer);
+    }
+    return regions;
 }
 
 inline std::array<int, 3> llama_region_ring_layer_counts(
