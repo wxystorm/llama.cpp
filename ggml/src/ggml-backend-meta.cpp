@@ -20954,7 +20954,52 @@ auto prefill_norm_sg_has_prework =
                                 !ggml_backend_meta_tensor_p2c_layer(
                                     backend_ctx, first_layer) &&
                                 !layer_is_tensor_phone_primary(first_layer);
-                            if (partial && !can_keep_phone_partial) {
+                            // The final one-token Phone-only FFN down
+                            // can also carry a PARTIAL Meta split marker.
+                            // Unlike an intermediate PARTIAL, this is the
+                            // original SG exit: the legacy Meta communication
+                            // at next_sg is still invoked after the fused
+                            // Phone graph and must handle any real handoff.
+                            // Never skip a directional or Tensor boundary.
+                            char expected_down_weight[64];
+                            char expected_swiglu[64];
+                            std::snprintf(expected_down_weight,
+                                sizeof(expected_down_weight),
+                                "blk.%d.ffn_down.weight", first_layer);
+                            std::snprintf(expected_swiglu,
+                                sizeof(expected_swiglu),
+                                "ffn_swiglu-%d", first_layer);
+                            const bool defer_terminal_phone_partial =
+                                partial && sg == next_sg &&
+                                phone->n_nodes == 9 &&
+                                k == phone->n_nodes - 1 &&
+                                t->ne[1] == 1 &&
+                                t->op == GGML_OP_MUL_MAT &&
+                                phone_compute && !pc_compute &&
+                                subgraph_is_phone_only(next_sg) &&
+                                !subgraph_will_execute_pc(next_sg) &&
+                                subgraph_will_execute_phone(next_sg) &&
+                                t->src[0] != nullptr &&
+                                t->src[1] == phone->nodes[7] &&
+                                std::strcmp(t->src[0]->name,
+                                    expected_down_weight) == 0 &&
+                                std::strcmp(phone->nodes[7]->name,
+                                    expected_swiglu) == 0 &&
+                                !ggml_backend_meta_tensor_c2p_layer(
+                                    backend_ctx, first_layer) &&
+                                !ggml_backend_meta_tensor_p2c_layer(
+                                    backend_ctx, first_layer) &&
+                                !layer_is_tensor_phone_primary(first_layer);
+                            if (defer_terminal_phone_partial) {
+                                GGML_LOG_INFO(
+                                    "[PHONE_FULL_REGION_GRAPH] "
+                                    "event=TERMINAL_PARTIAL_DEFER "
+                                    "layer=%d sg=%zu node=%s "
+                                    "action=KEEP_LEGACY_META_EXIT status=OK\n",
+                                    first_layer, sg, t->name);
+                            }
+                            if (partial && !can_keep_phone_partial &&
+                                    !defer_terminal_phone_partial) {
                                 // Diagnostic only: identify which safety
                                 // predicate rejected this Phone-local PARTIAL.
                                 // Never relax a Reduce/handoff on a guess.
@@ -20986,7 +21031,8 @@ auto prefill_norm_sg_has_prework =
                                 break;
                             }
                             kept_internal_partial |=
-                                can_keep_phone_partial;
+                                can_keep_phone_partial ||
+                                defer_terminal_phone_partial;
                             // Final-layer output selection can leave a
                             // nine-node Phone-only FFN tail after Attention:
                             // GET_ROWS(attn_out-L), GET_ROWS(residual),
