@@ -169,6 +169,44 @@ int main() {
         REQUIRE(llama_region_ring_gpu_initial_bank_count(2) == 2);
         REQUIRE(llama_region_ring_gpu_initial_bank_count(4) == 2);
 
+        // Reproduce the two-token warmup -> 358-token prefill failure:
+        // demand-loaded Bank A (region 0) and Bank B (region 3) are
+        // truly resident even when the separate preload flag is stale.
+        // Residency must be determined from the Bank state itself.
+        {
+            const std::vector<size_t> gpu_order {0, 3, 6};
+            std::array<bool, 2> bank_ready {{false, false}};
+            std::array<size_t, 2> bank_owner {{
+                std::numeric_limits<size_t>::max(),
+                std::numeric_limits<size_t>::max()
+            }};
+            REQUIRE(!llama_region_ring_gpu_initial_banks_match(
+                gpu_order, bank_ready, bank_owner));
+            bank_ready[0] = true;
+            bank_owner[0] = 0;
+            REQUIRE(!llama_region_ring_gpu_initial_banks_match(
+                gpu_order, bank_ready, bank_owner));
+            bank_ready[1] = true;
+            bank_owner[1] = 3;
+            REQUIRE(llama_region_ring_gpu_initial_banks_match(
+                gpu_order, bank_ready, bank_owner));
+            // A third GPU region overwrites A: the next formal prefill
+            // MUST reject/reload rather than trusting a stale true flag.
+            bank_owner[0] = 6;
+            REQUIRE(!llama_region_ring_gpu_initial_banks_match(
+                gpu_order, bank_ready, bank_owner));
+            bank_owner[0] = 0;
+            bank_ready[1] = false;
+            REQUIRE(!llama_region_ring_gpu_initial_banks_match(
+                gpu_order, bank_ready, bank_owner));
+            const std::vector<size_t> one_gpu {0};
+            REQUIRE(llama_region_ring_gpu_initial_banks_match(
+                one_gpu, bank_ready, bank_owner));
+            const std::vector<size_t> no_gpu_regions;
+            REQUIRE(!llama_region_ring_gpu_initial_banks_match(
+                no_gpu_regions, bank_ready, bank_owner));
+        }
+
         // The first GPU Region of a single-Cycle plan is load-time
         // resident in Bank A. It must not contribute prompt H2D time.
         single_model.gpu_weight_streaming = true;
