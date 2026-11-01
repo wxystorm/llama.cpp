@@ -418,6 +418,31 @@ int main() {
         reason.clear();
         REQUIRE(!simulate(measured, pipeline, invalid, &reason));
         REQUIRE(reason == "INVALID_DUPLEX_LINK_MODEL");
+
+        // Asymmetric tail: a 64-token C2P input can overlap the final
+        // 32-token P2C producer, and must query DIFFERENT payload sizes
+        // for the two directional slowdown curves.
+        model asymmetric = independent;
+        asymmetric.tokens = 96;
+        asymmetric.duplex_phone_contention = true;
+        int asymmetric_queries = 0;
+        asymmetric.duplex_slowdown = [&](
+                size_t c2p_bytes, size_t p2c_bytes,
+                double & c2p, double & p2c) {
+            if (c2p_bytes != p2c_bytes) {
+                ++asymmetric_queries;
+            }
+            c2p = 1.3;
+            p2c = 1.2;
+            return true;
+        };
+        candidate asym;
+        asym.xp = 64;
+        asym.xc = 32;
+        asym.xg = 64;
+        REQUIRE(simulate(asymmetric, pipeline, asym, &reason));
+        REQUIRE(asym.duplex_overlap_ms > 0.0);
+        REQUIRE(asymmetric_queries > 0);
     }
 
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
