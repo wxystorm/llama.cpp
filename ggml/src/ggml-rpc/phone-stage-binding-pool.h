@@ -49,6 +49,18 @@ inline bool checked_align(size_t value, size_t align, size_t & dst) {
     return true;
 }
 
+// Treat malformed/wrapping ranges as an overlap: unknown ownership can
+// NEVER authorize relocating a scratch tensor over a live external tensor.
+inline bool may_overlap(size_t a, size_t a_bytes, size_t b, size_t b_bytes) {
+    if (!a_bytes || !b_bytes) { return false; }
+    size_t a_end, b_end;
+    if (!checked_add(a, a_bytes, a_end) ||
+        !checked_add(b, b_bytes, b_end)) {
+        return true;
+    }
+    return a < b_end && b < a_end;
+}
+
 // An immutable layout. Only *private, transient* compute roots are included;
 // weights, KV, graph inputs, outputs, persistent SET_ROWS and all their aliases
 // MUST be excluded by the registering runtime before calling build().
