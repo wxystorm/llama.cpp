@@ -7876,7 +7876,9 @@ void rpc_server::phone_stage_binding_preflight(
             protected_ranges.push_back({
                 t->buffer,
                 reinterpret_cast<size_t>(t->data),
-                ggml_nbytes(t)
+                std::max(ggml_nbytes(t),
+                         ggml_backend_buffer_get_alloc_size(
+                             t->buffer, t))
             });
         }
     };
@@ -7937,7 +7939,13 @@ void rpc_server::phone_stage_binding_preflight(
         }
         ++compute_roots;
         const size_t address = reinterpret_cast<size_t>(t->data);
-        const size_t bytes = ggml_nbytes(t);
+        const size_t bytes =
+            std::max(ggml_nbytes(t),
+                     ggml_backend_buffer_get_alloc_size(
+                         t->buffer, t));
+        const size_t alignment =
+            std::max<size_t>(1,
+                ggml_backend_buffer_get_alignment(t->buffer));
         bool shared = false;
         bool overlaps_external = false;
         for (const protected_range & range : protected_ranges) {
@@ -7971,7 +7979,7 @@ void rpc_server::phone_stage_binding_preflight(
         }
         transient.push_back({
             static_cast<uint32_t>(i + 1), bytes,
-            256, static_cast<uint32_t>(i), last_use});
+            alignment, static_cast<uint32_t>(i), last_use});
     }
     ggml_phone_stage::template_plan plan;
     const int64_t tokens = graph->nodes[0]->ne[1];
@@ -8017,7 +8025,9 @@ void rpc_server::phone_stage_binding_preflight(
         plans.push_back(std::move(plan));
     }
     auto & pool = phone_stage_slot_policy[device];
-    const auto reserved = pool.reserve(plans, 256);
+    const size_t pool_alignment =
+        std::max<size_t>(1, ggml_backend_get_alignment(backends[device]));
+    const auto reserved = pool.reserve(plans, pool_alignment);
     if (reserved == ggml_phone_stage::status::ok) {
         GGML_LOG_INFO(
             "[PHONE_STAGE_BINDING] event=PREFLIGHT "
