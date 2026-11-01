@@ -11189,14 +11189,16 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             gpu_regions.push_back(r);
         }
     }
-    if (gpu_regions.size() < 2 || xg <= 0) {
-        return false;
+    const size_t initial_banks =
+        llama_region_ring_gpu_initial_bank_count(gpu_regions.size());
+    if (initial_banks == 0 || xg <= 0) {
+        return false; // No GPU work: neither Bank is needed.
     }
 
     auto & bank_a = region_ring_worker_resources[1];
     auto & bank_b = region_ring_worker_resources[2];
     if (!bank_a.sched || !bank_a.res ||
-            !bank_b.sched || !bank_b.res ||
+            (initial_banks == 2 && (!bank_b.sched || !bank_b.res)) ||
             backend_ptrs.size() < 2 ||
             backend_ptrs[1] == nullptr) {
         LLAMA_LOG_ERROR(
@@ -11205,18 +11207,22 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false;
     }
 
-    // Idempotent ensure: repeated perf resets do not move weights when the
-    // fixed initial pair is already resident.
-    if (bank_a.bank_ready && bank_b.bank_ready &&
+    // Idempotent ensure: a forced single GPU Region needs only Bank A.
+    // The multi-Region path still primes exactly the first two Banks.
+    if (bank_a.bank_ready &&
             bank_a.bank_region == gpu_regions[0] &&
-            bank_b.bank_region == gpu_regions[1]) {
+            (initial_banks == 1 ||
+             (bank_b.bank_ready &&
+              bank_b.bank_region == gpu_regions[1]))) {
         region_ring_initial_banks_loaded = true;
-        LLAMA_LOG_ERROR(
+        LLAMA_LOG_INFO(
             "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
-            "region0=%zu region1=%zu bankA=1 bankB=1 "
+            "banks=%zu region0=%zu region1=%lld bankA=1 bankB=%d "
             "upload_mib=0.000 prepare_ms=0.000 h2d_ms=0.000 "
             "wall_ms=0.000 status=ALREADY_READY\n",
-            gpu_regions[0], gpu_regions[1]);
+            initial_banks, gpu_regions[0],
+            initial_banks == 2 ? (long long) gpu_regions[1] : -1LL,
+            initial_banks == 2 ? 1 : 0);
         return true;
     }
 
@@ -11432,7 +11438,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 
 
     // Reserve each Bank's peak future-region weight capacity before the
-    // initial pair of streamed GPU Regions is loaded. Rebinding Bank A from
+    // initial one or two GPU Regions are loaded. Rebinding Bank A from
     // G10 to G11 during prefill could otherwise resize/free its CUDA buffer
     // while Bank B computes. This phase allocates graphs but uploads NO weights.
     // The persistent weight cache survives ggml_backend_sched_reset().
@@ -11520,31 +11526,39 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 
     region_ring_initial_banks_loaded = false;
     const bool ok_a = load_one(0, bank_a);
-    const bool ok_b = ok_a && load_one(1, bank_b);
+    const bool ok_b = initial_banks == 1 ||
+        (ok_a && load_one(1, bank_b));
     region_ring_initial_banks_loaded =
         ok_a && ok_b &&
-        bank_a.bank_ready && bank_b.bank_ready &&
+        bank_a.bank_ready &&
         bank_a.bank_region == gpu_regions[0] &&
-        bank_b.bank_region == gpu_regions[1];
+        (initial_banks == 1 ||
+         (bank_b.bank_ready &&
+          bank_b.bank_region == gpu_regions[1]));
 
     LLAMA_LOG_ERROR(
         "[REGION_RING_GPU_BANK_PEAK_SUM] phase=LOAD_TIME "
-        "enabled=%d future_graphs=%zu prepare_ms=%.3f "
+        "banks=%zu enabled=%d future_graphs=%zu prepare_ms=%.3f "
         "capacity_a_mib=%.3f capacity_b_mib=%.3f status=%s\n",
-        peak_reserve_enabled ? 1 : 0, peak_reserve_graphs,
-        peak_reserve_us / 1000.0,
+        initial_banks, peak_reserve_enabled ? 1 : 0,
+        peak_reserve_graphs, peak_reserve_us / 1000.0,
         ggml_backend_sched_get_weight_cache_buffer_size(bank_a.sched.get()) / 1048576.0,
-        ggml_backend_sched_get_weight_cache_buffer_size(bank_b.sched.get()) / 1048576.0,
+        initial_banks == 2 ?
+            ggml_backend_sched_get_weight_cache_buffer_size(
+                bank_b.sched.get()) / 1048576.0 : 0.0,
         region_ring_initial_banks_loaded ? "READY" : "FAIL");
 
     LLAMA_LOG_ERROR(
         "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
-        "region0=%zu region1=%zu bankA=%d bankB=%d "
+        "banks=%zu region0=%zu region1=%lld bankA=%d bankB=%d "
         "upload_mib=%.3f prepare_ms=%.3f h2d_ms=%.3f "
         "wall_ms=%.3f status=%s\n",
-        gpu_regions[0], gpu_regions[1],
-        bank_a.bank_region == gpu_regions[0] ? 1 : 0,
-        bank_b.bank_region == gpu_regions[1] ? 1 : 0,
+        initial_banks, gpu_regions[0],
+        initial_banks == 2 ? (long long) gpu_regions[1] : -1LL,
+        bank_a.bank_ready &&
+            bank_a.bank_region == gpu_regions[0] ? 1 : 0,
+        initial_banks == 2 && bank_b.bank_ready &&
+            bank_b.bank_region == gpu_regions[1] ? 1 : 0,
         total_upload_bytes / 1048576.0,
         total_prepare_us / 1000.0,
         total_h2d_us / 1000.0,
@@ -11556,7 +11570,8 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 
 void llama_context::perf_reset() {
     // The standard load/server initialization path calls perf_reset() after
-    // warmup/probes. Ensure the fixed initial pair G0/G1 is resident here.
+    // warmup/probes. Ensure the first GPU Region (and second if present)
+    // is resident here, including forced single-Cycle A/B layouts.
     // The ensure is idempotent, so an already-correct pair costs nothing.
     if (has_evaluated_once &&
             model.hybrid_ring_gpu_weight_streaming) {
