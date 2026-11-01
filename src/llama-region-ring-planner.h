@@ -77,11 +77,9 @@ struct candidate {
     double pc_local_link_ms_per_token = 0.0;
     std::array<double, 3> transfer_busy_ms {};
     // Read-only diagnostics: [PC_LOCAL, PC_TO_PHONE, PHONE_TO_PC].
-    // The current DAG charges one transfer per overlapping token interval,
-    // except when Phone Full Arena Stream publishes one frame per producer.
-    // A real outer-stage transfer happens once per output GET or input SET,
-    // not necessarily once per consumer/producer intersection. Keep both
-    // counts visible without silently changing Planner ranking.
+    // Physical full-stage transfers are one producer GET or destination SET
+    // per Chunk, even if token intersections create many logical consumers.
+    // Preserve interval-credit behavior only in artificial bounded-slot tests.
     std::array<int, 3> transfer_event_count {};
     std::array<int, 3> stage_copy_call_proxy_count {};
     std::array<double, 3> transfer_service_ms {};
