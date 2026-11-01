@@ -20445,6 +20445,10 @@ auto prefill_norm_sg_has_prework =
         bool full_region_graph_ready = false;
         bool full_region_graph_has_l_out = false;
         size_t full_region_graph_end = i;
+        // Preserve PC-owned vocabulary projection when fusing a mixed
+        // final-layer Phone prefix. The original Meta exit still runs.
+        bool full_region_pc_output_head = false;
+        size_t full_region_pc_output_sg = SIZE_MAX;
 
         // Qwen3-MoE emits a chunk-major Phone-only DAG between the
         // discovered C2P/P2C boundaries. PARTIAL markers still split it
@@ -20855,6 +20859,85 @@ auto prefill_norm_sg_has_prework =
                     bool next_consumes_attention = false;
                     const ggml_tensor * attn_output =
                         first_graph->nodes[first_graph->n_nodes - 1];
+                    // Qwen's final layer may contain a mixed 13-node
+                    // SG: Phone owns FFN/result_norm, PC owns only the
+                    // result_output vocabulary projection. Verify the
+                    // entire chain before moving the PC tail behind a
+                    // fused Phone graph and an explicit hidden-state copy.
+                    ggml_cgraph * pc_tail = pc1.cgraph_main;
+                    ggml_cgraph * phone_tail = phone1.cgraph_main;
+                    char mixed_ffn_name[64];
+                    char mixed_lout_name[64];
+                    std::snprintf(mixed_ffn_name, sizeof(mixed_ffn_name),
+                        "ffn_inp-%d", first_layer);
+                    std::snprintf(mixed_lout_name, sizeof(mixed_lout_name),
+                        "l_out-%d", first_layer);
+                    const bool mixed_tail_shape =
+                        contiguous &&
+                        first_graph->n_nodes == 27 &&
+                        pc_tail != nullptr && phone_tail != nullptr &&
+                        pc_tail->n_nodes == 13 &&
+                        phone_tail->n_nodes == 13;
+                    const bool mixed_pc_output_tail =
+                        mixed_tail_shape &&
+                        subgraph_is_phone_only(i) &&
+                        phone_tail->nodes[0]->op == GGML_OP_GET_ROWS &&
+                        phone_tail->nodes[1]->op == GGML_OP_GET_ROWS &&
+                        phone_tail->nodes[0]->src[0] == attn_output &&
+                        phone_tail->nodes[0]->src[1] ==
+                            phone_tail->nodes[1]->src[1] &&
+                        phone_tail->nodes[2]->op == GGML_OP_ADD &&
+                        std::strcmp(phone_tail->nodes[2]->name,
+                            mixed_ffn_name) == 0 &&
+                        phone_tail->nodes[2]->src[0] == phone_tail->nodes[0] &&
+                        phone_tail->nodes[2]->src[1] == phone_tail->nodes[1] &&
+                        phone_tail->nodes[3]->op == GGML_OP_RMS_NORM &&
+                        phone_tail->nodes[3]->src[0] == phone_tail->nodes[2] &&
+                        phone_tail->nodes[4]->src[0] == phone_tail->nodes[3] &&
+                        phone_tail->nodes[5]->src[1] == phone_tail->nodes[4] &&
+                        phone_tail->nodes[6]->src[1] == phone_tail->nodes[4] &&
+                        phone_tail->nodes[7]->op == GGML_OP_GLU &&
+                        phone_tail->nodes[7]->src[0] == phone_tail->nodes[5] &&
+                        phone_tail->nodes[7]->src[1] == phone_tail->nodes[6] &&
+                        phone_tail->nodes[8]->op == GGML_OP_MUL_MAT &&
+                        phone_tail->nodes[8]->src[1] == phone_tail->nodes[7] &&
+                        phone_tail->nodes[9]->op == GGML_OP_ADD &&
+                        std::strcmp(phone_tail->nodes[9]->name,
+                            mixed_lout_name) == 0 &&
+                        phone_tail->nodes[9]->src[0] == phone_tail->nodes[8] &&
+                        phone_tail->nodes[9]->src[1] == phone_tail->nodes[2] &&
+                        phone_tail->nodes[10]->op == GGML_OP_RMS_NORM &&
+                        phone_tail->nodes[10]->src[0] == phone_tail->nodes[9] &&
+                        std::strcmp(phone_tail->nodes[11]->name,
+                            "result_norm") == 0 &&
+                        phone_tail->nodes[11]->src[0] == phone_tail->nodes[10] &&
+                        std::strcmp(pc_tail->nodes[12]->name,
+                            "result_output") == 0 &&
+                        pc_tail->nodes[12]->op == GGML_OP_MUL_MAT &&
+                        pc_tail->nodes[12]->src[1] == pc_tail->nodes[11] &&
+                        (pc_tail->nodes[12]->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                        (phone_tail->nodes[12]->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) == 0 &&
+                        (phone_tail->nodes[8]->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                        (pc_tail->nodes[8]->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) == 0 &&
+                        (phone_tail->nodes[11]->flags &
+                            GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                        pc_tail->nodes[11]->type ==
+                            phone_tail->nodes[11]->type &&
+                        ggml_are_same_layout(
+                            pc_tail->nodes[11], phone_tail->nodes[11]) &&
+                        ggml_nbytes(pc_tail->nodes[11]) ==
+                            ggml_nbytes(phone_tail->nodes[11]) &&
+                        pc_tail->nodes[12]->ne[1] ==
+                            pc_tail->nodes[11]->ne[1] &&
+                        pc_tail->nodes[11]->ne[1] ==
+                            phone_tail->nodes[11]->ne[1] &&
+                        (ggml_nbytes(phone_tail->nodes[11]) == 0 ||
+                            (pc_tail->nodes[11]->buffer != nullptr &&
+                             phone_tail->nodes[11]->buffer != nullptr));
                     if (!contiguous) {
                         reject_reason = "NOT_CONTIGUOUS";
                     } else if (pc0.directional_completion != no_directional ||
@@ -20878,7 +20961,9 @@ auto prefill_norm_sg_has_prework =
                         if (pc == nullptr || phone == nullptr ||
                                 pc->n_nodes != phone->n_nodes ||
                                 phone->n_nodes == 0 ||
-                                !subgraph_is_phone_only(sg)) {
+                                (!subgraph_is_phone_only(sg) &&
+                                 !(mixed_pc_output_tail &&
+                                   sg == next_sg))) {
                             reject_reason = "NOT_PHONE_OWNED";
                             rejected_sg = sg;
                             break;
@@ -20946,8 +21031,10 @@ auto prefill_norm_sg_has_prework =
                                 partial && is_terminal_attention &&
                                 phone_compute && !pc_compute &&
                                 subgraph_is_phone_only(i) &&
-                                subgraph_is_phone_only(next_sg) &&
-                                !subgraph_will_execute_pc(next_sg) &&
+                                (subgraph_is_phone_only(next_sg) ||
+                                 mixed_pc_output_tail) &&
+                                (!subgraph_will_execute_pc(next_sg) ||
+                                 mixed_pc_output_tail) &&
                                 subgraph_will_execute_phone(next_sg) &&
                                 !ggml_backend_meta_tensor_c2p_layer(
                                     backend_ctx, first_layer) &&
@@ -20998,8 +21085,23 @@ auto prefill_norm_sg_has_prework =
                                     "action=KEEP_LEGACY_META_EXIT status=OK\n",
                                     first_layer, sg, t->name);
                             }
+                            // An internal Phone-only FFN down in
+                            // the mixed tail is not a cross-device reduce;
+                            // the explicit result_norm return is below.
+                            const bool mixed_ffn_down_partial =
+                                partial && mixed_pc_output_tail &&
+                                sg == next_sg && k == 8 &&
+                                t == phone->nodes[8] &&
+                                t->op == GGML_OP_MUL_MAT &&
+                                t->src[1] == phone->nodes[7] &&
+                                phone_compute && !pc_compute &&
+                                !ggml_backend_meta_tensor_c2p_layer(
+                                    backend_ctx, first_layer) &&
+                                !ggml_backend_meta_tensor_p2c_layer(
+                                    backend_ctx, first_layer);
                             if (partial && !can_keep_phone_partial &&
-                                    !defer_terminal_phone_partial) {
+                                    !defer_terminal_phone_partial &&
+                                    !mixed_ffn_down_partial) {
                                 // Diagnostic only: identify which safety
                                 // predicate rejected this Phone-local PARTIAL.
                                 // Never relax a Reduce/handoff on a guess.
@@ -21032,7 +21134,8 @@ auto prefill_norm_sg_has_prework =
                             }
                             kept_internal_partial |=
                                 can_keep_phone_partial ||
-                                defer_terminal_phone_partial;
+                                defer_terminal_phone_partial ||
+                                mixed_ffn_down_partial;
                             // Final-layer output selection can leave a
                             // nine-node Phone-only FFN tail after Attention:
                             // GET_ROWS(attn_out-L), GET_ROWS(residual),
@@ -21049,15 +21152,17 @@ auto prefill_norm_sg_has_prework =
                                 sizeof(expected_ffn_inp),
                                 "ffn_inp-%d", first_layer);
                             const bool same_layer_final_ffn_norm =
-                                sg == next_sg && phone->n_nodes == 9 &&
+                                sg == next_sg &&
+                                ((phone->n_nodes == 9 && t->ne[1] == 1) ||
+                                 mixed_pc_output_tail) &&
                                 k == 3 && t->op == GGML_OP_RMS_NORM &&
-                                t->ne[1] == 1 &&
                                 phone_compute && pc_compute &&
                                 std::sscanf(t->name, "norm-%d%n",
                                     &same_norm_layer, &same_norm_chars) == 1 &&
                                 t->name[same_norm_chars] == '\0' &&
                                 same_norm_layer == first_layer &&
-                                subgraph_is_phone_only(next_sg) &&
+                                (subgraph_is_phone_only(next_sg) ||
+                                 mixed_pc_output_tail) &&
                                 phone->nodes[0]->op == GGML_OP_GET_ROWS &&
                                 phone->nodes[1]->op == GGML_OP_GET_ROWS &&
                                 phone->nodes[0]->src[0] == attn_output &&
@@ -21068,11 +21173,18 @@ auto prefill_norm_sg_has_prework =
                                 phone->nodes[2]->src[1] == phone->nodes[1] &&
                                 t->src[0] == phone->nodes[2] &&
                                 t->src[1] == nullptr;
+                            const bool mixed_output_marker =
+                                mixed_pc_output_tail && sg == next_sg &&
+                                ((k == 11 &&
+                                  std::strcmp(t->name, "result_norm") == 0) ||
+                                 (k == 12 &&
+                                  std::strcmp(t->name, "result_output") == 0));
                             if (sg == next_sg &&
                                     (std::strncmp(t->name, "result_", 7) == 0 ||
                                      std::strncmp(t->name, "norm-", 5) == 0 ||
                                      std::strncmp(t->name, "attn_norm-", 10) == 0) &&
-                                    !same_layer_final_ffn_norm) {
+                                    !same_layer_final_ffn_norm &&
+                                    !mixed_output_marker) {
                                 // A norm-L in the second SG may be a
                                 // same-layer dependency/mirror rather than
                                 // proof of a new layer. Diagnose its actual
@@ -21118,7 +21230,10 @@ auto prefill_norm_sg_has_prework =
                                 reject_reason = "NEXT_LAYER_OR_OUTPUT";
                                 break;
                             }
-                            if (pc_compute) {
+                            if (pc_compute &&
+                                    !(mixed_pc_output_tail &&
+                                      sg == next_sg && k == 12 &&
+                                      !phone_compute)) {
                                 bool identical_mirror =
                                     phone_compute &&
                                     p->op == t->op && p->type == t->type;
@@ -21163,16 +21278,20 @@ auto prefill_norm_sg_has_prework =
                         phone_block_last_layer = -1;
                         full_region_graph_end = next_sg;
                         full_region_graph_ready = true;
+                        full_region_pc_output_head = mixed_pc_output_tail;
+                        full_region_pc_output_sg =
+                            mixed_pc_output_tail ? next_sg : SIZE_MAX;
                         timing_first_layer = first_layer;
                         timing_last_layer = first_layer;
                         GGML_LOG_INFO(
                             "[PHONE_FULL_REGION_GRAPH] event=PAIR_VALIDATED "
                             "sg=%zu..%zu layer=%d phone_compute=%zu "
                             "pc_mirror=%zu kept_partial=%d "
-                            "action=FUSE status=OK\n",
+                            "pc_output_head=%d action=FUSE status=OK\n",
                             i, next_sg, first_layer,
                             phone_compute_nodes, mirrored_pc_nodes,
-                            kept_internal_partial ? 1 : 0);
+                            kept_internal_partial ? 1 : 0,
+                            mixed_pc_output_tail ? 1 : 0);
                     } else {
                         // Opt-in, rejected-pair-only topology dump. The SG
                         // ownership check uses terminal COMPUTE flags; it
@@ -21348,7 +21467,9 @@ auto prefill_norm_sg_has_prework =
                 "[PHONE_FULL_REGION_GRAPH] event=READY form=%s "
                 "sg=%zu..%zu compute_end=%zu layer=%d nodes=%d "
                 "uid=%" PRIu64 " rpc_graphs=1 status=OK\n",
-                full_region_graph_has_l_out ? "TERMINAL_L_OUT" : "PHONE_LOCAL",
+                full_region_graph_has_l_out ? "TERMINAL_L_OUT" :
+                    full_region_pc_output_head ?
+                        "PHONE_WITH_PC_HEAD" : "PHONE_LOCAL",
                 i, full_region_graph_end, phone_block_end,
                 full_region_graph_has_l_out ?
                     phone_block_last_layer : first_fused_layer,
@@ -21969,6 +22090,77 @@ auto prefill_norm_sg_has_prework =
             } else {
                 compute_workers.start_graph(1, phone_graph);
                 compute_status = compute_workers.wait(1);
+            }
+
+            if (full_region_pc_output_head &&
+                    compute_status == GGML_STATUS_SUCCESS) {
+                // Preserve exactly one PC-owned vocabulary projection.
+                // The original PC tail's mirrored GET_ROWS/FFN nodes
+                // must NOT be reexecuted after Phone has completed them.
+                GGML_ASSERT(full_region_pc_output_sg <
+                    backend_ctx->n_subgraphs);
+                ggml_cgraph * pc_tail_graph =
+                    backend_ctx->backend_configs[0]
+                        .cgraphs[full_region_pc_output_sg].cgraph_main;
+                ggml_cgraph * phone_tail_graph =
+                    backend_ctx->backend_configs[1]
+                        .cgraphs[full_region_pc_output_sg].cgraph_main;
+                GGML_ASSERT(pc_tail_graph != nullptr &&
+                    phone_tail_graph != nullptr &&
+                    pc_tail_graph->n_nodes == 13 &&
+                    phone_tail_graph->n_nodes == 13);
+                ggml_tensor * pc_hidden = pc_tail_graph->nodes[11];
+                ggml_tensor * phone_hidden = phone_tail_graph->nodes[11];
+                ggml_tensor * pc_logits = pc_tail_graph->nodes[12];
+                const size_t hidden_bytes = ggml_nbytes(phone_hidden);
+                const size_t logits_bytes = ggml_nbytes(pc_logits);
+                if (logits_bytes == 0) {
+                    // No logits requested in this outer chunk. Keep
+                    // zero-sized result descriptors, no RPC GET or CPU GEMM.
+                    GGML_LOG_INFO(
+                        "[PHONE_FULL_REGION_GRAPH] event=PC_HEAD_SKIP "
+                        "sg=%zu layer=%d hidden_bytes=%zu "
+                        "reason=ZERO_OUTPUT status=OK\n",
+                        full_region_pc_output_sg,
+                        first_fused_layer, hidden_bytes);
+                } else {
+                    // The Phone graph has finished submitting; fence its
+                    // computation before obtaining the hidden state.
+                    auto & phone_cfg = backend_ctx->backend_configs[1];
+                    auto & pc_cfg = backend_ctx->backend_configs[0];
+                    ggml_backend_synchronize(phone_cfg.backend);
+                    const int64_t copy_begin = ggml_time_us();
+                    ggml_backend_tensor_copy_async(
+                        phone_cfg.backend, pc_cfg.backend,
+                        phone_hidden, pc_hidden);
+                    ggml_backend_synchronize(pc_cfg.backend);
+                    const int64_t copy_us = ggml_time_us() - copy_begin;
+                    record_copy_wait(copy_us);
+                    record_meta_copy(
+                        full_region_pc_output_sg, 1, 0,
+                        pc_hidden, copy_us);
+                    record_direct_copy();
+
+                    // Reuse the dedicated fused-graph slot of the SG
+                    // that is consumed by this fusion. The one-node
+                    // PC graph reads the copied result_norm and PC-only
+                    // output.weight. It does not recompute PC mirrors.
+                    ggml_cgraph * pc_output_graph =
+                        build_region_graph_slice(
+                            pc_tail_graph, 12, 13,
+                            full_region_pc_output_sg,
+                            UINT64_C(0x4c33395f50434844));
+                    compute_workers.start_graph(0, pc_output_graph);
+                    compute_status = compute_workers.wait(0);
+                    GGML_LOG_INFO(
+                        "[PHONE_FULL_REGION_GRAPH] event=PC_HEAD_DONE "
+                        "sg=%zu layer=%d hidden_bytes=%zu "
+                        "logits_bytes=%zu copy_ms=%.3f "
+                        "pc_nodes=1 status=%d\n",
+                        full_region_pc_output_sg, first_fused_layer,
+                        hidden_bytes, logits_bytes, copy_us / 1000.0,
+                        (int) compute_status);
+                }
             }
 
             if (region_pipeline_active && phone_region_fused &&
