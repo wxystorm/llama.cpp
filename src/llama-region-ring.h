@@ -565,7 +565,11 @@ inline bool llama_region_ring_single_cycle_force_compatible(
             regions.back().device != llama_region_ring_device::PHONE) {
         return false;
     }
-    const auto counts = llama_region_ring_layer_counts(regions);
+    std::array<int, 3> counts {};
+    for (const auto & region : regions) {
+        counts[(size_t) region.device] +=
+            region.layer_end - region.layer_begin;
+    }
     int active_devices = 0;
     for (int count : counts) {
         active_devices += count > 0 ? 1 : 0;
