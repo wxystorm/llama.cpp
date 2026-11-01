@@ -10315,7 +10315,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
 
             const bool single_cycle =
-                llama_region_ring_single_cycle_topology_compatible(
+                llama_region_ring_single_cycle_force_compatible(
                     forced_regions, model.layers);
             const bool multi_cycle =
                 llama_region_ring_apply_topology_compatible(
