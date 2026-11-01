@@ -708,7 +708,7 @@ int main() {
 
     // Search must measure E_min only over GPU-viable seed geometries.
     // Uniform control is unchanged, and terminal Beam states that fail
-    // CPU/Phone memory are removed before the Beam's top-8 truncation.
+    // CPU/Phone memory are removed before final top-24 truncation.
     {
         model limited = mock_profile();
         limited.layers = 24;
@@ -737,7 +737,9 @@ int main() {
         REQUIRE(selected.first_cycle_gpu_pairs_pruned > 0);
         REQUIRE(selected.first_cycle_gpu_shapes_pruned > 0);
         REQUIRE(selected.first_cycle_selected > 0);
-        REQUIRE(selected.first_cycle_selected <= 100);
+        REQUIRE(selected.first_cycle_selected <= 200);
+        REQUIRE(selected.first_cycle_e_pool <= 500);
+        REQUIRE(selected.first_cycle_selected <= selected.first_cycle_e_pool);
         REQUIRE(selected.first_cycle_selected ==
                 selected.first_cycle_seeds.size());
         for (const auto & seed : selected.first_cycle_seeds) {
@@ -1047,6 +1049,54 @@ int main() {
         }
         REQUIRE(std::isfinite(brute_min));
         REQUIRE(std::fabs(brute_min - found.first_cycle_e_min) < 1e-10);
+    }
+
+    // The absolute-service proxy charges every required boundary. Two
+    // independent phone directions must NOT be summed as a serial lane.
+    {
+        model proxy = mock_profile();
+        proxy.tokens = 100;
+        const std::array<double, 3> load {{2.0, 3.0, 1.0}};
+        const std::array<double, 3> links {{0.5, 0.25, 0.75}};
+        proxy.shared_phone_link = true;
+        REQUIRE(std::fabs(region_ring_absolute_service_proxy_ms(
+            proxy, 3, load, links) - 325.0) < 1e-9);
+        proxy.shared_phone_link = false;
+        REQUIRE(std::fabs(region_ring_absolute_service_proxy_ms(
+            proxy, 3, load, links) - 300.0) < 1e-9);
+        proxy.pc_compute_gate = true;
+        REQUIRE(std::fabs(region_ring_absolute_service_proxy_ms(
+            proxy, 3, load, links) - 500.0) < 1e-9);
+        REQUIRE(!std::isfinite(region_ring_absolute_service_proxy_ms(
+            proxy, 0, load, links)));
+
+        const double better = region_ring_e_absolute_score(
+            0.25, 150.0, 0.1, 0.6, 100.0, 600.0);
+        const double slower = region_ring_e_absolute_score(
+            0.1, 450.0, 0.1, 0.6, 100.0, 600.0);
+        REQUIRE(better < slower);
+        REQUIRE(better >= 0.0 && better <= 1.0);
+    }
+
+    // Per-Cycle E is only a soft term. A deliberately imbalanced second
+    // Cycle must win when it compensates the first Cycle's CPU overload.
+    {
+        const std::array<double, 3> links {{0.0, 0.0, 0.0}};
+        const std::array<double, 3> compensating {{1.0, 4.0, 4.0}};
+        const std::array<double, 3> balanced {{3.0, 3.0, 3.0}};
+        const std::array<double, 3> corrected {{7.0, 6.0, 6.0}};
+        const std::array<double, 3> uncorrected {{9.0, 5.0, 5.0}};
+        REQUIRE(prefix_cycle_max_error(compensating, links, 1) >
+                prefix_cycle_max_error(balanced, links, 1));
+        REQUIRE(prefix_balanced_rank(
+                    compensating, corrected, links, 2, 4, 0.0) <
+                prefix_balanced_rank(
+                    balanced, uncorrected, links, 2, 4, 0.0));
+        REQUIRE(std::fabs(prefix_balanced_rank(
+                    compensating, corrected, links, 4, 4, 0.0) -
+                prefix_cycle_max_error(corrected, links, 4)) < 1e-12);
+        REQUIRE(!std::isfinite(prefix_balanced_rank(
+            compensating, corrected, links, 0, 4, 0.0)));
     }
 
     candidate uniform;
@@ -1453,7 +1503,9 @@ int main() {
         REQUIRE(value_result.local_shortlisted <= 48);
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
-        REQUIRE(value_result.first_cycle_selected <= 100);
+        REQUIRE(value_result.first_cycle_selected <= 200);
+        REQUIRE(value_result.first_cycle_e_pool <= 500);
+        REQUIRE(value_result.first_cycle_selected <= value_result.first_cycle_e_pool);
         REQUIRE(value_result.first_cycle_selected ==
                 value_result.first_cycle_seeds.size());
         size_t recorded_completed = 0;
@@ -1468,6 +1520,12 @@ int main() {
             REQUIRE(first_cycle_chunk_supported(seed.xg));
             REQUIRE(first_cycle_chunk_supported(seed.xp));
             REQUIRE(std::isfinite(seed.first_e));
+            REQUIRE(std::isfinite(seed.first_absolute_proxy_ms));
+            REQUIRE(seed.first_absolute_proxy_ms >= 0.0);
+            REQUIRE(std::isfinite(seed.first_joint_score));
+            REQUIRE(seed.first_joint_score >= 0.0);
+            REQUIRE(seed.first_joint_score <= 1.0 + 1e-9);
+            REQUIRE(seed.completed <= 24);
             REQUIRE(seed.completed ==
                     seed.duplicates + seed.rejected_memory +
                     seed.rejected_profile + seed.rejected_dag +
