@@ -10384,14 +10384,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
 
             std::string force_reason;
             bool balance_ok = true;
-            if (!(single_cycle && zero_devices == 1)) {
+            if (!single_cycle) {
                 balance_ok =
                     llama_ring_planner::estimate_region_ring_balance(
                         model, forced_regions, forced);
             } else {
-                // E=max(e1,e2,e3) is a three-device cyclic-balance metric.
-                // A forced two-device single pass has no closed G/C/P ring,
-                // so rank it only by the exact event DAG and memory guards.
+                // Even with all three devices present, one G->C->P pass
+                // has no P->G return boundary. E=max(e1,e2,e3) measures
+                // a repeating ring, not this pipeline. Force A/B ranking
+                // therefore uses only memory guards and the full event DAG.
                 forced.ring_error = {-1.0, -1.0, -1.0};
                 forced.ring_error_max = -1.0;
                 forced.ring_error_mean = -1.0;
@@ -10419,11 +10420,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "layout=%s cycles=%d first_C=%d first_G=%d first_P=%d "
                 "XC=%d XG=%d XP=%d predicted_ms=%.3f "
                 "prepare_busy=%.3f weight_prepare=%.3f "
-                "weight_h2d_exposed=%.3f E=%.4f\n",
+                "weight_h2d_exposed=%.3f E=%.4f E_applicable=%d\n",
                 force_layout, best.cycles, best.c, best.g, best.p,
                 best.xc, best.xg, best.xp, best.wall_ms,
                 best.prepare_busy_ms, best.weight_prepare_busy_ms,
-                best.weight_h2d_exposed_ms, best.ring_error_max);
+                best.weight_h2d_exposed_ms, best.ring_error_max,
+                single_cycle ? 0 : 1);
         } else if (!llama_ring_planner::make_regions(
                 best, model.layers, best_regions)) {
             LLAMA_LOG_ERROR(
@@ -10716,6 +10718,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"estimated_gain_pct\":"
                             << improvement_pct
                             << ",\"e\":" << best.ring_error_max
+                            << ",\"e_applicable\":"
+                            << (forced_ab && forced_single_cycle ?
+                                "false" : "true")
                             << ",\"first_cycle_e\":"
                             << (best.prefix_cycles > 0 ?
                                 best.prefix_error[0] : best.ring_error_max)
