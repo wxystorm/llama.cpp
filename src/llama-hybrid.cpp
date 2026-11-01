@@ -9986,12 +9986,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     if (wide_apply && selected_layout != nullptr) {
         if (model.gpu_weight_streaming &&
                 profile.gpu_weight_h2d.size() < 2) {
-            LLAMA_LOG_ERROR(
-                "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
-                "reason=NO_WEIGHT_H2D_PROFILE points=%zu "
-                "status=KEEP_BASELINE\n",
+            // No prompt H2D is needed for the first one/two GPU Regions.
+            // Rank2+ candidates still fail with WEIGHT_PROFILE_MISSING
+            // inside the exact DAG if the rolling H2D curve is absent.
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_PROFILE] mode=APPLY_WIDE "
+                "weight_h2d_points=%zu rolling_profile=PARTIAL "
+                "initial_banks=LOAD_TIME status=DEFER_TO_DAG\n",
                 profile.gpu_weight_h2d.size());
-            return false;
         }
         if (selected_xc == nullptr || selected_xg == nullptr ||
                 selected_xp == nullptr) {
