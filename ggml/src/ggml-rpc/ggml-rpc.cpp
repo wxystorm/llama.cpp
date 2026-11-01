@@ -7786,6 +7786,10 @@ void rpc_server::phone_stage_binding_preflight(
         device >= phone_stage_plan_cache.size()) {
         return;
     }
+    if (graph->nodes[0] == nullptr ||
+        graph->nodes[graph->n_nodes - 1] == nullptr) {
+        return;
+    }
     int first_layer = -1;
     int parsed = 0;
     if (std::sscanf(graph->nodes[0]->name,
