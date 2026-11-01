@@ -321,6 +321,105 @@ int main() {
                 legacy.transfer_payload_bytes[2]);
     }
 
+    // A CPU64 producer is gathered into ONE Phone128 input SET, while
+    // Phone128 output GET fans out to four GPU32 consumers. These are
+    // physical RPC calls, not four interval-edge payments.
+    {
+        model wire = mock_profile();
+        wire.tokens = 128;
+        wire.hidden = 32;
+        wire.slot_pool = 0;
+        wire.compute_ms = [](device, int, int, int, double & ms) {
+            ms = 0.0;
+            return true;
+        };
+        wire.transfer_ms = [](device, device, size_t,
+                              double & ms) {
+            ms = 10.0;
+            return true;
+        };
+        const std::vector<llama_region_ring_region> c2p {
+            {device::CPU, 0, 1}, {device::PHONE, 1, 2}
+        };
+        candidate set;
+        set.xc = 64; set.xp = 128; set.xg = 32;
+        REQUIRE(simulate(wire, c2p, set));
+        REQUIRE(set.transfer_event_count[1] == 1);
+        REQUIRE(set.transfer_payload_bytes[1] ==
+                uint64_t(128 * 32 * sizeof(float)));
+        REQUIRE(set.wall_ms == 10.0);
+
+        const std::vector<llama_region_ring_region> p2g {
+            {device::PHONE, 0, 1}, {device::GPU, 1, 2}
+        };
+        candidate get = set;
+        REQUIRE(simulate(wire, p2g, get));
+        REQUIRE(get.transfer_event_count[2] == 1);
+        REQUIRE(get.transfer_payload_bytes[2] ==
+                uint64_t(128 * 32 * sizeof(float)));
+        REQUIRE(get.wall_ms == 10.0);
+    }
+
+    // Dynamic link competition: P2C and C2P can overlap even though
+    // each direction has its own FIFO. When one transfer finishes first,
+    // the survivor resumes at solo rate, not the duplex rate until the
+    // end of the original fixed duration. Use a full two-chunk pipeline.
+    {
+        model wire = mock_profile();
+        wire.tokens = 128;
+        wire.hidden = 32;
+        wire.slot_pool = 0;
+        wire.compute_ms = [](device, int, int, int, double & ms) {
+            ms = 0.0;
+            return true;
+        };
+        wire.transfer_ms = [](device, device, size_t,
+                              double & ms) {
+            ms = 10.0;
+            return true;
+        };
+        const std::vector<llama_region_ring_region> pipeline {
+            {device::PHONE, 0, 1}, {device::CPU, 1, 2},
+            {device::PHONE, 2, 3}
+        };
+        candidate serial;
+        serial.xp = serial.xc = serial.xg = 64;
+        std::string reason;
+        REQUIRE(simulate(wire, pipeline, serial, &reason));
+        REQUIRE(serial.transfer_event_count[1] == 2);
+        REQUIRE(serial.transfer_event_count[2] == 2);
+
+        model independent = wire;
+        independent.shared_phone_link = false;
+        candidate ideal = serial;
+        REQUIRE(simulate(independent, pipeline, ideal, &reason));
+
+        model measured = independent;
+        measured.duplex_phone_contention = true;
+        measured.duplex_slowdown = [](
+                size_t c2p_bytes, size_t p2c_bytes,
+                double & c2p, double & p2c) {
+            if (c2p_bytes == 0 || p2c_bytes == 0) {
+                return false;
+            }
+            c2p = 1.5; p2c = 1.25;
+            return true;
+        };
+        candidate contended = serial;
+        REQUIRE(simulate(measured, pipeline, contended, &reason));
+        REQUIRE(contended.duplex_overlap_ms > 0.0);
+        REQUIRE(ideal.wall_ms < contended.wall_ms);
+        REQUIRE(contended.wall_ms < serial.wall_ms);
+        REQUIRE(std::fabs(ideal.wall_ms - 30.0) < 1e-6);
+        REQUIRE(std::fabs(contended.wall_ms - 34.1666666667) < 1e-5);
+
+        measured.shared_phone_link = true;
+        candidate invalid = serial;
+        reason.clear();
+        REQUIRE(!simulate(measured, pipeline, invalid, &reason));
+        REQUIRE(reason == "INVALID_DUPLEX_LINK_MODEL");
+    }
+
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
     // regardless of the following GPU/CPU Chunk size. The PC Receiver
     // releases every intersecting downstream task only when that whole
