@@ -10046,11 +10046,47 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // minimize the first Cycle's E, then compensate accumulated load
         // through the remaining Cycles before full Prompt simulation.
         constexpr int wide_min_simulations = 64;
-        const auto result =
-            llama_ring_planner::search_runtime_applicable(
+        // A forced A/B must never depend on a successful or expensive
+        // automatic search. It is checked independently against memory,
+        // profiles and the exact full-prompt event DAG below.
+        const char * force_requested_layout =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+        const char * force_requested_xc =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XC");
+        const char * force_requested_xg =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XG");
+        const char * force_requested_xp =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XP");
+        const bool force_ab_requested =
+            (force_requested_layout && *force_requested_layout) ||
+            (force_requested_xc && *force_requested_xc) ||
+            (force_requested_xg && *force_requested_xg) ||
+            (force_requested_xp && *force_requested_xp);
+
+        llama_ring_planner::result result;
+        if (force_ab_requested) {
+            // Baseline is diagnostic only in forced mode. If its profile
+            // cannot be scored, the forced candidate is still eligible.
+            result.baseline.xc = baseline_chunk;
+            result.baseline.xg = baseline_chunk;
+            result.baseline.xp = baseline_chunk;
+            result.baseline_valid =
+                llama_ring_planner::estimate_region_ring_balance(
+                    model, baseline_regions, result.baseline) &&
+                llama_ring_planner::simulate(
+                    model, baseline_regions, result.baseline);
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
+                "search=SKIPPED reason=FORCED_AB "
+                "baseline_valid=%d baseline_ms=%.3f\n",
+                result.baseline_valid ? 1 : 0,
+                result.baseline_valid ?
+                    result.baseline.wall_ms : -1.0);
+        } else {
+            result = llama_ring_planner::search_runtime_applicable(
                 model, baseline_regions, baseline_chunk,
                 1, wide_e_margin, wide_min_simulations);
-        LLAMA_LOG_INFO(
+            LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
@@ -10105,6 +10141,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             model.gpu_weight_streaming ? 1 : 0,
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
+        }
 
         // Experiment-only artifact: a single small CSV after planning has
         // finished. No per-candidate file writes or terminal logging.
@@ -10199,8 +10236,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        if (!result.valid || !result.baseline_valid ||
-                !(result.baseline.wall_ms > 0.0)) {
+        if (!force_ab_requested &&
+                (!result.valid || !result.baseline_valid ||
+                 !(result.baseline.wall_ms > 0.0))) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
                 "reason=NO_SCOREABLE_RUNTIME_PLAN "
@@ -10609,9 +10647,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             forced_ab && forced_single_cycle ?
                 std::string(force_layout) :
                 llama_region_ring_layout_string(best_regions);
-        const double baseline_ms = result.baseline.wall_ms;
-        const double improvement_pct =
-            100.0 * (baseline_ms - best.wall_ms) / baseline_ms;
+        const double baseline_ms =
+            result.baseline_valid &&
+            std::isfinite(result.baseline.wall_ms) &&
+            result.baseline.wall_ms > 0.0 ?
+                result.baseline.wall_ms : -1.0;
+        const double improvement_pct = baseline_ms > 0.0 ?
+            100.0 * (baseline_ms - best.wall_ms) / baseline_ms : 0.0;
         double min_gain_pct = 2.0;
         if (const char * raw = std::getenv(
                 "LLAMA_HYBRID_REGION_RING_PLAN_MIN_GAIN_PCT")) {
