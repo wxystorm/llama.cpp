@@ -65,6 +65,65 @@ static void test_model_aware_default_layout() {
     check(llama_region_ring_directional_topology_compatible(dense, 40),
           "40-layer Dense baseline is not an executable directional ring");
 
+    // The implicit baseline must become a pure Full G/C/P ring with Arena
+    // Stream enabled, without changing the legacy or explicit Tensor layout.
+    const auto full = llama_region_ring_full_only_baseline(dense, 40);
+    check(llama_region_ring_layout_string(full) ==
+          "G4,C11,P9,G4,C7,P5",
+          "40-layer Full-only Stream baseline is incorrect");
+    check(!llama_region_ring_has_directional_stages(full) &&
+          llama_region_ring_apply_topology_compatible(full, 40),
+          "Full-only Stream baseline violates apply-wide topology");
+
+    // Check from_env() itself, since the Planner reads the baseline BEFORE
+    // applying forced XC/XG/XP. Preserve inherited environment for other tests.
+    const char * stream_key =
+        "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM";
+    const char * layout_key = "LLAMA_HYBRID_REGION_RING_LAYOUT";
+    const char * old_stream = std::getenv(stream_key);
+    const char * old_layout = std::getenv(layout_key);
+    const std::string saved_stream =
+        old_stream != nullptr ? old_stream : "";
+    const std::string saved_layout =
+        old_layout != nullptr ? old_layout : "";
+    const bool had_stream = old_stream != nullptr;
+    const bool had_layout = old_layout != nullptr;
+    const auto set_env = [&](const char * name, const char * value) {
+#ifdef _WIN32
+        const int rc = _putenv_s(name, value != nullptr ? value : "");
+#else
+        const int rc = value != nullptr ?
+            setenv(name, value, 1) : unsetenv(name);
+#endif
+        check(rc == 0, "unable to configure Stream baseline test env");
+    };
+    const auto restore = [&]() {
+        set_env(stream_key, had_stream ? saved_stream.c_str() : nullptr);
+        set_env(layout_key, had_layout ? saved_layout.c_str() : nullptr);
+    };
+    try {
+        set_env(layout_key, nullptr);
+        set_env(stream_key, "1");
+        check(llama_region_ring_layout_string(
+                  llama_region_ring_from_env(40)) ==
+                  "G4,C11,P9,G4,C7,P5",
+              "Stream from_env did not select compatible Full baseline");
+        set_env(stream_key, "0");
+        check(llama_region_ring_layout_string(
+                  llama_region_ring_from_env(40)) ==
+                  "G4,C10,C2P1,P8,P2C1,G4,C7,P5",
+              "legacy from_env baseline was unexpectedly changed");
+        set_env(stream_key, "1");
+        set_env(layout_key, "G4,C10,C2P1,P8,P2C1,G4,C7,P5");
+        check(llama_region_ring_has_directional_stages(
+                  llama_region_ring_from_env(40)),
+              "explicit directional override was silently converted");
+    } catch (...) {
+        restore();
+        throw;
+    }
+    restore();
+
     // A generic baseline must cover the actual model depth, end on Phone,
     // and satisfy all full-stage runtime topology constraints.
     for (int layers : {8, 12, 28, 32, 64, 80, 96}) {
