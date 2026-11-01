@@ -7501,8 +7501,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
         region_ring_v1 ?
             (model.hybrid_ring_plan_layout.empty() ?
                 llama_region_ring_from_env(model.hparams.n_layer()) :
-                llama_region_ring_parse(model.hybrid_ring_plan_layout,
-                                        model.hparams.n_layer())) :
+             model.hybrid_ring_plan_mode == "APPLY_WIDE" ?
+                llama_region_ring_parse_apply_wide_layout(
+                    model.hybrid_ring_plan_layout,
+                    model.hparams.n_layer()) :
+                llama_region_ring_parse(
+                    model.hybrid_ring_plan_layout,
+                    model.hparams.n_layer())) :
             std::vector<llama_region_ring_region>{};
     const std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
@@ -7541,15 +7546,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         const bool selected_directional =
             llama_region_ring_has_directional_stages(
                 ring_runtime_regions);
+        const bool selected_single_cycle =
+            apply_wide && !selected_directional &&
+            llama_region_ring_single_cycle_topology_compatible(
+                ring_runtime_regions, model.hparams.n_layer());
         const bool selected_topology_ok =
             selected_directional ?
                 llama_region_ring_directional_topology_compatible(
                     ring_runtime_regions, model.hparams.n_layer()) :
+            selected_single_cycle ?
+                true :
                 llama_region_ring_apply_topology_compatible(
                     ring_runtime_regions, model.hparams.n_layer());
         const bool runtime_shape_ok = (apply_cgp || apply_wide) ?
             ((apply_wide || ring_runtime_regions.size() == 9) &&
              selected_topology_ok &&
+             !ring_runtime_regions.empty() &&
              ring_runtime_regions.back().device ==
                  llama_region_ring_device::PHONE) :
             llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
