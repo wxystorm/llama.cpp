@@ -150,6 +150,17 @@ int main() {
         REQUIRE(frame.phone_full_stream_frames == 1);
         REQUIRE(std::fabs(frame.wall_ms - 11.0) < 1e-6);
 
+        // Two captured frames must traverse ONE P2C Sender/socket:
+        // Phone computes at t=1,2 while the first frame is in flight,
+        // but the two 10-ms wire sends complete at t=11 and t=21.
+        candidate serialized;
+        serialized.xp = 64;
+        serialized.xg = 32;
+        REQUIRE(simulate(synthetic, two_regions, serialized));
+        REQUIRE(serialized.phone_full_stream_frames == 2);
+        REQUIRE(serialized.edges == 2);
+        REQUIRE(std::fabs(serialized.wall_ms - 21.0) < 1e-6);
+
         synthetic.phone_full_return_stream = false;
         candidate get = frame;
         REQUIRE(simulate(synthetic, two_regions, get));
