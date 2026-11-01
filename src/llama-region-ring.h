@@ -128,6 +128,15 @@ inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
     return rank & 1u;
 }
 
+// Only the first one or two GPU Regions need load-time residency. A
+// single-Cycle forced layout has just Bank A; requiring Bank B to exist is
+// an obsolete multi-Cycle assumption. Keep the same rule in the loader,
+// runtime and Planner regression tests.
+inline size_t llama_region_ring_gpu_initial_bank_count(
+        size_t gpu_region_count) {
+    return std::min<size_t>(gpu_region_count, 2);
+}
+
 inline std::optional<size_t> llama_region_ring_gpu_weight_next_rank(
         size_t rank, size_t gpu_region_count) {
     if (rank > std::numeric_limits<size_t>::max() - 2) {
