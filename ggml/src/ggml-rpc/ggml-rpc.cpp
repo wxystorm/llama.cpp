@@ -5141,7 +5141,9 @@ private:
     void remember_opencl_tensor_extra(ggml_tensor * tensor);
     void erase_opencl_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
     void phone_stage_binding_preflight(uint32_t device, uint64_t graph_uid,
-                                      const ggml_cgraph * graph);
+                                      const ggml_cgraph * graph,
+                                      const rpc_tensor * wire_tensors,
+                                      uint32_t wire_tensor_count);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -7779,11 +7781,13 @@ bool rpc_server::set_tensor_graph_compute(
 }
 
 void rpc_server::phone_stage_binding_preflight(
-        uint32_t device, uint64_t graph_uid, const ggml_cgraph * graph) {
+        uint32_t device, uint64_t graph_uid, const ggml_cgraph * graph,
+        const rpc_tensor * wire_tensors, uint32_t wire_tensor_count) {
     const char * enabled = std::getenv("GGML_RPC_PHONE_BINDING_PREFLIGHT");
     if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
         graph == nullptr || graph->n_nodes < 16 ||
-        device >= phone_stage_plan_cache.size()) {
+        device >= phone_stage_plan_cache.size() ||
+        wire_tensors == nullptr || wire_tensor_count == 0) {
         return;
     }
     if (graph->nodes[0] == nullptr ||
@@ -7798,6 +7802,61 @@ void rpc_server::phone_stage_binding_preflight(
         first_layer < 0) {
         return; // ordinary RPC graph, not a Phone Full Stage
     }
+
+    // Stable structural identity excludes PC tensor pointers, buffer handles
+    // and current cl_mem offsets. It includes every op, shape, stride,
+    // operation parameter, view offset and canonical source index. Different
+    // KV view sizes / op params therefore create different templates.
+    std::unordered_map<uint64_t, uint32_t> wire_ids;
+    wire_ids.reserve(wire_tensor_count);
+    for (uint32_t i = 0; i < wire_tensor_count; ++i) {
+        if (wire_tensors[i].id == 0 ||
+            !wire_ids.emplace(wire_tensors[i].id, i + 1).second) {
+            return;
+        }
+    }
+    uint64_t structural_sig = UINT64_C(14695981039346656037);
+    uint64_t binding_sig = UINT64_C(14695981039346656037);
+    auto mix = [](uint64_t & h, uint64_t v) {
+        h ^= v;
+        h *= UINT64_C(1099511628211);
+    };
+    mix(structural_sig, static_cast<uint64_t>(graph->n_nodes));
+    mix(structural_sig, wire_tensor_count);
+    for (uint32_t i = 0; i < wire_tensor_count; ++i) {
+        const rpc_tensor & t = wire_tensors[i];
+        mix(structural_sig, t.op);
+        mix(structural_sig, t.type);
+        mix(structural_sig, static_cast<uint32_t>(t.flags));
+        for (size_t d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix(structural_sig, t.ne[d]);
+            mix(structural_sig, t.nb[d]);
+        }
+        for (int32_t param : t.op_params) {
+            mix(structural_sig, static_cast<uint32_t>(param));
+        }
+        mix(structural_sig, t.view_offs);
+        for (uint64_t src_id : t.src) {
+            if (src_id != 0 && !wire_ids.count(src_id)) {
+                return;
+            }
+            mix(structural_sig,
+                src_id == 0 ? 0 : wire_ids.at(src_id));
+        }
+        if (t.view_src != 0 && !wire_ids.count(t.view_src)) {
+            return;
+        }
+        mix(structural_sig,
+            t.view_src == 0 ? 0 : wire_ids.at(t.view_src));
+        // The input/weight/KV/output binding identity is independent of
+        // topology. It must be checked before any future template replay.
+        if (t.op == GGML_OP_NONE ||
+            (t.flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+            mix(binding_sig, t.buffer);
+            mix(binding_sig, t.data);
+        }
+    }
+    if (!structural_sig) { structural_sig = 1; }
 
     // A buffer with an external source or live output is not scratch. Never
     // move it: it may hold model weights, inputs, KV data or the P2C result.
@@ -7877,7 +7936,7 @@ void rpc_server::phone_stage_binding_preflight(
     plan.tokens = static_cast<uint32_t>(tokens);
     plan.output_kind =
         std::strstr(last->name, "result") != nullptr ? 1 : 0;
-    plan.topology_signature = graph_uid;
+    plan.topology_signature = structural_sig;
     const auto status = plan.scratch.build(transient, {});
     if (status != ggml_phone_stage::status::ok || !plan.tokens) {
         GGML_LOG_INFO(
@@ -7889,7 +7948,15 @@ void rpc_server::phone_stage_binding_preflight(
     auto & plans = phone_stage_plan_cache[device];
     // Keep only a small bounded set: the caller is still free to choose
     // separate full/tail/last-layer variants as actual graph shapes dictate.
-    if (plans.size() < 128) {
+    const bool new_template = std::none_of(plans.begin(), plans.end(),
+        [&](const ggml_phone_stage::template_plan & existing) {
+            return existing.layer_begin == plan.layer_begin &&
+                   existing.layer_end == plan.layer_end &&
+                   existing.tokens == plan.tokens &&
+                   existing.output_kind == plan.output_kind &&
+                   existing.topology_signature == plan.topology_signature;
+        });
+    if (new_template && plans.size() < 128) {
         plans.push_back(std::move(plan));
     }
     auto & pool = phone_stage_slot_policy[device];
@@ -7898,12 +7965,14 @@ void rpc_server::phone_stage_binding_preflight(
         GGML_LOG_INFO(
             "[PHONE_STAGE_BINDING] event=PREFLIGHT "
             "layer=%d..%d tokens=%u nodes=%d "
+            "topology_sig=%" PRIu64 " binding_sig=%" PRIu64 " "
+            "graph_uid=%" PRIu64 " new_template=%d "
             "transient=%zu slot_bytes=%zu total_two_slots=%zu "
             "mode=PLAN_ONLY status=OK\n",
             first_layer, max_layer, static_cast<unsigned>(plan.tokens),
-            graph->n_nodes, transient.size(),
-            pool.bytes_per_slot(),
-            pool.bytes_per_slot() * 2);
+            graph->n_nodes, structural_sig, binding_sig, graph_uid,
+            new_template ? 1 : 0, transient.size(),
+            pool.bytes_per_slot(), pool.bytes_per_slot() * 2);
 
         // Explicit opt-in PREP only. Never rebind current graphs here:
         // cached OpenCL extra/view and live KV/output ownership are still
@@ -8043,7 +8112,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     }   //恢复原来的计算图
     graph_entry.compute_samples = 0;
     graph_entry.recent_compute_wall_us = {};
-    phone_stage_binding_preflight(device, graph_uid, graph);
+    phone_stage_binding_preflight(
+        device, graph_uid, graph, tensors, n_tensors);
     if (register_only) {
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
