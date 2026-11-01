@@ -7858,18 +7858,37 @@ void rpc_server::phone_stage_binding_preflight(
     }
     if (!structural_sig) { structural_sig = 1; }
 
-    // A buffer with an external source or live output is not scratch. Never
-    // move it: it may hold model weights, inputs, KV data or the P2C result.
-    std::unordered_set<ggml_backend_buffer_t> external_buffers;
+    // Different tensors commonly occupy disjoint offsets of the SAME
+    // gallocr backend buffer. Excluding that entire buffer rejects all
+    // transient activations (transient=0). Protect the exact byte ranges of
+    // externally owned inputs, weights, KV writes and observable outputs
+    // instead. This is preflight-only: it does NOT authorize live rebinding.
+    struct protected_range {
+        ggml_backend_buffer_t buffer;
+        size_t address;
+        size_t bytes;
+    };
+    std::vector<protected_range> protected_ranges;
     std::unordered_set<const ggml_tensor *> visited;
+    const auto protect_tensor = [&](const ggml_tensor * t) {
+        if (t != nullptr && t->buffer != nullptr &&
+            t->data != nullptr && !ggml_is_empty(t)) {
+            protected_ranges.push_back({
+                t->buffer,
+                reinterpret_cast<size_t>(t->data),
+                ggml_nbytes(t)
+            });
+        }
+    };
     std::function<void(const ggml_tensor *)> visit =
         [&](const ggml_tensor * t) {
             if (t == nullptr || !visited.insert(t).second) { return; }
-            if (t->op == GGML_OP_NONE && t->buffer != nullptr) {
-                external_buffers.insert(t->buffer);
-            }
-            if (t->op == GGML_OP_SET_ROWS && t->buffer != nullptr) {
-                external_buffers.insert(t->buffer);
+            if (t->op == GGML_OP_NONE ||
+                t->op == GGML_OP_SET_ROWS ||
+                t->op == GGML_OP_CPY ||
+                (t->flags & (GGML_TENSOR_FLAG_INPUT |
+                             GGML_TENSOR_FLAG_OUTPUT)) != 0) {
+                protect_tensor(t);
             }
             if (t->view_src != nullptr) { visit(t->view_src); }
             for (const ggml_tensor * src : t->src) { visit(src); }
@@ -7878,19 +7897,16 @@ void rpc_server::phone_stage_binding_preflight(
         visit(graph->nodes[i]);
     }
     const ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
-    if (last != nullptr && last->buffer != nullptr) {
-        external_buffers.insert(last->buffer);
-    }
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * t = graph->nodes[i];
-        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 &&
-            t->buffer != nullptr) {
-            external_buffers.insert(t->buffer);
-        }
-    }
+    protect_tensor(last);
 
     std::vector<ggml_phone_stage::activation> transient;
     int max_layer = first_layer;
+    size_t compute_roots = 0;
+    size_t excluded_unallocated = 0;
+    size_t excluded_view = 0;
+    size_t excluded_ops = 0;
+    size_t excluded_overlap = 0;
+    size_t shared_arena_disjoint = 0;
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * t = graph->nodes[i];
         if (t == nullptr) { continue; }
@@ -7903,10 +7919,42 @@ void rpc_server::phone_stage_binding_preflight(
         }
         if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) ||
             t->buffer == nullptr || t->data == nullptr ||
-            t->view_src != nullptr || t->op == GGML_OP_NONE ||
-            t->op == GGML_OP_SET_ROWS || t->op == GGML_OP_CPY ||
-            external_buffers.count(t->buffer) || ggml_is_empty(t)) {
+            ggml_is_empty(t)) {
+            ++excluded_unallocated;
             continue;
+        }
+        if (t->view_src != nullptr) {
+            ++excluded_view;
+            continue;
+        }
+        if (t->op == GGML_OP_NONE ||
+            t->op == GGML_OP_SET_ROWS ||
+            t->op == GGML_OP_CPY ||
+            (t->flags & (GGML_TENSOR_FLAG_INPUT |
+                         GGML_TENSOR_FLAG_OUTPUT)) != 0) {
+            ++excluded_ops;
+            continue;
+        }
+        ++compute_roots;
+        const size_t address = reinterpret_cast<size_t>(t->data);
+        const size_t bytes = ggml_nbytes(t);
+        bool shared = false;
+        bool overlaps_external = false;
+        for (const protected_range & range : protected_ranges) {
+            if (range.buffer != t->buffer) { continue; }
+            shared = true;
+            if (ggml_phone_stage::may_overlap(
+                    address, bytes, range.address, range.bytes)) {
+                overlaps_external = true;
+                break;
+            }
+        }
+        if (overlaps_external) {
+            ++excluded_overlap;
+            continue;
+        }
+        if (shared) {
+            ++shared_arena_disjoint;
         }
         uint32_t last_use = static_cast<uint32_t>(i);
         for (int j = i + 1; j < graph->n_nodes; ++j) {
@@ -7922,7 +7970,7 @@ void rpc_server::phone_stage_binding_preflight(
             }
         }
         transient.push_back({
-            static_cast<uint32_t>(i + 1), ggml_nbytes(t),
+            static_cast<uint32_t>(i + 1), bytes,
             256, static_cast<uint32_t>(i), last_use});
     }
     ggml_phone_stage::template_plan plan;
