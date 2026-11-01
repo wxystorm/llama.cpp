@@ -20938,6 +20938,32 @@ auto prefill_norm_sg_has_prework =
                         (ggml_nbytes(phone_tail->nodes[11]) == 0 ||
                             (pc_tail->nodes[11]->buffer != nullptr &&
                              phone_tail->nodes[11]->buffer != nullptr));
+                    const char * mixed_trace_layer = std::getenv(
+                        "GGML_META_PHONE_FULL_REGION_TRACE_LAYER");
+                    if (mixed_tail_shape &&
+                            mixed_trace_layer != nullptr &&
+                            std::atoi(mixed_trace_layer) == first_layer) {
+                        GGML_LOG_INFO(
+                            "[PHONE_FULL_REGION_GRAPH] "
+                            "event=MIXED_TAIL_PROBE layer=%d sg=%zu "
+                            "candidate=%d pc_output_ne1=%" PRId64 " "
+                            "phone_norm_ne1=%" PRId64 " "
+                            "pc_norm_ne1=%" PRId64 " "
+                            "same_layout=%d phone_bytes=%zu pc_bytes=%zu "
+                            "phone_norm_buffer=%d pc_norm_buffer=%d "
+                            "status=TRACE\n",
+                            first_layer, next_sg,
+                            mixed_pc_output_tail ? 1 : 0,
+                            pc_tail->nodes[12]->ne[1],
+                            phone_tail->nodes[11]->ne[1],
+                            pc_tail->nodes[11]->ne[1],
+                            ggml_are_same_layout(
+                                pc_tail->nodes[11], phone_tail->nodes[11]) ? 1 : 0,
+                            ggml_nbytes(phone_tail->nodes[11]),
+                            ggml_nbytes(pc_tail->nodes[11]),
+                            phone_tail->nodes[11]->buffer != nullptr ? 1 : 0,
+                            pc_tail->nodes[11]->buffer != nullptr ? 1 : 0);
+                    }
                     if (!contiguous) {
                         reject_reason = "NOT_CONTIGUOUS";
                     } else if (pc0.directional_completion != no_directional ||
