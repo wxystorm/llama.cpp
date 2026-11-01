@@ -11239,19 +11239,30 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false;
     }
 
+    const bool implicit_layout = model.hybrid_ring_plan_layout.empty();
     const bool directional_fixed =
-        model.hybrid_ring_plan_layout.empty() &&
+        implicit_layout &&
         llama_region_ring_has_directional_stages(regions);
+    // The Phone Return Stream may convert the implicit directional default
+    // into a legal Full-only baseline. A rejected forced A/B then runs that
+    // same implicit baseline. It still needs initial A/B residency restored
+    // after warmup, especially if a third GPU Region displaced Bank A.
+    const bool full_only_fixed =
+        implicit_layout && !directional_fixed &&
+        llama_region_ring_apply_topology_compatible(
+            regions, model.hparams.n_layer());
     if (model.hybrid_ring_plan_mode != "APPLY_WIDE" &&
-            !directional_fixed) {
+            !directional_fixed && !full_only_fixed) {
         return false;
     }
 
-    if (directional_fixed) {
-        LLAMA_LOG_ERROR(
+    if (directional_fixed || full_only_fixed) {
+        LLAMA_LOG_INFO(
             "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
-            "source=FIXED_DIRECTIONAL_LAYOUT "
-            "layout=%s XC=%d XG=%d XP=%d status=ENABLED\n",
+            "source=%s layout=%s XC=%d XG=%d XP=%d status=ENABLED\n",
+            directional_fixed ?
+                "FIXED_DIRECTIONAL_LAYOUT" :
+                "IMPLICIT_FULL_ONLY_BASELINE",
             llama_region_ring_layout_string(regions).c_str(),
             xc, xg, xp);
     }
