@@ -5142,6 +5142,8 @@ private:
     void erase_opencl_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
     void phone_stage_binding_preflight(uint32_t device, uint64_t graph_uid,
                                       const ggml_cgraph * graph,
+                                      const uint64_t * wire_nodes,
+                                      uint32_t wire_node_count,
                                       const rpc_tensor * wire_tensors,
                                       uint32_t wire_tensor_count);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
@@ -7782,11 +7784,14 @@ bool rpc_server::set_tensor_graph_compute(
 
 void rpc_server::phone_stage_binding_preflight(
         uint32_t device, uint64_t graph_uid, const ggml_cgraph * graph,
+        const uint64_t * wire_nodes, uint32_t wire_node_count,
         const rpc_tensor * wire_tensors, uint32_t wire_tensor_count) {
     const char * enabled = std::getenv("GGML_RPC_PHONE_BINDING_PREFLIGHT");
     if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
         graph == nullptr || graph->n_nodes < 16 ||
         device >= phone_stage_plan_cache.size() ||
+        wire_nodes == nullptr ||
+        wire_node_count != static_cast<uint32_t>(graph->n_nodes) ||
         wire_tensors == nullptr || wire_tensor_count == 0) {
         return;
     }
@@ -7823,6 +7828,15 @@ void rpc_server::phone_stage_binding_preflight(
     };
     mix(structural_sig, static_cast<uint64_t>(graph->n_nodes));
     mix(structural_sig, wire_tensor_count);
+    // Node scheduling order is part of the template identity. Comparing only
+    // the set of serialized tensors is NOT sufficient for safe replay.
+    for (uint32_t i = 0; i < wire_node_count; ++i) {
+        const auto it = wire_ids.find(wire_nodes[i]);
+        if (wire_nodes[i] != 0 && it == wire_ids.end()) {
+            return;
+        }
+        mix(structural_sig, wire_nodes[i] == 0 ? 0 : it->second);
+    }
     for (uint32_t i = 0; i < wire_tensor_count; ++i) {
         const rpc_tensor & t = wire_tensors[i];
         mix(structural_sig, t.op);
@@ -8228,7 +8242,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     graph_entry.compute_samples = 0;
     graph_entry.recent_compute_wall_us = {};
     phone_stage_binding_preflight(
-        device, graph_uid, graph, tensors, n_tensors);
+        device, graph_uid, graph, nodes, n_nodes, tensors, n_tensors);
     if (register_only) {
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
