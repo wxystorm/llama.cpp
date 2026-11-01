@@ -1,5 +1,6 @@
 #include "llama-hybrid.h"
 #include "llama-hybrid-arch.h"
+#include "llama-hybrid-profile-cpu-threadpool.h"
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
 
@@ -8893,10 +8894,22 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         return false;
     }
     set_cpu_threads(cpu.get(), profile_cpu_threads);
+    // A standalone Backend otherwise builds and destroys a disposable
+    // threadpool on EVERY graph compute. Keep one alive across all isolated
+    // CPU profile samples, matching the Region Ring Runtime worker lifetime.
+    // Declared after cpu, so its destructor unbinds/frees before the Backend.
+    llama_hybrid_profile_cpu_threadpool profile_pool;
+    if (!profile_pool.attach(cpu.get(), profile_cpu_threads)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_CPU_PROFILE_THREADS] requested=%d "
+            "status=REJECT reason=CPU_PROFILE_POOL_UNAVAILABLE\n",
+            profile_cpu_threads);
+        return false;
+    }
     LLAMA_LOG_INFO(
         "[REGION_RING_PLAN_CPU_PROFILE_THREADS] profile_threads=%d "
         "batch_threads_requested=%d source=%s "
-        "threadpool=NONE_MODEL_LOAD status=APPLIED\n",
+        "threadpool=REUSED_MODEL_LOAD status=APPLIED\n
         profile_cpu_threads, params.hybrid_profile_n_threads_batch,
         params.hybrid_profile_n_threads_batch > 0 ?
             "BATCH_ARGUMENT" : "BACKEND_DEFAULT");

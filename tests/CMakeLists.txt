@@ -311,6 +311,7 @@ llama_test(test-hybrid)
 
 # Model-load Planner profiling must use -tb (or -t when -tb is unset).
 llama_build(test-hybrid-profile-threads.cpp)
+target_include_directories(test-hybrid-profile-threads PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-hybrid-profile-threads)
 
 llama_build_and_test(test-hybrid-boundary.cpp)
