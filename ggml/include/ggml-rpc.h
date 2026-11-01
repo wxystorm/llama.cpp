@@ -84,6 +84,28 @@ struct ggml_rpc_local_tensor_source {
 #define GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC \
     "ggml_backend_rpc_get_graph_profile"
 
+// Opt-in RPC transfer calibration. Two independent sockets issue the
+// existing SET_TENSOR and GET_TENSOR commands concurrently; the server
+// protocol and real inference data path are unchanged.
+#define GGML_BACKEND_RPC_PROFILE_DUPLEX_PROC \
+    "ggml_backend_rpc_profile_duplex"
+
+struct ggml_rpc_duplex_profile {
+    double c2p_solo_ms = 0.0;
+    double p2c_solo_ms = 0.0;
+    double c2p_concurrent_ms = 0.0;
+    double p2c_concurrent_ms = 0.0;
+    double concurrent_wall_ms = 0.0;
+    double concurrent_overlap_ms = 0.0;
+};
+
+using ggml_backend_rpc_profile_duplex_t = bool (*)(
+    ggml_backend_t backend,
+    ggml_tensor * upload_destination,
+    const ggml_tensor * download_source,
+    size_t bytes,
+    ggml_rpc_duplex_profile * result);
+
 // Experimental Region Ring stream: one Phone-side sender, one PC-side receiver.
 // All snapshot captures are published only after the GPU->Host read completes.
 #define GGML_BACKEND_RPC_P2C_STREAM_START_PROC \
