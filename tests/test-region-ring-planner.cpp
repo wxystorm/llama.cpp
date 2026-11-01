@@ -115,6 +115,17 @@ int main() {
         // splitting, versus 3 full frames per crossing with Arena Stream.
         REQUIRE(phone_to_gpu_payloads.size() == 24);
         REQUIRE(get_plan.edges == frame_plan.edges + 18);
+
+        // The user's follow-up A/B shape: same 40-layer Full layout,
+        // XC=XG=XP=64. The two middle Phone regions each produce 6 frames.
+        phone_to_gpu_payloads.clear();
+        candidate all64;
+        all64.xc = all64.xg = all64.xp = 64;
+        REQUIRE(simulate(stream, layout, all64, &why));
+        REQUIRE(all64.phone_full_stream_frames == 12);
+        REQUIRE(all64.phone_full_stream_bytes ==
+                uint64_t(2) * 358 * 5120 * sizeof(float));
+        REQUIRE(phone_to_gpu_payloads.size() == 12);
     }
 
     // A big Phone Chunk must NOT unblock an early small GPU Chunk at the
