@@ -126,6 +126,10 @@ struct binding_layout {
     status resolve(size_t slot_base, size_t slot_size,
                    std::unordered_map<uint32_t, size_t> & bound) const {
         if (required_bytes > slot_size) { return status::out_of_memory; }
+        size_t slot_end;
+        if (!checked_add(slot_base, slot_size, slot_end)) {
+            return status::overflow;
+        }
         std::unordered_map<uint32_t, size_t> pending;
         for (const allocation & a : roots) {
             size_t end, address;
