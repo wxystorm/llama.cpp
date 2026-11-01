@@ -7867,7 +7867,16 @@ void rpc_server::phone_stage_binding_preflight(
         ggml_backend_buffer_t buffer;
         size_t address;
         size_t bytes;
+        const ggml_tensor * tensor;
     };
+    struct overlap_detail {
+        int node_index;
+        const ggml_tensor * node;
+        const ggml_tensor * protected_tensor;
+        size_t src_offset;
+        size_t protected_offset;
+    };
+    std::vector<overlap_detail> overlap_details;
     std::vector<protected_range> protected_ranges;
     std::unordered_set<const ggml_tensor *> visited;
     const auto protect_tensor = [&](const ggml_tensor * t) {
@@ -7878,7 +7887,8 @@ void rpc_server::phone_stage_binding_preflight(
                 reinterpret_cast<size_t>(t->data),
                 std::max(ggml_nbytes(t),
                          ggml_backend_buffer_get_alloc_size(
-                             t->buffer, t))
+                             t->buffer, t)),
+                t,
             });
         }
     };
@@ -7954,6 +7964,10 @@ void rpc_server::phone_stage_binding_preflight(
             if (ggml_phone_stage::may_overlap(
                     address, bytes, range.address, range.bytes)) {
                 overlaps_external = true;
+                overlap_details.push_back({
+                    i, t, range.tensor,
+                    address, range.address,
+                });
                 break;
             }
         }
@@ -8027,8 +8041,38 @@ void rpc_server::phone_stage_binding_preflight(
     auto & pool = phone_stage_slot_policy[device];
     const size_t pool_alignment =
         std::max<size_t>(1, ggml_backend_get_alignment(backends[device]));
-    const auto reserved = pool.reserve(plans, pool_alignment);
+    // Do not invalidate existing slot leases on ordinary cache hits.
+    const auto reserved = new_template
+        ? pool.reserve(plans, pool_alignment)
+        : ggml_phone_stage::status::ok;
     if (reserved == ggml_phone_stage::status::ok) {
+        const char * trace_env =
+            std::getenv("GGML_RPC_PHONE_BINDING_TRACE");
+        if (new_template && trace_env != nullptr &&
+            std::strcmp(trace_env, "1") == 0) {
+            for (const auto & overlap : overlap_details) {
+                const ggml_tensor * owner = overlap.protected_tensor;
+                const ggml_tensor * node = overlap.node;
+                GGML_LOG_INFO(
+                    "[PHONE_STAGE_BINDING] event=OVERLAP_DETAIL "
+                    "layer=%d tokens=%u node=%d name=%s op=%d "
+                    "protect=%s protect_op=%d "
+                    "node_addr=%zx protect_addr=%zx "
+                    "node_bytes=%zu protect_bytes=%zu "
+                    "action=KEEP_ORIGINAL_STORAGE\n",
+                    first_layer, registered_tokens,
+                    overlap.node_index,
+                    node->name, static_cast<int>(node->op),
+                    owner->name, static_cast<int>(owner->op),
+                    overlap.src_offset, overlap.protected_offset,
+                    std::max(ggml_nbytes(node),
+                        ggml_backend_buffer_get_alloc_size(
+                            node->buffer, node)),
+                    std::max(ggml_nbytes(owner),
+                        ggml_backend_buffer_get_alloc_size(
+                            owner->buffer, owner)));
+            }
+        }
         GGML_LOG_INFO(
             "[PHONE_STAGE_BINDING] event=PREFLIGHT "
             "layer=%d..%d tokens=%u nodes=%d "
