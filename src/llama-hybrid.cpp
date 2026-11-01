@@ -9244,9 +9244,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
     model.phone_full_return_stream =
         phone_stream_env != nullptr && std::atoi(phone_stream_env) != 0;
-    // Stream uses the same Phone->PC profiled bandwidth curve as a proxy.
-    // Its transport EVENT count and dependency fan-out are now frame-exact;
-    // Phone Arena capture/readback is still part of compute-side calibration.
+    // Stream uses the legacy Phone->PC GET curve as a timing proxy.
+    // Frame count, payload bytes, Sender ordering and dependency fan-out are
+    // modeled exactly, but synchronous Arena capture/readback is not separately
+    // calibrated yet; compare predicted and measured wall time before tuning.
     // Runtime validation now shows CPU/CUDA compute are independently gated;
     // GPU/Phone CPU wait is no longer the execution bottleneck.
     model.pc_compute_gate = false;
@@ -10586,7 +10587,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_PLAN_P2C_MODEL] mode=APPLY_WIDE "
             "return=%s frames=%d bytes=%" PRIu64 " "
             "sender=%s dependencies=%s transfer_curve=PHONE_TO_PC_PROXY "
-            "status=MODELED\n",
+            "arena_capture=UNCALIBRATED status=MODELED\n",
             model.phone_full_return_stream ?
                 "PHONE_FULL_ARENA_FRAME" : "LEGACY_INTERVAL_GET",
             best.phone_full_stream_frames, best.phone_full_stream_bytes,
