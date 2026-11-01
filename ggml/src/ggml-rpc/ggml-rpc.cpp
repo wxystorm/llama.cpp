@@ -8117,22 +8117,48 @@ void rpc_server::phone_stage_binding_preflight(
     auto & plans = phone_stage_plan_cache[device];
     // Keep only a small bounded set: the caller is still free to choose
     // separate full/tail/last-layer variants as actual graph shapes dictate.
-    const bool new_template = std::none_of(plans.begin(), plans.end(),
-        [&](const ggml_phone_stage::template_plan & existing) {
-            return existing.layer_begin == plan.layer_begin &&
-                   existing.layer_end == plan.layer_end &&
-                   existing.tokens == plan.tokens &&
-                   existing.output_kind == plan.output_kind &&
-                   existing.topology_signature == plan.topology_signature;
+    auto existing = std::find_if(plans.begin(), plans.end(),
+        [&](const ggml_phone_stage::template_plan & cached) {
+            return cached.layer_begin == plan.layer_begin &&
+                   cached.layer_end == plan.layer_end &&
+                   cached.tokens == plan.tokens &&
+                   cached.output_kind == plan.output_kind &&
+                   cached.topology_signature == plan.topology_signature;
         });
-    if (new_template && plans.size() < 128) {
+    const bool new_template = existing == plans.end();
+    bool growing_template = false;
+    if (new_template) {
+        if (plans.size() >= 128) {
+            GGML_LOG_INFO(
+                "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+                "layer=%d tokens=%u reason=TEMPLATE_CACHE_FULL "
+                "status=SAFE\n",
+                first_layer, registered_tokens);
+            return;
+        }
         plans.push_back(std::move(plan));
+    } else {
+        // Same topology can still arrive with a wider original arena
+        // binding. Increase the capacity requirement, never silently reuse
+        // a too-small slot. Layout drift does NOT authorize rebinding.
+        const size_t previous_stage = existing->stage_arena_required_bytes;
+        const size_t previous_scratch = existing->scratch.required_bytes;
+        existing->stage_arena_required_bytes = std::max(
+            existing->stage_arena_required_bytes,
+            plan.stage_arena_required_bytes);
+        existing->scratch.required_bytes = std::max(
+            existing->scratch.required_bytes,
+            plan.scratch.required_bytes);
+        growing_template =
+            existing->stage_arena_required_bytes != previous_stage ||
+            existing->scratch.required_bytes != previous_scratch;
     }
     auto & pool = phone_stage_slot_policy[device];
     const size_t pool_alignment =
         std::max<size_t>(1, ggml_backend_get_alignment(backends[device]));
-    // Do not invalidate existing slot leases on ordinary cache hits.
-    const auto reserved = new_template
+    // Cache hits must not invalidate live slot leases. New or larger
+    // templates are the only cases requiring a capacity reservation.
+    const auto reserved = (new_template || growing_template)
         ? pool.reserve(plans, pool_alignment)
         : ggml_phone_stage::status::ok;
     if (reserved == ggml_phone_stage::status::ok) {
@@ -8252,15 +8278,19 @@ void rpc_server::phone_stage_binding_preflight(
             "layer=%d..%d tokens=%u nodes=%d "
             "topology_sig=%" PRIu64 " binding_sig=%" PRIu64 " "
             "graph_uid=%" PRIu64 " new_template=%d "
-            "transient=%zu compute_roots=%zu "
+            "growing_template=%d transient=%zu compute_roots=%zu "
             "shared_arena_disjoint=%zu overlap_external=%zu "
-            "protected_ranges=%zu slot_bytes=%zu total_two_slots=%zu "
+            "protected_ranges=%zu scratch_bytes=%zu "
+            "stage_span_bytes=%zu stage_end_offset=%zu "
+            "slot_bytes=%zu total_two_slots=%zu "
             "mode=PLAN_ONLY status=OK\n",
             first_layer, max_layer, static_cast<unsigned>(registered_tokens),
             graph->n_nodes, structural_sig, binding_sig, graph_uid,
-            new_template ? 1 : 0, transient.size(),
-            compute_roots, shared_arena_disjoint, excluded_overlap,
-            protected_ranges.size(), pool.bytes_per_slot(),
+            new_template ? 1 : 0, growing_template ? 1 : 0,
+            transient.size(), compute_roots, shared_arena_disjoint,
+            excluded_overlap, protected_ranges.size(),
+            plan.scratch.required_bytes, stage_used_span, stage_last,
+            pool.bytes_per_slot(),
             pool.bytes_per_slot() * 2);
 
         // Explicit opt-in PREP only. Never rebind current graphs here:
