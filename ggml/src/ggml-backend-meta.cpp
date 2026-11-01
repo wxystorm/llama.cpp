@@ -15636,6 +15636,16 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     const bool phone_full_add_enabled =
         phone_full_add_env != nullptr &&
         std::strcmp(phone_full_add_env, "1") == 0;
+    // Stage 1: the PC builds a single RPC graph for each Phone Full Region,
+    // including its actual terminal l_out when safe.  Chunk FIFO and the
+    // normal RPC graph submission protocol intentionally remain unchanged.
+    const char * full_region_graph_env =
+        std::getenv("GGML_META_PHONE_FULL_REGION_GRAPH");
+    const bool full_region_graph_requested =
+        n_backends == 2 && ring_exec != nullptr &&
+        std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
+        full_region_graph_env != nullptr &&
+        std::strcmp(full_region_graph_env, "1") == 0;
     const bool ring_phone_fusion =
         n_backends == 2 && ring_exec != nullptr && ring_fuse != nullptr &&
         std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
@@ -17801,6 +17811,9 @@ if (phone_status != GGML_STATUS_SUCCESS) {
     // Completion is consumed only at the exact final l_out bridge. Until
     // then the Phone MAIN worker owns execution and PC may do other work.
     std::map<int, uint64_t> pending_ring_auto_outputs;
+    // A terminal l_out absorbed by the preceding Region graph still visits
+    // its Meta SG for the original deferred Phone->PC / Arena handoff.
+    std::map<size_t, int> full_region_absorbed_l_out;
     // Seed the credit space from wall-clock time rather than starting from
     // one on every PC process restart. The Phone server may outlive a client.
     static std::atomic<uint64_t> next_ring_auto_seq {
@@ -20426,6 +20439,12 @@ auto prefill_norm_sg_has_prework =
         size_t phone_block_end = i;
         int first_fused_layer = -1;
         int phone_region_chunk_id = -1;
+        const auto absorbed_l_out_it = full_region_absorbed_l_out.find(i);
+        const bool absorbed_l_out_sg =
+            absorbed_l_out_it != full_region_absorbed_l_out.end();
+        bool full_region_graph_ready = false;
+        bool full_region_graph_has_l_out = false;
+        size_t full_region_graph_end = i;
 
         // Qwen3-MoE emits a chunk-major Phone-only DAG between the
         // discovered C2P/P2C boundaries. PARTIAL markers still split it
@@ -20718,15 +20737,153 @@ auto prefill_norm_sg_has_prework =
                 }
             }
         }
+        // Opt-in complete Phone Full Region graph.  The existing Phone-block
+        // path already joins a sequence of Attention/FFN SGs into one graph.
+        // Add the REAL terminal l_out (not a new aliasing ADD), then suppress
+        // its later execution while preserving its Meta handoff and fence.
+        //
+        // For the final Phone Full Region, consider merging consecutive
+        // Phone-only SGs only if no PC node, split, READY or PARTIAL boundary
+        // participates.  Otherwise leave the proven legacy path unchanged.
+        if (full_region_graph_requested && !region_pipeline_active &&
+                !ring_phone_fusion && !ring_phone_autostart &&
+                !absorbed_l_out_sg && !phone_region_fused) {
+            if (phone_block_fused && phone_block_last_layer >= 0) {
+                const size_t bridge_sg = phone_block_end + 1;
+                if (bridge_sg < backend_ctx->n_subgraphs &&
+                        subgraph_is_exact_l_out_bridge(
+                            bridge_sg, phone_block_last_layer)) {
+                    ggml_cgraph * main_graph =
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[phone_block_end].cgraph_main;
+                    ggml_cgraph * bridge_graph =
+                        backend_ctx->backend_configs[1]
+                            .cgraphs[bridge_sg].cgraph_main;
+                    ggml_tensor * terminal =
+                        main_graph != nullptr && main_graph->n_nodes > 0 ?
+                            main_graph->nodes[main_graph->n_nodes - 1] : nullptr;
+                    ggml_tensor * residual = find_recent_ffn_inp(
+                        1, phone_block_end, phone_block_last_layer);
+                    ggml_tensor * output =
+                        bridge_graph != nullptr && bridge_graph->n_nodes == 1 ?
+                            bridge_graph->nodes[0] : nullptr;
+                    const bool correct_add =
+                        terminal != nullptr && residual != nullptr &&
+                        output != nullptr && output->op == GGML_OP_ADD &&
+                        (output->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 &&
+                        terminal->ne[1] > 1 &&
+                        ((output->src[0] == terminal &&
+                          output->src[1] == residual) ||
+                         (output->src[1] == terminal &&
+                          output->src[0] == residual)) &&
+                        output->buffer != nullptr &&
+                        terminal->buffer != nullptr &&
+                        ggml_are_same_layout(output, terminal) &&
+                        ggml_nbytes(output) == ggml_nbytes(terminal);
+                    if (correct_add) {
+                        full_region_graph_ready = true;
+                        full_region_graph_has_l_out = true;
+                        full_region_graph_end = bridge_sg;
+                        full_region_absorbed_l_out.emplace(
+                            bridge_sg, phone_block_last_layer);
+                    } else if (pipeline_debug) {
+                        printf("[PHONE_FULL_REGION_GRAPH] event=FALLBACK "
+                               "form=TERMINAL_L_OUT sg=%zu..%zu layer=%d "
+                               "reason=BRIDGE_ADD_NOT_PROVEN\n",
+                               i, bridge_sg, phone_block_last_layer);
+                    }
+                }
+            } else if (!phone_block_fused) {
+                // The terminal P1 prefill often has an Attention SG followed
+                // by an FFN/output SG, even though both are Phone-local.
+                ggml_cgraph * first_graph =
+                    backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+                int first_layer = -1;
+                int parsed = 0;
+                const bool starts_full_prefill =
+                    first_graph != nullptr && first_graph->n_nodes > 0 &&
+                    first_graph->nodes[0]->ne[1] > 1 &&
+                    std::sscanf(first_graph->nodes[0]->name,
+                                "norm-%d%n", &first_layer, &parsed) == 1 &&
+                    first_graph->nodes[0]->name[parsed] == '\0' &&
+                    first_layer >= 0;
+                if (starts_full_prefill) {
+                    size_t last_safe = i;
+                    for (size_t sg = i; sg < backend_ctx->n_subgraphs; ++sg) {
+                        ggml_cgraph * pc =
+                            backend_ctx->backend_configs[0]
+                                .cgraphs[sg].cgraph_main;
+                        ggml_cgraph * phone =
+                            backend_ctx->backend_configs[1]
+                                .cgraphs[sg].cgraph_main;
+                        if (!subgraph_is_phone_only(sg) ||
+                                pc == nullptr || phone == nullptr ||
+                                phone->n_nodes == 0 ||
+                                pc->n_nodes != phone->n_nodes ||
+                                phone->nodes[0]->ne[1] <= 1 ||
+                                (sg > i && phone->n_nodes == 1 &&
+                                 std::strncmp(phone->nodes[0]->name,
+                                              "l_out-", 6) == 0)) {
+                            break;
+                        }
+                        bool safe = true;
+                        for (int k = 0; k < phone->n_nodes; ++k) {
+                            ggml_tensor * pc_node = pc->nodes[k];
+                            ggml_tensor * phone_node = phone->nodes[k];
+                            if ((pc_node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 ||
+                                    (phone_node->flags &
+                                     (GGML_TENSOR_FLAG_META_SEND_READY |
+                                      GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0 ||
+                                    ggml_backend_meta_get_split_state(
+                                        phone_node, false).axis ==
+                                        GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                safe = false;
+                                break;
+                            }
+                        }
+                        if (!safe) {
+                            break;
+                        }
+                        last_safe = sg;
+                    }
+                    if (last_safe > i) {
+                        phone_block_fused = true;
+                        phone_block_end = last_safe;
+                        first_fused_layer = first_layer;
+                        phone_block_last_layer = -1; // no forced l_out handoff
+                        full_region_graph_end = last_safe;
+                        full_region_graph_ready = true;
+                        timing_first_layer = first_layer;
+                        timing_last_layer = first_layer;
+                    } else if (pipeline_debug) {
+                        printf("[PHONE_FULL_REGION_GRAPH] event=FALLBACK "
+                               "form=PHONE_LOCAL sg=%zu layer=%d "
+                               "reason=NO_SAFE_CONTIGUOUS_SGS\n",
+                               i, first_layer);
+                    }
+                }
+            }
+        }
         const int64_t phone_region_build_begin_us =
             phone_region_fused ? ggml_time_us() : 0;
         if (phone_region_fused) {
             phone_region_pre_graph_us =
                 phone_region_build_begin_us - layer_wall_start_us;
         }
-        ggml_cgraph * phone_graph = phone_block_fused ?
-            build_phone_block_graph(i, phone_block_end) :
-            backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        ggml_cgraph * phone_graph = full_region_graph_ready ?
+            build_phone_block_graph(i, full_region_graph_end) :
+            phone_block_fused ?
+                build_phone_block_graph(i, phone_block_end) :
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (full_region_graph_ready) {
+            GGML_LOG_INFO(
+                "[PHONE_FULL_REGION_GRAPH] event=READY form=%s "
+                "sg=%zu..%zu compute_end=%zu layer=%d nodes=%d "
+                "uid=%" PRIu64 " rpc_graphs=1 status=OK\n",
+                full_region_graph_has_l_out ? "TERMINAL_L_OUT" : "PHONE_LOCAL",
+                i, full_region_graph_end, phone_block_end,
+                phone_block_last_layer, phone_graph->n_nodes, phone_graph->uid);
+        }
         if (phone_region_fused) {
             phone_region_graph_build_us =
                 ggml_time_us() - phone_region_build_begin_us;
@@ -20741,7 +20898,8 @@ auto prefill_norm_sg_has_prework =
             n_backends == 2 && !phone_block_fused &&
             is_phone_only_sg &&
             !phone_region_fused;
-        if (phone_full_add_enabled && n_backends == 2 &&
+        if (phone_full_add_enabled && !full_region_graph_ready &&
+                n_backends == 2 &&
                 (phone_block_fused || phone_single_sg) &&
                 !phone_region_fused &&
                 (!ring_phone_fusion || phone_single_sg)) {
@@ -21289,7 +21447,18 @@ auto prefill_norm_sg_has_prework =
                        scratch_reuse_seq);
             }
         } else {
-            if (ring_phone_autostart && phone_block_fused &&
+            if (absorbed_l_out_sg) {
+                // The real l_out already ran at the end of the preceding
+                // Phone Region graph.  Visit this SG only for the original
+                // DEFERRED_FINAL_L_OUT synchronization and output handoff.
+                compute_status = GGML_STATUS_SUCCESS;
+                if (pipeline_debug) {
+                    printf("[PHONE_FULL_REGION_GRAPH] event=BRIDGE_SKIP "
+                           "sg=%zu layer=%d extra_graphs=0 status=OK\n",
+                           i, absorbed_l_out_it->second);
+                }
+                full_region_absorbed_l_out.erase(absorbed_l_out_it);
+            } else if (ring_phone_autostart && phone_block_fused &&
                     !phone_region_fused &&
                     (first_fused_layer == 11 || first_fused_layer == 27)) {
                 // The final input copy is already complete by this stage.
