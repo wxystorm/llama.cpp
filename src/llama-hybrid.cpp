@@ -10686,6 +10686,28 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             model.phone_full_return_stream ?
                 "RELEASE_ON_COMPLETE_FRAME" : "INTERVAL_EDGE_COMPLETION");
         LLAMA_LOG_INFO(
+            "[REGION_RING_PLAN_TRANSFER_DIAG] mode=APPLY_WIDE "
+            "directions=PC_LOCAL,PC_TO_PHONE,PHONE_TO_PC "
+            "events=%d,%d,%d stage_copy_proxy=%d,%d,%d "
+            "service_ms=%.3f,%.3f,%.3f "
+            "lane_busy_ms=%.3f,%.3f,%.3f "
+            "shared_phone_link=%d phone_return_stream=%d "
+            "policy=DIAGNOSTIC_ONLY\n",
+            best.transfer_event_count[0],
+            best.transfer_event_count[1],
+            best.transfer_event_count[2],
+            best.stage_copy_call_proxy_count[0],
+            best.stage_copy_call_proxy_count[1],
+            best.stage_copy_call_proxy_count[2],
+            best.transfer_service_ms[0],
+            best.transfer_service_ms[1],
+            best.transfer_service_ms[2],
+            best.transfer_busy_ms[0],
+            best.transfer_busy_ms[1],
+            best.transfer_busy_ms[2],
+            model.shared_phone_link ? 1 : 0,
+            model.phone_full_return_stream ? 1 : 0);
+        LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
             "source=%s layout=%s baseline_layout=%s "
             "cycles=%d first_C=%d first_G=%d first_P=%d XC=%d XG=%d XP=%d "
@@ -10822,6 +10844,28 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << best.busy_ms[2]
                             << ",\"prepare_pred_ms\":"
                             << best.prepare_busy_ms
+                            << ",\"transfer_events_pred\":["
+                            << best.transfer_event_count[0] << ","
+                            << best.transfer_event_count[1] << ","
+                            << best.transfer_event_count[2] << "]"
+                            << ",\"stage_copy_calls_proxy\":["
+                            << best.stage_copy_call_proxy_count[0] << ","
+                            << best.stage_copy_call_proxy_count[1] << ","
+                            << best.stage_copy_call_proxy_count[2] << "]"
+                            << ",\"transfer_service_pred_ms\":["
+                            << best.transfer_service_ms[0] << ","
+                            << best.transfer_service_ms[1] << ","
+                            << best.transfer_service_ms[2] << "]"
+                            << ",\"transfer_lane_busy_pred_ms\":["
+                            << best.transfer_busy_ms[0] << ","
+                            << best.transfer_busy_ms[1] << ","
+                            << best.transfer_busy_ms[2] << "]"
+                            << ",\"phone_return_stream\":"
+                            << (model.phone_full_return_stream ?
+                                "true" : "false")
+                            << ",\"shared_phone_link\":"
+                            << (model.shared_phone_link ?
+                                "true" : "false")
                             << ",\"prefix_cycles\":"
                             << best.prefix_cycles;
                     if (best.prefix_cycles > 0) {
