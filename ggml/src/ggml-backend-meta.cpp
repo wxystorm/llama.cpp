@@ -53,6 +53,12 @@ bool ggml_backend_meta_phone_full_stream_return_layer_matches(int layer) {
     return layer >= 0 && ggml_meta_phone_full_stream_return_layer == layer;
 }
 
+bool ggml_backend_meta_phone_full_stream_skip_terminal_get(
+        bool phone_to_pc, bool phone_owner_exit, bool final_subgraph) {
+    return ggml_meta_phone_full_stream_return_layer >= 0 &&
+           phone_to_pc && phone_owner_exit && final_subgraph;
+}
+
 static void meta_debug_tensor_data(const ggml_tensor * tensor, const char * tag) {
     if (tensor == nullptr || tensor->type != GGML_TYPE_F32) {
         return;
@@ -9164,7 +9170,7 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     // avoid a redundant synchronous GET_TENSOR to the PC.
                     if (ggml_backend_meta_phone_full_stream_return_layer_matches(ring_layer)) {
                         handled = true;
-                        GGML_LOG_DEBUG(
+                        GGML_LOG_INFO(
                             "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
                             "path=RING_EXIT action=SKIP_GET\n",
                             ring_layer, i);
@@ -11155,9 +11161,12 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 // Keep the Phone residual ADD and device fence above, then
                 // hand the Phone-resident output directly to the outer Arena
                 // capture. Internal Phone->PC handoffs are never suppressed.
-                if (phone_owner_exit && external_backend_handoff &&
-                        ggml_backend_meta_phone_full_stream_return_layer_matches(layer)) {
-                    GGML_LOG_DEBUG(
+                if (external_backend_handoff &&
+                        (ggml_backend_meta_phone_full_stream_return_layer_matches(layer) ||
+                         ggml_backend_meta_phone_full_stream_skip_terminal_get(
+                             true, phone_owner_exit,
+                             i + 1 == backend_ctx->n_subgraphs))) {
+                    GGML_LOG_INFO(
                         "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
                         "path=PHONE_OWNER_EXIT action=SKIP_GET\n",
                         layer, i);
@@ -11296,6 +11305,24 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     const int64_t source_fence_start_us = ggml_time_us();
                     ggml_backend_synchronize(bcj_src.backend);
                     source_fence_us = ggml_time_us() - source_fence_start_us;
+                }
+
+                // A Phone Full terminal output is consumed by the outer
+                // Arena Receiver. Suppressing this one synchronous GET avoids
+                // returning the same chunk twice. Do not touch intermediate
+                // SG handoffs or the final (non-streamed) Phone Region.
+                if (ggml_backend_meta_phone_full_stream_skip_terminal_get(
+                        active_backend == 1 && j_dst == 0,
+                        phone_owner_exit,
+                        i + 1 == backend_ctx->n_subgraphs)) {
+                    GGML_LOG_INFO(
+                        "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
+                        "path=GENERIC_TERMINAL tensor=%s bytes=%zu "
+                        "action=SKIP_GET\n",
+                        ggml_meta_phone_full_stream_return_layer, i,
+                        nodes[active_backend]->name,
+                        ggml_nbytes(nodes[active_backend]));
+                    continue;
                 }
 
                 const int64_t copy_start_us = ggml_time_us();
@@ -14250,6 +14277,23 @@ if (phone_status != GGML_STATUS_SUCCESS) {
             const auto & bcj = backend_ctx->backend_configs[j];
             const ggml_tensor * node = bcj.cgraphs[i].cgraph_main->nodes[bcj.cgraphs[i].cgraph_main->n_nodes - 1];
             has_data[j] = (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+        }
+        // A Phone-only final SG has no PC-owned contribution to reduce.
+        // Its completed Phone tensor is already the exact Arena source.
+        if (n_backends == 2 && !has_data[0] && has_data[1] &&
+                ggml_backend_meta_phone_full_stream_skip_terminal_get(
+                    true, true, i + 1 == backend_ctx->n_subgraphs)) {
+            const auto & phone_sg =
+                backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+            const ggml_tensor * phone_output =
+                phone_sg->nodes[phone_sg->n_nodes - 1];
+            GGML_LOG_INFO(
+                "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
+                "path=ALLREDUCE_TERMINAL tensor=%s bytes=%zu "
+                "action=SKIP_GET\n",
+                ggml_meta_phone_full_stream_return_layer, i,
+                phone_output->name, ggml_nbytes(phone_output));
+            return GGML_STATUS_SUCCESS;
         }
         if (pipeline_debug && i == 1 && n_backends == 2) {
             for (size_t j = 0; j < n_backends; ++j) {

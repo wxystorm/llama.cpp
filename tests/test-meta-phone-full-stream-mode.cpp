@@ -17,11 +17,16 @@ int main() {
     REQUIRE(ggml_backend_meta_set_phone_full_stream_return_layer(-1) == -1);
     REQUIRE(!ggml_backend_meta_phone_full_stream_return_layer_matches(-1));
     REQUIRE(!ggml_backend_meta_phone_full_stream_return_layer_matches(12));
+    REQUIRE(!ggml_backend_meta_phone_full_stream_skip_terminal_get(true, true, true));
 
     const int outer = ggml_backend_meta_set_phone_full_stream_return_layer(12);
     REQUIRE(outer == -1);
     REQUIRE(ggml_backend_meta_phone_full_stream_return_layer_matches(12));
     REQUIRE(!ggml_backend_meta_phone_full_stream_return_layer_matches(26));
+    REQUIRE(ggml_backend_meta_phone_full_stream_skip_terminal_get(true, true, true));
+    REQUIRE(!ggml_backend_meta_phone_full_stream_skip_terminal_get(false, true, true));
+    REQUIRE(!ggml_backend_meta_phone_full_stream_skip_terminal_get(true, false, true));
+    REQUIRE(!ggml_backend_meta_phone_full_stream_skip_terminal_get(true, true, false));
 
     // A parallel worker must start in legacy mode even while this worker
     // holds an active Phone Full return scope.

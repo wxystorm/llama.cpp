@@ -579,6 +579,10 @@ extern "C" {
     // copies and the final Phone Region retain their normal behavior.
     GGML_API int  ggml_backend_meta_set_phone_full_stream_return_layer(int last_layer);
     GGML_API bool ggml_backend_meta_phone_full_stream_return_layer_matches(int layer);
+    // Suppress only the terminal Phone->PC copy when the current thread's
+    // non-final Phone Full stage is returning via the Arena stream.
+    GGML_API bool ggml_backend_meta_phone_full_stream_skip_terminal_get(
+        bool phone_to_pc, bool phone_owner_exit, bool final_subgraph);
 
     GGML_API bool ggml_backend_meta_tensor_profile_reset(ggml_backend_t backend);
     GGML_API bool ggml_backend_meta_set_tensor_phone_primary_layers(

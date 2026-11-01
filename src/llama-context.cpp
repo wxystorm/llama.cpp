@@ -2675,10 +2675,19 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             (void) ggml_backend_meta_set_phone_full_stream_return_layer(previous_layer);
         }
     };
-    const meta_phone_full_stream_return_scope meta_stream_scope(
+    const bool stream_meta_return =
         llama_region_ring_tls_phone_full_stream.enabled &&
         stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        stage_output != nullptr ? stage.layer_end - 1 : -1);
+        stage_output != nullptr;
+    const meta_phone_full_stream_return_scope meta_stream_scope(
+        stream_meta_return ? stage.layer_end - 1 : -1);
+    if (stream_meta_return && block_index == 0) {
+        LLAMA_LOG_INFO(
+            "[P2C_STREAM_META_SCOPE] stage=%zu layers=[%d,%d) "
+            "return_layer=%d status=ACTIVE\n",
+            stage_index, stage.layer_begin, stage.layer_end,
+            stage.layer_end - 1);
+    }
 
     const int n_splits = ggml_backend_sched_get_n_splits(sched_use);
     const bool gpu_weight_streaming =
