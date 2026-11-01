@@ -4377,39 +4377,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t get_tensor_bytes = 0;
         };
         std::vector<phone_rpc_region_counter> phone_rpc_regions(stages.size());
-        ggml_backend_t phone_rpc_backend = nullptr;
-        ggml_backend_rpc_get_snapshot_stats_t phone_rpc_getter = nullptr;
-        // One Phone Full FIFO owns these snapshots. Directional Tensor mode
-        // has independent return workers, so skip attribution in that mode.
-        if (!directional_runtime && pc_phone_overlap &&
-                experiment_meta_backend != nullptr &&
-                ggml_backend_meta_n_backends(experiment_meta_backend) > 1) {
-            ggml_backend_t candidate =
-                ggml_backend_meta_simple_backend(experiment_meta_backend, 1);
-            ggml_backend_dev_t rpc_dev =
-                candidate != nullptr ? ggml_backend_get_device(candidate) : nullptr;
-            ggml_backend_reg_t rpc_reg =
-                rpc_dev != nullptr ? ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
-            if (rpc_reg != nullptr) {
-                auto getter = reinterpret_cast<ggml_backend_rpc_get_snapshot_stats_t>(
-                    ggml_backend_reg_get_proc_address(
-                        rpc_reg, GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC));
-                ggml_backend_rpc_snapshot_stats probe {};
-                if (getter != nullptr && getter(candidate, &probe)) {
-                    phone_rpc_backend = candidate;
-                    phone_rpc_getter = getter;
-                }
-            }
-        }
-        // Opt-in A/B path. Keep the legacy GET and directional Tensor
-        // return routes untouched until Full Phone correctness is proven.
+        // Opt-in Stream must not depend on metrics.jsonl being enabled or
+        // on the RPC stats callback. Discover the actual RPC child of Meta
+        // whenever a non-final Phone Region needs to return a frame.
         const char * stream_env = std::getenv(
             "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
         const bool phone_stream_requested =
             stream_env != nullptr && std::atoi(stream_env) != 0;
-        // A single G->C->P pass ends on Phone and has no Phone->PC
-        // boundary. Do not require a P2C stream subscription when no
-        // non-final Phone stage can ever publish a return frame.
         bool has_phone_full_return = false;
         for (size_t i = 0; i + 1 < stages.size(); ++i) {
             if (stages[i].kind == llama_hybrid_runtime_stage_kind::PHONE) {
@@ -4417,6 +4391,42 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 break;
             }
         }
+        ggml_backend_t phone_rpc_backend = nullptr;
+        ggml_backend_rpc_get_snapshot_stats_t phone_rpc_getter = nullptr;
+        if (!directional_runtime && pc_phone_overlap) {
+            ggml_backend_t meta_for_phone = experiment_meta_backend;
+            if (meta_for_phone == nullptr &&
+                    phone_stream_requested && has_phone_full_return) {
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (backend != nullptr && ggml_backend_is_meta(backend)) {
+                        meta_for_phone = backend;
+                        break;
+                    }
+                }
+            }
+            if (meta_for_phone != nullptr &&
+                    ggml_backend_meta_n_backends(meta_for_phone) > 1) {
+                ggml_backend_t candidate =
+                    ggml_backend_meta_simple_backend(meta_for_phone, 1);
+                ggml_backend_dev_t rpc_dev = candidate != nullptr ?
+                    ggml_backend_get_device(candidate) : nullptr;
+                ggml_backend_reg_t rpc_reg = rpc_dev != nullptr ?
+                    ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+                if (rpc_reg != nullptr) {
+                    phone_rpc_backend = candidate;
+                    auto getter =
+                        reinterpret_cast<ggml_backend_rpc_get_snapshot_stats_t>(
+                            ggml_backend_reg_get_proc_address(
+                                rpc_reg, GGML_BACKEND_RPC_GET_SNAPSHOT_STATS_PROC));
+                    ggml_backend_rpc_snapshot_stats probe {};
+                    if (getter != nullptr && getter(candidate, &probe)) {
+                        phone_rpc_getter = getter;
+                    }
+                }
+            }
+        }
+        // Opt-in A/B path. Keep legacy GET and directional Tensor untouched.
+        // The single-Cycle last-Phone case has no Phone->PC boundary at all.
         if (phone_stream_requested && !has_phone_full_return) {
             LLAMA_LOG_INFO(
                 "[P2C_STREAM] phase=SKIP reason=NO_PHONE_TO_PC_BOUNDARY "
