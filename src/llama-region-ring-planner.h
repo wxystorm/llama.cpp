@@ -1040,6 +1040,12 @@ inline bool simulate(const model & m,
     std::vector<int> live_slots(regions.size(), 0);
     std::vector<bool> region_done(regions.size(), false);
     std::array<double, 3> busy_ms {}, transfer_busy_ms {};
+    // In duplex mode, each physical transfer has remaining solo-time work,
+    // rather than a precommitted EDGE completion timestamp. Changing from
+    // one active direction to two (or back) changes its instantaneous rate.
+    std::array<int, 3> active_duplex_edges {{-1, -1, -1}};
+    std::array<double, 3> duplex_remaining_ms {};
+    double duplex_overlap_ms = 0.0;
     std::deque<int> weight_queue;
     bool weight_busy = false;
     // A single shared PREPARE lane approximates region graph/split setup and
@@ -1071,6 +1077,33 @@ inline bool simulate(const model & m,
         t.queued = true;
         ready_queues[(size_t) t.queue_device].push_back(id);
     };
+    // Publish one complete frame to all consumers. Legacy Phone GET owns
+    // the Phone worker until this event; asynchronous Arena Stream does not.
+    auto complete_edge = [&](int edge_id) -> bool {
+        const auto & e = edges[(size_t) edge_id];
+        link_busy[(size_t) e.lane] = false;
+        if (e.release_phone_worker_on_complete) {
+            device_busy[(size_t) device::PHONE] = false;
+        }
+        const auto publish = [&](int consumer_id) {
+            auto & consumer = tasks[(size_t) consumer_id];
+            if (--consumer.inputs < 0) {
+                return false;
+            }
+            offer(consumer_id);
+            return true;
+        };
+        if (!publish(e.consumer)) {
+            return false;
+        }
+        for (const int consumer_id : e.extra_consumers) {
+            if (!publish(consumer_id)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
     auto claimable = [&](int id) -> bool {
         const auto & t = tasks[(size_t) id];
         const int r = t.region;
@@ -1196,7 +1229,14 @@ inline bool simulate(const model & m,
             it.started = true;
             link_busy[lane] = true;
             transfer_busy_ms[lane] += it.duration;
-            events.push({now + it.duration, edge_id, event_kind::EDGE});
+            if (m.duplex_phone_contention && lane >= 1) {
+                // Both directions are independent queues; completion is
+                // projected from the remaining work later in this tick.
+                active_duplex_edges[lane] = edge_id;
+                duplex_remaining_ms[lane] = it.duration;
+            } else {
+                events.push({now + it.duration, edge_id, event_kind::EDGE});
+            }
             scheduled = true;
         }
 
@@ -1298,41 +1338,69 @@ inline bool simulate(const model & m,
             scheduled = true;
         }
 
-        if (events.empty()) {
+        // Find the earliest task/weight/local-link completion OR a phone
+        // transport completion. A duplex edge is not pinned to a deadline:
+        // each active link advances in solo-ms units at 1/slowdown, with
+        // slowdown recomputed on every change of active directions.
+        const bool c2p_active = active_duplex_edges[1] >= 0;
+        const bool p2c_active = active_duplex_edges[2] >= 0;
+        double c2p_slowdown = 1.0;
+        double p2c_slowdown = 1.0;
+        if (c2p_active && p2c_active) {
+            const auto & c2p = edges[(size_t) active_duplex_edges[1]];
+            const auto & p2c = edges[(size_t) active_duplex_edges[2]];
+            if (!m.duplex_slowdown(
+                    c2p.payload_bytes, p2c.payload_bytes,
+                    c2p_slowdown, p2c_slowdown) ||
+                    !std::isfinite(c2p_slowdown) ||
+                    !std::isfinite(p2c_slowdown) ||
+                    c2p_slowdown <= 0.0 || p2c_slowdown <= 0.0) {
+                return reject("DUPLEX_PROFILE_INVALID");
+            }
+            // A slowdown below 1 in the small-packet measurements is
+            // measurement jitter, not reliable network acceleration.
+            c2p_slowdown = std::max(1.0, c2p_slowdown);
+            p2c_slowdown = std::max(1.0, p2c_slowdown);
+        }
+
+        double next_at = events.empty() ?
+            std::numeric_limits<double>::infinity() : events.top().at;
+        if (c2p_active) {
+            next_at = std::min(
+                next_at, now + duplex_remaining_ms[1] * c2p_slowdown);
+        }
+        if (p2c_active) {
+            next_at = std::min(
+                next_at, now + duplex_remaining_ms[2] * p2c_slowdown);
+        }
+        if (!std::isfinite(next_at) || next_at < now - 1e-8) {
             return reject(scheduled ? "INTERNAL_EVENT_ERROR" :
                                       "SLOT_OR_KV_DEADLOCK");
         }
-
-        now = events.top().at;
-        if (!std::isfinite(now)) {
-            return reject("TIME_NONFINITE");
+        const double elapsed_ms = std::max(0.0, next_at - now);
+        if (c2p_active) {
+            duplex_remaining_ms[1] = std::max(
+                0.0, duplex_remaining_ms[1] -
+                    elapsed_ms / c2p_slowdown);
         }
+        if (p2c_active) {
+            duplex_remaining_ms[2] = std::max(
+                0.0, duplex_remaining_ms[2] -
+                    elapsed_ms / p2c_slowdown);
+        }
+        if (c2p_active && p2c_active) {
+            duplex_overlap_ms += elapsed_ms;
+        }
+        now = next_at;
 
         // Process every completion at this timestamp before claiming more work.
-        while (!events.empty() && events.top().at <= now) {
+        while (!events.empty() && events.top().at <= now + 1e-9) {
             const event current = events.top();
             events.pop();
 
             if (current.kind == event_kind::EDGE) {
-                const auto & e = edges[(size_t) current.id];
-                link_busy[(size_t) e.lane] = false;
-                // A full Phone frame is a single network event with fan-out:
-                // no PC Chunk can run from a partial TCP frame.
-                auto publish = [&](int consumer_id) {
-                    auto & consumer = tasks[(size_t) consumer_id];
-                    if (--consumer.inputs < 0) {
-                        return false;
-                    }
-                    offer(consumer_id);
-                    return true;
-                };
-                if (!publish(e.consumer)) {
+                if (!complete_edge(current.id)) {
                     return reject("EDGE_COUNT_UNDERFLOW");
-                }
-                for (const int consumer_id : e.extra_consumers) {
-                    if (!publish(consumer_id)) {
-                        return reject("EDGE_COUNT_UNDERFLOW");
-                    }
                 }
                 continue;
             }
@@ -1354,8 +1422,11 @@ inline bool simulate(const model & m,
                 return reject("DUPLICATE_TASK_DONE");
             }
             t.done = true;
+            bool keep_phone_worker_for_get = false;
             for (int edge_id : outgoing_edges[(size_t) current.id]) {
                 const int lane = edges[(size_t) edge_id].lane;
+                keep_phone_worker_for_get |=
+                    edges[(size_t) edge_id].release_phone_worker_on_complete;
                 if (m.phone_full_return_stream) {
                     ready_links_fifo[(size_t) lane].push_back(edge_id);
                 } else {
@@ -1364,7 +1435,9 @@ inline bool simulate(const model & m,
             }
             for (int resource = 0; resource < 3; ++resource) {
                 if ((t.resource_mask &
-                        (1u << (unsigned) resource)) != 0) {
+                        (1u << (unsigned) resource)) != 0 &&
+                        !(resource == (int) device::PHONE &&
+                          keep_phone_worker_for_get)) {
                     device_busy[(size_t) resource] = false;
                 }
             }
@@ -1430,6 +1503,24 @@ inline bool simulate(const model & m,
 
             offer(t.next);
         }
+
+        // Complete one/both dynamic phone links at their projected finish.
+        // When one finishes first, the other's remaining work automatically
+        // uses solo speed on the following iteration.
+        if (m.duplex_phone_contention) {
+            for (int lane = 1; lane <= 2; ++lane) {
+                const int edge_id = active_duplex_edges[(size_t) lane];
+                if (edge_id < 0 ||
+                        duplex_remaining_ms[(size_t) lane] > 1e-7) {
+                    continue;
+                }
+                active_duplex_edges[(size_t) lane] = -1;
+                duplex_remaining_ms[(size_t) lane] = 0.0;
+                if (!complete_edge(edge_id)) {
+                    return reject("DUPLEX_EDGE_COUNT_UNDERFLOW");
+                }
+            }
+        }
     }
 
     if (m.slot_pool > 0 &&
@@ -1452,6 +1543,7 @@ inline bool simulate(const model & m,
                  busy_ms[(int) device::GPU]);
     c.busy_ms = busy_ms;
     c.transfer_busy_ms = transfer_busy_ms;
+    c.duplex_overlap_ms = duplex_overlap_ms;
     c.prepare_busy_ms = prepare_busy_ms;
     c.weight_prepare_busy_ms = weight_prepare_busy_ms;
     c.weight_h2d_busy_ms = weight_h2d_busy_ms;
