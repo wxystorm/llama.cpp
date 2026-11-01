@@ -1931,10 +1931,10 @@ inline double prefix_cycle_max_error(
 // three cycles need not have identical C/G widths (the fixed baseline ends in
 // G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
 // service rates; aggregate service demand is kept separately.
-// Legacy GET charges each actual intersecting token interval at a boundary.
-// Phone Full Arena Stream instead charges one complete payload per Phone
-// source Chunk; its receiver completes ALL overlapping PC dependencies only
-// after that frame is received. The DAG simulator determines temporal order.
+// Every cross-device wire packet has one producer-GET or consumer-SET
+// granularity, independent of the number of token interval intersections.
+// Arena Stream additionally releases the Phone worker while bytes are in
+// flight; legacy GET holds that worker. The DAG simulator handles timing.
 inline bool region_ring_handoff_ms_per_token(
         const model & m, device source, device target,
         int source_chunk, int target_chunk, double & per_token_ms) {
@@ -1945,22 +1945,25 @@ inline bool region_ring_handoff_ms_per_token(
         return false;
     }
     double total_ms = 0.0;
-    // The opt-in Phone Full stream publishes one entire source Chunk per
-    // TCP frame, even when the following PC Region uses smaller Chunks.
-    // Avoid charging multiple wire-startup costs for that one payload.
-    if (m.phone_full_return_stream &&
-            source == device::PHONE && target != device::PHONE) {
-        for (int begin = 0; begin < m.tokens; begin += source_chunk) {
-            const int n = std::min(source_chunk, m.tokens - begin);
-            double frame_ms = 0.0;
+    const bool one_per_source =
+        (source == device::PHONE && target != device::PHONE) ||
+        (source == device::GPU && target == device::CPU);
+    const bool one_per_destination =
+        (source != target && target == device::PHONE) ||
+        (source == device::CPU && target == device::GPU);
+    if (one_per_source || one_per_destination) {
+        const int x = one_per_source ? source_chunk : target_chunk;
+        for (int begin = 0; begin < m.tokens; begin += x) {
+            const int n = std::min(x, m.tokens - begin);
+            double packet_ms = 0.0;
             if (!m.transfer_ms(
                     source, target,
                     (size_t) n * (size_t) m.hidden * sizeof(float),
-                    frame_ms) ||
-                    !std::isfinite(frame_ms) || frame_ms < 0.0) {
+                    packet_ms) ||
+                    !std::isfinite(packet_ms) || packet_ms < 0.0) {
                 return false;
             }
-            total_ms += frame_ms;
+            total_ms += packet_ms;
         }
         per_token_ms = total_ms / m.tokens;
         return std::isfinite(per_token_ms) && per_token_ms >= 0.0;
