@@ -20835,6 +20835,10 @@ auto prefill_norm_sg_has_prework =
                     const auto & phone1 =
                         backend_ctx->backend_configs[1].cgraphs[next_sg];
                     const bool contiguous =
+                        pc0.cgraph_main != nullptr &&
+                        pc1.cgraph_main != nullptr &&
+                        phone0.cgraph_main != nullptr &&
+                        phone1.cgraph_main != nullptr &&
                         pc0.offset + pc0.cgraph_main->n_nodes ==
                             pc1.offset &&
                         phone0.offset + phone0.cgraph_main->n_nodes ==
@@ -20886,14 +20890,30 @@ auto prefill_norm_sg_has_prework =
                             rejected_sg = sg;
                             rejected_node = k;
 
-                            if (t->ne[1] <= 1 ||
-                                    (t->flags &
-                                     (GGML_TENSOR_FLAG_META_SEND_READY |
-                                      GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0 ||
-                                    ggml_backend_meta_get_split_state(
-                                        t, false).axis ==
-                                        GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                reject_reason = "SPLIT_OR_DECODE_NODE";
+                            // Simple-backend copies are NOT Meta tensors:
+                            // query split ownership on the corresponding
+                            // node in the original Meta graph, never on t.
+                            const int outer_index =
+                                backend_ctx->backend_configs[1]
+                                    .cgraphs[sg].offset + k;
+                            const ggml_tensor * outer =
+                                outer_index >= 0 &&
+                                outer_index < cgraph->n_nodes ?
+                                    cgraph->nodes[outer_index] : nullptr;
+                            if (outer == nullptr || outer->buffer == nullptr ||
+                                    !ggml_backend_buffer_is_meta(outer->buffer)) {
+                                reject_reason = "META_SOURCE_NOT_AVAILABLE";
+                                break;
+                            }
+                            const bool partial =
+                                ggml_backend_meta_get_split_state(
+                                    outer, false).axis ==
+                                    GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+                            if ((t->flags &
+                                 (GGML_TENSOR_FLAG_META_SEND_READY |
+                                  GGML_TENSOR_FLAG_META_SEND_PARTIAL)) != 0 ||
+                                    partial) {
+                                reject_reason = "DIRECTIONAL_OR_PARTIAL_NODE";
                                 break;
                             }
                             if (sg == next_sg &&
