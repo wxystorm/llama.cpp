@@ -11139,6 +11139,10 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
     try {
         regions = model.hybrid_ring_plan_layout.empty() ?
             llama_region_ring_from_env(model.hparams.n_layer()) :
+        model.hybrid_ring_plan_mode == "APPLY_WIDE" ?
+            llama_region_ring_parse_apply_wide_layout(
+                model.hybrid_ring_plan_layout,
+                model.hparams.n_layer()) :
             llama_region_ring_parse(
                 model.hybrid_ring_plan_layout,
                 model.hparams.n_layer());
