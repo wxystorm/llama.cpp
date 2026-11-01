@@ -7986,13 +7986,22 @@ void rpc_server::phone_stage_binding_preflight(
         std::strstr(last->name, "result") != nullptr ? 1 : 0;
     plan.topology_signature = structural_sig;
     const auto status = plan.scratch.build(transient, {});
-    if (status != ggml_phone_stage::status::ok || !plan.tokens) {
+    if (status != ggml_phone_stage::status::ok ||
+        transient.empty() || !plan.tokens) {
         GGML_LOG_INFO(
             "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
-            "layer=%d nodes=%d transient=%zu status=%d\n",
-            first_layer, graph->n_nodes, transient.size(), (int) status);
+            "layer=%d nodes=%d compute_roots=%zu "
+            "no_storage=%zu views=%zu excluded_ops=%zu "
+            "overlap_external=%zu protected_ranges=%zu "
+            "reason=%s status=%d\n",
+            first_layer, graph->n_nodes, compute_roots,
+            excluded_unallocated, excluded_view, excluded_ops,
+            excluded_overlap, protected_ranges.size(),
+            transient.empty() ? "NO_TRANSIENT" : "INVALID_LAYOUT",
+            (int) status);
         return;
     }
+    const uint32_t registered_tokens = plan.tokens;
     auto & plans = phone_stage_plan_cache[device];
     // Keep only a small bounded set: the caller is still free to choose
     // separate full/tail/last-layer variants as actual graph shapes dictate.
@@ -8015,12 +8024,16 @@ void rpc_server::phone_stage_binding_preflight(
             "layer=%d..%d tokens=%u nodes=%d "
             "topology_sig=%" PRIu64 " binding_sig=%" PRIu64 " "
             "graph_uid=%" PRIu64 " new_template=%d "
-            "transient=%zu slot_bytes=%zu total_two_slots=%zu "
+            "transient=%zu compute_roots=%zu "
+            "shared_arena_disjoint=%zu overlap_external=%zu "
+            "protected_ranges=%zu slot_bytes=%zu total_two_slots=%zu "
             "mode=PLAN_ONLY status=OK\n",
-            first_layer, max_layer, static_cast<unsigned>(plan.tokens),
+            first_layer, max_layer, static_cast<unsigned>(registered_tokens),
             graph->n_nodes, structural_sig, binding_sig, graph_uid,
             new_template ? 1 : 0, transient.size(),
-            pool.bytes_per_slot(), pool.bytes_per_slot() * 2);
+            compute_roots, shared_arena_disjoint, excluded_overlap,
+            protected_ranges.size(), pool.bytes_per_slot(),
+            pool.bytes_per_slot() * 2);
 
         // Explicit opt-in PREP only. Never rebind current graphs here:
         // cached OpenCL extra/view and live KV/output ownership are still
