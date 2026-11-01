@@ -9240,6 +9240,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     model.slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     model.max_tail = 12;
     model.shared_phone_link = true; // Conservative Wi-Fi contention.
+    const char * phone_stream_env = std::getenv(
+        "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
+    model.phone_full_return_stream =
+        phone_stream_env != nullptr && std::atoi(phone_stream_env) != 0;
+    // Stream uses the same Phone->PC profiled bandwidth curve as a proxy.
+    // Its transport EVENT count and dependency fan-out are now frame-exact;
+    // Phone Arena capture/readback is still part of compute-side calibration.
     // Runtime validation now shows CPU/CUDA compute are independently gated;
     // GPU/Phone CPU wait is no longer the execution bottleneck.
     model.pc_compute_gate = false;
@@ -10417,7 +10424,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
 
         bool boundary_tensor_selected = false;
         if (!forced_ab) {
-            if (boundary_memory_feasible &&
+            // The new Full-Frame Sender and directional Tensor return workers
+            // are mutually exclusive runtime modes; do not score impossible
+            // directional refiner candidates while the Full stream is on.
+            if (!model.phone_full_return_stream &&
+                    boundary_memory_feasible &&
                     model.directional_ms &&
                     model.directional_prepare_ms) {
                 model.region_memory_feasible =
@@ -10571,6 +10582,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.xc == baseline_chunk &&
             best.xg == baseline_chunk &&
             best.xp == baseline_chunk;
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PLAN_P2C_MODEL] mode=APPLY_WIDE "
+            "return=%s frames=%d bytes=%" PRIu64 " "
+            "sender=%s dependencies=%s transfer_curve=PHONE_TO_PC_PROXY "
+            "status=MODELED\n",
+            model.phone_full_return_stream ?
+                "PHONE_FULL_ARENA_FRAME" : "LEGACY_INTERVAL_GET",
+            best.phone_full_stream_frames, best.phone_full_stream_bytes,
+            model.phone_full_return_stream ?
+                "PUBLICATION_FIFO_SINGLE_LANE" : "LEGACY_EDGE_ORDER",
+            model.phone_full_return_stream ?
+                "RELEASE_ON_COMPLETE_FRAME" : "INTERVAL_EDGE_COMPLETION");
         LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SELECTED] mode=APPLY_WIDE "
             "source=%s layout=%s baseline_layout=%s "
