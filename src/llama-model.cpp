@@ -1704,7 +1704,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             region_ring ?
                 (hybrid_ring_plan_layout.empty() ?
                     llama_region_ring_from_env(n_layer) :
-                    llama_region_ring_parse(hybrid_ring_plan_layout,n_layer)) :
+                 hybrid_ring_plan_mode == "APPLY_WIDE" ?
+                    llama_region_ring_parse_apply_wide_layout(
+                        hybrid_ring_plan_layout, n_layer) :
+                    llama_region_ring_parse(
+                        hybrid_ring_plan_layout, n_layer)) :
                 std::vector<llama_region_ring_region>{};
         const bool directional_ring =
             region_ring &&
