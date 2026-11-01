@@ -20964,7 +20964,10 @@ auto prefill_norm_sg_has_prework =
                             "pc_mirror=%zu action=FUSE status=OK\n",
                             i, next_sg, first_layer,
                             phone_compute_nodes, mirrored_pc_nodes);
-                    } else if (pipeline_debug) {
+                    } else {
+                        // The opt-in has at most one fallback per candidate
+                        // Region/Chunk; keep a compact reason without enabling
+                        // the expensive global pipeline debug trace.
                         ggml_cgraph * rejected =
                             backend_ctx->backend_configs[1]
                                 .cgraphs[rejected_sg].cgraph_main;
@@ -20973,7 +20976,7 @@ auto prefill_norm_sg_has_prework =
                             rejected_node < rejected->n_nodes ?
                                 rejected->nodes[rejected_node]->name :
                                 "(none)";
-                        printf(
+                        GGML_LOG_INFO(
                             "[PHONE_FULL_REGION_GRAPH] event=FALLBACK "
                             "form=PHONE_LOCAL sg=%zu..%zu layer=%d "
                             "failed_sg=%zu node=%d name=%s reason=%s\n",
