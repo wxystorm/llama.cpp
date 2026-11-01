@@ -5396,6 +5396,20 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
         stats.total_us += copy_us;
         stats.max_us = std::max(stats.max_us, copy_us);
 
+        // Lightweight diagnostic: once per actual Phone->PC Meta copy while
+        // the outer Phone Full Arena return owns this worker. This also
+        // catches handoff branches not yet covered by the skip policy.
+        if (j_src == 1 && j_dst == 0 &&
+                ggml_meta_phone_full_stream_return_layer >= 0) {
+            GGML_LOG_INFO(
+                "[P2C_STREAM_META_GET] return_layer=%d sg=%zu/%zu "
+                "tensor=%s bytes=%zu copy_ms=%.3f "
+                "status=LEGACY_COPY_OBSERVED\n",
+                ggml_meta_phone_full_stream_return_layer,
+                i, backend_ctx->n_subgraphs,
+                node_src->name, copy_bytes, copy_us / 1000.0);
+        }
+
         const bool is_result_norm =
             std::strncmp(node_src->name, "result_norm", 11) == 0;
         if (pipeline_debug && (reduce_copy_detail_count < 4 || is_result_norm)) {
@@ -10932,6 +10946,24 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     if (pipeline_debug) {
                         printf("[PHONE_BLOCK_WAIT_END] layer=%d t=%" PRId64 " dur=%.3f ms\n",
                                deferred_phone_exit_layer, wait_end_us, (wait_end_us - wait_begin_us) / 1000.0);
+                    }
+
+                    // This is the deferred terminal l_out handoff, not an
+                    // intermediate Phone->PC edge. The Phone result has
+                    // already completed and been fenced above. When the
+                    // outer non-final Phone Full worker owns its Arena return,
+                    // copying this same l_out to PC would issue a redundant
+                    // blocking GET_TENSOR before the Arena Capture.
+                    if (ggml_backend_meta_phone_full_stream_return_layer_matches(
+                            deferred_phone_exit_layer)) {
+                        GGML_LOG_INFO(
+                            "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
+                            "path=DEFERRED_FINAL_L_OUT tensor=%s bytes=%zu "
+                            "action=SKIP_GET\n",
+                            deferred_phone_exit_layer, i,
+                            nodes[1]->name, ggml_nbytes(nodes[1]));
+                        deferred_phone_exit_layer = -1;
+                        return GGML_STATUS_SUCCESS;
                     }
 
                     auto & bcj_dst = backend_ctx->backend_configs[0];
