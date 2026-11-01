@@ -8114,6 +8114,7 @@ void rpc_server::phone_stage_binding_preflight(
         return;
     }
     const uint32_t registered_tokens = plan.tokens;
+    const size_t planned_scratch_bytes = plan.scratch.required_bytes;
     auto & plans = phone_stage_plan_cache[device];
     // Keep only a small bounded set: the caller is still free to choose
     // separate full/tail/last-layer variants as actual graph shapes dictate.
@@ -8289,7 +8290,7 @@ void rpc_server::phone_stage_binding_preflight(
             new_template ? 1 : 0, growing_template ? 1 : 0,
             transient.size(), compute_roots, shared_arena_disjoint,
             excluded_overlap, protected_ranges.size(),
-            plan.scratch.required_bytes, stage_used_span, stage_last,
+            planned_scratch_bytes, stage_used_span, stage_last,
             pool.bytes_per_slot(),
             pool.bytes_per_slot() * 2);
 
