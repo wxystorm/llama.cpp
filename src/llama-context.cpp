@@ -5446,6 +5446,23 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                         ++bank.bank_generation;
                                     }
                                     bank.bank_ready = true;
+                                    // A tiny warmup may restore both initial
+                                    // Banks using the demand path. Keep the
+                                    // cached preload flag consistent with
+                                    // actual Region ownership. If rank2 has
+                                    // evicted Bank A, this correctly remains
+                                    // false until load-time reinitialization.
+                                    const std::array<bool, 2> ready = {{
+                                        region_ring_worker_resources[1].bank_ready,
+                                        region_ring_worker_resources[2].bank_ready,
+                                    }};
+                                    const std::array<size_t, 2> owners = {{
+                                        region_ring_worker_resources[1].bank_region,
+                                        region_ring_worker_resources[2].bank_region,
+                                    }};
+                                    region_ring_initial_banks_loaded =
+                                        llama_region_ring_gpu_initial_banks_match(
+                                            gpu_region_order, ready, owners);
                                 }
                                 LLAMA_LOG_DEBUG(
                                     "[REGION_RING_GPU_BANK] "
