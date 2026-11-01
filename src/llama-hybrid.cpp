@@ -6560,6 +6560,9 @@ bool llama_hybrid_profile_rpc(llama_hybrid_profile & profile, ggml_backend_t pc_
                         metrics << std::fixed << std::setprecision(4)
                             << "{\"type\":\"rpc_duplex_profile\","
                             << "\"schema\":1,"
+                            << "\"transport\":\"RPC_SET_ACK_GET_TENSOR\","
+                            << "\"socket_mode\":\"INDEPENDENT\","
+                            << "\"samples\":5,"
                             << "\"bytes\":" << bytes
                             << ",\"c2p_solo_ms\":" << p.c2p_solo_ms
                             << ",\"p2c_solo_ms\":" << p.p2c_solo_ms
