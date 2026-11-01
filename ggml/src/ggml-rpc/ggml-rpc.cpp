@@ -8044,9 +8044,7 @@ void rpc_server::phone_stage_binding_preflight(
         ggml_backend_buffer_get_base(stage_buffer));
     const size_t stage_buffer_bytes =
         ggml_backend_buffer_get_size(stage_buffer);
-    size_t stage_first = SIZE_MAX;
-    size_t stage_last = 0;
-    size_t stage_tensor_count = 0;
+    ggml_phone_stage::arena_extent stage_extent;
     size_t stage_kv_ops = 0;
     size_t stage_quant_weights = 0;
     bool stage_bounds_ok = stage_buffer_bytes != 0;
@@ -8055,7 +8053,6 @@ void rpc_server::phone_stage_binding_preflight(
             t->data == nullptr || ggml_is_empty(t)) {
             continue;
         }
-        ++stage_tensor_count;
         if (t->op == GGML_OP_SET_ROWS) {
             ++stage_kv_ops;
         }
@@ -8069,33 +8066,28 @@ void rpc_server::phone_stage_binding_preflight(
         const size_t bytes = std::max(
             ggml_nbytes(t),
             ggml_backend_buffer_get_alloc_size(stage_buffer, t));
-        if (address < stage_buffer_base ||
-            bytes > stage_buffer_bytes ||
-            address - stage_buffer_base > stage_buffer_bytes - bytes) {
+        if (!stage_extent.add(
+                stage_buffer_base, stage_buffer_bytes, address, bytes)) {
             stage_bounds_ok = false;
             break;
         }
-        const size_t offset = address - stage_buffer_base;
-        stage_first = std::min(stage_first, offset);
-        stage_last = std::max(stage_last, offset + bytes);
     }
-    if (!stage_bounds_ok || stage_tensor_count == 0 ||
-        stage_first == SIZE_MAX || stage_kv_ops != 0 ||
-        stage_quant_weights != 0 || stage_last == 0) {
+    if (!stage_bounds_ok || !stage_extent.valid() ||
+        stage_kv_ops != 0 || stage_quant_weights != 0) {
         GGML_LOG_INFO(
             "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
             "layer=%d tokens=%u reason=INVALID_STAGE_SPAN "
             "bounds_ok=%d stage_tensors=%zu kv_ops=%zu "
             "quant_weights=%zu status=SAFE\n",
             first_layer, plan.tokens, stage_bounds_ok ? 1 : 0,
-            stage_tensor_count, stage_kv_ops, stage_quant_weights);
+            stage_extent.tensor_count, stage_kv_ops, stage_quant_weights);
         return;
     }
     // Use the original buffer-relative END offset, not (end-start).
     // This preserves original tensor offsets if the activation arena begins
     // after a reserved prefix; capacity is deliberately an upper bound.
-    plan.stage_arena_required_bytes = stage_last;
-    const size_t stage_used_span = stage_last - stage_first;
+    plan.stage_arena_required_bytes = stage_extent.last_offset;
+    const size_t stage_used_span = stage_extent.span_bytes();
 
     const auto status = plan.scratch.build(transient, {});
     if (status != ggml_phone_stage::status::ok ||
@@ -8307,7 +8299,8 @@ void rpc_server::phone_stage_binding_preflight(
             new_template ? 1 : 0, growing_template ? 1 : 0,
             transient.size(), compute_roots, shared_arena_disjoint,
             excluded_overlap, protected_ranges.size(),
-            planned_scratch_bytes, stage_used_span, stage_last,
+            planned_scratch_bytes, stage_used_span,
+            stage_extent.last_offset,
             pool.bytes_per_slot(),
             pool.bytes_per_slot() * 2);
 
