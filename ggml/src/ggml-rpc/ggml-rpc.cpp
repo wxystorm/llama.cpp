@@ -1288,6 +1288,8 @@ enum class rpc_socket_role {
     PHONE_REGION_PARTIAL_1,
     COMPLETION_WAIT,
     P2C_STREAM,
+    DUPLEX_PROFILE_C2P,
+    DUPLEX_PROFILE_P2C,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1337,6 +1339,12 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::P2C_STREAM:
             suffix = "_p2c_stream";
+            break;
+        case rpc_socket_role::DUPLEX_PROFILE_C2P:
+            suffix = "_duplex_profile_c2p";
+            break;
+        case rpc_socket_role::DUPLEX_PROFILE_P2C:
+            suffix = "_duplex_profile_p2c";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1483,6 +1491,193 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
 
     snprintf(result.name, GGML_MAX_NAME, "%s", tensor->name);
     return result;
+}
+
+// Measure simultaneous PC->Phone and Phone->PC RPC transport. Dedicated
+// role sockets are crucial: ordinary buffer RPCs share a COMPUTE socket,
+// where issuing GET and SET concurrently would corrupt command framing.
+// The ACK after SET is a tiny BUFFER_GET_BASE command on the SAME upload
+// socket; this ensures the server has finished receiving and applying the
+// preceding SET before the measured upload is considered complete.
+// No Phone RPC protocol patch or inference hot-path change is needed.
+static bool ggml_backend_rpc_profile_duplex(
+        ggml_backend_t backend,
+        ggml_tensor * upload_destination,
+        const ggml_tensor * download_source,
+        size_t bytes,
+        ggml_rpc_duplex_profile * result) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            upload_destination == nullptr || download_source == nullptr ||
+            result == nullptr || bytes == 0 ||
+            upload_destination == download_source ||
+            bytes > ggml_nbytes(upload_destination) ||
+            bytes > ggml_nbytes(download_source) ||
+            upload_destination->buffer == nullptr ||
+            download_source->buffer == nullptr ||
+            !ggml_backend_buffer_is_rpc(upload_destination->buffer) ||
+            !ggml_backend_buffer_is_rpc(download_source->buffer)) {
+        return false;
+    }
+    auto * rpc_ctx =
+        static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto * upload_ctx = static_cast<ggml_backend_rpc_buffer_context *>(
+        upload_destination->buffer->context);
+    auto * download_ctx = static_cast<ggml_backend_rpc_buffer_context *>(
+        download_source->buffer->context);
+    if (rpc_ctx == nullptr || upload_ctx == nullptr ||
+            download_ctx == nullptr ||
+            upload_ctx->endpoint != rpc_ctx->endpoint ||
+            download_ctx->endpoint != rpc_ctx->endpoint ||
+            upload_ctx->device != rpc_ctx->device ||
+            download_ctx->device != rpc_ctx->device) {
+        return false;
+    }
+
+    const auto up_sock = get_socket_role(
+        rpc_ctx->endpoint, rpc_socket_role::DUPLEX_PROFILE_C2P);
+    const auto down_sock = get_socket_role(
+        rpc_ctx->endpoint, rpc_socket_role::DUPLEX_PROFILE_P2C);
+    if (!up_sock || !down_sock || up_sock == down_sock) {
+        return false;
+    }
+
+    const rpc_tensor up_tensor = serialize_tensor(upload_destination);
+    rpc_msg_get_tensor_req get_req {};
+    get_req.tensor = serialize_tensor(download_source);
+    get_req.offset = 0;
+    get_req.size = bytes;
+
+    const uint64_t upload_offset = 0;
+    const size_t prefix_size = sizeof(up_tensor) + sizeof(upload_offset);
+    if (bytes > SIZE_MAX - prefix_size) {
+        return false;
+    }
+    std::vector<uint8_t> upload_payload(prefix_size + bytes);
+    std::vector<uint8_t> download_payload(bytes);
+    memcpy(upload_payload.data(), &up_tensor, sizeof(up_tensor));
+    memcpy(upload_payload.data() + sizeof(up_tensor),
+           &upload_offset, sizeof(upload_offset));
+
+    rpc_msg_buffer_get_base_req ack_req {};
+    ack_req.remote_ptr = upload_ctx->remote_ptr;
+
+    auto do_upload = [&]() -> bool {
+        // Alternate data patterns prevent accidental caching by external
+        // transport instrumentation; this direct SET deliberately bypasses
+        // the optional RPC hash-deduplication preflight.
+        if (!send_rpc_cmd(
+                up_sock, RPC_CMD_SET_TENSOR,
+                upload_payload.data(), upload_payload.size())) {
+            return false;
+        }
+        rpc_msg_buffer_get_base_rsp ack_rsp {};
+        return send_rpc_cmd(
+            up_sock, RPC_CMD_BUFFER_GET_BASE,
+            &ack_req, sizeof(ack_req),
+            &ack_rsp, sizeof(ack_rsp));
+    };
+    auto do_download = [&]() -> bool {
+        return send_rpc_cmd(
+            down_sock, RPC_CMD_GET_TENSOR,
+            &get_req, sizeof(get_req),
+            download_payload.data(), download_payload.size());
+    };
+    auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+
+    constexpr int warmup = 1;
+    constexpr int samples = 5;
+    std::vector<double> up_solo, down_solo, up_duplex, down_duplex;
+    std::vector<double> duplex_wall, duplex_overlap;
+    up_solo.reserve(samples);
+    down_solo.reserve(samples);
+    up_duplex.reserve(samples);
+    down_duplex.reserve(samples);
+    duplex_wall.reserve(samples);
+    duplex_overlap.reserve(samples);
+
+    for (int run = 0; run < warmup + samples; ++run) {
+        memset(upload_payload.data() + prefix_size,
+               0x31 + (run & 0x0f), bytes);
+
+        const int64_t up_begin = ggml_time_us();
+        if (!do_upload()) {
+            return false;
+        }
+        const double up_ms = (ggml_time_us() - up_begin) / 1000.0;
+
+        const int64_t down_begin = ggml_time_us();
+        if (!do_download()) {
+            return false;
+        }
+        const double down_ms = (ggml_time_us() - down_begin) / 1000.0;
+        if (run >= warmup) {
+            up_solo.push_back(up_ms);
+            down_solo.push_back(down_ms);
+        }
+    }
+
+    for (int run = 0; run < warmup + samples; ++run) {
+        memset(upload_payload.data() + prefix_size,
+               0x51 + (run & 0x0f), bytes);
+        std::mutex start_mutex;
+        std::condition_variable start_cv;
+        int ready = 0;
+        bool start = false;
+        std::array<int64_t, 2> begin_us {{0, 0}};
+        std::array<int64_t, 2> end_us {{0, 0}};
+        std::array<bool, 2> ok {{false, false}};
+        std::array<std::thread, 2> workers;
+
+        for (size_t lane = 0; lane < workers.size(); ++lane) {
+            workers[lane] = std::thread([&, lane]() {
+                {
+                    std::unique_lock<std::mutex> lock(start_mutex);
+                    ++ready;
+                    start_cv.notify_all();
+                    start_cv.wait(lock, [&]() { return start; });
+                }
+                begin_us[lane] = ggml_time_us();
+                ok[lane] = lane == 0 ? do_upload() : do_download();
+                end_us[lane] = ggml_time_us();
+            });
+        }
+        {
+            std::unique_lock<std::mutex> lock(start_mutex);
+            start_cv.wait(lock, [&]() { return ready == 2; });
+            start = true;
+        }
+        start_cv.notify_all();
+        for (auto & worker : workers) {
+            worker.join();
+        }
+        if (!ok[0] || !ok[1]) {
+            return false;
+        }
+        if (run >= warmup) {
+            up_duplex.push_back(
+                (end_us[0] - begin_us[0]) / 1000.0);
+            down_duplex.push_back(
+                (end_us[1] - begin_us[1]) / 1000.0);
+            duplex_wall.push_back(
+                (std::max(end_us[0], end_us[1]) -
+                 std::min(begin_us[0], begin_us[1])) / 1000.0);
+            duplex_overlap.push_back(
+                std::max<int64_t>(
+                    0, std::min(end_us[0], end_us[1]) -
+                       std::max(begin_us[0], begin_us[1])) / 1000.0);
+        }
+    }
+
+    result->c2p_solo_ms = median(up_solo);
+    result->p2c_solo_ms = median(down_solo);
+    result->c2p_concurrent_ms = median(up_duplex);
+    result->p2c_concurrent_ms = median(down_duplex);
+    result->concurrent_wall_ms = median(duplex_wall);
+    result->concurrent_overlap_ms = median(duplex_overlap);
+    return true;
 }
 
 static constexpr size_t RPC_ALLOC_SIZE_EXACT_CACHE_MAX      = 16384;
@@ -9794,6 +9989,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             name,
             GGML_BACKEND_RPC_GET_GRAPH_PROFILE_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_get_graph_profile);
+    }
+    if (std::strcmp(
+            name,
+            GGML_BACKEND_RPC_PROFILE_DUPLEX_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_profile_duplex);
     }
     if (std::strcmp(
             name,
