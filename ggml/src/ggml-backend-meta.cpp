@@ -9168,7 +9168,8 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                     // The outer Phone Full Arena capture will publish this
                     // exact completed l_out. Keep the Phone fence above, but
                     // avoid a redundant synchronous GET_TENSOR to the PC.
-                    if (ggml_backend_meta_phone_full_stream_return_layer_matches(ring_layer)) {
+                    if (i + 1 == backend_ctx->n_subgraphs &&
+                            ggml_backend_meta_phone_full_stream_return_layer_matches(ring_layer)) {
                         handled = true;
                         GGML_LOG_INFO(
                             "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
@@ -11162,10 +11163,9 @@ if (decode_pc_only_attn || prefill_directional_owner_attn) {
                 // hand the Phone-resident output directly to the outer Arena
                 // capture. Internal Phone->PC handoffs are never suppressed.
                 if (external_backend_handoff &&
-                        (ggml_backend_meta_phone_full_stream_return_layer_matches(layer) ||
-                         ggml_backend_meta_phone_full_stream_skip_terminal_get(
-                             true, phone_owner_exit,
-                             i + 1 == backend_ctx->n_subgraphs))) {
+                        ggml_backend_meta_phone_full_stream_skip_terminal_get(
+                            true, phone_owner_exit,
+                            i + 1 == backend_ctx->n_subgraphs)) {
                     GGML_LOG_INFO(
                         "[P2C_STREAM_META_RETURN] layer=%d sg=%zu "
                         "path=PHONE_OWNER_EXIT action=SKIP_GET\n",
