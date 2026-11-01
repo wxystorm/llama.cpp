@@ -6,6 +6,7 @@
 #include "transport.h"
 #include "p2c-arena-queue.h"
 #include "p2c-stream-receiver.h"
+#include "phone-stage-binding-pool.h"
 
 #include <array>
 #include <chrono>
@@ -5029,6 +5030,8 @@ public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
         stored_graphs.resize(backends.size());
+        phone_stage_plan_cache.resize(backends.size());
+        phone_stage_slot_policy.resize(backends.size());
         snapshot_devices.reserve(backends.size());
         route_snapshot_devices.reserve(backends.size());
         phone_region_partial_devices.reserve(backends.size());
@@ -5136,6 +5139,8 @@ private:
         bool allow_quantized_weight_init = true);
     void remember_opencl_tensor_extra(ggml_tensor * tensor);
     void erase_opencl_tensor_extras_for_buffer(ggml_backend_buffer_t buffer);
+    void phone_stage_binding_preflight(uint32_t device, uint64_t graph_uid,
+                                      const ggml_cgraph * graph);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -5183,6 +5188,12 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
+    // PREPARE-ONLY: logical layouts are verified on the Phone, never used to
+    // override live OpenCL bindings before the full input/KV/output contract
+    // is implemented and tested. The existing RPC path stays authoritative.
+    std::vector<std::vector<ggml_phone_stage::template_plan>>
+        phone_stage_plan_cache;
+    std::vector<ggml_phone_stage::two_slot_pool> phone_stage_slot_policy;
     std::recursive_mutex graph_compute_mutex;
 
     std::mutex route_ready_mutex;
@@ -7757,6 +7768,126 @@ bool rpc_server::set_tensor_graph_compute(
     return ok;
 }
 
+void rpc_server::phone_stage_binding_preflight(
+        uint32_t device, uint64_t graph_uid, const ggml_cgraph * graph) {
+    const char * enabled = std::getenv("GGML_RPC_PHONE_BINDING_PREFLIGHT");
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 ||
+        graph == nullptr || graph->n_nodes < 16 ||
+        device >= phone_stage_plan_cache.size()) {
+        return;
+    }
+    int first_layer = -1;
+    int parsed = 0;
+    if (std::sscanf(graph->nodes[0]->name,
+                    "norm-%d%n", &first_layer, &parsed) != 1 ||
+        graph->nodes[0]->name[parsed] != '\0' ||
+        first_layer < 0) {
+        return; // ordinary RPC graph, not a Phone Full Stage
+    }
+
+    // A buffer with an external source or live output is not scratch. Never
+    // move it: it may hold model weights, inputs, KV data or the P2C result.
+    std::unordered_set<ggml_backend_buffer_t> external_buffers;
+    std::unordered_set<const ggml_tensor *> visited;
+    std::function<void(const ggml_tensor *)> visit =
+        [&](const ggml_tensor * t) {
+            if (t == nullptr || !visited.insert(t).second) { return; }
+            if (t->op == GGML_OP_NONE && t->buffer != nullptr) {
+                external_buffers.insert(t->buffer);
+            }
+            if (t->op == GGML_OP_SET_ROWS && t->buffer != nullptr) {
+                external_buffers.insert(t->buffer);
+            }
+            if (t->view_src != nullptr) { visit(t->view_src); }
+            for (const ggml_tensor * src : t->src) { visit(src); }
+        };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        visit(graph->nodes[i]);
+    }
+    const ggml_tensor * last = graph->nodes[graph->n_nodes - 1];
+    if (last != nullptr && last->buffer != nullptr) {
+        external_buffers.insert(last->buffer);
+    }
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 &&
+            t->buffer != nullptr) {
+            external_buffers.insert(t->buffer);
+        }
+    }
+
+    std::vector<ggml_phone_stage::activation> transient;
+    int max_layer = first_layer;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if (t == nullptr) { continue; }
+        int layer = -1;
+        int matched = 0;
+        if ((std::sscanf(t->name, "l_out-%d%n", &layer, &matched) == 1 ||
+             std::sscanf(t->name, "attn_out-%d%n", &layer, &matched) == 1) &&
+            layer >= first_layer && t->name[matched] == '\0') {
+            max_layer = std::max(max_layer, layer);
+        }
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            t->buffer == nullptr || t->data == nullptr ||
+            t->view_src != nullptr || t->op == GGML_OP_NONE ||
+            t->op == GGML_OP_SET_ROWS || t->op == GGML_OP_CPY ||
+            external_buffers.count(t->buffer) || ggml_is_empty(t)) {
+            continue;
+        }
+        uint32_t last_use = static_cast<uint32_t>(i);
+        for (int j = i + 1; j < graph->n_nodes; ++j) {
+            const ggml_tensor * consumer = graph->nodes[j];
+            if (consumer == nullptr) { continue; }
+            for (const ggml_tensor * src : consumer->src) {
+                while (src != nullptr && src->view_src != nullptr) {
+                    src = src->view_src;
+                }
+                if (src == t) {
+                    last_use = static_cast<uint32_t>(j);
+                }
+            }
+        }
+        transient.push_back({
+            static_cast<uint32_t>(i + 1), ggml_nbytes(t),
+            256, static_cast<uint32_t>(i), last_use});
+    }
+    ggml_phone_stage::template_plan plan;
+    plan.layer_begin = static_cast<uint32_t>(first_layer);
+    plan.layer_end = static_cast<uint32_t>(max_layer + 1);
+    plan.tokens = static_cast<uint32_t>(graph->nodes[0]->ne[1]);
+    plan.output_kind =
+        std::strstr(last->name, "result") != nullptr ? 1 : 0;
+    plan.topology_signature = graph_uid;
+    const auto status = plan.scratch.build(transient, {});
+    if (status != ggml_phone_stage::status::ok || !plan.tokens) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+            "layer=%d nodes=%d transient=%zu status=%d\n",
+            first_layer, graph->n_nodes, transient.size(), (int) status);
+        return;
+    }
+    auto & plans = phone_stage_plan_cache[device];
+    // Keep only a small bounded set: the caller is still free to choose
+    // separate full/tail/last-layer variants as actual graph shapes dictate.
+    if (plans.size() < 128) {
+        plans.push_back(std::move(plan));
+    }
+    auto & pool = phone_stage_slot_policy[device];
+    const auto reserved = pool.reserve(plans, 256);
+    if (reserved == ggml_phone_stage::status::ok) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT "
+            "layer=%d..%d tokens=%u nodes=%d "
+            "transient=%zu slot_bytes=%zu total_two_slots=%zu "
+            "mode=PLAN_ONLY status=OK\n",
+            first_layer, max_layer, graph->nodes[0]->ne[1],
+            graph->n_nodes, transient.size(),
+            pool.bytes_per_slot(),
+            pool.bytes_per_slot() * 2);
+    }
+}
+
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     // serialization format:
@@ -7828,6 +7959,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     }   //恢复原来的计算图
     graph_entry.compute_samples = 0;
     graph_entry.recent_compute_wall_us = {};
+    phone_stage_binding_preflight(device, graph_uid, graph);
     if (register_only) {
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
