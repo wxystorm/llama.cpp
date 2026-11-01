@@ -137,6 +137,29 @@ inline size_t llama_region_ring_gpu_initial_bank_count(
     return std::min<size_t>(gpu_region_count, 2);
 }
 
+// The Bank's actual resident Region is the source of truth at prefill
+// entry. A preceding tiny/decode ubatch may populate each Bank on demand
+// without going through load_initial_gpu_banks(), so an independent
+// "preloaded" flag can be stale even though both Banks are ready.
+// Conversely, a ready Bank bound to a later Region is NOT a valid initial
+// Bank and must be reloaded before the next large prefill.
+inline bool llama_region_ring_gpu_initial_banks_match(
+        const std::vector<size_t> & gpu_regions,
+        const std::array<bool, 2> & bank_ready,
+        const std::array<size_t, 2> & bank_region) {
+    const size_t initial =
+        llama_region_ring_gpu_initial_bank_count(gpu_regions.size());
+    if (initial == 0) {
+        return false;
+    }
+    for (size_t rank = 0; rank < initial; ++rank) {
+        if (!bank_ready[rank] || bank_region[rank] != gpu_regions[rank]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::optional<size_t> llama_region_ring_gpu_weight_next_rank(
         size_t rank, size_t gpu_region_count) {
     if (rank > std::numeric_limits<size_t>::max() - 2) {
