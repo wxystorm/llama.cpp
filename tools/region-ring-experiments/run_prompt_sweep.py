@@ -31,6 +31,9 @@ FIELDS = [
     "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
     "n_predict", "gpu_weight_streaming", "predicted_ms", "baseline_predicted_ms",
     "selected_dag_sim_ms", "final_dag_sim_ms", "final_dag_source",
+    "link_ab_serial_ms", "link_ab_independent_ms",
+    "link_ab_contended_ms", "link_ab_overlap_ms", "link_ab_status",
+    "duplex_profile_points", "link_ab_contended_error_ms",
     "dag_plan_tokens", "first_cycle_e", "final_e", "first_cycle_seeds", "prefix_completed",
     "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
@@ -255,6 +258,18 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "selected_dag_sim_ms": selected_dag_sim_ms,
         "final_dag_sim_ms": final_dag_sim_ms,
         "final_dag_source": final_dag_source,
+        "link_ab_serial_ms": plan.get("link_ab_serial_ms"),
+        "link_ab_independent_ms": (
+            plan.get("link_ab_independent_ms")
+            if (plan.get("link_ab_independent_ms") or -1) >= 0 else None
+        ),
+        "link_ab_contended_ms": (
+            plan.get("link_ab_contended_ms")
+            if (plan.get("link_ab_contended_ms") or -1) >= 0 else None
+        ),
+        "link_ab_overlap_ms": plan.get("link_ab_overlap_ms"),
+        "link_ab_status": plan.get("link_ab_status"),
+        "duplex_profile_points": plan.get("duplex_profile_points"),
         "dag_plan_tokens": plan.get("plan_tokens"),
         "first_cycle_e": plan.get("first_cycle_e"), "final_e": plan.get("e"),
         "first_cycle_seeds": plan.get("first_cycle_seeds"),
@@ -348,6 +363,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                 for region in record["phone_rpc_regions"]
                 if isinstance(region, dict)
             )
+    if (plan.get("applied") is True and ring and
+            row["link_ab_contended_ms"] is not None):
+        row["link_ab_contended_error_ms"] = round(
+            row["link_ab_contended_ms"] - total(ring, "wall_ms"), 3)
     row["cpu_cpu_gate_wait_ms"] = total(ring, "cpu_cpu_gate_wait_ms")
     row["gpu_cuda_gate_wait_ms"] = total(ring, "gpu_cuda_gate_wait_ms")
     return {field: row.get(field) for field in FIELDS}
