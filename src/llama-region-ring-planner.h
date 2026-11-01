@@ -1930,6 +1930,29 @@ inline double prefix_cycle_max_error(
     return std::max({e1, e2, e3});
 }
 
+// A single Cycle need not be balanced when it compensates earlier work.
+// Accumulated E dominates; the weight on the current Cycle's own E fades
+// towards zero in the terminal Cycle. Width variance is already limited by
+// the legal geometry spread, so it receives only a light soft penalty.
+inline double prefix_balanced_rank(
+        const std::array<double, 3> & cycle_load,
+        const std::array<double, 3> & cumulative_load,
+        const std::array<double, 3> & links,
+        int completed, int total_cycles, double width_variance) {
+    if (completed < 1 || total_cycles < 2 ||
+            completed > total_cycles || !std::isfinite(width_variance) ||
+            width_variance < 0.0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double cumulative_e =
+        prefix_cycle_max_error(cumulative_load, links, completed);
+    const double stage_e = prefix_cycle_max_error(cycle_load, links, 1);
+    const double stage_weight =
+        0.20 * (double) (total_cycles - completed) / (total_cycles - 1);
+    return cumulative_e + stage_weight * stage_e +
+        0.05 * width_variance / completed;
+}
+
 // Evaluate the same local ring equations for a concrete runtime layout whose
 // three cycles need not have identical C/G widths (the fixed baseline ends in
 // G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
@@ -2222,6 +2245,8 @@ struct first_cycle_seed_record {
     int xg = 0;
     int xp = 0;
     double first_e = std::numeric_limits<double>::infinity();
+    double first_absolute_proxy_ms = std::numeric_limits<double>::infinity();
+    double first_joint_score = std::numeric_limits<double>::infinity();
     std::array<double, 3> first_service_mspt {};
     std::array<double, 3> first_handoff_mspt {};
     long double gpu_bank0_min_bytes = 0.0L;
@@ -2269,6 +2294,7 @@ struct result {
     // Geometry/XG pairs rejected before E anchors or bitsets are built.
     size_t first_cycle_gpu_pairs_pruned = 0;
     size_t first_cycle_gpu_shapes_pruned = 0;
+    size_t first_cycle_e_pool = 0;
     size_t first_cycle_selected = 0;
     std::vector<first_cycle_seed_record> first_cycle_seeds;
     size_t prefix_expanded = 0;
@@ -2798,6 +2824,61 @@ inline bool estimate_complete_cycle_coarse_ms(
     return std::isfinite(plan.coarse_ms) && plan.coarse_ms >= 0.0;
 }
 
+// Cheap throughput-oriented proxy for complete Prefix load vectors. For the
+// first Cycle, callers deliberately project the one-Cycle load across N
+// Cycles; this is an ordering heuristic, NOT a rigorous remaining-work bound.
+// The full event DAG remains the only final selection metric.
+inline double region_ring_absolute_service_proxy_ms(
+        const model & m, int cycles,
+        const std::array<double, 3> & total_service_mspt,
+        const std::array<double, 3> & links_mspt) {
+    if (m.tokens <= 0 || cycles <= 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    for (double v : total_service_mspt) {
+        if (!std::isfinite(v) || v < 0.0) {
+            return std::numeric_limits<double>::infinity();
+        }
+    }
+    for (double v : links_mspt) {
+        if (!std::isfinite(v) || v < 0.0) {
+            return std::numeric_limits<double>::infinity();
+        }
+    }
+    const double cpu = total_service_mspt[(size_t) device::CPU];
+    const double gpu = total_service_mspt[(size_t) device::GPU];
+    const double phone = total_service_mspt[(size_t) device::PHONE];
+    const double pc = m.pc_compute_gate ? cpu + gpu : std::max(cpu, gpu);
+    const double c2p = (double) cycles * links_mspt[2];
+    const double p2g = (double) (cycles - 1) * links_mspt[0];
+    const double phone_link = m.shared_phone_link ?
+        c2p + p2g : std::max(c2p, p2g);
+    const double gpu_to_cpu = (double) cycles * links_mspt[1];
+    return (double) m.tokens *
+        std::max({pc, phone, phone_link, gpu_to_cpu});
+}
+
+// E and absolute-service values use different units. Normalize them within
+// an eligible candidate pool using the best and 90th-percentile anchors, so
+// isolated slow outliers do not flatten all useful throughput differences.
+inline double region_ring_e_absolute_score(
+        double e, double absolute_ms,
+        double best_e, double e_p90,
+        double best_absolute_ms, double absolute_p90_ms) {
+    if (!std::isfinite(e) || !std::isfinite(absolute_ms) ||
+            !std::isfinite(best_e) || !std::isfinite(e_p90) ||
+            !std::isfinite(best_absolute_ms) ||
+            !std::isfinite(absolute_p90_ms)) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double e_scale = std::max(0.02, e_p90 - best_e);
+    const double abs_scale = std::max(1.0, absolute_p90_ms - best_absolute_ms);
+    const double e_norm = std::clamp((e - best_e) / e_scale, 0.0, 1.0);
+    const double abs_norm =
+        std::clamp((absolute_ms - best_absolute_ms) / abs_scale, 0.0, 1.0);
+    return 0.35 * e_norm + 0.65 * abs_norm;
+}
+
 // Runtime-applicable wide search. Unlike WIDE_PREVIEW, every candidate
 // ends on Phone and has no tail, so the selected topology can be loaded and
 // executed by the current canonical final-output path. C/G/P and XC/XG/XP
@@ -3202,6 +3283,8 @@ inline result search_runtime_applicable(
         size_t gi = 0;
         size_t pi = 0;
         double first_e = std::numeric_limits<double>::infinity();
+        double absolute_proxy_ms = std::numeric_limits<double>::infinity();
+        double joint_score = std::numeric_limits<double>::infinity();
         std::array<double, 3> load {};
         std::array<double, 3> links {};
     };
@@ -3212,6 +3295,7 @@ inline result search_runtime_applicable(
         std::array<std::array<double, 3>, 4> prefix_service {};
         double prefix_e_sum = 0.0;
         double width_variance = 0.0;
+        double absolute_proxy_ms = std::numeric_limits<double>::infinity();
         double rank = 0.0;
         int min_width = 0;
         int max_width = 0;
@@ -3219,14 +3303,14 @@ inline result search_runtime_applicable(
     // First Cycle is close to L/N. Subsequent Cycles may differ, but the
     // maximum spread across Cycles is about 25% of average length. The
     // squared-length term below is a *soft* preference inside that range.
-    // E is evaluated over every supported first-Cycle X triple. Only
-    // the subsequent prefix search is bounded: 100 seeds across 2/3/4 Cycles.
-    constexpr size_t k_first_seeds_total = 100;
+    // A wide E-first pool is ranked again by absolute service demand before
+    // entering the nonuniform search. No additional device Profile is run.
+    constexpr size_t k_first_cycle_e_pool_total = 500;
+    constexpr size_t k_first_seeds_total = 200;
     constexpr size_t k_seed_geometry_diversity_per_n = 12;
     constexpr size_t k_seed_chunk_diversity = 36;
-    constexpr size_t k_prefix_beam_per_seed = 8;
-    constexpr double k_history_weight = 0.20;
-    constexpr double k_width_weight = 0.20;
+    constexpr size_t k_prefix_beam_per_seed = 16;
+    constexpr size_t k_final_beam_per_seed = 24;
 
     const auto first_seed_less = [](const first_cycle_seed & a,
                                     const first_cycle_seed & b) {
@@ -3482,7 +3566,7 @@ inline result search_runtime_applicable(
                         }
                         // Preserve the global lowest-E candidates as well
                         // as the best per geometry and per Chunk triple.
-                        if (best_by_e.size() < k_first_seeds_total) {
+                        if (best_by_e.size() < k_first_cycle_e_pool_total) {
                             best_by_e.push(seed);
                         } else if (first_seed_less(seed, best_by_e.top())) {
                             best_by_e.pop();
@@ -3529,17 +3613,13 @@ inline result search_runtime_applicable(
         }
     }
 
-    // Select at most 100 first-Cycle seeds ACROSS all Cycle counts.
-    // E-window filtering happens before this cap. Each candidate has already
-    // been compared against shape, Chunk and global-E alternatives.
+    // Pass 1: E-first screening. Keep a wider set of 500 seeds, with basic
+    // coverage of Cycle counts, first-Cycle geometries and Chunk triples.
+    // We do not materialize every six-dimensional candidate: the streaming
+    // E window, per-geometry/per-Chunk representatives and bounded E heaps
+    // above are still the inputs to this pool.
     std::sort(all_first_cycle_seeds.begin(),
               all_first_cycle_seeds.end(), first_seed_less);
-    std::vector<size_t> chosen;
-    std::vector<const char *> chosen_reasons;
-    std::unordered_set<size_t> chosen_indices;
-    std::unordered_set<std::string> chosen_shapes;
-    std::unordered_set<std::string> chosen_chunks;
-    std::array<size_t, 5> distinct_shapes_per_cycle {};
     const auto shape_key = [](const first_cycle_seed & v) {
         return std::to_string(v.cycles) + "/" +
                std::to_string(v.g) + "/" +
@@ -3549,62 +3629,191 @@ inline result search_runtime_applicable(
         return std::to_string(v.ci) + "/" +
                std::to_string(v.gi) + "/" + std::to_string(v.pi);
     };
-    const auto choose = [&](size_t i, const char * reason) {
-        if (chosen.size() >= k_first_seeds_total ||
-                !chosen_indices.insert(i).second) {
+    std::vector<size_t> e_pool_indices;
+    std::vector<uint8_t> e_pool_taken(
+        all_first_cycle_seeds.size(), (uint8_t) 0);
+    std::unordered_set<std::string> e_pool_shapes;
+    std::unordered_set<std::string> e_pool_chunks;
+    std::array<size_t, 5> e_pool_distinct_shapes {};
+    const auto take_e_pool = [&](size_t index) {
+        if (e_pool_indices.size() >= k_first_cycle_e_pool_total ||
+                e_pool_taken[index]) {
             return;
         }
-        chosen.push_back(i);
-        chosen_reasons.push_back(reason);
-        const auto & v = all_first_cycle_seeds[i];
-        if (chosen_shapes.insert(shape_key(v)).second) {
-            ++distinct_shapes_per_cycle[(size_t) v.cycles];
+        e_pool_taken[index] = 1;
+        e_pool_indices.push_back(index);
+        const auto & v = all_first_cycle_seeds[index];
+        if (e_pool_shapes.insert(shape_key(v)).second) {
+            ++e_pool_distinct_shapes[(size_t) v.cycles];
         }
-        chosen_chunks.insert(chunk_key(v));
+        e_pool_chunks.insert(chunk_key(v));
     };
-
-    // Keep one best-E seed from each available Cycle count, then spread
-    // the remaining budget across different geometries and Chunk triples.
     for (int n = 2; n <= 4; ++n) {
         for (size_t i = 0; i < all_first_cycle_seeds.size(); ++i) {
             if (all_first_cycle_seeds[i].cycles == n) {
-                choose(i, "CYCLE_BEST_E");
+                take_e_pool(i);
                 break;
             }
         }
     }
     for (int n = 2; n <= 4; ++n) {
         for (size_t i = 0; i < all_first_cycle_seeds.size() &&
-                chosen.size() < k_first_seeds_total &&
-                distinct_shapes_per_cycle[(size_t) n] <
+                e_pool_distinct_shapes[(size_t) n] <
                     k_seed_geometry_diversity_per_n; ++i) {
             const auto & v = all_first_cycle_seeds[i];
             if (v.cycles == n &&
-                    chosen_shapes.find(shape_key(v)) ==
-                        chosen_shapes.end()) {
-                choose(i, "GEOMETRY_DIVERSITY");
+                    e_pool_shapes.count(shape_key(v)) == 0) {
+                take_e_pool(i);
             }
         }
     }
-    size_t additional_chunk_shapes = 0;
     for (size_t i = 0; i < all_first_cycle_seeds.size() &&
-            chosen.size() < k_first_seeds_total &&
-            additional_chunk_shapes < k_seed_chunk_diversity; ++i) {
-        if (chosen_chunks.find(chunk_key(all_first_cycle_seeds[i])) ==
-                chosen_chunks.end()) {
-            choose(i, "CHUNK_DIVERSITY");
-            ++additional_chunk_shapes;
+            e_pool_chunks.size() < k_seed_chunk_diversity; ++i) {
+        if (e_pool_chunks.count(chunk_key(all_first_cycle_seeds[i])) == 0) {
+            take_e_pool(i);
         }
     }
     for (size_t i = 0; i < all_first_cycle_seeds.size() &&
-            chosen.size() < k_first_seeds_total; ++i) {
-        choose(i, "LOW_E_FILL");
+            e_pool_indices.size() < k_first_cycle_e_pool_total; ++i) {
+        take_e_pool(i);
+    }
+
+    // Pass 2: each seed's first-Cycle service costs are projected across
+    // its requested Cycle count, charging all required C2P/P2G and G2C
+    // boundaries. This ABS value is a cheap proxy for sorting, not a
+    // completed-layout prediction: later Cycles can compensate the first.
+    std::vector<first_cycle_seed> e_pool;
+    e_pool.reserve(e_pool_indices.size());
+    for (size_t index : e_pool_indices) {
+        first_cycle_seed seed = all_first_cycle_seeds[index];
+        std::array<double, 3> projected = seed.load;
+        for (double & v : projected) {
+            v *= seed.cycles;
+        }
+        seed.absolute_proxy_ms = region_ring_absolute_service_proxy_ms(
+            m, seed.cycles, projected, seed.links);
+        if (std::isfinite(seed.absolute_proxy_ms)) {
+            e_pool.push_back(std::move(seed));
+        }
+    }
+    out.first_cycle_e_pool = e_pool.size();
+
+    std::vector<size_t> chosen;
+    std::vector<const char *> chosen_reasons;
+    if (!e_pool.empty()) {
+        std::vector<double> e_values, absolute_values;
+        e_values.reserve(e_pool.size());
+        absolute_values.reserve(e_pool.size());
+        for (const auto & seed : e_pool) {
+            e_values.push_back(seed.first_e);
+            absolute_values.push_back(seed.absolute_proxy_ms);
+        }
+        std::sort(e_values.begin(), e_values.end());
+        std::sort(absolute_values.begin(), absolute_values.end());
+        const size_t p90 = 9 * (e_pool.size() - 1) / 10;
+        for (auto & seed : e_pool) {
+            seed.joint_score = region_ring_e_absolute_score(
+                seed.first_e, seed.absolute_proxy_ms,
+                e_values.front(), e_values[p90],
+                absolute_values.front(), absolute_values[p90]);
+        }
+
+        std::vector<size_t> by_e, by_absolute, by_joint;
+        for (size_t i = 0; i < e_pool.size(); ++i) {
+            by_e.push_back(i);
+        }
+        by_absolute = by_e;
+        by_joint = by_e;
+        std::sort(by_e.begin(), by_e.end(),
+            [&](size_t a, size_t b) {
+                return first_seed_less(e_pool[a], e_pool[b]);
+            });
+        std::sort(by_absolute.begin(), by_absolute.end(),
+            [&](size_t a, size_t b) {
+                if (e_pool[a].absolute_proxy_ms !=
+                        e_pool[b].absolute_proxy_ms) {
+                    return e_pool[a].absolute_proxy_ms <
+                           e_pool[b].absolute_proxy_ms;
+                }
+                return first_seed_less(e_pool[a], e_pool[b]);
+            });
+        std::sort(by_joint.begin(), by_joint.end(),
+            [&](size_t a, size_t b) {
+                if (e_pool[a].joint_score != e_pool[b].joint_score) {
+                    return e_pool[a].joint_score < e_pool[b].joint_score;
+                }
+                return first_seed_less(e_pool[a], e_pool[b]);
+            });
+
+        std::unordered_set<size_t> chosen_indices;
+        std::unordered_set<std::string> chosen_shapes;
+        std::unordered_set<std::string> chosen_chunks;
+        std::array<size_t, 5> distinct_shapes_per_cycle {};
+        const auto choose = [&](size_t i, const char * reason) {
+            if (chosen.size() >= k_first_seeds_total ||
+                    !chosen_indices.insert(i).second) {
+                return;
+            }
+            chosen.push_back(i);
+            chosen_reasons.push_back(reason);
+            const auto & v = e_pool[i];
+            if (chosen_shapes.insert(shape_key(v)).second) {
+                ++distinct_shapes_per_cycle[(size_t) v.cycles];
+            }
+            chosen_chunks.insert(chunk_key(v));
+        };
+
+        // Never lose the best-E and best-absolute seeds for a feasible Cycle
+        // count, even when their combined score is mediocre.
+        for (int n = 2; n <= 4; ++n) {
+            for (size_t i : by_e) {
+                if (e_pool[i].cycles == n) {
+                    choose(i, "CYCLE_BEST_E");
+                    break;
+                }
+            }
+            for (size_t i : by_absolute) {
+                if (e_pool[i].cycles == n) {
+                    choose(i, "CYCLE_BEST_ABSOLUTE");
+                    break;
+                }
+            }
+        }
+        for (int n = 2; n <= 4; ++n) {
+            for (size_t i : by_joint) {
+                if (chosen.size() >= k_first_seeds_total ||
+                        distinct_shapes_per_cycle[(size_t) n] >=
+                            k_seed_geometry_diversity_per_n) {
+                    break;
+                }
+                const auto & v = e_pool[i];
+                if (v.cycles == n &&
+                        chosen_shapes.count(shape_key(v)) == 0) {
+                    choose(i, "GEOMETRY_DIVERSITY");
+                }
+            }
+        }
+        for (size_t i : by_joint) {
+            if (chosen.size() >= k_first_seeds_total ||
+                    chosen_chunks.size() >= k_seed_chunk_diversity) {
+                break;
+            }
+            if (chosen_chunks.count(chunk_key(e_pool[i])) == 0) {
+                choose(i, "CHUNK_DIVERSITY");
+            }
+        }
+        for (size_t i : by_joint) {
+            if (chosen.size() >= k_first_seeds_total) {
+                break;
+            }
+            choose(i, "E_ABSOLUTE_SCORE");
+        }
     }
     out.first_cycle_selected = chosen.size();
     out.first_cycle_seeds.reserve(chosen.size());
 
     for (size_t selected_i = 0; selected_i < chosen.size(); ++selected_i) {
-        const auto & seed = all_first_cycle_seeds[chosen[selected_i]];
+        const auto & seed = e_pool[chosen[selected_i]];
         auto & trace = out.first_cycle_seeds.emplace_back();
         trace.selection_rank = selected_i + 1;
         trace.selection_reason = chosen_reasons[selected_i];
@@ -3617,6 +3826,8 @@ inline result search_runtime_applicable(
         trace.xg = chunks[seed.gi];
         trace.xp = chunks[seed.pi];
         trace.first_e = seed.first_e;
+        trace.first_absolute_proxy_ms = seed.absolute_proxy_ms;
+        trace.first_joint_score = seed.joint_score;
         trace.first_service_mspt = seed.load;
         trace.first_handoff_mspt = seed.links;
         const int n_cycles = seed.cycles;
@@ -3668,7 +3879,9 @@ inline result search_runtime_applicable(
         initial.prefix_error[0] = seed.first_e;
         initial.prefix_service[0] = seed.load;
         initial.prefix_e_sum = seed.first_e;
-        initial.rank = seed.first_e;
+        initial.rank = prefix_balanced_rank(
+            seed.load, seed.load, seed.links,
+            1, n_cycles, 0.0);
         initial.min_width = seed.width;
         initial.max_width = seed.width;
         std::vector<prefix_state> beam { std::move(initial) };
@@ -3749,11 +3962,13 @@ inline result search_runtime_applicable(
                                 seed.width;
                             next.width_variance +=
                                 relative_width * relative_width;
-                            next.rank = prefix_e +
-                                k_history_weight *
-                                    next.prefix_e_sum / (completed + 1) +
-                                k_width_weight *
-                                    next.width_variance / (completed + 1);
+                            next.rank = prefix_balanced_rank(
+                                extra, next.load, seed.links,
+                                completed + 1, n_cycles,
+                                next.width_variance);
+                            if (!std::isfinite(next.rank)) {
+                                continue;
+                            }
                             next.min_width = new_min;
                             next.max_width = new_max;
                             next.regions.emplace_back(
@@ -3801,9 +4016,18 @@ inline result search_runtime_applicable(
                                 }
                             }
 
-                            // Keep Beam memory bounded even when the
-                            // Phone depth is unrestricted.
-                            if (expanded.size() < k_prefix_beam_per_seed ||
+                            // Intermediate Cycles retain Beam=16 by the
+                            // cumulative/stage E rank. The last Cycle is
+                            // complete: allow a wider pool and rank by both
+                            // absolute work and final accumulated E.
+                            if (completed + 1 == n_cycles) {
+                                next.absolute_proxy_ms =
+                                    region_ring_absolute_service_proxy_ms(
+                                        m, n_cycles, next.load, seed.links);
+                                if (std::isfinite(next.absolute_proxy_ms)) {
+                                    expanded.push_back(std::move(next));
+                                }
+                            } else if (expanded.size() < k_prefix_beam_per_seed ||
                                     prefix_less(next, expanded.back())) {
                                 const auto pos = std::lower_bound(
                                     expanded.begin(), expanded.end(),
@@ -3817,7 +4041,66 @@ inline result search_runtime_applicable(
                     }
                 }
             }
-            beam.swap(expanded);
+            if (completed + 1 == n_cycles &&
+                    expanded.size() > k_final_beam_per_seed) {
+                std::vector<double> e_values, absolute_values;
+                e_values.reserve(expanded.size());
+                absolute_values.reserve(expanded.size());
+                for (const auto & state : expanded) {
+                    e_values.push_back(
+                        state.prefix_error[(size_t) completed]);
+                    absolute_values.push_back(state.absolute_proxy_ms);
+                }
+                std::sort(e_values.begin(), e_values.end());
+                std::sort(absolute_values.begin(), absolute_values.end());
+                const size_t p90 = 9 * (expanded.size() - 1) / 10;
+                for (auto & state : expanded) {
+                    state.rank = region_ring_e_absolute_score(
+                        state.prefix_error[(size_t) completed],
+                        state.absolute_proxy_ms,
+                        e_values.front(), e_values[p90],
+                        absolute_values.front(), absolute_values[p90]);
+                }
+
+                std::vector<size_t> by_joint;
+                by_joint.reserve(expanded.size());
+                size_t best_e = 0, best_absolute = 0;
+                for (size_t i = 0; i < expanded.size(); ++i) {
+                    by_joint.push_back(i);
+                    if (expanded[i].prefix_error[(size_t) completed] <
+                            expanded[best_e].prefix_error[(size_t) completed]) {
+                        best_e = i;
+                    }
+                    if (expanded[i].absolute_proxy_ms <
+                            expanded[best_absolute].absolute_proxy_ms) {
+                        best_absolute = i;
+                    }
+                }
+                std::stable_sort(by_joint.begin(), by_joint.end(),
+                    [&](size_t a, size_t b) {
+                        return prefix_less(expanded[a], expanded[b]);
+                    });
+                std::vector<size_t> keep {best_e};
+                if (best_absolute != best_e) {
+                    keep.push_back(best_absolute);
+                }
+                for (size_t index : by_joint) {
+                    if (keep.size() >= k_final_beam_per_seed) {
+                        break;
+                    }
+                    if (index != best_e && index != best_absolute) {
+                        keep.push_back(index);
+                    }
+                }
+                std::vector<prefix_state> finalists;
+                finalists.reserve(keep.size());
+                for (size_t index : keep) {
+                    finalists.push_back(std::move(expanded[index]));
+                }
+                beam.swap(finalists);
+            } else {
+                beam.swap(expanded);
+            }
         }
 
         for (const auto & state : beam) {
