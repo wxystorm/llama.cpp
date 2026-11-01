@@ -363,6 +363,8 @@ def main():
     ap.add_argument("--out", type=Path, default=Path("region-ring-results"))
     ap.add_argument("--planner", default="apply-wide")
     ap.add_argument("--streaming", choices=("on", "off"), default="on")
+    ap.add_argument("--duplex-profile", choices=("on", "off"), default="off",
+                    help="measure solo/overlapped C2P and P2C RPC transfer at startup; diagnostic only")
     ap.add_argument("--log-verbosity", type=int, choices=range(0, 6), default=4,
                     metavar="{0,1,2,3,4,5}",
                     help="llama -lv threshold (default: 4, required for GGML/LLAMA INFO logs; 5 enables DEBUG)")
@@ -429,6 +431,8 @@ def main():
                 str(args.baseline_chunk_tokens),
             "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM":
                 "1" if args.streaming == "on" else "0",
+            "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE":
+                "1" if args.duplex_profile == "on" else "0",
             "LLAMA_REGION_RING_METRICS_FILE": str(folder / "metrics.jsonl"),
         })
         if args.force_layout:
