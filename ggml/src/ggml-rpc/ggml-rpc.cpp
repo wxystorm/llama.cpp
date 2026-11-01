@@ -8064,6 +8064,90 @@ void rpc_server::phone_stage_binding_preflight(
             std::getenv("GGML_RPC_PHONE_BINDING_TRACE");
         if (new_template && trace_env != nullptr &&
             std::strcmp(trace_env, "1") == 0) {
+            // Report the entire original allocation span, including leaves,
+            // aliased intermediates, inputs and final outputs. The scratch
+            // planner above is a lower bound until all those aliases are
+            // explicitly owned by the Phone. Never label a partial estimate
+            // as verified slot capacity.
+            struct arena_probe {
+                ggml_backend_buffer_t buffer = nullptr;
+                size_t capacity = 0;
+                size_t first_offset = SIZE_MAX;
+                size_t last_offset = 0;
+                size_t tensor_count = 0;
+                size_t leaves = 0;
+                size_t kv_writes = 0;
+                size_t quant_leaves = 0;
+                bool bounds_ok = true;
+            };
+            std::vector<arena_probe> arenas;
+            std::unordered_map<ggml_backend_buffer_t, size_t> arena_index;
+            for (const ggml_tensor * tensor : visited) {
+                if (tensor == nullptr || tensor->buffer == nullptr ||
+                    tensor->data == nullptr || ggml_is_empty(tensor)) {
+                    continue;
+                }
+                const ggml_backend_buffer_t buffer = tensor->buffer;
+                auto it = arena_index.find(buffer);
+                if (it == arena_index.end()) {
+                    const size_t index = arenas.size();
+                    arena_index.emplace(buffer, index);
+                    arena_probe probe;
+                    probe.buffer = buffer;
+                    probe.capacity = ggml_backend_buffer_get_size(buffer);
+                    arenas.push_back(probe);
+                    it = arena_index.find(buffer);
+                }
+                arena_probe & probe = arenas[it->second];
+                ++probe.tensor_count;
+                probe.leaves += tensor->op == GGML_OP_NONE ? 1 : 0;
+                probe.kv_writes += tensor->op == GGML_OP_SET_ROWS ? 1 : 0;
+                probe.quant_leaves += (tensor->op == GGML_OP_NONE &&
+                    (tensor->type == GGML_TYPE_Q4_K ||
+                     tensor->type == GGML_TYPE_Q5_K ||
+                     tensor->type == GGML_TYPE_Q6_K)) ? 1 : 0;
+                const size_t base = reinterpret_cast<size_t>(
+                    ggml_backend_buffer_get_base(buffer));
+                const size_t address = reinterpret_cast<size_t>(tensor->data);
+                const size_t alloc_bytes = std::max(
+                    ggml_nbytes(tensor),
+                    ggml_backend_buffer_get_alloc_size(buffer, tensor));
+                if (address < base || alloc_bytes > probe.capacity ||
+                    address - base > probe.capacity - alloc_bytes) {
+                    probe.bounds_ok = false;
+                    continue;
+                }
+                probe.first_offset =
+                    std::min(probe.first_offset, address - base);
+                probe.last_offset = std::max(
+                    probe.last_offset, address - base + alloc_bytes);
+            }
+            for (size_t k = 0; k < arenas.size(); ++k) {
+                const arena_probe & arena = arenas[k];
+                const bool stage_boundary =
+                    arena.buffer == graph->nodes[0]->buffer ||
+                    arena.buffer == last->buffer;
+                if (!stage_boundary && !arena.kv_writes) {
+                    continue;
+                }
+                const size_t span =
+                    arena.first_offset == SIZE_MAX ? 0 :
+                    arena.last_offset - arena.first_offset;
+                GGML_LOG_INFO(
+                    "[PHONE_STAGE_BINDING] event=ARENA_SPAN "
+                    "layer=%d tokens=%u group=%zu stage_boundary=%d "
+                    "full_buffer_bytes=%zu used_span_bytes=%zu "
+                    "first_offset=%zu last_offset=%zu "
+                    "tensors=%zu leaves=%zu kv_writes=%zu "
+                    "quant_leaves=%zu bounds_ok=%d "
+                    "status=DIAGNOSTIC_ONLY\n",
+                    first_layer, registered_tokens, k,
+                    stage_boundary ? 1 : 0, arena.capacity, span,
+                    arena.first_offset == SIZE_MAX ? 0 : arena.first_offset,
+                    arena.last_offset, arena.tensor_count,
+                    arena.leaves, arena.kv_writes, arena.quant_leaves,
+                    arena.bounds_ok ? 1 : 0);
+            }
             for (const auto & overlap : overlap_details) {
                 const ggml_tensor * owner = overlap.protected_tensor;
                 const ggml_tensor * node = overlap.node;
