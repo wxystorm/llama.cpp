@@ -78,5 +78,20 @@ int main() {
     assert(pool.output_published(0, 102) == status::ok);
     assert(pool.reserve({main, tail}, 256) == status::ok);
     assert(pool.acquire(0, 103, epoch) == status::stale); // invalidated epoch
+
+    // The 105-node Stage may alias its input and final output into the
+    // same original gallocr arena. A scratch-only peak of ~15.25 MiB
+    // MUST NOT allow allocating a smaller slot than the true 16.56 MiB
+    // observed span (17,368,320 bytes from the original arena base).
+    main.stage_arena_required_bytes = 17368320;
+    tail.stage_arena_required_bytes = 10312704;
+    assert(pool.reserve({main, tail}, 256) == status::ok);
+    assert(pool.bytes_per_slot() == 17368320);
+    assert(pool.bytes_per_slot() * k_slot_count == 34736640);
+
+    // Pure scratch-only tests still use scratch peak when larger.
+    tail.scratch.required_bytes = 20000000;
+    assert(pool.reserve({main, tail}, 256) == status::ok);
+    assert(pool.bytes_per_slot() == 20000000);
     return 0;
 }
