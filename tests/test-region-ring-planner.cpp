@@ -130,6 +130,85 @@ int main() {
         REQUIRE(rebuilt.size() == 2);
         REQUIRE(simulate(m, rebuilt, forced_two_device));
         REQUIRE(forced_two_device.wall_ms > 0.0);
+        REQUIRE(forced_two_device.tasks == 12);
+
+        // A one-pass three-device pipeline and a zero-CPU two-device
+        // pipeline must both make progress with the real interval DAG.
+        model single_model = mock_profile();
+        single_model.layers = 40;
+        candidate forced_three;
+        forced_three.cycles = 1;
+        forced_three.xc = forced_three.xg = forced_three.xp = 64;
+        forced_three.concrete_regions = single;
+        REQUIRE(make_regions(forced_three, 40, rebuilt));
+        REQUIRE(rebuilt.size() == 3);
+        REQUIRE(simulate(single_model, rebuilt, forced_three));
+        REQUIRE(forced_three.tasks == 18);
+        REQUIRE(forced_three.wall_ms > 0.0);
+
+        candidate forced_no_cpu;
+        forced_no_cpu.cycles = 1;
+        forced_no_cpu.xc = forced_no_cpu.xg = 64;
+        forced_no_cpu.xp = 128;
+        forced_no_cpu.concrete_regions = no_cpu;
+        REQUIRE(make_regions(forced_no_cpu, 40, rebuilt));
+        REQUIRE(rebuilt.size() == 2);
+        REQUIRE(simulate(single_model, rebuilt, forced_no_cpu));
+        REQUIRE(forced_no_cpu.tasks == 9);
+
+        // Neither a final-PC layout nor Phone-only work may reach
+        // APPLY_WIDE concrete-plan runtime validation.
+        candidate invalid = forced_three;
+        invalid.concrete_regions = no_phone;
+        REQUIRE(!make_regions(invalid, 40, rebuilt));
+        invalid.concrete_regions = phone_only;
+        REQUIRE(!make_regions(invalid, 40, rebuilt));
+
+        REQUIRE(llama_region_ring_gpu_initial_bank_count(0) == 0);
+        REQUIRE(llama_region_ring_gpu_initial_bank_count(1) == 1);
+        REQUIRE(llama_region_ring_gpu_initial_bank_count(2) == 2);
+        REQUIRE(llama_region_ring_gpu_initial_bank_count(4) == 2);
+
+        // The first GPU Region of a single-Cycle plan is load-time
+        // resident in Bank A. It must not contribute prompt H2D time.
+        single_model.gpu_weight_streaming = true;
+        single_model.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) {
+                    return false;
+                }
+                bytes = (size_t) (end - begin) * 1024;
+                return true;
+            };
+        single_model.gpu_weight_h2d_ms =
+            [](size_t bytes, double & ms) {
+                ms = bytes / 1024.0;
+                return true;
+            };
+        std::array<size_t, 2> single_bank_peaks {};
+        REQUIRE(gpu_weight_bank_peaks(
+            single_model, single, single_bank_peaks));
+        REQUIRE(single_bank_peaks[0] > 0);
+        REQUIRE(single_bank_peaks[1] == 0);
+        double prompt_h2d = -1.0;
+        REQUIRE(gpu_weight_h2d_total(
+            single_model, single, prompt_h2d));
+        REQUIRE(prompt_h2d == 0.0);
+
+        forced_three = {};
+        forced_three.cycles = 1;
+        forced_three.xc = forced_three.xg = forced_three.xp = 64;
+        forced_three.concrete_regions = single;
+        REQUIRE(simulate(single_model, single, forced_three));
+        REQUIRE(forced_three.weight_h2d_busy_ms == 0.0);
+        REQUIRE(forced_three.weight_h2d_startup_ms == 0.0);
+        REQUIRE(forced_three.weight_h2d_exposed_ms == 0.0);
+
+        std::array<size_t, 2> no_gpu_bank_peaks {};
+        REQUIRE(gpu_weight_bank_peaks(
+            single_model, no_gpu, no_gpu_bank_peaks));
+        REQUIRE(no_gpu_bank_peaks[0] == 0);
+        REQUIRE(no_gpu_bank_peaks[1] == 0);
     }
 
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
