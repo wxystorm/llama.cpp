@@ -21,6 +21,25 @@ static template_plan plan(uint32_t tokens, size_t bytes) {
 }
 
 int main() {
+    // Reproduce 64-token Phone Stage addresses: source gallocr backend
+    // buffer is 321,650,688 bytes, but the Stage only references its
+    // first 17,368,320 bytes. A partial scratch-only estimate of
+    // 15,990,784 must never become a binding-capacity guarantee.
+    arena_extent stage;
+    const size_t base = 0x100000;
+    assert(stage.add(base, 321650688, base, 1310720));
+    assert(stage.add(base, 321650688, base + 16057600, 1310720));
+    assert(stage.valid());
+    assert(stage.first_offset == 0);
+    assert(stage.last_offset == 17368320);
+    assert(stage.span_bytes() == 17368320);
+    const auto count = stage.tensor_count;
+    assert(!stage.add(base, 321650688, base + 321650688 - 8, 16));
+    assert(!stage.add(base, 321650688, base - 1, 1));
+    assert(stage.tensor_count == count && stage.last_offset == 17368320);
+    assert(!stage.add(base, 321650688,
+                      std::numeric_limits<size_t>::max(), 1024));
+
     binding_layout a;
     // Reuse is allowed only AFTER the previous consumer has finished.
     assert(a.build({
