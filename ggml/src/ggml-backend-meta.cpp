@@ -20851,6 +20851,10 @@ auto prefill_norm_sg_has_prework =
                     int rejected_node = -1;
                     size_t mirrored_pc_nodes = 0;
                     size_t phone_compute_nodes = 0;
+                    bool kept_internal_partial = false;
+                    bool next_consumes_attention = false;
+                    const ggml_tensor * attn_output =
+                        first_graph->nodes[first_graph->n_nodes - 1];
                     if (!contiguous) {
                         reject_reason = "NOT_CONTIGUOUS";
                     } else if (pc0.directional_completion != no_directional ||
@@ -20954,14 +20958,8 @@ auto prefill_norm_sg_has_prework =
                                 reject_reason = "PARTIAL_REQUIRES_BOUNDARY";
                                 break;
                             }
-                            if (can_keep_phone_partial) {
-                                GGML_LOG_INFO(
-                                    "[PHONE_FULL_REGION_GRAPH] "
-                                    "event=KEEP_PHONE_PARTIAL sg=%zu "
-                                    "layer=%d node=%s next_sg=%zu "
-                                    "action=SKIP_INTERNAL_REDUCE status=OK\n",
-                                    sg, first_layer, t->name, next_sg);
-                            }
+                            kept_internal_partial |=
+                                can_keep_phone_partial;
                             if (sg == next_sg &&
                                     (std::strncmp(t->name, "result_", 7) == 0 ||
                                      std::strncmp(t->name, "norm-", 5) == 0 ||
@@ -20985,6 +20983,12 @@ auto prefill_norm_sg_has_prework =
                                 }
                                 ++mirrored_pc_nodes;
                             }
+                            if (sg == next_sg) {
+                                for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                                    next_consumes_attention |=
+                                        t->src[src] == attn_output;
+                                }
+                            }
                             has_phone_compute |= phone_compute;
                             phone_compute_nodes += phone_compute ? 1 : 0;
                         }
@@ -20992,6 +20996,12 @@ auto prefill_norm_sg_has_prework =
                                 reject_reason == nullptr) {
                             reject_reason = "NO_PHONE_COMPUTE";
                         }
+                    }
+                    if (reject_reason == nullptr &&
+                            !next_consumes_attention) {
+                        reject_reason = "ATTENTION_OUTPUT_NOT_CONSUMED";
+                        rejected_sg = next_sg;
+                        rejected_node = -1;
                     }
                     if (reject_reason == nullptr) {
                         phone_block_fused = true;
@@ -21007,9 +21017,11 @@ auto prefill_norm_sg_has_prework =
                         GGML_LOG_INFO(
                             "[PHONE_FULL_REGION_GRAPH] event=PAIR_VALIDATED "
                             "sg=%zu..%zu layer=%d phone_compute=%zu "
-                            "pc_mirror=%zu action=FUSE status=OK\n",
+                            "pc_mirror=%zu kept_partial=%d "
+                            "action=FUSE status=OK\n",
                             i, next_sg, first_layer,
-                            phone_compute_nodes, mirrored_pc_nodes);
+                            phone_compute_nodes, mirrored_pc_nodes,
+                            kept_internal_partial ? 1 : 0);
                     } else {
                         // The opt-in has at most one fallback per candidate
                         // Region/Chunk; keep a compact reason without enabling
