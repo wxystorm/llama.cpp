@@ -20955,6 +20955,33 @@ auto prefill_norm_sg_has_prework =
                                     backend_ctx, first_layer) &&
                                 !layer_is_tensor_phone_primary(first_layer);
                             if (partial && !can_keep_phone_partial) {
+                                // Diagnostic only: identify which safety
+                                // predicate rejected this Phone-local PARTIAL.
+                                // Never relax a Reduce/handoff on a guess.
+                                GGML_LOG_INFO(
+                                    "[PHONE_FULL_REGION_GRAPH] "
+                                    "event=PARTIAL_REJECT "
+                                    "sg=%zu next_sg=%zu layer=%d node=%d name=%s "
+                                    "terminal_attn=%d ne1=%" PRId64 " "
+                                    "phone_compute=%d pc_compute=%d "
+                                    "first_phone_only=%d next_phone_only=%d "
+                                    "next_pc_exec=%d next_phone_exec=%d "
+                                    "tensor_c2p=%d tensor_p2c=%d "
+                                    "tensor_phone_primary=%d "
+                                    "phone_op=%s pc_op=%s status=REJECT\n",
+                                    sg, next_sg, first_layer, k, t->name,
+                                    is_terminal_attention ? 1 : 0, t->ne[1],
+                                    phone_compute ? 1 : 0, pc_compute ? 1 : 0,
+                                    subgraph_is_phone_only(i) ? 1 : 0,
+                                    subgraph_is_phone_only(next_sg) ? 1 : 0,
+                                    subgraph_will_execute_pc(next_sg) ? 1 : 0,
+                                    subgraph_will_execute_phone(next_sg) ? 1 : 0,
+                                    ggml_backend_meta_tensor_c2p_layer(
+                                        backend_ctx, first_layer) ? 1 : 0,
+                                    ggml_backend_meta_tensor_p2c_layer(
+                                        backend_ctx, first_layer) ? 1 : 0,
+                                    layer_is_tensor_phone_primary(first_layer) ? 1 : 0,
+                                    ggml_op_name(t->op), ggml_op_name(p->op));
                                 reject_reason = "PARTIAL_REQUIRES_BOUNDARY";
                                 break;
                             }
@@ -20964,6 +20991,48 @@ auto prefill_norm_sg_has_prework =
                                     (std::strncmp(t->name, "result_", 7) == 0 ||
                                      std::strncmp(t->name, "norm-", 5) == 0 ||
                                      std::strncmp(t->name, "attn_norm-", 10) == 0)) {
+                                // A norm-L in the second SG may be a
+                                // same-layer dependency/mirror rather than
+                                // proof of a new layer. Diagnose its actual
+                                // role before changing this conservative gate.
+                                int marker_layer = -1;
+                                int marker_chars = 0;
+                                bool parsed_marker =
+                                    std::sscanf(t->name, "norm-%d%n",
+                                        &marker_layer, &marker_chars) == 1 &&
+                                    t->name[marker_chars] == '\0';
+                                if (!parsed_marker) {
+                                    marker_layer = -1;
+                                    marker_chars = 0;
+                                    parsed_marker =
+                                        std::sscanf(t->name, "attn_norm-%d%n",
+                                            &marker_layer, &marker_chars) == 1 &&
+                                        t->name[marker_chars] == '\0';
+                                }
+                                bool direct_attn_source = false;
+                                for (int src = 0; src < GGML_MAX_SRC; ++src) {
+                                    direct_attn_source |=
+                                        t->src[src] == attn_output;
+                                }
+                                GGML_LOG_INFO(
+                                    "[PHONE_FULL_REGION_GRAPH] "
+                                    "event=NEXT_MARKER_REJECT "
+                                    "sg=%zu layer=%d node=%d name=%s "
+                                    "marker_layer=%d same_layer=%d "
+                                    "phone_compute=%d pc_compute=%d "
+                                    "phone_op=%s pc_op=%s "
+                                    "meta_partial=%d ne1=%" PRId64 " "
+                                    "attn_direct_src=%d src0=%s src1=%s "
+                                    "status=REJECT\n",
+                                    sg, first_layer, k, t->name,
+                                    parsed_marker ? marker_layer : -1,
+                                    parsed_marker && marker_layer == first_layer ? 1 : 0,
+                                    phone_compute ? 1 : 0, pc_compute ? 1 : 0,
+                                    ggml_op_name(t->op), ggml_op_name(p->op),
+                                    partial ? 1 : 0, t->ne[1],
+                                    direct_attn_source ? 1 : 0,
+                                    t->src[0] ? t->src[0]->name : "(none)",
+                                    t->src[1] ? t->src[1]->name : "(none)");
                                 reject_reason = "NEXT_LAYER_OR_OUTPUT";
                                 break;
                             }
