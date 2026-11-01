@@ -172,6 +172,15 @@ struct template_plan {
     uint32_t output_kind = 0;
     uint64_t topology_signature = 0;
     binding_layout scratch;
+
+    // Upper bound of all observed tensor address ranges in the original
+    // stage activation buffer, measured from its actual buffer base.
+    // It includes input/output aliases which the scratch-only lifetimes
+    // intentionally exclude. KV and model weights remain separate.
+    //
+    // This is a CAPACITY check, NOT a validated relocation map. No graph
+    // is allowed to rebind into a slot based solely on this value.
+    size_t stage_arena_required_bytes = 0;
 };
 
 // Slots are not graphs. A slot is released only after both GPU completion
@@ -192,7 +201,10 @@ public:
                 !p.tokens || !p.topology_signature) {
                 return status::invalid;
             }
-            maximum = std::max(maximum, p.scratch.required_bytes);
+            maximum = std::max(
+                maximum,
+                std::max(p.scratch.required_bytes,
+                         p.stage_arena_required_bytes));
         }
         size_t needed;
         if (!checked_add(maximum, headroom, needed) ||
