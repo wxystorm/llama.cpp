@@ -288,8 +288,14 @@ inline bool gpu_weight_bank_peaks(
     if (!m.gpu_weight_streaming) {
         return true;
     }
+    // A zero-GPU forced layout has no weights to bank, even if the
+    // optional CUDA weight-size profiler is unavailable.
     if (!m.gpu_region_weight_bytes) {
-        return false;
+        return std::none_of(
+            regions.begin(), regions.end(),
+            [](const llama_region_ring_region & r) {
+                return r.device == device::GPU;
+            });
     }
 
     size_t gpu_ordinal = 0;
@@ -548,9 +554,8 @@ inline bool gpu_weight_h2d_total(
     if (!m.gpu_weight_streaming) {
         return true;
     }
-    if (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms) {
-        return false;
-    }
+    // The first one or two GPU Regions are prepared before prompt timing;
+    // no H2D transfer curve is needed unless there is a rolling replacement.
     size_t gpu_rank = 0;
     for (const auto & region : regions) {
         if (region.device != device::GPU) {
@@ -564,8 +569,10 @@ inline bool gpu_weight_h2d_total(
         }
         size_t bytes = 0;
         double ms = 0.0;
-        if (!m.gpu_region_weight_bytes(
-                region.layer_begin, region.layer_end, bytes) ||
+        if (!m.gpu_region_weight_bytes ||
+                !m.gpu_weight_h2d_ms ||
+                !m.gpu_region_weight_bytes(
+                    region.layer_begin, region.layer_end, bytes) ||
                 !m.gpu_weight_h2d_ms(bytes, ms) ||
                 !std::isfinite(ms) || ms < 0.0) {
             return false;
@@ -638,10 +645,9 @@ inline bool simulate(const model & m,
         m.slot_pool < 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
     }
-    if (m.gpu_weight_streaming &&
-            (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms)) {
-        return reject("WEIGHT_PROFILE_MISSING");
-    }
+    // Weight-transfer profiles are needed only for GPU rank >= 2.
+    // Rank0/A and rank1/B are preloaded, and a forced 0/1-GPU-Region
+    // layout has no rolling H2D work inside the measured prompt.
     if (m.phone_full_return_stream &&
             llama_region_ring_has_directional_stages(regions)) {
         return reject("PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
@@ -870,11 +876,13 @@ inline bool simulate(const model & m,
         }
         gpu_rank[r] = (int) gpu_regions.size();
         gpu_regions.push_back((int) r);
-        if (m.gpu_weight_streaming) {
+        if (m.gpu_weight_streaming && gpu_rank[r] >= 2) {
             size_t bytes = 0;
             double ms = 0.0;
-            if (!m.gpu_region_weight_bytes(
-                    regions[r].layer_begin, regions[r].layer_end, bytes) ||
+            if (!m.gpu_region_weight_bytes ||
+                    !m.gpu_weight_h2d_ms ||
+                    !m.gpu_region_weight_bytes(
+                        regions[r].layer_begin, regions[r].layer_end, bytes) ||
                     !m.gpu_weight_h2d_ms(bytes, ms) ||
                     !std::isfinite(ms) || ms < 0.0) {
                 return reject("WEIGHT_PROFILE_MISSING");
@@ -1002,7 +1010,7 @@ inline bool simulate(const model & m,
     double now = 0.0;
     if (m.gpu_weight_streaming) {
         const size_t initial =
-            std::min<size_t>(2, gpu_regions.size());
+            llama_region_ring_gpu_initial_bank_count(gpu_regions.size());
         for (size_t i = 0; i < initial; ++i) {
             const int r = gpu_regions[i];
             gpu_weight_release_ms[(size_t) r] = 0.0;
@@ -1336,7 +1344,7 @@ inline bool simulate(const model & m,
     c.weight_h2d_hidden_ms = 0.0;
     if (m.gpu_weight_streaming) {
         const size_t initial =
-            std::min<size_t>(2, gpu_regions.size());
+            llama_region_ring_gpu_initial_bank_count(gpu_regions.size());
         for (size_t rank = initial;
                 rank < gpu_regions.size(); ++rank) {
             const int r = gpu_regions[rank];
