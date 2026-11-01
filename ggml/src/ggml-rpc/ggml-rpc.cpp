@@ -8118,7 +8118,7 @@ void rpc_server::phone_stage_binding_preflight(
     auto & plans = phone_stage_plan_cache[device];
     // Keep only a small bounded set: the caller is still free to choose
     // separate full/tail/last-layer variants as actual graph shapes dictate.
-    auto existing = std::find_if(plans.begin(), plans.end(),
+    const auto existing = std::find_if(plans.begin(), plans.end(),
         [&](const ggml_phone_stage::template_plan & cached) {
             return cached.layer_begin == plan.layer_begin &&
                    cached.layer_end == plan.layer_end &&
@@ -8127,41 +8127,58 @@ void rpc_server::phone_stage_binding_preflight(
                    cached.topology_signature == plan.topology_signature;
         });
     const bool new_template = existing == plans.end();
+    if (new_template && plans.size() >= 128) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+            "layer=%d tokens=%u reason=TEMPLATE_CACHE_FULL status=SAFE\n",
+            first_layer, registered_tokens);
+        return;
+    }
+
+    // Check for changing arena requirements even when the topology remains
+    // identical. This is a reservation bound only: it never authenticates a
+    // new dynamic Tensor layout or bypasses the OpenCL extra/view checks.
     bool growing_template = false;
-    if (new_template) {
-        if (plans.size() >= 128) {
-            GGML_LOG_INFO(
-                "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
-                "layer=%d tokens=%u reason=TEMPLATE_CACHE_FULL "
-                "status=SAFE\n",
-                first_layer, registered_tokens);
-            return;
-        }
-        plans.push_back(std::move(plan));
-    } else {
-        // Same topology can still arrive with a wider original arena
-        // binding. Increase the capacity requirement, never silently reuse
-        // a too-small slot. Layout drift does NOT authorize rebinding.
-        const size_t previous_stage = existing->stage_arena_required_bytes;
-        const size_t previous_scratch = existing->scratch.required_bytes;
-        existing->stage_arena_required_bytes = std::max(
-            existing->stage_arena_required_bytes,
-            plan.stage_arena_required_bytes);
-        existing->scratch.required_bytes = std::max(
-            existing->scratch.required_bytes,
-            plan.scratch.required_bytes);
+    if (!new_template) {
         growing_template =
-            existing->stage_arena_required_bytes != previous_stage ||
-            existing->scratch.required_bytes != previous_scratch;
+            plan.stage_arena_required_bytes >
+                existing->stage_arena_required_bytes ||
+            plan.scratch.required_bytes > existing->scratch.required_bytes;
     }
     auto & pool = phone_stage_slot_policy[device];
     const size_t pool_alignment =
         std::max<size_t>(1, ggml_backend_get_alignment(backends[device]));
-    // Cache hits must not invalidate live slot leases. New or larger
-    // templates are the only cases requiring a capacity reservation.
-    const auto reserved = (new_template || growing_template)
-        ? pool.reserve(plans, pool_alignment)
-        : ggml_phone_stage::status::ok;
+    ggml_phone_stage::status reserved = ggml_phone_stage::status::ok;
+    if (new_template || growing_template) {
+        // Transactional: do not publish a new template or larger arena
+        // requirement until all active slot leases allow reservation.
+        std::vector<ggml_phone_stage::template_plan> proposed = plans;
+        if (new_template) {
+            proposed.push_back(std::move(plan));
+        } else {
+            const size_t index = static_cast<size_t>(
+                std::distance(plans.begin(), existing));
+            auto & cached = proposed[index];
+            cached.stage_arena_required_bytes = std::max(
+                cached.stage_arena_required_bytes,
+                plan.stage_arena_required_bytes);
+            cached.scratch.required_bytes = std::max(
+                cached.scratch.required_bytes,
+                plan.scratch.required_bytes);
+        }
+        reserved = pool.reserve(proposed, pool_alignment);
+        if (reserved == ggml_phone_stage::status::ok) {
+            plans.swap(proposed);
+        }
+    }
+    if (reserved != ggml_phone_stage::status::ok) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=PREFLIGHT_REJECT "
+            "layer=%d tokens=%u reason=POOL_RESERVE_FAILED "
+            "status=%d safe_fallback=1\n",
+            first_layer, registered_tokens, static_cast<int>(reserved));
+        return;
+    }
     if (reserved == ggml_phone_stage::status::ok) {
         const char * trace_env =
             std::getenv("GGML_RPC_PHONE_BINDING_TRACE");
