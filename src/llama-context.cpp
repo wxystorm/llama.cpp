@@ -3665,22 +3665,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         gpu_region_order.size() >= 2 &&
         (int) ubatch.n_tokens >= gpu_bank_min_tokens;
 
+    // Tiny warmup/decode runs can fill Bank A/B through demand loading.
+    // Those successful tasks update bank_ready/region, but historically
+    // only the load-time preload path could restore the global flag.
+    // Validate the actual resident pair instead of rejecting a correct pair
+    // merely because the redundant global flag was left false.
+    const std::array<bool, 2> initial_bank_ready = {{
+        region_ring_worker_resources[1].bank_ready,
+        region_ring_worker_resources[2].bank_ready,
+    }};
+    const std::array<size_t, 2> initial_bank_regions = {{
+        region_ring_worker_resources[1].bank_region,
+        region_ring_worker_resources[2].bank_region,
+    }};
     const bool initial_banks_ready =
         gpu_bank_streaming &&
-        region_ring_initial_banks_loaded &&
-        region_ring_worker_resources[1].bank_ready &&
-        region_ring_worker_resources[2].bank_ready &&
-        region_ring_worker_resources[1].bank_region ==
-            gpu_region_order[0] &&
-        region_ring_worker_resources[2].bank_region ==
-            gpu_region_order[1];
+        llama_region_ring_gpu_initial_banks_match(
+            gpu_region_order, initial_bank_ready, initial_bank_regions);
 
     if (gpu_bank_streaming && !initial_banks_ready) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK] phase=PREFILL_START status=REJECT "
             "reason=INITIAL_BANKS_NOT_LOADED "
+            "initial_flag=%d "
             "bankA_ready=%d bankA_region=%zu expectedA=%zu "
             "bankB_ready=%d bankB_region=%zu expectedB=%zu\n",
+            region_ring_initial_banks_loaded ? 1 : 0,
             region_ring_worker_resources[1].bank_ready ? 1 : 0,
             region_ring_worker_resources[1].bank_region,
             gpu_region_order[0],
@@ -3689,6 +3699,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order[1]);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+    if (gpu_bank_streaming && !region_ring_initial_banks_loaded) {
+        // State was recovered by successful warmup demand loads; no
+        // weight upload is needed before this large prompt.
+        region_ring_initial_banks_loaded = true;
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_BANK] phase=PREFILL_START "
+            "event=INITIAL_BANKS_REVALIDATED source=RESIDENT_BANKS "
+            "bankA_region=%zu bankB_region=%zu status=READY\n",
+            gpu_region_order[0], gpu_region_order[1]);
     }
 
     if (gpu_bank_streaming) {
