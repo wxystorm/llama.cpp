@@ -93,6 +93,10 @@ struct candidate {
     int tasks = 0;
     int edges = 0;
     int max_live_slots = 0;
+    // Non-final Phone Full -> PC returns using the opt-in P2C Arena stream.
+    // Each frame covers exactly one Phone Chunk, regardless of downstream X.
+    int phone_full_stream_frames = 0;
+    uint64_t phone_full_stream_bytes = 0;
 };
 
 struct model {
@@ -103,6 +107,10 @@ struct model {
     int slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     int max_tail = 12;
     bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
+    // Opt-in Phone Full Arena push: one complete Phone Chunk per TCP frame.
+    // The Receiver publishes all overlapping PC Chunk dependencies only after
+    // the entire frame arrives. Legacy GET and directional Tensor remain off.
+    bool phone_full_return_stream = false;
     // Current Region Ring runtime has independent CPU and CUDA compute lanes.
     // Keep this switch only so tests can compare the historical gated model.
     bool pc_compute_gate = false;
@@ -589,6 +597,9 @@ struct edge {
     int lane = 0; // 0=PC-local, 1=PC->Phone, 2=Phone->PC (when independent)
     double duration = 0.0;
     bool started = false;
+    // A single Phone Full frame may satisfy several smaller PC Chunks.
+    // All consumers are released at the SAME frame-receive completion event.
+    std::vector<int> extra_consumers;
 };
 enum class event_kind : uint8_t {
     TASK = 0,
@@ -629,6 +640,12 @@ inline bool simulate(const model & m,
             (!m.gpu_region_weight_bytes || !m.gpu_weight_h2d_ms)) {
         return reject("WEIGHT_PROFILE_MISSING");
     }
+    if (m.phone_full_return_stream &&
+            llama_region_ring_has_directional_stages(regions)) {
+        return reject("PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
+    }
+    c.phone_full_stream_frames = 0;
+    c.phone_full_stream_bytes = 0;
 
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
@@ -726,11 +743,70 @@ inline bool simulate(const model & m,
         const int lane = a == device::PHONE ?
             (m.shared_phone_link ? 1 : 2) :
             b == device::PHONE ? 1 : 0;
-        // Both regions partition the same ordered token interval. Merge
-        // their interval streams instead of testing every source/destination
-        // pair: O(Nsrc + Ndst), even for small non-multiple Chunk sizes.
-        // The emitted intersecting EDGE order is the same as src-major
-        // enumeration, preserving the event simulator's link FIFO policy.
+
+        // The new Phone Full return does NOT transfer one packet per token
+        // intersection. The Phone captures [begin,end) as one immutable Arena
+        // slab, and a single Sender sends ONE full-frame TCP payload. Only
+        // after PC Receiver receives the complete payload does the runtime
+        // complete_deferred() and publish ALL intersecting PC dependencies.
+        // The final Phone Region has no outgoing edge, hence no P2C frame.
+        const bool whole_phone_frame =
+            m.phone_full_return_stream &&
+            regions[r].kind == llama_region_ring_stage_kind::PHONE &&
+            a == device::PHONE && b != device::PHONE;
+        if (whole_phone_frame) {
+            size_t di = 0;
+            for (const int src : by_region[r]) {
+                const auto & producer = tasks[(size_t) src];
+                while (di < by_region[r + 1].size() &&
+                        tasks[(size_t) by_region[r + 1][di]].end <=
+                            producer.begin) {
+                    ++di;
+                }
+                const size_t bytes =
+                    (size_t) (producer.end - producer.begin) *
+                    (size_t) m.hidden * sizeof(float);
+                double ms = 0.0;
+                if (!m.transfer_ms(a, b, bytes, ms) ||
+                        !std::isfinite(ms) || ms < 0.0) {
+                    return reject("STREAM_FRAME_TRANSFER_PROFILE_MISSING");
+                }
+
+                edge frame;
+                frame.producer = src;
+                frame.lane = lane;
+                frame.duration = ms;
+                for (size_t j = di; j < by_region[r + 1].size(); ++j) {
+                    const int dst = by_region[r + 1][j];
+                    const auto & consumer = tasks[(size_t) dst];
+                    if (consumer.begin >= producer.end) {
+                        break;
+                    }
+                    if (consumer.end <= producer.begin) {
+                        continue;
+                    }
+                    if (frame.consumer < 0) {
+                        frame.consumer = dst;
+                    } else {
+                        frame.extra_consumers.push_back(dst);
+                    }
+                    ++tasks[(size_t) src].outputs;
+                    ++tasks[(size_t) dst].inputs;
+                }
+                if (frame.consumer < 0) {
+                    return reject("STREAM_FRAME_WITHOUT_CONSUMER");
+                }
+                const int edge_id = (int) edges.size();
+                edges.push_back(std::move(frame));
+                outgoing_edges[(size_t) src].push_back(edge_id);
+                ++c.phone_full_stream_frames;
+                c.phone_full_stream_bytes += (uint64_t) bytes;
+            }
+            continue;
+        }
+
+        // Legacy GET / other boundaries: transfer each actual intersecting
+        // token interval. This is intentionally unchanged with Stream off.
         size_t si = 0;
         size_t di = 0;
         while (si < by_region[r].size() &&
@@ -829,6 +905,9 @@ inline bool simulate(const model & m,
     // O(total_edges) polling on every simulated event.
     std::array<std::priority_queue<
         int, std::vector<int>, std::greater<int>>, 3> ready_links;
+    // Stream Sender follows Arena READY publication order, not preassigned
+    // edge IDs. Preserve historical edge-ID priority with the flag off.
+    std::array<std::deque<int>, 3> ready_links_fifo;
     std::array<bool, 3> device_busy {}, link_busy {};
     bool pc_compute_gate_busy = false;
     int next_pc_device = 0;
@@ -966,15 +1045,27 @@ inline bool simulate(const model & m,
             scheduled = true;
         }
 
-        // Producer completion makes intersecting edges transferable.
-        // Select the lowest ready edge-id on each independent link lane,
-        // exactly as the previous src-major global scan did.
+        // One transfer at a time per link lane. Arena Stream sends frames
+        // in actual READY-publication FIFO order; legacy mode retains the
+        // previous source-major edge-ID priority for exact A/B comparison.
         for (size_t lane = 0; lane < ready_links.size(); ++lane) {
-            if (link_busy[lane] || ready_links[lane].empty()) {
+            if (link_busy[lane]) {
                 continue;
             }
-            const int edge_id = ready_links[lane].top();
-            ready_links[lane].pop();
+            int edge_id = -1;
+            if (m.phone_full_return_stream) {
+                if (ready_links_fifo[lane].empty()) {
+                    continue;
+                }
+                edge_id = ready_links_fifo[lane].front();
+                ready_links_fifo[lane].pop_front();
+            } else {
+                if (ready_links[lane].empty()) {
+                    continue;
+                }
+                edge_id = ready_links[lane].top();
+                ready_links[lane].pop();
+            }
             auto & it = edges[(size_t) edge_id];
             it.started = true;
             link_busy[lane] = true;
@@ -1099,11 +1190,24 @@ inline bool simulate(const model & m,
             if (current.kind == event_kind::EDGE) {
                 const auto & e = edges[(size_t) current.id];
                 link_busy[(size_t) e.lane] = false;
-                auto & consumer = tasks[(size_t) e.consumer];
-                if (--consumer.inputs < 0) {
+                // A full Phone frame is a single network event with fan-out:
+                // no PC Chunk can run from a partial TCP frame.
+                auto publish = [&](int consumer_id) {
+                    auto & consumer = tasks[(size_t) consumer_id];
+                    if (--consumer.inputs < 0) {
+                        return false;
+                    }
+                    offer(consumer_id);
+                    return true;
+                };
+                if (!publish(e.consumer)) {
                     return reject("EDGE_COUNT_UNDERFLOW");
                 }
-                offer(e.consumer);
+                for (const int consumer_id : e.extra_consumers) {
+                    if (!publish(consumer_id)) {
+                        return reject("EDGE_COUNT_UNDERFLOW");
+                    }
+                }
                 continue;
             }
 
@@ -1126,7 +1230,11 @@ inline bool simulate(const model & m,
             t.done = true;
             for (int edge_id : outgoing_edges[(size_t) current.id]) {
                 const int lane = edges[(size_t) edge_id].lane;
-                ready_links[(size_t) lane].push(edge_id);
+                if (m.phone_full_return_stream) {
+                    ready_links_fifo[(size_t) lane].push_back(edge_id);
+                } else {
+                    ready_links[(size_t) lane].push(edge_id);
+                }
             }
             for (int resource = 0; resource < 3; ++resource) {
                 if ((t.resource_mask &
@@ -1174,7 +1282,10 @@ inline bool simulate(const model & m,
             // finite output credit.
             if (m.slot_pool > 0) {
                 for (const auto & e : edges) {
-                    if (e.consumer != current.id) {
+                    if (e.consumer != current.id &&
+                            std::find(e.extra_consumers.begin(),
+                                      e.extra_consumers.end(),
+                                      current.id) == e.extra_consumers.end()) {
                         continue;
                     }
                     auto & producer = tasks[(size_t) e.producer];
@@ -1617,6 +1728,28 @@ inline bool region_ring_handoff_ms_per_token(
         return false;
     }
     double total_ms = 0.0;
+    // The opt-in Phone Full stream publishes one entire source Chunk per
+    // TCP frame, even when the following PC Region uses smaller Chunks.
+    // Avoid charging multiple wire-startup costs for that one payload.
+    if (m.phone_full_return_stream &&
+            source == device::PHONE && target != device::PHONE) {
+        double total_ms = 0.0;
+        for (int begin = 0; begin < m.tokens; begin += source_chunk) {
+            const int n = std::min(source_chunk, m.tokens - begin);
+            double frame_ms = 0.0;
+            if (!m.transfer_ms(
+                    source, target,
+                    (size_t) n * (size_t) m.hidden * sizeof(float),
+                    frame_ms) ||
+                    !std::isfinite(frame_ms) || frame_ms < 0.0) {
+                return false;
+            }
+            total_ms += frame_ms;
+        }
+        per_token_ms = total_ms / m.tokens;
+        return std::isfinite(per_token_ms) && per_token_ms >= 0.0;
+    }
+
     int source_begin = 0;
     int target_begin = 0;
     while (source_begin < m.tokens && target_begin < m.tokens) {
