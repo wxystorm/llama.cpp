@@ -250,6 +250,40 @@ int main() {
         REQUIRE(zero_gpu_plan.weight_h2d_busy_ms == 0.0);
     }
 
+    // Match the observed 358-token forced A/B: G32/C128/P128.
+    // Legacy interval GET charges four P->G edges for one P128
+    // producer, while the runtime materializes one P128 host output.
+    // The comparison counters are diagnostic only: do not change scores.
+    {
+        model transport = mock_profile();
+        transport.layers = 40;
+        transport.tokens = 358;
+        const auto layout = llama_region_ring_parse(
+            "G11,C1,P1,G11,C1,P2,G11,C1,P1", 40);
+        candidate legacy;
+        legacy.xg = 32;
+        legacy.xc = 128;
+        legacy.xp = 128;
+        REQUIRE(simulate(transport, layout, legacy));
+        REQUIRE(legacy.tasks == 54);
+        REQUIRE(legacy.transfer_event_count[0] == 36);
+        REQUIRE(legacy.stage_copy_call_proxy_count[0] == 36);
+        REQUIRE(legacy.transfer_event_count[1] == 9);
+        REQUIRE(legacy.stage_copy_call_proxy_count[1] == 9);
+        REQUIRE(legacy.transfer_event_count[2] == 24);
+        REQUIRE(legacy.stage_copy_call_proxy_count[2] == 6);
+        REQUIRE(legacy.transfer_service_ms[2] > 0.0);
+
+        transport.phone_full_return_stream = true;
+        candidate arena = legacy;
+        REQUIRE(simulate(transport, layout, arena));
+        REQUIRE(arena.transfer_event_count[2] == 6);
+        REQUIRE(arena.stage_copy_call_proxy_count[2] == 6);
+        REQUIRE(arena.phone_full_stream_frames == 6);
+        REQUIRE(arena.transfer_payload_bytes[2] ==
+                legacy.transfer_payload_bytes[2]);
+    }
+
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
     // regardless of the following GPU/CPU Chunk size. The PC Receiver
     // releases every intersecting downstream task only when that whole
