@@ -556,6 +556,23 @@ inline bool llama_region_ring_single_cycle_topology_compatible(
 // Parse a model-owned APPLY_WIDE layout. Normal multi-Cycle layouts keep the
 // legacy strict parser; only a failed strict parse gets the single-Cycle A/B
 // fallback above.
+inline bool llama_region_ring_single_cycle_force_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer) {
+    if (!llama_region_ring_single_cycle_topology_compatible(
+            regions, n_layer) ||
+            regions.empty() ||
+            regions.back().device != llama_region_ring_device::PHONE) {
+        return false;
+    }
+    const auto counts = llama_region_ring_layer_counts(regions);
+    int active_devices = 0;
+    for (int count : counts) {
+        active_devices += count > 0 ? 1 : 0;
+    }
+    return active_devices >= 2;
+}
+
 inline std::vector<llama_region_ring_region>
 llama_region_ring_parse_apply_wide_layout(
         const std::string & spec, int n_layer) {
