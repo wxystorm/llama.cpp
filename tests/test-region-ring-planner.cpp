@@ -65,6 +65,133 @@ int main() {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
+    // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
+    // regardless of the following GPU/CPU Chunk size. The PC Receiver
+    // releases every intersecting downstream task only when that whole
+    // frame is delivered. Legacy GET stays interval-based with flag off.
+    {
+        model stream = mock_profile();
+        stream.layers = 40;
+        stream.tokens = 358;
+        stream.hidden = 5120;
+        stream.slot_pool = 0;
+        stream.phone_full_return_stream = true;
+        const auto layout = llama_region_ring_parse(
+            "G11,C1,P1,G11,C1,P2,G11,C1,P1", 40);
+        std::vector<size_t> phone_to_gpu_payloads;
+        stream.transfer_ms =
+            [&](device from, device to, size_t bytes, double & ms) {
+                if (from == device::PHONE && to == device::GPU) {
+                    phone_to_gpu_payloads.push_back(bytes);
+                }
+                ms = 0.4 + bytes / 65536.0;
+                return true;
+            };
+
+        candidate frame_plan;
+        frame_plan.xc = 128;
+        frame_plan.xg = 32;
+        frame_plan.xp = 128;
+        std::string why;
+        REQUIRE(simulate(stream, layout, frame_plan, &why));
+        REQUIRE(frame_plan.phone_full_stream_frames == 6);
+        REQUIRE(frame_plan.phone_full_stream_bytes ==
+                uint64_t(2) * 358 * 5120 * sizeof(float));
+        REQUIRE(phone_to_gpu_payloads.size() == 6);
+        for (size_t k = 0; k < phone_to_gpu_payloads.size(); ++k) {
+            const int chunk_tokens = k % 3 == 2 ? 102 : 128;
+            REQUIRE(phone_to_gpu_payloads[k] ==
+                    size_t(chunk_tokens) * 5120 * sizeof(float));
+        }
+
+        model legacy = stream;
+        legacy.phone_full_return_stream = false;
+        phone_to_gpu_payloads.clear();
+        candidate get_plan = frame_plan;
+        REQUIRE(simulate(legacy, layout, get_plan, &why));
+        REQUIRE(get_plan.phone_full_stream_frames == 0);
+        REQUIRE(get_plan.phone_full_stream_bytes == 0);
+        // 12 GPU Chunks per P->G crossing with legacy interval-edge
+        // splitting, versus 3 full frames per crossing with Arena Stream.
+        REQUIRE(phone_to_gpu_payloads.size() == 24);
+        REQUIRE(get_plan.edges == frame_plan.edges + 18);
+    }
+
+    // A big Phone Chunk must NOT unblock an early small GPU Chunk at the
+    // first subset of its payload. A single frame costs one wire startup
+    // (10 ms), not four 10-ms transfers. The GPU gets all four pieces only
+    // at t=11 ms, not progressively at 11,21,31,41 ms.
+    {
+        model synthetic = mock_profile();
+        synthetic.layers = 2;
+        synthetic.tokens = 128;
+        synthetic.hidden = 16;
+        synthetic.slot_pool = 0;
+        synthetic.phone_full_return_stream = true;
+        synthetic.compute_ms =
+            [](device d, int, int, int, double & ms) {
+                ms = d == device::PHONE ? 1.0 : 0.0;
+                return true;
+            };
+        synthetic.transfer_ms =
+            [](device, device, size_t, double & ms) {
+                ms = 10.0;
+                return true;
+            };
+        const std::vector<llama_region_ring_region> two_regions {
+            {device::PHONE, 0, 1}, {device::GPU, 1, 2}
+        };
+        candidate frame;
+        frame.xp = 128;
+        frame.xg = 32;
+        REQUIRE(simulate(synthetic, two_regions, frame));
+        REQUIRE(frame.tasks == 5);
+        REQUIRE(frame.edges == 1);
+        REQUIRE(frame.phone_full_stream_frames == 1);
+        REQUIRE(std::fabs(frame.wall_ms - 11.0) < 1e-6);
+
+        synthetic.phone_full_return_stream = false;
+        candidate get = frame;
+        REQUIRE(simulate(synthetic, two_regions, get));
+        REQUIRE(get.edges == 4);
+        REQUIRE(get.phone_full_stream_frames == 0);
+        REQUIRE(std::fabs(get.wall_ms - 41.0) < 1e-6);
+
+        synthetic.phone_full_return_stream = true;
+        candidate gather;
+        gather.xp = 32;
+        gather.xg = 128;
+        REQUIRE(simulate(synthetic, two_regions, gather));
+        REQUIRE(gather.edges == 4);
+        REQUIRE(gather.phone_full_stream_frames == 4);
+        REQUIRE(std::fabs(gather.wall_ms - 41.0) < 1e-6);
+
+        // The minimax E transfer helper uses exactly the same full-frame
+        // cost model as the event simulation (one startup per Phone Chunk).
+        double streamed = 0.0;
+        double old_interval = 0.0;
+        REQUIRE(region_ring_handoff_ms_per_token(
+            synthetic, device::PHONE, device::GPU, 128, 32, streamed));
+        synthetic.phone_full_return_stream = false;
+        REQUIRE(region_ring_handoff_ms_per_token(
+            synthetic, device::PHONE, device::GPU, 128, 32, old_interval));
+        REQUIRE(std::fabs(streamed - 10.0 / 128.0) < 1e-10);
+        REQUIRE(std::fabs(old_interval - 40.0 / 128.0) < 1e-10);
+    }
+
+    // The Stream switch must not silently reinterpret directional Tensor
+    // P2C returns as Phone Full Arena frames.
+    {
+        model only_full = mock_profile();
+        only_full.phone_full_return_stream = true;
+        const auto directional = llama_region_ring_parse(
+            "G4,C10,C2P1,P8,P2C1,G4,C7,P5", 40);
+        candidate rejected;
+        std::string why;
+        REQUIRE(!simulate(only_full, directional, rejected, &why));
+        REQUIRE(why == "PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
+    }
+
     // GPU peak memory is a hard constraint BEFORE first-Cycle E. The
     // streamed VRAM requirement is max(G0,G2) + max(G1,G3), not the
     // sum of every GPU Cycle. Future cycles reserve one mandatory GPU
