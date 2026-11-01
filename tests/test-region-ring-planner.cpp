@@ -201,6 +201,23 @@ int main() {
         std::string why;
         REQUIRE(!simulate(only_full, directional, rejected, &why));
         REQUIRE(why == "PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
+        // A full-only baseline is required even for forced experiments:
+        // search_runtime_applicable() simulates its baseline before applying
+        // LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT.
+        const auto compatible =
+            llama_region_ring_full_only_baseline(directional, 40);
+        only_full.layers = 40;
+        only_full.slot_pool = 0;
+        candidate baseline;
+        baseline.xc = 64;
+        baseline.xg = 64;
+        baseline.xp = 64;
+        why.clear();
+        REQUIRE(estimate_region_ring_balance(
+            only_full, compatible, baseline));
+        REQUIRE(simulate(only_full, compatible, baseline, &why));
+        REQUIRE(baseline.wall_ms > 0.0);
+        REQUIRE(baseline.phone_full_stream_frames == 6);
     }
 
     // GPU peak memory is a hard constraint BEFORE first-Cycle E. The
