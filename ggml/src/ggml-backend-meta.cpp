@@ -21092,6 +21092,142 @@ auto prefill_norm_sg_has_prework =
                             phone_compute_nodes, mirrored_pc_nodes,
                             kept_internal_partial ? 1 : 0);
                     } else {
+                        // Opt-in, rejected-pair-only topology dump. The SG
+                        // ownership check uses terminal COMPUTE flags; it
+                        // does not prove that PC work in the next SG is only
+                        // a mirror. Inspect the actual node flags and tail
+                        // before considering any relaxation of this guard.
+                        const char * trace_layer_text = std::getenv(
+                            "GGML_META_PHONE_FULL_REGION_TRACE_LAYER");
+                        if (trace_layer_text != nullptr) {
+                            char * trace_end = nullptr;
+                            const long trace_layer = std::strtol(
+                                trace_layer_text, &trace_end, 10);
+                            if (trace_end != trace_layer_text &&
+                                    *trace_end == '\0' &&
+                                    trace_layer == first_layer) {
+                                for (size_t trace_sg = i;
+                                        trace_sg <= next_sg; ++trace_sg) {
+                                    ggml_cgraph * trace_pc =
+                                        backend_ctx->backend_configs[0]
+                                            .cgraphs[trace_sg].cgraph_main;
+                                    ggml_cgraph * trace_phone =
+                                        backend_ctx->backend_configs[1]
+                                            .cgraphs[trace_sg].cgraph_main;
+                                    if (trace_pc == nullptr ||
+                                            trace_phone == nullptr ||
+                                            trace_pc->n_nodes !=
+                                                trace_phone->n_nodes ||
+                                            trace_phone->n_nodes <= 0) {
+                                        GGML_LOG_INFO(
+                                            "[PHONE_FULL_REGION_GRAPH] "
+                                            "event=SG_TOPOLOGY layer=%d sg=%zu "
+                                            "reason=INVALID_PAIRED_GRAPHS "
+                                            "status=TRACE\n",
+                                            first_layer, trace_sg);
+                                        continue;
+                                    }
+                                    size_t trace_pc_active = 0;
+                                    size_t trace_phone_active = 0;
+                                    size_t trace_pc_only = 0;
+                                    size_t trace_phone_only = 0;
+                                    size_t trace_both = 0;
+                                    size_t trace_pc_nonmirror = 0;
+                                    for (int node_id = 0;
+                                            node_id < trace_phone->n_nodes;
+                                            ++node_id) {
+                                        const ggml_tensor * pc_node =
+                                            trace_pc->nodes[node_id];
+                                        const ggml_tensor * phone_node =
+                                            trace_phone->nodes[node_id];
+                                        const bool pc_active =
+                                            (pc_node->flags &
+                                                GGML_TENSOR_FLAG_COMPUTE) != 0;
+                                        const bool phone_active =
+                                            (phone_node->flags &
+                                                GGML_TENSOR_FLAG_COMPUTE) != 0;
+                                        bool mirror =
+                                            pc_node->op == phone_node->op &&
+                                            pc_node->type == phone_node->type;
+                                        for (int dim = 0;
+                                                dim < GGML_MAX_DIMS && mirror;
+                                                ++dim) {
+                                            mirror = pc_node->ne[dim] ==
+                                                phone_node->ne[dim];
+                                        }
+                                        trace_pc_active += pc_active ? 1 : 0;
+                                        trace_phone_active += phone_active ? 1 : 0;
+                                        trace_pc_only +=
+                                            pc_active && !phone_active ? 1 : 0;
+                                        trace_phone_only +=
+                                            phone_active && !pc_active ? 1 : 0;
+                                        trace_both +=
+                                            pc_active && phone_active ? 1 : 0;
+                                        trace_pc_nonmirror +=
+                                            pc_active && (!phone_active || !mirror)
+                                            ? 1 : 0;
+
+                                        if (trace_sg == next_sg) {
+                                            GGML_LOG_INFO(
+                                                "[PHONE_FULL_REGION_GRAPH] "
+                                                "event=SG_NODE layer=%d sg=%zu "
+                                                "node=%d name=%s op=%s "
+                                                "ne0=%" PRId64 " ne1=%" PRId64 " "
+                                                "pc_compute=%d phone_compute=%d "
+                                                "mirror_shape=%d "
+                                                "src0=%s src1=%s "
+                                                "pc_name=%s status=TRACE\n",
+                                                first_layer, trace_sg, node_id,
+                                                phone_node->name,
+                                                ggml_op_name(phone_node->op),
+                                                phone_node->ne[0],
+                                                phone_node->ne[1],
+                                                pc_active ? 1 : 0,
+                                                phone_active ? 1 : 0,
+                                                mirror ? 1 : 0,
+                                                phone_node->src[0] != nullptr ?
+                                                    phone_node->src[0]->name :
+                                                    "(none)",
+                                                phone_node->src[1] != nullptr ?
+                                                    phone_node->src[1]->name :
+                                                    "(none)",
+                                                pc_node->name);
+                                        }
+                                    }
+                                    const ggml_tensor * phone_first =
+                                        trace_phone->nodes[0];
+                                    const ggml_tensor * phone_last =
+                                        trace_phone->nodes[
+                                            trace_phone->n_nodes - 1];
+                                    const ggml_tensor * pc_last =
+                                        trace_pc->nodes[
+                                            trace_pc->n_nodes - 1];
+                                    GGML_LOG_INFO(
+                                        "[PHONE_FULL_REGION_GRAPH] "
+                                        "event=SG_TOPOLOGY layer=%d sg=%zu "
+                                        "nodes=%d first=%s last=%s "
+                                        "first_ne1=%" PRId64 " "
+                                        "last_ne1=%" PRId64 " "
+                                        "pc_last=%s pc_last_compute=%d "
+                                        "phone_last_compute=%d "
+                                        "pc_active=%zu phone_active=%zu "
+                                        "pc_only=%zu phone_only=%zu both=%zu "
+                                        "pc_nonmirror=%zu status=TRACE\n",
+                                        first_layer, trace_sg,
+                                        trace_phone->n_nodes,
+                                        phone_first->name, phone_last->name,
+                                        phone_first->ne[1], phone_last->ne[1],
+                                        pc_last->name,
+                                        (pc_last->flags &
+                                            GGML_TENSOR_FLAG_COMPUTE) != 0 ? 1 : 0,
+                                        (phone_last->flags &
+                                            GGML_TENSOR_FLAG_COMPUTE) != 0 ? 1 : 0,
+                                        trace_pc_active, trace_phone_active,
+                                        trace_pc_only, trace_phone_only,
+                                        trace_both, trace_pc_nonmirror);
+                                }
+                            }
+                        }
                         // The opt-in has at most one fallback per candidate
                         // Region/Chunk; keep a compact reason without enabling
                         // the expensive global pipeline debug trace.
