@@ -65,6 +65,73 @@ int main() {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
+    // Forced APPLY_WIDE A/B may test one logical G/C/P pass without
+    // broadening the automatic Planner's 2..4-Cycle search contract.
+    {
+        bool strict_rejected = false;
+        try {
+            (void) llama_region_ring_parse("G33,C3,P4", 40);
+        } catch (const std::exception &) {
+            strict_rejected = true;
+        }
+        REQUIRE(strict_rejected);
+
+        const auto single =
+            llama_region_ring_parse_apply_wide_layout(
+                "G33,C3,P4", 40);
+        REQUIRE(single.size() == 3);
+        REQUIRE(llama_region_ring_single_cycle_force_compatible(
+            single, 40));
+
+        const auto no_gpu =
+            llama_region_ring_parse_apply_wide_layout(
+                "G0,C3,P37", 40);
+        REQUIRE(no_gpu.size() == 2);
+        REQUIRE(no_gpu[0].device == device::CPU);
+        REQUIRE(no_gpu[1].device == device::PHONE);
+        REQUIRE(llama_region_ring_single_cycle_force_compatible(
+            no_gpu, 40));
+
+        const auto no_cpu =
+            llama_region_ring_parse_apply_wide_layout(
+                "G33,C0,P7", 40);
+        REQUIRE(no_cpu.size() == 2);
+        REQUIRE(no_cpu[0].device == device::GPU);
+        REQUIRE(no_cpu[1].device == device::PHONE);
+        REQUIRE(llama_region_ring_single_cycle_force_compatible(
+            no_cpu, 40));
+
+        // Current fifo-pc-phone final-output path is still Phone-owned.
+        const auto no_phone =
+            llama_region_ring_parse_apply_wide_layout(
+                "G37,C3,P0", 40);
+        REQUIRE(!llama_region_ring_single_cycle_force_compatible(
+            no_phone, 40));
+
+        // A zero-count stage is allowed, but a forced collaborative
+        // single-Cycle A/B must still involve at least two devices.
+        const auto phone_only =
+            llama_region_ring_parse_apply_wide_layout(
+                "G0,C0,P40", 40);
+        REQUIRE(!llama_region_ring_single_cycle_force_compatible(
+            phone_only, 40));
+
+        candidate forced_two_device;
+        forced_two_device.cycles = 1;
+        forced_two_device.c = 3;
+        forced_two_device.g = 0;
+        forced_two_device.p = 37;
+        forced_two_device.xc = 64;
+        forced_two_device.xg = 64;
+        forced_two_device.xp = 64;
+        forced_two_device.concrete_regions = no_gpu;
+        std::vector<llama_region_ring_region> rebuilt;
+        REQUIRE(make_regions(forced_two_device, 40, rebuilt));
+        REQUIRE(rebuilt.size() == 2);
+        REQUIRE(simulate(m, rebuilt, forced_two_device));
+        REQUIRE(forced_two_device.wall_ms > 0.0);
+    }
+
     // Opt-in Phone Full stream: each Phone Chunk is ONE wire frame,
     // regardless of the following GPU/CPU Chunk size. The PC Receiver
     // releases every intersecting downstream task only when that whole
