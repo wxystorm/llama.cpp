@@ -10322,7 +10322,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
             "nonuniform_profiled=%zu nonuniform_simulated=%zu "
-            "first_cycle_profiled=%zu first_cycle_selected=%zu "
+            "first_cycle_profiled=%zu first_cycle_e_pool=%zu first_cycle_selected=%zu "
             "gpu_first_pairs_pruned=%zu gpu_first_shapes_pruned=%zu "
             "prefix_expanded=%zu prefix_completed=%zu "
             "prefix_gpu_pruned=%zu prefix_full_memory_pruned=%zu "
@@ -10334,10 +10334,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "reject_memory=%zu reject_profile=%zu reject_dag=%zu "
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
             "E_margin=%.4f shortlist_floor=%d "
-            "filter=E1_FIRST_CYCLE_PLUS_UNIFORM_CONTROL "
+            "filter=E_WIDE_THEN_ABSOLUTE_PLUS_UNIFORM_CONTROL "
             "exact=FULL_PROMPT_EVENT_SIM ranking=SIM_WALL "
-            "uniform_sim_cap=NONE first_seeds_total_cap=100 "
-            "prefix_beam_per_seed=8 width_spread_pct=25 "
+            "uniform_sim_cap=NONE first_e_pool_cap=500 "
+            "first_seeds_total_cap=200 prefix_beam_middle=16 "
+            "prefix_beam_final=24 seed_rank=0.35E_0.65ABS "
+            "prefix_rank=CUM_E_PLUS_STAGE_E width_spread_pct=25 "
             "phone_depth=UNRESTRICTED_PREFIX "
             "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
             "handoff=TOKEN_INTERVAL_PAIR_COST "
@@ -10352,7 +10354,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.e_window_shortlisted, result.shortlisted,
             result.simulated, result.nonuniform_profiled,
             result.nonuniform_simulated, result.first_cycle_profiled,
-            result.first_cycle_selected,
+            result.first_cycle_e_pool, result.first_cycle_selected,
             result.first_cycle_gpu_pairs_pruned,
             result.first_cycle_gpu_shapes_pruned,
             result.prefix_expanded, result.prefix_completed,
@@ -10387,11 +10389,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 const std::string output_file =
                     (split == std::string::npos ? std::string() :
                      metrics_file.substr(0, split + 1)) +
-                    "planner-first-cycle-top100.csv";
+                    "planner-first-cycle-top200.csv";
                 std::ofstream csv(output_file, std::ios::trunc);
                 if (csv) {
                     csv << "rank,selected_by,cycles,first_G,first_C,first_P,"
                            "first_cycle_layers,XC,XG,XP,first_E,"
+                           "first_absolute_proxy_ms,first_joint_score,"
                            "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
                            "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
                            "gpu_bank0_min_mib,gpu_bank1_min_mib,"
@@ -10413,6 +10416,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "," << seed.width << ","
                             << seed.xc << "," << seed.xg << ","
                             << seed.xp << "," << seed.first_e << ","
+                            << seed.first_absolute_proxy_ms << ","
+                            << seed.first_joint_score << ","
                             << seed.first_service_mspt[0] << ","
                             << seed.first_service_mspt[1] << ","
                             << seed.first_service_mspt[2] << ","
@@ -11103,6 +11108,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << result.local_improved
                             << ",\"first_cycle_seeds\":"
                             << result.first_cycle_selected
+                            << ",\"first_cycle_e_pool\":"
+                            << result.first_cycle_e_pool
                             << ",\"gpu_first_pairs_pruned\":"
                             << result.first_cycle_gpu_pairs_pruned
                             << ",\"gpu_first_shapes_pruned\":"
@@ -11115,7 +11122,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << (model.gpu_memory_budget_bytes / 1048576.0L)
                             << ",\"first_cycle_seed_csv\":\""
                             << (first_cycle_seed_csv_saved ?
-                                "planner-first-cycle-top100.csv" : "")
+                                "planner-first-cycle-top200.csv" : "")
                             << "\""
                             << ",\"prefix_completed\":"
                             << result.prefix_completed
