@@ -5032,6 +5032,7 @@ public:
         stored_graphs.resize(backends.size());
         phone_stage_plan_cache.resize(backends.size());
         phone_stage_slot_policy.resize(backends.size());
+        phone_stage_device_arenas.resize(backends.size());
         snapshot_devices.reserve(backends.size());
         route_snapshot_devices.reserve(backends.size());
         phone_region_partial_devices.reserve(backends.size());
@@ -5194,6 +5195,15 @@ private:
     std::vector<std::vector<ggml_phone_stage::template_plan>>
         phone_stage_plan_cache;
     std::vector<ggml_phone_stage::two_slot_pool> phone_stage_slot_policy;
+    // Phone-local OpenCL allocations, never exported as arbitrary PC RPC
+    // pointers. They remain unused by inference until tested rebind support
+    // is explicitly enabled in a subsequent stage.
+    struct phone_owned_arenas {
+        std::array<ggml_backend_buffer_t, ggml_phone_stage::k_slot_count>
+            buffers {};
+        size_t capacity = 0;
+    };
+    std::vector<phone_owned_arenas> phone_stage_device_arenas;
     std::recursive_mutex graph_compute_mutex;
 
     std::mutex route_ready_mutex;
@@ -7885,6 +7895,71 @@ void rpc_server::phone_stage_binding_preflight(
             graph->n_nodes, transient.size(),
             pool.bytes_per_slot(),
             pool.bytes_per_slot() * 2);
+
+        // Explicit opt-in PREP only. Never rebind current graphs here:
+        // cached OpenCL extra/view and live KV/output ownership are still
+        // governed by the original RPC graph until numerical parity passes.
+        const char * reserve_env =
+            std::getenv("GGML_RPC_PHONE_PERSISTENT_POOL_PREP");
+        if (reserve_env != nullptr &&
+            std::strcmp(reserve_env, "1") == 0 &&
+            pool.bytes_per_slot() != 0) {
+            auto & arenas = phone_stage_device_arenas[device];
+            const size_t needed = pool.bytes_per_slot();
+            if (needed > arenas.capacity) {
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                ggml_backend_dev_memory(
+                    ggml_backend_get_device(backends[device]),
+                    &free_bytes, &total_bytes);
+                // Do not reserve more than 1/4 of currently available
+                // GPU memory on an unvalidated experimental path.
+                if (needed > free_bytes / 8) {
+                    GGML_LOG_INFO(
+                        "[PHONE_STAGE_SLOT_POOL] event=REJECT "
+                        "need_each=%zu free=%zu reason=BUDGET status=SAFE\n",
+                        needed, free_bytes);
+                } else {
+                    std::array<ggml_backend_buffer_t,
+                        ggml_phone_stage::k_slot_count> new_buffers {};
+                    bool allocated = true;
+                    for (size_t slot = 0;
+                         slot < ggml_phone_stage::k_slot_count; ++slot) {
+                        new_buffers[slot] =
+                            ggml_backend_alloc_buffer(
+                                backends[device], needed);
+                        if (new_buffers[slot] == nullptr) {
+                            allocated = false;
+                            break;
+                        }
+                    }
+                    if (allocated) {
+                        for (ggml_backend_buffer_t old : arenas.buffers) {
+                            if (old != nullptr) {
+                                ggml_backend_buffer_free(old);
+                            }
+                        }
+                        arenas.buffers = new_buffers;
+                        arenas.capacity = needed;
+                        GGML_LOG_INFO(
+                            "[PHONE_STAGE_SLOT_POOL] event=RESERVED "
+                            "slot_bytes=%zu slot_count=2 "
+                            "total_bytes=%zu mode=PREP_ONLY status=OK\n",
+                            needed, needed * 2);
+                    } else {
+                        for (ggml_backend_buffer_t partial : new_buffers) {
+                            if (partial != nullptr) {
+                                ggml_backend_buffer_free(partial);
+                            }
+                        }
+                        GGML_LOG_INFO(
+                            "[PHONE_STAGE_SLOT_POOL] event=REJECT "
+                            "need_each=%zu reason=ALLOC_FAILED "
+                            "status=SAFE\n", needed);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -8343,6 +8418,16 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    // Phone-owned scratch is private and must be freed before the backend.
+    for (auto & arenas : phone_stage_device_arenas) {
+        for (ggml_backend_buffer_t & buffer : arenas.buffers) {
+            if (buffer != nullptr) {
+                ggml_backend_buffer_free(buffer);
+                buffer = nullptr;
+            }
+        }
+        arenas.capacity = 0;
+    }
     {
         std::lock_guard<std::mutex> lock(phone_region_main_mutex);
         phone_region_main_stop = true;
