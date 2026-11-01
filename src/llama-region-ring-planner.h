@@ -1713,11 +1713,10 @@ inline double prefix_cycle_max_error(
 // three cycles need not have identical C/G widths (the fixed baseline ends in
 // G3,C8,P5 rather than G4,C7,P5). A/B/D are the mean per-cycle station
 // service rates; aggregate service demand is kept separately.
-// Cost the *actual intersecting token intervals* at a device boundary.
-// This matches simulate()'s per-overlap EDGE events, including fixed
-// transfer/setup costs when two independently chosen Chunk grids misalign.
-// The producer's full Chunk must finish before any intersecting edge starts.
-// The full Prompt simulator still owns the final ordering/overlap decision.
+// Legacy GET charges each actual intersecting token interval at a boundary.
+// Phone Full Arena Stream instead charges one complete payload per Phone
+// source Chunk; its receiver completes ALL overlapping PC dependencies only
+// after that frame is received. The DAG simulator determines temporal order.
 inline bool region_ring_handoff_ms_per_token(
         const model & m, device source, device target,
         int source_chunk, int target_chunk, double & per_token_ms) {
@@ -1733,7 +1732,6 @@ inline bool region_ring_handoff_ms_per_token(
     // Avoid charging multiple wire-startup costs for that one payload.
     if (m.phone_full_return_stream &&
             source == device::PHONE && target != device::PHONE) {
-        double total_ms = 0.0;
         for (int begin = 0; begin < m.tokens; begin += source_chunk) {
             const int n = std::min(source_chunk, m.tokens - begin);
             double frame_ms = 0.0;
