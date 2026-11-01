@@ -9597,6 +9597,55 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         return llama_hybrid_transfer_cost(points, bytes, cost);
     };
 
+    if (!profile.duplex_phone_link.empty()) {
+        model.duplex_slowdown = [&profile](
+                size_t c2p_bytes, size_t p2c_bytes,
+                double & c2p_factor, double & p2c_factor) -> bool {
+            // The duplex probe measured equal-size SET and GET. Until
+            // asymmetric paired probes are available, interpolate each
+            // direction's slowdown by its OWN payload size. This is a
+            // calibrated first-order approximation, not a 2D bandwidth
+            // surface. Clamp outlier speedups caused by Wi-Fi jitter.
+            const auto & pts = profile.duplex_phone_link;
+            const auto at = [&](size_t bytes, bool c2p) {
+                const auto slowdown = [&](const llama_hybrid_duplex_transfer_point & p) {
+                    const double solo = c2p ?
+                        p.c2p_solo_ms : p.p2c_solo_ms;
+                    const double both = c2p ?
+                        p.c2p_concurrent_ms : p.p2c_concurrent_ms;
+                    return solo > 0.0 && std::isfinite(solo) &&
+                           std::isfinite(both) && both > 0.0 ?
+                           std::clamp(both / solo, 1.0, 3.0) : 1.0;
+                };
+                if (bytes <= pts.front().bytes) {
+                    return slowdown(pts.front());
+                }
+                if (bytes >= pts.back().bytes) {
+                    return slowdown(pts.back());
+                }
+                const auto upper = std::lower_bound(
+                    pts.begin(), pts.end(), bytes,
+                    [](const llama_hybrid_duplex_transfer_point & p, size_t n) {
+                        return p.bytes < n;
+                    });
+                const auto lower = upper - 1;
+                const double x0 = std::log((double) lower->bytes);
+                const double x1 = std::log((double) upper->bytes);
+                const double x = std::log((double) bytes);
+                const double alpha = x1 > x0 ?
+                    std::clamp((x - x0) / (x1 - x0), 0.0, 1.0) : 0.0;
+                return (1.0 - alpha) * slowdown(*lower) +
+                       alpha * slowdown(*upper);
+            };
+            if (c2p_bytes == 0 || p2c_bytes == 0) {
+                return false;
+            }
+            c2p_factor = at(c2p_bytes, true);
+            p2c_factor = at(p2c_bytes, false);
+            return std::isfinite(c2p_factor) &&
+                   std::isfinite(p2c_factor);
+        };
+    }
 
     const auto read_boundary_ratio =
         [](const char * name, float fallback, float & ratio) {
