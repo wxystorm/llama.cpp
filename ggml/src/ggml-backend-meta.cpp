@@ -20809,7 +20809,12 @@ auto prefill_norm_sg_has_prework =
                     first_layer >= 0;
                 if (starts_full_prefill) {
                     size_t last_safe = i;
-                    for (size_t sg = i; sg < backend_ctx->n_subgraphs; ++sg) {
+                    // Stage 1 only: merge the immediately adjacent final
+                    // Attention/FFN pair.  Never absorb further result/output
+                    // SGs or silently cross a separate scheduling boundary.
+                    const size_t stop_sg =
+                        std::min(backend_ctx->n_subgraphs, i + 2);
+                    for (size_t sg = i; sg < stop_sg; ++sg) {
                         ggml_cgraph * pc =
                             backend_ctx->backend_configs[0]
                                 .cgraphs[sg].cgraph_main;
