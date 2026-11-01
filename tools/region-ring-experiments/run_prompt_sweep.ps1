@@ -24,6 +24,8 @@ param(
     [int] $ForceXP = 0,
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
+    [ValidateSet("on", "off")]
+    [string] $DuplexProfile = "off",
     [string] $Planner = "apply-wide",
     [ValidateRange(0, 5)]
     [int] $LogVerbosity = 4,
@@ -51,6 +53,7 @@ $callArgs = @(
     "--min-context", "$MinContext",
     "--context-padding", "$ContextPadding",
     "--streaming", $Streaming,
+    "--duplex-profile", $DuplexProfile,
     "--planner", $Planner,
     "--log-verbosity", "$LogVerbosity"
 )
