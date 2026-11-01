@@ -86,6 +86,8 @@ struct candidate {
     std::array<int, 3> stage_copy_call_proxy_count {};
     std::array<double, 3> transfer_service_ms {};
     std::array<uint64_t, 3> transfer_payload_bytes {};
+    // A/B only: duration when two independent phone directions were active.
+    double duplex_overlap_ms = 0.0;
     // Shared host-side graph/split preparation lane. This is service time,
     // not lock wait; queueing is reconstructed by simulate().
     double prepare_busy_ms = 0.0;
@@ -116,7 +118,15 @@ struct model {
     int hidden = 2048;
     int slot_pool = (int) LLAMA_REGION_RING_SLOT_POOL_SIZE;
     int max_tail = 12;
-    bool shared_phone_link = true; // Conservative effective Wi-Fi contention.
+    bool shared_phone_link = true; // Historical conservative serial baseline.
+    // Optional A/B-only measured network contention. When both phone link
+    // directions are active, virtual transport work advances at 1/slowdown
+    // per wall-ms. When either direction completes, the survivor resumes
+    // at its measured solo speed. Asymmetric sizes use direction-specific
+    // interpolation of the measured equal-size probe as a first estimate.
+    bool duplex_phone_contention = false;
+    std::function<bool(size_t, size_t, double &, double &)>
+        duplex_slowdown;
     // Opt-in Phone Full Arena push: one complete Phone Chunk per TCP frame.
     // The Receiver publishes all overlapping PC Chunk dependencies only after
     // the entire frame arrives. Legacy GET and directional Tensor remain off.
@@ -622,6 +632,7 @@ struct edge {
     // Synchronous legacy GET returns from the Phone worker; unlike Arena
     // Stream, it keeps that worker occupied until the full TCP frame arrives.
     bool release_phone_worker_on_complete = false;
+    size_t payload_bytes = 0;
 };
 enum class event_kind : uint8_t {
     TASK = 0,
@@ -661,6 +672,10 @@ inline bool simulate(const model & m,
     // Weight-transfer profiles are needed only for GPU rank >= 2.
     // Rank0/A and rank1/B are preloaded, and a forced 0/1-GPU-Region
     // layout has no rolling H2D work inside the measured prompt.
+    if (m.duplex_phone_contention &&
+            (m.shared_phone_link || !m.duplex_slowdown)) {
+        return reject("INVALID_DUPLEX_LINK_MODEL");
+    }
     if (m.phone_full_return_stream &&
             llama_region_ring_has_directional_stages(regions)) {
         return reject("PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
@@ -671,6 +686,7 @@ inline bool simulate(const model & m,
     c.stage_copy_call_proxy_count = {};
     c.transfer_service_ms = {};
     c.transfer_payload_bytes = {};
+    c.duplex_overlap_ms = 0.0;
 
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
@@ -824,6 +840,7 @@ inline bool simulate(const model & m,
                 frame.producer = src;
                 frame.lane = lane;
                 frame.duration = ms;
+                frame.payload_bytes = bytes;
                 frame.release_phone_worker_on_complete =
                     phone_output && !m.phone_full_return_stream;
                 for (size_t j = di; j < by_region[r + 1].size(); ++j) {
@@ -895,6 +912,7 @@ inline bool simulate(const model & m,
                 }
                 const int edge_id = (int) edges.size();
                 edges.push_back({last_src, dst, lane, ms});
+                edges.back().payload_bytes = bytes;
                 outgoing_edges[(size_t) last_src].push_back(edge_id);
                 ++tasks[(size_t) last_src].outputs;
                 ++tasks[(size_t) dst].inputs;
@@ -931,6 +949,7 @@ inline bool simulate(const model & m,
                 }
                 const int edge_id = (int) edges.size();
                 edges.push_back({src, dst, lane, ms});
+                edges.back().payload_bytes = bytes;
                 outgoing_edges[(size_t) src].push_back(edge_id);
                 if (a != b) {
                     ++c.transfer_event_count[direction];
