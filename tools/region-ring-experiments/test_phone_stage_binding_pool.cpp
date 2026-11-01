@@ -30,8 +30,8 @@ int main() {
     }, {{4, 1, 64, 128}}) == status::ok);
     assert(a.roots.size() == 3);
     assert(a.roots[0].offset == 0);
-    assert(a.roots[1].offset == 0); // root 1 is no longer live
-    assert(a.roots[2].offset >= 4096); // overlapping at node 3
+    assert(a.roots[1].id == 3 && a.roots[1].offset >= 4096); // live at node 3
+    assert(a.roots[2].id == 2 && a.roots[2].offset == 0); // root 1 is free by node 4
 
     std::unordered_map<uint32_t, size_t> bound = {{123, 777}};
     assert(a.resolve(0x100000, a.required_bytes, bound) == status::ok);
