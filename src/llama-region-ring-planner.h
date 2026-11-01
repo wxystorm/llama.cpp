@@ -774,7 +774,8 @@ inline bool simulate(const model & m,
             // producing chunk; input SET happens once per destination chunk.
             // Internal Meta subgraph transfers are not represented here.
             const bool source_owned_copy =
-                a == device::PHONE || a == device::GPU;
+                a == device::PHONE ||
+                (a == device::GPU && b != device::PHONE);
             c.stage_copy_call_proxy_count[direction] +=
                 (int) (source_owned_copy ?
                     by_region[r].size() : by_region[r + 1].size());
