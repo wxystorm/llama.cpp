@@ -20,6 +20,19 @@ struct llama_hybrid_dual_transfer_point {
     double wall_ms = 0.0;
 };
 
+// RPC bidirectional transport calibration, opt-in and NOT part of the
+// automatic Planner ranking until actual concurrent-link scheduling is
+// modeled. Solo and concurrent measurements use the same RPC commands.
+struct llama_hybrid_duplex_transfer_point {
+    size_t bytes = 0;
+    double c2p_solo_ms = 0.0;
+    double p2c_solo_ms = 0.0;
+    double c2p_concurrent_ms = 0.0;
+    double p2c_concurrent_ms = 0.0;
+    double concurrent_wall_ms = 0.0;
+    double concurrent_overlap_ms = 0.0;
+};
+
 struct llama_hybrid_ffn_compute_point {
     int     tokens        = 0;
     float   local_ratio   = 1.0f;
@@ -203,6 +216,7 @@ struct llama_hybrid_profile {
     std::vector<llama_hybrid_transfer_point> phone_to_pc;
 
     std::vector<llama_hybrid_dual_transfer_point> dual_phone_to_pc;
+    std::vector<llama_hybrid_duplex_transfer_point> duplex_phone_link;
 
     double reduce_ms     = 0.0;
     double rpc_submit_ms = 0.0;
