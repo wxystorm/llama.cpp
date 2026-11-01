@@ -4407,11 +4407,26 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
         const bool phone_stream_requested =
             stream_env != nullptr && std::atoi(stream_env) != 0;
+        // A single G->C->P pass ends on Phone and has no Phone->PC
+        // boundary. Do not require a P2C stream subscription when no
+        // non-final Phone stage can ever publish a return frame.
+        bool has_phone_full_return = false;
+        for (size_t i = 0; i + 1 < stages.size(); ++i) {
+            if (stages[i].kind == llama_hybrid_runtime_stage_kind::PHONE) {
+                has_phone_full_return = true;
+                break;
+            }
+        }
+        if (phone_stream_requested && !has_phone_full_return) {
+            LLAMA_LOG_INFO(
+                "[P2C_STREAM] phase=SKIP reason=NO_PHONE_TO_PC_BOUNDARY "
+                "status=NOT_NEEDED\n");
+        }
         llama_region_ring_phone_full_stream_session phone_stream_session;
         void * phone_stream_handle = nullptr;
         ggml_backend_rpc_p2c_stream_capture_t phone_stream_capture = nullptr;
         ggml_backend_rpc_p2c_stream_stop_t phone_stream_stop = nullptr;
-        if (phone_stream_requested) {
+        if (phone_stream_requested && has_phone_full_return) {
             if (!pc_phone_overlap || directional_runtime ||
                     phone_rpc_backend == nullptr) {
                 LLAMA_LOG_ERROR(
