@@ -14,7 +14,7 @@ namespace ggml_phone_stage {
 
 constexpr size_t k_slot_count = 2;
 enum class status { ok, invalid, overflow, out_of_memory, busy, stale };
-enum class state  { free, computing, output_pending };
+enum class state  { free, preparing, computing, output_pending };
 
 struct activation {
     uint32_t id;
@@ -259,6 +259,39 @@ public:
         s.seq = seq;
         return status::ok;
     }
+    status acquire_next_preparing(uint64_t seq, uint64_t epoch,
+                                  size_t & index) {
+        if (!seq) { return status::invalid; }
+        if (epoch != epoch_) { return status::stale; }
+        for (size_t step = 0; step < k_slot_count; ++step) {
+            const size_t next = (next_slot_ + step) % k_slot_count;
+            if (slots_[next].phase != state::free) { continue; }
+            slots_[next].phase = state::preparing;
+            slots_[next].seq = seq;
+            index = next;
+            next_slot_ = (next + 1) % k_slot_count;
+            return status::ok;
+        }
+        return status::busy;
+    }
+    status start_compute(size_t index, uint64_t seq) {
+        if (index >= k_slot_count || !seq) { return status::invalid; }
+        slot & s = slots_[index];
+        if (s.phase != state::preparing || s.seq != seq) {
+            return status::stale;
+        }
+        s.phase = state::computing;
+        return status::ok;
+    }
+    status cancel_preparing(size_t index, uint64_t seq) {
+        if (index >= k_slot_count || !seq) { return status::invalid; }
+        slot & s = slots_[index];
+        if (s.phase != state::preparing || s.seq != seq) {
+            return status::stale;
+        }
+        s = {};
+        return status::ok;
+    }
     status compute_complete(size_t index, uint64_t seq) {
         if (index >= k_slot_count || !seq) { return status::invalid; }
         slot & s = slots_[index];
@@ -286,6 +319,7 @@ private:
         uint64_t seq = 0;
     };
     std::array<slot, k_slot_count> slots_ {};
+    size_t next_slot_ = 0;
     size_t capacity_ = 0;
     uint64_t epoch_ = 0;
 };
