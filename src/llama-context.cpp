@@ -109,6 +109,8 @@ struct llama_region_ring_phone_full_return_job {
 struct llama_region_ring_phone_full_stream_session {
     uint64_t run_id = 0;
     llama_region_ring_ready * ready = nullptr;
+    // PC-host timestamp of complete Arena frame receipt, when tracing.
+    std::function<void(const llama_region_ring_task &)> on_frame_received;
     std::mutex mutex;
     std::unordered_map<uint64_t, llama_region_ring_phone_full_return_job> pending;
     std::atomic<bool> failed { false };
@@ -172,6 +174,7 @@ static void llama_region_ring_phone_full_stream_complete(
                 frame->n_tokens == uint32_t(it->second.task.n_tokens)) {
             it->second.received = true;
             valid = true;
+            task = it->second.task;
             if (it->second.deferred) {
                 task = it->second.task;
                 publish = true;
@@ -183,6 +186,9 @@ static void llama_region_ring_phone_full_stream_complete(
         session->failed.store(true, std::memory_order_relaxed);
         session->ready->cancel();
         return;
+    }
+    if (session->on_frame_received) {
+        session->on_frame_received(task);
     }
     if (publish && !session->ready->failed()) {
         try {
@@ -2654,7 +2660,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         timing != nullptr ? &timing->graph_reused : nullptr,
         timing);
     if (timing != nullptr) {
-        timing->prepare_us += ggml_time_us() - prepare_begin_us;
+        const int64_t prepare_end_us = ggml_time_us();
+        timing->prepare_us += prepare_end_us - prepare_begin_us;
+        if (timing->capture_timeline) {
+            timing->graph_prepare_begin_us = prepare_begin_us;
+            timing->graph_prepare_end_us = prepare_end_us;
+        }
     }
     apply_mctx = false;
     if (result == nullptr || ret != GGML_STATUS_SUCCESS) {
@@ -2962,8 +2973,15 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 timing != nullptr ? ggml_time_us() : 0;
             ret = ggml_backend_sched_prepare_split(sched_use, split);
             if (timing != nullptr) {
+                const int64_t split_prepare_end_us = ggml_time_us();
                 const int64_t split_prepare_us =
-                    ggml_time_us() - split_prepare_begin_us;
+                    split_prepare_end_us - split_prepare_begin_us;
+                if (timing->capture_timeline) {
+                    if (timing->split_prepare_begin_us == 0) {
+                        timing->split_prepare_begin_us = split_prepare_begin_us;
+                    }
+                    timing->split_prepare_end_us = split_prepare_end_us;
+                }
                 timing->prepare_us += split_prepare_us;
                 timing->split_prepare_us += split_prepare_us;
                 if (gpu_weight_streaming) {
@@ -3109,7 +3127,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         ret = graph_compute_range(sched_use, 0, n_splits, block_tokens > 1);
     }
     if (timing != nullptr) {
-        timing->compute_range_us += ggml_time_us() - compute_begin_us;
+        const int64_t compute_end_us = ggml_time_us();
+        timing->compute_range_us += compute_end_us - compute_begin_us;
+        if (timing->capture_timeline) {
+            timing->compute_range_begin_us = compute_begin_us;
+            timing->compute_range_end_us = compute_end_us;
+        }
     }
     if (ret != GGML_STATUS_SUCCESS) {
         return nullptr;
@@ -3140,10 +3163,17 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         // The stage output is not readable yet. The outer Region Ring owns the
         // stable host edge buffer and a dedicated join worker will fill it
         // before publishing downstream READY.
+        if (timing != nullptr && timing->capture_timeline) {
+            timing->output_kind = 4;
+        }
         return result;
     }
 
     if (llama_region_ring_tls_phone_full_stream.enabled) {
+        if (timing != nullptr && timing->capture_timeline) {
+            timing->output_begin_us = ggml_time_us();
+            timing->output_kind = 2;
+        }
         auto & stream = llama_region_ring_tls_phone_full_stream;
         ggml_tensor * stage_tensor = result->get_stage_output();
         ggml_tensor * phone_tensor =
@@ -3171,11 +3201,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             return nullptr;
         }
         stream.deferred = true;
+        if (timing != nullptr && timing->capture_timeline) {
+            timing->output_end_us = ggml_time_us();
+        }
         return result;
     }
 
     if (stage_output != nullptr) {
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
+        if (timing != nullptr && timing->capture_timeline) {
+            timing->output_begin_us = sync_begin_us;
+            timing->output_kind = 1;
+        }
         if (!copy_hybrid_stage_output(
                 result, sched_use, stage_output, block_tokens, ubatch_id,
                 stage_index, block_index, graph_already_synchronized)) {
@@ -3186,13 +3223,25 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             return nullptr;
         }
         if (timing != nullptr) {
-            timing->sync_us += ggml_time_us() - sync_begin_us;
+            const int64_t sync_end_us = ggml_time_us();
+            timing->sync_us += sync_end_us - sync_begin_us;
+            if (timing->capture_timeline) {
+                timing->output_end_us = sync_end_us;
+            }
         }
     } else if (synchronize && !graph_already_synchronized) {
         const int64_t sync_begin_us = timing != nullptr ? ggml_time_us() : 0;
+        if (timing != nullptr && timing->capture_timeline) {
+            timing->output_begin_us = sync_begin_us;
+            timing->output_kind = 3;
+        }
         ggml_backend_sched_synchronize(sched_use);
         if (timing != nullptr) {
-            timing->sync_us += ggml_time_us() - sync_begin_us;
+            const int64_t sync_end_us = ggml_time_us();
+            timing->sync_us += sync_end_us - sync_begin_us;
+            if (timing->capture_timeline) {
+                timing->output_end_us = sync_end_us;
+            }
         }
     }
 
