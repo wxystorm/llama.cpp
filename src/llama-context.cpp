@@ -4634,6 +4634,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "status=NOT_NEEDED\n");
         }
         llama_region_ring_phone_full_stream_session phone_stream_session;
+        if (ring_trace_enabled) {
+            phone_stream_session.on_frame_received =
+                [&](const llama_region_ring_task & task) {
+                    if (auto * row = trace_row(task)) {
+                        row->frame_received_us = ggml_time_us();
+                    }
+                };
+        }
         void * phone_stream_handle = nullptr;
         ggml_backend_rpc_p2c_stream_capture_t phone_stream_capture = nullptr;
         ggml_backend_rpc_p2c_stream_stop_t phone_stream_stop = nullptr;
@@ -4783,6 +4791,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
 
                 const int64_t refill_begin_us = ggml_time_us();
+                if (ring_trace_enabled) {
+                    auto & row = ring_bank_trace_rows[region];
+                    row.begin_us = refill_begin_us;
+                    row.source_region = source_region;
+                }
                 ++gpu_bank_mover_stats_v.started;
                 LLAMA_LOG_INFO(
                     "[REGION_RING_GPU_BANK_MOVER] event=REFILL_START "
@@ -4800,6 +4813,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         if (region_ring_cuda_transfer_backend) {
                             ggml_backend_synchronize(
                                 region_ring_cuda_transfer_backend.get());
+                        }
+                        if (ring_trace_enabled) {
+                            auto & row = ring_bank_trace_rows[region];
+                            row.done_us = ggml_time_us();
+                            row.success = 0;
                         }
                         ++gpu_bank_mover_stats_v.failures;
                         gpu_bank_mover_stats_v.wall_us +=
@@ -4831,6 +4849,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_sched_get_weight_cache_buffer_size(
                         bank.sched.get());
                 const int64_t prepare_begin_us = ggml_time_us();
+                if (ring_trace_enabled) {
+                    ring_bank_trace_rows[region].prepare_begin_us = prepare_begin_us;
+                }
                 {
                     // Bank A/B share CUDA0. Never synchronize it during the
                     // other Bank's graph capture. Lock CUDA before PREPARE.
@@ -4857,6 +4878,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
                 const int64_t prepare_us =
                     ggml_time_us() - prepare_begin_us;
+                if (ring_trace_enabled) {
+                    ring_bank_trace_rows[region].prepare_end_us =
+                        prepare_begin_us + prepare_us;
+                }
                 const size_t weight_capacity_after =
                     ggml_backend_sched_get_weight_cache_buffer_size(
                         bank.sched.get());
@@ -4900,6 +4925,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 int64_t stage_cpu_copy_us = 0;
                 size_t stage_chunks = 0;
                 const int64_t h2d_begin_us = ggml_time_us();
+                if (ring_trace_enabled) {
+                    ring_bank_trace_rows[region].h2d_begin_us = h2d_begin_us;
+                }
                 ggml_backend_sched_t staging_owner =
                     region_ring_worker_resources[1].sched.get();
                 for (int split = 0; split < n_splits; ++split) {
@@ -4926,6 +4954,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     region_ring_cuda_transfer_backend.get());
                 const int64_t h2d_us =
                     ggml_time_us() - h2d_begin_us;
+                if (ring_trace_enabled) {
+                    ring_bank_trace_rows[region].h2d_end_us =
+                        h2d_begin_us + h2d_us;
+                }
                 gpu_bank_mover_kv_view->clear_stage_range();
 
                 gpu_bank_mover_stats_v.wall_us +=
@@ -4937,6 +4969,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 gpu_bank_mover_stats_v.stage_chunks += stage_chunks;
                 gpu_bank_mover_stats_v.upload_bytes += upload_bytes;
                 ++gpu_bank_mover_stats_v.completed;
+                if (ring_trace_enabled) {
+                    auto & row = ring_bank_trace_rows[region];
+                    row.done_us = ggml_time_us();
+                    row.upload_bytes = upload_bytes;
+                    row.success = 1;
+                }
 
                 LLAMA_LOG_INFO(
                     "[REGION_RING_GPU_BANK_MOVER] event=REFILL_DONE "
@@ -4982,6 +5020,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     auto & bank =
                         region_ring_worker_resources[bank_index + 1];
                     bank.bank_ready = false;
+                    if (ring_trace_enabled) {
+                        auto & row = ring_bank_trace_rows[region];
+                        row.enqueue_us = ggml_time_us();
+                        row.source_region = source_region;
+                    }
                     gpu_bank_mover_jobs.push_back({
                         region, bank_index, source_region});
                 }
