@@ -46,6 +46,17 @@ FIELDS = [
     "phone_input_push_applied", "phone_input_push_fallback",
     "phone_input_push_mib", "phone_input_push_wall_ms",
     "phone_input_push_worker_wait_ms",
+    "phone_input_push_socket_lock_ms", "phone_input_push_hash_ms",
+    "phone_input_push_pack_ms", "phone_input_push_header_send_ms",
+    "phone_input_push_payload_send_ms", "phone_input_push_socket_send_ms",
+    "phone_input_push_ack_wait_ms",
+    "phone_input_push_phone_recv_header_ms",
+    "phone_input_push_phone_recv_alloc_ms",
+    "phone_input_push_phone_recv_payload_ms",
+    "phone_input_push_phone_hash_ms",
+    "phone_input_push_phone_slot_wait_ms",
+    "phone_input_push_phone_host_stage_ms",
+    "phone_input_push_phone_handler_ms",
     "cpu_split_target_wait_ms", "gpu_split_target_wait_ms", "phone_split_target_wait_ms",
     "cpu_split_source_sync_ms", "gpu_split_source_sync_ms", "phone_split_source_sync_ms",
     "cpu_split_copy_call_ms", "gpu_split_copy_call_ms", "phone_split_copy_call_ms",
@@ -110,6 +121,46 @@ def records(path: Path):
 
 def total(rows, key):
     return round(sum(float(r.get(key, 0) or 0) for r in rows), 3)
+
+
+# One row per Phone Region/Chunk; populated from the native Ring timeline.
+# Parse *after* the measurement_start marker so startup/warmup cannot
+# contaminate the measured 358-token Push breakdown.
+PHONE_PUSH_TRACE_FIELDS = (
+    "ubatch", "region", "chunk", "layer_begin", "layer_end", "token_begin",
+    "tokens", "push_status", "push_bytes", "push_begin_ms", "push_end_ms",
+    "push_wall_ms", "push_socket_lock_ms", "push_hash_ms",
+    "push_pack_ms", "push_header_send_ms", "push_payload_send_ms",
+    "push_socket_send_ms", "push_ack_wait_ms",
+    "push_phone_recv_header_ms", "push_phone_recv_alloc_ms",
+    "push_phone_recv_payload_ms", "push_phone_hash_ms",
+    "push_phone_slot_wait_ms", "push_phone_host_stage_ms",
+    "push_phone_handler_ms",
+)
+
+
+def write_phone_input_push_timeline(folder: Path):
+    entries = records(folder / "metrics.jsonl")
+    markers = [i for i, row in enumerate(entries)
+               if row.get("type") == "measurement_start"]
+    measured = entries[markers[-1] + 1:] if markers else entries
+    rows = [
+        {field: row.get(field) for field in PHONE_PUSH_TRACE_FIELDS}
+        for row in measured
+        if row.get("type") == "region_ring_chunk_trace"
+        and row.get("push_status") is not None
+    ]
+    if not rows:
+        return 0
+    rows.sort(key=lambda row: (int(row.get("ubatch") or 0),
+                               int(row.get("region") or 0),
+                               int(row.get("chunk") or 0)))
+    path = folder / "phone_input_push_timeline.csv"
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=PHONE_PUSH_TRACE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
 
 
 def match_last(pattern, string):
@@ -335,7 +386,18 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
     for key in ("phone_input_push_accepted", "phone_input_push_applied",
                 "phone_input_push_fallback", "phone_input_push_mib",
-                "phone_input_push_wall_ms", "phone_input_push_worker_wait_ms"):
+                "phone_input_push_wall_ms", "phone_input_push_worker_wait_ms",
+                "phone_input_push_socket_lock_ms", "phone_input_push_hash_ms",
+                "phone_input_push_pack_ms", "phone_input_push_header_send_ms",
+                "phone_input_push_payload_send_ms",
+                "phone_input_push_socket_send_ms", "phone_input_push_ack_wait_ms",
+                "phone_input_push_phone_recv_header_ms",
+                "phone_input_push_phone_recv_alloc_ms",
+                "phone_input_push_phone_recv_payload_ms",
+                "phone_input_push_phone_hash_ms",
+                "phone_input_push_phone_slot_wait_ms",
+                "phone_input_push_phone_host_stage_ms",
+                "phone_input_push_phone_handler_ms"):
         row[key] = total(ring, key)
     row["phone_input_push_enabled"] = any(
         record.get("phone_input_push_enabled") is True for record in ring)
@@ -514,7 +576,8 @@ def main():
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
                                           "LLAMA_REGION_RING_TASK_TRACE",
-                                          "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES")
+                                          "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
+                                          "LLAMA_REGION_RING_PHONE_INPUT_PUSH")
                                  or k in ("GGML_META_PHONE_FULL_ADD_FUSION",
                                           "GGML_META_RING_PHONE_FUSION")},
             "phone_full_add_fusion_requested":
@@ -546,6 +609,8 @@ def main():
                     stderr.write(f"LAUNCH_ERROR: {exc}\n".encode("utf-8"))
             elapsed = 1000.0 * (time.perf_counter() - start)
         row = result_row(args, folder, prompt, hint, ctx, exitcode, elapsed, commit)
+        if not args.dry_run:
+            write_phone_input_push_timeline(folder)
         if args.dry_run:
             row["status"], row["exit_code"] = "DRY_RUN", ""
         (folder / "result.json").write_text(

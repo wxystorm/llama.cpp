@@ -2,7 +2,7 @@
 
 **Opt-in and default-off.** This feature changes both the PC and Android RPC
 server implementation. Both binaries must be rebuilt from the SAME commit:
-the RPC patch version changes from 20 to **21**.
+the RPC patch version is now **22** (PUSH timing payload added).
 
 On the PC, before invoking the ordinary prompt sweep:
 
@@ -89,6 +89,65 @@ Batch/UBatch, PC/Phone binaries and other flags with this one difference:
 $env:LLAMA_REGION_RING_PHONE_INPUT_PUSH = "0"  # baseline
 $env:LLAMA_REGION_RING_PHONE_INPUT_PUSH = "1"  # opt-in
 ```
+
+## ACK and transport timing breakdown (RPC patch 22)
+
+The PC now measures PUSH in the *existing* call, without additional RPCs:
+`phone_input_push_hash_ms`, `phone_input_push_pack_ms`,
+`phone_input_push_header_send_ms`,
+`phone_input_push_payload_send_ms`,
+`phone_input_push_socket_send_ms` (sum of the two send calls),
+`phone_input_push_ack_wait_ms`, and
+`phone_input_push_socket_lock_ms`. Phone reports its own measured durations
+*inside the same ACK*: `phone_input_push_phone_recv_header_ms`,
+`phone_input_push_phone_recv_alloc_ms`,
+`phone_input_push_phone_recv_payload_ms`,
+`phone_input_push_phone_hash_ms`,
+`phone_input_push_phone_slot_wait_ms`,
+`phone_input_push_phone_host_stage_ms` and
+`phone_input_push_phone_handler_ms`.
+
+All values are cumulative across measured Push chunks. `ack_wait_ms` is
+**not** pure network RTT: it includes any unfinished Phone receiver processing,
+the Phone response, and scheduling. `payload_send_ms` is the PC-side duration
+of blocking socket `send` calls and does not prove that bytes have already
+arrived. `phone_recv_payload_ms` includes time spent blocked in Phone `recv`,
+not just on-the-wire transmission. The Phone and PC use different clocks, so
+only durations are compared; PC/Phone intervals may overlap and **must not be
+summed** into `push_wall_ms`.
+
+The existing trace flag writes a per-Chunk breakdown with no per-Chunk logging:
+
+```powershell
+$env:LLAMA_REGION_RING_TASK_TRACE = "1"
+$env:LLAMA_REGION_RING_PHONE_INPUT_PUSH = "1"
+# Re-run the existing 358-token prompt sweep.
+$run = "E:\\llama\\llama-tensor-v2\\planner-test-results-full-region-v7\\YOUR-NEW-RUN"
+Import-Csv "$run\\summary.csv" |
+    Select-Object status,prefill_tps,phone_input_push_wall_ms,
+        phone_input_push_hash_ms,phone_input_push_pack_ms,
+        phone_input_push_socket_send_ms,phone_input_push_ack_wait_ms,
+        phone_input_push_phone_recv_payload_ms,
+        phone_input_push_phone_hash_ms,
+        phone_input_push_phone_host_stage_ms |
+    Format-List
+
+Import-Csv "$run\\prompt_358\\phone_input_push_timeline.csv" |
+    Select-Object region,chunk,tokens,push_wall_ms,push_hash_ms,
+        push_pack_ms,push_socket_send_ms,push_ack_wait_ms,
+        push_phone_recv_payload_ms,push_phone_hash_ms,
+        push_phone_host_stage_ms |
+    Format-Table -AutoSize
+```
+
+For optional *Phone-side* ACK-send timing, launch the Android RPC server
+with `GGML_RPC_PHONE_INPUT_ACK_TRACE=1` and filter
+`[PHONE_INPUT_PUSH_ACK]`. Its `ack_send_ms` **cannot** be included in the
+ACK being timed and is therefore logged separately on the Phone only.
+
+This profiling does not change the producer/consumer schedule, staged-input
+semantics, Graph binding or ACK flow. Neither the old summary nor existing
+server logs can reconstruct the new breakdown retroactively.
 
 No speedup is claimed until Windows + Android runtime builds, output parity and
 measured timelines have been checked.

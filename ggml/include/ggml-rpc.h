@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    21
+#define RPC_PROTO_PATCH_VERSION    22
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -371,10 +371,31 @@ using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
         ggml_backend_t backend,
         struct ggml_backend_rpc_snapshot_stats * stats);
 
+// Durations from two independent monotonic clocks. Do NOT subtract PC
+// timestamps from Phone timestamps or add overlapping send/receive calls.
+// This lightweight breakdown is returned by the PUSH RPC ACK; no per-chunk
+// terminal logging or extra control-plane round trips are required.
+struct ggml_backend_rpc_phone_input_push_timing {
+    int64_t pc_socket_lock_wait_us = 0;
+    int64_t pc_hash_us = 0;
+    int64_t pc_pack_us = 0;
+    int64_t pc_header_send_us = 0;
+    int64_t pc_payload_send_us = 0;
+    int64_t pc_ack_wait_us = 0;
+    int64_t phone_recv_header_us = 0;
+    int64_t phone_recv_alloc_us = 0;
+    int64_t phone_recv_payload_us = 0;
+    int64_t phone_hash_us = 0;
+    int64_t phone_slot_lock_wait_us = 0;
+    int64_t phone_host_stage_us = 0;
+    int64_t phone_handler_us = 0;
+};
+
 using ggml_backend_rpc_phone_input_push_t = bool (*)(
         ggml_backend_t backend, uint64_t run_id,
         uint32_t region, uint32_t chunk,
-        const void * input, size_t bytes);
+        const void * input, size_t bytes,
+        struct ggml_backend_rpc_phone_input_push_timing * timing);
 // PC Phone Worker thread-local scope for one already staged input. The
 // ordinary RPC set_tensor() transparently applies the matching staged bytes
 // to its original destination tensor; all other tensors use legacy SET.

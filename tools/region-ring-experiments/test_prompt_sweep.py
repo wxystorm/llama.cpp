@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline regression test for sweep CSV parsing. No GGUF, RPC or CUDA required."""
+import csv
 import importlib.util
 import json
 from pathlib import Path
@@ -15,6 +16,38 @@ SPEC.loader.exec_module(SWEEP)
 
 
 class ExperimentReportTests(unittest.TestCase):
+    def test_phone_input_push_timeline_only_measured_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            sample = {
+                "type": "region_ring_chunk_trace", "ubatch": 0,
+                "region": 2, "chunk": 1, "push_status": 1,
+                "push_bytes": 1310720, "push_wall_ms": 27.0,
+                "push_ack_wait_ms": 8.5, "push_socket_send_ms": 12.0,
+                "push_phone_recv_payload_ms": 11.5,
+                "push_phone_hash_ms": 3.5,
+            }
+            newer = dict(sample, chunk=0, push_ack_wait_ms=6.25)
+            data = [
+                sample,  # warmup: do not export
+                {"type": "measurement_start", "schema": 1},
+                sample, newer,
+                {"type": "region_ring_chunk_trace", "ubatch": 0,
+                 "region": 0, "chunk": 0},
+            ]
+            (folder / "metrics.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in data) + "\n",
+                encoding="utf-8")
+            count = SWEEP.write_phone_input_push_timeline(folder)
+            self.assertEqual(count, 2)
+            with (folder / "phone_input_push_timeline.csv").open(
+                    encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual([x["chunk"] for x in rows], ["0", "1"])
+            self.assertEqual(rows[0]["push_ack_wait_ms"], "6.25")
+            self.assertEqual(rows[1]["push_phone_hash_ms"], "3.5")
+            self.assertEqual(rows[1]["push_bytes"], "1310720")
+
     def test_warmup_excluded_and_actual_tokens_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

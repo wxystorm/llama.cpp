@@ -403,6 +403,20 @@ struct rpc_msg_phone_input_apply_req {
 struct rpc_msg_phone_input_ack {
     uint8_t accepted = 0;
 };
+// These are independent server-side durations returned with PUSH ACK.
+// A Phone timestamp is NEVER directly subtracted from a PC timestamp.
+struct rpc_msg_phone_input_push_ack {
+    uint8_t accepted = 0;
+    int64_t recv_header_us = 0;
+    int64_t recv_alloc_us = 0;
+    int64_t recv_payload_us = 0;
+    int64_t hash_us = 0;
+    int64_t slot_lock_wait_us = 0;
+    int64_t host_stage_us = 0;
+    int64_t handler_us = 0;
+};
+static_assert(sizeof(rpc_msg_phone_input_push_ack) == 64,
+              "PUSH timing ACK ABI changed; update RPC protocol version");
 static constexpr size_t RPC_PHONE_INPUT_MAX_BYTES = 32 * 1024 * 1024;
 
 struct rpc_phone_input_consumer_tls {
@@ -979,9 +993,19 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     return sock->recv_data(msg, msg_size);
 }
 
-static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
+static bool recv_msg(
+        socket_ptr sock, std::vector<uint8_t> & input,
+        int64_t * header_us = nullptr,
+        int64_t * alloc_us = nullptr,
+        int64_t * payload_us = nullptr) {
+    const bool timed = header_us != nullptr ||
+        alloc_us != nullptr || payload_us != nullptr;
+    const int64_t start_us = timed ? ggml_time_us() : 0;
     uint64_t size;
-    if (!sock->recv_data(&size, sizeof(size))) {
+    const bool header_ok = sock->recv_data(&size, sizeof(size));
+    const int64_t header_end_us = timed ? ggml_time_us() : 0;
+    if (header_us != nullptr) { *header_us = header_end_us - start_us; }
+    if (!header_ok) {
         return false;
     }
     try {
@@ -990,7 +1014,13 @@ static bool recv_msg(socket_ptr sock, std::vector<uint8_t> & input) {
         GGML_LOG_ERROR("Failed to allocate input buffer of size %" PRIu64 "\n", size);
         return false;
     }
-    return sock->recv_data(input.data(), size);
+    const int64_t alloc_end_us = timed ? ggml_time_us() : 0;
+    if (alloc_us != nullptr) { *alloc_us = alloc_end_us - header_end_us; }
+    const bool received = sock->recv_data(input.data(), size);
+    if (payload_us != nullptr) {
+        *payload_us = ggml_time_us() - alloc_end_us;
+    }
+    return received;
 }
 
 static bool parse_endpoint(const std::string & endpoint, std::string & host, int & port) {
@@ -4084,7 +4114,9 @@ static bool ggml_backend_rpc_wait_ready_seq(
 static bool ggml_backend_rpc_phone_input_push(
         ggml_backend_t backend, uint64_t run_id,
         uint32_t region, uint32_t chunk,
-        const void * input, size_t bytes) {
+        const void * input, size_t bytes,
+        ggml_backend_rpc_phone_input_push_timing * timing) {
+    if (timing != nullptr) { *timing = {}; }
     if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
         return false;
     }
@@ -4096,13 +4128,18 @@ static bool ggml_backend_rpc_phone_input_push(
     auto * dev_ctx = device != nullptr ?
         static_cast<ggml_backend_rpc_device_context *>(device->context) : nullptr;
     if (dev_ctx == nullptr) { return false; }
+
+    const int64_t lock_begin_us = ggml_time_us();
     std::lock_guard<std::mutex> connection_guard(
         dev_ctx->phone_input_push_connection_mutex);
+    if (timing != nullptr) {
+        timing->pc_socket_lock_wait_us = ggml_time_us() - lock_begin_us;
+    }
     auto & sock = dev_ctx->phone_input_push_socket;
     if (sock == nullptr) {
         sock = get_socket_role(ctx->endpoint, rpc_socket_role::PHONE_INPUT_PUSH);
     }
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_phone_input_push") < 21) {
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_phone_input_push") < 22) {
         return false;
     }
     if (input == nullptr && bytes == 0 && run_id == 0) {
@@ -4112,20 +4149,61 @@ static bool ggml_backend_rpc_phone_input_push(
             bytes > RPC_PHONE_INPUT_MAX_BYTES) {
         return false;
     }
+
     rpc_msg_phone_input_push_req req {};
     req.key = {run_id, region, chunk};
     req.size = bytes;
+    const int64_t hash_begin_us = ggml_time_us();
     req.hash = fnv_hash(static_cast<const uint8_t *>(input), bytes);
+    if (timing != nullptr) { timing->pc_hash_us = ggml_time_us() - hash_begin_us; }
+
+    const int64_t pack_begin_us = ggml_time_us();
     std::vector<uint8_t> payload(sizeof(req) + bytes);
     memcpy(payload.data(), &req, sizeof(req));
     memcpy(payload.data() + sizeof(req), input, bytes);
-    rpc_msg_phone_input_ack ack {};
-    const bool ok = send_rpc_cmd(sock, RPC_CMD_PHONE_INPUT_PUSH,
-        payload.data(), payload.size(), &ack, sizeof(ack));
+    if (timing != nullptr) { timing->pc_pack_us = ggml_time_us() - pack_begin_us; }
+
+    // Preserve the exact existing RPC frame: 1-byte command, 8-byte size,
+    // payload. Split the send() timing at the two existing write boundaries.
+    std::array<uint8_t, 1 + sizeof(uint64_t)> header {};
+    header[0] = static_cast<uint8_t>(RPC_CMD_PHONE_INPUT_PUSH);
+    const uint64_t wire_size = static_cast<uint64_t>(payload.size());
+    memcpy(header.data() + 1, &wire_size, sizeof(wire_size));
+
+    const int64_t header_begin_us = ggml_time_us();
+    bool ok = sock->send_data(header.data(), header.size());
+    if (timing != nullptr) {
+        timing->pc_header_send_us = ggml_time_us() - header_begin_us;
+    }
+    if (ok) {
+        const int64_t payload_begin_us = ggml_time_us();
+        ok = sock->send_data(payload.data(), payload.size());
+        if (timing != nullptr) {
+            timing->pc_payload_send_us = ggml_time_us() - payload_begin_us;
+        }
+    }
+    rpc_msg_phone_input_push_ack ack {};
+    if (ok) {
+        const int64_t ack_begin_us = ggml_time_us();
+        ok = recv_msg(sock, &ack, sizeof(ack));
+        if (timing != nullptr) {
+            timing->pc_ack_wait_us = ggml_time_us() - ack_begin_us;
+        }
+    }
     if (!ok) {
         sock.reset();
+        return false;
     }
-    return ok && ack.accepted;
+    if (timing != nullptr) {
+        timing->phone_recv_header_us = ack.recv_header_us;
+        timing->phone_recv_alloc_us = ack.recv_alloc_us;
+        timing->phone_recv_payload_us = ack.recv_payload_us;
+        timing->phone_hash_us = ack.hash_us;
+        timing->phone_slot_lock_wait_us = ack.slot_lock_wait_us;
+        timing->phone_host_stage_us = ack.host_stage_us;
+        timing->phone_handler_us = ack.handler_us;
+    }
+    return ack.accepted != 0;
 }
 
 static bool ggml_backend_rpc_phone_input_drop(
@@ -5285,7 +5363,7 @@ public:
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool phone_input_push(const std::vector<uint8_t> & input,
-                          rpc_msg_phone_input_ack & response);
+                          rpc_msg_phone_input_push_ack & response);
     bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
                            rpc_msg_phone_input_ack & response);
     void phone_input_drop(const rpc_phone_input_key & key,
@@ -6123,10 +6201,15 @@ void rpc_server::phone_stage_record_input_rx(
 
 bool rpc_server::phone_input_push(
         const std::vector<uint8_t> & input,
-        rpc_msg_phone_input_ack & response) {
+        rpc_msg_phone_input_push_ack & response) {
     response = {};
+    const int64_t handler_begin_us = ggml_time_us();
+    const auto finish = [&]() -> bool {
+        response.handler_us = ggml_time_us() - handler_begin_us;
+        return true; // Invalid pushes are rejected with accepted=0.
+    };
     if (input.size() < sizeof(rpc_msg_phone_input_push_req)) {
-        return true;
+        return finish();
     }
     rpc_msg_phone_input_push_req request {};
     memcpy(&request, input.data(), sizeof(request));
@@ -6134,13 +6217,24 @@ bool rpc_server::phone_input_push(
             request.size == 0 ||
             request.size > RPC_PHONE_INPUT_MAX_BYTES ||
             input.size() - sizeof(request) != request.size) {
-        return true;
+        return finish();
     }
     const uint8_t * data = input.data() + sizeof(request);
-    if (fnv_hash(data, static_cast<size_t>(request.size)) != request.hash) {
-        return true;
+    const int64_t hash_begin_us = ggml_time_us();
+    const uint64_t received_hash =
+        fnv_hash(data, static_cast<size_t>(request.size));
+    response.hash_us = ggml_time_us() - hash_begin_us;
+    if (received_hash != request.hash) {
+        return finish();
     }
+    const int64_t lock_begin_us = ggml_time_us();
     std::lock_guard<std::mutex> lock(phone_input_mutex);
+    response.slot_lock_wait_us = ggml_time_us() - lock_begin_us;
+    const int64_t stage_begin_us = ggml_time_us();
+    const auto finish_stage = [&]() -> bool {
+        response.host_stage_us = ggml_time_us() - stage_begin_us;
+        return finish();
+    };
     const auto same = [&](const phone_input_staged & e) {
         return e.key.run_id == request.key.run_id &&
             e.key.region == request.key.region &&
@@ -6151,7 +6245,7 @@ bool rpc_server::phone_input_push(
     if (found != phone_input_staged_slots.end()) {
         response.accepted = found->hash == request.hash &&
             found->payload.size() == request.size ? 1 : 0;
-        return true;
+        return finish_stage();
     }
     const size_t in_region = std::count_if(
         phone_input_staged_slots.begin(), phone_input_staged_slots.end(),
@@ -6159,7 +6253,7 @@ bool rpc_server::phone_input_push(
             return e.key.region == request.key.region;
         });
     if (in_region >= 2 || phone_input_staged_slots.size() >= 16) {
-        return true;
+        return finish_stage();
     }
     phone_input_staged entry {};
     entry.key = request.key;
@@ -6167,7 +6261,7 @@ bool rpc_server::phone_input_push(
     entry.payload.assign(data, data + request.size);
     phone_input_staged_slots.emplace_back(std::move(entry));
     response.accepted = 1;
-    return true;
+    return finish_stage();
 }
 
 bool rpc_server::phone_input_apply(
@@ -11021,11 +11115,41 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
+                // Receive timing is taken on the Phone monotonic clock.
+                // The command byte was already read by the dispatcher.
+                int64_t recv_header_us = 0;
+                int64_t recv_alloc_us = 0;
+                int64_t recv_payload_us = 0;
                 std::vector<uint8_t> packet;
-                if (!recv_msg(sock, packet)) { return; }
-                rpc_msg_phone_input_ack ack {};
-                if (!server.phone_input_push(packet, ack) ||
-                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                if (!recv_msg(sock, packet, &recv_header_us,
+                              &recv_alloc_us, &recv_payload_us)) {
+                    return;
+                }
+                rpc_msg_phone_input_push_ack ack {};
+                if (!server.phone_input_push(packet, ack)) { return; }
+                ack.recv_header_us = recv_header_us;
+                ack.recv_alloc_us = recv_alloc_us;
+                ack.recv_payload_us = recv_payload_us;
+                // The ACK send itself cannot be encoded into the SAME ACK.
+                // Keep that optional diagnostic on Phone, off by default.
+                const int64_t ack_send_begin_us = ggml_time_us();
+                const bool sent = send_msg(sock, &ack, sizeof(ack));
+                const int64_t ack_send_us = ggml_time_us() - ack_send_begin_us;
+                const char * trace_env =
+                    std::getenv("GGML_RPC_PHONE_INPUT_ACK_TRACE");
+                if (trace_env != nullptr && std::strcmp(trace_env, "1") == 0 &&
+                        packet.size() >= sizeof(rpc_msg_phone_input_push_req)) {
+                    rpc_msg_phone_input_push_req key {};
+                    memcpy(&key, packet.data(), sizeof(key));
+                    GGML_LOG_INFO(
+                        "[PHONE_INPUT_PUSH_ACK] run=%" PRIu64
+                        " region=%u chunk=%u accepted=%u"
+                        " ack_send_ms=%.3f status=%s\n",
+                        key.key.run_id, key.key.region, key.key.chunk,
+                        unsigned(ack.accepted), ack_send_us / 1000.0,
+                        sent ? "OK" : "FAIL");
+                }
+                if (!sent) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_APPLY: {
@@ -11361,11 +11485,41 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
+                // Receive timing is taken on the Phone monotonic clock.
+                // The command byte was already read by the dispatcher.
+                int64_t recv_header_us = 0;
+                int64_t recv_alloc_us = 0;
+                int64_t recv_payload_us = 0;
                 std::vector<uint8_t> packet;
-                if (!recv_msg(sock, packet)) { return; }
-                rpc_msg_phone_input_ack ack {};
-                if (!server.phone_input_push(packet, ack) ||
-                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                if (!recv_msg(sock, packet, &recv_header_us,
+                              &recv_alloc_us, &recv_payload_us)) {
+                    return;
+                }
+                rpc_msg_phone_input_push_ack ack {};
+                if (!server.phone_input_push(packet, ack)) { return; }
+                ack.recv_header_us = recv_header_us;
+                ack.recv_alloc_us = recv_alloc_us;
+                ack.recv_payload_us = recv_payload_us;
+                // The ACK send itself cannot be encoded into the SAME ACK.
+                // Keep that optional diagnostic on Phone, off by default.
+                const int64_t ack_send_begin_us = ggml_time_us();
+                const bool sent = send_msg(sock, &ack, sizeof(ack));
+                const int64_t ack_send_us = ggml_time_us() - ack_send_begin_us;
+                const char * trace_env =
+                    std::getenv("GGML_RPC_PHONE_INPUT_ACK_TRACE");
+                if (trace_env != nullptr && std::strcmp(trace_env, "1") == 0 &&
+                        packet.size() >= sizeof(rpc_msg_phone_input_push_req)) {
+                    rpc_msg_phone_input_push_req key {};
+                    memcpy(&key, packet.data(), sizeof(key));
+                    GGML_LOG_INFO(
+                        "[PHONE_INPUT_PUSH_ACK] run=%" PRIu64
+                        " region=%u chunk=%u accepted=%u"
+                        " ack_send_ms=%.3f status=%s\n",
+                        key.key.run_id, key.key.region, key.key.chunk,
+                        unsigned(ack.accepted), ack_send_us / 1000.0,
+                        sent ? "OK" : "FAIL");
+                }
+                if (!sent) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_APPLY: {

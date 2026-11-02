@@ -4317,6 +4317,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int output_kind = 0;
         int graph_reused = -1;
         int result = -1;
+        // PC-initiated PUSH diagnostics are written only by the PC pusher;
+        // records are serialized after all workers have joined.
+        int64_t push_begin_us = 0;
+        int64_t push_end_us = 0;
+        size_t push_bytes = 0;
+        int push_status = -1;
+        ggml_backend_rpc_phone_input_push_timing push_timing {};
     };
     struct ring_bank_trace_row {
         int64_t enqueue_us = 0;
@@ -4922,7 +4929,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_input_consume_begin != nullptr &&
             phone_input_consume_end != nullptr &&
             phone_input_drop != nullptr &&
-            phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0);
+            phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr);
         static std::atomic<uint64_t> next_phone_input_push_run {
             static_cast<uint64_t>(ggml_time_us()) + 1
         };
@@ -5605,6 +5612,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         int64_t phone_push_wall_us = 0;
         int64_t phone_push_wait_us = 0;
+        ggml_backend_rpc_phone_input_push_timing phone_push_timing_sum {};
         size_t phone_push_accepted = 0;
         size_t phone_push_applied = 0;
         size_t phone_push_missed = 0;
@@ -5623,11 +5631,33 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         outputs[job.region - 1].data() +
                         (size_t) job.token_begin * (size_t) n_embd;
                     const int64_t begin_us = ggml_time_us();
+                    ggml_backend_rpc_phone_input_push_timing profile {};
                     const bool accepted = phone_input_push(
                         phone_rpc_backend, phone_input_push_run_id,
                         (uint32_t) job.region, (uint32_t) job.chunk,
-                        source, bytes);
-                    phone_push_wall_us += ggml_time_us() - begin_us;
+                        source, bytes, &profile);
+                    const int64_t end_us = ggml_time_us();
+                    phone_push_wall_us += end_us - begin_us;
+                    phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
+                    phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
+                    phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
+                    phone_push_timing_sum.pc_header_send_us += profile.pc_header_send_us;
+                    phone_push_timing_sum.pc_payload_send_us += profile.pc_payload_send_us;
+                    phone_push_timing_sum.pc_ack_wait_us += profile.pc_ack_wait_us;
+                    phone_push_timing_sum.phone_recv_header_us += profile.phone_recv_header_us;
+                    phone_push_timing_sum.phone_recv_alloc_us += profile.phone_recv_alloc_us;
+                    phone_push_timing_sum.phone_recv_payload_us += profile.phone_recv_payload_us;
+                    phone_push_timing_sum.phone_hash_us += profile.phone_hash_us;
+                    phone_push_timing_sum.phone_slot_lock_wait_us += profile.phone_slot_lock_wait_us;
+                    phone_push_timing_sum.phone_host_stage_us += profile.phone_host_stage_us;
+                    phone_push_timing_sum.phone_handler_us += profile.phone_handler_us;
+                    if (auto * row = trace_row(job)) {
+                        row->push_begin_us = begin_us;
+                        row->push_end_us = end_us;
+                        row->push_bytes = bytes;
+                        row->push_status = accepted ? 1 : 0;
+                        row->push_timing = profile;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(phone_push_mutex);
                         phone_push_state[job.region][job.chunk] =
@@ -6762,6 +6792,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_push_wall_us / 1000.0, phone_push_wait_us / 1000.0,
                 phone_push_thread_started ? 1 : 0,
                 ready.failed() ? "FAIL" : "PASS");
+            LLAMA_LOG_INFO(
+                "[PHONE_INPUT_PUSH_PROFILE] run=%" PRIu64
+                " pc_socket_lock_ms=%.3f pc_hash_ms=%.3f pc_pack_ms=%.3f"
+                " pc_header_send_ms=%.3f pc_payload_send_ms=%.3f"
+                " pc_ack_wait_ms=%.3f"
+                " phone_recv_header_ms=%.3f phone_recv_alloc_ms=%.3f"
+                " phone_recv_payload_ms=%.3f phone_hash_ms=%.3f"
+                " phone_slot_wait_ms=%.3f phone_host_stage_ms=%.3f"
+                " phone_handler_ms=%.3f"
+                " policy=ACCUMULATED_PER_CHUNK status=OK\n",
+                phone_input_push_run_id,
+                phone_push_timing_sum.pc_socket_lock_wait_us / 1000.0,
+                phone_push_timing_sum.pc_hash_us / 1000.0,
+                phone_push_timing_sum.pc_pack_us / 1000.0,
+                phone_push_timing_sum.pc_header_send_us / 1000.0,
+                phone_push_timing_sum.pc_payload_send_us / 1000.0,
+                phone_push_timing_sum.pc_ack_wait_us / 1000.0,
+                phone_push_timing_sum.phone_recv_header_us / 1000.0,
+                phone_push_timing_sum.phone_recv_alloc_us / 1000.0,
+                phone_push_timing_sum.phone_recv_payload_us / 1000.0,
+                phone_push_timing_sum.phone_hash_us / 1000.0,
+                phone_push_timing_sum.phone_slot_lock_wait_us / 1000.0,
+                phone_push_timing_sum.phone_host_stage_us / 1000.0,
+                phone_push_timing_sum.phone_handler_us / 1000.0);
         }
         if (phone_stream_handle != nullptr) {
             const bool stream_ok = phone_stream_stop(
@@ -6974,6 +7028,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << ",\"phone_input_push_mib\":" << phone_push_bytes / 1048576.0
                             << ",\"phone_input_push_wall_ms\":" << phone_push_wall_us / 1000.0
                             << ",\"phone_input_push_worker_wait_ms\":" << phone_push_wait_us / 1000.0
+                            << ",\"phone_input_push_socket_lock_ms\":" << phone_push_timing_sum.pc_socket_lock_wait_us / 1000.0
+                            << ",\"phone_input_push_hash_ms\":" << phone_push_timing_sum.pc_hash_us / 1000.0
+                            << ",\"phone_input_push_pack_ms\":" << phone_push_timing_sum.pc_pack_us / 1000.0
+                            << ",\"phone_input_push_header_send_ms\":" << phone_push_timing_sum.pc_header_send_us / 1000.0
+                            << ",\"phone_input_push_payload_send_ms\":" << phone_push_timing_sum.pc_payload_send_us / 1000.0
+                            << ",\"phone_input_push_socket_send_ms\":" << (phone_push_timing_sum.pc_header_send_us + phone_push_timing_sum.pc_payload_send_us) / 1000.0
+                            << ",\"phone_input_push_ack_wait_ms\":" << phone_push_timing_sum.pc_ack_wait_us / 1000.0
+                            << ",\"phone_input_push_phone_recv_header_ms\":" << phone_push_timing_sum.phone_recv_header_us / 1000.0
+                            << ",\"phone_input_push_phone_recv_alloc_ms\":" << phone_push_timing_sum.phone_recv_alloc_us / 1000.0
+                            << ",\"phone_input_push_phone_recv_payload_ms\":" << phone_push_timing_sum.phone_recv_payload_us / 1000.0
+                            << ",\"phone_input_push_phone_hash_ms\":" << phone_push_timing_sum.phone_hash_us / 1000.0
+                            << ",\"phone_input_push_phone_slot_wait_ms\":" << phone_push_timing_sum.phone_slot_lock_wait_us / 1000.0
+                            << ",\"phone_input_push_phone_host_stage_ms\":" << phone_push_timing_sum.phone_host_stage_us / 1000.0
+                            << ",\"phone_input_push_phone_handler_ms\":" << phone_push_timing_sum.phone_handler_us / 1000.0
                             << ","
                             << "\"phone_graph_slots\":"
                             << phone_graph_template_slots << ","
@@ -7275,6 +7343,29 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         << R"(,"output_kind":")" << output_kind << '"'
                         << R"(,"graph_reused":)" << t.graph_reused
                         << R"(,"status":)" << t.result;
+                    if (t.push_status != -1) {
+                        out << R"(,"push_status":)" << t.push_status
+                            << R"(,"push_bytes":)" << t.push_bytes;
+                        point(out, "push_begin_ms", t.push_begin_us);
+                        point(out, "push_end_ms", t.push_end_us);
+                        duration(out, "push_wall_ms", t.push_begin_us, t.push_end_us);
+                        const auto & p = t.push_timing;
+                        out << R"(,"push_socket_lock_ms":)" << p.pc_socket_lock_wait_us / 1000.0
+                            << R"(,"push_hash_ms":)" << p.pc_hash_us / 1000.0
+                            << R"(,"push_pack_ms":)" << p.pc_pack_us / 1000.0
+                            << R"(,"push_header_send_ms":)" << p.pc_header_send_us / 1000.0
+                            << R"(,"push_payload_send_ms":)" << p.pc_payload_send_us / 1000.0
+                            << R"(,"push_socket_send_ms":)"
+                            << (p.pc_header_send_us + p.pc_payload_send_us) / 1000.0
+                            << R"(,"push_ack_wait_ms":)" << p.pc_ack_wait_us / 1000.0
+                            << R"(,"push_phone_recv_header_ms":)" << p.phone_recv_header_us / 1000.0
+                            << R"(,"push_phone_recv_alloc_ms":)" << p.phone_recv_alloc_us / 1000.0
+                            << R"(,"push_phone_recv_payload_ms":)" << p.phone_recv_payload_us / 1000.0
+                            << R"(,"push_phone_hash_ms":)" << p.phone_hash_us / 1000.0
+                            << R"(,"push_phone_slot_wait_ms":)" << p.phone_slot_lock_wait_us / 1000.0
+                            << R"(,"push_phone_host_stage_ms":)" << p.phone_host_stage_us / 1000.0
+                            << R"(,"push_phone_handler_ms":)" << p.phone_handler_us / 1000.0;
+                    }
                     point(out, "ready_ms", t.ready_us);
                     point(out, "claim_ms", t.claim_us);
                     point(out, "bank_wait_begin_ms", t.bank_wait_begin_us);
