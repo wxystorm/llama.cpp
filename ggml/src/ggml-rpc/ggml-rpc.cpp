@@ -344,6 +344,9 @@ enum rpc_cmd {
     RPC_CMD_P2C_STREAM_SUBSCRIBE,
     RPC_CMD_P2C_STREAM_CAPTURE,
     RPC_CMD_P2C_STREAM_FINISH,
+    RPC_CMD_PHONE_INPUT_PUSH,
+    RPC_CMD_PHONE_INPUT_APPLY,
+    RPC_CMD_PHONE_INPUT_DROP,
     RPC_CMD_COUNT,
 };
 
@@ -372,8 +375,43 @@ static_assert(RPC_CMD_PHONE_RING_INPUT_READY == 37, "RPC_CMD_PHONE_RING_INPUT_RE
 static_assert(RPC_CMD_PHONE_RING_WAIT == 38, "RPC_CMD_PHONE_RING_WAIT index");
 static_assert(RPC_CMD_GET_TENSOR_RETURN_WAIT == 39, "RPC_CMD_GET_TENSOR_RETURN_WAIT index");
 static_assert(RPC_CMD_GET_GRAPH_PROFILE == 40, "RPC_CMD_GET_GRAPH_PROFILE index");
+static_assert(RPC_CMD_PHONE_INPUT_PUSH == 44, "RPC_CMD_PHONE_INPUT_PUSH index");
+static_assert(RPC_CMD_PHONE_INPUT_APPLY == 45, "RPC_CMD_PHONE_INPUT_APPLY index");
+static_assert(RPC_CMD_PHONE_INPUT_DROP == 46, "RPC_CMD_PHONE_INPUT_DROP index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
+
+// Producer-driven Phone input landing: two host slots per Region, keyed by
+// run/region/chunk. The incoming bytes are never written into a live Graph.
+struct rpc_phone_input_key {
+    uint64_t run_id = 0;
+    uint32_t region = 0;
+    uint32_t chunk = 0;
+};
+struct rpc_msg_phone_input_push_req {
+    rpc_phone_input_key key {};
+    uint64_t size = 0;
+    uint64_t hash = 0;
+};
+struct rpc_msg_phone_input_apply_req {
+    rpc_phone_input_key key {};
+    rpc_tensor tensor {};
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint64_t hash = 0;
+};
+struct rpc_msg_phone_input_ack {
+    uint8_t accepted = 0;
+};
+static constexpr size_t RPC_PHONE_INPUT_MAX_BYTES = 32 * 1024 * 1024;
+
+struct rpc_phone_input_consumer_tls {
+    rpc_phone_input_key key {};
+    size_t expected_bytes = 0;
+    bool active = false;
+    bool applied = false;
+};
+static thread_local rpc_phone_input_consumer_tls rpc_phone_input_consumer {};
 
 struct rpc_msg_hello_req {
     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
@@ -784,6 +822,10 @@ struct ggml_backend_rpc_device_context {
     rpc_region_ring_command_stats region_ring_command_stats;
     std::array<std::shared_ptr<socket_t>, RPC_ROUTE_TRANSFER_LANES> route_transfer_socks {};
     std::array<std::shared_ptr<socket_t>, RPC_RETURN_TRANSFER_LANES> return_transfer_socks {};
+    // Keep the producer PUSH socket alive across chunks. get_socket_role()
+    // otherwise holds only a weak_ptr and would reconnect on every upload.
+    std::mutex phone_input_push_connection_mutex;
+    std::shared_ptr<socket_t> phone_input_push_socket;
 };
 
 // Classify the concrete client CGraph that was submitted to Phone.
@@ -1073,6 +1115,22 @@ struct rpc_snapshot_read_context {
 
 static thread_local rpc_snapshot_read_context rpc_snapshot_read;
 
+static void ggml_backend_rpc_phone_input_consume_begin(
+        uint64_t run_id, uint32_t region, uint32_t chunk, size_t bytes) {
+    rpc_phone_input_consumer = {};
+    if (run_id != 0 && bytes != 0) {
+        rpc_phone_input_consumer.key = {run_id, region, chunk};
+        rpc_phone_input_consumer.expected_bytes = bytes;
+        rpc_phone_input_consumer.active = true;
+    }
+}
+
+static bool ggml_backend_rpc_phone_input_consume_end() {
+    const bool applied = rpc_phone_input_consumer.applied;
+    rpc_phone_input_consumer = {};
+    return applied;
+}
+
 static void ggml_backend_rpc_set_stage_ready_callback(
         ggml_backend_rpc_stage_ready_callback_t callback,
         void * user_data) {
@@ -1344,6 +1402,7 @@ enum class rpc_socket_role {
     P2C_STREAM,
     DUPLEX_PROFILE_C2P,
     DUPLEX_PROFILE_P2C,
+    PHONE_INPUT_PUSH,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1399,6 +1458,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
             break;
         case rpc_socket_role::DUPLEX_PROFILE_P2C:
             suffix = "_duplex_profile_p2c";
+            break;
+        case rpc_socket_role::PHONE_INPUT_PUSH:
+            suffix = "_phone_input_push";
             break;
     }
     std::string key = endpoint + suffix;
@@ -1999,6 +2061,28 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     const rpc_tensor serialized_tensor =
         serialize_tensor(tensor);
+
+    // Stage payload arrives on the independent PC push socket. Apply it to
+    // this exact destination only when the ordinary scheduler is preparing
+    // its input, so the active Phone Graph buffer is never overwritten early.
+    auto & consumer = rpc_phone_input_consumer;
+    if (consumer.active && !consumer.applied &&
+            offset == 0 && size == consumer.expected_bytes &&
+            size > 0 && ctx->sock != nullptr) {
+        rpc_msg_phone_input_apply_req request {};
+        request.key = consumer.key;
+        request.tensor = serialized_tensor;
+        request.size = size;
+        request.hash = fnv_hash(static_cast<const uint8_t *>(data), size);
+        rpc_msg_phone_input_ack response {};
+        if (send_rpc_cmd(ctx->sock, RPC_CMD_PHONE_INPUT_APPLY,
+                &request, sizeof(request), &response, sizeof(response)) &&
+                response.accepted) {
+            consumer.applied = true;
+            return;
+        }
+        // Source hash/layout mismatch: retain the original full SET_TENSOR.
+    }
 
     if (rpc_opencl_extra_debug_enabled() &&
         rpc_is_k_quant_type(tensor->type)) {
@@ -3997,6 +4081,71 @@ static bool ggml_backend_rpc_wait_ready_seq(
 }
 
 
+static bool ggml_backend_rpc_phone_input_push(
+        ggml_backend_t backend, uint64_t run_id,
+        uint32_t region, uint32_t chunk,
+        const void * input, size_t bytes) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+    const auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) {
+        return false;
+    }
+    auto * device = ggml_backend_get_device(backend);
+    auto * dev_ctx = device != nullptr ?
+        static_cast<ggml_backend_rpc_device_context *>(device->context) : nullptr;
+    if (dev_ctx == nullptr) { return false; }
+    std::lock_guard<std::mutex> connection_guard(
+        dev_ctx->phone_input_push_connection_mutex);
+    auto & sock = dev_ctx->phone_input_push_socket;
+    if (sock == nullptr) {
+        sock = get_socket_role(ctx->endpoint, rpc_socket_role::PHONE_INPUT_PUSH);
+    }
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_phone_input_push") < 21) {
+        return false;
+    }
+    if (input == nullptr && bytes == 0 && run_id == 0) {
+        return true; // Capability probe, no RPC issued.
+    }
+    if (run_id == 0 || input == nullptr || bytes == 0 ||
+            bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return false;
+    }
+    rpc_msg_phone_input_push_req req {};
+    req.key = {run_id, region, chunk};
+    req.size = bytes;
+    req.hash = fnv_hash(static_cast<const uint8_t *>(input), bytes);
+    std::vector<uint8_t> payload(sizeof(req) + bytes);
+    memcpy(payload.data(), &req, sizeof(req));
+    memcpy(payload.data() + sizeof(req), input, bytes);
+    rpc_msg_phone_input_ack ack {};
+    const bool ok = send_rpc_cmd(sock, RPC_CMD_PHONE_INPUT_PUSH,
+        payload.data(), payload.size(), &ack, sizeof(ack));
+    if (!ok) {
+        sock.reset();
+    }
+    return ok && ack.accepted;
+}
+
+static bool ggml_backend_rpc_phone_input_drop(
+        ggml_backend_t backend, uint64_t run_id,
+        uint32_t region, uint32_t chunk) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) || run_id == 0) {
+        return false;
+    }
+    const auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket(ctx->endpoint);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 21) {
+        return false;
+    }
+    rpc_phone_input_key key {run_id, region, chunk};
+    rpc_msg_phone_input_ack ack {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_INPUT_DROP,
+        &key, sizeof(key), &ack, sizeof(ack)) && ack.accepted;
+}
+
 static bool ggml_backend_rpc_phone_ring_auto_ready(
         ggml_backend_t backend,
         const ggml_cgraph * graph,
@@ -5135,6 +5284,12 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
+    bool phone_input_push(const std::vector<uint8_t> & input,
+                          rpc_msg_phone_input_ack & response);
+    bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
+                           rpc_msg_phone_input_ack & response);
+    void phone_input_drop(const rpc_phone_input_key & key,
+                          rpc_msg_phone_input_ack & response);
     bool set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us = 0);
     bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size,
                            int64_t rx_done_us = 0);
@@ -5365,6 +5520,17 @@ private:
     std::recursive_mutex graph_compute_mutex;
     std::mutex phone_stage_pool_mutex;
     std::mutex phone_stage_source_mutex;
+
+    struct phone_input_staged {
+        rpc_phone_input_key key {};
+        uint64_t hash = 0;
+        std::vector<uint8_t> payload;
+    };
+    // Host-only landing: two future chunks per Region. The current GPU
+    // activation buffer is changed only by the ordinary Phone Worker.
+    std::mutex phone_input_mutex;
+    std::vector<phone_input_staged> phone_input_staged_slots;
+
     struct phone_stage_rx_write {
         ggml_backend_buffer_t buffer = nullptr;
         uintptr_t begin = 0;
@@ -5953,6 +6119,103 @@ void rpc_server::phone_stage_record_input_rx(
     if (phone_stage_rx_writes.size() > k_phone_stage_rx_history) {
         phone_stage_rx_writes.pop_front();
     }
+}
+
+bool rpc_server::phone_input_push(
+        const std::vector<uint8_t> & input,
+        rpc_msg_phone_input_ack & response) {
+    response = {};
+    if (input.size() < sizeof(rpc_msg_phone_input_push_req)) {
+        return true;
+    }
+    rpc_msg_phone_input_push_req request {};
+    memcpy(&request, input.data(), sizeof(request));
+    if (request.key.run_id == 0 || request.key.region >= 64 ||
+            request.size == 0 ||
+            request.size > RPC_PHONE_INPUT_MAX_BYTES ||
+            input.size() - sizeof(request) != request.size) {
+        return true;
+    }
+    const uint8_t * data = input.data() + sizeof(request);
+    if (fnv_hash(data, static_cast<size_t>(request.size)) != request.hash) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(phone_input_mutex);
+    const auto same = [&](const phone_input_staged & e) {
+        return e.key.run_id == request.key.run_id &&
+            e.key.region == request.key.region &&
+            e.key.chunk == request.key.chunk;
+    };
+    const auto found = std::find_if(
+        phone_input_staged_slots.begin(), phone_input_staged_slots.end(), same);
+    if (found != phone_input_staged_slots.end()) {
+        response.accepted = found->hash == request.hash &&
+            found->payload.size() == request.size ? 1 : 0;
+        return true;
+    }
+    const size_t in_region = std::count_if(
+        phone_input_staged_slots.begin(), phone_input_staged_slots.end(),
+        [&](const phone_input_staged & e) {
+            return e.key.region == request.key.region;
+        });
+    if (in_region >= 2 || phone_input_staged_slots.size() >= 16) {
+        return true;
+    }
+    phone_input_staged entry {};
+    entry.key = request.key;
+    entry.hash = request.hash;
+    entry.payload.assign(data, data + request.size);
+    phone_input_staged_slots.emplace_back(std::move(entry));
+    response.accepted = 1;
+    return true;
+}
+
+bool rpc_server::phone_input_apply(
+        const rpc_msg_phone_input_apply_req & request,
+        rpc_msg_phone_input_ack & response) {
+    response = {};
+    if (request.key.run_id == 0 || request.size == 0 ||
+            request.offset != 0 || request.size > RPC_PHONE_INPUT_MAX_BYTES) {
+        return true;
+    }
+    phone_input_staged staged {};
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        const auto it = std::find_if(
+            phone_input_staged_slots.begin(), phone_input_staged_slots.end(),
+            [&](const phone_input_staged & e) {
+                return e.key.run_id == request.key.run_id &&
+                    e.key.region == request.key.region &&
+                    e.key.chunk == request.key.chunk;
+            });
+        if (it == phone_input_staged_slots.end() ||
+                it->hash != request.hash ||
+                it->payload.size() != request.size) {
+            return true; // Wrong input: keep bytes for the matching tensor.
+        }
+        staged = std::move(*it);
+        phone_input_staged_slots.erase(it);
+    }
+    response.accepted = set_tensor_direct(
+        request.tensor, request.offset,
+        staged.payload.data(), staged.payload.size()) ? 1 : 0;
+    return true;
+}
+
+void rpc_server::phone_input_drop(
+        const rpc_phone_input_key & key,
+        rpc_msg_phone_input_ack & response) {
+    response = {};
+    std::lock_guard<std::mutex> lock(phone_input_mutex);
+    phone_input_staged_slots.erase(
+        std::remove_if(phone_input_staged_slots.begin(),
+                       phone_input_staged_slots.end(),
+            [&](const phone_input_staged & e) {
+                return e.key.run_id == key.run_id &&
+                    e.key.region == key.region && e.key.chunk == key.chunk;
+            }),
+        phone_input_staged_slots.end());
+    response.accepted = 1;
 }
 
 bool rpc_server::set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us) {
@@ -10757,6 +11020,30 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PHONE_INPUT_PUSH: {
+                std::vector<uint8_t> packet;
+                if (!recv_msg(sock, packet)) { return; }
+                rpc_msg_phone_input_ack ack {};
+                if (!server.phone_input_push(packet, ack) ||
+                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_APPLY: {
+                rpc_msg_phone_input_apply_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack ack {};
+                if (!server.phone_input_apply(request, ack) ||
+                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_DROP: {
+                rpc_phone_input_key key {};
+                if (!recv_msg(sock, &key, sizeof(key))) { return; }
+                rpc_msg_phone_input_ack ack {};
+                server.phone_input_drop(key, ack);
+                if (!send_msg(sock, &ack, sizeof(ack))) { return; }
+                break;
+            }
             case RPC_CMD_SET_TENSOR: {
                 std::vector<uint8_t> input;
                 if (!recv_msg(sock, input)) {
@@ -11071,6 +11358,30 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_PUSH: {
+                std::vector<uint8_t> packet;
+                if (!recv_msg(sock, packet)) { return; }
+                rpc_msg_phone_input_ack ack {};
+                if (!server.phone_input_push(packet, ack) ||
+                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_APPLY: {
+                rpc_msg_phone_input_apply_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack ack {};
+                if (!server.phone_input_apply(request, ack) ||
+                        !send_msg(sock, &ack, sizeof(ack))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_DROP: {
+                rpc_phone_input_key key {};
+                if (!recv_msg(sock, &key, sizeof(key))) { return; }
+                rpc_msg_phone_input_ack ack {};
+                server.phone_input_drop(key, ack);
+                if (!send_msg(sock, &ack, sizeof(ack))) { return; }
                 break;
             }
             case RPC_CMD_SET_TENSOR: {
@@ -12079,6 +12390,18 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_phone_region_partial_get);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_PUSH_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_push);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_CONSUME_BEGIN_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_consume_begin);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_CONSUME_END_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_consume_end);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_DROP_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_drop);
     }
     GGML_UNUSED(reg);
 

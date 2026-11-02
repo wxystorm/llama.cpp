@@ -1169,6 +1169,65 @@ static void test_phone_static_template_shapes() {
           "template catalog must reject a mismatched Chunk-width vector");
 }
 
+static void test_phone_input_push_ahead() {
+    const auto regions = llama_region_ring_parse_single_cycle_force("G1,C1,P1", 3);
+    // Producer chunks are X=16, while Phone consumes X=64. The push queue
+    // must wait for all four upstream intervals but NOT for the previous
+    // Phone chunk's KV commit.
+    llama_region_ring_ready ready(regions, 192, std::vector<int>{16, 16, 64},
+                                   0, false, {}, true);
+
+    auto finish_upstream = [&](int chunk) {
+        const auto g = ready.try_take(llama_region_ring_device::GPU);
+        check(g && g->chunk == (size_t) chunk,
+              "Phone PUSH missing GPU producer");
+        ready.complete(*g);
+        const auto c = ready.try_take(llama_region_ring_device::CPU);
+        check(c && c->chunk == (size_t) chunk,
+              "Phone PUSH missing CPU producer");
+        ready.complete(*c);
+    };
+    for (int i = 0; i < 3; ++i) {
+        finish_upstream(i);
+    }
+    check(!ready.try_take_input_push().has_value(),
+          "Phone PUSH allowed partial upstream interval");
+    finish_upstream(3);
+    const auto phone0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(phone0 && phone0->chunk == 0,
+          "first Phone chunk not claimable after upstream completion");
+    // Keep chunk 0 computing while the PC completes chunks 1 and 2.
+    for (int i = 4; i < 12; ++i) {
+        finish_upstream(i);
+    }
+    const auto push0 = ready.try_take_input_push();
+    const auto push1 = ready.try_take_input_push();
+    check(push0 && push0->chunk == 0 && push1 && push1->chunk == 1,
+          "PC did not stage two Phone inputs independently of KV commit");
+    check(!ready.try_take_input_push().has_value(),
+          "Phone PUSH overfilled the two host landing slots");
+    check(!ready.try_take(llama_region_ring_device::PHONE).has_value(),
+          "Phone compute skipped same-region KV FIFO");
+
+    ready.release_input_push(*push0);
+    const auto push2 = ready.try_take_input_push();
+    check(push2 && push2->chunk == 2,
+          "Phone PUSH did not release its producer credit");
+    ready.complete(*phone0);
+    const auto phone1 = ready.try_take(llama_region_ring_device::PHONE);
+    check(phone1 && phone1->chunk == 1,
+          "Phone chunk 1 not scheduled after chunk 0 KV commit");
+    ready.release_input_push(*push1);
+    ready.complete(*phone1);
+    const auto phone2 = ready.try_take(llama_region_ring_device::PHONE);
+    check(phone2 && phone2->chunk == 2,
+          "Phone chunk 2 not scheduled after chunk 1 KV commit");
+    ready.release_input_push(*push2);
+    ready.complete(*phone2);
+    check(ready.all_done() && !ready.failed(),
+          "Phone PUSH mock did not drain");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1228,6 +1287,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] phone_static_template_shapes=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
+        test_phone_input_push_ahead();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_input_push_ahead=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
         return 0;
     } catch (const std::exception & e) {

@@ -42,6 +42,10 @@ FIELDS = [
     "phone_graph_reuse_count", "phone_graph_reuse_check_ms",
     "phone_graph_reset_ms", "phone_graph_build_ms", "phone_graph_alloc_ms",
     "phone_input_set_ms", "phone_split_prepare_ms",
+    "phone_input_push_enabled", "phone_input_push_accepted",
+    "phone_input_push_applied", "phone_input_push_fallback",
+    "phone_input_push_mib", "phone_input_push_wall_ms",
+    "phone_input_push_worker_wait_ms",
     "cpu_split_target_wait_ms", "gpu_split_target_wait_ms", "phone_split_target_wait_ms",
     "cpu_split_source_sync_ms", "gpu_split_source_sync_ms", "phone_split_source_sync_ms",
     "cpu_split_copy_call_ms", "gpu_split_copy_call_ms", "phone_split_copy_call_ms",
@@ -329,6 +333,12 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                         "split_copy_call_ms", "split_profiled_ms",
                         "split_copy_mib", "split_copy_calls"):
             row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
+    for key in ("phone_input_push_accepted", "phone_input_push_applied",
+                "phone_input_push_fallback", "phone_input_push_mib",
+                "phone_input_push_wall_ms", "phone_input_push_worker_wait_ms"):
+        row[key] = total(ring, key)
+    row["phone_input_push_enabled"] = any(
+        record.get("phone_input_push_enabled") is True for record in ring)
     for key in ("phone_graph_reuse_check_ms", "phone_graph_reset_ms",
                 "phone_graph_build_ms", "phone_graph_alloc_ms",
                 "phone_input_set_ms", "phone_split_prepare_ms"):

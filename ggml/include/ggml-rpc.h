@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    20
+#define RPC_PROTO_PATCH_VERSION    21
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -155,6 +155,17 @@ using ggml_backend_rpc_profile_duplex_t = bool (*)(
 
 #define GGML_BACKEND_RPC_PHONE_RING_AUTO_WAIT_PROC \
     "ggml_backend_rpc_phone_ring_auto_wait"
+
+// Experiment: producer-driven PC->Phone host landing slots. No current Graph
+// tensors are touched until the ordinary Phone Worker enters split_prepare().
+#define GGML_BACKEND_RPC_PHONE_INPUT_PUSH_PROC \
+    "ggml_backend_rpc_phone_input_push"
+#define GGML_BACKEND_RPC_PHONE_INPUT_CONSUME_BEGIN_PROC \
+    "ggml_backend_rpc_phone_input_consume_begin"
+#define GGML_BACKEND_RPC_PHONE_INPUT_CONSUME_END_PROC \
+    "ggml_backend_rpc_phone_input_consume_end"
+#define GGML_BACKEND_RPC_PHONE_INPUT_DROP_PROC \
+    "ggml_backend_rpc_phone_input_drop"
 
 typedef bool (*ggml_backend_rpc_init_zero_tensor_t)(
     ggml_tensor * tensor);
@@ -359,6 +370,20 @@ struct ggml_backend_rpc_snapshot_stats {
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
         ggml_backend_t backend,
         struct ggml_backend_rpc_snapshot_stats * stats);
+
+using ggml_backend_rpc_phone_input_push_t = bool (*)(
+        ggml_backend_t backend, uint64_t run_id,
+        uint32_t region, uint32_t chunk,
+        const void * input, size_t bytes);
+// PC Phone Worker thread-local scope for one already staged input. The
+// ordinary RPC set_tensor() transparently applies the matching staged bytes
+// to its original destination tensor; all other tensors use legacy SET.
+using ggml_backend_rpc_phone_input_consume_begin_t = void (*)(
+        uint64_t run_id, uint32_t region, uint32_t chunk, size_t bytes);
+using ggml_backend_rpc_phone_input_consume_end_t = bool (*)();
+using ggml_backend_rpc_phone_input_drop_t = bool (*)(
+        ggml_backend_t backend, uint64_t run_id,
+        uint32_t region, uint32_t chunk);
 
 // Native Phone clock, timed around one full graph with device sync.
 // Query only after the normal warmup/measurement loop has finished.

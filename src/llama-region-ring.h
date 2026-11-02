@@ -919,11 +919,13 @@ public:
             int n_tokens, int chunk_tokens,
             size_t slot_pool_size = 0,
             bool gpu_two_bank_lifetime = false,
-            task_event_observer observer = {}) :
+            task_event_observer observer = {},
+            bool track_phone_input_push = false) :
         llama_region_ring_ready(
             regions, n_tokens,
             std::vector<int>(regions.size(), chunk_tokens),
-            slot_pool_size, gpu_two_bank_lifetime, std::move(observer)) {
+            slot_pool_size, gpu_two_bank_lifetime, std::move(observer),
+            track_phone_input_push) {
     }
 
     llama_region_ring_ready(
@@ -932,10 +934,12 @@ public:
             const std::vector<int> & region_chunk_tokens,
             size_t slot_pool_size = 0,
             bool gpu_two_bank_lifetime = false,
-            task_event_observer observer = {}) :
+            task_event_observer observer = {},
+            bool track_phone_input_push = false) :
         regions_(regions),
         region_chunk_tokens_(region_chunk_tokens),
         slot_pool_size_(slot_pool_size),
+        track_phone_input_push_(track_phone_input_push),
         n_tokens_(n_tokens),
         gpu_two_bank_lifetime_(gpu_two_bank_lifetime),
         task_event_observer_(std::move(observer)) {
@@ -959,11 +963,19 @@ public:
             throw std::runtime_error(
                 "bounded legacy slots require uniform region chunks");
         }
+        if (track_phone_input_push_ && slot_pool_size_ != 0) {
+            throw std::runtime_error(
+                "Phone input push requires full-batch activation storage");
+        }
 
         chunk_begins_.resize(regions_.size());
         chunk_sizes_.resize(regions_.size());
         input_pending_.resize(regions_.size());
         state_.resize(regions_.size());
+        if (track_phone_input_push_) {
+            phone_push_state_.resize(regions_.size());
+            phone_push_inflight_.assign(regions_.size(), 0);
+        }
 
         for (size_t r = 0; r < regions_.size(); ++r) {
             const int x = region_chunk_tokens_[r];
@@ -975,6 +987,9 @@ public:
             total_tasks_ += chunk_sizes_[r].size();
             input_pending_[r].assign(chunk_sizes_[r].size(), 0);
             state_[r].assign(chunk_sizes_[r].size(), 0);
+            if (track_phone_input_push_) {
+                phone_push_state_[r].assign(chunk_sizes_[r].size(), 0);
+            }
         }
 
         // READY_V2 dependencies are token intervals, not equal chunk ids.
@@ -1137,6 +1152,75 @@ public:
             return std::nullopt;
         }
         return take_device_locked(dev, preferred_region, preferred_tokens);
+    }
+
+    // PC push is allowed as soon as ALL upstream token intervals are
+    // available. Unlike Phone compute, it does not wait for the preceding
+    // Phone chunk's KV commit. Each Phone region has two independent host
+    // landing slots; claiming an input reserves one until release_input_push.
+    std::optional<llama_region_ring_task> wait_take_input_push() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&]() {
+            return failed_ || all_done_locked() ||
+                std::any_of(phone_push_queue_.begin(), phone_push_queue_.end(),
+                    [&](const auto & job) {
+                        return phone_push_inflight_[job.region] < 2;
+                    });
+        });
+        if (failed_ || all_done_locked()) {
+            return std::nullopt;
+        }
+        const auto it = std::find_if(
+            phone_push_queue_.begin(), phone_push_queue_.end(),
+            [&](const auto & job) {
+                return phone_push_inflight_[job.region] < 2;
+            });
+        if (it == phone_push_queue_.end()) {
+            return std::nullopt;
+        }
+        const auto job = *it;
+        phone_push_queue_.erase(it);
+        if (phone_push_state_[job.region][job.chunk] != 1) {
+            throw std::runtime_error("Phone input push task claimed twice");
+        }
+        phone_push_state_[job.region][job.chunk] = 2;
+        ++phone_push_inflight_[job.region];
+        return job;
+    }
+
+    std::optional<llama_region_ring_task> try_take_input_push() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_) { return std::nullopt; }
+        const auto it = std::find_if(
+            phone_push_queue_.begin(), phone_push_queue_.end(),
+            [&](const auto & job) {
+                return phone_push_inflight_[job.region] < 2;
+            });
+        if (it == phone_push_queue_.end()) { return std::nullopt; }
+        const auto job = *it;
+        phone_push_queue_.erase(it);
+        if (phone_push_state_[job.region][job.chunk] != 1) {
+            throw std::runtime_error("Phone input push task claimed twice");
+        }
+        phone_push_state_[job.region][job.chunk] = 2;
+        ++phone_push_inflight_[job.region];
+        return job;
+    }
+
+    void release_input_push(const llama_region_ring_task & job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!track_phone_input_push_ ||
+                    job.region >= phone_push_state_.size() ||
+                    job.chunk >= phone_push_state_[job.region].size() ||
+                    phone_push_state_[job.region][job.chunk] != 2 ||
+                    phone_push_inflight_[job.region] == 0) {
+                throw std::runtime_error("invalid Phone input push release");
+            }
+            phone_push_state_[job.region][job.chunk] = 3;
+            --phone_push_inflight_[job.region];
+        }
+        cv_.notify_all();
     }
 
     void complete(const llama_region_ring_task & task) {
@@ -1314,6 +1398,7 @@ private:
                 }
                 --pending;
                 if (pending == 0) {
+                    offer_phone_input_push_locked(next_region, dst);
                     offer_locked(next_region, dst);
                 }
             }
@@ -1496,6 +1581,22 @@ private:
         return task;
     }
 
+    void offer_phone_input_push_locked(size_t region, size_t chunk) {
+        if (!track_phone_input_push_ || region == 0 ||
+                region >= regions_.size() ||
+                regions_[region].device != llama_region_ring_device::PHONE ||
+                chunk >= chunk_sizes_[region].size() ||
+                input_pending_[region][chunk] != 0 ||
+                phone_push_state_[region][chunk] != 0) {
+            return;
+        }
+        phone_push_state_[region][chunk] = 1;
+        phone_push_queue_.push_back({
+            region, chunk,
+            chunk_begins_[region][chunk], chunk_sizes_[region][chunk]
+        });
+    }
+
     void offer_locked(size_t region, size_t chunk) {
         if (region >= regions_.size() ||
                 chunk >= chunk_sizes_[region].size() ||
@@ -1521,6 +1622,10 @@ private:
     const std::vector<llama_region_ring_region> regions_;
     const std::vector<int> region_chunk_tokens_;
     const size_t slot_pool_size_ = 0;
+    const bool track_phone_input_push_ = false;
+    std::vector<std::vector<uint8_t>> phone_push_state_;
+    std::vector<size_t> phone_push_inflight_;
+    std::deque<llama_region_ring_task> phone_push_queue_;
     const int n_tokens_ = 0;
     const bool gpu_two_bank_lifetime_ = false;
     const task_event_observer task_event_observer_;
