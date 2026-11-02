@@ -5310,6 +5310,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                     const auto task = *next;
                     active_task = task;
+                    ring_chunk_trace_row * task_trace = trace_row(task);
                     llama_region_ring_tls_phone_full_stream = {};
                     const bool target_phone_shape =
                         dev == (size_t) llama_region_ring_device::PHONE &&
@@ -5393,6 +5394,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                         if (gpu_bank_streaming) {
                             const int64_t wait_begin_us = ggml_time_us();
+                            if (task_trace != nullptr) {
+                                task_trace->bank_wait_begin_us = wait_begin_us;
+                            }
                             std::unique_lock<std::mutex> lock(
                                 gpu_bank_mover_mutex);
                             if (!selected.bank_ready ||
@@ -5415,6 +5419,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             }
                             gpu_bank_wait_us =
                                 ggml_time_us() - wait_begin_us;
+                            if (task_trace != nullptr) {
+                                task_trace->bank_wait_end_us =
+                                    wait_begin_us + gpu_bank_wait_us;
+                            }
                             state.weight_bank_wait_us +=
                                 gpu_bank_wait_us;
                             if (gpu_bank_mover_failed) {
@@ -5478,6 +5486,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     }
 
                     const int64_t backend_begin_us = ggml_time_us();
+                    if (task_trace != nullptr) {
+                        task_trace->dispatch_us = backend_begin_us;
+                    }
                     auto execute_backend_task = [&]() -> ggml_status {
                     {
                         std::unique_lock<std::mutex> broad_backend_lock;
@@ -5564,9 +5575,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 phone_rpc_getter != nullptr &&
                                 phone_rpc_getter(phone_rpc_backend, &phone_rpc_before);
                             const int64_t compute_begin_us = ggml_time_us();
+                            if (task_trace != nullptr) {
+                                task_trace->host_execute_begin_us = compute_begin_us;
+                            }
                             int64_t lane_compute_begin_us = 0;
                             int64_t lane_compute_end_us = 0;
                             llama_hybrid_stage_timing task_timing {};
+                            task_timing.capture_timeline = ring_trace_enabled;
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
@@ -5590,6 +5605,42 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 dev == 1 && gpu_weight_streaming &&
                                     gpu_bank_resident);
                             const int64_t compute_end_us = ggml_time_us();
+                            if (task_trace != nullptr) {
+                                task_trace->host_execute_end_us = compute_end_us;
+                                task_trace->graph_prepare_begin_us =
+                                    task_timing.graph_prepare_begin_us;
+                                task_trace->graph_prepare_end_us =
+                                    task_timing.graph_prepare_end_us;
+                                task_trace->split_prepare_begin_us =
+                                    task_timing.split_prepare_begin_us;
+                                task_trace->split_prepare_end_us =
+                                    task_timing.split_prepare_end_us;
+                                task_trace->compute_range_begin_us =
+                                    task_timing.compute_range_begin_us;
+                                task_trace->compute_range_end_us =
+                                    task_timing.compute_range_end_us;
+                                task_trace->lane_compute_begin_us =
+                                    lane_compute_begin_us;
+                                task_trace->lane_compute_end_us =
+                                    lane_compute_end_us;
+                                task_trace->output_begin_us =
+                                    task_timing.output_begin_us;
+                                task_trace->output_end_us =
+                                    task_timing.output_end_us;
+                                task_trace->graph_prepare_cost_us =
+                                    task_timing.prepare_us;
+                                task_trace->split_prepare_cost_us =
+                                    task_timing.split_prepare_us;
+                                task_trace->compute_range_cost_us =
+                                    task_timing.compute_range_us;
+                                task_trace->output_sync_cost_us =
+                                    task_timing.sync_us;
+                                task_trace->output_kind =
+                                    task_timing.output_kind;
+                                task_trace->graph_reused =
+                                    task_timing.graph_reused ? 1 : 0;
+                                task_trace->result = (int) task_status;
+                            }
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
                             if (sample_phone_rpc) {
@@ -5880,6 +5931,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         }
                     } else {
                         (void) execute_backend_task();
+                    }
+
+                    if (task_trace != nullptr) {
+                        task_trace->worker_done_us = ggml_time_us();
+                        task_trace->result = (int) task_status;
                     }
 
                     // Do not publish a downstream READY while the producer's
