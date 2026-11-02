@@ -6659,6 +6659,159 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 region_ring_experiment_records.push_back(metrics.str());
             }
         }
+
+        // Serialize the PC-clock timeline only after the workers, Bank Mover
+        // and Arena Receiver have drained. No per-Chunk logs or file I/O.
+        if (ring_trace_enabled) {
+            const auto point = [&](std::ostringstream & out,
+                                   const char * name, int64_t at_us) {
+                out << R"(,")" << name << R"(":)";
+                if (at_us == 0) {
+                    out << "null";
+                } else {
+                    out << (at_us - ring_trace_origin_us) / 1000.0;
+                }
+            };
+            const auto duration = [&](std::ostringstream & out,
+                                      const char * name,
+                                      int64_t from_us, int64_t to_us) {
+                out << R"(,")" << name << R"(":)";
+                if (from_us == 0 || to_us == 0 || to_us < from_us) {
+                    out << "null";
+                } else {
+                    out << (to_us - from_us) / 1000.0;
+                }
+            };
+            std::ostringstream meta;
+            meta << std::fixed << std::setprecision(3)
+                 << R"({"type":"region_ring_trace_meta","schema":1,"ubatch":)"
+                 << ubatch_id
+                 << R"(,"tokens":)" << ubatch.n_tokens
+                 << R"(,"clock":"PC_GGML_TIME_US")"
+                 << R"(,"time_origin":"BEFORE_READY_INIT")"
+                 << R"(,"ring_start_ms":)"
+                 << (begin_us - ring_trace_origin_us) / 1000.0
+                 << R"(,"ring_wall_ms":)"
+                 << experiment_wall_us / 1000.0
+                 << R"(,"records":)" << ready.total_tasks()
+                 << R"(,"phone_gpu_kernel_time_included":false)"
+                 << "}\n";
+            region_ring_experiment_records.push_back(meta.str());
+
+            for (size_t r = 0; r < stages.size(); ++r) {
+                const auto & stage = stages[r];
+                const size_t x = (size_t) stage.macro_tokens;
+                for (size_t chunk = 0;
+                     chunk < ring_trace_rows[r].size(); ++chunk) {
+                    const auto & t = ring_trace_rows[r][chunk];
+                    const size_t token_begin = chunk * x;
+                    const size_t count = std::min(
+                        x, (size_t) ubatch.n_tokens - token_begin);
+                    const char * output_kind =
+                        t.output_kind == 1 ? "HOST_OUTPUT_COPY" :
+                        t.output_kind == 2 ? "ARENA_CAPTURE" :
+                        t.output_kind == 3 ? "BACKEND_SYNC" :
+                        t.output_kind == 4 ? "P2C_DEFERRED" : "NONE";
+                    std::ostringstream out;
+                    out << std::fixed << std::setprecision(3)
+                        << R"({"type":"region_ring_chunk_trace","schema":1,"ubatch":)"
+                        << ubatch_id
+                        << R"(,"region":)" << r
+                        << R"(,"chunk":)" << chunk
+                        << R"(,"device":")"
+                        << llama_region_ring_device_name(regions[r].device)
+                        << '"'
+                        << R"(,"stage":")"
+                        << llama_hybrid_runtime_stage_name(stage.kind)
+                        << '"'
+                        << R"(,"layer_begin":)" << stage.layer_begin
+                        << R"(,"layer_end":)" << stage.layer_end
+                        << R"(,"token_begin":)" << token_begin
+                        << R"(,"tokens":)" << count
+                        << R"(,"output_kind":")" << output_kind << '"'
+                        << R"(,"graph_reused":)" << t.graph_reused
+                        << R"(,"status":)" << t.result;
+                    point(out, "ready_ms", t.ready_us);
+                    point(out, "claim_ms", t.claim_us);
+                    point(out, "bank_wait_begin_ms", t.bank_wait_begin_us);
+                    point(out, "bank_wait_end_ms", t.bank_wait_end_us);
+                    point(out, "dispatch_ms", t.dispatch_us);
+                    point(out, "host_execute_begin_ms", t.host_execute_begin_us);
+                    point(out, "host_execute_end_ms", t.host_execute_end_us);
+                    point(out, "graph_prepare_begin_ms", t.graph_prepare_begin_us);
+                    point(out, "graph_prepare_end_ms", t.graph_prepare_end_us);
+                    point(out, "input_set_begin_ms", t.input_set_begin_us);
+                    point(out, "input_set_end_ms", t.input_set_end_us);
+                    point(out, "split_prepare_begin_ms", t.split_prepare_begin_us);
+                    point(out, "split_prepare_end_ms", t.split_prepare_end_us);
+                    point(out, "compute_range_begin_ms", t.compute_range_begin_us);
+                    point(out, "compute_range_end_ms", t.compute_range_end_us);
+                    point(out, "lane_compute_begin_ms", t.lane_compute_begin_us);
+                    point(out, "lane_compute_end_ms", t.lane_compute_end_us);
+                    point(out, "output_begin_ms", t.output_begin_us);
+                    point(out, "output_end_ms", t.output_end_us);
+                    point(out, "worker_done_ms", t.worker_done_us);
+                    point(out, "frame_received_ms", t.frame_received_us);
+                    point(out, "defer_ms", t.defer_us);
+                    point(out, "complete_ms", t.complete_us);
+                    point(out, "fail_ms", t.fail_us);
+                    duration(out, "ready_to_claim_ms", t.ready_us, t.claim_us);
+                    duration(out, "claim_to_dispatch_ms",
+                             t.claim_us, t.dispatch_us);
+                    duration(out, "dispatch_to_execute_ms",
+                             t.dispatch_us, t.host_execute_begin_us);
+                    duration(out, "ready_to_complete_ms",
+                             t.ready_us, t.complete_us);
+                    duration(out, "defer_to_complete_ms",
+                             t.defer_us, t.complete_us);
+                    duration(out, "bank_wait_ms",
+                             t.bank_wait_begin_us, t.bank_wait_end_us);
+                    out << R"(,"prepare_total_ms":)"
+                        << t.graph_prepare_cost_us / 1000.0
+                        << R"(,"split_prepare_ms":)"
+                        << t.split_prepare_cost_us / 1000.0
+                        << R"(,"compute_range_ms":)"
+                        << t.compute_range_cost_us / 1000.0
+                        << R"(,"output_sync_ms":)"
+                        << t.output_sync_cost_us / 1000.0
+                        << "}\n";
+                    region_ring_experiment_records.push_back(out.str());
+                }
+            }
+
+            for (size_t r = 0; r < ring_bank_trace_rows.size(); ++r) {
+                const auto & b = ring_bank_trace_rows[r];
+                if (b.enqueue_us == 0 && b.begin_us == 0) {
+                    continue;
+                }
+                std::ostringstream out;
+                out << std::fixed << std::setprecision(3)
+                    << R"({"type":"region_ring_bank_trace","schema":1,"ubatch":)"
+                    << ubatch_id
+                    << R"(,"region":)" << r
+                    << R"(,"layer_begin":)" << stages[r].layer_begin
+                    << R"(,"layer_end":)" << stages[r].layer_end
+                    << R"(,"source_region":)";
+                if (b.source_region == std::numeric_limits<size_t>::max()) {
+                    out << "null";
+                } else {
+                    out << b.source_region;
+                }
+                out << R"(,"upload_bytes":)" << b.upload_bytes
+                    << R"(,"status":)" << b.success;
+                point(out, "enqueue_ms", b.enqueue_us);
+                point(out, "begin_ms", b.begin_us);
+                point(out, "prepare_begin_ms", b.prepare_begin_us);
+                point(out, "prepare_end_ms", b.prepare_end_us);
+                point(out, "h2d_begin_ms", b.h2d_begin_us);
+                point(out, "h2d_end_ms", b.h2d_end_us);
+                point(out, "done_ms", b.done_us);
+                duration(out, "queue_wait_ms", b.enqueue_us, b.begin_us);
+                duration(out, "total_ms", b.begin_us, b.done_us);
+                out << "}\n";
+                region_ring_experiment_records.push_back(out.str());
+            }
+        }
         if (audit_backend_resources) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_BACKEND_OWNERSHIP_SUM] "
