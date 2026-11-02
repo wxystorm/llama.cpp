@@ -4681,9 +4681,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_INFO(
                 "[PHONE_STATIC_TEMPLATE] event=PC_GRAPH_READY region=%zu "
                 "layers=[%d,%d) tokens=%u outputs=%d canonical=%d "
-                "scheduler=%p result=%p status=OK\n",
+                "head_policy=%s scheduler=%p result=%p status=OK\n",
                 item.region, stage.layer_begin, stage.layer_end,
                 item.tokens, item.output_count, item.canonical ? 1 : 0,
+                item.region + 1 == stages.size() ?
+                    "PHONE_L_OUT_NORM_PC_PROJECTION_DEFER_META_CHECK" :
+                    "PHONE_FULL_TO_NEXT_REGION",
                 (void *) item.scheduler, (void *) item.result);
         }
         if (canonical_count != 1) {
@@ -4695,6 +4698,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             return nullptr;
         }
         phone_static_prebuild_us = ggml_time_us() - prebuild_begin_us;
+        // The current Ring wall timer starts before this prebuild. Report
+        // the setup cost separately, but do not call it a free speedup.
         LLAMA_LOG_INFO(
             "[PHONE_STATIC_TEMPLATE] event=PC_PREBUILD_DONE "
             "templates=%zu wall_ms=%.3f stage=PC_OUTER_GRAPH "
