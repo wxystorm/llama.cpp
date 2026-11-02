@@ -41,6 +41,15 @@ static bool rpc_phone_stage_prepare_ahead_enabled() {
         std::strcmp(s, "1") == 0;
 }
 
+// Opt-in, server-side timing only. Never adds network round trips.
+static bool rpc_phone_chunk_dispatch_profile_enabled() {
+    static const bool enabled = []() {
+        const char * p = std::getenv("GGML_RPC_PHONE_CHUNK_DISPATCH_PROFILE");
+        return p != nullptr && std::strcmp(p, "1") == 0;
+    }();
+    return enabled;
+}
+
 static thread_local bool rpc_phone_stage_prepare_bypass = false;
 
 struct rpc_phone_stage_prepare_bypass_scope {
@@ -5085,13 +5094,15 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
-    bool set_tensor(const std::vector<uint8_t> & input);
-    bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size);
+    bool set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us = 0);
+    bool set_tensor_direct(const rpc_tensor & in_tensor, uint64_t offset, const void * data, size_t size,
+                           int64_t rx_done_us = 0);
     bool set_tensor_direct_opencl_async(
         const rpc_tensor & in_tensor,
         uint64_t offset,
         const void * data,
-        size_t size);
+        size_t size,
+        int64_t rx_done_us = 0);
     bool set_tensor_recompute_snapshot(const std::vector<uint8_t> & input);
     bool set_tensor_async_return(const std::vector<uint8_t> & input);
     bool set_tensor_async_return_wait(const std::vector<uint8_t> & input);
@@ -5118,10 +5129,11 @@ public:
     bool get_route_snapshot(
         const rpc_msg_get_route_snapshot_req & request,
         std::vector<uint8_t> & response);
-    bool set_tensor_graph_compute(const std::vector<uint8_t> & input);
+    bool set_tensor_graph_compute(const std::vector<uint8_t> & input, int64_t rx_done_us = 0);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
-    bool graph_compute(const std::vector<uint8_t> & input, bool register_only = false);
-    bool graph_recompute(const rpc_msg_graph_recompute_req & request);
+    bool graph_compute(const std::vector<uint8_t> & input, bool register_only = false,
+                       int64_t command_rx_us = 0);
+    bool graph_recompute(const rpc_msg_graph_recompute_req & request, int64_t command_rx_us = 0);
     bool get_graph_profile(
         const rpc_msg_get_graph_profile_req & request,
         rpc_msg_get_graph_profile_rsp & response);
@@ -5185,6 +5197,13 @@ private:
         size_t input_bytes = 0;
         int64_t prepare_begin_us = 0;
         int64_t prepare_end_us = 0;
+        // Correlated by a received SET_TENSOR buffer range, not graph UID alone.
+        uint64_t order = 0;
+        uint64_t input_write_seq = 0;
+        size_t input_write_bytes = 0;
+        int64_t input_rx_done_us = 0;
+        int64_t input_set_done_us = 0;
+        int64_t command_rx_us = 0;
     };
     struct phone_stage_buffer_range {
         ggml_backend_buffer_t buffer = nullptr;
@@ -5195,6 +5214,7 @@ private:
         uint32_t device = 0;
         uint64_t uid = 0;
         uint64_t order = 0;
+        int64_t command_rx_us = 0;
         stored_graph * entry = nullptr;
         ggml_cgraph * graph = nullptr;
         std::vector<phone_stage_buffer_range> outputs;
@@ -5211,8 +5231,13 @@ private:
         phone_stage_slot0_graph & plan, size_t slot_index);
     std::optional<bool> phone_stage_recompute_pipelined(
         const rpc_msg_graph_recompute_req & request,
-        bool first_compute = false);
+        bool first_compute = false,
+        int64_t command_rx_us = 0);
     void phone_stage_wait_idle();
+    // Caller holds phone_stage_source_mutex. A bounded diagnostic history
+    // identifies the most recent incoming write that feeds a Stage input.
+    void phone_stage_record_input_rx(const rpc_tensor & wire, uint64_t offset,
+                                     size_t bytes, int64_t rx_done_us);
     void phone_region_main_loop();
     bool run_phone_region_local_task(
         const rpc_phone_region_local_task & task);
@@ -5299,6 +5324,18 @@ private:
     std::recursive_mutex graph_compute_mutex;
     std::mutex phone_stage_pool_mutex;
     std::mutex phone_stage_source_mutex;
+    struct phone_stage_rx_write {
+        ggml_backend_buffer_t buffer = nullptr;
+        uintptr_t begin = 0;
+        size_t bytes = 0;
+        int64_t rx_done_us = 0;
+        int64_t set_done_us = 0;
+        uint64_t seq = 0;
+    };
+    std::deque<phone_stage_rx_write> phone_stage_rx_writes;
+    std::unordered_map<uint64_t, uint64_t> phone_stage_rx_consumed_by_uid;
+    uint64_t phone_stage_rx_next_seq = 0;
+    static constexpr size_t k_phone_stage_rx_history = 4096;
 
     // The cached-graph pipeline is opt-in. The caller remains synchronous,
     // while a separate thread fills the next owned Slot in advance.
@@ -5784,6 +5821,13 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
         return false;
     }
     erase_opencl_tensor_extras_for_buffer(buffer);
+    if (rpc_phone_chunk_dispatch_profile_enabled()) {
+        phone_stage_rx_writes.erase(std::remove_if(
+            phone_stage_rx_writes.begin(), phone_stage_rx_writes.end(),
+            [&](const phone_stage_rx_write & write) {
+                return write.buffer == buffer;
+            }), phone_stage_rx_writes.end());
+    }
     ggml_backend_buffer_free(buffer);
     buffers.erase(buffer);
     return true;
@@ -5852,7 +5896,25 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
 }
 
 
-bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+void rpc_server::phone_stage_record_input_rx(
+        const rpc_tensor & wire, uint64_t offset,
+        size_t bytes, int64_t rx_done_us) {
+    if (!rpc_phone_chunk_dispatch_profile_enabled() || rx_done_us <= 0 ||
+        bytes == 0 || wire.data > UINTPTR_MAX - offset ||
+        bytes > UINTPTR_MAX - static_cast<uintptr_t>(wire.data + offset)) {
+        return;
+    }
+    phone_stage_rx_writes.push_back({
+        reinterpret_cast<ggml_backend_buffer_t>(wire.buffer),
+        static_cast<uintptr_t>(wire.data + offset),
+        bytes, rx_done_us, ggml_time_us(), ++phone_stage_rx_next_seq,
+    });
+    if (phone_stage_rx_writes.size() > k_phone_stage_rx_history) {
+        phone_stage_rx_writes.pop_front();
+    }
+}
+
+bool rpc_server::set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us) {
     // serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes) |
     if (input.size() < sizeof(rpc_tensor) + sizeof(uint64_t)) {
         return false;
@@ -5873,14 +5935,15 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO("[%s] saved to '%s'\n", __func__, cache_file.string().c_str());
     }
 
-    return set_tensor_direct(*in_tensor, offset, data, size);
+    return set_tensor_direct(*in_tensor, offset, data, size, rx_done_us);
 }
 
 bool rpc_server::set_tensor_direct(
         const rpc_tensor & in_tensor,
         uint64_t offset,
         const void * data,
-        size_t size) {
+        size_t size,
+        int64_t rx_done_us) {
     std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
 
     struct ggml_init_params params {
@@ -5958,6 +6021,7 @@ bool rpc_server::set_tensor_direct(
     // OpenCL quantized set_tensor may replace the generic extra with a
     // type-specific object. Preserve the post-write pointer.
     remember_opencl_tensor_extra(tensor);
+    phone_stage_record_input_rx(in_tensor, offset, size, rx_done_us);
 
     if (debug_k_quant) {
         GGML_LOG_DEBUG(
@@ -5976,7 +6040,8 @@ bool rpc_server::set_tensor_direct_opencl_async(
         const rpc_tensor & in_tensor,
         uint64_t offset,
         const void * data,
-        size_t size) {
+        size_t size,
+        int64_t rx_done_us) {
     std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -6029,6 +6094,7 @@ bool rpc_server::set_tensor_direct_opencl_async(
     }
 
     remember_opencl_tensor_extra(tensor);
+    phone_stage_record_input_rx(in_tensor, offset, size, rx_done_us);
     return true;
 }
 
@@ -7795,7 +7861,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::set_tensor_graph_compute(
-        const std::vector<uint8_t> & input) {
+        const std::vector<uint8_t> & input, int64_t rx_done_us) {
     // This RPC may enqueue a nonblocking input write immediately before
     // graph submission, without an event visible to the transfer queue.
     std::unique_lock<std::mutex> stage_lock;
@@ -7871,7 +7937,8 @@ bool rpc_server::set_tensor_graph_compute(
             request_v6.tensor,
             request_v6.offset,
             data,
-            data_size);
+            data_size,
+            rx_done_us);
     }
 
     if (!async_write_used &&
@@ -7879,7 +7946,8 @@ bool rpc_server::set_tensor_graph_compute(
                 request_v6.tensor,
                 request_v6.offset,
                 data,
-                data_size)) {
+                data_size,
+                rx_done_us)) {
         return false;
     }
     const int64_t write_us = ggml_time_us() - write_begin_us;
@@ -7891,7 +7959,7 @@ bool rpc_server::set_tensor_graph_compute(
         rpc_msg_graph_recompute_req recompute {};
         recompute.device = device;
         recompute.graph_uid = graph_uid;
-        ok = graph_recompute(recompute);
+        ok = graph_recompute(recompute, rx_done_us);
     } else {
         std::vector<uint8_t> graph_input(graph_size);
         if (graph_size > 0) {
@@ -7900,7 +7968,7 @@ bool rpc_server::set_tensor_graph_compute(
                 data + data_size,
                 graph_size);
         }
-        ok = graph_compute(graph_input);
+        ok = graph_compute(graph_input, false, rx_done_us);
     }
 
     const int64_t graph_us = ggml_time_us() - graph_begin_us;
@@ -9059,15 +9127,51 @@ rpc_server::phone_stage_prepare_input(
                 reg, GGML_BACKEND_OPENCL_STAGE_INPUT_COPY_PROC)) :
         nullptr;
     bool copied = false;
+    std::optional<phone_stage_rx_write> matched_write;
     if (copy != nullptr) {
         // The source lock excludes concurrent RPC writes while transferring.
         // Nonblocking writes without a producer event always fall back.
         std::lock_guard<std::mutex> payload_guard(
             async_return_payload_mutex);
         std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
+        if (rpc_phone_chunk_dispatch_profile_enabled() &&
+            job.command_rx_us > 0) {
+            const auto consumed = phone_stage_rx_consumed_by_uid.find(job.uid);
+            const uint64_t floor_seq =
+                consumed == phone_stage_rx_consumed_by_uid.end() ?
+                    0 : consumed->second;
+            for (auto iter = phone_stage_rx_writes.rbegin();
+                 iter != phone_stage_rx_writes.rend(); ++iter) {
+                if (iter->seq <= floor_seq) {
+                    break;
+                }
+                // Only writes completed before this graph command are eligible.
+                if (iter->set_done_us > job.command_rx_us) {
+                    continue;
+                }
+                for (const auto & item : plan.tensors) {
+                    if (!item.input || item.original_buffer != iter->buffer) {
+                        continue;
+                    }
+                    if (ggml_phone_stage::may_overlap(
+                            reinterpret_cast<uintptr_t>(item.original_data),
+                            ggml_nbytes(&item.snapshot),
+                            iter->begin, iter->bytes)) {
+                        matched_write = *iter;
+                        break;
+                    }
+                }
+                if (matched_write) {
+                    break;
+                }
+            }
+        }
         const auto it = async_return_payloads.find(dev);
         if (it == async_return_payloads.end() || it->second.empty()) {
             copied = copy(src_ptrs.data(), dst_ptrs.data(), sources.size());
+        }
+        if (copied && matched_write) {
+            phone_stage_rx_consumed_by_uid[job.uid] = matched_write->seq;
         }
     }
     if (!copied) {
@@ -9084,6 +9188,14 @@ rpc_server::phone_stage_prepare_input(
     prepared.input_bytes = input_bytes;
     prepared.prepare_begin_us = start_us;
     prepared.prepare_end_us = ggml_time_us();
+    prepared.order = job.order;
+    prepared.command_rx_us = job.command_rx_us;
+    if (matched_write) {
+        prepared.input_write_seq = matched_write->seq;
+        prepared.input_write_bytes = matched_write->bytes;
+        prepared.input_rx_done_us = matched_write->rx_done_us;
+        prepared.input_set_done_us = matched_write->set_done_us;
+    }
     GGML_LOG_INFO(
         "[PHONE_STAGE_PREPARE] event=INPUT_READY uid=%" PRIu64
         " order=%" PRIu64 " slot=%zu ticket=%" PRIu64
@@ -9132,7 +9244,8 @@ void rpc_server::phone_stage_wait_idle() {
 }
 
 std::optional<bool> rpc_server::phone_stage_recompute_pipelined(
-        const rpc_msg_graph_recompute_req & request, bool first_compute) {
+        const rpc_msg_graph_recompute_req & request, bool first_compute,
+        int64_t command_rx_us) {
     if (!rpc_phone_stage_prepare_ahead_enabled() ||
         rpc_phone_stage_prepare_bypass ||
         request.device >= stored_graphs.size()) {
@@ -9154,6 +9267,7 @@ std::optional<bool> rpc_server::phone_stage_recompute_pipelined(
         job->graph = it->second.graph;
         job->entry = &it->second;
         job->order = phone_stage_next_order++;
+        job->command_rx_us = command_rx_us;
         for (const auto & item : it->second.slot0.tensors) {
             if (item.output) {
                 job->outputs.push_back({
@@ -9407,6 +9521,11 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
         item.tensor->extra = slot_extras[i];
     }
 
+    // Capture just before submitting the OpenCL graph; log only afterwards
+    // so diagnostic I/O never delays the measured graph launch.
+    const int64_t graph_exec_begin_us =
+        rpc_phone_chunk_dispatch_profile_enabled() ?
+            ggml_time_us() : 0;
     const ggml_status status =
         ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_synchronize(backends[device]);
@@ -9446,6 +9565,35 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
             graph_uid, ticket, epoch, slot_index, output_bytes);
     }
 
+    if (rpc_phone_chunk_dispatch_profile_enabled() &&
+        prepared != nullptr) {
+        const int64_t rx_us = prepared->input_rx_done_us;
+        const int64_t cmd_us = prepared->command_rx_us;
+        const bool command_valid = cmd_us > 0 && graph_exec_begin_us >= cmd_us;
+        const bool matched = rx_us > 0 && command_valid &&
+            rx_us <= cmd_us && prepared->input_set_done_us <= cmd_us;
+        GGML_LOG_INFO(
+            "[PHONE_CHUNK_DISPATCH] uid=%" PRIu64
+            " order=%" PRIu64 " ticket=%" PRIu64
+            " slot=%zu tokens=%u inputs_bytes=%zu"
+            " matched_write_seq=%" PRIu64 " matched_write_bytes=%zu"
+            " input_rx_done_us=%" PRId64
+            " input_set_done_us=%" PRId64
+            " graph_cmd_rx_us=%" PRId64
+            " graph_exec_begin_us=%" PRId64
+            " rx_to_cmd_ms=%.3f cmd_to_exec_ms=%.3f"
+            " rx_to_exec_ms=%.3f"
+            " match=%s status=%s\n",
+            graph_uid, prepared->order, ticket, slot_index, plan.tokens,
+            input_bytes, prepared->input_write_seq,
+            prepared->input_write_bytes, rx_us, prepared->input_set_done_us,
+            cmd_us, graph_exec_begin_us,
+            matched ? (cmd_us - rx_us) / 1000.0 : -1.0,
+            command_valid ? (graph_exec_begin_us - cmd_us) / 1000.0 : -1.0,
+            matched ? (graph_exec_begin_us - rx_us) / 1000.0 : -1.0,
+            matched ? "LAST_INPUT_WRITE" : "UNMATCHED",
+            status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+    }
     GGML_LOG_INFO(
         "[PHONE_STAGE_SLOT0] event=COMPUTE uid=%" PRIu64
         " slot=%zu ticket=%" PRIu64
@@ -9461,7 +9609,9 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
     return status;
 }
 
-bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
+bool rpc_server::graph_compute(
+        const std::vector<uint8_t> & input, bool register_only,
+        int64_t command_rx_us) {
     std::unique_lock<std::mutex> registry_lock;
     std::unique_lock<std::recursive_mutex> graph_lock(
         graph_compute_mutex, std::defer_lock);
@@ -9570,7 +9720,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
         stage_request.device = device;
         stage_request.graph_uid = graph_uid;
         if (const auto result =
-                phone_stage_recompute_pipelined(stage_request, true)) {
+                phone_stage_recompute_pipelined(stage_request, true,
+                                                command_rx_us)) {
             registry_lock.lock();
             auto it = phone_stage_active_uids.find(graph_uid);
             GGML_ASSERT(it != phone_stage_active_uids.end() &&
@@ -9635,8 +9786,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     return true;
 }
 
-bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
-    if (const auto result = phone_stage_recompute_pipelined(request)) {
+bool rpc_server::graph_recompute(
+        const rpc_msg_graph_recompute_req & request, int64_t command_rx_us) {
+    if (const auto result =
+            phone_stage_recompute_pipelined(request, false, command_rx_us)) {
         return *result;
     }
     std::unique_lock<std::mutex> registry_lock;
@@ -10568,7 +10721,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor(
+                        input, rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -10659,7 +10814,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.graph_compute(input)) {
+                if (!server.graph_compute(
+                        input, false,
+                        rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -10669,7 +10827,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                if (!server.graph_recompute(request)) {
+                if (!server.graph_recompute(
+                        request, rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -10877,7 +11037,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor(input)) {
+                if (!server.set_tensor(
+                        input, rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -11098,7 +11260,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.set_tensor_graph_compute(input)) {
+                if (!server.set_tensor_graph_compute(
+                        input, rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -11122,7 +11286,10 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.graph_compute(input)) {
+                if (!server.graph_compute(
+                        input, false,
+                        rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
@@ -11132,7 +11299,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                if (!server.graph_recompute(request)) {
+                if (!server.graph_recompute(
+                        request, rpc_phone_chunk_dispatch_profile_enabled() ?
+                            ggml_time_us() : 0)) {
                     return;
                 }
                 break;
