@@ -4593,7 +4593,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     if (phone_static_requested && !phone_static_templates) {
         LLAMA_LOG_INFO(
             "[PHONE_STATIC_TEMPLATE] event=DISABLED reason=%s "
-            "tokens=%u status=LEGACY\\n",
+            "tokens=%u status=LEGACY\n",
             !phone_static_eligible ? "UNSUPPORTED_RUNTIME" :
                 "NONCANONICAL_LOGITS_MASK",
             ubatch.n_tokens);
