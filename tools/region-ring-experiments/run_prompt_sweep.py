@@ -476,7 +476,8 @@ def main():
             "commit": commit, "log_verbosity": args.log_verbosity,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
-                                 or k == "LLAMA_REGION_RING_METRICS_FILE"
+                                 or k in ("LLAMA_REGION_RING_METRICS_FILE",
+                                          "LLAMA_REGION_RING_TASK_TRACE")
                                  or k in ("GGML_META_PHONE_FULL_ADD_FUSION",
                                           "GGML_META_RING_PHONE_FUSION")},
             "phone_full_add_fusion_requested":
