@@ -477,7 +477,8 @@ def main():
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
-                                          "LLAMA_REGION_RING_TASK_TRACE")
+                                          "LLAMA_REGION_RING_TASK_TRACE",
+                                          "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES")
                                  or k in ("GGML_META_PHONE_FULL_ADD_FUSION",
                                           "GGML_META_RING_PHONE_FUSION")},
             "phone_full_add_fusion_requested":
