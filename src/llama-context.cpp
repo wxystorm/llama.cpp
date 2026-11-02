@@ -2596,7 +2596,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_prepare_wait_us,
         int64_t *                          ring_cpu_wait_us,
         int64_t *                          ring_cuda_wait_us,
-        bool                               preserve_weight_cache_on_graph_reset) {
+        bool                               preserve_weight_cache_on_graph_reset,
+        bool                               phone_prebuilt_graph) {
     llama_region_ring_tls_p2c_deferred = {};
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
@@ -2627,6 +2628,18 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
     const bool split_backend_gates =
         pc_phone_overlap && ring_prepare_gate != nullptr && ring_lane >= 0;
+    if (phone_prebuilt_graph &&
+            (!split_backend_gates || ring_lane != 2 ||
+             stage.kind != llama_hybrid_runtime_stage_kind::PHONE ||
+             res_use == nullptr || sched_use == nullptr ||
+             apply_mctx || !task_local_graph_outputs)) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_STATIC_TEMPLATE] event=REJECT region=%zu chunk=%zu "
+            "reason=INVALID_EXECUTION_CONTRACT status=FAIL\n",
+            stage_index, block_index);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (split_backend_gates) {
         const bool lane_valid = ring_lane >= 0 && ring_lane <= 2;
         const bool prepare_owned = ring_prepare_gate->owns_lock();
@@ -2658,13 +2671,32 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
     }
 
     const int64_t prepare_begin_us = timing != nullptr ? ggml_time_us() : 0;
-    llm_graph_result * result = prepare_ubatch(
-        res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
-        &stage, task_local_graph_outputs ? block_outputs : -1,
-        stage_input != nullptr, false,
-        preserve_weight_cache_on_graph_reset,
-        timing != nullptr ? &timing->graph_reused : nullptr,
-        timing);
+    llm_graph_result * result = nullptr;
+    if (phone_prebuilt_graph) {
+        // The Graph and ggml Scheduler allocation were frozen before the
+        // worker threads launched. The chosen template exactly matches this
+        // Region, token count and output count; only the current input data,
+        // attention mask and KV write indices may change per Chunk.
+        result = res_use;
+        result->set_inputs(&stage_ubatch);
+        if (timing != nullptr) {
+            timing->graph_reused = true;
+            const int64_t input_end_us = ggml_time_us();
+            timing->input_set_us += input_end_us - prepare_begin_us;
+            if (timing->capture_timeline) {
+                timing->input_set_begin_us = prepare_begin_us;
+                timing->input_set_end_us = input_end_us;
+            }
+        }
+    } else {
+        result = prepare_ubatch(
+            res_use, sched_use, stage_ubatch, gtype, mctx, ret, apply_mctx,
+            &stage, task_local_graph_outputs ? block_outputs : -1,
+            stage_input != nullptr, false,
+            preserve_weight_cache_on_graph_reset,
+            timing != nullptr ? &timing->graph_reused : nullptr,
+            timing);
+    }
     if (timing != nullptr) {
         const int64_t prepare_end_us = ggml_time_us();
         timing->prepare_us += prepare_end_us - prepare_begin_us;
@@ -2938,12 +2970,32 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 }
             }
 
-            {
+            // The Phone worker has an independently allocated, immutable
+            // Scheduler/Graph. A pure Meta input transfer may run without
+            // monopolizing the global Graph PREPARE mutex: no PC/CUDA worker
+            // can enter this dedicated Scheduler, and no shared CPU backend
+            // is read or written by this particular split preparation.
+            // Keep the original lock for mixed final output/PC head, other
+            // backends, and any split with a CPU synchronization source.
+            const bool private_phone_input_prepare =
+                phone_prebuilt_graph &&
+                stage.layer_end < model.hparams.n_layer &&
+                n_splits == 1 &&
+                ring_lane == 2 && !target_uses_cpu &&
+                !prepare_needs_cpu && ggml_backend_is_meta(target) &&
+                prepare_sync_mask == 0;
+            if (!private_phone_input_prepare) {
                 const int64_t wait_begin_us = ggml_time_us();
                 ring_prepare_gate->lock();
                 if (ring_prepare_wait_us != nullptr) {
                     *ring_prepare_wait_us += ggml_time_us() - wait_begin_us;
                 }
+            } else if (block_index == 0) {
+                LLAMA_LOG_INFO(
+                    "[PHONE_STATIC_TEMPLATE] event=INPUT_PREPARE "
+                    "region=%zu chunk=%zu global_lock=RELEASED "
+                    "reason=DEDICATED_META_SCHEDULER status=OK\n",
+                    stage_index, block_index);
             }
 
             if (directional_meta_stage && block_index == 0) {
@@ -3030,7 +3082,9 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 }
             }
 
-            ring_prepare_gate->unlock();
+            if (ring_prepare_gate->owns_lock()) {
+                ring_prepare_gate->unlock();
+            }
             if (!target_uses_cpu && ring_cpu_gate->owns_lock()) {
                 ring_cpu_gate->unlock();
             }
