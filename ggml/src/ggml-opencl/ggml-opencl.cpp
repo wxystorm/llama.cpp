@@ -563,6 +563,8 @@ struct ggml_backend_opencl_context {
 
     cl_context context;
     cl_command_queue queue;
+    cl_command_queue stage_input_queue = nullptr;
+    std::mutex stage_input_queue_mutex;
 
     // prealloc buffers for transposing weights and activations
     ggml_cl_buffer prealloc_quant_trans;
@@ -1045,6 +1047,14 @@ struct ggml_backend_opencl_context {
 
         ref_count--;
         if (ref_count == 0) {
+            {
+                std::lock_guard<std::mutex> guard(stage_input_queue_mutex);
+                if (stage_input_queue != nullptr) {
+                    CL_CHECK(clFinish(stage_input_queue));
+                    CL_CHECK(clReleaseCommandQueue(stage_input_queue));
+                    stage_input_queue = nullptr;
+                }
+            }
 #ifdef GGML_OPENCL_PROFILING
             flush_profiling_batch();
             write_profiling_info();
@@ -10513,10 +10523,111 @@ static ggml_backend_dev_t ggml_backend_opencl_reg_device_get(ggml_backend_reg_t 
     GGML_UNUSED(index);
 }
 
+
+static bool ggml_backend_opencl_stage_input_copy(
+        const ggml_tensor * const * sources,
+        const ggml_tensor * const * destinations,
+        size_t count) {
+    if (sources == nullptr || destinations == nullptr ||
+        count == 0 || count > 64) {
+        return false;
+    }
+    ggml_backend_opencl_context * ctx = nullptr;
+    struct transfer {
+        cl_mem src = nullptr;
+        cl_mem dst = nullptr;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        size_t size = 0;
+    };
+    std::vector<transfer> copies;
+    copies.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        const ggml_tensor * src = sources[i];
+        const ggml_tensor * dst = destinations[i];
+        if (src == nullptr || dst == nullptr ||
+            src->buffer == nullptr || dst->buffer == nullptr ||
+            src->extra == nullptr || dst->extra == nullptr ||
+            src->view_src != nullptr || dst->view_src != nullptr ||
+            src->type != dst->type ||
+            (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16 &&
+             src->type != GGML_TYPE_I32 && src->type != GGML_TYPE_I64) ||
+            !ggml_is_contiguous(src) || !ggml_are_same_layout(src, dst) ||
+            src->buffer == dst->buffer) {
+            return false;
+        }
+        auto * dev = static_cast<ggml_backend_opencl_device_context *>(
+            src->buffer->buft->device->context);
+        auto * dst_dev = static_cast<ggml_backend_opencl_device_context *>(
+            dst->buffer->buft->device->context);
+        if (dev == nullptr || dst_dev == nullptr ||
+            dev->backend_ctx == nullptr ||
+            dev->backend_ctx != dst_dev->backend_ctx ||
+            (ctx != nullptr && ctx != dev->backend_ctx)) {
+            return false;
+        }
+        ctx = dev->backend_ctx;
+        auto * se = static_cast<ggml_tensor_extra_cl *>(src->extra);
+        auto * de = static_cast<ggml_tensor_extra_cl *>(dst->extra);
+        const size_t bytes = ggml_nbytes(src);
+        if (bytes == 0 || se->data_device == nullptr ||
+            de->data_device == nullptr ||
+            se->offset > ggml_backend_buffer_get_size(src->buffer) ||
+            de->offset > ggml_backend_buffer_get_size(dst->buffer) ||
+            bytes > ggml_backend_buffer_get_size(src->buffer) - se->offset ||
+            bytes > ggml_backend_buffer_get_size(dst->buffer) - de->offset) {
+            return false;
+        }
+        copies.push_back({
+            se->data_device, de->data_device,
+            se->offset, de->offset, bytes,
+        });
+    }
+
+    std::lock_guard<std::mutex> guard(ctx->stage_input_queue_mutex);
+    if (ctx->stage_input_queue == nullptr) {
+        cl_int err = CL_SUCCESS;
+        ctx->stage_input_queue = clCreateCommandQueue(
+            ctx->context, ctx->device, 0, &err);
+        if (err != CL_SUCCESS || ctx->stage_input_queue == nullptr) {
+            GGML_LOG_WARN("[PHONE_STAGE_TRANSFER] reason=QUEUE_CREATE error=%d\n", err);
+            return false;
+        }
+    }
+    cl_event last = nullptr;
+    for (const auto & copy : copies) {
+        cl_event next = nullptr;
+        const cl_int err = clEnqueueCopyBuffer(
+            ctx->stage_input_queue, copy.src, copy.dst,
+            copy.src_offset, copy.dst_offset, copy.size,
+            0, nullptr, &next);
+        if (err != CL_SUCCESS) {
+            if (last != nullptr) {
+                clWaitForEvents(1, &last);
+                clReleaseEvent(last);
+            }
+            GGML_LOG_WARN("[PHONE_STAGE_TRANSFER] reason=COPY error=%d\n", err);
+            return false;
+        }
+        if (last != nullptr) {
+            clReleaseEvent(last);
+        }
+        last = next;
+    }
+    clFlush(ctx->stage_input_queue);
+    const cl_int wait_status = clWaitForEvents(1, &last);
+    clReleaseEvent(last);
+    return wait_status == CL_SUCCESS;
+}
+
 static void * ggml_backend_opencl_reg_get_proc_address(
         ggml_backend_reg_t reg,
         const char * name) {
     GGML_UNUSED(reg);
+    if (std::strcmp(name, GGML_BACKEND_OPENCL_STAGE_INPUT_COPY_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_opencl_stage_input_copy);
+    }
     if (std::strcmp(
             name,
             GGML_BACKEND_OPENCL_GET_TENSOR_BATCH3_PROC) == 0) {

@@ -31,6 +31,28 @@
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
+static bool rpc_phone_stage_prepare_ahead_enabled() {
+    const char * p = std::getenv("GGML_RPC_PHONE_STAGE_PREPARE_AHEAD");
+    const char * d = std::getenv("GGML_RPC_PHONE_STAGE_DUAL_SLOT");
+    const char * s = std::getenv("GGML_RPC_PHONE_STAGE_SLOT0_EXEC");
+    return p && d && s &&
+        std::strcmp(p, "1") == 0 &&
+        std::strcmp(d, "1") == 0 &&
+        std::strcmp(s, "1") == 0;
+}
+
+static thread_local bool rpc_phone_stage_prepare_bypass = false;
+
+struct rpc_phone_stage_prepare_bypass_scope {
+    bool previous = rpc_phone_stage_prepare_bypass;
+    rpc_phone_stage_prepare_bypass_scope() {
+        rpc_phone_stage_prepare_bypass = true;
+    }
+    ~rpc_phone_stage_prepare_bypass_scope() {
+        rpc_phone_stage_prepare_bypass = previous;
+    }
+};
+
 // Experiment-only counters; no added RPC traffic or hot-path file writes.
 static bool rpc_region_ring_metrics_enabled() {
     static const bool enabled = []() {
@@ -5049,6 +5071,10 @@ public:
         }
         phone_region_main_thread =
             std::thread([this]() { phone_region_main_loop(); });
+        if (rpc_phone_stage_prepare_ahead_enabled()) {
+            phone_stage_prepare_thread =
+                std::thread([this]() { phone_stage_prepare_loop(); });
+        }
     }
     ~rpc_server();
 
@@ -5125,6 +5151,7 @@ public:
         ggml_backend_buffer_t original_buffer = nullptr;
         void * original_data = nullptr;
         void * original_extra = nullptr;
+        ggml_tensor snapshot {};
         size_t offset = 0;
         size_t parent = SIZE_MAX;
         bool input = false;
@@ -5151,6 +5178,41 @@ public:
         uint64_t compute_samples = 0;
     };
 private:
+    struct phone_stage_prepared_input {
+        size_t slot = 0;
+        uint64_t ticket = 0;
+        uint64_t epoch = 0;
+        size_t input_bytes = 0;
+        int64_t prepare_begin_us = 0;
+        int64_t prepare_end_us = 0;
+    };
+    struct phone_stage_buffer_range {
+        ggml_backend_buffer_t buffer = nullptr;
+        void * data = nullptr;
+        size_t bytes = 0;
+    };
+    struct phone_stage_prepare_job {
+        uint32_t device = 0;
+        uint64_t uid = 0;
+        uint64_t order = 0;
+        stored_graph * entry = nullptr;
+        ggml_cgraph * graph = nullptr;
+        std::vector<phone_stage_buffer_range> outputs;
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done = false;
+        std::optional<phone_stage_prepared_input> prepared;
+    };
+    void phone_stage_prepare_loop();
+    std::optional<phone_stage_prepared_input> phone_stage_prepare_input(
+        const phone_stage_prepare_job & job);
+    bool phone_stage_init_slot_extras(
+        uint32_t device, uint64_t uid,
+        phone_stage_slot0_graph & plan, size_t slot_index);
+    std::optional<bool> phone_stage_recompute_pipelined(
+        const rpc_msg_graph_recompute_req & request,
+        bool first_compute = false);
+    void phone_stage_wait_idle();
     void phone_region_main_loop();
     bool run_phone_region_local_task(
         const rpc_phone_region_local_task & task);
@@ -5172,7 +5234,8 @@ private:
                                       uint32_t wire_tensor_count);
     std::optional<ggml_status> phone_stage_slot0_compute(
         uint32_t device, uint64_t graph_uid,
-        ggml_cgraph * graph, stored_graph & entry);
+        ggml_cgraph * graph, stored_graph & entry,
+        const phone_stage_prepared_input * prepared = nullptr);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -5234,6 +5297,29 @@ private:
     };
     std::vector<phone_owned_arenas> phone_stage_device_arenas;
     std::recursive_mutex graph_compute_mutex;
+    std::mutex phone_stage_pool_mutex;
+    std::mutex phone_stage_source_mutex;
+
+    // The cached-graph pipeline is opt-in. The caller remains synchronous,
+    // while a separate thread fills the next owned Slot in advance.
+    std::mutex phone_stage_registry_mutex;
+    std::condition_variable phone_stage_registry_cv;
+    size_t phone_stage_active_jobs = 0;
+    std::unordered_map<uint64_t, size_t> phone_stage_active_uids;
+    std::vector<std::shared_ptr<phone_stage_prepare_job>>
+        phone_stage_inflight_jobs;
+    std::mutex phone_stage_prepare_mutex;
+    std::condition_variable phone_stage_prepare_cv;
+    std::deque<std::shared_ptr<phone_stage_prepare_job>>
+        phone_stage_prepare_queue;
+    std::thread phone_stage_prepare_thread;
+    bool phone_stage_prepare_stop = false;
+    uint64_t phone_stage_next_order = 1;
+    std::mutex phone_stage_order_mutex;
+    std::condition_variable phone_stage_order_cv;
+    uint64_t phone_stage_compute_order = 1;
+    int64_t phone_stage_last_compute_begin_us = 0;
+    int64_t phone_stage_last_compute_end_us = 0;
 
     std::mutex route_ready_mutex;
     std::condition_variable route_ready_cv;
@@ -5689,6 +5775,8 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 }
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
+    phone_stage_wait_idle();
+    std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -5702,6 +5790,8 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 }
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
+    phone_stage_wait_idle();
+    std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -5791,6 +5881,7 @@ bool rpc_server::set_tensor_direct(
         uint64_t offset,
         const void * data,
         size_t size) {
+    std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
 
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
@@ -5886,6 +5977,7 @@ bool rpc_server::set_tensor_direct_opencl_async(
         uint64_t offset,
         const void * data,
         size_t size) {
+    std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
@@ -6423,6 +6515,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 bool rpc_server::get_tensor_into(
         const rpc_msg_get_tensor_req & request,
         void * response_data) {
+    phone_stage_wait_idle();
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -6587,6 +6680,11 @@ bool rpc_server::phone_ring_input_ready(
     // The PC pre-registers this graph; the Phone never infers it from a
     // partial input transfer.
     {
+        std::unique_lock<std::mutex> registry_lock;
+        if (rpc_phone_stage_prepare_ahead_enabled()) {
+            registry_lock = std::unique_lock<std::mutex>(
+                phone_stage_registry_mutex);
+        }
         std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
         const auto it = stored_graphs[request.device].find(request.graph_uid);
         if (it == stored_graphs[request.device].end() ||
@@ -6666,6 +6764,14 @@ void rpc_server::phone_region_main_loop() {
         }
 
         if (task.ring_auto) {
+            std::unique_lock<std::mutex> pipeline_guard;
+            if (rpc_phone_stage_prepare_ahead_enabled()) {
+                pipeline_guard = std::unique_lock<std::mutex>(
+                    phone_stage_registry_mutex);
+                phone_stage_registry_cv.wait(pipeline_guard, [&]() {
+                    return phone_stage_active_jobs == 0;
+                });
+            }
             const int64_t begin_us = ggml_time_us();
             bool ok = false;
             {
@@ -6676,6 +6782,7 @@ void rpc_server::phone_region_main_loop() {
                 rpc_msg_graph_recompute_req req {};
                 req.device = task.ring_device;
                 req.graph_uid = task.ring_graph_uid;
+                const rpc_phone_stage_prepare_bypass_scope bypass_pipeline;
                 ok = graph_recompute(req);
                 if (ok) {
                     ggml_backend_synchronize(backends[task.ring_device]);
@@ -6712,7 +6819,16 @@ void rpc_server::phone_region_main_loop() {
 
 bool rpc_server::run_phone_region_local_task(
         const rpc_phone_region_local_task & task) {
+    std::unique_lock<std::mutex> pipeline_guard;
+    if (rpc_phone_stage_prepare_ahead_enabled()) {
+        pipeline_guard = std::unique_lock<std::mutex>(
+            phone_stage_registry_mutex);
+        phone_stage_registry_cv.wait(pipeline_guard, [&]() {
+            return phone_stage_active_jobs == 0;
+        });
+    }
     const int64_t begin_us = ggml_time_us();
+    const rpc_phone_stage_prepare_bypass_scope bypass_pipeline;
 
     // MAIN priority: once a chunk enters Region, no unrelated GRAPH_COMPUTE
     // may interleave before P2C READY/FFN/PARTIAL is published. graph_compute()
@@ -7056,6 +7172,7 @@ bool rpc_server::get_tensor_batch3_wait(
 bool rpc_server::get_tensor_batch3(
         const rpc_msg_get_tensor_batch3_req & request,
         std::vector<uint8_t> & response) {
+    phone_stage_wait_idle();
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t server_begin_us =
@@ -7434,6 +7551,7 @@ bool rpc_server::snapshot_tensor_direct(
 }
 
 bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_ptr sock) {
+    phone_stage_wait_idle();
     if (request.device >= backends.size() ||
             request.slot >= RPC_SNAPSHOT_SLOTS) {
         return false;
@@ -7531,6 +7649,7 @@ bool rpc_server::send_snapshot(const rpc_msg_get_snapshot_req & request, socket_
         }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+    phone_stage_wait_idle();
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -7677,6 +7796,17 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 
 bool rpc_server::set_tensor_graph_compute(
         const std::vector<uint8_t> & input) {
+    // This RPC may enqueue a nonblocking input write immediately before
+    // graph submission, without an event visible to the transfer queue.
+    std::unique_lock<std::mutex> stage_lock;
+    if (rpc_phone_stage_prepare_ahead_enabled()) {
+        stage_lock = std::unique_lock<std::mutex>(
+            phone_stage_registry_mutex);
+        phone_stage_registry_cv.wait(stage_lock, [&]() {
+            return phone_stage_active_jobs == 0;
+        });
+    }
+    const rpc_phone_stage_prepare_bypass_scope bypass_pipeline;
     const bool stage_profile =
         rpc_tensor_phone_stage_profile_enabled();
     const int64_t server_begin_us =
@@ -8239,13 +8369,14 @@ void rpc_server::phone_stage_binding_preflight(
                 existing->stage_arena_required_bytes ||
             plan.scratch.required_bytes > existing->scratch.required_bytes;
     }
+    std::lock_guard<std::mutex> slot_pool_lock(phone_stage_pool_mutex);
     auto & pool = phone_stage_slot_policy[device];
     const size_t pool_alignment =
         std::max<size_t>(1, ggml_backend_get_alignment(backends[device]));
     ggml_phone_stage::status reserved = ggml_phone_stage::status::ok;
     if (new_template || growing_template) {
-        // Transactional: do not publish a new template or larger arena
-        // requirement until all active slot leases allow reservation.
+        // A layout that fits in the existing arena does not invalidate
+        // active leases. Growth still waits for both Slots to become free.
         std::vector<ggml_phone_stage::template_plan> proposed = plans;
         if (new_template) {
             proposed.push_back(std::move(plan));
@@ -8260,7 +8391,19 @@ void rpc_server::phone_stage_binding_preflight(
                 cached.scratch.required_bytes,
                 plan.scratch.required_bytes);
         }
-        reserved = pool.reserve(proposed, pool_alignment);
+        size_t max_needed = 0;
+        for (const auto & candidate : proposed) {
+            max_needed = std::max(max_needed,
+                std::max(candidate.stage_arena_required_bytes,
+                         candidate.scratch.required_bytes));
+        }
+        if (pool.busy(0) || pool.busy(1)) {
+            reserved = max_needed <= pool.bytes_per_slot() ?
+                ggml_phone_stage::status::ok :
+                ggml_phone_stage::status::busy;
+        } else {
+            reserved = pool.reserve(proposed, pool_alignment);
+        }
         if (reserved == ggml_phone_stage::status::ok) {
             plans.swap(proposed);
         }
@@ -8646,7 +8789,7 @@ void rpc_server::phone_stage_binding_preflight(
                     output_count += output;
                     proposed.tensors.push_back({
                         const_cast<ggml_tensor *>(t),
-                        t->buffer, t->data, t->extra,
+                        t->buffer, t->data, t->extra, *t,
                         record.source_offset, SIZE_MAX, input, output,
                     });
                 }
@@ -8747,9 +8890,394 @@ void rpc_server::phone_stage_binding_preflight(
 }
 
 
+
+bool rpc_server::phone_stage_init_slot_extras(
+        uint32_t device, uint64_t uid,
+        phone_stage_slot0_graph & plan, size_t slot_index) {
+    auto & arenas = phone_stage_device_arenas[device];
+    ggml_backend_buffer_t slot = arenas.buffers[slot_index];
+    if (slot == nullptr ||
+        ggml_backend_buffer_get_size(slot) < plan.required_bytes) {
+        return false;
+    }
+    auto & extras = plan.extras[slot_index];
+    if (plan.cached_slot[slot_index] == slot &&
+        plan.cached_generation[slot_index] == arenas.generation &&
+        extras.size() == plan.tensors.size()) {
+        return true;
+    }
+
+    const size_t base = reinterpret_cast<size_t>(
+        ggml_backend_buffer_get_base(slot));
+    if (base == 0 || plan.required_bytes > SIZE_MAX - base) {
+        return false;
+    }
+    std::vector<ggml_tensor> clones;
+    clones.reserve(plan.tensors.size());
+    for (const auto & item : plan.tensors) {
+        ggml_tensor copy = item.snapshot;
+        copy.buffer = slot;
+        copy.data = reinterpret_cast<void *>(base + item.offset);
+        copy.extra = nullptr;
+        copy.view_src = nullptr;
+        clones.push_back(copy);
+    }
+    std::vector<void *> new_extras(plan.tensors.size(), nullptr);
+    for (size_t i : plan.init_order) {
+        const size_t parent = plan.tensors[i].parent;
+        if (parent != SIZE_MAX) {
+            clones[i].view_src = &clones[parent];
+        }
+        if (ggml_backend_buffer_init_tensor(slot, &clones[i]) !=
+                GGML_STATUS_SUCCESS ||
+            clones[i].extra == nullptr) {
+            GGML_LOG_INFO(
+                "[PHONE_STAGE_PREPARE] event=SKIP uid=%" PRIu64
+                " slot=%zu tensor=%s reason=EXTRA_INIT\n",
+                uid, slot_index, plan.tensors[i].tensor->name);
+            plan.ready = false;
+            return false;
+        }
+        new_extras[i] = clones[i].extra;
+    }
+    extras = std::move(new_extras);
+    plan.cached_slot[slot_index] = slot;
+    plan.cached_generation[slot_index] = arenas.generation;
+    GGML_LOG_INFO(
+        "[PHONE_STAGE_SLOT0] event=BIND_EXTRA uid=%" PRIu64
+        " slot=%zu tensors=%zu generation=%" PRIu64
+        " status=READY\n",
+        uid, slot_index, extras.size(), arenas.generation);
+    return true;
+}
+
+std::optional<rpc_server::phone_stage_prepared_input>
+rpc_server::phone_stage_prepare_input(
+        const phone_stage_prepare_job & job) {
+    const uint32_t device = job.device;
+    auto & plan = job.entry->slot0;
+    auto & arenas = phone_stage_device_arenas[device];
+    if (!plan.ready || plan.tensors.empty()) {
+        return std::nullopt;
+    }
+    // A later Stage may read the previous Stage's published output.
+    // It cannot snapshot that source until the producer has completed.
+    {
+        std::unique_lock<std::mutex> lock(phone_stage_registry_mutex);
+        phone_stage_registry_cv.wait(lock, [&]() {
+            for (const auto & earlier : phone_stage_inflight_jobs) {
+                if (earlier->order >= job.order) { continue; }
+                for (const auto & output : earlier->outputs) {
+                    for (const auto & input : plan.tensors) {
+                        if (!input.input ||
+                            output.buffer != input.original_buffer) {
+                            continue;
+                        }
+                        if (ggml_phone_stage::may_overlap(
+                                reinterpret_cast<size_t>(output.data),
+                                output.bytes,
+                                reinterpret_cast<size_t>(input.original_data),
+                                ggml_nbytes(&input.snapshot))) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            return true;
+        });
+    }
+    const int64_t start_us = ggml_time_us();
+    size_t slot_index = 0;
+    uint64_t ticket = 0;
+    uint64_t epoch = 0;
+    {
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
+        auto & pool = phone_stage_slot_policy[device];
+        if (arenas.buffers[0] == nullptr ||
+            arenas.buffers[1] == nullptr ||
+            arenas.capacity < plan.required_bytes) {
+            return std::nullopt;
+        }
+        epoch = pool.epoch();
+        ticket = ++arenas.next_ticket;
+        if (ticket == 0) { ticket = ++arenas.next_ticket; }
+        if (pool.acquire_next_preparing(ticket, epoch, slot_index) !=
+                ggml_phone_stage::status::ok) {
+            return std::nullopt;
+        }
+    }
+    const auto cancel = [&]() {
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
+        const auto result = phone_stage_slot_policy[device].
+            cancel_preparing(slot_index, ticket);
+        GGML_ASSERT(result == ggml_phone_stage::status::ok);
+    };
+    if (!phone_stage_init_slot_extras(device, job.uid, plan, slot_index)) {
+        cancel();
+        return std::nullopt;
+    }
+    ggml_backend_buffer_t slot = arenas.buffers[slot_index];
+    const size_t base = reinterpret_cast<size_t>(
+        ggml_backend_buffer_get_base(slot));
+    std::vector<ggml_tensor> sources;
+    std::vector<ggml_tensor> destinations;
+    size_t input_bytes = 0;
+    for (size_t i = 0; i < plan.tensors.size(); ++i) {
+        const auto & item = plan.tensors[i];
+        if (!item.input) { continue; }
+        ggml_tensor src = item.snapshot;
+        src.buffer = item.original_buffer;
+        src.data = item.original_data;
+        src.extra = item.original_extra;
+        if (src.view_src != nullptr || !ggml_is_contiguous(&src)) {
+            cancel();
+            return std::nullopt;
+        }
+        ggml_tensor dst = src;
+        dst.buffer = slot;
+        dst.data = reinterpret_cast<void *>(base + item.offset);
+        dst.extra = plan.extras[slot_index][i];
+        sources.push_back(src);
+        destinations.push_back(dst);
+        input_bytes += ggml_nbytes(&src);
+    }
+    if (sources.empty()) {
+        cancel();
+        return std::nullopt;
+    }
+    std::vector<const ggml_tensor *> src_ptrs;
+    std::vector<const ggml_tensor *> dst_ptrs;
+    for (size_t i = 0; i < sources.size(); ++i) {
+        src_ptrs.push_back(&sources[i]);
+        dst_ptrs.push_back(&destinations[i]);
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backends[device]);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    const auto copy = reg != nullptr ?
+        reinterpret_cast<ggml_backend_opencl_stage_input_copy_t>(
+            ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_OPENCL_STAGE_INPUT_COPY_PROC)) :
+        nullptr;
+    bool copied = false;
+    if (copy != nullptr) {
+        // The source lock excludes concurrent RPC writes while transferring.
+        // Nonblocking writes without a producer event always fall back.
+        std::lock_guard<std::mutex> payload_guard(
+            async_return_payload_mutex);
+        std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
+        const auto it = async_return_payloads.find(dev);
+        if (it == async_return_payloads.end() || it->second.empty()) {
+            copied = copy(src_ptrs.data(), dst_ptrs.data(), sources.size());
+        }
+    }
+    if (!copied) {
+        cancel();
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_PREPARE] event=SKIP uid=%" PRIu64
+            " reason=TRANSFER_UNAVAILABLE status=FALLBACK\n", job.uid);
+        return std::nullopt;
+    }
+    phone_stage_prepared_input prepared;
+    prepared.slot = slot_index;
+    prepared.ticket = ticket;
+    prepared.epoch = epoch;
+    prepared.input_bytes = input_bytes;
+    prepared.prepare_begin_us = start_us;
+    prepared.prepare_end_us = ggml_time_us();
+    GGML_LOG_INFO(
+        "[PHONE_STAGE_PREPARE] event=INPUT_READY uid=%" PRIu64
+        " order=%" PRIu64 " slot=%zu ticket=%" PRIu64
+        " inputs_bytes=%zu start_us=%" PRId64 " end_us=%" PRId64
+        " prepare_ms=%.3f status=READY\n",
+        job.uid, job.order, slot_index, ticket, input_bytes,
+        start_us, prepared.prepare_end_us,
+        (prepared.prepare_end_us - start_us) / 1000.0);
+    return prepared;
+}
+
+void rpc_server::phone_stage_prepare_loop() {
+    for (;;) {
+        std::shared_ptr<phone_stage_prepare_job> job;
+        {
+            std::unique_lock<std::mutex> lock(phone_stage_prepare_mutex);
+            phone_stage_prepare_cv.wait(lock, [&]() {
+                return phone_stage_prepare_stop ||
+                    !phone_stage_prepare_queue.empty();
+            });
+            if (phone_stage_prepare_stop && phone_stage_prepare_queue.empty()) {
+                return;
+            }
+            job = phone_stage_prepare_queue.front();
+            phone_stage_prepare_queue.pop_front();
+        }
+        const auto prepared = phone_stage_prepare_input(*job);
+        {
+            std::lock_guard<std::mutex> guard(job->mutex);
+            job->prepared = prepared;
+            job->done = true;
+        }
+        job->cv.notify_one();
+    }
+}
+
+void rpc_server::phone_stage_wait_idle() {
+    if (!rpc_phone_stage_prepare_ahead_enabled() ||
+        rpc_phone_stage_prepare_bypass) {
+        return;
+    }
+    std::unique_lock<std::mutex> lock(phone_stage_registry_mutex);
+    phone_stage_registry_cv.wait(lock, [&]() {
+        return phone_stage_active_jobs == 0;
+    });
+}
+
+std::optional<bool> rpc_server::phone_stage_recompute_pipelined(
+        const rpc_msg_graph_recompute_req & request, bool first_compute) {
+    if (!rpc_phone_stage_prepare_ahead_enabled() ||
+        rpc_phone_stage_prepare_bypass ||
+        request.device >= stored_graphs.size()) {
+        return std::nullopt;
+    }
+    std::shared_ptr<phone_stage_prepare_job> job;
+    {
+        std::lock_guard<std::mutex> lock(phone_stage_registry_mutex);
+        auto it = stored_graphs[request.device].find(request.graph_uid);
+        if (it == stored_graphs[request.device].end() ||
+            it->second.graph == nullptr || !it->second.slot0.ready ||
+            it->second.slot0.tensors.empty() ||
+            phone_stage_active_jobs >= ggml_phone_stage::k_slot_count) {
+            return std::nullopt;
+        }
+        job = std::make_shared<phone_stage_prepare_job>();
+        job->device = request.device;
+        job->uid = request.graph_uid;
+        job->graph = it->second.graph;
+        job->entry = &it->second;
+        job->order = phone_stage_next_order++;
+        for (const auto & item : it->second.slot0.tensors) {
+            if (item.output) {
+                job->outputs.push_back({
+                    item.original_buffer, item.original_data,
+                    ggml_nbytes(&item.snapshot),
+                });
+            }
+        }
+        phone_stage_inflight_jobs.push_back(job);
+        ++phone_stage_active_jobs;
+        ++phone_stage_active_uids[request.graph_uid];
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_stage_prepare_mutex);
+        phone_stage_prepare_queue.push_back(job);
+    }
+    phone_stage_prepare_cv.notify_one();
+
+    {
+        std::unique_lock<std::mutex> lock(job->mutex);
+        job->cv.wait(lock, [&]() { return job->done; });
+    }
+    std::unique_lock<std::mutex> order_lock(phone_stage_order_mutex);
+    phone_stage_order_cv.wait(order_lock, [&]() {
+        return job->order == phone_stage_compute_order;
+    });
+    order_lock.unlock();
+
+    const int64_t wait_begin_us = ggml_time_us();
+    ggml_status status = GGML_STATUS_FAILED;
+    int64_t compute_begin_us = 0;
+    int64_t compute_end_us = 0;
+    {
+        std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
+        compute_begin_us = ggml_time_us();
+        auto result = phone_stage_slot0_compute(
+            request.device, request.graph_uid, job->graph, *job->entry,
+            job->prepared ? &*job->prepared : nullptr);
+        if (!result.has_value() && job->prepared) {
+            std::lock_guard<std::mutex> slot_lock(phone_stage_pool_mutex);
+            auto & pool = phone_stage_slot_policy[request.device];
+            const auto cancelled = pool.cancel_preparing(
+                job->prepared->slot, job->prepared->ticket);
+            GGML_ASSERT(cancelled == ggml_phone_stage::status::ok);
+        }
+        status = result.has_value() ?
+            *result : ggml_backend_graph_compute(
+                backends[request.device], job->graph);
+        compute_end_us = ggml_time_us();
+        if (status == GGML_STATUS_SUCCESS) {
+            auto & g = *job->entry;
+            g.recent_compute_wall_us[
+                g.compute_samples % g.recent_compute_wall_us.size()] =
+                    compute_end_us - compute_begin_us;
+            ++g.compute_samples;
+        }
+        rpc_tensor_phone_log_graph_compute(
+            first_compute ? "compute" : "recompute",
+            request.graph_uid, job->graph,
+            compute_end_us - compute_begin_us, 0);
+    }
+    int64_t previous_compute_begin_us = 0;
+    int64_t previous_compute_end_us = 0;
+    {
+        std::lock_guard<std::mutex> lock(phone_stage_order_mutex);
+        previous_compute_begin_us = phone_stage_last_compute_begin_us;
+        previous_compute_end_us = phone_stage_last_compute_end_us;
+        phone_stage_last_compute_begin_us = compute_begin_us;
+        phone_stage_last_compute_end_us = compute_end_us;
+        ++phone_stage_compute_order;
+    }
+    phone_stage_order_cv.notify_all();
+    {
+        std::lock_guard<std::mutex> lock(phone_stage_registry_mutex);
+        GGML_ASSERT(phone_stage_active_jobs > 0);
+        --phone_stage_active_jobs;
+        auto it = phone_stage_active_uids.find(request.graph_uid);
+        GGML_ASSERT(it != phone_stage_active_uids.end() && it->second > 0);
+        if (--it->second == 0) {
+            phone_stage_active_uids.erase(it);
+        }
+        const auto found = std::find(
+            phone_stage_inflight_jobs.begin(),
+            phone_stage_inflight_jobs.end(), job);
+        GGML_ASSERT(found != phone_stage_inflight_jobs.end());
+        phone_stage_inflight_jobs.erase(found);
+    }
+    phone_stage_registry_cv.notify_all();
+
+    const int64_t prep_begin_us =
+        job->prepared ? job->prepared->prepare_begin_us : 0;
+    const int64_t prep_end_us =
+        job->prepared ? job->prepared->prepare_end_us : 0;
+    const int64_t overlap_us =
+        prep_end_us && previous_compute_end_us ?
+            std::max<int64_t>(0,
+                std::min(prep_end_us, previous_compute_end_us) -
+                std::max(prep_begin_us, previous_compute_begin_us)) : 0;
+    const bool ready_ahead =
+        prep_end_us != 0 && previous_compute_end_us != 0 &&
+        prep_end_us <= previous_compute_end_us;
+    GGML_LOG_INFO(
+        "[PHONE_STAGE_PIPELINE] event=COMPLETED uid=%" PRIu64
+        " order=%" PRIu64 " slot=%zu prefetched=%d "
+        "prepare_begin_us=%" PRId64 " prepare_end_us=%" PRId64
+        " previous_compute_end_us=%" PRId64
+        " compute_begin_us=%" PRId64 " compute_end_us=%" PRId64
+        " overlap_ms=%.3f ready_ahead=%d "
+        " queue_wait_ms=%.3f status=%s\n",
+        job->uid, job->order,
+        job->prepared ? job->prepared->slot : size_t(0),
+        job->prepared.has_value() ? 1 : 0,
+        prep_begin_us, prep_end_us, previous_compute_end_us,
+        compute_begin_us, compute_end_us,
+        overlap_us / 1000.0, ready_ahead ? 1 : 0,
+        (compute_begin_us - wait_begin_us) / 1000.0,
+        status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+    return status == GGML_STATUS_SUCCESS;
+}
+
 std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
         uint32_t device, uint64_t graph_uid,
-        ggml_cgraph * graph, stored_graph & entry) {
+        ggml_cgraph * graph, stored_graph & entry,
+        const phone_stage_prepared_input * prepared) {
     auto & plan = entry.slot0;
     if (!plan.ready || graph == nullptr || device >= backends.size() ||
         plan.tensors.empty()) {
@@ -8772,37 +9300,45 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
     }
 
     const char * dual_env = std::getenv("GGML_RPC_PHONE_STAGE_DUAL_SLOT");
-    const bool dual_slot = dual_env != nullptr && std::strcmp(dual_env, "1") == 0;
-    size_t slot_index = 0;
-    uint64_t ticket = 0;
-    const uint64_t epoch = phone_stage_slot_policy[device].epoch();
+    const bool dual_slot =
+        prepared != nullptr ||
+        (dual_env != nullptr && std::strcmp(dual_env, "1") == 0);
+    size_t slot_index = prepared ? prepared->slot : 0;
+    uint64_t ticket = prepared ? prepared->ticket : 0;
+    uint64_t epoch = prepared ? prepared->epoch : 0;
     auto & pool = phone_stage_slot_policy[device];
-    if (dual_slot) {
+    if (dual_slot && prepared == nullptr) {
+        std::lock_guard<std::mutex> lock(phone_stage_pool_mutex);
+        epoch = pool.epoch();
         if (arenas.buffers[1] == nullptr ||
-            ggml_backend_buffer_get_size(arenas.buffers[1]) < plan.required_bytes) {
+            ggml_backend_buffer_get_size(arenas.buffers[1]) <
+                plan.required_bytes) {
             GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=SKIP uid=%" PRIu64
                 " reason=NO_SECOND_SLOT status=FALLBACK\n", graph_uid);
             return std::nullopt;
         }
         ticket = ++arenas.next_ticket;
         if (ticket == 0) { ticket = ++arenas.next_ticket; }
-        const auto admission = pool.acquire_next_preparing(ticket, epoch, slot_index);
+        const auto admission = pool.acquire_next_preparing(
+            ticket, epoch, slot_index);
         if (admission != ggml_phone_stage::status::ok) {
             GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=SKIP uid=%" PRIu64
-                " ticket=%" PRIu64 " epoch=%" PRIu64 " reason=BUSY_OR_STALE"
-                " result=%d status=FALLBACK\n", graph_uid, ticket, epoch,
-                static_cast<int>(admission));
+                " ticket=%" PRIu64 " epoch=%" PRIu64
+                " reason=BUSY_OR_STALE result=%d status=FALLBACK\n",
+                graph_uid, ticket, epoch, static_cast<int>(admission));
             return std::nullopt;
         }
         GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=ACQUIRE uid=%" PRIu64
-            " ticket=%" PRIu64 " epoch=%" PRIu64 " slot=%zu status=PREPARING\n",
+            " ticket=%" PRIu64 " epoch=%" PRIu64
+            " slot=%zu status=PREPARING\n",
             graph_uid, ticket, epoch, slot_index);
     }
+
     const auto cancel_prepare = [&]() {
-        if (dual_slot) {
-            const auto cancelled = pool.cancel_preparing(slot_index, ticket);
-            GGML_ASSERT(cancelled == ggml_phone_stage::status::ok);
-        }
+        if (!dual_slot || prepared != nullptr) { return; }
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
+        const auto cancelled = pool.cancel_preparing(slot_index, ticket);
+        GGML_ASSERT(cancelled == ggml_phone_stage::status::ok);
     };
     ggml_backend_buffer_t slot = arenas.buffers[slot_index];
     if (slot == nullptr ||
@@ -8816,68 +9352,37 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
         cancel_prepare();
         return std::nullopt;
     }
-    auto & slot_extras = plan.extras[slot_index];
-    if (plan.cached_slot[slot_index] != slot ||
-        plan.cached_generation[slot_index] != arenas.generation ||
-        slot_extras.size() != plan.tensors.size()) {
-        std::vector<ggml_tensor> clones;
-        clones.reserve(plan.tensors.size());
-        for (const auto & item : plan.tensors) {
-            ggml_tensor copy = *item.tensor;
-            copy.buffer = slot;
-            copy.data = reinterpret_cast<void *>(base + item.offset);
-            copy.extra = nullptr;
-            copy.view_src = nullptr;
-            clones.push_back(copy);
-        }
-        std::vector<void *> new_extras(plan.tensors.size(), nullptr);
-        for (size_t i : plan.init_order) {
-            const auto parent = plan.tensors[i].parent;
-            if (parent != SIZE_MAX) {
-                clones[i].view_src = &clones[parent];
-            }
-            if (ggml_backend_buffer_init_tensor(slot, &clones[i]) !=
-                    GGML_STATUS_SUCCESS ||
-                clones[i].extra == nullptr) {
-                GGML_LOG_INFO(
-                    "[PHONE_STAGE_SLOT0] event=SKIP uid=%" PRIu64
-                    " slot=%zu tensor=%s reason=EXTRA_INIT status=FALLBACK\n",
-                    graph_uid, slot_index, plan.tensors[i].tensor->name);
-                plan.ready = false;
-                cancel_prepare();
-                return std::nullopt;
-            }
-            new_extras[i] = clones[i].extra;
-        }
-        slot_extras = std::move(new_extras);
-        plan.cached_slot[slot_index] = slot;
-        plan.cached_generation[slot_index] = arenas.generation;
-        GGML_LOG_INFO(
-            "[PHONE_STAGE_SLOT0] event=BIND_EXTRA uid=%" PRIu64
-            " slot=%zu tensors=%zu generation=%" PRIu64
-            " status=READY\n",
-            graph_uid, slot_index, slot_extras.size(), arenas.generation);
+    if (!phone_stage_init_slot_extras(
+            device, graph_uid, plan, slot_index)) {
+        cancel_prepare();
+        return std::nullopt;
     }
 
     const int64_t begin_us = ggml_time_us();
-    size_t input_bytes = 0;
-    for (size_t i = 0; i < plan.tensors.size(); ++i) {
-        const auto & item = plan.tensors[i];
-        if (!item.input) { continue; }
-        ggml_tensor dst = *item.tensor;
-        dst.buffer = slot;
-        dst.data = reinterpret_cast<void *>(base + item.offset);
-        dst.extra = slot_extras[i];
-        ggml_backend_tensor_copy(item.tensor, &dst);
-        input_bytes += ggml_nbytes(item.tensor);
+    size_t input_bytes = prepared ? prepared->input_bytes : 0;
+    auto & slot_extras = plan.extras[slot_index];
+    if (prepared == nullptr) {
+        for (size_t i = 0; i < plan.tensors.size(); ++i) {
+            const auto & item = plan.tensors[i];
+            if (!item.input) { continue; }
+            ggml_tensor dst = item.snapshot;
+            dst.buffer = slot;
+            dst.data = reinterpret_cast<void *>(base + item.offset);
+            dst.extra = slot_extras[i];
+            ggml_backend_tensor_copy(item.tensor, &dst);
+            input_bytes += ggml_nbytes(item.tensor);
+        }
+        ggml_backend_synchronize(backends[device]);
     }
-    ggml_backend_synchronize(backends[device]);
     if (dual_slot) {
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
         const auto started = pool.start_compute(slot_index, ticket);
         GGML_ASSERT(started == ggml_phone_stage::status::ok);
         GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=INPUT_READY uid=%" PRIu64
-            " ticket=%" PRIu64 " slot=%zu bytes=%zu status=COMPUTING\n",
-            graph_uid, ticket, slot_index, input_bytes);
+            " ticket=%" PRIu64 " slot=%zu bytes=%zu"
+            " prefetched=%d status=COMPUTING\n",
+            graph_uid, ticket, slot_index, input_bytes,
+            prepared != nullptr ? 1 : 0);
     }
 
     struct restore_binding {
@@ -8906,6 +9411,7 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
         ggml_backend_graph_compute(backends[device], graph);
     ggml_backend_synchronize(backends[device]);
     if (dual_slot) {
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
         const auto completed = pool.compute_complete(slot_index, ticket);
         GGML_ASSERT(completed == ggml_phone_stage::status::ok);
         GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=COMPUTE_DONE uid=%" PRIu64
@@ -8915,9 +9421,10 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
 
     size_t output_bytes = 0;
     if (status == GGML_STATUS_SUCCESS) {
+        std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
         for (const auto & item : plan.tensors) {
             if (!item.output) { continue; }
-            ggml_tensor dst = *item.tensor;
+            ggml_tensor dst = item.snapshot;
             dst.buffer = item.original_buffer;
             dst.data = item.original_data;
             dst.extra = item.original_extra;
@@ -8930,11 +9437,12 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
     }
     restore.reset();
     if (dual_slot) {
+        std::lock_guard<std::mutex> guard(phone_stage_pool_mutex);
         const auto published = pool.output_published(slot_index, ticket);
         GGML_ASSERT(published == ggml_phone_stage::status::ok);
         GGML_LOG_INFO("[PHONE_STAGE_SLOT] event=RELEASE uid=%" PRIu64
-            " ticket=%" PRIu64 " epoch=%" PRIu64 " slot=%zu "
-            "outputs_bytes=%zu status=FREE\n",
+            " ticket=%" PRIu64 " epoch=%" PRIu64
+            " slot=%zu outputs_bytes=%zu status=FREE\n",
             graph_uid, ticket, epoch, slot_index, output_bytes);
     }
 
@@ -8954,7 +9462,16 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
-    std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
+    std::unique_lock<std::mutex> registry_lock;
+    std::unique_lock<std::recursive_mutex> graph_lock(
+        graph_compute_mutex, std::defer_lock);
+    if (rpc_phone_stage_prepare_ahead_enabled() &&
+        !rpc_phone_stage_prepare_bypass) {
+        registry_lock = std::unique_lock<std::mutex>(
+            phone_stage_registry_mutex);
+    } else {
+        graph_lock.lock();
+    }
     // serialization format:
     // | device (4 bytes) | graph_uid (8 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
     if (input.size() < 2*sizeof(uint32_t) + sizeof(uint64_t)) {
@@ -8970,6 +9487,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     uint64_t graph_uid;
     memcpy(&graph_uid, src, sizeof(graph_uid));
     src += sizeof(graph_uid);
+    if (registry_lock.owns_lock()) {
+        phone_stage_registry_cv.wait(registry_lock, [&]() {
+            return phone_stage_active_uids.find(graph_uid) ==
+                phone_stage_active_uids.end();
+        });
+    }
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
@@ -9037,6 +9560,34 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
             device, graph_uid, n_nodes);
         return true;
     }
+    bool graph_registration_reserved = false;
+    if (registry_lock.owns_lock()) {
+        graph_entry.graph = graph;
+        ++phone_stage_active_uids[graph_uid];
+        graph_registration_reserved = true;
+        registry_lock.unlock();
+        rpc_msg_graph_recompute_req stage_request {};
+        stage_request.device = device;
+        stage_request.graph_uid = graph_uid;
+        if (const auto result =
+                phone_stage_recompute_pipelined(stage_request, true)) {
+            registry_lock.lock();
+            auto it = phone_stage_active_uids.find(graph_uid);
+            GGML_ASSERT(it != phone_stage_active_uids.end() &&
+                        it->second > 0);
+            if (--it->second == 0) {
+                phone_stage_active_uids.erase(it);
+            }
+            registry_lock.unlock();
+            phone_stage_registry_cv.notify_all();
+            return *result;
+        }
+        registry_lock.lock();
+        phone_stage_registry_cv.wait(registry_lock, [&]() {
+            return phone_stage_active_jobs == 0;
+        });
+        graph_lock.lock();
+    }
     const int64_t t0 = ggml_time_us();
 
     const auto slot0_status =
@@ -9070,10 +9621,33 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     }
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
     graph_entry.graph = graph;
+    if (graph_registration_reserved) {
+        GGML_ASSERT(registry_lock.owns_lock());
+        auto it = phone_stage_active_uids.find(graph_uid);
+        GGML_ASSERT(it != phone_stage_active_uids.end() &&
+                    it->second > 0);
+        if (--it->second == 0) {
+            phone_stage_active_uids.erase(it);
+        }
+        registry_lock.unlock();
+        phone_stage_registry_cv.notify_all();
+    }
     return true;
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    if (const auto result = phone_stage_recompute_pipelined(request)) {
+        return *result;
+    }
+    std::unique_lock<std::mutex> registry_lock;
+    if (rpc_phone_stage_prepare_ahead_enabled() &&
+        !rpc_phone_stage_prepare_bypass) {
+        registry_lock = std::unique_lock<std::mutex>(
+            phone_stage_registry_mutex);
+        phone_stage_registry_cv.wait(registry_lock, [&]() {
+            return phone_stage_active_jobs == 0;
+        });
+    }
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     uint32_t device = request.device;
     if (device >= backends.size()) {
@@ -9125,6 +9699,11 @@ bool rpc_server::get_graph_profile(
         const rpc_msg_get_graph_profile_req & request,
         rpc_msg_get_graph_profile_rsp & response) {
     response = {};
+    std::unique_lock<std::mutex> registry_lock;
+    if (rpc_phone_stage_prepare_ahead_enabled()) {
+        registry_lock = std::unique_lock<std::mutex>(
+            phone_stage_registry_mutex);
+    }
     std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
     if (request.device >= stored_graphs.size()) {
         return true;
@@ -9288,6 +9867,7 @@ bool rpc_server::finish_p2c_stream(
 
 bool rpc_server::graph_recompute_snapshot(
         const rpc_msg_graph_recompute_snapshot_req & request) {
+    phone_stage_wait_idle();
     std::lock_guard<std::recursive_mutex> graph_lock(graph_compute_mutex);
     if (request.device >= backends.size() ||
             request.slot >= RPC_SNAPSHOT_SLOTS) {
@@ -9348,6 +9928,7 @@ bool rpc_server::synchronize(uint32_t device) {
     if (device >= backends.size()) {
         return false;
     }
+    phone_stage_wait_idle();
 
     ggml_backend_t backend = backends[device];
     ggml_backend_dev_t dev =
@@ -9411,7 +9992,25 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
-    // Phone-owned scratch is private and must be freed before the backend.
+    {
+        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
+        phone_region_main_stop = true;
+    }
+    phone_region_main_cv.notify_all();
+    if (phone_region_main_thread.joinable()) {
+        phone_region_main_thread.join();
+    }
+    phone_stage_wait_idle();
+    {
+        std::lock_guard<std::mutex> lock(phone_stage_prepare_mutex);
+        phone_stage_prepare_stop = true;
+    }
+    phone_stage_prepare_cv.notify_all();
+    if (phone_stage_prepare_thread.joinable()) {
+        phone_stage_prepare_thread.join();
+    }
+
+    // No Stage worker may still reference these buffers.
     for (auto & arenas : phone_stage_device_arenas) {
         for (ggml_backend_buffer_t & buffer : arenas.buffers) {
             if (buffer != nullptr) {
@@ -9420,14 +10019,6 @@ rpc_server::~rpc_server() {
             }
         }
         arenas.capacity = 0;
-    }
-    {
-        std::lock_guard<std::mutex> lock(phone_region_main_mutex);
-        phone_region_main_stop = true;
-    }
-    phone_region_main_cv.notify_all();
-    if (phone_region_main_thread.joinable()) {
-        phone_region_main_thread.join();
     }
 
     for (size_t lane = 0; lane < snapshot_breakdown.size(); ++lane) {

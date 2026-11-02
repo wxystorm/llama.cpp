@@ -23,6 +23,16 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_opencl_host_buffer_type
 #define GGML_BACKEND_OPENCL_SET_TENSOR_ASYNC_PROC \
     "ggml_backend_opencl_set_tensor_async"
 
+// Blocking-on-event batch copy via a dedicated OpenCL transfer queue.
+// Sources must already be fully written by their producer.
+#define GGML_BACKEND_OPENCL_STAGE_INPUT_COPY_PROC \
+    "ggml_backend_opencl_stage_input_copy"
+
+typedef bool (*ggml_backend_opencl_stage_input_copy_t)(
+        const struct ggml_tensor * const * sources,
+        const struct ggml_tensor * const * destinations,
+        size_t count);
+
 typedef bool (*ggml_backend_opencl_set_tensor_async_t)(
         struct ggml_tensor * tensor,
         const void * data,
