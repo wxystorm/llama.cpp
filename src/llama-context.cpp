@@ -2190,7 +2190,13 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         res->set_inputs(&ubatch);
 
         if (log_prepare_breakdown) {
-            set_inputs_us = ggml_time_us() - set_inputs_begin_us;
+            const int64_t set_inputs_end_us = ggml_time_us();
+            set_inputs_us = set_inputs_end_us - set_inputs_begin_us;
+            if (stage_timing_out != nullptr &&
+                stage_timing_out->capture_timeline) {
+                stage_timing_out->input_set_begin_us = set_inputs_begin_us;
+                stage_timing_out->input_set_end_us = set_inputs_end_us;
+            }
         }
     }
 
@@ -4213,6 +4219,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int64_t host_execute_end_us = 0;
         int64_t graph_prepare_begin_us = 0;
         int64_t graph_prepare_end_us = 0;
+        int64_t input_set_begin_us = 0;
+        int64_t input_set_end_us = 0;
         int64_t split_prepare_begin_us = 0;
         int64_t split_prepare_end_us = 0;
         int64_t compute_range_begin_us = 0;
@@ -5611,6 +5619,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     task_timing.graph_prepare_begin_us;
                                 task_trace->graph_prepare_end_us =
                                     task_timing.graph_prepare_end_us;
+                                task_trace->input_set_begin_us =
+                                    task_timing.input_set_begin_us;
+                                task_trace->input_set_end_us =
+                                    task_timing.input_set_end_us;
                                 task_trace->split_prepare_begin_us =
                                     task_timing.split_prepare_begin_us;
                                 task_trace->split_prepare_end_us =
