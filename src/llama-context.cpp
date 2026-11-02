@@ -4600,60 +4600,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     }
     if (phone_static_templates) {
         const int64_t prebuild_begin_us = ggml_time_us();
-        // Build a finite, deterministic catalog: full Chunk, tail Chunk,
-        // and (for the final Region) the count of requested logits.
-        for (size_t region = 0; region < stages.size(); ++region) {
-            const auto & stage = stages[region];
-            if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
-                continue;
-            }
-            if (region == 0 || stage.macro_tokens <= 0) {
+        // The catalog is also unit-tested independently of GGML.
+        const auto shapes = llama_region_ring_phone_static_shapes(
+            regions, region_chunk_tokens, ubatch.n_tokens, ubatch.output);
+        for (const auto & shape : shapes) {
+            if (shape.region == 0) {
                 LLAMA_LOG_ERROR(
-                    "[PHONE_STATIC_TEMPLATE] event=REJECT region=%zu "
-                    "reason=UNSUPPORTED_PHONE_INPUT status=FAIL\n", region);
+                    "[PHONE_STATIC_TEMPLATE] event=REJECT region=0 "
+                    "reason=UNSUPPORTED_PHONE_INPUT status=FAIL\n");
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
-            const uint32_t width = (uint32_t) stage.macro_tokens;
-            for (uint32_t begin = 0; begin < ubatch.n_tokens; begin += width) {
-                const uint32_t count = std::min(
-                    width, ubatch.n_tokens - begin);
-                int32_t outputs_for_chunk = 0;
-                if (region + 1 == stages.size()) {
-                    for (uint32_t t = begin; t < begin + count; ++t) {
-                        outputs_for_chunk += ubatch.output[t] != 0;
-                    }
-                }
-                const bool seen = std::any_of(
-                    phone_prefill_templates.begin(),
-                    phone_prefill_templates.end(),
-                    [&](const phone_prefill_template & item) {
-                        return item.region == region &&
-                               item.tokens == count &&
-                               item.output_count == outputs_for_chunk;
-                    });
-                if (!seen) {
-                    phone_prefill_template item;
-                    item.region = region;
-                    item.tokens = count;
-                    item.output_count = outputs_for_chunk;
-                    item.sample_begin = begin;
-                    item.canonical =
-                        region + 1 == stages.size() &&
-                        begin + count == ubatch.n_tokens;
-                    phone_prefill_templates.emplace_back(std::move(item));
-                }
-            }
+            phone_prefill_template item;
+            item.region = shape.region;
+            item.tokens = shape.tokens;
+            item.output_count = shape.output_count;
+            item.sample_begin = shape.sample_begin;
+            item.canonical = shape.canonical;
+            phone_prefill_templates.emplace_back(std::move(item));
         }
-        // Build the canonical final graph LAST. Other templates have their
-        // own outer Scheduler allocations, so they cannot overwrite it.
-        std::stable_sort(
-            phone_prefill_templates.begin(),
-            phone_prefill_templates.end(),
-            [](const phone_prefill_template & a,
-               const phone_prefill_template & b) {
-                return !a.canonical && b.canonical;
-            });
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         size_t canonical_count = 0;
