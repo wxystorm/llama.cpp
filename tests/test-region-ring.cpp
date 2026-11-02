@@ -437,6 +437,103 @@ static void test_deferred_p2c_join_scheduler() {
           "bounded slot scheduler accepted deferred completion");
 }
 
+static void test_task_event_observer() {
+    // A fixed-size sink models the production opt-in trace callback: no
+    // allocations, no logging and no lock acquisition while READY is held.
+    using event = llama_region_ring_task_event;
+    struct observed {
+        event kind = event::READY;
+        size_t region = 0;
+        size_t chunk = 0;
+    };
+    std::array<observed, 32> events {};
+    size_t n_events = 0;
+    const auto observer = [&](event kind, const llama_region_ring_task & task) {
+        if (n_events < events.size()) {
+            events[n_events++] = {kind, task.region, task.chunk};
+        }
+    };
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::PHONE, 0, 1},
+        {llama_region_ring_device::GPU, 1, 2},
+    };
+    llama_region_ring_ready ready(
+        regions, 4, std::vector<int> {2, 2}, 0, false, observer);
+    check(n_events == 1 && events[0].kind == event::READY &&
+          events[0].region == 0 && events[0].chunk == 0,
+          "observer must capture initial READY inside constructor");
+
+    const auto p0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p0 && events[n_events - 1].kind == event::CLAIM,
+          "observer missed first CLAIM");
+    ready.defer(*p0);
+    check(n_events >= 4 &&
+          events[n_events - 2].kind == event::DEFER &&
+          events[n_events - 1].kind == event::READY &&
+          events[n_events - 1].region == 0 &&
+          events[n_events - 1].chunk == 1,
+          "DEFER must precede next same-Region READY");
+    check(!ready.try_take(llama_region_ring_device::GPU),
+          "DEFER must not publish downstream READY");
+
+    const auto p1 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p1 && p1->chunk == 1, "second Phone task missing");
+    ready.complete(*p1);
+    ready.complete_deferred(*p0);
+    const auto g0 = ready.try_take(llama_region_ring_device::GPU);
+    check(g0 && g0->chunk == 0,
+          "deferred join must release first downstream task");
+    ready.complete(*g0);
+    const auto g1 = ready.try_take(llama_region_ring_device::GPU);
+    check(g1 && g1->chunk == 1,
+          "downstream second Chunk must respect KV order");
+    ready.complete(*g1);
+    check(ready.all_done(), "observer changed scheduler completion");
+
+    std::array<std::array<int, 2>, 2> ready_seen {};
+    std::array<std::array<int, 2>, 2> claim_seen {};
+    std::array<std::array<int, 2>, 2> complete_seen {};
+    int defer_seen = 0;
+    for (size_t i = 0; i < n_events; ++i) {
+        const auto & e = events[i];
+        check(e.region < 2 && e.chunk < 2, "observer emitted invalid task");
+        switch (e.kind) {
+            case event::READY:    ++ready_seen[e.region][e.chunk]; break;
+            case event::CLAIM:    ++claim_seen[e.region][e.chunk]; break;
+            case event::DEFER:    ++defer_seen; break;
+            case event::COMPLETE: ++complete_seen[e.region][e.chunk]; break;
+            case event::FAIL:     check(false, "unexpected observer FAIL"); break;
+        }
+    }
+    check(n_events == 13 && defer_seen == 1,
+          "observer emitted unexpected event count");
+    for (size_t r = 0; r < 2; ++r) {
+        for (size_t c = 0; c < 2; ++c) {
+            check(ready_seen[r][c] == 1 &&
+                  claim_seen[r][c] == 1 &&
+                  complete_seen[r][c] == 1,
+                  "observer did not report exactly one lifecycle per task");
+        }
+    }
+
+    std::array<observed, 3> fail_events {};
+    size_t fail_count = 0;
+    llama_region_ring_ready failure(
+        {{llama_region_ring_device::PHONE, 0, 1}},
+        2, 2, 0, false,
+        [&](event kind, const llama_region_ring_task & task) {
+            if (fail_count < fail_events.size()) {
+                fail_events[fail_count++] = {kind, task.region, task.chunk};
+            }
+        });
+    const auto first = failure.try_take(llama_region_ring_device::PHONE);
+    check(first.has_value(), "failure observer missing initial task");
+    failure.fail(*first);
+    check(failure.failed() && fail_count == 3 &&
+          fail_events[2].kind == event::FAIL,
+          "observer failed to capture FAILED task");
+}
+
 static void test_duplicate_completion() {
     const auto regions = llama_region_ring_parse("", 48);
     llama_region_ring_ready ready(regions, 256, 128);
@@ -1054,6 +1151,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] dependencies=PASS\n");
         test_deferred_p2c_join_scheduler();
         std::fprintf(stderr, "[REGION_RING_TEST] deferred_p2c_join=PASS\n");
+        test_task_event_observer();
+        std::fprintf(stderr, "[REGION_RING_TEST] task_event_observer=PASS\n");
         test_duplicate_completion();
         std::fprintf(stderr, "[REGION_RING_TEST] duplicate=PASS\n");
         test_device_fifo_simulation();
