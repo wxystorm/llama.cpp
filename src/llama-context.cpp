@@ -2979,7 +2979,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             // backends, and any split with a CPU synchronization source.
             const bool private_phone_input_prepare =
                 phone_prebuilt_graph &&
-                stage.layer_end < model.hparams.n_layer &&
+                stage.layer_end < static_cast<int>(model.hparams.n_layer()) &&
                 n_splits == 1 &&
                 ring_lane == 2 && !target_uses_cpu &&
                 !prepare_needs_cpu && ggml_backend_is_meta(target) &&
