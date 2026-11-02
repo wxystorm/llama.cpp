@@ -4190,10 +4190,114 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Production Region Ring keeps one full-ubatch activation buffer on each
     // boundary. slot_pool_size=0 disables finite producer credits completely.
     const size_t slot_pool_size = 0;
+    // Optional PC-clock timeline. READY/CLAIM/DEFER/COMPLETE are observed
+    // inside the scheduler's existing mutex; the callback only stores one
+    // timestamp in a pre-sized row. No file I/O or logs in the Chunk path.
+    const char * trace_setting =
+        std::getenv("LLAMA_REGION_RING_TASK_TRACE");
+    const char * trace_file =
+        std::getenv("LLAMA_REGION_RING_METRICS_FILE");
+    const bool ring_trace_enabled =
+        threaded_execution && pc_phone_overlap &&
+        trace_setting != nullptr && std::strcmp(trace_setting, "1") == 0 &&
+        trace_file != nullptr && *trace_file != '\0';
+    const int64_t ring_trace_origin_us =
+        ring_trace_enabled ? ggml_time_us() : 0;
+    struct ring_chunk_trace_row {
+        int64_t ready_us = 0;
+        int64_t claim_us = 0;
+        int64_t bank_wait_begin_us = 0;
+        int64_t bank_wait_end_us = 0;
+        int64_t dispatch_us = 0;
+        int64_t host_execute_begin_us = 0;
+        int64_t host_execute_end_us = 0;
+        int64_t graph_prepare_begin_us = 0;
+        int64_t graph_prepare_end_us = 0;
+        int64_t split_prepare_begin_us = 0;
+        int64_t split_prepare_end_us = 0;
+        int64_t compute_range_begin_us = 0;
+        int64_t compute_range_end_us = 0;
+        int64_t lane_compute_begin_us = 0;
+        int64_t lane_compute_end_us = 0;
+        int64_t output_begin_us = 0;
+        int64_t output_end_us = 0;
+        int64_t worker_done_us = 0;
+        int64_t frame_received_us = 0;
+        int64_t defer_us = 0;
+        int64_t complete_us = 0;
+        int64_t fail_us = 0;
+        int64_t graph_prepare_cost_us = 0;
+        int64_t split_prepare_cost_us = 0;
+        int64_t compute_range_cost_us = 0;
+        int64_t output_sync_cost_us = 0;
+        int output_kind = 0;
+        int graph_reused = -1;
+        int result = -1;
+    };
+    struct ring_bank_trace_row {
+        int64_t enqueue_us = 0;
+        int64_t begin_us = 0;
+        int64_t prepare_begin_us = 0;
+        int64_t prepare_end_us = 0;
+        int64_t h2d_begin_us = 0;
+        int64_t h2d_end_us = 0;
+        int64_t done_us = 0;
+        size_t source_region = std::numeric_limits<size_t>::max();
+        size_t upload_bytes = 0;
+        int success = -1;
+    };
+    std::vector<std::vector<ring_chunk_trace_row>> ring_trace_rows;
+    std::vector<ring_bank_trace_row> ring_bank_trace_rows;
+    if (ring_trace_enabled) {
+        ring_trace_rows.resize(stages.size());
+        ring_bank_trace_rows.resize(stages.size());
+        for (size_t r = 0; r < stages.size(); ++r) {
+            const size_t x = (size_t) stages[r].macro_tokens;
+            ring_trace_rows[r].resize(
+                ((size_t) ubatch.n_tokens + x - 1) / x);
+        }
+    }
+    auto trace_row = [&](const llama_region_ring_task & task)
+            -> ring_chunk_trace_row * {
+        if (!ring_trace_enabled || task.region >= ring_trace_rows.size() ||
+            task.chunk >= ring_trace_rows[task.region].size()) {
+            return nullptr;
+        }
+        return &ring_trace_rows[task.region][task.chunk];
+    };
+    llama_region_ring_ready::task_event_observer ring_event_observer;
+    if (ring_trace_enabled) {
+        ring_event_observer =
+            [&](llama_region_ring_task_event event,
+                const llama_region_ring_task & task) {
+                ring_chunk_trace_row * row = trace_row(task);
+                if (row == nullptr) {
+                    return;
+                }
+                const int64_t at = ggml_time_us();
+                switch (event) {
+                    case llama_region_ring_task_event::READY:
+                        row->ready_us = at;
+                        break;
+                    case llama_region_ring_task_event::CLAIM:
+                        row->claim_us = at;
+                        break;
+                    case llama_region_ring_task_event::DEFER:
+                        row->defer_us = at;
+                        break;
+                    case llama_region_ring_task_event::COMPLETE:
+                        row->complete_us = at;
+                        break;
+                    case llama_region_ring_task_event::FAIL:
+                        row->fail_us = at;
+                        break;
+                }
+            };
+    }
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens,
         region_chunk_tokens, slot_pool_size,
-        gpu_weight_streaming);
+        gpu_weight_streaming, std::move(ring_event_observer));
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
         "XC=%d XG=%d XP=%d dependency=TOKEN_INTERVAL "
