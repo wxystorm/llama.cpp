@@ -98,7 +98,7 @@ The PC now measures PUSH in the *existing* call, without additional RPCs:
 `phone_input_push_payload_send_ms`,
 `phone_input_push_socket_send_ms` (sum of the two send calls),
 `phone_input_push_ack_wait_ms`, and
-`phone_input_push_socket_lock_ms`. Phone reports its own measured durations
+`phone_input_push_socket_lock_ms` and `phone_input_push_other_ms` (PC wall minus the accounted PC phases; includes possible socket prewarm). Phone reports its own measured durations
 *inside the same ACK*: `phone_input_push_phone_recv_header_ms`,
 `phone_input_push_phone_recv_alloc_ms`,
 `phone_input_push_phone_recv_payload_ms`,

@@ -5613,6 +5613,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int64_t phone_push_wall_us = 0;
         int64_t phone_push_wait_us = 0;
         ggml_backend_rpc_phone_input_push_timing phone_push_timing_sum {};
+        int64_t phone_push_pc_other_us = 0;
         size_t phone_push_accepted = 0;
         size_t phone_push_applied = 0;
         size_t phone_push_missed = 0;
@@ -5638,6 +5639,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         source, bytes, &profile);
                     const int64_t end_us = ggml_time_us();
                     phone_push_wall_us += end_us - begin_us;
+                    const int64_t accounted_pc_us =
+                        profile.pc_socket_lock_wait_us + profile.pc_hash_us +
+                        profile.pc_pack_us + profile.pc_header_send_us +
+                        profile.pc_payload_send_us + profile.pc_ack_wait_us;
+                    phone_push_pc_other_us +=
+                        std::max<int64_t>(0, end_us - begin_us - accounted_pc_us);
                     phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
                     phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
                     phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
@@ -6796,7 +6803,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[PHONE_INPUT_PUSH_PROFILE] run=%" PRIu64
                 " pc_socket_lock_ms=%.3f pc_hash_ms=%.3f pc_pack_ms=%.3f"
                 " pc_header_send_ms=%.3f pc_payload_send_ms=%.3f"
-                " pc_ack_wait_ms=%.3f"
+                " pc_ack_wait_ms=%.3f pc_other_ms=%.3f"
                 " phone_recv_header_ms=%.3f phone_recv_alloc_ms=%.3f"
                 " phone_recv_payload_ms=%.3f phone_hash_ms=%.3f"
                 " phone_slot_wait_ms=%.3f phone_host_stage_ms=%.3f"
@@ -6809,6 +6816,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_push_timing_sum.pc_header_send_us / 1000.0,
                 phone_push_timing_sum.pc_payload_send_us / 1000.0,
                 phone_push_timing_sum.pc_ack_wait_us / 1000.0,
+                phone_push_pc_other_us / 1000.0,
                 phone_push_timing_sum.phone_recv_header_us / 1000.0,
                 phone_push_timing_sum.phone_recv_alloc_us / 1000.0,
                 phone_push_timing_sum.phone_recv_payload_us / 1000.0,
@@ -7035,6 +7043,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << ",\"phone_input_push_payload_send_ms\":" << phone_push_timing_sum.pc_payload_send_us / 1000.0
                             << ",\"phone_input_push_socket_send_ms\":" << (phone_push_timing_sum.pc_header_send_us + phone_push_timing_sum.pc_payload_send_us) / 1000.0
                             << ",\"phone_input_push_ack_wait_ms\":" << phone_push_timing_sum.pc_ack_wait_us / 1000.0
+                            << ",\"phone_input_push_other_ms\":" << phone_push_pc_other_us / 1000.0
                             << ",\"phone_input_push_phone_recv_header_ms\":" << phone_push_timing_sum.phone_recv_header_us / 1000.0
                             << ",\"phone_input_push_phone_recv_alloc_ms\":" << phone_push_timing_sum.phone_recv_alloc_us / 1000.0
                             << ",\"phone_input_push_phone_recv_payload_ms\":" << phone_push_timing_sum.phone_recv_payload_us / 1000.0
@@ -7358,6 +7367,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << R"(,"push_socket_send_ms":)"
                             << (p.pc_header_send_us + p.pc_payload_send_us) / 1000.0
                             << R"(,"push_ack_wait_ms":)" << p.pc_ack_wait_us / 1000.0
+                            << R"(,"push_other_ms":)"
+                            << std::max<int64_t>(0,
+                                t.push_end_us - t.push_begin_us -
+                                (p.pc_socket_lock_wait_us + p.pc_hash_us +
+                                 p.pc_pack_us + p.pc_header_send_us +
+                                 p.pc_payload_send_us + p.pc_ack_wait_us)) / 1000.0
                             << R"(,"push_phone_recv_header_ms":)" << p.phone_recv_header_us / 1000.0
                             << R"(,"push_phone_recv_alloc_ms":)" << p.phone_recv_alloc_us / 1000.0
                             << R"(,"push_phone_recv_payload_ms":)" << p.phone_recv_payload_us / 1000.0

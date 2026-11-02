@@ -407,6 +407,9 @@ struct rpc_msg_phone_input_ack {
 // A Phone timestamp is NEVER directly subtracted from a PC timestamp.
 struct rpc_msg_phone_input_push_ack {
     uint8_t accepted = 0;
+    // The wire structs are under #pragma pack(1): keep 64-bit fields
+    // naturally positioned on both Windows and Android and assert size.
+    uint8_t reserved[7] {};
     int64_t recv_header_us = 0;
     int64_t recv_alloc_us = 0;
     int64_t recv_payload_us = 0;
