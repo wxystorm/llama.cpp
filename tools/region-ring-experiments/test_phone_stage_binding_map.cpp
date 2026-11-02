@@ -55,6 +55,34 @@ int main() {
     assert(map.resolve_slots(null_slot, output) == status::invalid);
     assert(output == saved);
 
+    // OpenCL returns a shared synthetic data pointer for independent buffers.
+    // A tensor is identified by (buffer, data), never by data alone.
+    bindings cl_output;
+    const std::array<stage_slot_address, k_slot_count> cl_slots {{
+        {0x1000, 17368320, 0x1111, true},
+        {0x1000, 17368320, 0x2222, true},
+    }};
+    assert(map.resolve_slots(cl_slots, cl_output) == status::ok);
+    assert(cl_output[0].at(2) == cl_output[1].at(2));
+    assert(cl_output[0].at(2) == 0x1000 + 16057600);
+    const auto cl_saved = cl_output;
+    auto same_buffer = cl_slots;
+    same_buffer[1].buffer_identity = same_buffer[0].buffer_identity;
+    assert(map.resolve_slots(same_buffer, cl_output) == status::invalid);
+    assert(cl_output == cl_saved);
+    auto no_identity = cl_slots;
+    no_identity[0].buffer_identity = 0;
+    assert(map.resolve_slots(no_identity, cl_output) == status::invalid);
+    assert(cl_output == cl_saved);
+    auto mixed_address_spaces = cl_slots;
+    mixed_address_spaces[0].opaque_address_space = false;
+    assert(map.resolve_slots(mixed_address_spaces, cl_output) == status::invalid);
+    assert(cl_output == cl_saved);
+    auto host_same_base = slots;
+    host_same_base[1].base = host_same_base[0].base;
+    assert(map.resolve_slots(host_same_base, cl_output) == status::invalid);
+    assert(cl_output == cl_saved);
+
     stage_binding_map bounds(128);
     assert(bounds.add({1, 120, 16, 0, 0, false}) == status::invalid);
     assert(bounds.entries().empty());

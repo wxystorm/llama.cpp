@@ -8465,6 +8465,8 @@ void rpc_server::phone_stage_binding_preflight(
                         reinterpret_cast<size_t>(
                             ggml_backend_buffer_get_base(buffer)),
                         ggml_backend_buffer_get_size(buffer),
+                        reinterpret_cast<uintptr_t>(buffer),
+                        !ggml_backend_buffer_is_host(buffer),
                     };
                 }
                 bind_status = binding_map.resolve_slots(slot_addresses,
@@ -8475,18 +8477,43 @@ void rpc_server::phone_stage_binding_preflight(
                 "layer=%d..%d tokens=%u stage_tensors=%zu views=%zu "
                 "protected=%zu external=%zu external_kv=%zu "
                 "external_leaves=%zu required_bytes=%zu "
-                "slot_bytes=%zu result=%d status=%s "
-                "mode=DIAGNOSTIC_ONLY\n",
+                "slot_bytes=%zu slot_space=%s same_base=%d "
+                "result=%d status=%s mode=DIAGNOSTIC_ONLY\n",
                 first_layer, max_layer, registered_tokens,
                 binding_map.entries().size(), binding_map.view_count(),
                 binding_map.protected_count(), external_tensors,
                 external_kv, external_leaves, binding_map.required_bytes(),
-                arenas.capacity, static_cast<int>(bind_status),
+                arenas.capacity,
+                !have_slots ? "UNAVAILABLE" :
+                    slot_addresses[0].opaque_address_space ?
+                        "OPAQUE_BUFFER" : "HOST_POINTER",
+                have_slots && slot_addresses[0].base ==
+                    slot_addresses[1].base ? 1 : 0,
+                static_cast<int>(bind_status),
                 !have_slots ? "SKIPPED_NO_POOL" :
                     bind_status == ggml_phone_stage::status::ok ?
                         "PASS" : "REJECT");
             const char * map_trace =
                 std::getenv("GGML_RPC_PHONE_BINDING_MAP_TRACE");
+            if (have_slots && map_trace != nullptr &&
+                std::strcmp(map_trace, "1") == 0) {
+                GGML_LOG_INFO(
+                    "[PHONE_STAGE_BINDING] event=BIND_SLOT_SPACE "
+                    "layer=%d tokens=%u "
+                    "slot0_buffer=%p slot1_buffer=%p "
+                    "slot0_base=%zx slot1_base=%zx "
+                    "slot0_bytes=%zu slot1_bytes=%zu "
+                    "same_base=%d opaque=%d result=%d "
+                    "mode=DIAGNOSTIC_ONLY\n",
+                    first_layer, registered_tokens,
+                    static_cast<void *>(arenas.buffers[0]),
+                    static_cast<void *>(arenas.buffers[1]),
+                    slot_addresses[0].base, slot_addresses[1].base,
+                    slot_addresses[0].capacity, slot_addresses[1].capacity,
+                    slot_addresses[0].base == slot_addresses[1].base ? 1 : 0,
+                    slot_addresses[0].opaque_address_space ? 1 : 0,
+                    static_cast<int>(bind_status));
+            }
             if (bind_status == ggml_phone_stage::status::ok &&
                 map_trace != nullptr && std::strcmp(map_trace, "1") == 0) {
                 for (const auto & entry : binding_map.entries()) {
@@ -8496,14 +8523,21 @@ void rpc_server::phone_stage_binding_preflight(
                         "layer=%d tokens=%u id=%u name=%s kind=%s "
                         "protected=%d source_offset=%zu bytes=%zu "
                         "view_source=%u view_offset=%zu "
-                        "slot0_addr=%zx slot1_addr=%zx "
+                        "slot0_buffer=%p slot0_data=%zx "
+                        "slot1_buffer=%p slot1_data=%zx "
+                        "slot_offset=%zu address_space=%s "
                         "status=DIAGNOSTIC_ONLY\n",
                         first_layer, registered_tokens, entry.id,
                         t->name, entry.view_source_id ? "VIEW" : "ROOT",
                         entry.protected_storage ? 1 : 0,
                         entry.source_offset, entry.bytes,
                         entry.view_source_id, entry.view_offset,
-                        candidates[0].at(entry.id), candidates[1].at(entry.id));
+                        static_cast<void *>(arenas.buffers[0]),
+                        candidates[0].at(entry.id),
+                        static_cast<void *>(arenas.buffers[1]),
+                        candidates[1].at(entry.id), entry.source_offset,
+                        slot_addresses[0].opaque_address_space ?
+                            "OPAQUE_BUFFER" : "HOST_POINTER");
                 }
                 for (const ggml_tensor * t : visited_order) {
                     if (t->buffer == nullptr || t->data == nullptr ||

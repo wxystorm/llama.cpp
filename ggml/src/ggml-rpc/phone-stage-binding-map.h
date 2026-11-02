@@ -23,6 +23,8 @@ struct stage_binding_entry {
 struct stage_slot_address {
     size_t base = 0;
     size_t capacity = 0;
+    uintptr_t buffer_identity = 0;
+    bool opaque_address_space = false;
 };
 
 // Diagnostic-only address projection. It preserves the original gallocr
@@ -119,7 +121,8 @@ public:
         std::array<size_t, k_slot_count> ends {};
         for (size_t slot = 0; slot < k_slot_count; ++slot) {
             const auto & address = slots[slot];
-            if (!address.base || !address.capacity) {
+            if (!address.base || !address.capacity ||
+                (address.opaque_address_space && !address.buffer_identity)) {
                 return status::invalid;
             }
             if (required_bytes_ > address.capacity) {
@@ -129,8 +132,18 @@ public:
                 return status::overflow;
             }
         }
-        if (may_overlap(slots[0].base, slots[0].capacity,
-                        slots[1].base, slots[1].capacity)) {
+        if (slots[0].opaque_address_space != slots[1].opaque_address_space) {
+            return status::invalid;
+        }
+        if (slots[0].opaque_address_space) {
+            // OpenCL buffers can share a sentinel get_base() value while
+            // owning separate cl_mem allocations. Distinguish buffer handles,
+            // not the overlapping logical address ranges.
+            if (slots[0].buffer_identity == slots[1].buffer_identity) {
+                return status::invalid;
+            }
+        } else if (may_overlap(slots[0].base, slots[0].capacity,
+                               slots[1].base, slots[1].capacity)) {
             return status::invalid;
         }
 
