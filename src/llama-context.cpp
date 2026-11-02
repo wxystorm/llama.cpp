@@ -4204,7 +4204,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const char * trace_file =
         std::getenv("LLAMA_REGION_RING_METRICS_FILE");
     const bool ring_trace_enabled =
-        threaded_execution && pc_phone_overlap &&
+        ubatch.n_tokens > 1 && threaded_execution && pc_phone_overlap &&
         trace_setting != nullptr && std::strcmp(trace_setting, "1") == 0 &&
         trace_file != nullptr && *trace_file != '\0';
     const int64_t ring_trace_origin_us =
@@ -4260,7 +4260,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ring_trace_rows.resize(stages.size());
         ring_bank_trace_rows.resize(stages.size());
         for (size_t r = 0; r < stages.size(); ++r) {
-            const size_t x = (size_t) stages[r].macro_tokens;
+            const size_t x = (size_t) std::max(1, stages[r].macro_tokens);
             ring_trace_rows[r].resize(
                 ((size_t) ubatch.n_tokens + x - 1) / x);
         }
@@ -6700,7 +6700,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
             for (size_t r = 0; r < stages.size(); ++r) {
                 const auto & stage = stages[r];
-                const size_t x = (size_t) stage.macro_tokens;
+                const size_t x = (size_t) std::max(1, stage.macro_tokens);
                 for (size_t chunk = 0;
                      chunk < ring_trace_rows[r].size(); ++chunk) {
                     const auto & t = ring_trace_rows[r][chunk];
@@ -6742,8 +6742,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     point(out, "graph_prepare_end_ms", t.graph_prepare_end_us);
                     point(out, "input_set_begin_ms", t.input_set_begin_us);
                     point(out, "input_set_end_ms", t.input_set_end_us);
-                    point(out, "split_prepare_begin_ms", t.split_prepare_begin_us);
-                    point(out, "split_prepare_end_ms", t.split_prepare_end_us);
+                    // With multiple splits these are the first and last
+                    // preparation boundaries; the interval between them may
+                    // contain compute. Only split_prepare_ms is additive.
+                    point(out, "split_prepare_first_begin_ms",
+                          t.split_prepare_begin_us);
+                    point(out, "split_prepare_last_end_ms",
+                          t.split_prepare_end_us);
                     point(out, "compute_range_begin_ms", t.compute_range_begin_us);
                     point(out, "compute_range_end_ms", t.compute_range_end_us);
                     point(out, "lane_compute_begin_ms", t.lane_compute_begin_us);
