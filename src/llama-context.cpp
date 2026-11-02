@@ -4544,6 +4544,200 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ring_embedding_prelude_us / 1000.0);
     }
 
+    // Eagerly create immutable PC-side Phone Graph templates by exact
+    // (Region, token count, output count). This occurs after the sole KV
+    // ubatch assignment, but before any CPU/CUDA/Phone worker is started.
+    // The canonical main Scheduler/Result are reserved exclusively for the
+    // terminal Phone Chunk, preserving the caller's final logits ownership.
+    struct phone_prefill_template {
+        size_t region = 0;
+        uint32_t tokens = 0;
+        int32_t output_count = 0;
+        uint32_t sample_begin = 0;
+        bool canonical = false;
+        ggml_backend_sched_ptr owned_sched;
+        std::unique_ptr<llm_graph_result> owned_res;
+        ggml_backend_sched_t scheduler = nullptr;
+        llm_graph_result * result = nullptr;
+    };
+    std::vector<phone_prefill_template> phone_prefill_templates;
+    const char * phone_static_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES");
+    const bool phone_static_requested =
+        phone_static_env != nullptr && std::atoi(phone_static_env) == 1;
+    const bool phone_static_eligible =
+        threaded_execution && pc_phone_overlap && own_stage_resources &&
+        task_local_graph_outputs && !directional_runtime &&
+        !stages.empty() &&
+        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
+        !ubatch.equal_seqs() && ubatch.output != nullptr &&
+        worker_kv_views[2] != nullptr && backend_ptrs.size() == 3 &&
+        sched_use == sched.get() && res_use == gf_res_prev.get();
+    // The current caller consumes logits from one canonical final graph.
+    // Multi-output prefills need a separate multi-chunk gather contract.
+    bool single_terminal_output = ubatch.n_tokens > 0;
+    if (single_terminal_output) {
+        for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+            const bool expected = t + 1 == ubatch.n_tokens;
+            if ((ubatch.output[t] != 0) != expected) {
+                single_terminal_output = false;
+                break;
+            }
+        }
+    }
+    const bool phone_static_templates =
+        phone_static_requested && phone_static_eligible &&
+        single_terminal_output;
+    int64_t phone_static_prebuild_us = 0;
+    if (phone_static_requested && !phone_static_templates) {
+        LLAMA_LOG_INFO(
+            "[PHONE_STATIC_TEMPLATE] event=DISABLED reason=%s "
+            "tokens=%u status=LEGACY\\n",
+            !phone_static_eligible ? "UNSUPPORTED_RUNTIME" :
+                "NONCANONICAL_LOGITS_MASK",
+            ubatch.n_tokens);
+    }
+    if (phone_static_templates) {
+        const int64_t prebuild_begin_us = ggml_time_us();
+        // Build a finite, deterministic catalog: full Chunk, tail Chunk,
+        // and (for the final Region) the count of requested logits.
+        for (size_t region = 0; region < stages.size(); ++region) {
+            const auto & stage = stages[region];
+            if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                continue;
+            }
+            if (region == 0 || stage.macro_tokens <= 0) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_STATIC_TEMPLATE] event=REJECT region=%zu "
+                    "reason=UNSUPPORTED_PHONE_INPUT status=FAIL\n", region);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            const uint32_t width = (uint32_t) stage.macro_tokens;
+            for (uint32_t begin = 0; begin < ubatch.n_tokens; begin += width) {
+                const uint32_t count = std::min(
+                    width, ubatch.n_tokens - begin);
+                int32_t outputs_for_chunk = 0;
+                if (region + 1 == stages.size()) {
+                    for (uint32_t t = begin; t < begin + count; ++t) {
+                        outputs_for_chunk += ubatch.output[t] != 0;
+                    }
+                }
+                const bool seen = std::any_of(
+                    phone_prefill_templates.begin(),
+                    phone_prefill_templates.end(),
+                    [&](const phone_prefill_template & item) {
+                        return item.region == region &&
+                               item.tokens == count &&
+                               item.output_count == outputs_for_chunk;
+                    });
+                if (!seen) {
+                    phone_prefill_template item;
+                    item.region = region;
+                    item.tokens = count;
+                    item.output_count = outputs_for_chunk;
+                    item.sample_begin = begin;
+                    item.canonical =
+                        region + 1 == stages.size() &&
+                        begin + count == ubatch.n_tokens;
+                    phone_prefill_templates.emplace_back(std::move(item));
+                }
+            }
+        }
+        // Build the canonical final graph LAST. Other templates have their
+        // own outer Scheduler allocations, so they cannot overwrite it.
+        std::stable_sort(
+            phone_prefill_templates.begin(),
+            phone_prefill_templates.end(),
+            [](const phone_prefill_template & a,
+               const phone_prefill_template & b) {
+                return !a.canonical && b.canonical;
+            });
+        const size_t max_nodes =
+            graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        size_t canonical_count = 0;
+        for (auto & item : phone_prefill_templates) {
+            if (item.canonical) {
+                ++canonical_count;
+                item.scheduler = sched_use;
+                item.result = res_use;
+            } else {
+                item.owned_sched.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(),
+                    (int) backend_ptrs.size(), max_nodes, false,
+                    cparams.op_offload));
+                item.owned_res.reset(new llm_graph_result(max_nodes));
+                item.scheduler = item.owned_sched.get();
+                item.result = item.owned_res.get();
+            }
+            if (item.scheduler == nullptr || item.result == nullptr ||
+                !worker_kv_views[2]->set_stage_range(
+                    ubatch_id, item.sample_begin, item.tokens)) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_STATIC_TEMPLATE] event=REJECT region=%zu "
+                    "tokens=%u outputs=%d reason=ALLOC_OR_KV_VIEW "
+                    "status=FAIL\n",
+                    item.region, item.tokens, item.output_count);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+            const auto & stage = stages[item.region];
+            float * sample_input =
+                outputs[item.region - 1].data() +
+                (size_t) item.sample_begin * (size_t) n_embd;
+            const llama_ubatch sample = llama_hybrid_slice_ubatch(
+                ubatch, item.sample_begin, item.tokens, sample_input);
+            ggml_status prep_status = GGML_STATUS_SUCCESS;
+            llm_graph_result * prepared = prepare_ubatch(
+                item.result, item.scheduler, sample, gtype,
+                worker_kv_views[2].get(), prep_status,
+                false, &stage, item.output_count, true);
+            worker_kv_views[2]->clear_stage_range();
+            const int splits = item.scheduler != nullptr ?
+                ggml_backend_sched_get_n_splits(item.scheduler) : 0;
+            const bool valid =
+                prepared == item.result &&
+                prep_status == GGML_STATUS_SUCCESS &&
+                splits == 1 &&
+                ggml_backend_sched_get_split_backend(item.scheduler, 0) ==
+                    backend_ptrs[0];
+            if (!valid) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_STATIC_TEMPLATE] event=REJECT region=%zu "
+                    "layers=[%d,%d) tokens=%u outputs=%d "
+                    "splits=%d reason=INVALID_PHONE_META_GRAPH "
+                    "status=FAIL\n",
+                    item.region, stage.layer_begin, stage.layer_end,
+                    item.tokens, item.output_count, splits);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_STATIC_TEMPLATE] event=PC_GRAPH_READY region=%zu "
+                "layers=[%d,%d) tokens=%u outputs=%d canonical=%d "
+                "scheduler=%p result=%p status=OK\n",
+                item.region, stage.layer_begin, stage.layer_end,
+                item.tokens, item.output_count, item.canonical ? 1 : 0,
+                (void *) item.scheduler, (void *) item.result);
+        }
+        if (canonical_count != 1) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_STATIC_TEMPLATE] event=REJECT "
+                "reason=FINAL_OWNER_COUNT canonical=%zu status=FAIL\n",
+                canonical_count);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        phone_static_prebuild_us = ggml_time_us() - prebuild_begin_us;
+        LLAMA_LOG_INFO(
+            "[PHONE_STATIC_TEMPLATE] event=PC_PREBUILD_DONE "
+            "templates=%zu wall_ms=%.3f stage=PC_OUTER_GRAPH "
+            "phone_rpc_registration=LAZY status=OK\n",
+            phone_prefill_templates.size(),
+            phone_static_prebuild_us / 1000.0);
+    }
+
     if (threaded_execution) {
         if (pc_phone_overlap) {
             // graph_compute_range() used to mutate ALL backend thread configs
