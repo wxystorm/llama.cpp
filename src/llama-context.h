@@ -86,6 +86,8 @@ struct llama_hybrid_stage_timing {
     bool    capture_timeline = false;
     int64_t graph_prepare_begin_us = 0;
     int64_t graph_prepare_end_us = 0;
+    int64_t input_set_begin_us = 0;
+    int64_t input_set_end_us = 0;
     int64_t split_prepare_begin_us = 0;
     int64_t split_prepare_end_us = 0;
     int64_t compute_range_begin_us = 0;
