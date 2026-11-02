@@ -1120,6 +1120,55 @@ static void test_phone_single_graph_ready_affinity() {
           "Phone affinity must preserve every causal task");
 }
 
+static void test_phone_static_template_shapes() {
+    const auto regions = llama_region_ring_parse(
+        "G10,C1,P3,G11,C1,P1,G11,C1,P1", 40);
+    const std::vector<int> widths = {16, 16, 64, 16, 16, 64, 16, 16, 64};
+    std::vector<int8_t> output(358, 0);
+    output.back() = 1;
+
+    const auto shapes = llama_region_ring_phone_static_shapes(
+        regions, widths, (uint32_t) output.size(), output.data());
+    check(shapes.size() == 6,
+          "three Phone Regions must each have full+tail templates");
+    size_t canonical_count = 0;
+    for (const auto & s : shapes) {
+        check(s.region == 2 || s.region == 5 || s.region == 8,
+              "a non-Phone Region received a Phone template");
+        check(s.tokens == 64 || s.tokens == 38,
+              "full and tail token shapes are incorrect");
+        if (s.region != 8) {
+            check(s.output_count == 0 && !s.canonical,
+                  "non-terminal Phone Region must not own final logits");
+        }
+        if (s.canonical) {
+            ++canonical_count;
+            check(s.region == 8 && s.tokens == 38 &&
+                  s.output_count == 1 && s.sample_begin == 320,
+                  "canonical Phone tail must own the final logits");
+        }
+    }
+    check(canonical_count == 1 && shapes.back().canonical,
+          "the canonical Phone result must be built last");
+
+    output.assign(128, 0);
+    output.back() = 1;
+    const auto uniform = llama_region_ring_phone_static_shapes(
+        regions, widths, 128, output.data());
+    check(uniform.size() == 4,
+          "uniform chunks need one normal template per Phone Region and "
+          "one distinct final-output template");
+    check(uniform.back().region == 8 &&
+          uniform.back().tokens == 64 &&
+          uniform.back().output_count == 1 && uniform.back().canonical,
+          "uniform final Chunk output ownership differs from interior chunks");
+
+    const auto invalid = llama_region_ring_phone_static_shapes(
+        regions, {16, 16}, 128, output.data());
+    check(invalid.empty(),
+          "template catalog must reject a mismatched Chunk-width vector");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1175,6 +1224,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_phone_single_graph_ready_affinity();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_single_graph_ready_affinity=PASS\n");
+        test_phone_static_template_shapes();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_static_template_shapes=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
