@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -829,21 +830,35 @@ struct llama_region_ring_task {
     int output_slot = -1;
 };
 
+// Optional observer: called with the READY mutex held. Callbacks MUST only
+// perform bounded, non-blocking writes; no logging, I/O, or other lock acquisition.
+enum class llama_region_ring_task_event : uint8_t {
+    READY,
+    CLAIM,
+    DEFER,
+    COMPLETE,
+    FAIL,
+};
+
 // Cooperative, dependency-driven per-device FIFOs.  A region's (L,C) task
 // becomes runnable only after its upstream region has completed that chunk AND
 // the same region has completed chunk C-1 (KV-cache commit ordering).  Completion
 // publishes downstream readiness; device execution is supplied by the caller.
 class llama_region_ring_ready {
 public:
+    using task_event_observer = std::function<void(
+        llama_region_ring_task_event, const llama_region_ring_task &)>;
+
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
             int n_tokens, int chunk_tokens,
             size_t slot_pool_size = 0,
-            bool gpu_two_bank_lifetime = false) :
+            bool gpu_two_bank_lifetime = false,
+            task_event_observer observer = {}) :
         llama_region_ring_ready(
             regions, n_tokens,
             std::vector<int>(regions.size(), chunk_tokens),
-            slot_pool_size, gpu_two_bank_lifetime) {
+            slot_pool_size, gpu_two_bank_lifetime, std::move(observer)) {
     }
 
     llama_region_ring_ready(
@@ -851,12 +866,14 @@ public:
             int n_tokens,
             const std::vector<int> & region_chunk_tokens,
             size_t slot_pool_size = 0,
-            bool gpu_two_bank_lifetime = false) :
+            bool gpu_two_bank_lifetime = false,
+            task_event_observer observer = {}) :
         regions_(regions),
         region_chunk_tokens_(region_chunk_tokens),
         slot_pool_size_(slot_pool_size),
         n_tokens_(n_tokens),
-        gpu_two_bank_lifetime_(gpu_two_bank_lifetime) {
+        gpu_two_bank_lifetime_(gpu_two_bank_lifetime),
+        task_event_observer_(std::move(observer)) {
         if (regions_.empty() || n_tokens_ <= 0 ||
                 region_chunk_tokens_.size() != regions_.size() ||
                 std::any_of(
@@ -1082,6 +1099,7 @@ public:
                     "invalid region ring deferred completion");
             }
             state_[task.region][task.chunk] = 5;
+            observe_locked(llama_region_ring_task_event::DEFER, task);
             if (!failed_) {
                 offer_locked(task.region, task.chunk + 1);
             }
@@ -1110,6 +1128,7 @@ public:
                     "invalid region ring failure");
             }
             state_[task.region][task.chunk] = 4;
+            observe_locked(llama_region_ring_task_event::FAIL, task);
             failed_ = true;
         }
         cv_.notify_all();
@@ -1124,6 +1143,14 @@ public:
     }
 
 private:
+    void observe_locked(
+            llama_region_ring_task_event event,
+            const llama_region_ring_task & task) const {
+        if (task_event_observer_) {
+            task_event_observer_(event, task);
+        }
+    }
+
     static size_t device_index(
             llama_region_ring_device device) {
         const size_t dev = (size_t) device;
@@ -1193,6 +1220,7 @@ private:
 
         state_[task.region][task.chunk] = 3;
         ++finished_;
+        observe_locked(llama_region_ring_task_event::COMPLETE, task);
 
         if (failed_) {
             return;
@@ -1399,6 +1427,7 @@ private:
         }
 
         state_[task.region][task.chunk] = 2;
+        observe_locked(llama_region_ring_task_event::CLAIM, task);
         return task;
     }
 
@@ -1414,12 +1443,14 @@ private:
         }
 
         state_[region][chunk] = 1;
-        queues_[(size_t) regions_[region].device].push_back({
+        auto & queue = queues_[(size_t) regions_[region].device];
+        queue.push_back({
             region,
             chunk,
             chunk_begins_[region][chunk],
             chunk_sizes_[region][chunk]
         });
+        observe_locked(llama_region_ring_task_event::READY, queue.back());
     }
 
     const std::vector<llama_region_ring_region> regions_;
@@ -1427,6 +1458,7 @@ private:
     const size_t slot_pool_size_ = 0;
     const int n_tokens_ = 0;
     const bool gpu_two_bank_lifetime_ = false;
+    const task_event_observer task_event_observer_;
     std::vector<std::vector<output_slot>> output_slots_;
     std::vector<std::vector<int>> chunk_begins_;
     std::vector<std::vector<int>> chunk_sizes_;
