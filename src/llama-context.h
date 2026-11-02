@@ -79,6 +79,22 @@ struct llama_hybrid_stage_timing {
     size_t  weight_upload_bytes    = 0;
     size_t  weight_cache_hit_bytes = 0;
     bool    graph_reused = false;
+    // Opt-in PC-clock timeline for the current Region/Chunk. The ranges
+    // intentionally distinguish graph preparation, split preparation,
+    // compute submission+synchronization, and output materialization.
+    // Keep aggregate stage counters unchanged; these are NOT additive.
+    bool    capture_timeline = false;
+    int64_t graph_prepare_begin_us = 0;
+    int64_t graph_prepare_end_us = 0;
+    int64_t split_prepare_begin_us = 0;
+    int64_t split_prepare_end_us = 0;
+    int64_t compute_range_begin_us = 0;
+    int64_t compute_range_end_us = 0;
+    int64_t output_begin_us = 0;
+    int64_t output_end_us = 0;
+    // 0=none, 1=host_output_copy, 2=arena_capture,
+    // 3=backend_sync, 4=p2c_deferred.
+    int     output_kind = 0;
 };
 
 struct llama_context {
