@@ -5120,9 +5120,30 @@ public:
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
     bool set_tensor_from_local_file(const rpc_msg_set_tensor_from_local_file_req & request, rpc_msg_set_tensor_from_local_file_rsp & response); //新加的
+    struct phone_stage_slot0_tensor {
+        ggml_tensor * tensor = nullptr;
+        ggml_backend_buffer_t original_buffer = nullptr;
+        void * original_data = nullptr;
+        void * original_extra = nullptr;
+        size_t offset = 0;
+        size_t parent = SIZE_MAX;
+        bool input = false;
+        bool output = false;
+    };
+    struct phone_stage_slot0_graph {
+        bool ready = false;
+        size_t required_bytes = 0;
+        uint32_t tokens = 0;
+        std::vector<phone_stage_slot0_tensor> tensors;
+        std::vector<size_t> init_order;
+        std::vector<void *> extras;
+        ggml_backend_buffer_t cached_slot = nullptr;
+        uint64_t cached_generation = 0;
+    };
     struct stored_graph {
         std::vector<uint8_t> buffer;
         ggml_cgraph * graph = nullptr;
+        phone_stage_slot0_graph slot0;
         // One warmup + three measured synthetic runs: retain last three.
         std::array<int64_t, 3> recent_compute_wall_us {};
         uint64_t compute_samples = 0;
@@ -5147,6 +5168,9 @@ private:
                                       uint32_t wire_node_count,
                                       const rpc_tensor * wire_tensors,
                                       uint32_t wire_tensor_count);
+    std::optional<ggml_status> phone_stage_slot0_compute(
+        uint32_t device, uint64_t graph_uid,
+        ggml_cgraph * graph, stored_graph & entry);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
@@ -5194,19 +5218,16 @@ private:
 
     // store computed graphs for each backend by graph uid
     std::vector<std::unordered_map<uint64_t, stored_graph>> stored_graphs;
-    // PREPARE-ONLY: logical layouts are verified on the Phone, never used to
-    // override live OpenCL bindings before the full input/KV/output contract
-    // is implemented and tested. The existing RPC path stays authoritative.
+    // Slot 0 execution is explicitly opt-in; default RPC graphs are unchanged.
     std::vector<std::vector<ggml_phone_stage::template_plan>>
         phone_stage_plan_cache;
     std::vector<ggml_phone_stage::two_slot_pool> phone_stage_slot_policy;
-    // Phone-local OpenCL allocations, never exported as arbitrary PC RPC
-    // pointers. They remain unused by inference until tested rebind support
-    // is explicitly enabled in a subsequent stage.
+    // Phone-local OpenCL allocations, never exported as RPC pointers.
     struct phone_owned_arenas {
         std::array<ggml_backend_buffer_t, ggml_phone_stage::k_slot_count>
             buffers {};
         size_t capacity = 0;
+        uint64_t generation = 0;
     };
     std::vector<phone_owned_arenas> phone_stage_device_arenas;
     std::recursive_mutex graph_compute_mutex;
@@ -8427,6 +8448,7 @@ void rpc_server::phone_stage_binding_preflight(
                         }
                         arenas.buffers = new_buffers;
                         arenas.capacity = needed;
+                        ++arenas.generation;
                         GGML_LOG_INFO(
                             "[PHONE_STAGE_SLOT_POOL] event=RESERVED "
                             "slot_bytes=%zu slot_count=2 "
@@ -8556,7 +8578,265 @@ void rpc_server::phone_stage_binding_preflight(
                 }
             }
         }
+
+        const char * slot0_env =
+            std::getenv("GGML_RPC_PHONE_STAGE_SLOT0_EXEC");
+        if (slot0_env != nullptr && std::strcmp(slot0_env, "1") == 0) {
+            auto & slot0 = stored_graphs[device][graph_uid].slot0;
+            const auto & arenas = phone_stage_device_arenas[device];
+            const bool eligible =
+                arenas.buffers[0] != nullptr &&
+                arenas.capacity >= binding_map.required_bytes() &&
+                ggml_backend_buffer_get_type(arenas.buffers[0]) ==
+                    ggml_backend_buffer_get_type(stage_buffer) &&
+                is_opencl_tensor(last) &&
+                !ggml_backend_buffer_is_host(arenas.buffers[0]);
+
+            phone_stage_slot0_graph proposed;
+            bool valid = eligible;
+            const char * reject_reason = eligible ?
+                "INVALID_TENSOR_LAYOUT" : "NO_OPENCL_SLOT";
+            size_t input_count = 0;
+            size_t output_count = 0;
+            if (valid) {
+                proposed.required_bytes = binding_map.required_bytes();
+                proposed.tokens = registered_tokens;
+                proposed.tensors.reserve(binding_map.entries().size());
+                std::unordered_map<const ggml_tensor *, size_t> by_tensor;
+                by_tensor.reserve(binding_map.entries().size());
+
+                for (const auto & record : binding_map.entries()) {
+                    const ggml_tensor * t = visited_order[record.id - 1];
+                    by_tensor.emplace(t, proposed.tensors.size());
+                    const bool input =
+                        t->op == GGML_OP_NONE ||
+                        (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+                    const bool output =
+                        t == last ||
+                        (t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+                    if (t->extra == nullptr ||
+                        ((input || output) && t->view_src != nullptr)) {
+                        valid = false;
+                        reject_reason = "UNSUPPORTED_INPUT_OUTPUT";
+                        break;
+                    }
+                    input_count += input;
+                    output_count += output;
+                    proposed.tensors.push_back({
+                        const_cast<ggml_tensor *>(t),
+                        t->buffer, t->data, t->extra,
+                        record.source_offset, SIZE_MAX, input, output,
+                    });
+                }
+                if (valid && input_count != 0 && output_count != 0) {
+                    for (const ggml_tensor * t : visited_order) {
+                        if (t != nullptr && t->buffer != stage_buffer &&
+                            t->view_src != nullptr &&
+                            t->view_src->buffer == stage_buffer) {
+                            valid = false;
+                            reject_reason = "EXTERNAL_VIEW_OF_STAGE";
+                            break;
+                        }
+                    }
+                }
+                if (valid && input_count != 0 && output_count != 0) {
+                    for (auto & item : proposed.tensors) {
+                        if (item.tensor->view_src == nullptr) {
+                            continue;
+                        }
+                        const auto parent =
+                            by_tensor.find(item.tensor->view_src);
+                        if (parent == by_tensor.end()) {
+                            valid = false;
+                            reject_reason = "MISSING_VIEW_PARENT";
+                            break;
+                        }
+                        item.parent = parent->second;
+                    }
+                } else {
+                    valid = false;
+                }
+                if (valid) {
+                    std::vector<uint8_t> color(proposed.tensors.size(), 0);
+                    std::function<bool(size_t)> visit_slot0 =
+                        [&](size_t i) -> bool {
+                            if (color[i] == 2) { return true; }
+                            if (color[i] == 1) { return false; }
+                            color[i] = 1;
+                            const size_t parent = proposed.tensors[i].parent;
+                            if (parent != SIZE_MAX &&
+                                (parent >= proposed.tensors.size() ||
+                                 !visit_slot0(parent))) {
+                                return false;
+                            }
+                            color[i] = 2;
+                            proposed.init_order.push_back(i);
+                            return true;
+                        };
+                    for (size_t i = 0; i < proposed.tensors.size(); ++i) {
+                        if (!visit_slot0(i)) {
+                            valid = false;
+                            reject_reason = "VIEW_CYCLE";
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (valid) {
+                proposed.ready = true;
+                slot0 = std::move(proposed);
+            }
+            GGML_LOG_INFO(
+                "[PHONE_STAGE_SLOT0] event=REGISTER uid=%" PRIu64
+                " layer=%d..%d tokens=%u tensors=%zu inputs=%zu "
+                "outputs=%zu slot_bytes=%zu status=%s reason=%s "
+                "mode=OPT_IN\n",
+                graph_uid, first_layer, max_layer, registered_tokens,
+                valid ? slot0.tensors.size() : size_t(0),
+                input_count, output_count, arenas.capacity,
+                valid ? "READY" : "SKIP",
+                valid ? "NONE" : reject_reason);
+        }
     }
+}
+
+
+std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
+        uint32_t device, uint64_t graph_uid,
+        ggml_cgraph * graph, stored_graph & entry) {
+    auto & plan = entry.slot0;
+    if (!plan.ready || graph == nullptr || device >= backends.size() ||
+        plan.tensors.empty()) {
+        return std::nullopt;
+    }
+    auto & arenas = phone_stage_device_arenas[device];
+    ggml_backend_buffer_t slot = arenas.buffers[0];
+    if (slot == nullptr ||
+        ggml_backend_buffer_get_size(slot) < plan.required_bytes ||
+        !is_opencl_tensor(plan.tensors.front().tensor)) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_SLOT0] event=SKIP uid=%" PRIu64
+            " reason=SLOT_UNAVAILABLE status=FALLBACK\n", graph_uid);
+        return std::nullopt;
+    }
+    for (const auto & item : plan.tensors) {
+        if (item.tensor->buffer != item.original_buffer ||
+            item.tensor->data != item.original_data ||
+            item.tensor->extra != item.original_extra) {
+            GGML_LOG_INFO(
+                "[PHONE_STAGE_SLOT0] event=SKIP uid=%" PRIu64
+                " reason=SOURCE_BINDING_CHANGED status=FALLBACK\n",
+                graph_uid);
+            return std::nullopt;
+        }
+    }
+
+    const size_t base = reinterpret_cast<size_t>(
+        ggml_backend_buffer_get_base(slot));
+    if (base == 0 ||
+        plan.required_bytes > SIZE_MAX - base) {
+        return std::nullopt;
+    }
+    if (plan.cached_slot != slot ||
+        plan.cached_generation != arenas.generation ||
+        plan.extras.size() != plan.tensors.size()) {
+        std::vector<ggml_tensor> clones;
+        clones.reserve(plan.tensors.size());
+        for (const auto & item : plan.tensors) {
+            ggml_tensor copy = *item.tensor;
+            copy.buffer = slot;
+            copy.data = reinterpret_cast<void *>(base + item.offset);
+            copy.extra = nullptr;
+            copy.view_src = nullptr;
+            clones.push_back(copy);
+        }
+        std::vector<void *> new_extras(plan.tensors.size(), nullptr);
+        for (size_t i : plan.init_order) {
+            const auto parent = plan.tensors[i].parent;
+            if (parent != SIZE_MAX) {
+                clones[i].view_src = &clones[parent];
+            }
+            if (ggml_backend_buffer_init_tensor(slot, &clones[i]) !=
+                    GGML_STATUS_SUCCESS ||
+                clones[i].extra == nullptr) {
+                GGML_LOG_INFO(
+                    "[PHONE_STAGE_SLOT0] event=SKIP uid=%" PRIu64
+                    " tensor=%s reason=EXTRA_INIT status=FALLBACK\n",
+                    graph_uid, plan.tensors[i].tensor->name);
+                plan.ready = false;
+                return std::nullopt;
+            }
+            new_extras[i] = clones[i].extra;
+        }
+        plan.extras = std::move(new_extras);
+        plan.cached_slot = slot;
+        plan.cached_generation = arenas.generation;
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_SLOT0] event=BIND_EXTRA uid=%" PRIu64
+            " tensors=%zu generation=%" PRIu64
+            " status=READY\n",
+            graph_uid, plan.extras.size(), arenas.generation);
+    }
+
+    const int64_t begin_us = ggml_time_us();
+    size_t input_bytes = 0;
+    for (size_t i = 0; i < plan.tensors.size(); ++i) {
+        const auto & item = plan.tensors[i];
+        if (!item.input) { continue; }
+        ggml_tensor dst = *item.tensor;
+        dst.buffer = slot;
+        dst.data = reinterpret_cast<void *>(base + item.offset);
+        dst.extra = plan.extras[i];
+        ggml_backend_tensor_copy(item.tensor, &dst);
+        input_bytes += ggml_nbytes(item.tensor);
+    }
+    ggml_backend_synchronize(backends[device]);
+
+    struct restore_binding {
+        std::vector<phone_stage_slot0_tensor> & entries;
+        ~restore_binding() {
+            for (const auto & item : entries) {
+                item.tensor->buffer = item.original_buffer;
+                item.tensor->data = item.original_data;
+                item.tensor->extra = item.original_extra;
+            }
+        }
+    } restore { plan.tensors };
+
+    for (size_t i = 0; i < plan.tensors.size(); ++i) {
+        const auto & item = plan.tensors[i];
+        item.tensor->buffer = slot;
+        item.tensor->data = reinterpret_cast<void *>(base + item.offset);
+        item.tensor->extra = plan.extras[i];
+    }
+
+    const ggml_status status =
+        ggml_backend_graph_compute(backends[device], graph);
+    ggml_backend_synchronize(backends[device]);
+
+    size_t output_bytes = 0;
+    if (status == GGML_STATUS_SUCCESS) {
+        for (const auto & item : plan.tensors) {
+            if (!item.output) { continue; }
+            ggml_tensor dst = *item.tensor;
+            dst.buffer = item.original_buffer;
+            dst.data = item.original_data;
+            dst.extra = item.original_extra;
+            ggml_backend_tensor_copy(item.tensor, &dst);
+            output_bytes += ggml_nbytes(item.tensor);
+        }
+        ggml_backend_synchronize(backends[device]);
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_STAGE_SLOT0] event=COMPUTE uid=%" PRIu64
+        " tokens=%u inputs_bytes=%zu outputs_bytes=%zu "
+        "wall_ms=%.3f status=%s mode=SLOT0_EXEC\n",
+        graph_uid, plan.tokens, input_bytes, output_bytes,
+        (ggml_time_us() - begin_us) / 1000.0,
+        status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+    return status;
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register_only) {
@@ -8595,6 +8875,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
 
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
     stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
+    graph_entry.slot0 = {};
     if (graph_entry.buffer.size() < buf_size) {
         graph_entry.buffer.resize(buf_size);
     }
@@ -8644,10 +8925,10 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input, bool register
     }
     const int64_t t0 = ggml_time_us();
 
-    ggml_status status =
-        ggml_backend_graph_compute(
-            backends[device],
-            graph);
+    const auto slot0_status =
+        phone_stage_slot0_compute(device, graph_uid, graph, graph_entry);
+    const ggml_status status = slot0_status.has_value() ?
+        *slot0_status : ggml_backend_graph_compute(backends[device], graph);
 
     const int64_t t1 = ggml_time_us();
     if (status == GGML_STATUS_SUCCESS) {
@@ -8692,10 +8973,11 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 "\n", __func__, device, request.graph_uid);
     const int64_t t0 = ggml_time_us();
 
-    ggml_status status =
-        ggml_backend_graph_compute(
-            backends[device],
-            graph);
+    const auto slot0_status =
+        phone_stage_slot0_compute(device, request.graph_uid, graph,
+                                  it->second);
+    const ggml_status status = slot0_status.has_value() ?
+        *slot0_status : ggml_backend_graph_compute(backends[device], graph);
 
     const int64_t t1 = ggml_time_us();
     if (status == GGML_STATUS_SUCCESS) {
