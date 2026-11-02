@@ -974,6 +974,9 @@ struct ggml_backend_sched {
     size_t last_weight_upload_bytes = 0;
     size_t last_weight_cache_hit_bytes = 0;
 
+    bool prepare_breakdown_enabled = false;
+    ggml_backend_sched_prepare_breakdown last_prepare_breakdown {};
+
     // Two fixed CUDA-pinned staging slots for Region Ring weight streaming.
     // Canonical model weights remain in mmap/pageable host storage.
     bool weight_stage_init_attempted = false;
@@ -2232,6 +2235,47 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     sched->last_weight_upload_bytes = 0;
     sched->last_weight_cache_hit_bytes = 0;
 
+    auto & breakdown = sched->last_prepare_breakdown;
+    breakdown = {};
+    const bool profile = sched->prepare_breakdown_enabled;
+    const int64_t profile_begin_us = profile ? ggml_time_us() : 0;
+
+    // The event WAIT and event SYNCHRONIZE paths are deliberately distinct:
+    // the former enqueues an ordering dependency, the latter blocks the host.
+    auto target_wait = [&](bool enqueue_event_wait) {
+        const int64_t begin_us = profile ? ggml_time_us() : 0;
+        if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+            if (enqueue_event_wait) {
+                ggml_backend_event_wait(
+                    split_backend, sched->events[split_backend_id][sched->cur_copy]);
+            } else {
+                ggml_backend_event_synchronize(
+                    sched->events[split_backend_id][sched->cur_copy]);
+            }
+        } else {
+            ggml_backend_synchronize(split_backend);
+        }
+        if (profile) {
+            breakdown.target_wait_call_us += ggml_time_us() - begin_us;
+        }
+    };
+    auto source_sync = [&](ggml_backend_t source) {
+        const int64_t begin_us = profile ? ggml_time_us() : 0;
+        ggml_backend_synchronize(source);
+        if (profile) {
+            breakdown.source_sync_us += ggml_time_us() - begin_us;
+        }
+    };
+    auto tensor_copy_call = [&](const ggml_tensor * src, ggml_tensor * dst) {
+        const int64_t begin_us = profile ? ggml_time_us() : 0;
+        ggml_backend_tensor_copy(src, dst);
+        if (profile) {
+            breakdown.copy_call_us += ggml_time_us() - begin_us;
+            breakdown.copy_bytes += ggml_nbytes(src);
+            ++breakdown.copy_calls;
+        }
+    };
+
     // copy the input tensors to the split backend
     for (int input_id = 0; input_id < split->n_inputs; input_id++) {
         ggml_backend_t       input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -2250,19 +2294,11 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(split_backend);
-            }
-            ggml_backend_tensor_copy(input, input_cpy);
+            target_wait(false);
+            tensor_copy_call(input, input_cpy);
         } else {
             // wait for the split backend to finish using the input before overwriting it
-            if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(split_backend);
-            }
+            target_wait(true);
 
             // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
             ggml_tensor * node = split->graph.nodes[0];
@@ -2276,7 +2312,7 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                 const int64_t n_expert    = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                 const size_t  expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                ggml_backend_synchronize(input_backend);
+                source_sync(input_backend);
 
                 // get the ids
                 ggml_tensor *  ids_tensor  = node->src[2];
@@ -2295,7 +2331,7 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                 if (ids_tensor != prev_ids_tensor) {
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-                    ggml_backend_synchronize(ids_backend);
+                    source_sync(ids_backend);
 
                     // find the used experts
                     used_ids.clear();
@@ -2319,11 +2355,17 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                     const size_t padding          = std::min<size_t>(expert_size, 512);
                     const size_t padding_end      = last_id < n_expert - 1 ? padding : 0;
 
+                    const int64_t copy_begin_us = profile ? ggml_time_us() : 0;
                     ggml_backend_tensor_set_async(
                         split_backend, input_cpy, (const uint8_t *) input->data + expert_offset, expert_offset,
                         // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                         // this is necessary for MMQ in the CUDA backend
                         expert_size_copy + padding_end);
+                    if (profile) {
+                        breakdown.copy_call_us += ggml_time_us() - copy_begin_us;
+                        breakdown.copy_bytes += expert_size_copy + padding_end;
+                        ++breakdown.copy_calls;
+                    }
                 };
 
                 int id = 0;
@@ -2360,24 +2402,27 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                     immutable_weight &&
                     ggml_backend_buffer_is_host(input->buffer);
                 if (cached_host_weight) {
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_synchronize(
-                            sched->events[split_backend_id][sched->cur_copy]);
-                    } else {
-                        ggml_backend_synchronize(split_backend);
+                    target_wait(false);
+                    tensor_copy_call(input, input_cpy);
+                } else {
+                    bool copied_async = false;
+                    if (split_backend->iface.cpy_tensor_async) {
+                        const int64_t copy_begin_us = profile ? ggml_time_us() : 0;
+                        copied_async = split_backend->iface.cpy_tensor_async(
+                            input_backend, split_backend, input, input_cpy);
+                        if (profile) {
+                            breakdown.copy_call_us += ggml_time_us() - copy_begin_us;
+                            if (copied_async) {
+                                breakdown.copy_bytes += ggml_nbytes(input);
+                                ++breakdown.copy_calls;
+                            }
+                        }
                     }
-                    ggml_backend_tensor_copy(input, input_cpy);
-                } else if (!split_backend->iface.cpy_tensor_async ||
-                    !split_backend->iface.cpy_tensor_async(
-                        input_backend, split_backend, input, input_cpy)) {
-                    ggml_backend_synchronize(input_backend);
-                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                        ggml_backend_event_synchronize(
-                            sched->events[split_backend_id][sched->cur_copy]);
-                    } else {
-                        ggml_backend_synchronize(split_backend);
+                    if (!copied_async) {
+                        source_sync(input_backend);
+                        target_wait(false);
+                        tensor_copy_call(input, input_cpy);
                     }
-                    ggml_backend_tensor_copy(input, input_cpy);
                 }
             }
 
@@ -2387,6 +2432,10 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
                 sched->last_weight_upload_bytes += ggml_nbytes(input);
             }
         }
+    }
+
+    if (profile) {
+        breakdown.total_us = ggml_time_us() - profile_begin_us;
     }
 
     if (getenv("GGML_META_PIPELINE_DEBUG") != NULL) {
@@ -2530,6 +2579,9 @@ ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t *             backend
     const char * GGML_SCHED_DEBUG_REALLOC = getenv("GGML_SCHED_DEBUG_REALLOC");
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
+    const char * breakdown_env = getenv("LLAMA_REGION_RING_PREPARE_BREAKDOWN");
+    sched->prepare_breakdown_enabled =
+        breakdown_env != nullptr && strcmp(breakdown_env, "1") == 0;
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
@@ -2946,6 +2998,12 @@ size_t ggml_backend_sched_get_last_weight_cache_hit_bytes(
         ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->last_weight_cache_hit_bytes;
+}
+
+void ggml_backend_sched_get_last_prepare_breakdown(
+        ggml_backend_sched_t sched, ggml_backend_sched_prepare_breakdown * stats) {
+    GGML_ASSERT(sched != nullptr && stats != nullptr);
+    *stats = sched->last_prepare_breakdown;
 }
 
 int64_t ggml_backend_sched_get_last_weight_stage_cpu_copy_us(

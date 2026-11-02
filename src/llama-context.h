@@ -73,6 +73,13 @@ struct llama_hybrid_stage_timing {
     int64_t graph_alloc_us = 0;
     int64_t input_set_us = 0;
     int64_t split_prepare_us = 0;
+    // Nested inside split_prepare_us; async copy time measures enqueue only.
+    int64_t split_target_wait_us = 0;
+    int64_t split_source_sync_us = 0;
+    int64_t split_copy_call_us = 0;
+    int64_t split_profiled_us = 0;
+    uint64_t split_copy_bytes = 0;
+    uint64_t split_copy_calls = 0;
     int64_t compute_range_us = 0;
     int64_t sync_us          = 0;
     int64_t weight_stage_us  = 0;

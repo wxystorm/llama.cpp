@@ -42,6 +42,12 @@ FIELDS = [
     "phone_graph_reuse_count", "phone_graph_reuse_check_ms",
     "phone_graph_reset_ms", "phone_graph_build_ms", "phone_graph_alloc_ms",
     "phone_input_set_ms", "phone_split_prepare_ms",
+    "cpu_split_target_wait_ms", "gpu_split_target_wait_ms", "phone_split_target_wait_ms",
+    "cpu_split_source_sync_ms", "gpu_split_source_sync_ms", "phone_split_source_sync_ms",
+    "cpu_split_copy_call_ms", "gpu_split_copy_call_ms", "phone_split_copy_call_ms",
+    "cpu_split_profiled_ms", "gpu_split_profiled_ms", "phone_split_profiled_ms",
+    "cpu_split_copy_mib", "gpu_split_copy_mib", "phone_split_copy_mib",
+    "cpu_split_copy_calls", "gpu_split_copy_calls", "phone_split_copy_calls",
     "phone_graph_affinity", "phone_graph_affinity_region",
     "phone_graph_affinity_tokens", "phone_target_graph_tasks",
     "phone_target_consecutive", "phone_target_graph_reuses",
@@ -63,6 +69,7 @@ FIELDS = [
     "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
     "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
     "meta_graph_execute_ms", "meta_graph_other_ms",
+    "meta_phone_full_graph_assemble_ms",
     "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
     "phone_result_get_count", "phone_result_get_mib",
     "phone_result_request_ms", "phone_result_response_wait_ms",
@@ -75,6 +82,8 @@ FIELDS = [
     "phone_rpc_graph_snapshot_count",
     "phone_rpc_graph_multi_count", "phone_rpc_graph_multi_nodes",
     "phone_rpc_graph_single_add_count", "phone_rpc_graph_single_other_count",
+    "phone_rpc_graph_serialize_ms", "phone_rpc_graph_serialized_mib",
+    "phone_rpc_graph_compute_cmd_ms", "phone_rpc_graph_recompute_cmd_ms",
     "phone_rpc_get_tensor_count", "phone_rpc_get_tensor_bytes",
     "estimated_gpu_to_cpu_activation_mib", "estimated_cpu_to_gpu_activation_mib",
     "estimated_pc_to_phone_activation_mib", "estimated_phone_to_pc_activation_mib",
@@ -315,7 +324,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
     for dev in ("cpu", "gpu", "phone"):
         for suffix in ("tasks", "compute_range_ms", "lane_active_ms",
                        "prepare_ms", "output_sync_ms", "ready_wait_ms",
-                       "prepare_wait_ms"):
+                       "prepare_wait_ms",
+                        "split_target_wait_ms", "split_source_sync_ms",
+                        "split_copy_call_ms", "split_profiled_ms",
+                        "split_copy_mib", "split_copy_calls"):
             row[f"{dev}_{suffix}"] = total(ring, f"{dev}_{suffix}")
     for key in ("phone_graph_reuse_check_ms", "phone_graph_reset_ms",
                 "phone_graph_build_ms", "phone_graph_alloc_ms",
@@ -327,6 +339,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "meta_pc_ffn_ms", "meta_attn_ms", "meta_reduce_ms",
         "meta_wait_ms", "meta_graph_ms", "meta_graph_rebuild_ms",
         "meta_graph_execute_ms", "meta_graph_other_ms",
+        "meta_phone_full_graph_assemble_ms",
         "meta_graph_calls", "meta_graph_rebuilds", "meta_return_payload_mib",
         "phone_result_get_count", "phone_result_get_mib",
         "phone_result_request_ms", "phone_result_response_wait_ms",
@@ -364,6 +377,19 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                 for region in record["phone_rpc_regions"]
                 if isinstance(region, dict)
             )
+        def rpc_profile_sum(key):
+            return sum(int(region.get(key, 0) or 0)
+                       for record in phone_rpc_rows
+                       for region in record["phone_rpc_regions"]
+                       if isinstance(region, dict))
+        row["phone_rpc_graph_serialize_ms"] = round(
+            rpc_profile_sum("graph_serialize_us") / 1000.0, 3)
+        row["phone_rpc_graph_serialized_mib"] = round(
+            rpc_profile_sum("graph_serialized_bytes") / 1048576.0, 3)
+        row["phone_rpc_graph_compute_cmd_ms"] = round(
+            rpc_profile_sum("graph_compute_cmd_us") / 1000.0, 3)
+        row["phone_rpc_graph_recompute_cmd_ms"] = round(
+            rpc_profile_sum("graph_recompute_cmd_us") / 1000.0, 3)
     if (plan.get("applied") is True and ring and
             row["link_ab_contended_ms"] is not None):
         row["link_ab_contended_error_ms"] = round(

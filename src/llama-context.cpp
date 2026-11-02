@@ -3031,6 +3031,14 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 timing != nullptr ? ggml_time_us() : 0;
             ret = ggml_backend_sched_prepare_split(sched_use, split);
             if (timing != nullptr) {
+                ggml_backend_sched_prepare_breakdown breakdown {};
+                ggml_backend_sched_get_last_prepare_breakdown(sched_use, &breakdown);
+                timing->split_target_wait_us += breakdown.target_wait_call_us;
+                timing->split_source_sync_us += breakdown.source_sync_us;
+                timing->split_copy_call_us += breakdown.copy_call_us;
+                timing->split_profiled_us += breakdown.total_us;
+                timing->split_copy_bytes += breakdown.copy_bytes;
+                timing->split_copy_calls += breakdown.copy_calls;
                 const int64_t split_prepare_end_us = ggml_time_us();
                 const int64_t split_prepare_us =
                     split_prepare_end_us - split_prepare_begin_us;
@@ -4290,6 +4298,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int64_t fail_us = 0;
         int64_t graph_prepare_cost_us = 0;
         int64_t split_prepare_cost_us = 0;
+        int64_t split_target_wait_us = 0;
+        int64_t split_source_sync_us = 0;
+        int64_t split_copy_call_us = 0;
+        int64_t split_profiled_us = 0;
+        uint64_t split_copy_bytes = 0;
+        uint64_t split_copy_calls = 0;
         int64_t compute_range_cost_us = 0;
         int64_t output_sync_cost_us = 0;
         int output_kind = 0;
@@ -4770,6 +4784,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             int64_t         graph_alloc_us = 0;
             int64_t         input_set_us = 0;
             int64_t         split_prepare_us = 0;
+            int64_t         split_target_wait_us = 0;
+            int64_t         split_source_sync_us = 0;
+            int64_t         split_copy_call_us = 0;
+            int64_t         split_profiled_us = 0;
+            uint64_t        split_copy_bytes = 0;
+            uint64_t        split_copy_calls = 0;
             size_t          graph_reuses = 0;
             size_t          phone_target_graph_tasks = 0;
             size_t          phone_target_consecutive = 0;
@@ -4800,6 +4820,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             uint64_t graph_multi_nodes = 0;
             uint64_t graph_single_add_count = 0;
             uint64_t graph_single_other_count = 0;
+            uint64_t graph_serialize_us = 0;
+            uint64_t graph_serialized_bytes = 0;
+            uint64_t graph_compute_cmd_us = 0;
+            uint64_t graph_recompute_cmd_us = 0;
             uint64_t get_tensor_count = 0;
             uint64_t get_tensor_bytes = 0;
         };
@@ -5883,6 +5907,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     task_timing.prepare_us;
                                 task_trace->split_prepare_cost_us =
                                     task_timing.split_prepare_us;
+                                task_trace->split_target_wait_us =
+                                    task_timing.split_target_wait_us;
+                                task_trace->split_source_sync_us =
+                                    task_timing.split_source_sync_us;
+                                task_trace->split_copy_call_us =
+                                    task_timing.split_copy_call_us;
+                                task_trace->split_profiled_us =
+                                    task_timing.split_profiled_us;
+                                task_trace->split_copy_bytes =
+                                    task_timing.split_copy_bytes;
+                                task_trace->split_copy_calls =
+                                    task_timing.split_copy_calls;
                                 task_trace->compute_range_cost_us =
                                     task_timing.compute_range_us;
                                 task_trace->output_sync_cost_us =
@@ -5930,6 +5966,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     counts.graph_single_other_count += delta(
                                         phone_rpc_before.graph_single_other_count,
                                         phone_rpc_after.graph_single_other_count);
+                                    counts.graph_serialize_us += delta(
+                                        phone_rpc_before.graph_serialize_us,
+                                        phone_rpc_after.graph_serialize_us);
+                                    counts.graph_serialized_bytes += delta(
+                                        phone_rpc_before.graph_serialized_bytes,
+                                        phone_rpc_after.graph_serialized_bytes);
+                                    counts.graph_compute_cmd_us += delta(
+                                        phone_rpc_before.graph_compute_cmd_us,
+                                        phone_rpc_after.graph_compute_cmd_us);
+                                    counts.graph_recompute_cmd_us += delta(
+                                        phone_rpc_before.graph_recompute_cmd_us,
+                                        phone_rpc_after.graph_recompute_cmd_us);
                                     counts.get_tensor_count += delta(
                                         phone_rpc_before.tensor_get_count,
                                         phone_rpc_after.tensor_get_count);
@@ -5946,6 +5994,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             state.graph_alloc_us += task_timing.graph_alloc_us;
                             state.input_set_us += task_timing.input_set_us;
                             state.split_prepare_us += task_timing.split_prepare_us;
+                            state.split_target_wait_us += task_timing.split_target_wait_us;
+                            state.split_source_sync_us += task_timing.split_source_sync_us;
+                            state.split_copy_call_us += task_timing.split_copy_call_us;
+                            state.split_profiled_us += task_timing.split_profiled_us;
+                            state.split_copy_bytes += task_timing.split_copy_bytes;
+                            state.split_copy_calls += task_timing.split_copy_calls;
                             state.graph_reuses += task_timing.graph_reused ? 1 : 0;
                             if (target_phone_shape &&
                                     task_result != nullptr &&
@@ -6769,6 +6823,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 << active_us / 1000.0
                                 << ",\"" << base << "_prepare_ms\":"
                                 << w.graph_prepare_us / 1000.0
+                                << ",\"" << base << "_split_target_wait_ms\":"
+                                << w.split_target_wait_us / 1000.0
+                                << ",\"" << base << "_split_source_sync_ms\":"
+                                << w.split_source_sync_us / 1000.0
+                                << ",\"" << base << "_split_copy_call_ms\":"
+                                << w.split_copy_call_us / 1000.0
+                                << ",\"" << base << "_split_profiled_ms\":"
+                                << w.split_profiled_us / 1000.0
+                                << ",\"" << base << "_split_copy_mib\":"
+                                << w.split_copy_bytes / 1048576.0
+                                << ",\"" << base << "_split_copy_calls\":"
+                                << w.split_copy_calls
                                 << ",\"" << base << "_output_sync_ms\":"
                                 << w.output_sync_us / 1000.0
                                 << ",\"" << base << "_ready_wait_ms\":"
@@ -6831,6 +6897,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 << ",\"meta_graph_rebuild_ms\":"
                                 << meta_delta_us(a.graph_rebuild_us,
                                                  b.graph_rebuild_us) / 1000.0
+                                << ",\"meta_phone_full_graph_assemble_ms\":"
+                                << meta_delta_us(a.graph_phone_full_assemble_us,
+                                                 b.graph_phone_full_assemble_us) / 1000.0
                                 << ",\"meta_graph_execute_ms\":"
                                 << meta_delta_us(a.graph_execute_us,
                                                  b.graph_execute_us) / 1000.0
@@ -6894,6 +6963,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     << ",\"set_tensor_bytes\":" << c.set_tensor_bytes
                                     << ",\"graph_compute_count\":" << c.graph_compute_count
                                     << ",\"graph_recompute_count\":" << c.graph_recompute_count
+                                    << ",\"graph_serialize_us\":" << c.graph_serialize_us
+                                    << ",\"graph_serialized_bytes\":" << c.graph_serialized_bytes
+                                    << ",\"graph_compute_cmd_us\":" << c.graph_compute_cmd_us
+                                    << ",\"graph_recompute_cmd_us\":" << c.graph_recompute_cmd_us
                                     << ",\"graph_snapshot_count\":" << c.graph_snapshot_count
                                     << ",\"graph_multi_count\":" << c.graph_multi_count
                                     << ",\"graph_multi_nodes\":" << c.graph_multi_nodes
@@ -7025,6 +7098,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         << t.graph_prepare_cost_us / 1000.0
                         << R"(,"split_prepare_ms":)"
                         << t.split_prepare_cost_us / 1000.0
+                        << R"(,"split_target_wait_ms":)"
+                        << t.split_target_wait_us / 1000.0
+                        << R"(,"split_source_sync_ms":)"
+                        << t.split_source_sync_us / 1000.0
+                        << R"(,"split_copy_call_ms":)"
+                        << t.split_copy_call_us / 1000.0
+                        << R"(,"split_profiled_ms":)"
+                        << t.split_profiled_us / 1000.0
+                        << R"(,"split_copy_bytes":)"
+                        << t.split_copy_bytes
+                        << R"(,"split_copy_calls":)"
+                        << t.split_copy_calls
                         << R"(,"compute_range_ms":)"
                         << t.compute_range_cost_us / 1000.0
                         << R"(,"output_sync_ms":)"

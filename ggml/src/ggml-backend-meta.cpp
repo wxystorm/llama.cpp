@@ -4316,6 +4316,7 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
     const int64_t meta_rebuild_begin_us = needs_rebuild ? ggml_time_us() : 0;
     int64_t meta_rebuild_us = 0;
+    int64_t meta_phone_full_assemble_us = 0;
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -21483,12 +21484,15 @@ auto prefill_norm_sg_has_prework =
             phone_region_pre_graph_us =
                 phone_region_build_begin_us - layer_wall_start_us;
         }
+        const int64_t full_assemble_begin_us =
+            full_region_graph_ready ? ggml_time_us() : 0;
         ggml_cgraph * phone_graph = full_region_graph_ready ?
             build_phone_block_graph(i, full_region_graph_end) :
             phone_block_fused ?
                 build_phone_block_graph(i, phone_block_end) :
                 backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
         if (full_region_graph_ready) {
+            meta_phone_full_assemble_us += ggml_time_us() - full_assemble_begin_us;
             GGML_LOG_INFO(
                 "[PHONE_FULL_REGION_GRAPH] event=READY form=%s "
                 "sg=%zu..%zu compute_end=%zu layer=%d nodes=%d "
@@ -23602,6 +23606,7 @@ auto prefill_norm_sg_has_prework =
         backend_ctx->tensor_profile.graph_compute_count += 1;
         backend_ctx->tensor_profile.graph_total_us += meta_graph_total_all_us;
         backend_ctx->tensor_profile.graph_rebuild_us += meta_rebuild_us;
+        backend_ctx->tensor_profile.graph_phone_full_assemble_us += meta_phone_full_assemble_us;
         backend_ctx->tensor_profile.graph_execute_us += meta_execute_us;
         backend_ctx->tensor_profile.graph_other_us += meta_other_all_us;
         backend_ctx->tensor_profile.simple_backend_count =

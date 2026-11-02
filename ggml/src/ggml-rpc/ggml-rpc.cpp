@@ -71,6 +71,15 @@ static bool rpc_region_ring_metrics_enabled() {
     return enabled;
 }
 
+static bool rpc_region_ring_graph_io_profile_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_REGION_RING_RPC_GRAPH_PROFILE");
+        return rpc_region_ring_metrics_enabled() &&
+            env != nullptr && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 static constexpr size_t RPC_ROUTE_TRANSFER_LANES = 4;
 static constexpr size_t RPC_RETURN_TRANSFER_LANES = 2;
 static constexpr size_t RPC_SNAPSHOT_SLOTS = 4;
@@ -747,6 +756,10 @@ struct rpc_region_ring_command_stats {
     std::atomic<uint64_t> graph_multi_nodes { 0 };
     std::atomic<uint64_t> graph_single_add_count { 0 };
     std::atomic<uint64_t> graph_single_other_count { 0 };
+    std::atomic<uint64_t> graph_serialize_us { 0 };
+    std::atomic<uint64_t> graph_serialized_bytes { 0 };
+    std::atomic<uint64_t> graph_compute_cmd_us { 0 };
+    std::atomic<uint64_t> graph_recompute_cmd_us { 0 };
 };
 
 struct ggml_backend_rpc_device_context {
@@ -1151,6 +1164,14 @@ static bool ggml_backend_rpc_get_snapshot_stats(
         commands.graph_single_add_count.load(std::memory_order_relaxed);
     stats->graph_single_other_count =
         commands.graph_single_other_count.load(std::memory_order_relaxed);
+    stats->graph_serialize_us =
+        commands.graph_serialize_us.load(std::memory_order_relaxed);
+    stats->graph_serialized_bytes =
+        commands.graph_serialized_bytes.load(std::memory_order_relaxed);
+    stats->graph_compute_cmd_us =
+        commands.graph_compute_cmd_us.load(std::memory_order_relaxed);
+    stats->graph_recompute_cmd_us =
+        commands.graph_recompute_cmd_us.load(std::memory_order_relaxed);
     return true;
 }
 
@@ -4648,6 +4669,7 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    const bool profile_graph_io = rpc_region_ring_graph_io_profile_enabled();
     const uint64_t graph_uid = rpc_graph_effective_uid(cgraph); //这个是客户端的
     const bool cacheable = cgraph->uid != 0;
     bool reuse = cacheable && rpc_dev_ctx->graph_uids.find(graph_uid) != rpc_dev_ctx->graph_uids.end();
@@ -4768,10 +4790,13 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
         auto sock = get_socket(rpc_ctx->endpoint);
+        const int64_t command_begin_us = profile_graph_io ? ggml_time_us() : 0;
         bool status = send_rpc_cmd_compact_small(
             sock,
             RPC_CMD_GRAPH_RECOMPUTE,
             request);
+        const int64_t command_wall_us =
+            profile_graph_io ? ggml_time_us() - command_begin_us : 0;
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
@@ -4785,6 +4810,10 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         if (status && rpc_region_ring_metrics_enabled()) {
             rpc_dev_ctx->region_ring_command_stats.graph_recompute_count.fetch_add(
                 1, std::memory_order_relaxed);
+            if (profile_graph_io) {
+                rpc_dev_ctx->region_ring_command_stats.graph_recompute_cmd_us.fetch_add(
+                    (uint64_t) command_wall_us, std::memory_order_relaxed);
+            }
             rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
         }
     } else {
@@ -4801,12 +4830,24 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
             rpc_dev_ctx->graph_uids.insert(graph_uid);
         }
         std::vector<uint8_t> input;
+        const int64_t serialize_begin_us = profile_graph_io ? ggml_time_us() : 0;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
+        const int64_t serialize_us =
+            profile_graph_io ? ggml_time_us() - serialize_begin_us : 0;
         auto sock = get_socket(rpc_ctx->endpoint);
+        const int64_t command_begin_us = profile_graph_io ? ggml_time_us() : 0;
         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        const int64_t command_wall_us =
+            profile_graph_io ? ggml_time_us() - command_begin_us : 0;
         if (status && rpc_region_ring_metrics_enabled()) {
             rpc_dev_ctx->region_ring_command_stats.graph_compute_count.fetch_add(
                 1, std::memory_order_relaxed);
+            if (profile_graph_io) {
+                auto & stats = rpc_dev_ctx->region_ring_command_stats;
+                stats.graph_serialize_us.fetch_add((uint64_t) serialize_us, std::memory_order_relaxed);
+                stats.graph_serialized_bytes.fetch_add((uint64_t) input.size(), std::memory_order_relaxed);
+                stats.graph_compute_cmd_us.fetch_add((uint64_t) command_wall_us, std::memory_order_relaxed);
+            }
             rpc_region_ring_classify_graph(rpc_dev_ctx, cgraph);
         }
         uint32_t n_tensors = 0;

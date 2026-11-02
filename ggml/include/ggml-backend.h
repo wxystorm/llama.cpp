@@ -381,6 +381,18 @@ extern "C" {
     GGML_API bool             ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched,
                                                              struct ggml_cgraph * graph);  // returns success
     // Prepare or compute one split of the currently allocated graph. Split ranges are [first_split, last_split).
+    // Opt-in client-clock timing for split preparation (not GPU kernel time).
+    // LLAMA_REGION_RING_PREPARE_BREAKDOWN=1; zeroed if disabled.
+    struct ggml_backend_sched_prepare_breakdown {
+        int64_t  total_us;
+        int64_t  target_wait_call_us;
+        int64_t  source_sync_us;
+        int64_t  copy_call_us;
+        uint64_t copy_bytes;
+        uint64_t copy_calls;
+    };
+    GGML_API void ggml_backend_sched_get_last_prepare_breakdown(
+        ggml_backend_sched_t sched, struct ggml_backend_sched_prepare_breakdown * stats);
     GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
     // Weight-prefetch helper: enqueue only immutable host weights for one split
     // onto a separate destination backend stream. The caller synchronizes
@@ -487,6 +499,8 @@ extern "C" {
         int64_t graph_rebuild_us;
         int64_t graph_execute_us;
         int64_t graph_other_us;
+        // Subset of graph_execute_us: Phone Full Region graph assembly.
+        int64_t graph_phone_full_assemble_us;
 
         // Generic per-simple-backend compute timing accumulated inside Meta.
         // Index 0 is the primary backend (PC CPU in the hybrid setup);

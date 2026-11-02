@@ -348,6 +348,12 @@ struct ggml_backend_rpc_snapshot_stats {
     uint64_t graph_multi_nodes;
     uint64_t graph_single_add_count;
     uint64_t graph_single_other_count;
+    // Optional client-side graph I/O timing. Command wall time may include
+    // remote execution/ack; it is NOT pure graph registration cost.
+    uint64_t graph_serialize_us;
+    uint64_t graph_serialized_bytes;
+    uint64_t graph_compute_cmd_us;
+    uint64_t graph_recompute_cmd_us;
 };
 
 using ggml_backend_rpc_get_snapshot_stats_t = bool (*)(
