@@ -4679,6 +4679,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         bank.sched.get());
                 const int64_t prepare_begin_us = ggml_time_us();
                 {
+                    // Bank A/B share CUDA0. Never synchronize it during the
+                    // other Bank's graph capture. Lock CUDA before PREPARE.
+                    std::unique_lock<std::mutex> cuda_gate(
+                        region_ring_cuda_execution_mutex);
                     std::unique_lock<std::mutex> prepare_gate(
                         region_ring_prepare_mutex);
 
