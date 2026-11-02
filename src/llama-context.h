@@ -452,8 +452,7 @@ private:
                                       int64_t *                            ring_prepare_wait_us = nullptr,
                                       int64_t *                            ring_cpu_wait_us = nullptr,
                                       int64_t *                            ring_cuda_wait_us = nullptr,
-                                      bool                                 preserve_weight_cache_on_graph_reset = false,
-                                      bool                                 phone_static_graph = false);
+                                      bool                                 preserve_weight_cache_on_graph_reset = false);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
