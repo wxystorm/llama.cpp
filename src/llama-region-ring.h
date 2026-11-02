@@ -122,6 +122,71 @@ struct llama_region_ring_region {
     }
 };
 
+// The outer Phone scheduler has one immutable graph per distinct
+// (Region, Chunk width, output count). Only the terminal shape may own the
+// canonical Graph Result used by the caller to read logits. All other shapes
+// must have independent Scheduler allocations.
+struct llama_region_ring_phone_static_shape {
+    size_t region = 0;
+    uint32_t tokens = 0;
+    int32_t output_count = 0;
+    uint32_t sample_begin = 0;
+    bool canonical = false;
+};
+
+inline std::vector<llama_region_ring_phone_static_shape>
+llama_region_ring_phone_static_shapes(
+        const std::vector<llama_region_ring_region> & regions,
+        const std::vector<int> & widths,
+        uint32_t n_tokens,
+        const int8_t * output_flags) {
+    std::vector<llama_region_ring_phone_static_shape> result;
+    if (regions.size() != widths.size() ||
+        output_flags == nullptr || n_tokens == 0) {
+        return result;
+    }
+    for (size_t r = 0; r < regions.size(); ++r) {
+        if (regions[r].kind != llama_region_ring_stage_kind::PHONE) {
+            continue;
+        }
+        if (widths[r] <= 0) {
+            return {};
+        }
+        const uint32_t width = (uint32_t) widths[r];
+        for (uint32_t begin = 0; begin < n_tokens; begin += width) {
+            const uint32_t count = std::min(width, n_tokens - begin);
+            int32_t outputs = 0;
+            if (r + 1 == regions.size()) {
+                for (uint32_t t = begin; t < begin + count; ++t) {
+                    outputs += output_flags[t] != 0;
+                }
+            }
+            const bool terminal = r + 1 == regions.size() &&
+                begin + count == n_tokens;
+            const auto it = std::find_if(result.begin(), result.end(),
+                [&](const llama_region_ring_phone_static_shape & item) {
+                    return item.region == r && item.tokens == count &&
+                           item.output_count == outputs;
+                });
+            if (it == result.end()) {
+                result.push_back({r, count, outputs, begin, terminal});
+            } else if (terminal) {
+                // Output masks other than the single-terminal-logit contract
+                // are rejected by the caller. This defensive branch also
+                // keeps the canonical graph's representative range correct.
+                it->sample_begin = begin;
+                it->canonical = true;
+            }
+        }
+    }
+    std::stable_sort(result.begin(), result.end(),
+        [](const llama_region_ring_phone_static_shape & a,
+           const llama_region_ring_phone_static_shape & b) {
+            return !a.canonical && b.canonical;
+        });
+    return result;
+}
+
 // GPU weight streaming uses two fixed physical Banks. Keep Bank
 // parity and rank+2 lookahead in one shared policy so runtime, planner and
 // regression tests cannot silently drift.
