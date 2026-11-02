@@ -5628,6 +5628,27 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ring_sched[dev];
                     llm_graph_result * task_res =
                         ring_res[dev];
+                    bool phone_prebuilt_task = false;
+                    if (phone_static_templates &&
+                            dev == (size_t) llama_region_ring_device::PHONE &&
+                            stage.kind == llama_hybrid_runtime_stage_kind::PHONE) {
+                        const auto it = std::find_if(
+                            phone_prefill_templates.begin(),
+                            phone_prefill_templates.end(),
+                            [&](const phone_prefill_template & item) {
+                                return item.region == task.region &&
+                                       item.tokens == (uint32_t) task.n_tokens &&
+                                       item.output_count == block_outputs;
+                            });
+                        if (it == phone_prefill_templates.end() ||
+                                it->scheduler == nullptr || it->result == nullptr) {
+                            throw std::runtime_error(
+                                "missing exact prebuilt Phone Region Graph");
+                        }
+                        task_sched = it->scheduler;
+                        task_res = it->result;
+                        phone_prebuilt_task = true;
+                    }
                     int gpu_bank = -1;
                     int64_t gpu_bank_wait_us = 0;
                     bool gpu_bank_resident = false;
@@ -5859,7 +5880,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 pc_phone_overlap ? &state.cpu_wait_us : nullptr,
                                 pc_phone_overlap ? &state.cuda_wait_us : nullptr,
                                 dev == 1 && gpu_weight_streaming &&
-                                    gpu_bank_resident);
+                                    gpu_bank_resident,
+                                phone_prebuilt_task);
                             const int64_t compute_end_us = ggml_time_us();
                             if (task_trace != nullptr) {
                                 task_trace->host_execute_end_us = compute_end_us;
@@ -6204,7 +6226,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // and final outputs before returning.
                     if (cancelled_before_compute || task_result == nullptr ||
                         task_status != GGML_STATUS_SUCCESS ||
-                        (last && task_result != res_use)) {
+                        (last &&
+                         task.token_begin + task.n_tokens ==
+                             (int) ubatch.n_tokens &&
+                         task_result != res_use)) {
                         state.status = task_status == GGML_STATUS_SUCCESS ?
                             GGML_STATUS_FAILED : task_status;
                         LLAMA_LOG_ERROR(
