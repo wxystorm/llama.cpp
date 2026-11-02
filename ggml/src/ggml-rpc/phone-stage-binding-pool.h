@@ -211,6 +211,7 @@ struct template_plan {
     // This is a CAPACITY check, NOT a validated relocation map. No graph
     // is allowed to rebind into a slot based solely on this value.
     size_t stage_arena_required_bytes = 0;
+    uint64_t stage_layout_signature = 0;
 };
 
 // Slots are not graphs. A slot is released only after both GPU completion

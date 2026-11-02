@@ -7,6 +7,7 @@
 #include "p2c-arena-queue.h"
 #include "p2c-stream-receiver.h"
 #include "phone-stage-binding-pool.h"
+#include "phone-stage-binding-map.h"
 
 #include <array>
 #include <chrono>
@@ -7893,6 +7894,7 @@ void rpc_server::phone_stage_binding_preflight(
     std::vector<overlap_detail> overlap_details;
     std::vector<protected_range> protected_ranges;
     std::unordered_set<const ggml_tensor *> visited;
+    std::vector<const ggml_tensor *> visited_order;
     const auto protect_tensor = [&](const ggml_tensor * t) {
         if (t != nullptr && t->buffer != nullptr &&
             t->data != nullptr && !ggml_is_empty(t)) {
@@ -7909,6 +7911,7 @@ void rpc_server::phone_stage_binding_preflight(
     std::function<void(const ggml_tensor *)> visit =
         [&](const ggml_tensor * t) {
             if (t == nullptr || !visited.insert(t).second) { return; }
+            visited_order.push_back(t);
             if (t->op == GGML_OP_NONE ||
                 t->op == GGML_OP_SET_ROWS ||
                 t->op == GGML_OP_CPY ||
@@ -8045,12 +8048,38 @@ void rpc_server::phone_stage_binding_preflight(
     const size_t stage_buffer_bytes =
         ggml_backend_buffer_get_size(stage_buffer);
     ggml_phone_stage::arena_extent stage_extent;
+    ggml_phone_stage::stage_binding_map binding_map(stage_buffer_bytes);
+    if (visited_order.size() > UINT32_MAX) {
+        return;
+    }
+    std::unordered_map<const ggml_tensor *, uint32_t> binding_ids;
+    binding_ids.reserve(visited_order.size());
+    std::unordered_set<ggml_backend_buffer_t> kv_buffers;
+    for (size_t i = 0; i < visited_order.size(); ++i) {
+        const ggml_tensor * t = visited_order[i];
+        binding_ids.emplace(t, static_cast<uint32_t>(i + 1));
+        if (t->op == GGML_OP_SET_ROWS && t->buffer != nullptr) {
+            kv_buffers.insert(t->buffer);
+        }
+    }
+    size_t external_tensors = 0;
+    size_t external_kv = 0;
+    size_t external_leaves = 0;
+    ggml_phone_stage::status map_status = ggml_phone_stage::status::ok;
+    uint32_t map_failed_id = 0;
     size_t stage_kv_ops = 0;
     size_t stage_quant_weights = 0;
     bool stage_bounds_ok = stage_buffer_bytes != 0;
-    for (const ggml_tensor * t : visited) {
-        if (t == nullptr || t->buffer != stage_buffer ||
+    for (const ggml_tensor * t : visited_order) {
+        if (t == nullptr || t->buffer == nullptr ||
             t->data == nullptr || ggml_is_empty(t)) {
+            continue;
+        }
+        if (t->buffer != stage_buffer) {
+            ++external_tensors;
+            external_kv += kv_buffers.count(t->buffer) != 0;
+            external_leaves += kv_buffers.count(t->buffer) == 0 &&
+                               t->op == GGML_OP_NONE;
             continue;
         }
         if (t->op == GGML_OP_SET_ROWS) {
@@ -8071,6 +8100,27 @@ void rpc_server::phone_stage_binding_preflight(
             stage_bounds_ok = false;
             break;
         }
+        const uint32_t id = binding_ids.at(t);
+        if (t->view_src != nullptr && t->view_src->buffer != stage_buffer) {
+            map_status = ggml_phone_stage::status::invalid;
+            map_failed_id = id;
+            break;
+        }
+        const uint32_t view_id = t->view_src == nullptr ? 0 :
+            binding_ids.at(t->view_src);
+        const bool protected_storage =
+            t == last || t->op == GGML_OP_NONE ||
+            t->op == GGML_OP_SET_ROWS || t->op == GGML_OP_CPY ||
+            (t->flags & (GGML_TENSOR_FLAG_INPUT |
+                         GGML_TENSOR_FLAG_OUTPUT)) != 0;
+        map_status = binding_map.add({
+            id, address - stage_buffer_base, bytes, view_id,
+            static_cast<size_t>(t->view_offs), protected_storage,
+        });
+        if (map_status != ggml_phone_stage::status::ok) {
+            map_failed_id = id;
+            break;
+        }
     }
     if (!stage_bounds_ok || !stage_extent.valid() ||
         stage_kv_ops != 0 || stage_quant_weights != 0) {
@@ -8083,10 +8133,27 @@ void rpc_server::phone_stage_binding_preflight(
             stage_extent.tensor_count, stage_kv_ops, stage_quant_weights);
         return;
     }
+    if (map_status == ggml_phone_stage::status::ok) {
+        map_status = binding_map.validate(&map_failed_id);
+    }
+    if (map_status != ggml_phone_stage::status::ok ||
+        binding_map.required_bytes() != stage_extent.last_offset ||
+        binding_map.entries().size() != stage_extent.tensor_count) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=BIND_MAP_REJECT "
+            "layer=%d tokens=%u failed_id=%u map_status=%d "
+            "map_entries=%zu stage_tensors=%zu "
+            "reason=VIEW_OR_LAYOUT_INVALID status=SAFE\n",
+            first_layer, plan.tokens, map_failed_id,
+            static_cast<int>(map_status), binding_map.entries().size(),
+            stage_extent.tensor_count);
+        return;
+    }
     // Use the original buffer-relative END offset, not (end-start).
     // This preserves original tensor offsets if the activation arena begins
     // after a reserved prefix; capacity is deliberately an upper bound.
     plan.stage_arena_required_bytes = stage_extent.last_offset;
+    plan.stage_layout_signature = binding_map.layout_signature();
     const size_t stage_used_span = stage_extent.span_bytes();
 
     const auto status = plan.scratch.build(transient, {});
@@ -8127,6 +8194,17 @@ void rpc_server::phone_stage_binding_preflight(
         return;
     }
 
+    const bool layout_drift = !new_template &&
+        existing->stage_layout_signature != plan.stage_layout_signature;
+    if (layout_drift) {
+        GGML_LOG_INFO(
+            "[PHONE_STAGE_BINDING] event=BIND_LAYOUT_DRIFT "
+            "layer=%d tokens=%u topology_sig=%" PRIu64 " "
+            "cached_sig=%" PRIu64 " current_sig=%" PRIu64 " "
+            "action=NO_REBIND status=DIAGNOSTIC_ONLY\n",
+            first_layer, registered_tokens, structural_sig,
+            existing->stage_layout_signature, plan.stage_layout_signature);
+    }
     // Check for changing arena requirements even when the topology remains
     // identical. This is a reservation bound only: it never authenticates a
     // new dynamic Tensor layout or bypasses the OpenCL extra/view checks.
@@ -8365,6 +8443,82 @@ void rpc_server::phone_stage_binding_preflight(
                             "need_each=%zu reason=ALLOC_FAILED "
                             "status=SAFE\n", needed);
                     }
+                }
+            }
+        }
+        if (new_template || growing_template) {
+            const auto & arenas = phone_stage_device_arenas[device];
+            const bool have_slots = arenas.buffers[0] != nullptr &&
+                arenas.buffers[1] != nullptr &&
+                arenas.buffers[0] != arenas.buffers[1] &&
+                arenas.capacity >= binding_map.required_bytes();
+            std::array<ggml_phone_stage::stage_slot_address,
+                       ggml_phone_stage::k_slot_count> slot_addresses {};
+            std::array<std::unordered_map<uint32_t, size_t>,
+                       ggml_phone_stage::k_slot_count> candidates;
+            auto bind_status = ggml_phone_stage::status::out_of_memory;
+            if (have_slots) {
+                for (size_t slot = 0;
+                     slot < ggml_phone_stage::k_slot_count; ++slot) {
+                    const ggml_backend_buffer_t buffer = arenas.buffers[slot];
+                    slot_addresses[slot] = {
+                        reinterpret_cast<size_t>(
+                            ggml_backend_buffer_get_base(buffer)),
+                        ggml_backend_buffer_get_size(buffer),
+                    };
+                }
+                bind_status = binding_map.resolve_slots(slot_addresses,
+                                                        candidates);
+            }
+            GGML_LOG_INFO(
+                "[PHONE_STAGE_BINDING] event=BIND_MAP "
+                "layer=%d..%d tokens=%u stage_tensors=%zu views=%zu "
+                "protected=%zu external=%zu external_kv=%zu "
+                "external_leaves=%zu required_bytes=%zu "
+                "slot_bytes=%zu result=%d status=%s "
+                "mode=DIAGNOSTIC_ONLY\n",
+                first_layer, max_layer, registered_tokens,
+                binding_map.entries().size(), binding_map.view_count(),
+                binding_map.protected_count(), external_tensors,
+                external_kv, external_leaves, binding_map.required_bytes(),
+                arenas.capacity, static_cast<int>(bind_status),
+                !have_slots ? "SKIPPED_NO_POOL" :
+                    bind_status == ggml_phone_stage::status::ok ?
+                        "PASS" : "REJECT");
+            const char * map_trace =
+                std::getenv("GGML_RPC_PHONE_BINDING_MAP_TRACE");
+            if (bind_status == ggml_phone_stage::status::ok &&
+                map_trace != nullptr && std::strcmp(map_trace, "1") == 0) {
+                for (const auto & entry : binding_map.entries()) {
+                    const ggml_tensor * t = visited_order[entry.id - 1];
+                    GGML_LOG_INFO(
+                        "[PHONE_STAGE_BINDING] event=BIND_ENTRY "
+                        "layer=%d tokens=%u id=%u name=%s kind=%s "
+                        "protected=%d source_offset=%zu bytes=%zu "
+                        "view_source=%u view_offset=%zu "
+                        "slot0_addr=%zx slot1_addr=%zx "
+                        "status=DIAGNOSTIC_ONLY\n",
+                        first_layer, registered_tokens, entry.id,
+                        t->name, entry.view_source_id ? "VIEW" : "ROOT",
+                        entry.protected_storage ? 1 : 0,
+                        entry.source_offset, entry.bytes,
+                        entry.view_source_id, entry.view_offset,
+                        candidates[0].at(entry.id), candidates[1].at(entry.id));
+                }
+                for (const ggml_tensor * t : visited_order) {
+                    if (t->buffer == nullptr || t->data == nullptr ||
+                        ggml_is_empty(t) || t->buffer == stage_buffer) {
+                        continue;
+                    }
+                    const char * storage_class =
+                        kv_buffers.count(t->buffer) ? "KV" :
+                        t->op == GGML_OP_NONE ? "LEAF" : "OTHER";
+                    GGML_LOG_INFO(
+                        "[PHONE_STAGE_BINDING] event=BIND_EXTERNAL "
+                        "layer=%d tokens=%u id=%u name=%s class=%s "
+                        "action=KEEP_ORIGINAL_BUFFER\n",
+                        first_layer, registered_tokens, binding_ids.at(t),
+                        t->name, storage_class);
                 }
             }
         }
