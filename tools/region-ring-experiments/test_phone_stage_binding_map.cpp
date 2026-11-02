@@ -11,6 +11,22 @@
 using namespace ggml_phone_stage;
 
 int main() {
+    // A zero-logit prefill chunk is allowed only when its KV writes
+    // remain externally owned. Nonempty missing outputs must fail closed.
+    using contract = slot0_output_contract;
+    assert(classify_slot0_output(5, 1, false, 0, false) ==
+           contract::copied);
+    assert(classify_slot0_output(5, 0, true, 2, false) ==
+           contract::kv_only);
+    assert(classify_slot0_output(5, 0, false, 2, false) ==
+           contract::reject);
+    assert(classify_slot0_output(5, 0, true, 0, false) ==
+           contract::reject);
+    assert(classify_slot0_output(5, 0, true, 2, true) ==
+           contract::reject);
+    assert(classify_slot0_output(0, 0, true, 2, false) ==
+           contract::reject);
+
     stage_binding_map map(321650688);
     // Real 64-token full-stage high-water extent, including input/output.
     assert(map.add({1, 0, 1310720, 0, 0, true}) == status::ok);

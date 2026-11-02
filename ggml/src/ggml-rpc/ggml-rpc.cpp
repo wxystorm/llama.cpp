@@ -5132,6 +5132,8 @@ public:
     };
     struct phone_stage_slot0_graph {
         bool ready = false;
+        bool kv_only_output = false;
+        size_t external_kv_writes = 0;
         size_t required_bytes = 0;
         uint32_t tokens = 0;
         std::vector<phone_stage_slot0_tensor> tensors;
@@ -8598,6 +8600,25 @@ void rpc_server::phone_stage_binding_preflight(
                 "INVALID_TENSOR_LAYOUT" : "NO_OPENCL_SLOT";
             size_t input_count = 0;
             size_t output_count = 0;
+            size_t external_kv_writes = 0;
+            bool unmapped_external_output = false;
+            const bool zero_token_terminal =
+                last->ne[0] > 0 && last->ne[1] == 0 &&
+                last->ne[2] > 0 && last->ne[3] > 0 &&
+                (last->flags & GGML_TENSOR_FLAG_OUTPUT) != 0;
+            if (valid) {
+                for (const ggml_tensor * t : visited_order) {
+                    if (t == nullptr || t->buffer == nullptr ||
+                        t->buffer == stage_buffer || ggml_is_empty(t)) {
+                        continue;
+                    }
+                    if (t->op == GGML_OP_SET_ROWS) {
+                        ++external_kv_writes;
+                    } else if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+                        unmapped_external_output = true;
+                    }
+                }
+            }
             if (valid) {
                 proposed.required_bytes = binding_map.required_bytes();
                 proposed.tokens = registered_tokens;
@@ -8628,7 +8649,25 @@ void rpc_server::phone_stage_binding_preflight(
                         record.source_offset, SIZE_MAX, input, output,
                     });
                 }
-                if (valid && input_count != 0 && output_count != 0) {
+                if (valid) {
+                    const auto contract =
+                        ggml_phone_stage::classify_slot0_output(
+                            input_count, output_count, zero_token_terminal,
+                            external_kv_writes, unmapped_external_output);
+                    if (contract == ggml_phone_stage::slot0_output_contract::reject) {
+                        valid = false;
+                        reject_reason = input_count == 0 ? "NO_STAGE_INPUT" :
+                            output_count != 0 ? "INVALID_OUTPUT_CONTRACT" :
+                            !zero_token_terminal ? "NONEMPTY_TERMINAL_WITHOUT_COPY" :
+                            unmapped_external_output ? "UNMAPPED_EXTERNAL_OUTPUT" :
+                            "NO_EXTERNAL_KV_WRITES";
+                    } else {
+                        proposed.kv_only_output =
+                            contract == ggml_phone_stage::slot0_output_contract::kv_only;
+                        proposed.external_kv_writes = external_kv_writes;
+                    }
+                }
+                if (valid) {
                     for (const ggml_tensor * t : visited_order) {
                         if (t != nullptr && t->buffer != stage_buffer &&
                             t->view_src != nullptr &&
@@ -8639,7 +8678,7 @@ void rpc_server::phone_stage_binding_preflight(
                         }
                     }
                 }
-                if (valid && input_count != 0 && output_count != 0) {
+                if (valid) {
                     for (auto & item : proposed.tensors) {
                         if (item.tensor->view_src == nullptr) {
                             continue;
@@ -8653,8 +8692,6 @@ void rpc_server::phone_stage_binding_preflight(
                         }
                         item.parent = parent->second;
                     }
-                } else {
-                    valid = false;
                 }
                 if (valid) {
                     std::vector<uint8_t> color(proposed.tensors.size(), 0);
@@ -8690,12 +8727,19 @@ void rpc_server::phone_stage_binding_preflight(
             GGML_LOG_INFO(
                 "[PHONE_STAGE_SLOT0] event=REGISTER uid=%" PRIu64
                 " layer=%d..%d tokens=%u tensors=%zu inputs=%zu "
-                "outputs=%zu slot_bytes=%zu status=%s reason=%s "
-                "mode=OPT_IN\n",
+                "outputs=%zu terminal=%s terminal_ne1=%" PRId64 " "
+                "terminal_flags=%u zero_token_terminal=%d "
+                "kv_writes=%zu external_output=%d output_mode=%s "
+                "slot_bytes=%zu status=%s reason=%s mode=OPT_IN\n",
                 graph_uid, first_layer, max_layer, registered_tokens,
                 valid ? slot0.tensors.size() : size_t(0),
-                input_count, output_count, arenas.capacity,
-                valid ? "READY" : "SKIP",
+                input_count, output_count,
+                last->name, last->ne[1], static_cast<unsigned>(last->flags),
+                zero_token_terminal ? 1 : 0,
+                external_kv_writes, unmapped_external_output ? 1 : 0,
+                !valid ? "REJECT" :
+                    slot0.kv_only_output ? "KV_ONLY" : "COPY",
+                arenas.capacity, valid ? "READY" : "SKIP",
                 valid ? "NONE" : reject_reason);
         }
     }
@@ -8826,14 +8870,19 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
             ggml_backend_tensor_copy(item.tensor, &dst);
             output_bytes += ggml_nbytes(item.tensor);
         }
-        ggml_backend_synchronize(backends[device]);
+        if (!plan.kv_only_output) {
+            ggml_backend_synchronize(backends[device]);
+        }
     }
 
     GGML_LOG_INFO(
         "[PHONE_STAGE_SLOT0] event=COMPUTE uid=%" PRIu64
         " tokens=%u inputs_bytes=%zu outputs_bytes=%zu "
+        "kv_writes=%zu output_mode=%s "
         "wall_ms=%.3f status=%s mode=SLOT0_EXEC\n",
         graph_uid, plan.tokens, input_bytes, output_bytes,
+        plan.external_kv_writes,
+        plan.kv_only_output ? "KV_ONLY" : "COPY",
         (ggml_time_us() - begin_us) / 1000.0,
         status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
     return status;

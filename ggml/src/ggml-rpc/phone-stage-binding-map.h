@@ -197,4 +197,26 @@ private:
     std::vector<stage_binding_entry> entries_;
 };
 
+enum class slot0_output_contract : uint8_t {
+    reject,
+    copied,
+    kv_only,
+};
+
+inline slot0_output_contract classify_slot0_output(
+        size_t inputs, size_t stage_outputs,
+        bool zero_token_terminal, size_t external_kv_writes,
+        bool unmapped_external_output) {
+    if (inputs == 0) {
+        return slot0_output_contract::reject;
+    }
+    if (stage_outputs != 0) {
+        return slot0_output_contract::copied;
+    }
+    return zero_token_terminal && external_kv_writes != 0 &&
+        !unmapped_external_output ?
+        slot0_output_contract::kv_only :
+        slot0_output_contract::reject;
+}
+
 } // namespace ggml_phone_stage
