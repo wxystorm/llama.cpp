@@ -945,3 +945,66 @@ A forced Ctrl+C can make the wrapper report STAGE3 exited 1; the last
 completed [JUPITER_SEQUENCE_PLAN] record does not by itself establish
 a crash. Restart the same command with --resume: completed x/repeat
 q-sweep samples and fully committed targeted q samples will be reused.
+
+## Jupiter versus Region Ring: compare existing Prefill results without rerunning
+
+The methods have different runtime structures. Jupiter uses PC GPU + Phone
+layer scheduling (`--split-mode layer`); Region Ring uses CPU/CUDA/Phone
+region/tensor scheduling (`--split-mode tensor`). The comparison is
+**system-level**, not an isolation of one Planner optimization.
+
+The read-only aggregator `compare_region_ring.py` uses an existing Jupiter
+Stage-5 suite and a Region Ring `summary.csv`:
+
+```powershell
+cd E:\llama\llama-jupiter
+git pull --ff-only origin baseline/jupiter-infocom25
+python -m unittest discover -s .\tools\jupiter -p test_compare_region_ring.py -v
+
+# Set this to the actual path printed by your completed Region Ring sweep.
+$ringSummary = 'E:\llama\llama-tensor-v2\region-ring-results\<run-id>\summary.csv'
+
+python .\tools\jupiter\compare_region_ring.py `
+  --jupiter .\jupiter-prompt-suite-once\suite-results.csv `
+  --region $ringSummary `
+  --out .\jupiter-vs-region-ring.csv
+```
+
+To locate an existing Ring summary without running a benchmark:
+
+```powershell
+Get-ChildItem E:\llama\llama-tensor-v2 -Filter summary.csv -Recurse |
+  Select-Object FullName,LastWriteTime |
+  Sort-Object LastWriteTime -Descending
+```
+
+The generated CSV records Prompt, status, actual token counts, Jupiter DP
+chunks, Region Ring G/C/P layout, Prefill latency/throughput, sample counts,
+configuration differences, and observed time ratios. It launches **no**
+llama.cpp process or Phone RPC server.
+
+**Matching checks:**
+
+- Locate by prompt name, then verify **raw prompt SHA256**.
+- Verify actual Prefill token count, not filename tokens: `prompt_1024.txt`
+  may have 1032 measured tokens.
+- Verify GGUF filename and size. For publication, verify the full model
+  hash or other evidence of identical weights; size/name alone is weak.
+- Require PASS for both; reject duplicate runs rather than cherry-picking.
+- If any matching check fails, do **not** produce a latency ratio.
+- If prompt/model/tokens match, show an observed ratio, but mark config
+  differences in batch, ubatch, context, threads or n_predict as
+  `MATCHED_INPUTS_CONFIG_DIFF`, which is **indicative only**.
+  Equal recorded settings are marked `MATCHED_STRICT_PARAMS`.
+
+For controlled testing, ensure identical UTF-8 prompt text. Jupiter `-p`
+strips trailing CR/LF whereas Region Ring `-f` reads the supplied file;
+matching hashes and token counts may still need actual-text verification.
+Use consistent model and input tokens, context, batch/ubatch, threads,
+generation length, phone hardware and commits. Run the two Phone RPC
+servers **sequentially**, not as competing loads on one phone. Both
+Prefill timers should exclude planner calibration and model loading.
+
+A single Region Ring run versus a multi-run Jupiter median is exploratory,
+not a stable statistical effect. If the preliminary trend is useful,
+collect repeated measurements under one controlled protocol.
