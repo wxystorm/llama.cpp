@@ -156,6 +156,19 @@ using ggml_backend_rpc_profile_duplex_t = bool (*)(
 #define GGML_BACKEND_RPC_PHONE_RING_AUTO_WAIT_PROC \
     "ggml_backend_rpc_phone_ring_auto_wait"
 
+// Experimental ACK-free Phone input stream (RPC patch 23).
+#define GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC \
+    "ggml_backend_rpc_phone_input_stream_run"
+#define GGML_BACKEND_RPC_PHONE_INPUT_STREAM_PUSH_PROC \
+    "ggml_backend_rpc_phone_input_stream_push"
+
+using ggml_backend_rpc_phone_input_stream_run_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, bool active);
+using ggml_backend_rpc_phone_input_stream_push_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t region,
+    uint32_t chunk, const void * input, size_t bytes,
+    struct ggml_backend_rpc_phone_input_push_timing * timing);
+
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
 #define GGML_BACKEND_RPC_PHONE_INPUT_PUSH_PROC \
