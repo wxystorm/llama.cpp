@@ -64,6 +64,14 @@ struct llama_hybrid_runtime_stage {
     bool wave_probe = false;
 };
 
+// A copy of the Scheduler event: ggml tensor-name pointers are deliberately
+// not retained across Graph rebuilds. Only filled by optional Phone tracing.
+struct llama_hybrid_copy_trace_record {
+    std::string tensor;
+    std::string dst_tensor;
+    ggml_backend_sched_copy_trace event {};
+};
+
 struct llama_hybrid_stage_timing {
     int64_t prepare_us       = 0;
     // Stage graph and split preparation, aggregated only after the UBatch.
@@ -91,6 +99,8 @@ struct llama_hybrid_stage_timing {
     // compute submission+synchronization, and output materialization.
     // Keep aggregate stage counters unchanged; these are NOT additive.
     bool    capture_timeline = false;
+    bool    capture_copy_trace = false;
+    std::vector<llama_hybrid_copy_trace_record> copy_traces;
     int64_t graph_prepare_begin_us = 0;
     int64_t graph_prepare_end_us = 0;
     int64_t input_set_begin_us = 0;
