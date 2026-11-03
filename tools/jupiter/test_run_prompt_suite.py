@@ -1,6 +1,7 @@
 """Offline tests for the Jupiter multi-prompt length experiment runner."""
 from __future__ import annotations
 
+import argparse
 import contextlib
 import csv
 import io
@@ -18,6 +19,8 @@ from run_prompt_suite import (
     ineligible_prompt_reason,
     launch_logged,
     main,
+    read_finished_benchmark,
+    sha256_bytes,
     read_benchmark_results,
 )
 
@@ -105,6 +108,68 @@ class JupiterPromptSuiteTests(unittest.TestCase):
             self.assertIn(
                 "[JUPITER_SEQUENCE_PLAN]", log.read_text(encoding="utf-8")
             )
+
+    def test_completed_benchmark_reused_only_for_exact_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe, model, prompt, plan = (
+                root / "llama-cli.exe",
+                root / "model.gguf",
+                root / "prompt_64.txt",
+                root / "final.plan",
+            )
+            exe.write_bytes(b"fake-exe")
+            model.write_bytes(b"fake-model")
+            prompt.write_text("some prompt\n", encoding="utf-8")
+            plan.write_text("sequence.72=32,40\n", encoding="utf-8")
+            bench = root / "bench"
+            bench.mkdir()
+            args = argparse.Namespace(
+                exe=str(exe), model=str(model), rpc="127.0.0.1:10139",
+                window=2, verbosity=3, context=2048, batch=2048,
+                ubatch=128, bench_repeats=1,
+            )
+            modes = ["default", "fixed64", "dp"]
+            manifest = {
+                "prompt_sha256": sha256_bytes(b"some prompt"),
+                "exe": str(exe),
+                "exe_size": exe.stat().st_size,
+                "exe_mtime_ns": exe.stat().st_mtime_ns,
+                "model": str(model),
+                "model_size": model.stat().st_size,
+                "rpc": args.rpc, "target_tokens": 72,
+                "pc_layers": 20, "window": args.window,
+                "async_c2p": False, "comm_timing": False,
+                "profile_stage": 0, "trace": 0,
+                "verbosity": args.verbosity, "context": args.context,
+                "batch": args.batch, "ubatch": args.ubatch,
+                "modes": modes, "repeats": 1, "plan": str(plan),
+                "dp_chunks": [32, 40], "timing_token_tolerance": 1,
+            }
+            (bench / "configuration.json").write_text(json.dumps(manifest))
+            with (bench / "results.csv").open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=[
+                    "mode", "repeat", "tokens", "prefill_ms"
+                ])
+                writer.writeheader()
+                for mode, ms in (("default", 3000),
+                                 ("fixed64", 2800), ("dp", 3200)):
+                    writer.writerow({
+                        "mode": mode, "repeat": 1, "tokens": 72,
+                        "prefill_ms": ms
+                    })
+            result = read_finished_benchmark(
+                bench, args, prompt, plan, 72, 20, [32, 40], modes
+            )
+            self.assertIsNotNone(result)
+            self.assertEqual(result["default_median_ms"], 3000)
+            self.assertIsNone(read_finished_benchmark(
+                bench, args, prompt, plan, 72, 20, [40, 32], modes
+            ))
+            args.bench_repeats = 2
+            self.assertIsNone(read_finished_benchmark(
+                bench, args, prompt, plan, 72, 20, [32, 40], modes
+            ))
 
     def test_summary_checks_complete_repeat_sets(self):
         with tempfile.TemporaryDirectory() as tmp:
