@@ -37,6 +37,7 @@ FIELDS = [
     "dag_plan_tokens", "first_cycle_e", "final_e", "first_cycle_e_pool", "first_cycle_seeds", "prefix_completed",
     "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
+    "phone_auto_final_enabled", "phone_final_head_ms",
     "cpu_full_meta_queue", "phone_graph_cache", "phone_graph_slots",
     "phone_graph_slot_revisits", "phone_graph_reuses",
     "phone_graph_reuse_count", "phone_graph_reuse_check_ms",
@@ -389,6 +390,11 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             plan.get("prefix_service_mspt", [])),
         "ring_ubatches": len(ring), "ring_tokens": sum(x.get("tokens", 0) for x in ring),
         "ring_wall_ms": total(ring, "wall_ms"),
+        "phone_auto_final_enabled": any(
+            x.get("phone_auto_final_enabled") is True for x in ring),
+        "phone_final_head_ms": (
+            total(ring, "phone_final_head_ms")
+            if any("phone_final_head_ms" in x for x in ring) else None),
         "cpu_full_meta_queue": ring[0].get("cpu_full_meta_queue") if ring else None,
         "phone_graph_cache": ring[0].get("phone_graph_cache") if ring else None,
         "phone_graph_slots": ring[0].get("phone_graph_slots") if ring else None,
@@ -650,6 +656,8 @@ def main():
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
                                           "LLAMA_REGION_RING_TASK_TRACE",
                                           "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
+                                          "LLAMA_REGION_RING_PHONE_AUTONOMOUS",
+                                          "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL",
                                           "LLAMA_REGION_RING_PHONE_INPUT_PUSH",
                                           "LLAMA_REGION_RING_PHONE_INPUT_STREAM",
                                           "LLAMA_REGION_RING_PHONE_COPY_TRACE",

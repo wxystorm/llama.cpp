@@ -87,14 +87,33 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
     const bool build_output_head = !stage_graph || params.hybrid_output_head;
     const bool embedding_only    = stage_graph && params.hybrid_embedding_only;
+    // The terminal PC-only Head consumes a single Phone-produced l_out.
+    // An empty layer interval is legal ONLY for the final RMSNorm/LM Head.
+    const bool head_only = stage_graph &&
+        layer_begin == n_layer && layer_end == n_layer &&
+        hidden_input && build_output_head && !embedding_only;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
-    GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
+    GGML_ASSERT(layer_begin >= 0 &&
+                (layer_begin < layer_end || head_only) &&
+                layer_end <= n_layer);
     GGML_ASSERT(layer_begin == 0 || hidden_input);
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
     GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
     GGML_ASSERT(!embedding_only || (layer_begin == 0 && !hidden_input));
+
+    if (head_only) {
+        ggml_tensor * cur = build_inp_stage();
+        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+        cb(cur, "result_norm", -1);
+        res->t_embd = cur;
+        cur = build_lora_mm(model.output, cur, model.output_s);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+        ggml_build_forward_expand(gf, cur);
+        return;
+    }
 
     ggml_tensor * cur;
     ggml_tensor * inpL;
