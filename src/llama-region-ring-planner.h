@@ -2845,9 +2845,8 @@ inline void search_runtime_cpu_optional(
             [](const llama_region_ring_region & r) {
                 return r.device == device::CPU;
             });
-        proposals.push_back({std::move(plan),
-                             proposals.empty() ? 0.0 : 0.0, cpu_free});
-        proposals.back().proxy = proposals.back().value.coarse_ms;
+        const double proxy = plan.coarse_ms;
+        proposals.push_back({std::move(plan), proxy, cpu_free});
     };
 
     std::vector<size_t> order(out.top.size());
