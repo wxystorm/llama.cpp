@@ -2230,6 +2230,10 @@ void ggml_backend_sched_copy_trace_set_callback(
         ggml_backend_sched_copy_trace_callback callback, void * user_data) {
     ggml_copy_trace_callback = callback;
     ggml_copy_trace_user_data = callback != nullptr ? user_data : nullptr;
+    if (callback == nullptr) {
+        // Also clear a partially unwound copy when its caller cancelled.
+        ggml_copy_trace_active = nullptr;
+    }
 }
 
 bool ggml_backend_sched_copy_trace_active(void) {
