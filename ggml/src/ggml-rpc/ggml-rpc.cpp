@@ -20,6 +20,8 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <map>
+#include <tuple>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -5557,6 +5559,12 @@ public:
         }
         phone_region_main_thread =
             std::thread([this]() { phone_region_main_loop(); });
+        // Server-side autonomous queue is dormant until patch24 task
+        // registration; it never intercepts the legacy RPC compute path.
+        phone_auto_prepare_thread =
+            std::thread([this]() { phone_auto_prepare_loop(); });
+        phone_auto_compute_thread =
+            std::thread([this]() { phone_auto_compute_loop(); });
         if (rpc_phone_stage_prepare_ahead_enabled()) {
             phone_stage_prepare_thread =
                 std::thread([this]() { phone_stage_prepare_loop(); });
@@ -5574,6 +5582,11 @@ public:
     bool phone_input_push(const std::vector<uint8_t> & input,
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
+    bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
+    bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
+    void phone_auto_input_verified(const rpc_phone_input_key & key);
+    void phone_auto_prepare_loop();
+    void phone_auto_compute_loop();
     bool phone_input_stream_reserve(size_t bytes);
     void phone_input_stream_cancel_reserve(size_t bytes);
     void phone_input_stream_complete(std::vector<uint8_t> && packet,
@@ -5693,6 +5706,26 @@ private:
         int64_t input_set_done_us = 0;
         int64_t command_rx_us = 0;
     };
+    enum class phone_auto_status : uint8_t {
+        REGISTERED, VERIFIED, UPLOADING, UPLOADED, PREPARING,
+        PREPARED, COMPUTING, COMPLETE, FAILED,
+    };
+    struct phone_auto_job {
+        rpc_msg_phone_auto_task_req request {};
+        rpc_tensor input_wire {};
+        std::shared_ptr<phone_stage_prepare_job> prepared_job;
+        std::optional<phone_stage_prepared_input> prepared;
+        phone_auto_status state = phone_auto_status::REGISTERED;
+        int64_t verified_us = 0;
+        int64_t upload_done_us = 0;
+        int64_t prepare_done_us = 0;
+        int64_t compute_begin_us = 0;
+        int64_t compute_end_us = 0;
+    };
+    using phone_auto_key = std::tuple<uint64_t, uint32_t, uint32_t>;
+    static phone_auto_key auto_key(const rpc_phone_input_key & key) {
+        return std::make_tuple(key.run_id, key.region, key.chunk);
+    }
     struct phone_stage_buffer_range {
         ggml_backend_buffer_t buffer = nullptr;
         void * data = nullptr;
@@ -5841,6 +5874,17 @@ private:
         int64_t apply_wait_us = 0;
     };
     std::unordered_map<uint64_t, phone_input_stream_profile> phone_input_stream_profiles;
+
+    // Patch24: incoming VERIFIED frames trigger local preparation and Graph
+    // execution. The two separate workers overlap next-slot upload and
+    // current-slot compute; no thread waits for a PC Graph Compute command.
+    std::mutex phone_auto_mutex;
+    std::condition_variable phone_auto_cv;
+    std::map<phone_auto_key, std::shared_ptr<phone_auto_job>> phone_auto_jobs;
+    std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
+    std::thread phone_auto_prepare_thread;
+    std::thread phone_auto_compute_thread;
+    bool phone_auto_stop = false;
 
     struct phone_stage_rx_write {
         ggml_backend_buffer_t buffer = nullptr;
@@ -10959,6 +11003,22 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 }
 
 rpc_server::~rpc_server() {
+    {
+        std::lock_guard<std::mutex> lock(phone_auto_mutex);
+        phone_auto_stop = true;
+        for (auto & kv : phone_auto_jobs) {
+            if (kv.second->state != phone_auto_status::COMPLETE) {
+                kv.second->state = phone_auto_status::FAILED;
+            }
+        }
+    }
+    phone_auto_cv.notify_all();
+    if (phone_auto_prepare_thread.joinable()) {
+        phone_auto_prepare_thread.join();
+    }
+    if (phone_auto_compute_thread.joinable()) {
+        phone_auto_compute_thread.join();
+    }
     {
         std::lock_guard<std::mutex> lock(phone_region_main_mutex);
         phone_region_main_stop = true;
