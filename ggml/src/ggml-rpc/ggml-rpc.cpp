@@ -6286,6 +6286,100 @@ bool rpc_server::phone_input_push(
     return finish_stage();
 }
 
+
+bool rpc_server::phone_input_stream_run(
+        const rpc_msg_phone_input_stream_run_req & request) {
+    if (request.run_id == 0) { return false; }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (request.active) {
+            phone_input_stream_runs.insert(request.run_id);
+        } else {
+            phone_input_stream_runs.erase(request.run_id);
+            phone_input_stream_failed.erase(
+                std::remove_if(phone_input_stream_failed.begin(),
+                    phone_input_stream_failed.end(),
+                    [&](const rpc_phone_input_key & e) {
+                        return e.run_id == request.run_id;
+                    }), phone_input_stream_failed.end());
+            auto it = phone_input_staged_slots.begin();
+            while (it != phone_input_staged_slots.end()) {
+                if (it->key.run_id == request.run_id) {
+                    GGML_ASSERT(phone_input_stream_held_bytes >= it->reserved_bytes);
+                    phone_input_stream_held_bytes -= it->reserved_bytes;
+                    it = phone_input_staged_slots.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    phone_input_stream_cv.notify_all();
+    return true;
+}
+
+bool rpc_server::phone_input_stream_reserve(size_t bytes) {
+    if (bytes < sizeof(rpc_msg_phone_input_push_req) ||
+            bytes > RPC_PHONE_INPUT_MAX_BYTES + sizeof(rpc_msg_phone_input_push_req) ||
+            bytes > phone_input_stream_budget) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(phone_input_mutex);
+    const bool capacity = phone_input_stream_cv.wait_for(
+        lock, std::chrono::seconds(30), [&]() {
+            return phone_input_stream_held_bytes <=
+                phone_input_stream_budget - bytes;
+        });
+    if (!capacity) { return false; }
+    phone_input_stream_held_bytes += bytes;
+    return true;
+}
+
+void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet) {
+    const size_t bytes = packet.size();
+    rpc_msg_phone_input_push_req request {};
+    bool valid = bytes >= sizeof(request);
+    if (valid) {
+        memcpy(&request, packet.data(), sizeof(request));
+        valid = request.key.run_id != 0 && request.key.region < 64 &&
+                request.size != 0 && request.size <= RPC_PHONE_INPUT_MAX_BYTES &&
+                bytes - sizeof(request) == request.size;
+    }
+    if (valid) {
+        valid = fnv_hash(packet.data() + sizeof(request),
+                         (size_t) request.size) == request.hash;
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (valid && phone_input_stream_runs.count(request.key.run_id) != 0) {
+            const auto same = [&](const phone_input_staged & e) {
+                return e.key.run_id == request.key.run_id &&
+                    e.key.region == request.key.region &&
+                    e.key.chunk == request.key.chunk;
+            };
+            if (std::none_of(phone_input_staged_slots.begin(),
+                             phone_input_staged_slots.end(), same)) {
+                phone_input_staged entry {};
+                entry.key = request.key;
+                entry.hash = request.hash;
+                entry.payload_offset = sizeof(request);
+                entry.reserved_bytes = bytes;
+                entry.payload = std::move(packet);
+                phone_input_staged_slots.emplace_back(std::move(entry));
+                phone_input_stream_cv.notify_all();
+                return;
+            }
+        }
+        if (request.key.run_id != 0 &&
+                phone_input_stream_runs.count(request.key.run_id) != 0) {
+            phone_input_stream_failed.push_back(request.key);
+        }
+        GGML_ASSERT(phone_input_stream_held_bytes >= bytes);
+        phone_input_stream_held_bytes -= bytes;
+    }
+    phone_input_stream_cv.notify_all();
+}
+
 bool rpc_server::phone_input_apply(
         const rpc_msg_phone_input_apply_req & request,
         rpc_msg_phone_input_ack & response) {
