@@ -116,6 +116,11 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# Standalone Region Ring Phone KV FIFO/two-slot policy test. No model or RPC
+# server is needed; usable on Windows and Linux in Release builds.
+add_executable(test-phone-autonomous-policy test-phone-autonomous-policy.cpp)
+llama_test(test-phone-autonomous-policy LABEL region-ring)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
