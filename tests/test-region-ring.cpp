@@ -1297,6 +1297,58 @@ static void test_phone_auto_final_graph_node_budget() {
           "missing model depth should preserve existing capacity");
 }
 
+static void test_phone_auto_final_p2c_prebind() {
+    constexpr size_t n_regions = 9;
+    constexpr size_t n_tokens = 358;
+    constexpr size_t n_hidden = 5120;
+    constexpr size_t xp = 64;
+    constexpr size_t full_buffer = n_tokens * n_hidden;
+
+    // Three Phone Regions each register six independent P2C jobs. The
+    // final Region 8 was previously rejected by 'region + 1 >= n_regions'
+    // even though its complete host buffer was already allocated.
+    for (const size_t region : {size_t(2), size_t(5), size_t(8)}) {
+        size_t registered = 0;
+        for (size_t begin = 0; begin < n_tokens; begin += xp) {
+            const size_t count = std::min(xp, n_tokens - begin);
+            check(llama_region_ring_phone_auto_p2c_prebind_valid(
+                      region, n_regions, n_regions, true, begin, count,
+                      n_tokens, n_hidden, full_buffer),
+                  "valid autonomous Phone P2C range was rejected");
+            ++registered;
+        }
+        check(registered == 6, "Phone Chunk count differs from expected six");
+    }
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions - 1, true, 0, xp,
+              n_tokens, n_hidden, full_buffer),
+          "terminal Region without host output buffer was accepted");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions, false, 0, xp,
+              n_tokens, n_hidden, full_buffer),
+          "legacy final Meta Region was incorrectly prebound");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              9, n_regions, n_regions, true, 0, xp,
+              n_tokens, n_hidden, full_buffer),
+          "nonexistent Phone Region was accepted");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions, true, 320, 39,
+              n_tokens, n_hidden, full_buffer),
+          "terminal chunk beyond token count was accepted");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions, true, 320, 38,
+              n_tokens, n_hidden, full_buffer - 1),
+          "partial terminal output buffer was accepted");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions, true, n_tokens + 1, xp,
+              n_tokens, n_hidden, full_buffer),
+          "out-of-range Chunk beginning was accepted");
+    check(!llama_region_ring_phone_auto_p2c_prebind_valid(
+              8, n_regions, n_regions, true, 0, 0,
+              n_tokens, n_hidden, full_buffer),
+          "zero-length Chunk was accepted");
+}
+
 static void test_phone_auto_final_output_offsets() {
     constexpr size_t total_tokens = 358;
     constexpr size_t chunk_tokens = 64;
@@ -1396,6 +1448,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         test_phone_auto_final_output_offsets();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_output_offsets=PASS\n");
+        test_phone_auto_final_p2c_prebind();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_p2c_prebind=PASS\n");
         test_phone_auto_final_graph_node_budget();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_graph_node_budget=PASS\n");
         test_phone_input_stream_no_host_credits();

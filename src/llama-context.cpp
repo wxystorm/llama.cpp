@@ -5420,14 +5420,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // yet claimed its logical task. Register every receiver target
             // BEFORE starting the PUSH producer or any Ring worker.
             for (const auto & item : phone_auto_templates) {
-                if (item.region + 1 >= stages.size() ||
-                        item.token_begin + item.tokens > ubatch.n_tokens ||
-                        outputs[item.region].size() <
-                            (size_t) (item.token_begin + item.tokens) * (size_t) n_embd) {
+                // The terminal Phone Region is a valid return producer
+                // with a separate PC Head. Never index its host output
+                // buffer before validating the region index.
+                const size_t host_floats = item.region < outputs.size() ?
+                    outputs[item.region].size() : 0;
+                if (!llama_region_ring_phone_auto_p2c_prebind_valid(
+                        item.region, stages.size(), outputs.size(),
+                        phone_auto_final_enabled, item.token_begin, item.tokens,
+                        ubatch.n_tokens, (size_t) n_embd, host_floats)) {
                     LLAMA_LOG_ERROR(
                         "[PHONE_AUTO_P2C] event=PREBIND status=REJECT "
-                        "reason=OUTPUT_RANGE region=%zu chunk=%zu\n",
-                        item.region, item.chunk);
+                        "reason=OUTPUT_RANGE region=%zu chunk=%zu "
+                        "begin=%u tokens=%u regions=%zu buffers=%zu "
+                        "host_floats=%zu total_tokens=%u hidden=%u final=%d\n",
+                        item.region, item.chunk, item.token_begin, item.tokens,
+                        stages.size(), outputs.size(), host_floats,
+                        ubatch.n_tokens, n_embd,
+                        phone_auto_final_enabled ? 1 : 0);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }

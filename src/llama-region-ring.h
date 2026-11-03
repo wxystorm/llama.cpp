@@ -71,6 +71,25 @@ inline size_t llama_region_ring_phone_autonomous_graph_max_nodes(
     return std::min(full_max_nodes, std::max<size_t>(1024, scaled));
 }
 
+// Before any Phone input PUSH, reserve an exact P2C destination for each
+// autonomous Chunk. The terminal Phone Region is a valid producer only when
+// its final l_out is returned to the separate PC Head. Check both region
+// indexing and token/host-buffer capacity without overflowing byte counts.
+inline bool llama_region_ring_phone_auto_p2c_prebind_valid(
+        size_t region, size_t n_regions, size_t n_output_buffers,
+        bool phone_auto_final, size_t token_begin, size_t chunk_tokens,
+        size_t total_tokens, size_t hidden_size, size_t buffer_floats) {
+    if (n_regions == 0 || region >= n_regions ||
+            region >= n_output_buffers ||
+            (region + 1 == n_regions && !phone_auto_final) ||
+            chunk_tokens == 0 || token_begin > total_tokens ||
+            chunk_tokens > total_tokens - token_begin ||
+            hidden_size == 0) {
+        return false;
+    }
+    return token_begin + chunk_tokens <= buffer_floats / hidden_size;
+}
+
 inline size_t llama_region_ring_output_host_token_begin(
         bool last, bool phone_auto_final, size_t token_begin,
         int output_slot, size_t chunk_tokens, size_t slot_pool_size) {
