@@ -6750,7 +6750,11 @@ bool rpc_server::phone_auto_task_register(
             // pre-upload from overwriting another chunk's input tensor.
             if (other.request.graph_uid == request.graph_uid ||
                     (other.input_wire.buffer == wire.buffer &&
-                     other.input_wire.data == wire.data)) {
+                     ggml_phone_stage::may_overlap(
+                         static_cast<size_t>(other.input_wire.data),
+                         static_cast<size_t>(other.request.input_bytes),
+                         static_cast<size_t>(wire.data),
+                         static_cast<size_t>(request.input_bytes)))) {
                 return false;
             }
         }
