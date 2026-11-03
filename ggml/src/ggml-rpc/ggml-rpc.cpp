@@ -5377,6 +5377,7 @@ public:
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_input_stream_reserve(size_t bytes);
+    void phone_input_stream_cancel_reserve(size_t bytes);
     void phone_input_stream_complete(std::vector<uint8_t> && packet);
     bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
                            rpc_msg_phone_input_ack & response);
@@ -6333,6 +6334,15 @@ bool rpc_server::phone_input_stream_reserve(size_t bytes) {
     if (!capacity) { return false; }
     phone_input_stream_held_bytes += bytes;
     return true;
+}
+
+void rpc_server::phone_input_stream_cancel_reserve(size_t bytes) {
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        GGML_ASSERT(phone_input_stream_held_bytes >= bytes);
+        phone_input_stream_held_bytes -= bytes;
+    }
+    phone_input_stream_cv.notify_all();
 }
 
 void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet) {
@@ -11267,6 +11277,38 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PHONE_INPUT_STREAM_RUN: {
+                rpc_msg_phone_input_stream_run_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted = server.phone_input_stream_run(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
+                // The Phone receiver itself owns the bounded host budget.
+                // Do not emit an ACK: send_data()/TCP backpressure is the
+                // only normal feedback to the PC producer.
+                uint64_t bytes = 0;
+                if (!sock->recv_data(&bytes, sizeof(bytes)) ||
+                        bytes > SIZE_MAX ||
+                        !server.phone_input_stream_reserve((size_t) bytes)) {
+                    return;
+                }
+                std::vector<uint8_t> packet;
+                try {
+                    packet.resize((size_t) bytes);
+                } catch (const std::bad_alloc &) {
+                    server.phone_input_stream_cancel_reserve((size_t) bytes);
+                    return;
+                }
+                if (!sock->recv_data(packet.data(), packet.size())) {
+                    server.phone_input_stream_complete(std::move(packet));
+                    return;
+                }
+                server.phone_input_stream_complete(std::move(packet));
+                break;
+            }
             case RPC_CMD_PHONE_INPUT_PUSH: {
                 // Receive timing is taken on the Phone monotonic clock.
                 // The command byte was already read by the dispatcher.
@@ -11635,6 +11677,38 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_STREAM_RUN: {
+                rpc_msg_phone_input_stream_run_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted = server.phone_input_stream_run(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
+                // The Phone receiver itself owns the bounded host budget.
+                // Do not emit an ACK: send_data()/TCP backpressure is the
+                // only normal feedback to the PC producer.
+                uint64_t bytes = 0;
+                if (!sock->recv_data(&bytes, sizeof(bytes)) ||
+                        bytes > SIZE_MAX ||
+                        !server.phone_input_stream_reserve((size_t) bytes)) {
+                    return;
+                }
+                std::vector<uint8_t> packet;
+                try {
+                    packet.resize((size_t) bytes);
+                } catch (const std::bad_alloc &) {
+                    server.phone_input_stream_cancel_reserve((size_t) bytes);
+                    return;
+                }
+                if (!sock->recv_data(packet.data(), packet.size())) {
+                    server.phone_input_stream_complete(std::move(packet));
+                    return;
+                }
+                server.phone_input_stream_complete(std::move(packet));
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
