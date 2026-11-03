@@ -317,6 +317,63 @@ def read_benchmark_results(
     return result
 
 
+def read_finished_benchmark(
+    bench_dir: Path, args: argparse.Namespace, prompt: Path,
+    plan: Path, total: int, pc_layers: int,
+    chunks: list[int], modes: list[str],
+) -> dict[str, float | int] | None:
+    """Reuse only a complete, configuration-identical formal benchmark.
+
+    The lower-level benchmark runner's --resume always replays two
+    verification inference passes. Once a multi-prompt case is fully done,
+    there is no reason to launch it again unless the requested repeat count
+    or experimental identity changed.
+    """
+    manifest = bench_dir / "configuration.json"
+    results = bench_dir / "results.csv"
+    if not manifest.is_file() or not results.is_file():
+        return None
+    try:
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+        exe = Path(args.exe).resolve()
+        model = Path(args.model).resolve()
+        normalized_prompt = prompt.read_text(
+            encoding="utf-8-sig"
+        ).rstrip("\r\n")
+        expected = {
+            "prompt_sha256": sha256_bytes(normalized_prompt.encode("utf-8")),
+            "exe": str(exe),
+            "exe_size": exe.stat().st_size,
+            "exe_mtime_ns": exe.stat().st_mtime_ns,
+            "model": str(model),
+            "model_size": model.stat().st_size,
+            "rpc": args.rpc,
+            "target_tokens": total,
+            "pc_layers": pc_layers,
+            "window": args.window,
+            "async_c2p": False,
+            "comm_timing": False,
+            "profile_stage": 0,
+            "trace": 0,
+            "verbosity": args.verbosity,
+            "context": args.context,
+            "batch": args.batch,
+            "ubatch": args.ubatch,
+            "modes": modes,
+            "repeats": args.bench_repeats,
+            "plan": str(plan.resolve()),
+            "dp_chunks": chunks,
+            "timing_token_tolerance": 1,
+        }
+        if any(saved.get(key) != value for key, value in expected.items()):
+            return None
+        return read_benchmark_results(
+            results, total, modes, args.bench_repeats
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def save_suite(out: Path, rows: list[dict], identity: dict) -> None:
     with (out / "suite-results.csv").open(
         "w", encoding="utf-8", newline=""
@@ -541,10 +598,24 @@ def main() -> int:
             ]
             # Deliberately NO --async-c2p or --comm-timing here: all
             # policies run the same original Jupiter data plane.
-            launch_logged(bench, case / "bench-run.log", "BENCH")
-            data = read_benchmark_results(
-                case / "bench" / "results.csv", actual, modes, args.bench_repeats
+            data = (
+                read_finished_benchmark(
+                    case / "bench", args, prompt, plan,
+                    actual, pc, chunks, modes,
+                ) if args.resume else None
             )
+            if data is not None:
+                print(
+                    f"[JUPITER_SUITE_PHASE] phase=BENCH action=REUSE "
+                    f"prompt={prompt.name} repeats={args.bench_repeats}",
+                    flush=True,
+                )
+            else:
+                launch_logged(bench, case / "bench-run.log", "BENCH")
+                data = read_benchmark_results(
+                    case / "bench" / "results.csv",
+                    actual, modes, args.bench_repeats,
+                )
             row.update(data)
             row["status"] = "PASS"
             print(f"[JUPITER_SUITE_RESULT] prompt={prompt.name} "
