@@ -75,6 +75,43 @@ number is a hint), and generates up to 32 tokens by default. Context size
 grows with the filename token hint; increase `--context-padding` if the
 tokenizer produces more tokens than expected.
 
+### APPLY_WIDE CPU-optional Cycle search (C=0)
+
+After the existing three-device Uniform/Prefix/local refinement, APPLY_WIDE
+also explores executable `G,[C],P` cycles with the CPU region omitted in
+one or all cycles. GPU and Phone each retain a positive depth per cycle;
+the final Region remains Phone. Examples for a 40-layer model:
+
+- `G12,P2,G11,P2,G11,P2` (no CPU compute at all)
+- `G11,C1,P2,G12,P2,G11,P1` (one CPU cycle, two without)
+
+The search removes CPU Regions from diverse already-simulated layouts,
+considering transfer of their layers either to GPU or to Phone, and adds
+independent G/P uniform seeds so an all-CPU-free configuration can compete
+without a lucky three-device starting point. Memory is checked first:
+canonical streamed GPU weights on the PC, the two GPU Banks and KV, Phone
+memory, and full boundary host buffers. At most **64** additional full DAG
+simulations enter the ranking; no extra model inference or device profiling
+is performed. For C-optional candidates the cheap E-style proxy uses only
+active devices and actual boundary pairs, not the legacy fictitious G→C→P
+links. Final ranking always uses complete DAG wall time.
+
+A zero-length region is **never** a runtime Task. The selected layout omits
+`C0` entirely. The APPLY_WIDE forced layout parser accepts an explicit
+`C0` only as input spelling and normalizes it away. Other backend-zero
+families (no GPU or no Phone) are not enabled by this first-stage search.
+The existing G/C/P search and its detailed Prefix metrics are unchanged.
+
+Offline source-only test (no model, RPC or CUDA needed):
+
+```powershell
+cl /nologo /std:c++17 /EHsc /I src /Fe:test_cpu_optional_planner.exe tools/region-ring-experiments/test_cpu_optional_planner.cpp
+.\test_cpu_optional_planner.exe
+```
+
+Check `[REGION_RING_PLAN_CPU_OPTIONAL]` in the captured engine log for the
+number of profiled and full-DAG-simulated C-optional candidates.
+
 ### APPLY_WIDE first-Cycle Chunk search (fine-grid E + fixed-X prefix)
 
 The apply-wide first-Cycle search considers six variables:
