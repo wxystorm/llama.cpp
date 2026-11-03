@@ -2274,6 +2274,19 @@ void ggml_backend_sched_copy_trace_rpc_note(
     }
 }
 
+// Set only by the PC pre-registration caller. Normal inference never skips
+// any scheduler input; in particular it still handles PUSH_APPLY and KV masks.
+static thread_local const char * ggml_sched_skip_input_name = nullptr;
+
+enum ggml_status ggml_backend_sched_prepare_split_skip_input(
+        ggml_backend_sched_t sched, int split_id, const char * input_name) {
+    const char * previous = ggml_sched_skip_input_name;
+    ggml_sched_skip_input_name = input_name;
+    const ggml_status status = ggml_backend_sched_prepare_split(sched, split_id);
+    ggml_sched_skip_input_name = previous;
+    return status;
+}
+
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
@@ -2352,6 +2365,12 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
     for (int input_id = 0; input_id < split->n_inputs; input_id++) {
         ggml_backend_t       input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
         struct ggml_tensor * input         = split->inputs[input_id];
+        // A pre-registered graph uses this destination only after Phone
+        // receives its verified PUSH. Never send placeholder hidden bytes.
+        if (ggml_sched_skip_input_name != nullptr &&
+                std::strcmp(input->name, ggml_sched_skip_input_name) == 0) {
+            continue;
+        }
         struct ggml_tensor * input_cpy     = tensor_copy(input, split_backend_id, sched->cur_copy);
         const bool immutable_weight =
             input->buffer != NULL &&
