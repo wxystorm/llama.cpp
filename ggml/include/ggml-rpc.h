@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    23
+#define RPC_PROTO_PATCH_VERSION    24
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -168,6 +168,27 @@ using ggml_backend_rpc_phone_input_stream_push_t = bool (*)(
     ggml_backend_t backend, uint64_t run_id, uint32_t region,
     uint32_t chunk, const void * input, size_t bytes,
     struct ggml_backend_rpc_phone_input_push_timing * timing);
+
+// Experimental Phone-owned compute: PC registers the exact per-Chunk
+// graph before streaming; a verified PUSH is the only compute trigger.
+// The Phone prepares two local GPU slots, then executes chunks in KV order.
+// Non-final Phone Regions retain the existing PC-side output handoff.
+// RPC patch 24; unsupported servers fail closed.
+#define GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC \
+    "ggml_backend_rpc_phone_auto_graph_register"
+#define GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC \
+    "ggml_backend_rpc_phone_auto_task_register"
+#define GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC \
+    "ggml_backend_rpc_phone_auto_wait"
+using ggml_backend_rpc_phone_auto_graph_register_t = bool (*)(
+    ggml_backend_t backend, const ggml_cgraph * graph,
+    uint64_t * registered_uid);
+using ggml_backend_rpc_phone_auto_task_register_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t region,
+    uint32_t chunk, uint64_t graph_uid, size_t expected_input_bytes);
+using ggml_backend_rpc_phone_auto_wait_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t region,
+    uint32_t chunk);
 
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
