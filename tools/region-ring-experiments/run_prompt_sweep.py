@@ -618,6 +618,11 @@ def main():
                 "1" if args.duplex_profile == "on" else "0",
             "LLAMA_REGION_RING_METRICS_FILE": str(folder / "metrics.jsonl"),
         })
+        if env.get("LLAMA_REGION_RING_PHONE_COPY_TRACE") == "1":
+            # One opt-in switch collects both the per-copy detail and the
+            # reference split breakdown for coverage reconciliation.
+            env["LLAMA_REGION_RING_TASK_TRACE"] = "1"
+            env["LLAMA_REGION_RING_PREPARE_BREAKDOWN"] = "1"
         if args.force_layout:
             env.update({
                 "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.force_layout,
@@ -642,7 +647,10 @@ def main():
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
                                           "LLAMA_REGION_RING_TASK_TRACE",
                                           "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
-                                          "LLAMA_REGION_RING_PHONE_INPUT_PUSH")
+                                          "LLAMA_REGION_RING_PHONE_INPUT_PUSH",
+                                          "LLAMA_REGION_RING_PHONE_INPUT_STREAM",
+                                          "LLAMA_REGION_RING_PHONE_COPY_TRACE",
+                                          "LLAMA_REGION_RING_PREPARE_BREAKDOWN")
                                  or k in ("GGML_META_PHONE_FULL_ADD_FUSION",
                                           "GGML_META_RING_PHONE_FUSION")},
             "phone_full_add_fusion_requested":
