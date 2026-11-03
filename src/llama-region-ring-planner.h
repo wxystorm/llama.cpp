@@ -43,6 +43,8 @@ struct candidate {
     // Full-layout refinement can start from either a uniform or prefix plan.
     // It is not a new first-Cycle prefix trajectory.
     bool throughput_seed = false;
+    // CPU-optional G,[C],P cycle candidate; zero-length Regions are omitted.
+    bool cpu_optional_seed = false;
     bool local_refined = false;
     bool local_from_prefix = false;
     bool local_from_throughput = false;
@@ -2322,9 +2324,63 @@ inline bool estimate_region_ring_balance(
         stage_sum[(size_t) d] += ms / x;
         ++stage_count[(size_t) d];
     }
-    if (stage_count[0] <= 0 || stage_count[1] <= 0 ||
-        stage_count[2] <= 0) {
+    if (stage_count[1] <= 0 || stage_count[2] <= 0) {
         return false;
+    }
+    if (stage_count[0] < stage_count[2]) {
+        // G->[C]->P: a skipped CPU stage creates a direct G->P edge.
+        // The historical three-resource E formula would invent G->C and
+        // C->P transfers, so use an active-resource workload proxy ONLY
+        // for cheap screening. The complete event DAG decides ranking.
+        std::array<double, 3> load = stage_sum;
+        double p2g = 0.0;
+        double pc2p = 0.0;
+        for (size_t r = 0; r + 1 < regions.size(); ++r) {
+            const device src = regions[r].device;
+            const device dst = regions[r + 1].device;
+            if (src == dst) { continue; }
+            double link = 0.0;
+            if (!region_ring_handoff_ms_per_token(
+                    m, src, dst,
+                    chunk_for(c, src), chunk_for(c, dst), link)) {
+                return false;
+            }
+            load[(size_t) dst] += link;
+            if (src == device::PHONE) { p2g += link; }
+            if (dst == device::PHONE) { pc2p += link; }
+        }
+        double worst = 0.0;
+        double total = 0.0;
+        int pairs = 0;
+        std::array<double, 3> errors {};
+        for (int a = 0; a < 3; ++a) {
+            for (int b = a + 1; b < 3; ++b) {
+                if (stage_count[(size_t) a] == 0 ||
+                        stage_count[(size_t) b] == 0) {
+                    continue;
+                }
+                const double e = relative_ring_mismatch(
+                    load[(size_t) a], load[(size_t) b]);
+                if (!std::isfinite(e)) { return false; }
+                errors[(size_t) pairs++] = e;
+                worst = std::max(worst, e);
+                total += e;
+            }
+        }
+        c.ring_stage_ms_per_token = stage_sum;
+        c.ring_p2c_ms_per_token = p2g;
+        c.ring_c2p_ms_per_token = pc2p;
+        c.ring_error = errors;
+        c.ring_error_max = worst;
+        c.ring_error_mean = pairs > 0 ? total / pairs : 0.0;
+        c.balance = worst;
+        if (!gpu_weight_h2d_total(m, regions, c.weight_h2d_busy_ms)) {
+            return false;
+        }
+        c.coarse_ms = m.tokens *
+            std::max({load[0], load[1], load[2]}) +
+            c.weight_h2d_busy_ms;
+        return std::isfinite(c.coarse_ms);
     }
 
     const double A = stage_sum[0] / stage_count[0];
@@ -2545,6 +2601,9 @@ struct result {
     size_t e_window_shortlisted = 0;
     size_t nonuniform_profiled = 0;
     size_t nonuniform_simulated = 0;
+    size_t cpu_optional_enumerated = 0;
+    size_t cpu_optional_profiled = 0;
+    size_t cpu_optional_simulated = 0;
     size_t first_cycle_profiled = 0;
     // Geometry/XG pairs rejected before E anchors or bitsets are built.
     size_t first_cycle_gpu_pairs_pruned = 0;
@@ -2730,6 +2789,213 @@ inline bool first_cycle_chunk_supported(int x) {
     return std::find(first_cycle_chunk_candidates.begin(),
                      first_cycle_chunk_candidates.end(), x) !=
            first_cycle_chunk_candidates.end();
+}
+
+// First-stage zero-CPU search. Keep legacy Uniform/Prefix E optimizers
+// unchanged: they assume three nonempty regions per cycle. Expand only
+// complete layouts by removing CPU regions from promising incumbents, plus
+// independent two-device G/P uniform seeds. Memory is checked BEFORE any
+// expensive DAG simulation; there is no additional real inference.
+inline void search_runtime_cpu_optional(
+        const model & m, result & out,
+        std::unordered_set<std::string> & scored) {
+    if (out.top.empty() || !m.memory_feasible) { return; }
+    constexpr size_t k_dag_cap = 64;
+    constexpr int k_anchors_per_cycles = 4;
+    struct option {
+        candidate value;
+        double proxy = 0.0;
+        bool cpu_free = false;
+    };
+    std::vector<option> proposals;
+    std::unordered_set<std::string> generated;
+    auto consider = [&](candidate plan,
+                        const std::vector<llama_region_ring_region> & regions) {
+        if (regions.empty() ||
+                !llama_region_ring_apply_topology_compatible(regions, m.layers) ||
+                regions.back().device != device::PHONE) {
+            return;
+        }
+        plan.concrete_regions = regions;
+        plan.cpu_optional_seed = true;
+        plan.prefix_cycles = 0;
+        plan.local_refined = false;
+        plan.throughput_seed = false;
+        const std::string key = llama_region_ring_layout_string(regions) + "/" +
+            std::to_string(plan.xc) + "/" + std::to_string(plan.xg) + "/" +
+            std::to_string(plan.xp);
+        if (scored.count(key) || !generated.insert(key).second) {
+            return;
+        }
+        ++out.cpu_optional_enumerated;
+        ++out.enumerated;
+        if (!m.memory_feasible(plan) ||
+                (m.region_memory_feasible &&
+                 !m.region_memory_feasible(regions))) {
+            ++out.rejected_memory;
+            return;
+        }
+        if (!estimate_region_ring_balance(m, regions, plan)) {
+            ++out.rejected_profile;
+            return;
+        }
+        ++out.cpu_optional_profiled;
+        ++out.profiled;
+        const bool cpu_free = std::none_of(regions.begin(), regions.end(),
+            [](const llama_region_ring_region & r) {
+                return r.device == device::CPU;
+            });
+        proposals.push_back({std::move(plan),
+                             proposals.empty() ? 0.0 : 0.0, cpu_free});
+        proposals.back().proxy = proposals.back().value.coarse_ms;
+    };
+
+    std::vector<size_t> order(out.top.size());
+    for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return out.top[a].wall_ms < out.top[b].wall_ms;
+    });
+    std::array<int, 5> anchors_per_cycle {};
+    for (size_t idx : order) {
+        const auto & base = out.top[idx];
+        if (base.cycles < 2 || base.cycles > 4 ||
+                anchors_per_cycle[(size_t) base.cycles] >= k_anchors_per_cycles) {
+            continue;
+        }
+        std::vector<llama_region_ring_region> rs;
+        if (!make_regions(base, m.layers, rs) ||
+                rs.size() != (size_t) (3 * base.cycles)) {
+            continue;
+        }
+        bool all_gcp = true;
+        for (int k = 0; k < base.cycles; ++k) {
+            all_gcp = all_gcp &&
+                rs[(size_t) k * 3].device == device::GPU &&
+                rs[(size_t) k * 3 + 1].device == device::CPU &&
+                rs[(size_t) k * 3 + 2].device == device::PHONE;
+        }
+        if (!all_gcp) { continue; }
+        ++anchors_per_cycle[(size_t) base.cycles];
+        int combinations = 1;
+        for (int k = 0; k < base.cycles; ++k) { combinations *= 3; }
+        // Digit 0 keeps C; 1 merges C into G; 2 merges C into P.
+        for (int code = 1; code < combinations; ++code) {
+            std::vector<llama_region_ring_region> variant;
+            int layer = 0;
+            int digits = code;
+            for (int k = 0; k < base.cycles; ++k) {
+                const int at = 3 * k;
+                int g = rs[(size_t) at].layer_end - rs[(size_t) at].layer_begin;
+                int c = rs[(size_t) at + 1].layer_end - rs[(size_t) at + 1].layer_begin;
+                int p = rs[(size_t) at + 2].layer_end - rs[(size_t) at + 2].layer_begin;
+                const int choice = digits % 3;
+                digits /= 3;
+                if (choice == 1) { g += c; c = 0; }
+                if (choice == 2) { p += c; c = 0; }
+                variant.emplace_back(device::GPU, layer, layer + g);
+                layer += g;
+                if (c > 0) {
+                    variant.emplace_back(device::CPU, layer, layer + c);
+                    layer += c;
+                }
+                variant.emplace_back(device::PHONE, layer, layer + p);
+                layer += p;
+            }
+            candidate plan;
+            plan.cycles = base.cycles;
+            plan.xc = base.xc;
+            plan.xg = base.xg;
+            plan.xp = base.xp;
+            plan.g = variant[0].layer_end;
+            plan.c = variant[1].device == device::CPU ?
+                variant[1].layer_end - variant[1].layer_begin : 0;
+            plan.p = variant[(size_t) (plan.c > 0 ? 2 : 1)].layer_end -
+                variant[(size_t) (plan.c > 0 ? 2 : 1)].layer_begin;
+            consider(std::move(plan), variant);
+        }
+    }
+
+    // Independent CPU-free seeds ensure G/P can win even if all three-lane
+    // E-optimal anchors are poor G/P starting points. Limit geometry/chunks;
+    // the exact DAG evaluates only a bounded, diverse shortlist below.
+    for (int cycles = 2; cycles <= 4; ++cycles) {
+        const int width = m.layers / cycles;
+        if (width < 2) { continue; }
+        for (int p = 1; p <= std::min(8, width - 1); ++p) {
+            std::vector<llama_region_ring_region> rs;
+            int layer = 0;
+            for (int k = 0; k < cycles; ++k) {
+                const int w = width + (k < m.layers % cycles ? 1 : 0);
+                if (w <= p) { rs.clear(); break; }
+                rs.emplace_back(device::GPU, layer, layer + w - p);
+                layer += w - p;
+                rs.emplace_back(device::PHONE, layer, layer + p);
+                layer += p;
+            }
+            if (rs.empty() || layer != m.layers) { continue; }
+            for (int xg : {32, 64, 128}) {
+                for (int xp : {32, 64, 128}) {
+                    candidate plan;
+                    plan.cycles = cycles;
+                    plan.g = rs[0].layer_end;
+                    plan.p = p;
+                    plan.c = 0;
+                    plan.xc = 64; // Unused: this layout has no CPU task.
+                    plan.xg = xg;
+                    plan.xp = xp;
+                    consider(std::move(plan), rs);
+                }
+            }
+        }
+    }
+
+    std::sort(proposals.begin(), proposals.end(),
+        [](const option & a, const option & b) {
+            if (std::abs(a.proxy - b.proxy) > 0.05) {
+                return a.proxy < b.proxy;
+            }
+            return a.value.ring_error_max < b.value.ring_error_max;
+        });
+    std::vector<size_t> chosen;
+    std::vector<uint8_t> taken(proposals.size(), 0);
+    auto take = [&](size_t i) {
+        if (chosen.size() >= k_dag_cap || taken[i]) { return; }
+        chosen.push_back(i);
+        taken[i] = 1;
+    };
+    // Reserve coverage across Cycle counts and full-/partial-CPU removal.
+    for (int cycles = 2; cycles <= 4; ++cycles) {
+        for (int no_cpu = 0; no_cpu < 2; ++no_cpu) {
+            for (size_t i = 0; i < proposals.size(); ++i) {
+                if (proposals[i].value.cycles == cycles &&
+                        proposals[i].cpu_free == (no_cpu != 0)) {
+                    take(i);
+                    break;
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < proposals.size() &&
+            chosen.size() < k_dag_cap; ++i) {
+        take(i);
+    }
+    for (size_t i : chosen) {
+        candidate plan = proposals[i].value;
+        const auto & rs = plan.concrete_regions;
+        std::string reason;
+        if (!simulate(m, rs, plan, &reason)) {
+            ++out.rejected_deadlock;
+            continue;
+        }
+        const std::string key = llama_region_ring_layout_string(rs) + "/" +
+            std::to_string(plan.xc) + "/" + std::to_string(plan.xg) + "/" +
+            std::to_string(plan.xp);
+        scored.insert(key);
+        ++out.simulated;
+        ++out.cpu_optional_simulated;
+        ++out.shortlisted;
+        out.top.push_back(std::move(plan));
+    }
 }
 
 // Refine complete, already simulated uniform/prefix plans using their
@@ -4439,10 +4705,10 @@ inline result search_runtime_applicable(
         }
         }
 
-    // Compare the best Uniform/Prefix incumbents against complete-layout
-    // neighbors before choosing the final one. Only profile-backed event
-    // simulations are added; no real inference or Profile acquisition.
+    // Refine only full G/C/P layouts; existing boundary moves use 3*i.
     refine_runtime_local_candidates(m, out, scored);
+    // CPU-optional candidates are introduced after that legacy local pass.
+    search_runtime_cpu_optional(m, out, scored);
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();
