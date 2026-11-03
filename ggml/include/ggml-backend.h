@@ -436,6 +436,10 @@ extern "C" {
     GGML_API void ggml_backend_sched_get_last_prepare_breakdown(
         ggml_backend_sched_t sched, struct ggml_backend_sched_prepare_breakdown * stats);
     GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
+    // Exact pre-registration only: send dynamic side inputs to the Phone,
+    // but do not write the upstream hidden tensor before its PUSH arrives.
+    GGML_API enum ggml_status ggml_backend_sched_prepare_split_skip_input(
+        ggml_backend_sched_t sched, int split_id, const char * input_name);
     // Weight-prefetch helper: enqueue only immutable host weights for one split
     // onto a separate destination backend stream. The caller synchronizes
     // upload_backend before publishing the Bank as ready.
@@ -473,6 +477,13 @@ extern "C" {
 
 #define GGML_BACKEND_META_MAX_DEVICES 16
 #define GGML_BACKEND_META_MAX_LAYER_TIMINGS 512
+
+    // Experimental Phone-owned prefill. Per-thread action: 0=normal,
+    // 1=register exact Phone Full graph (no execution), 2=wait for the
+    // registered graph to finish instead of issuing GRAPH_COMPUTE.
+    GGML_API void ggml_backend_meta_phone_auto_context(
+        int action, uint64_t run_id, uint32_t region, uint32_t chunk);
+    GGML_API uint64_t ggml_backend_meta_phone_auto_registered_uid();
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
