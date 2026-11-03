@@ -6386,11 +6386,18 @@ bool rpc_server::phone_input_push(
 bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
+    phone_input_stream_profile report {};
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (request.active) {
             phone_input_stream_runs.insert(request.run_id);
+            phone_input_stream_profiles[request.run_id] = {};
         } else {
+            if (auto it = phone_input_stream_profiles.find(request.run_id);
+                    it != phone_input_stream_profiles.end()) {
+                report = it->second;
+                phone_input_stream_profiles.erase(it);
+            }
             phone_input_stream_runs.erase(request.run_id);
             phone_input_stream_failed.erase(
                 std::remove_if(phone_input_stream_failed.begin(),
@@ -6411,6 +6418,20 @@ bool rpc_server::phone_input_stream_run(
         }
     }
     phone_input_stream_cv.notify_all();
+    if (!request.active) {
+        GGML_LOG_INFO(
+            "[PHONE_INPUT_STREAM_SUM] run=%" PRIu64
+            " frames=%" PRIu64 " verified=%" PRIu64
+            " applied=%" PRIu64 " errors=%" PRIu64
+            " payload_mib=%.3f recv_ms=%.3f hash_ms=%.3f"
+            " apply_wait_ms=%.3f status=END\\n",
+            request.run_id, report.frames, report.verified,
+            report.applied, report.errors,
+            report.payload_bytes / 1048576.0,
+            report.recv_us / 1000.0,
+            report.hash_us / 1000.0,
+            report.apply_wait_us / 1000.0);
+    }
     return true;
 }
 
@@ -6528,12 +6549,15 @@ bool rpc_server::phone_input_apply(
                     });
             };
             // PC send() returning does not mean Phone received/verified input.
+            const int64_t wait_begin_us = ggml_time_us();
             const bool available = phone_input_stream_cv.wait_for(
                 lock, std::chrono::seconds(30), [&]() {
                     return matching() != phone_input_staged_slots.end() ||
                            has_error() ||
                            phone_input_stream_runs.count(request.key.run_id) == 0;
                 });
+            phone_input_stream_profiles[request.key.run_id].apply_wait_us +=
+                ggml_time_us() - wait_begin_us;
             if (!available || has_error()) { return true; }
         }
         auto it = matching();
