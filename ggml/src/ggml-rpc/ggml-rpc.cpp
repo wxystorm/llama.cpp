@@ -6594,6 +6594,332 @@ bool rpc_server::phone_input_stream_run(
     return true;
 }
 
+// Bind an exact per-Chunk RPC graph to the verified input stream. The
+// registered graph must have a private, writable inp_stage leaf and a complete
+// dual-slot plan: never guess graph UID, KV offsets, or tensor ownership.
+bool rpc_server::phone_auto_task_register(
+        const rpc_msg_phone_auto_task_req & request) {
+    if (request.key.run_id == 0 || request.key.region >= 64 ||
+            request.graph_uid == 0 || request.input_bytes == 0 ||
+            request.input_bytes > RPC_PHONE_INPUT_MAX_BYTES ||
+            request.device >= stored_graphs.size()) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (!phone_input_stream_runs.count(request.key.run_id)) {
+            return false;
+        }
+    }
+    std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
+    auto it = stored_graphs[request.device].find(request.graph_uid);
+    if (it == stored_graphs[request.device].end() ||
+            it->second.graph == nullptr || !it->second.slot0.ready ||
+            it->second.slot0.kv_only_output ||
+            phone_stage_device_arenas[request.device].buffers[1] == nullptr) {
+        return false;
+    }
+    const auto & plan = it->second.slot0;
+    ggml_tensor * input = nullptr;
+    std::unordered_set<const ggml_tensor *> seen;
+    std::function<void(ggml_tensor *)> visit = [&](ggml_tensor * t) {
+        if (t == nullptr || !seen.insert(t).second) { return; }
+        if (std::strcmp(t->name, "inp_stage") == 0 &&
+                t->op == GGML_OP_NONE &&
+                t->buffer != nullptr && is_opencl_tensor(t) &&
+                ggml_nbytes(t) == request.input_bytes) {
+            if (input == nullptr) { input = t; }
+            else if (input != t) { input = nullptr; } // reject ambiguity
+        }
+        for (ggml_tensor * src : t->src) { visit(src); }
+        if (t->view_src != nullptr) { visit(t->view_src); }
+    };
+    for (int i = 0; i < it->second.graph->n_nodes; ++i) {
+        visit(it->second.graph->nodes[i]);
+    }
+    if (input == nullptr) {
+        return false;
+    }
+    rpc_tensor wire = serialize_tensor(input);
+    const phone_auto_key key = auto_key(request.key);
+    bool already_verified = false;
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        already_verified = std::any_of(phone_input_staged_slots.begin(),
+                phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
+            return auto_key(e.key) == key;
+        });
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_auto_mutex);
+        if (phone_auto_stop || phone_auto_jobs.count(key) != 0) {
+            return false;
+        }
+        for (const auto & candidate : phone_auto_jobs) {
+            const auto & other = *candidate.second;
+            if (other.request.device != request.device) { continue; }
+            // One graph per KV-distinct chunk. Also prevent concurrent
+            // pre-upload from overwriting another chunk's input tensor.
+            if (other.request.graph_uid == request.graph_uid ||
+                    (other.input_wire.buffer == wire.buffer &&
+                     other.input_wire.data == wire.data)) {
+                return false;
+            }
+        }
+        auto job = std::make_shared<phone_auto_job>();
+        job->request = request;
+        job->input_wire = wire;
+        job->state = already_verified ?
+            phone_auto_status::VERIFIED : phone_auto_status::REGISTERED;
+        phone_auto_jobs.emplace(key, std::move(job));
+        phone_auto_next_chunk.try_emplace(
+            std::make_pair(request.key.run_id, request.key.region), 0);
+    }
+    phone_auto_cv.notify_all();
+    GGML_LOG_INFO(
+        "[PHONE_AUTO] event=REGISTER run=%" PRIu64
+        " region=%u chunk=%u uid=%" PRIu64
+        " bytes=%" PRIu64 " verified=%d status=READY\n",
+        request.key.run_id, request.key.region, request.key.chunk,
+        request.graph_uid, request.input_bytes,
+        already_verified ? 1 : 0);
+    return true;
+}
+
+void rpc_server::phone_auto_input_verified(const rpc_phone_input_key & key) {
+    {
+        std::lock_guard<std::mutex> guard(phone_auto_mutex);
+        const auto it = phone_auto_jobs.find(auto_key(key));
+        if (it != phone_auto_jobs.end() &&
+                it->second->state == phone_auto_status::REGISTERED) {
+            it->second->state = phone_auto_status::VERIFIED;
+            it->second->verified_us = ggml_time_us();
+        }
+    }
+    phone_auto_cv.notify_all();
+}
+
+bool rpc_server::phone_auto_wait(const rpc_msg_phone_auto_wait_req & request) {
+    if (request.key.run_id == 0) { return false; }
+    std::unique_lock<std::mutex> lock(phone_auto_mutex);
+    const auto it = phone_auto_jobs.find(auto_key(request.key));
+    if (it == phone_auto_jobs.end()) { return false; }
+    const bool done = phone_auto_cv.wait_for(
+        lock, std::chrono::seconds(60), [&]() {
+            return phone_auto_stop ||
+                it->second->state == phone_auto_status::COMPLETE ||
+                it->second->state == phone_auto_status::FAILED;
+        });
+    return done && !phone_auto_stop &&
+        it->second->state == phone_auto_status::COMPLETE;
+}
+
+// A verified input may upload to the next local Slot while Phone is still
+// running the preceding Chunk. The original remote input tensors are private
+// per Chunk. Slot admission uses the existing two_slot_pool state machine.
+void rpc_server::phone_auto_prepare_loop() {
+    for (;;) {
+        std::shared_ptr<phone_auto_job> task;
+        phone_auto_status previous = phone_auto_status::REGISTERED;
+        {
+            std::unique_lock<std::mutex> lock(phone_auto_mutex);
+            phone_auto_cv.wait_for(lock, std::chrono::milliseconds(20), [&]() {
+                if (phone_auto_stop) { return true; }
+                for (const auto & item : phone_auto_jobs) {
+                    const auto & job = *item.second;
+                    const auto next = phone_auto_next_chunk.find(
+                        { job.request.key.run_id, job.request.key.region });
+                    if (next == phone_auto_next_chunk.end() ||
+                            job.request.key.chunk > next->second + 1) {
+                        continue;
+                    }
+                    if (job.state == phone_auto_status::VERIFIED ||
+                            job.state == phone_auto_status::UPLOADED) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (phone_auto_stop) { return; }
+            for (const auto & item : phone_auto_jobs) {
+                auto & job = *item.second;
+                const auto next = phone_auto_next_chunk.find(
+                    { job.request.key.run_id, job.request.key.region });
+                if (next == phone_auto_next_chunk.end() ||
+                        job.request.key.chunk > next->second + 1) {
+                    continue;
+                }
+                if (job.state == phone_auto_status::VERIFIED ||
+                        job.state == phone_auto_status::UPLOADED) {
+                    task = item.second;
+                    previous = job.state;
+                    job.state = previous == phone_auto_status::VERIFIED ?
+                        phone_auto_status::UPLOADING : phone_auto_status::PREPARING;
+                    break;
+                }
+            }
+        }
+        if (!task) { continue; }
+        const auto & req = task->request;
+        bool ok = true;
+        if (previous == phone_auto_status::VERIFIED) {
+            rpc_msg_phone_input_apply_req apply {};
+            apply.key = req.key;
+            apply.tensor = task->input_wire;
+            apply.size = req.input_bytes;
+            {
+                std::lock_guard<std::mutex> lock(phone_input_mutex);
+                const auto found = std::find_if(
+                    phone_input_staged_slots.begin(),
+                    phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
+                        return auto_key(e.key) == auto_key(req.key);
+                    });
+                ok = found != phone_input_staged_slots.end() &&
+                    found->payload.size() - found->payload_offset ==
+                        req.input_bytes;
+                if (ok) { apply.hash = found->hash; }
+            }
+            if (ok) {
+                rpc_msg_phone_input_ack rsp {};
+                ok = phone_input_apply(apply, rsp) && rsp.accepted;
+            }
+            task->upload_done_us = ggml_time_us();
+        }
+        bool busy = false;
+        std::optional<phone_stage_prepared_input> prepared;
+        if (ok) {
+            std::shared_ptr<phone_stage_prepare_job> job =
+                std::make_shared<phone_stage_prepare_job>();
+            job->device = req.device;
+            job->uid = req.graph_uid;
+            job->command_rx_us = task->verified_us;
+            // Graph registration and task binding happen before this Stream
+            // is allowed to run. The backing stored_graph reference remains
+            // stable until RUN teardown.
+            auto it = stored_graphs[req.device].find(req.graph_uid);
+            if (it == stored_graphs[req.device].end() ||
+                    it->second.graph == nullptr ||
+                    !it->second.slot0.ready) {
+                ok = false;
+            } else {
+                job->entry = &it->second;
+                job->graph = it->second.graph;
+                prepared = phone_stage_prepare_input(*job);
+                if (prepared) {
+                    task->prepared_job = std::move(job);
+                    task->prepare_done_us = ggml_time_us();
+                } else {
+                    std::lock_guard<std::mutex> slot_guard(
+                        phone_stage_pool_mutex);
+                    busy = phone_stage_slot_policy[req.device].busy(0) &&
+                           phone_stage_slot_policy[req.device].busy(1);
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            if (phone_auto_stop) { return; }
+            if (!ok || (!prepared && !busy)) {
+                task->state = phone_auto_status::FAILED;
+            } else if (prepared) {
+                task->prepared = std::move(prepared);
+                task->state = phone_auto_status::PREPARED;
+            } else {
+                task->state = phone_auto_status::UPLOADED;
+            }
+        }
+        phone_auto_cv.notify_all();
+        if (busy) {
+            std::unique_lock<std::mutex> lock(phone_auto_mutex);
+            phone_auto_cv.wait_for(lock, std::chrono::milliseconds(10));
+        }
+    }
+}
+
+void rpc_server::phone_auto_compute_loop() {
+    for (;;) {
+        std::shared_ptr<phone_auto_job> task;
+        {
+            std::unique_lock<std::mutex> lock(phone_auto_mutex);
+            phone_auto_cv.wait(lock, [&]() {
+                if (phone_auto_stop) { return true; }
+                for (const auto & item : phone_auto_jobs) {
+                    const auto & job = *item.second;
+                    const auto next = phone_auto_next_chunk.find(
+                        { job.request.key.run_id, job.request.key.region });
+                    if (next != phone_auto_next_chunk.end() &&
+                            next->second == job.request.key.chunk &&
+                            job.state == phone_auto_status::PREPARED) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (phone_auto_stop) { return; }
+            for (const auto & item : phone_auto_jobs) {
+                auto & job = *item.second;
+                const auto next = phone_auto_next_chunk.find(
+                    { job.request.key.run_id, job.request.key.region });
+                if (next != phone_auto_next_chunk.end() &&
+                        next->second == job.request.key.chunk &&
+                        job.state == phone_auto_status::PREPARED) {
+                    task = item.second;
+                    job.state = phone_auto_status::COMPUTING;
+                    break;
+                }
+            }
+        }
+        if (!task) { continue; }
+        const auto & req = task->request;
+        task->compute_begin_us = ggml_time_us();
+        ggml_status status = GGML_STATUS_FAILED;
+        {
+            std::lock_guard<std::recursive_mutex> graph_guard(
+                graph_compute_mutex);
+            const auto it = stored_graphs[req.device].find(req.graph_uid);
+            if (it != stored_graphs[req.device].end() &&
+                    it->second.graph != nullptr &&
+                    task->prepared.has_value()) {
+                const auto computed = phone_stage_slot0_compute(
+                    req.device, req.graph_uid, it->second.graph,
+                    it->second, &*task->prepared);
+                if (computed.has_value()) {
+                    status = *computed;
+                } else {
+                    // Fail closed, do not recompute on an unbound graph.
+                    std::lock_guard<std::mutex> slot_guard(
+                        phone_stage_pool_mutex);
+                    const auto cancelled =
+                        phone_stage_slot_policy[req.device].cancel_preparing(
+                            task->prepared->slot, task->prepared->ticket);
+                    GGML_ASSERT(cancelled == ggml_phone_stage::status::ok);
+                }
+            }
+        }
+        task->compute_end_us = ggml_time_us();
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            task->state = status == GGML_STATUS_SUCCESS ?
+                phone_auto_status::COMPLETE : phone_auto_status::FAILED;
+            if (status == GGML_STATUS_SUCCESS) {
+                ++phone_auto_next_chunk[
+                    { req.key.run_id, req.key.region }];
+            }
+        }
+        phone_auto_cv.notify_all();
+        GGML_LOG_INFO(
+            "[PHONE_AUTO] event=EXECUTE run=%" PRIu64
+            " region=%u chunk=%u uid=%" PRIu64
+            " upload_to_prepare_ms=%.3f compute_ms=%.3f "
+            "status=%s\n",
+            req.key.run_id, req.key.region, req.key.chunk,
+            req.graph_uid,
+            (task->prepare_done_us - task->upload_done_us) / 1000.0,
+            (task->compute_end_us - task->compute_begin_us) / 1000.0,
+            status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+    }
+}
+
 bool rpc_server::phone_input_stream_reserve(size_t bytes) {
     if (bytes < sizeof(rpc_msg_phone_input_push_req) ||
             bytes > RPC_PHONE_INPUT_MAX_BYTES + sizeof(rpc_msg_phone_input_push_req) ||
