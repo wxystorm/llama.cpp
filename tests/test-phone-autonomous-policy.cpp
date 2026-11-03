@@ -33,8 +33,25 @@ static void test_strict_kv_fifo() {
     assert(can_compute(38, 38));
 }
 
+static void test_stage_input_name_contract() {
+    using ggml_phone_auto::is_stage_input_name;
+    assert(is_stage_input_name("inp_stage"));
+    assert(is_stage_input_name("Meta(CPU,RPC0)#inp_stage#0"));
+    assert(is_stage_input_name("Meta(RPC0)#inp_stage#0"));
+    assert(!is_stage_input_name(nullptr));
+    assert(!is_stage_input_name(""));
+    assert(!is_stage_input_name("inp_stage_copy"));
+    assert(!is_stage_input_name("Meta(CPU,RPC0)#inp_stage#1"));
+    assert(!is_stage_input_name("Meta(CPU,RPC0)#inp_stage#0_extra"));
+    assert(!is_stage_input_name("Meta(CPU,RPC0)#other_inp_stage#0"));
+    assert(!is_stage_input_name("Other(CPU,RPC0)#inp_stage#0"));
+    assert(!is_stage_input_name("Meta()#inp_stage#0"));
+    assert(!is_stage_input_name("Meta(CPU,RPC0)inp_stage"));
+}
+
 int main() {
     test_one_chunk_lookahead();
     test_strict_kv_fifo();
+    test_stage_input_name_contract();
     return 0;
 }

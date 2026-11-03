@@ -6686,38 +6686,73 @@ bool rpc_server::phone_input_stream_run(
 // dual-slot plan: never guess graph UID, KV offsets, or tensor ownership.
 bool rpc_server::phone_auto_task_register(
         const rpc_msg_phone_auto_task_req & request) {
+    // Reject explicitly; a PC-side BIND_FAIL otherwise conceals the reason
+    // the registered Phone graph cannot accept a task.
+    const auto reject = [&](const char * reason) -> bool {
+        GGML_LOG_ERROR(
+            "[PHONE_AUTO] event=REGISTER_REJECT run=%" PRIu64
+            " region=%u chunk=%u device=%u uid=%" PRIu64
+            " bytes=%" PRIu64 " reason=%s status=REJECT\n",
+            request.key.run_id, request.key.region, request.key.chunk,
+            request.device, request.graph_uid, request.input_bytes, reason);
+        return false;
+    };
     if (request.key.run_id == 0 || request.key.region >= 64 ||
             request.graph_uid == 0 || request.input_bytes == 0 ||
-            request.input_bytes > RPC_PHONE_INPUT_MAX_BYTES ||
-            request.device >= stored_graphs.size()) {
-        return false;
+            request.input_bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return reject("INVALID_REQUEST");
+    }
+    if (request.device >= stored_graphs.size() ||
+            request.device >= phone_stage_device_arenas.size()) {
+        return reject("INVALID_DEVICE");
     }
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (!phone_input_stream_runs.count(request.key.run_id)) {
-            return false;
+            return reject("STREAM_NOT_ACTIVE");
         }
     }
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     auto it = stored_graphs[request.device].find(request.graph_uid);
-    if (it == stored_graphs[request.device].end() ||
-            it->second.graph == nullptr || !it->second.slot0.ready ||
-            it->second.slot0.kv_only_output ||
-            phone_stage_device_arenas[request.device].buffers[1] == nullptr) {
-        return false;
+    if (it == stored_graphs[request.device].end()) {
+        return reject("GRAPH_NOT_FOUND");
     }
-    const auto & plan = it->second.slot0;
+    if (it->second.graph == nullptr) {
+        return reject("GRAPH_EMPTY");
+    }
+    if (!it->second.slot0.ready) {
+        return reject("SLOT0_NOT_READY");
+    }
+    if (it->second.slot0.kv_only_output) {
+        return reject("KV_ONLY_OUTPUT");
+    }
+    if (phone_stage_device_arenas[request.device].buffers[1] == nullptr) {
+        return reject("SECOND_SLOT_MISSING");
+    }
     ggml_tensor * input = nullptr;
     bool ambiguous_input = false;
+    size_t name_candidates = 0;
+    size_t invalid_storage = 0;
+    size_t size_mismatch = 0;
     std::unordered_set<const ggml_tensor *> seen;
     std::function<void(ggml_tensor *)> visit = [&](ggml_tensor * t) {
         if (t == nullptr || !seen.insert(t).second) { return; }
-        if (std::strcmp(t->name, "inp_stage") == 0 &&
-                t->op == GGML_OP_NONE &&
-                t->buffer != nullptr && is_opencl_tensor(t) &&
-                ggml_nbytes(t) == request.input_bytes) {
-            if (input == nullptr) { input = t; }
-            else if (input != t) { ambiguous_input = true; }
+        // The Meta RPC serializer preserves a namespaced leaf name such as
+        // Meta(CPU,RPC0)#inp_stage#0, not necessarily plain inp_stage.
+        // Matching only the leaf's exact contract (not arbitrary substrings)
+        // prevents an unrelated tensor from being selected by shape.
+        if (ggml_phone_auto::is_stage_input_name(t->name)) {
+            ++name_candidates;
+            if (t->op != GGML_OP_NONE || t->buffer == nullptr ||
+                    !is_opencl_tensor(t)) {
+                ++invalid_storage;
+            } else if (ggml_nbytes(t) != request.input_bytes) {
+                ++size_mismatch;
+            } else if (input == nullptr) {
+                input = t;
+            } else if (input != t) {
+                ambiguous_input = true;
+            }
         }
         for (ggml_tensor * src : t->src) { visit(src); }
         if (t->view_src != nullptr) { visit(t->view_src); }
@@ -6725,8 +6760,19 @@ bool rpc_server::phone_auto_task_register(
     for (int i = 0; i < it->second.graph->n_nodes; ++i) {
         visit(it->second.graph->nodes[i]);
     }
-    if (input == nullptr || ambiguous_input) {
-        return false;
+    if (input == nullptr) {
+        GGML_LOG_ERROR(
+            "[PHONE_AUTO] event=INPUT_SCAN uid=%" PRIu64
+            " names=%zu invalid_storage=%zu size_mismatch=%zu"
+            " expected_bytes=%" PRIu64 " status=REJECT\n",
+            request.graph_uid, name_candidates, invalid_storage,
+            size_mismatch, request.input_bytes);
+        return reject(name_candidates == 0 ? "INPUT_NAME_NOT_FOUND" :
+            size_mismatch > 0 ? "INPUT_BYTES_MISMATCH" :
+            "INPUT_STORAGE_INVALID");
+    }
+    if (ambiguous_input) {
+        return reject("INPUT_AMBIGUOUS");
     }
     rpc_tensor wire = serialize_tensor(input);
     const phone_auto_key key = auto_key(request.key);
@@ -6740,22 +6786,27 @@ bool rpc_server::phone_auto_task_register(
     }
     {
         std::lock_guard<std::mutex> lock(phone_auto_mutex);
-        if (phone_auto_stop || phone_auto_jobs.count(key) != 0) {
-            return false;
+        if (phone_auto_stop) {
+            return reject("SERVER_STOPPING");
+        }
+        if (phone_auto_jobs.count(key) != 0) {
+            return reject("TASK_ALREADY_REGISTERED");
         }
         for (const auto & candidate : phone_auto_jobs) {
             const auto & other = *candidate.second;
             if (other.request.device != request.device) { continue; }
-            // One graph per KV-distinct chunk. Also prevent concurrent
-            // pre-upload from overwriting another chunk's input tensor.
-            if (other.request.graph_uid == request.graph_uid ||
-                    (other.input_wire.buffer == wire.buffer &&
-                     ggml_phone_stage::may_overlap(
-                         static_cast<size_t>(other.input_wire.data),
-                         static_cast<size_t>(other.request.input_bytes),
-                         static_cast<size_t>(wire.data),
-                         static_cast<size_t>(request.input_bytes)))) {
-                return false;
+            if (other.request.graph_uid == request.graph_uid) {
+                return reject("GRAPH_UID_REUSED");
+            }
+            // A different Graph UID is not sufficient: a second Chunk must
+            // never pre-upload into any overlapping input allocation.
+            if (other.input_wire.buffer == wire.buffer &&
+                    ggml_phone_stage::may_overlap(
+                        static_cast<size_t>(other.input_wire.data),
+                        static_cast<size_t>(other.request.input_bytes),
+                        static_cast<size_t>(wire.data),
+                        static_cast<size_t>(request.input_bytes))) {
+                return reject("INPUT_RANGE_OVERLAP");
             }
         }
         auto job = std::make_shared<phone_auto_job>();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 
 namespace ggml_phone_auto {
 
@@ -15,6 +16,18 @@ constexpr bool can_prepare(uint32_t next_kv_chunk, uint32_t chunk) {
 // compute and KV writes for Chunk N have completed.
 constexpr bool can_compute(uint32_t next_kv_chunk, uint32_t chunk) {
     return next_kv_chunk == chunk;
+}
+
+// Meta names its RPC split inputs (e.g. Meta(CPU,RPC0)#inp_stage#0).
+// Accept the original leaf or that exact namespaced leaf, not shape-only
+// guesses, partial suffixes, or similarly named unrelated inputs.
+inline bool is_stage_input_name(const char * name) {
+    if (name == nullptr) { return false; }
+    if (std::strcmp(name, "inp_stage") == 0) { return true; }
+    if (std::strncmp(name, "Meta(", 5) != 0) { return false; }
+    const char * close = std::strchr(name + 5, ')');
+    return close != nullptr && close > name + 5 &&
+        std::strcmp(close + 1, "#inp_stage#0") == 0;
 }
 
 } // namespace ggml_phone_auto

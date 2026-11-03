@@ -22,11 +22,19 @@ checks; it must not silently run the new protocol.
 Start the Phone RPC server with:
 
 ```sh
+export GGML_RPC_PHONE_BINDING_PREFLIGHT=1
 export GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1
 export GGML_RPC_PHONE_STAGE_DUAL_SLOT=1
 export GGML_RPC_PHONE_STAGE_PREPARE_AHEAD=1
 # Run your normal RPC server from this exact branch.
 ```
+
+Binding preflight is required to populate each registered Graph's Slot plan.
+The Phone accepts either plain `inp_stage` or the exact Meta-serialized
+`Meta(...)#inp_stage#0` leaf, and rejects ambiguous/invalid candidates.
+A task binding failure now logs `[PHONE_AUTO] event=REGISTER_REJECT` with
+`reason=...` on the Phone (e.g. `SLOT0_NOT_READY`, `INPUT_NAME_NOT_FOUND`,
+`INPUT_BYTES_MISMATCH`, or `INPUT_RANGE_OVERLAP`).
 
 Before launching `run_prompt_sweep.ps1` on Windows:
 
