@@ -6548,6 +6548,14 @@ bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
     phone_input_stream_profile report {};
+    size_t auto_jobs_total = 0;
+    size_t auto_jobs_complete = 0;
+    size_t auto_jobs_failed = 0;
+    size_t auto_prepared_ahead = 0;
+    int64_t auto_upload_us = 0;
+    int64_t auto_prepare_us = 0;
+    int64_t auto_compute_us = 0;
+    int64_t auto_overlap_us = 0;
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (request.active) {
@@ -6585,8 +6593,45 @@ bool rpc_server::phone_input_stream_run(
             for (auto it = phone_auto_jobs.begin();
                     it != phone_auto_jobs.end();) {
                 if (std::get<0>(it->first) == request.run_id) {
-                    if (it->second->state != phone_auto_status::COMPLETE) {
-                        it->second->state = phone_auto_status::FAILED;
+                    auto & job = *it->second;
+                    ++auto_jobs_total;
+                    if (job.state == phone_auto_status::COMPLETE) {
+                        ++auto_jobs_complete;
+                    } else {
+                        ++auto_jobs_failed;
+                        job.state = phone_auto_status::FAILED;
+                    }
+                    if (job.upload_begin_us > 0 &&
+                            job.upload_done_us >= job.upload_begin_us) {
+                        auto_upload_us += job.upload_done_us - job.upload_begin_us;
+                    }
+                    if (job.upload_done_us > 0 &&
+                            job.prepare_done_us >= job.upload_done_us) {
+                        auto_prepare_us += job.prepare_done_us - job.upload_done_us;
+                    }
+                    if (job.compute_begin_us > 0 &&
+                            job.compute_end_us >= job.compute_begin_us) {
+                        auto_compute_us += job.compute_end_us - job.compute_begin_us;
+                    }
+                    if (job.request.key.chunk > 0 &&
+                            job.upload_begin_us > 0 &&
+                            job.prepare_done_us > job.upload_begin_us) {
+                        const rpc_phone_input_key previous {
+                            request.run_id, job.request.key.region,
+                            job.request.key.chunk - 1 };
+                        const auto prev = phone_auto_jobs.find(auto_key(previous));
+                        if (prev != phone_auto_jobs.end() &&
+                                prev->second->compute_begin_us > 0 &&
+                                prev->second->compute_end_us >
+                                    prev->second->compute_begin_us) {
+                            const auto & p = *prev->second;
+                            const int64_t overlap = std::max<int64_t>(0,
+                                std::min(job.prepare_done_us, p.compute_end_us) -
+                                std::max(job.upload_begin_us, p.compute_begin_us));
+                            auto_overlap_us += overlap;
+                            auto_prepared_ahead +=
+                                job.prepare_done_us <= p.compute_end_us ? 1 : 0;
+                        }
                     }
                     it = phone_auto_jobs.erase(it);
                 } else { ++it; }
@@ -6599,6 +6644,19 @@ bool rpc_server::phone_input_stream_run(
             }
         }
         phone_auto_cv.notify_all();
+        if (auto_jobs_total > 0) {
+            GGML_LOG_INFO(
+                "[PHONE_AUTO_SUM] run=%" PRIu64
+                " registered=%zu completed=%zu failed=%zu"
+                " upload_ms=%.3f prepare_ms=%.3f compute_ms=%.3f"
+                " prepare_compute_overlap_ms=%.3f prepared_ahead=%zu"
+                " mode=VERIFIED_TRIGGER_KV_FIFO_DUAL_SLOT status=%s\\n",
+                request.run_id, auto_jobs_total, auto_jobs_complete,
+                auto_jobs_failed, auto_upload_us / 1000.0,
+                auto_prepare_us / 1000.0, auto_compute_us / 1000.0,
+                auto_overlap_us / 1000.0, auto_prepared_ahead,
+                auto_jobs_failed == 0 ? "PASS" : "FAIL");
+        }
         GGML_LOG_INFO(
             "[PHONE_INPUT_STREAM_SUM] run=%" PRIu64
             " frames=%" PRIu64 " verified=%" PRIu64
