@@ -11942,6 +11942,32 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_PHONE_AUTO_GRAPH_REGISTER: {
+                std::vector<uint8_t> graph;
+                if (!recv_msg(sock, graph)) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.graph_compute(graph, true) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
+                rpc_msg_phone_auto_task_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_auto_task_register(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_WAIT: {
+                rpc_msg_phone_auto_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted = server.phone_auto_wait(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_INPUT_STREAM_RUN: {
                 rpc_msg_phone_input_stream_run_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -12342,6 +12368,32 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!send_msg(sock, nullptr, 0)) {
                     return;
                 }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_GRAPH_REGISTER: {
+                std::vector<uint8_t> graph;
+                if (!recv_msg(sock, graph)) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.graph_compute(graph, true) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
+                rpc_msg_phone_auto_task_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_auto_task_register(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_WAIT: {
+                rpc_msg_phone_auto_wait_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted = server.phone_auto_wait(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_RUN: {
