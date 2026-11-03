@@ -5718,6 +5718,7 @@ private:
         std::optional<phone_stage_prepared_input> prepared;
         phone_auto_status state = phone_auto_status::REGISTERED;
         int64_t verified_us = 0;
+        int64_t upload_begin_us = 0;
         int64_t upload_done_us = 0;
         int64_t prepare_done_us = 0;
         int64_t compute_begin_us = 0;
@@ -6692,6 +6693,7 @@ bool rpc_server::phone_auto_task_register(
         job->input_wire = wire;
         job->state = already_verified ?
             phone_auto_status::VERIFIED : phone_auto_status::REGISTERED;
+        if (already_verified) { job->verified_us = ggml_time_us(); }
         phone_auto_jobs.emplace(key, std::move(job));
         phone_auto_next_chunk.try_emplace(
             std::make_pair(request.key.run_id, request.key.region), 0);
@@ -6784,6 +6786,7 @@ void rpc_server::phone_auto_prepare_loop() {
         const auto & req = task->request;
         bool ok = true;
         if (previous == phone_auto_status::VERIFIED) {
+            task->upload_begin_us = ggml_time_us();
             rpc_msg_phone_input_apply_req apply {};
             apply.key = req.key;
             apply.tensor = task->input_wire;
@@ -6928,6 +6931,9 @@ void rpc_server::phone_auto_compute_loop() {
             }
         }
         phone_auto_cv.notify_all();
+        const char * trace_env =
+            std::getenv("GGML_RPC_PHONE_AUTO_TRACE");
+        if (trace_env != nullptr && std::strcmp(trace_env, "1") == 0) {
         GGML_LOG_INFO(
             "[PHONE_AUTO] event=EXECUTE run=%" PRIu64
             " region=%u chunk=%u uid=%" PRIu64
@@ -6938,6 +6944,7 @@ void rpc_server::phone_auto_compute_loop() {
             (task->prepare_done_us - task->upload_done_us) / 1000.0,
             (task->compute_end_us - task->compute_begin_us) / 1000.0,
             status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        }
     }
 }
 
