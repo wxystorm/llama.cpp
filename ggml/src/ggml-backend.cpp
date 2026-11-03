@@ -2220,6 +2220,56 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_async(
         sched, split_id, upload_backend, sched);
 }
 
+// The copy callback is per host Worker thread, not global. RPC buffer setters
+// annotate only a copy currently being measured in this same thread.
+static thread_local ggml_backend_sched_copy_trace_callback ggml_copy_trace_callback = nullptr;
+static thread_local void * ggml_copy_trace_user_data = nullptr;
+static thread_local ggml_backend_sched_copy_trace * ggml_copy_trace_active = nullptr;
+
+void ggml_backend_sched_copy_trace_set_callback(
+        ggml_backend_sched_copy_trace_callback callback, void * user_data) {
+    ggml_copy_trace_callback = callback;
+    ggml_copy_trace_user_data = callback != nullptr ? user_data : nullptr;
+}
+
+bool ggml_backend_sched_copy_trace_active(void) {
+    return ggml_copy_trace_active != nullptr;
+}
+
+void ggml_backend_sched_copy_trace_rpc_note(
+        enum ggml_backend_sched_copy_rpc_kind kind,
+        size_t bytes, int64_t call_us) {
+    auto * e = ggml_copy_trace_active;
+    if (e == nullptr) {
+        return; // no event allocation or clock reading without tracing
+    }
+    switch (kind) {
+        case GGML_BACKEND_SCHED_COPY_RPC_APPLY_OK:
+            ++e->rpc_apply_calls;
+            e->rpc_apply_bytes += bytes;
+            e->rpc_apply_us += call_us;
+            break;
+        case GGML_BACKEND_SCHED_COPY_RPC_APPLY_MISS:
+            ++e->rpc_apply_misses;
+            e->rpc_apply_miss_us += call_us;
+            break;
+        case GGML_BACKEND_SCHED_COPY_RPC_SET:
+            ++e->rpc_set_calls;
+            e->rpc_set_bytes += bytes;
+            e->rpc_set_us += call_us;
+            break;
+        case GGML_BACKEND_SCHED_COPY_RPC_HASH_HIT:
+            ++e->rpc_hash_hit_calls;
+            e->rpc_hash_hit_bytes += bytes;
+            e->rpc_hash_hit_us += call_us;
+            break;
+        case GGML_BACKEND_SCHED_COPY_RPC_FUSED:
+            ++e->rpc_fused_calls;
+            e->rpc_fused_us += call_us;
+            break;
+    }
+}
+
 enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(split_id >= 0 && split_id < sched->n_splits);
@@ -2267,10 +2317,28 @@ enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, in
         }
     };
     auto tensor_copy_call = [&](const ggml_tensor * src, ggml_tensor * dst) {
-        const int64_t begin_us = profile ? ggml_time_us() : 0;
+        const bool trace = ggml_copy_trace_callback != nullptr;
+        ggml_backend_sched_copy_trace event {};
+        ggml_backend_sched_copy_trace * previous = ggml_copy_trace_active;
+        if (trace) {
+            event.src_name = src->name;
+            event.dst_name = dst->name;
+            event.split = (uint32_t) split_id;
+            event.logical_bytes = ggml_nbytes(src);
+            event.src_is_host = src->buffer != nullptr && ggml_backend_buffer_is_host(src->buffer);
+            event.dst_is_host = dst->buffer != nullptr && ggml_backend_buffer_is_host(dst->buffer);
+            ggml_copy_trace_active = &event;
+        }
+        const int64_t begin_us = profile || trace ? ggml_time_us() : 0;
         ggml_backend_tensor_copy(src, dst);
+        const int64_t elapsed_us = profile || trace ? ggml_time_us() - begin_us : 0;
+        if (trace) {
+            ggml_copy_trace_active = previous;
+            event.call_us = elapsed_us;
+            ggml_copy_trace_callback(ggml_copy_trace_user_data, &event);
+        }
         if (profile) {
-            breakdown.copy_call_us += ggml_time_us() - begin_us;
+            breakdown.copy_call_us += elapsed_us;
             breakdown.copy_bytes += ggml_nbytes(src);
             ++breakdown.copy_calls;
         }
