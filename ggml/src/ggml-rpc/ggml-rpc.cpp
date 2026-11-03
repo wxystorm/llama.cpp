@@ -6578,6 +6578,25 @@ bool rpc_server::phone_input_stream_run(
     }
     phone_input_stream_cv.notify_all();
     if (!request.active) {
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            for (auto it = phone_auto_jobs.begin();
+                    it != phone_auto_jobs.end();) {
+                if (std::get<0>(it->first) == request.run_id) {
+                    if (it->second->state != phone_auto_status::COMPLETE) {
+                        it->second->state = phone_auto_status::FAILED;
+                    }
+                    it = phone_auto_jobs.erase(it);
+                } else { ++it; }
+            }
+            for (auto it = phone_auto_next_chunk.begin();
+                    it != phone_auto_next_chunk.end();) {
+                if (it->first.first == request.run_id) {
+                    it = phone_auto_next_chunk.erase(it);
+                } else { ++it; }
+            }
+        }
+        phone_auto_cv.notify_all();
         GGML_LOG_INFO(
             "[PHONE_INPUT_STREAM_SUM] run=%" PRIu64
             " frames=%" PRIu64 " verified=%" PRIu64
@@ -6963,6 +6982,7 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
                          (size_t) request.size) == request.hash;
     }
     const int64_t hash_us = ggml_time_us() - hash_begin_us;
+    bool enqueued_verified = false;
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (request.key.run_id != 0 &&
@@ -6990,18 +7010,24 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
                 entry.reserved_bytes = bytes;
                 entry.payload = std::move(packet);
                 phone_input_staged_slots.emplace_back(std::move(entry));
-                phone_input_stream_cv.notify_all();
-                return;
+                enqueued_verified = true;
             }
         }
-        if (request.key.run_id != 0 &&
-                phone_input_stream_runs.count(request.key.run_id) != 0) {
-            phone_input_stream_failed.push_back(request.key);
+        if (!enqueued_verified) {
+            if (request.key.run_id != 0 &&
+                    phone_input_stream_runs.count(request.key.run_id) != 0) {
+                phone_input_stream_failed.push_back(request.key);
+            }
+            GGML_ASSERT(phone_input_stream_held_bytes >= bytes);
+            phone_input_stream_held_bytes -= bytes;
         }
-        GGML_ASSERT(phone_input_stream_held_bytes >= bytes);
-        phone_input_stream_held_bytes -= bytes;
     }
     phone_input_stream_cv.notify_all();
+    if (enqueued_verified) {
+        // The callback never holds phone_input_mutex while taking the
+        // autonomous scheduler mutex; lock order stays acyclic.
+        phone_auto_input_verified(request.key);
+    }
 }
 
 bool rpc_server::phone_input_apply(
