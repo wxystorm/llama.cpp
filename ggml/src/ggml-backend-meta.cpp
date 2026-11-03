@@ -38,6 +38,30 @@ struct ggml_backend_meta_buffer_type;
 struct ggml_backend_meta_buffer;
 struct ggml_backend_meta;
 
+// Scoped to the invoking PC Phone Worker thread. Graph registration and
+// waiting are mutually exclusive and cannot affect CPU/CUDA/decode workers.
+struct ggml_meta_phone_auto_tls_state {
+    int action = 0;
+    uint64_t run_id = 0;
+    uint64_t registered_uid = 0;
+    uint32_t region = 0;
+    uint32_t chunk = 0;
+};
+static thread_local ggml_meta_phone_auto_tls_state ggml_meta_phone_auto_tls {};
+
+void ggml_backend_meta_phone_auto_context(
+        int action, uint64_t run_id, uint32_t region, uint32_t chunk) {
+    ggml_meta_phone_auto_tls = {};
+    ggml_meta_phone_auto_tls.action = action;
+    ggml_meta_phone_auto_tls.run_id = run_id;
+    ggml_meta_phone_auto_tls.region = region;
+    ggml_meta_phone_auto_tls.chunk = chunk;
+}
+
+uint64_t ggml_backend_meta_phone_auto_registered_uid() {
+    return ggml_meta_phone_auto_tls.registered_uid;
+}
+
 // The outer Region Ring Phone worker owns this scope. Never derive it from
 // a process-global environment variable: other worker threads and decode
 // must continue to execute ordinary Meta output handoffs.
@@ -15647,6 +15671,13 @@ if (phone_status != GGML_STATUS_SUCCESS) {
         std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
         full_region_graph_env != nullptr &&
         std::strcmp(full_region_graph_env, "1") == 0;
+    // Registration/wait must never execute a partially fused or Tensor
+    // graph. If the Full Region proof is disabled, fail rather than silently
+    // fall back to an additional Phone compute.
+    if (ggml_meta_phone_auto_tls.action != 0 &&
+            !full_region_graph_requested) {
+        return GGML_STATUS_FAILED;
+    }
     const bool ring_phone_fusion =
         n_backends == 2 && ring_exec != nullptr && ring_fuse != nullptr &&
         std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
@@ -21491,6 +21522,35 @@ auto prefill_norm_sg_has_prework =
             phone_block_fused ?
                 build_phone_block_graph(i, phone_block_end) :
                 backend_ctx->backend_configs[1].cgraphs[i].cgraph_main;
+        if (ggml_meta_phone_auto_tls.action == 1) {
+            // Only a proven complete Phone Full graph can be registered.
+            // This does not launch kernels or perform the terminal handoff.
+            if (!full_region_graph_ready || phone_graph == nullptr ||
+                    phone_graph->uid == 0 || n_backends != 2) {
+                GGML_LOG_ERROR(
+                    "[PHONE_AUTO] event=REGISTER_REJECT reason=NOT_FULL_REGION\n");
+                return GGML_STATUS_FAILED;
+            }
+            auto * dev = ggml_backend_get_device(
+                backend_ctx->backend_configs[1].backend);
+            auto * reg = dev != nullptr ?
+                ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto fn = reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_auto_graph_register_t>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC)) :
+                nullptr;
+            uint64_t uid = 0;
+            if (fn == nullptr ||
+                    !fn(backend_ctx->backend_configs[1].backend, phone_graph, &uid) ||
+                    uid == 0) {
+                GGML_LOG_ERROR(
+                    "[PHONE_AUTO] event=REGISTER_REJECT reason=RPC_GRAPH_REGISTRATION\n");
+                return GGML_STATUS_FAILED;
+            }
+            ggml_meta_phone_auto_tls.registered_uid = uid;
+            return GGML_STATUS_SUCCESS;
+        }
         if (full_region_graph_ready) {
             meta_phone_full_assemble_us += ggml_time_us() - full_assemble_begin_us;
             GGML_LOG_INFO(
@@ -22079,6 +22139,38 @@ auto prefill_norm_sg_has_prework =
                            i, absorbed_l_out_it->second);
                 }
                 full_region_absorbed_l_out.erase(absorbed_l_out_it);
+            } else if (ggml_meta_phone_auto_tls.action == 2) {
+                // Phone has already received VERIFIED input and submitted
+                // this exact graph. Wait for local completion only, then
+                // continue the existing Meta output bridge/fence.
+                if (!full_region_graph_ready ||
+                        ggml_meta_phone_auto_tls.run_id == 0) {
+                    return GGML_STATUS_FAILED;
+                }
+                auto * phone_backend =
+                    backend_ctx->backend_configs[1].backend;
+                auto * dev = ggml_backend_get_device(phone_backend);
+                auto * reg = dev != nullptr ?
+                    ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto wait_fn = reg != nullptr ?
+                    reinterpret_cast<ggml_backend_rpc_phone_auto_wait_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC)) :
+                    nullptr;
+                if (wait_fn == nullptr ||
+                        !wait_fn(phone_backend,
+                            ggml_meta_phone_auto_tls.run_id,
+                            ggml_meta_phone_auto_tls.region,
+                            ggml_meta_phone_auto_tls.chunk)) {
+                    GGML_LOG_ERROR(
+                        "[PHONE_AUTO] event=WAIT_REJECT run=%" PRIu64
+                        " region=%u chunk=%u reason=PHONE_TASK_FAILED\n",
+                        ggml_meta_phone_auto_tls.run_id,
+                        ggml_meta_phone_auto_tls.region,
+                        ggml_meta_phone_auto_tls.chunk);
+                    return GGML_STATUS_FAILED;
+                }
+                compute_status = GGML_STATUS_SUCCESS;
             } else if (ring_phone_autostart && phone_block_fused &&
                     !phone_region_fused &&
                     (first_fused_layer == 11 || first_fused_layer == 27)) {
