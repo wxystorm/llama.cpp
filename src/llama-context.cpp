@@ -2600,6 +2600,37 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         bool                               preserve_weight_cache_on_graph_reset,
         bool                               phone_prebuilt_graph) {
     llama_region_ring_tls_p2c_deferred = {};
+    // Scoped to a single synchronous Scheduler prepare_split call. Other
+    // workers have their own TLS, and the Phone RPC server is never asked to
+    // log every tensor on the hot path.
+    struct phone_copy_trace_scope {
+        bool active = false;
+
+        explicit phone_copy_trace_scope(llama_hybrid_stage_timing * t) {
+            active = t != nullptr && t->capture_copy_trace;
+            if (!active) {
+                return;
+            }
+            ggml_backend_sched_copy_trace_set_callback(
+                +[](void * user, const ggml_backend_sched_copy_trace * e) {
+                    auto * timing = static_cast<llama_hybrid_stage_timing *>(user);
+                    llama_hybrid_copy_trace_record record {};
+                    record.tensor = e->src_name != nullptr ? e->src_name : "";
+                    record.dst_tensor = e->dst_name != nullptr ? e->dst_name : "";
+                    record.event = *e;
+                    // Graph descriptors may be rebuilt after this Chunk.
+                    record.event.src_name = nullptr;
+                    record.event.dst_name = nullptr;
+                    timing->copy_traces.emplace_back(std::move(record));
+                }, t);
+        }
+
+        ~phone_copy_trace_scope() {
+            if (active) {
+                ggml_backend_sched_copy_trace_set_callback(nullptr, nullptr);
+            }
+        }
+    };
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     if (kv_mctx == nullptr || !kv_mctx->set_stage_range(ubatch_id, token_begin, block_tokens)) {
         LLAMA_LOG_INFO(
@@ -3030,7 +3061,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
             const int64_t split_prepare_begin_us =
                 timing != nullptr ? ggml_time_us() : 0;
-            ret = ggml_backend_sched_prepare_split(sched_use, split);
+            {
+                phone_copy_trace_scope copy_trace(timing);
+                ret = ggml_backend_sched_prepare_split(sched_use, split);
+            }
             if (timing != nullptr) {
                 ggml_backend_sched_prepare_breakdown breakdown {};
                 ggml_backend_sched_get_last_prepare_breakdown(sched_use, &breakdown);
