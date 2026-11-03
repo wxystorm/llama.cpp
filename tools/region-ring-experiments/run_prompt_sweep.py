@@ -29,7 +29,7 @@ FIELDS = [
     "planner_mode", "plan_applied", "plan_layout", "runtime_layout",
     "gpu_layers", "cpu_layers", "phone_layers", "tensor_layers",
     "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
-    "n_predict", "gpu_weight_streaming", "predicted_ms", "baseline_predicted_ms",
+    "n_predict", "gpu_weight_streaming", "no_mmap", "predicted_ms", "baseline_predicted_ms",
     "selected_dag_sim_ms", "final_dag_sim_ms", "final_dag_source",
     "link_ab_serial_ms", "link_ab_independent_ms",
     "link_ab_contended_ms", "link_ab_overlap_ms", "link_ab_status",
@@ -362,6 +362,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "context": context, "batch": args.batch, "ubatch": args.ubatch,
         "threads": args.threads, "seed": args.seed,
         "n_predict": args.n_predict, "gpu_weight_streaming": args.streaming,
+        "no_mmap": getattr(args, "no_mmap", False),
         "predicted_ms": selected_dag_sim_ms,
         "baseline_predicted_ms": baseline_dag_sim_ms,
         "selected_dag_sim_ms": selected_dag_sim_ms,
@@ -572,6 +573,8 @@ def main():
     ap.add_argument("--force-xc", type=int)
     ap.add_argument("--force-xg", type=int)
     ap.add_argument("--force-xp", type=int)
+    ap.add_argument("--no-mmap", action="store_true",
+                    help="disable memory mapping when loading the model")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     args.exe = args.exe.expanduser().resolve()
@@ -647,10 +650,13 @@ def main():
             "--seed", str(args.seed), "--no-conversation",
             "-f", str(prompt), "-lv", str(args.log_verbosity),
         ]
+        if args.no_mmap:
+            command.append("--no-mmap")
         config = {
             "command": command, "cwd": str(root), "repeat": 1,
             "prompt_file": str(prompt), "prompt_hint": hint,
             "commit": commit, "log_verbosity": args.log_verbosity,
+            "no_mmap": args.no_mmap,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
