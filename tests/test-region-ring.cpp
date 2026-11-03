@@ -1275,6 +1275,28 @@ static void test_phone_input_stream_no_host_credits() {
           "Phone stream scheduler failed to drain");
 }
 
+static void test_phone_auto_final_graph_node_budget() {
+    // Isolated L11..13 and L39 do not need the entire 40-layer graph budget.
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              8192, 40, 3) == 1024,
+          "three-layer Phone stage did not reduce scheduler memory");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              8192, 40, 1) == 1024,
+          "terminal L39 scheduler was not bounded");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              8192, 40, 8) == 2048,
+          "larger Phone stage budget was not scaled");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              8192, 40, 40) == 8192,
+          "full-depth graph budget was reduced incorrectly");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              800, 40, 1) == 800,
+          "budget must never exceed full-model capacity");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              8192, 0, 3) == 8192,
+          "missing model depth should preserve existing capacity");
+}
+
 static void test_phone_auto_final_output_offsets() {
     constexpr size_t total_tokens = 358;
     constexpr size_t chunk_tokens = 64;
@@ -1374,6 +1396,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         test_phone_auto_final_output_offsets();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_output_offsets=PASS\n");
+        test_phone_auto_final_graph_node_budget();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_graph_node_budget=PASS\n");
         test_phone_input_stream_no_host_credits();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_input_stream=PASS\n");
         test_phone_input_push_ahead();

@@ -52,6 +52,25 @@ inline constexpr size_t LLAMA_REGION_RING_SLOT_POOL_SIZE = 0;
 // The terminal autonomous Phone Region returns one hidden buffer per token,
 // just like an intermediate Region. The legacy final Meta graph still writes
 // logits directly and does not need a host output buffer.
+// Full-model graph budgets are much larger than an isolated Phone Region.
+// Every registered Chunk keeps its own Scheduler, whose metadata scratch
+// allocation scales with max_nodes * GGML_SCHED_MAX_SPLIT_INPUTS. Reserve two
+// virtual layers for stage inputs/outputs while scaling for Region depth.
+// Only the opt-in autonomous-final Qwen3 runtime selects this budget.
+inline size_t llama_region_ring_phone_autonomous_graph_max_nodes(
+        size_t full_max_nodes, size_t model_layers, size_t stage_layers) {
+    if (model_layers == 0 || stage_layers == 0 ||
+            stage_layers >= model_layers) {
+        return full_max_nodes;
+    }
+    const size_t weighted_layers = stage_layers +
+        std::min<size_t>(2, model_layers - stage_layers);
+    const size_t scaled = (full_max_nodes / model_layers) * weighted_layers +
+        ((full_max_nodes % model_layers) * weighted_layers + model_layers - 1) /
+            model_layers;
+    return std::min(full_max_nodes, std::max<size_t>(1024, scaled));
+}
+
 inline size_t llama_region_ring_output_host_token_begin(
         bool last, bool phone_auto_final, size_t token_begin,
         int output_slot, size_t chunk_tokens, size_t slot_pool_size) {

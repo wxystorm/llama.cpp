@@ -68,6 +68,25 @@ $env:LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL = "1"
   (`LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL=0`).
   A `PASS` status alone is not a numerical parity check.
 
+## Registration memory (2026-11-03 fix)
+
+On the autonomous-final path, the old PC static Phone templates are skipped:
+all three Phone Regions already use exact per-Chunk registered graphs, and
+the four legacy templates would not be executed. Each retained autonomous
+Scheduler/Graph Result now uses a stage-depth-scaled node budget instead of
+the full-model node budget. The RPC graph and backing buffers remain alive
+until their corresponding work is finished; they are not prematurely freed.
+
+Expected PC startup logs:
+- `[PHONE_STATIC_TEMPLATE] event=SKIP reason=AUTONOMOUS_ALL_PHONE_REGIONS`
+- `[PHONE_AUTO] event=GRAPH_NODE_BUDGET ... policy=REGION_SCALED`
+- `[PHONE_AUTO] event=GRAPH_SETUP_DONE count=18`
+
+This addresses the memory-pressure regression where the original version
+registered 6+6+3 Phone graphs before `ggml_init` failed during the next
+Region-8 graph. It is a source-level fix, not yet evidence of successful
+hardware execution; still compare logits and the legacy baseline.
+
 ## Deliberate V1 limits
 
 Only Qwen3 dense, single terminal output, fixed threaded full-Region

@@ -4773,7 +4773,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "NONCANONICAL_LOGITS_MASK",
             ubatch.n_tokens);
     }
-    if (phone_static_templates) {
+    // In autonomous-final mode every Phone Chunk has an immutable registered
+    // Graph below. The legacy PC static templates would never be executed,
+    // yet would retain four full-model Schedulers during the entire Prefill.
+    if (phone_auto_final_enabled) {
+        LLAMA_LOG_INFO(
+            "[PHONE_STATIC_TEMPLATE] event=SKIP "
+            "reason=AUTONOMOUS_ALL_PHONE_REGIONS status=OK\n");
+    }
+    if (phone_static_templates && !phone_auto_final_enabled) {
         const int64_t prebuild_begin_us = ggml_time_us();
         // The catalog is also unit-tested independently of GGML.
         const auto shapes = llama_region_ring_phone_static_shapes(
@@ -4903,6 +4911,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 continue;
             }
             const auto & stage = stages[r];
+            const size_t stage_max_nodes = phone_auto_final_enabled ?
+                llama_region_ring_phone_autonomous_graph_max_nodes(
+                    max_nodes, (size_t) model.hparams.n_layer(),
+                    (size_t) std::max(0, stage.layer_end - stage.layer_begin)) :
+                max_nodes;
+            LLAMA_LOG_INFO(
+                "[PHONE_AUTO] event=GRAPH_NODE_BUDGET "
+                "region=%zu layers=%d full_nodes=%zu stage_nodes=%zu "
+                "policy=%s status=READY\n",
+                r, stage.layer_end - stage.layer_begin,
+                max_nodes, stage_max_nodes,
+                phone_auto_final_enabled ? "REGION_SCALED" : "FULL_LEGACY");
             const uint32_t size = (uint32_t) stage.macro_tokens;
             if (size == 0) {
                 ret = GGML_STATUS_FAILED;
@@ -4918,9 +4938,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     size, ubatch.n_tokens - begin);
                 item.owned_sched.reset(ggml_backend_sched_new(
                     backend_ptrs.data(), backend_buft.data(),
-                    (int) backend_ptrs.size(), max_nodes,
+                    (int) backend_ptrs.size(), stage_max_nodes,
                     false, cparams.op_offload));
-                item.owned_res.reset(new llm_graph_result(max_nodes));
+                item.owned_res.reset(new llm_graph_result(stage_max_nodes));
                 if (item.owned_sched == nullptr ||
                         !worker_kv_views[2]->set_stage_range(
                             ubatch_id, begin, item.tokens)) {
