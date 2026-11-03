@@ -1275,6 +1275,44 @@ static void test_phone_input_stream_no_host_credits() {
           "Phone stream scheduler failed to drain");
 }
 
+static void test_phone_auto_final_output_offsets() {
+    constexpr size_t total_tokens = 358;
+    constexpr size_t chunk_tokens = 64;
+    constexpr size_t hidden = 4;
+    std::vector<float> outputs(total_tokens * hidden, -1.0f);
+    size_t chunks = 0;
+
+    // The P2C Receiver is bound before PUSH using global token positions.
+    // The terminal Phone Worker must address those exact destinations,
+    // including the last partial Chunk (begin=320, tokens=38).
+    for (size_t begin = 0; begin < total_tokens; begin += chunk_tokens) {
+        const size_t count = std::min(chunk_tokens, total_tokens - begin);
+        const size_t worker_begin = llama_region_ring_output_host_token_begin(
+            true, true, begin, -1, chunk_tokens, 0);
+        check(worker_begin == begin, "autonomous final output offset was reset");
+        float * producer = outputs.data() + worker_begin * hidden;
+        float * receiver = outputs.data() + begin * hidden;
+        check(producer == receiver, "terminal Phone P2C prebind mismatch");
+        for (size_t t = 0; t < count; ++t) {
+            producer[t * hidden] = (float) (begin + t);
+        }
+        ++chunks;
+    }
+    check(chunks == 6, "incorrect final Phone Chunk count");
+    check(outputs[(total_tokens - 1) * hidden] == 357.0f,
+          "last token hidden output was not retained for PC Head");
+
+    check(llama_region_ring_output_host_token_begin(
+              true, false, 320, -1, chunk_tokens, 0) == 0,
+          "legacy final Meta output address changed");
+    check(llama_region_ring_output_host_token_begin(
+              false, false, 128, -1, chunk_tokens, 0) == 128,
+          "full-ubatch intermediate output address changed");
+    check(llama_region_ring_output_host_token_begin(
+              false, false, 128, 1, chunk_tokens, 2) == 64,
+          "bounded-slot intermediate output address changed");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1334,6 +1372,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] phone_static_template_shapes=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
+        test_phone_auto_final_output_offsets();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_auto_final_output_offsets=PASS\n");
         test_phone_input_stream_no_host_credits();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_input_stream=PASS\n");
         test_phone_input_push_ahead();

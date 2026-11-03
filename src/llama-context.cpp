@@ -4749,6 +4749,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    // Autonomous final P2C prebinds every token at its global UBatch offset.
+    // It requires a full-UBatch host buffer, not a rotating output slot.
+    if (phone_auto_final_enabled &&
+            (slot_pool_size != 0 || outputs.size() != stages.size() ||
+             outputs.back().size() <
+                 (size_t) ubatch.n_tokens * (size_t) n_embd)) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_AUTO_FINAL_HEAD] event=REJECT "
+            "reason=FINAL_OUTPUT_BUFFER_CAPACITY "
+            "expected_floats=%zu actual_floats=%zu slot_pool_size=%zu\n",
+            (size_t) ubatch.n_tokens * (size_t) n_embd,
+            outputs.empty() ? 0 : outputs.back().size(), slot_pool_size);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     int64_t phone_static_prebuild_us = 0;
     if (phone_static_requested && !phone_static_templates) {
         LLAMA_LOG_INFO(
@@ -6152,10 +6167,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         slot_pool_size > 0 ?
                             (size_t) task.input_slot * (size_t) chunk_tokens :
                             (size_t) task.token_begin;
-                    const size_t output_host_token_begin = last ? 0 :
-                        slot_pool_size > 0 ?
-                            (size_t) task.output_slot * (size_t) chunk_tokens :
-                            (size_t) task.token_begin;
+                    const size_t output_host_token_begin =
+                        llama_region_ring_output_host_token_begin(
+                            last, phone_auto_final_enabled,
+                            (size_t) task.token_begin, task.output_slot,
+                            (size_t) chunk_tokens, slot_pool_size);
                     float * input = first ?
                         (ring_embedding_prelude ?
                             ring_input_hidden.data() +
