@@ -8,6 +8,7 @@
 #include "p2c-stream-receiver.h"
 #include "phone-stage-binding-pool.h"
 #include "phone-stage-binding-map.h"
+#include "phone-autonomous-policy.h"
 
 #include <array>
 #include <chrono>
@@ -6818,7 +6819,8 @@ void rpc_server::phone_auto_prepare_loop() {
                     const auto next = phone_auto_next_chunk.find(
                         { job.request.key.run_id, job.request.key.region });
                     if (next == phone_auto_next_chunk.end() ||
-                            job.request.key.chunk > next->second + 1) {
+                            !ggml_phone_auto::can_prepare(
+                                next->second, job.request.key.chunk)) {
                         continue;
                     }
                     if (job.state == phone_auto_status::VERIFIED ||
@@ -6834,7 +6836,8 @@ void rpc_server::phone_auto_prepare_loop() {
                 const auto next = phone_auto_next_chunk.find(
                     { job.request.key.run_id, job.request.key.region });
                 if (next == phone_auto_next_chunk.end() ||
-                        job.request.key.chunk > next->second + 1) {
+                        !ggml_phone_auto::can_prepare(
+                                next->second, job.request.key.chunk)) {
                     continue;
                 }
                 if (job.state == phone_auto_status::VERIFIED ||
@@ -6937,7 +6940,8 @@ void rpc_server::phone_auto_compute_loop() {
                     const auto next = phone_auto_next_chunk.find(
                         { job.request.key.run_id, job.request.key.region });
                     if (next != phone_auto_next_chunk.end() &&
-                            next->second == job.request.key.chunk &&
+                            ggml_phone_auto::can_compute(
+                                next->second, job.request.key.chunk) &&
                             job.state == phone_auto_status::PREPARED) {
                         return true;
                     }
@@ -6950,7 +6954,8 @@ void rpc_server::phone_auto_compute_loop() {
                 const auto next = phone_auto_next_chunk.find(
                     { job.request.key.run_id, job.request.key.region });
                 if (next != phone_auto_next_chunk.end() &&
-                        next->second == job.request.key.chunk &&
+                        ggml_phone_auto::can_compute(
+                                next->second, job.request.key.chunk) &&
                         job.state == phone_auto_status::PREPARED) {
                     task = item.second;
                     job.state = phone_auto_status::COMPUTING;
