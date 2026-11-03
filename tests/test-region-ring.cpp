@@ -1335,7 +1335,7 @@ int main() {
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
         test_phone_input_stream_no_host_credits();
-        std::fprintf(stderr, "[REGION_RING_TEST] phone_input_stream=PASS\\n");
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_input_stream=PASS\n");
         test_phone_input_push_ahead();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_input_push_ahead=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
