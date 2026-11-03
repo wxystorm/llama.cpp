@@ -30,4 +30,15 @@ inline bool is_stage_input_name(const char * name) {
         std::strcmp(close + 1, "#inp_stage#0") == 0;
 }
 
+// The native Phone backend holds actual OpenCL buffer/data addresses.
+// The generic RPC client serializer blanks these fields for non-RPC buffers;
+// they must be restored before server-local APPLY or overlap validation.
+inline bool bind_native_storage(uint64_t & wire_buffer, uint64_t & wire_data,
+                                const void * buffer, const void * data) {
+    if (buffer == nullptr || data == nullptr) { return false; }
+    wire_buffer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer));
+    wire_data = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
+    return true;
+}
+
 } // namespace ggml_phone_auto

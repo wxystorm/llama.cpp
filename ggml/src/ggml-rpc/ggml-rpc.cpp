@@ -6774,7 +6774,18 @@ bool rpc_server::phone_auto_task_register(
     if (ambiguous_input) {
         return reject("INPUT_AMBIGUOUS");
     }
+    // serialize_tensor() is a *client-side* serializer: it deliberately
+    // writes buffer=0/data=0 for a native OpenCL tensor. On the RPC server,
+    // the graph's input is already deserialized and its native storage must
+    // be preserved for both collision detection and local APPLY.
+    if (buffers.find(input->buffer) == buffers.end()) {
+        return reject("INPUT_BUFFER_NOT_LIVE");
+    }
     rpc_tensor wire = serialize_tensor(input);
+    if (!ggml_phone_auto::bind_native_storage(
+            wire.buffer, wire.data, input->buffer, input->data)) {
+        return reject("INPUT_ADDRESS_INVALID");
+    }
     const phone_auto_key key = auto_key(request.key);
     bool already_verified = false;
     {
@@ -6806,6 +6817,18 @@ bool rpc_server::phone_auto_task_register(
                         static_cast<size_t>(other.request.input_bytes),
                         static_cast<size_t>(wire.data),
                         static_cast<size_t>(request.input_bytes))) {
+                GGML_LOG_ERROR(
+                    "[PHONE_AUTO] event=INPUT_RANGE_CONFLICT "
+                    "run=%" PRIu64 " region=%u chunk=%u "
+                    "uid=%" PRIu64 " existing_uid=%" PRIu64 " "
+                    "buffer=0x%" PRIx64 " data=0x%" PRIx64 " "
+                    "existing_data=0x%" PRIx64 " "
+                    "bytes=%" PRIu64 " existing_bytes=%" PRIu64 "\n",
+                    request.key.run_id, request.key.region,
+                    request.key.chunk, request.graph_uid,
+                    other.request.graph_uid, wire.buffer, wire.data,
+                    other.input_wire.data, request.input_bytes,
+                    other.request.input_bytes);
                 return reject("INPUT_RANGE_OVERLAP");
             }
         }

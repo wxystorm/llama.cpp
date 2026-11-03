@@ -34,7 +34,12 @@ The Phone accepts either plain `inp_stage` or the exact Meta-serialized
 `Meta(...)#inp_stage#0` leaf, and rejects ambiguous/invalid candidates.
 A task binding failure now logs `[PHONE_AUTO] event=REGISTER_REJECT` with
 `reason=...` on the Phone (e.g. `SLOT0_NOT_READY`, `INPUT_NAME_NOT_FOUND`,
-`INPUT_BYTES_MISMATCH`, or `INPUT_RANGE_OVERLAP`).
+`INPUT_BYTES_MISMATCH`, or `INPUT_RANGE_OVERLAP`). The server uses
+native OpenCL storage addresses for its registered input leaves: the generic
+client serializer alone zeroes non-RPC buffer addresses and must not be used
+as an authoritative Phone-local tensor descriptor. If an actual address
+conflict remains, `event=INPUT_RANGE_CONFLICT` reports both UID and address
+ranges; the collision is still rejected rather than silently overwritten.
 
 Before launching `run_prompt_sweep.ps1` on Windows:
 
