@@ -4304,6 +4304,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens > 1 && threaded_execution && pc_phone_overlap &&
         trace_setting != nullptr && std::strcmp(trace_setting, "1") == 0 &&
         trace_file != nullptr && *trace_file != '\0';
+    const char * phone_copy_trace_setting =
+        std::getenv("LLAMA_REGION_RING_PHONE_COPY_TRACE");
+    const bool phone_copy_trace_enabled =
+        ring_trace_enabled && phone_copy_trace_setting != nullptr &&
+        std::strcmp(phone_copy_trace_setting, "1") == 0;
     const int64_t ring_trace_origin_us =
         ring_trace_enabled ? ggml_time_us() : 0;
     struct ring_chunk_trace_row {
@@ -4351,6 +4356,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         size_t push_bytes = 0;
         int push_status = -1;
         ggml_backend_rpc_phone_input_push_timing push_timing {};
+        // Populated by the Phone Worker only; serialized after all Workers join.
+        std::vector<llama_hybrid_copy_trace_record> copy_traces;
     };
     struct ring_bank_trace_row {
         int64_t enqueue_us = 0;
@@ -6099,6 +6106,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             int64_t lane_compute_end_us = 0;
                             llama_hybrid_stage_timing task_timing {};
                             task_timing.capture_timeline = ring_trace_enabled;
+                            task_timing.capture_copy_trace =
+                                phone_copy_trace_enabled &&
+                                dev == (size_t) llama_region_ring_device::PHONE &&
+                                stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
@@ -6174,6 +6185,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 task_trace->graph_reused =
                                     task_timing.graph_reused ? 1 : 0;
                                 task_trace->result = (int) task_status;
+                                task_trace->copy_traces = std::move(task_timing.copy_traces);
                             }
                             state.backend_exec_us +=
                                 compute_end_us - compute_begin_us;
