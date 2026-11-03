@@ -56,6 +56,10 @@ inline constexpr size_t LLAMA_REGION_RING_SLOT_POOL_SIZE = 0;
 // Every registered Chunk keeps its own Scheduler, whose metadata scratch
 // allocation scales with max_nodes * GGML_SCHED_MAX_SPLIT_INPUTS. Reserve two
 // virtual layers for stage inputs/outputs while scaling for Region depth.
+// A 1024-node floor retained too much Scheduler scratch for 24 registered
+// Graphs at XP=48, even though the individual 1/2-layer Qwen3 Graphs are
+// much smaller. Keep a 640-node minimum and preserve depth scaling, rather
+// than forcing a larger XP (which would bias the Planner's ranking).
 // Only the opt-in autonomous-final Qwen3 runtime selects this budget.
 inline size_t llama_region_ring_phone_autonomous_graph_max_nodes(
         size_t full_max_nodes, size_t model_layers, size_t stage_layers) {
@@ -68,7 +72,7 @@ inline size_t llama_region_ring_phone_autonomous_graph_max_nodes(
     const size_t scaled = (full_max_nodes / model_layers) * weighted_layers +
         ((full_max_nodes % model_layers) * weighted_layers + model_layers - 1) /
             model_layers;
-    return std::min(full_max_nodes, std::max<size_t>(1024, scaled));
+    return std::min(full_max_nodes, std::max<size_t>(640, scaled));
 }
 
 // Before any Phone input PUSH, reserve an exact P2C destination for each

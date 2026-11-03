@@ -1281,8 +1281,14 @@ static void test_phone_auto_final_graph_node_budget() {
               8192, 40, 3) == 1024,
           "three-layer Phone stage did not reduce scheduler memory");
     check(llama_region_ring_phone_autonomous_graph_max_nodes(
-              8192, 40, 1) == 1024,
+              8192, 40, 1) == 640,
           "terminal L39 scheduler was not bounded");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              6424, 40, 2) == 643,
+          "two-layer autonomous Scheduler should scale below 1024");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              6424, 40, 3) == 803,
+          "three-layer autonomous Scheduler should preserve depth scaling");
     check(llama_region_ring_phone_autonomous_graph_max_nodes(
               8192, 40, 8) == 2048,
           "larger Phone stage budget was not scaled");
@@ -1290,7 +1296,10 @@ static void test_phone_auto_final_graph_node_budget() {
               8192, 40, 40) == 8192,
           "full-depth graph budget was reduced incorrectly");
     check(llama_region_ring_phone_autonomous_graph_max_nodes(
-              800, 40, 1) == 800,
+              800, 40, 1) == 640,
+          "minimum should fit within the full-model budget");
+    check(llama_region_ring_phone_autonomous_graph_max_nodes(
+              400, 40, 1) == 400,
           "budget must never exceed full-model capacity");
     check(llama_region_ring_phone_autonomous_graph_max_nodes(
               8192, 0, 3) == 8192,

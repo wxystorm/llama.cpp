@@ -4911,6 +4911,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         std::set<uint64_t> registered_uids;
+        size_t phone_graph_meta_total_bytes = 0;
+        std::array<size_t, 3> phone_graph_backend_total_bytes {};
         for (size_t r = 1; r < stages.size(); ++r) {
             if (r + 1 == stages.size() && !phone_auto_final_enabled) { continue; }
             if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
@@ -5049,6 +5051,51 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         (rpc_register_end_us - rpc_register_begin_us) / 1000.0,
                         (rpc_register_end_us - graph_setup_begin_us) / 1000.0);
                 }
+                // A registered RPC graph has persistent client-side
+                // allocator ownership: freeing its Scheduler here would
+                // release remote RPC buffers still referenced by Phone
+                // stored_graphs. Count actual retained bytes so memory
+                // pressure is visible before the next registration.
+                const ggml_cgraph * created_graph =
+                    item.owned_res->get_gf();
+                const size_t metadata_bytes =
+                    item.owned_res->buf_compute_meta.size();
+                std::array<size_t, 3> allocated_bytes {};
+                for (size_t backend_index = 0; backend_index < 3;
+                        ++backend_index) {
+                    allocated_bytes[backend_index] =
+                        ggml_backend_sched_get_buffer_size(
+                            item.owned_sched.get(), backend_ptrs[backend_index]);
+                    phone_graph_backend_total_bytes[backend_index] +=
+                        allocated_bytes[backend_index];
+                }
+                phone_graph_meta_total_bytes += metadata_bytes;
+                if (stage_profile_enabled || chunk == 0 ||
+                        begin + item.tokens >= ubatch.n_tokens) {
+                    LLAMA_LOG_INFO(
+                        "[PHONE_AUTO_GRAPH_MEMORY] region=%zu chunk=%u "
+                        "tokens=%u graph_nodes=%d graph_leafs=%d "
+                        "node_budget=%zu graph_meta_mib=%.3f "
+                        "meta_backend_mib=%.3f gpu_backend_mib=%.3f "
+                        "cpu_backend_mib=%.3f registered=%zu "
+                        "cumulative_graph_meta_mib=%.3f "
+                        "cumulative_meta_backend_mib=%.3f "
+                        "cumulative_gpu_backend_mib=%.3f "
+                        "cumulative_cpu_backend_mib=%.3f "
+                        "status=RETAINED\n",
+                        r, chunk, item.tokens,
+                        created_graph != nullptr ? created_graph->n_nodes : -1,
+                        created_graph != nullptr ? created_graph->n_leafs : -1,
+                        stage_max_nodes, metadata_bytes / 1048576.0,
+                        allocated_bytes[0] / 1048576.0,
+                        allocated_bytes[1] / 1048576.0,
+                        allocated_bytes[2] / 1048576.0,
+                        registered_uids.size(),
+                        phone_graph_meta_total_bytes / 1048576.0,
+                        phone_graph_backend_total_bytes[0] / 1048576.0,
+                        phone_graph_backend_total_bytes[1] / 1048576.0,
+                        phone_graph_backend_total_bytes[2] / 1048576.0);
+                }
                 LLAMA_LOG_INFO(
                     "[PHONE_AUTO] event=GRAPH_READY region=%zu chunk=%u "
                     "tokens=%u begin=%u uid=%" PRIu64 " status=REGISTERED\n",
@@ -5062,6 +5109,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        LLAMA_LOG_INFO(
+            "[PHONE_AUTO_GRAPH_MEMORY_SUM] graphs=%zu "
+            "graph_meta_mib=%.3f backend_meta_mib=%.3f "
+            "backend_gpu_mib=%.3f backend_cpu_mib=%.3f "
+            "scheduler_node_budget=REGION_SCALED status=RETAINED\n",
+            phone_auto_templates.size(),
+            phone_graph_meta_total_bytes / 1048576.0,
+            phone_graph_backend_total_bytes[0] / 1048576.0,
+            phone_graph_backend_total_bytes[1] / 1048576.0,
+            phone_graph_backend_total_bytes[2] / 1048576.0);
         LLAMA_LOG_INFO(
             "[PHONE_AUTO] event=GRAPH_SETUP_DONE count=%zu setup_ms=%.3f "
             "policy=ONE_GRAPH_PER_CHUNK_KV_SAFE status=OK\n",
