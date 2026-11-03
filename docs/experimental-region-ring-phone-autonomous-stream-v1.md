@@ -79,3 +79,72 @@ for stream mode, because there is no ACK. Do not interpret them as zero cost.
    new overlapping C2P service-time model.
 
 Never report Phase A as Phone-autonomous inference.
+
+## Opt-in per-tensor Phone Split Prepare Copy trace
+
+To investigate a large `phone_split_copy_call_ms` without increasing terminal
+verbosity, enable tracing **only for the next diagnostic run**:
+
+```powershell
+$env:LLAMA_REGION_RING_PHONE_INPUT_STREAM = "1"
+$env:LLAMA_REGION_RING_PHONE_COPY_TRACE = "1"
+# Then run your existing run_prompt_sweep.ps1 fixed-layout command.
+```
+
+`run_prompt_sweep.py` automatically enables
+`LLAMA_REGION_RING_TASK_TRACE=1` and
+`LLAMA_REGION_RING_PREPARE_BREAKDOWN=1` when this switch is on.
+No extra RPC request is added by tracing; the callback runs in the PC Phone
+Worker and stores entries in memory until the UBatch finishes.
+
+The sweep produces `prompt_358/phone_copy_timeline.csv` and new
+`phone_copy_*` summary columns. Each CSV record has Region/Chunk, source and
+destination tensor names, logical bytes, complete `copy_call_ms`, observed
+RPC APPLY/SET/hash events, and the payload byte count sent with `RPC_SET`.
+The classification is:
+
+- `PUSH_APPLY`: a verified chunk previously pushed to Phone is bound via a
+  small control RPC; `rpc_apply_bytes` are **logical Host-to-Device bytes**,
+  **not** data sent again over the network. `rpc_apply_ms` includes the
+  synchronous RPC wait and the Phone-side apply action.
+- `RPC_SET`: ordinary `RPC_CMD_SET_TENSOR` path; `rpc_set_bytes` are
+  payload bytes sent through that command, excluding frame/descriptor headers.
+- `MIXED`: both APPLY and SET occurred inside one Scheduler copy.
+- `RPC_HASH_HIT`: server already had the tensor, so only the hash probe
+  was transmitted.
+- `RPC_FUSED`: the client deferred the payload into a fused RPC packet.
+- `LOCAL_COPY`: both endpoints are confirmed host buffers, with no
+  instrumented RPC call.
+- `OTHER_COPY`: unclassified (e.g. an uninstrumented backend path);
+  do not infer that it is local or that it sent data over Wi-Fi.
+
+`copy_call_ms` wraps `ggml_backend_tensor_copy`; it may include network
+round trips, the Phone's Host-to-GPU upload and blocking work. It is not a
+pure transfer-bandwidth measurement. The summary's
+`phone_copy_call_ms` should approximately reconcile with
+`phone_split_copy_call_ms` when all costly copies passed the instrumented
+`tensor_copy_call` path. A count mismatch may point to the scheduler's
+asynchronous-copy branch or an uninstrumented setter.
+
+Quick PowerShell views:
+
+```powershell
+$dir = "E:\\llama\\llama-tensor-v2\\planner-test-results-full-region-v7\\<NEW_RUN>\\prompt_358"
+Import-Csv "$dir\\phone_copy_timeline.csv" |
+  Group-Object kind | ForEach-Object {
+    [pscustomobject]@{
+      Kind=$_.Name
+      Calls=$_.Count
+      Ms=[math]::Round(($_.Group | Measure-Object copy_call_ms -Sum).Sum,3)
+      WireMiB=[math]::Round((($_.Group | Measure-Object rpc_set_bytes -Sum).Sum)/1MB,3)
+    }
+  } | Format-Table -AutoSize
+
+Import-Csv "$dir\\phone_copy_timeline.csv" |
+  Sort-Object { [double]$_.copy_call_ms } -Descending |
+  Select-Object -First 25 region,chunk,tensor,kind,bytes,copy_call_ms,
+    rpc_apply_ms,rpc_set_ms,rpc_apply_misses,rpc_set_bytes |
+  Format-Table -AutoSize
+```
+
+Disable the switch for final performance comparisons.
