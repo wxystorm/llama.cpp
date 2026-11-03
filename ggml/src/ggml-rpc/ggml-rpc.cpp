@@ -5706,6 +5706,7 @@ private:
         int64_t input_set_done_us = 0;
         int64_t command_rx_us = 0;
     };
+    struct phone_stage_prepare_job;
     enum class phone_auto_status : uint8_t {
         REGISTERED, VERIFIED, UPLOADING, UPLOADED, PREPARING,
         PREPARED, COMPUTING, COMPLETE, FAILED,
