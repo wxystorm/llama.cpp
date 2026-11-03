@@ -347,6 +347,8 @@ enum rpc_cmd {
     RPC_CMD_PHONE_INPUT_PUSH,
     RPC_CMD_PHONE_INPUT_APPLY,
     RPC_CMD_PHONE_INPUT_DROP,
+    RPC_CMD_PHONE_INPUT_STREAM_RUN,
+    RPC_CMD_PHONE_INPUT_STREAM_PUSH,
     RPC_CMD_COUNT,
 };
 
@@ -378,6 +380,8 @@ static_assert(RPC_CMD_GET_GRAPH_PROFILE == 40, "RPC_CMD_GET_GRAPH_PROFILE index"
 static_assert(RPC_CMD_PHONE_INPUT_PUSH == 44, "RPC_CMD_PHONE_INPUT_PUSH index");
 static_assert(RPC_CMD_PHONE_INPUT_APPLY == 45, "RPC_CMD_PHONE_INPUT_APPLY index");
 static_assert(RPC_CMD_PHONE_INPUT_DROP == 46, "RPC_CMD_PHONE_INPUT_DROP index");
+static_assert(RPC_CMD_PHONE_INPUT_STREAM_RUN == 47, "RPC_CMD_PHONE_INPUT_STREAM_RUN index");
+static_assert(RPC_CMD_PHONE_INPUT_STREAM_PUSH == 48, "RPC_CMD_PHONE_INPUT_STREAM_PUSH index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -402,6 +406,10 @@ struct rpc_msg_phone_input_apply_req {
 };
 struct rpc_msg_phone_input_ack {
     uint8_t accepted = 0;
+};
+struct rpc_msg_phone_input_stream_run_req {
+    uint64_t run_id = 0;
+    uint8_t active = 0;
 };
 // These are independent server-side durations returned with PUSH ACK.
 // A Phone timestamp is NEVER directly subtracted from a PC timestamp.
@@ -5367,6 +5375,9 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool phone_input_push(const std::vector<uint8_t> & input,
                           rpc_msg_phone_input_push_ack & response);
+    bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
+    bool phone_input_stream_reserve(size_t bytes);
+    void phone_input_stream_complete(std::vector<uint8_t> && packet);
     bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
                            rpc_msg_phone_input_ack & response);
     void phone_input_drop(const rpc_phone_input_key & key,
@@ -5606,11 +5617,19 @@ private:
         rpc_phone_input_key key {};
         uint64_t hash = 0;
         std::vector<uint8_t> payload;
+        size_t payload_offset = 0;
+        size_t reserved_bytes = 0;
     };
     // Host-only landing: two future chunks per Region. The current GPU
     // activation buffer is changed only by the ordinary Phone Worker.
     std::mutex phone_input_mutex;
     std::vector<phone_input_staged> phone_input_staged_slots;
+    // Inclusive budget: in-flight recv, staged bytes and APPLY copy lifetime.
+    static constexpr size_t phone_input_stream_budget = 128 * 1024 * 1024;
+    std::condition_variable phone_input_stream_cv;
+    std::unordered_set<uint64_t> phone_input_stream_runs;
+    std::vector<rpc_phone_input_key> phone_input_stream_failed;
+    size_t phone_input_stream_held_bytes = 0;
 
     struct phone_stage_rx_write {
         ggml_backend_buffer_t buffer = nullptr;
