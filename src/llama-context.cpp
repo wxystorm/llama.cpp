@@ -2598,8 +2598,10 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_cpu_wait_us,
         int64_t *                          ring_cuda_wait_us,
         bool                               preserve_weight_cache_on_graph_reset,
-        bool                               phone_prebuilt_graph) {
+        bool                               phone_prebuilt_graph,
+        bool                               phone_auto_wait) {
     llama_region_ring_tls_p2c_deferred = {};
+    GGML_ASSERT(!phone_auto_wait || (ring_lane == 2 && phone_prebuilt_graph));
     // Scoped to a single synchronous Scheduler prepare_split call. Other
     // workers have their own TLS, and the Phone RPC server is never asked to
     // log every tensor on the hot path.
@@ -3061,13 +3063,16 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
 
             const int64_t split_prepare_begin_us =
                 timing != nullptr ? ggml_time_us() : 0;
-            {
+            if (!phone_auto_wait) {
                 phone_copy_trace_scope copy_trace(timing);
                 ret = ggml_backend_sched_prepare_split(sched_use, split);
             }
             if (timing != nullptr) {
                 ggml_backend_sched_prepare_breakdown breakdown {};
-                ggml_backend_sched_get_last_prepare_breakdown(sched_use, &breakdown);
+                if (!phone_auto_wait) {
+                    ggml_backend_sched_get_last_prepare_breakdown(
+                        sched_use, &breakdown);
+                }
                 timing->split_target_wait_us += breakdown.target_wait_call_us;
                 timing->split_source_sync_us += breakdown.source_sync_us;
                 timing->split_copy_call_us += breakdown.copy_call_us;
