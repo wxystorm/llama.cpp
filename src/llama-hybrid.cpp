@@ -3,6 +3,7 @@
 #include "llama-hybrid-profile-cpu-threadpool.h"
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
+#include "llama-region-ring-real-profile.h"
 
 #include "../ggml/src/ggml-impl.h"
 #include "ggml-backend.h"
@@ -24,6 +25,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <iterator>
 #include <mutex>
 #include <numeric>
@@ -9693,6 +9695,87 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 profile.pc_to_phone : profile.gpu_to_pc;
         return llama_hybrid_transfer_cost(points, bytes, cost);
     };
+
+    // One-time real-path profile import. The CSV must come from actual Ring
+    // Stage execution on the same model/hardware. Incomplete coverage falls
+    // back to independent legacy Profile functions; the measured samples
+    // never launch an additional inference during the DAG search.
+    if (const char * csv_path =
+            std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV")) {
+        if (*csv_path != '\0') {
+            auto measured =
+                std::make_shared<llama_ring_planner::real_stage_profile>();
+            std::string why;
+            if (!measured->load(csv_path, why)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_REAL_STAGE_PROFILE] status=REJECT "
+                    "reason=%s path=%s\n", why.c_str(), csv_path);
+                return false;
+            }
+            const auto base_compute = model.compute_ms;
+            const auto base_prepare = model.prepare_ms;
+            const auto cost_kind =
+                llama_ring_planner::real_stage_phase::COMPUTE;
+            const auto prep_kind =
+                llama_ring_planner::real_stage_phase::PREPARE;
+            const auto setup_kind =
+                llama_ring_planner::real_stage_phase::SETUP;
+            model.compute_ms = [measured, base_compute, cost_kind](
+                    llama_region_ring_device d, int layers, int tokens,
+                    int kv, double & ms) {
+                return measured->estimate(
+                        d, layers, tokens, kv, false, cost_kind, ms) ||
+                    base_compute(d, layers, tokens, kv, ms);
+            };
+            model.prepare_ms = [measured, base_prepare, prep_kind](
+                    llama_region_ring_device d, int layers, int tokens,
+                    int kv, double & ms) {
+                return measured->estimate(
+                        d, layers, tokens, kv, false, prep_kind, ms) ||
+                    !base_prepare ||
+                    base_prepare(d, layers, tokens, kv, ms);
+            };
+            model.compute_region_ms =
+                [measured, base_compute, cost_kind](
+                    llama_region_ring_device d, int begin, int end,
+                    int tokens, int kv, bool terminal, double & ms) {
+                    return measured->estimate(
+                            d, end - begin, tokens, kv,
+                            d == llama_region_ring_device::PHONE && terminal,
+                            cost_kind, ms) ||
+                        base_compute(d, end - begin, tokens, kv, ms);
+                };
+            model.prepare_region_ms =
+                [measured, base_prepare, prep_kind](
+                    llama_region_ring_device d, int begin, int end,
+                    int tokens, int kv, bool terminal, double & ms) {
+                    return measured->estimate(
+                            d, end - begin, tokens, kv,
+                            d == llama_region_ring_device::PHONE && terminal,
+                            prep_kind, ms) ||
+                        !base_prepare ||
+                        base_prepare(d, end - begin, tokens, kv, ms);
+                };
+            model.phone_autonomous_graph_setup_ms =
+                [measured, &model, setup_kind](
+                    int layers, int tokens, bool terminal, double & ms) {
+                    // The actual registration callback is preserved as a
+                    // fallback when a measured shape is absent.
+                    if (measured->estimate(
+                            llama_region_ring_device::PHONE, layers,
+                            tokens, tokens, terminal, setup_kind, ms)) {
+                        return true;
+                    }
+                    return llama_ring_planner::phone_registration_cost(
+                        model, llama_region_ring_stage_kind::PHONE,
+                        layers, tokens, false, ms);
+                };
+            LLAMA_LOG_INFO(
+                "[REGION_RING_REAL_STAGE_PROFILE] status=LOADED "
+                "points=%zu path=%s missing=LEGACY_FALLBACK\n",
+                measured->size(), csv_path);
+        }
+    }
 
     if (!profile.duplex_phone_link.empty()) {
         model.duplex_slowdown = [&profile](

@@ -172,9 +172,16 @@ struct model {
         phone_registration_cost;
     // Return false when no measured/interpolated profile supports the shape.
     std::function<bool(device, int, int, int, double &)> compute_ms;
+    // The full DAG additionally knows the concrete layer range and whether
+    // the Phone region is terminal; real-path Stage samples can distinguish
+    // those while older synthetic/independent profiles remain unchanged.
+    std::function<bool(device, int, int, int, int, bool, double &)>
+        compute_region_ms;
     // Optional host-side scheduler prepare cost for the same shape. Missing
     // callbacks preserve the historical zero-prepare simulator behaviour.
     std::function<bool(device, int, int, int, double &)> prepare_ms;
+    std::function<bool(device, int, int, int, int, bool, double &)>
+        prepare_region_ms;
     // One directional Tensor layer already includes its internal route,
     // split-FFN, return and reduce traffic. Keeping this callback separate
     // prevents C2P/P2C from being mis-scored as ordinary Phone Full work.
@@ -757,8 +764,12 @@ inline bool simulate(const model & m,
             const bool compute_ok = directional ?
                 m.directional_ms(
                     region.kind, end - begin, kv, ms) :
-                m.compute_ms(
-                    d, layers, end - begin, kv, ms);
+                m.compute_region_ms ?
+                    m.compute_region_ms(
+                        d, region.layer_begin, region.layer_end,
+                        end - begin, kv, r + 1 == regions.size(), ms) :
+                    m.compute_ms(
+                        d, layers, end - begin, kv, ms);
             if (!compute_ok || !std::isfinite(ms) || ms < 0.0) {
                 return reject(
                     directional ?
@@ -775,12 +786,19 @@ inline bool simulate(const model & m,
                     return reject(
                         "DIRECTIONAL_PREPARE_PROFILE_MISSING");
                 }
-            } else if (m.prepare_ms &&
-                    (!m.prepare_ms(
-                        d, layers, end - begin, kv, prepare_ms) ||
-                     !std::isfinite(prepare_ms) ||
-                     prepare_ms < 0.0)) {
-                return reject("PREPARE_PROFILE_MISSING");
+            } else {
+                const bool prepared_ok = m.prepare_region_ms ?
+                    m.prepare_region_ms(
+                        d, region.layer_begin, region.layer_end,
+                        end - begin, kv, r + 1 == regions.size(),
+                        prepare_ms) :
+                    !m.prepare_ms ||
+                    m.prepare_ms(
+                        d, layers, end - begin, kv, prepare_ms);
+                if (!prepared_ok || !std::isfinite(prepare_ms) ||
+                        prepare_ms < 0.0) {
+                    return reject("PREPARE_PROFILE_MISSING");
+                }
             }
 
             // Directional stages submit Phone-side work, but only a
