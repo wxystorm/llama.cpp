@@ -391,6 +391,48 @@ extern "C" {
         uint64_t copy_bytes;
         uint64_t copy_calls;
     };
+    // Opt-in, thread-local instrumentation for one Scheduler tensor_copy_call.
+    // No terminal output is emitted from the copy hot path. RPC client setters
+    // annotate the active copy with APPLY/SET outcomes; the caller receives
+    // one aggregate event when the enclosing copy call finishes.
+    enum ggml_backend_sched_copy_rpc_kind {
+        GGML_BACKEND_SCHED_COPY_RPC_APPLY_OK,
+        GGML_BACKEND_SCHED_COPY_RPC_APPLY_MISS,
+        GGML_BACKEND_SCHED_COPY_RPC_SET,
+        GGML_BACKEND_SCHED_COPY_RPC_HASH_HIT,
+        GGML_BACKEND_SCHED_COPY_RPC_FUSED,
+    };
+    struct ggml_backend_sched_copy_trace {
+        const char * src_name;
+        const char * dst_name;
+        uint32_t split;
+        uint64_t logical_bytes;
+        int64_t call_us;
+        uint64_t rpc_apply_bytes;
+        uint64_t rpc_set_bytes;
+        uint64_t rpc_hash_hit_bytes;
+        uint32_t rpc_apply_calls;
+        uint32_t rpc_apply_misses;
+        uint32_t rpc_set_calls;
+        uint32_t rpc_hash_hit_calls;
+        uint32_t rpc_fused_calls;
+        int64_t rpc_apply_us;
+        int64_t rpc_apply_miss_us;
+        int64_t rpc_set_us;
+        int64_t rpc_hash_hit_us;
+        int64_t rpc_fused_us;
+        uint8_t src_is_host;
+        uint8_t dst_is_host;
+    };
+    typedef void (*ggml_backend_sched_copy_trace_callback)(
+        void * user_data, const struct ggml_backend_sched_copy_trace * event);
+    GGML_API void ggml_backend_sched_copy_trace_set_callback(
+        ggml_backend_sched_copy_trace_callback callback, void * user_data);
+    GGML_API bool ggml_backend_sched_copy_trace_active(void);
+    GGML_API void ggml_backend_sched_copy_trace_rpc_note(
+        enum ggml_backend_sched_copy_rpc_kind kind, size_t bytes,
+        int64_t call_us);
+
     GGML_API void ggml_backend_sched_get_last_prepare_breakdown(
         ggml_backend_sched_t sched, struct ggml_backend_sched_prepare_breakdown * stats);
     GGML_API enum ggml_status ggml_backend_sched_prepare_split(ggml_backend_sched_t sched, int split_id);
