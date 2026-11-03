@@ -50,6 +50,11 @@ FIELDS = [
     "phone_input_push_pack_ms", "phone_input_push_header_send_ms",
     "phone_input_push_payload_send_ms", "phone_input_push_socket_send_ms",
     "phone_input_push_ack_wait_ms", "phone_input_push_other_ms",
+    "phone_copy_records", "phone_copy_call_ms",
+    "phone_copy_apply_calls", "phone_copy_apply_ms",
+    "phone_copy_apply_misses", "phone_copy_rpc_set_calls",
+    "phone_copy_rpc_set_ms", "phone_copy_rpc_set_mib",
+    "phone_copy_hash_hit_calls", "phone_copy_other_calls",
     "phone_input_push_phone_recv_header_ms",
     "phone_input_push_phone_recv_alloc_ms",
     "phone_input_push_phone_recv_payload_ms",
@@ -163,6 +168,42 @@ def write_phone_input_push_timeline(folder: Path):
     return len(rows)
 
 
+# One record per Scheduler tensor_copy_call, annotated by the synchronous
+# RPC client setter on the same PC Phone Worker thread. Saved after inference.
+PHONE_COPY_TRACE_FIELDS = (
+    "ubatch", "region", "chunk", "split", "tensor", "dst_tensor",
+    "kind", "bytes", "copy_call_ms", "rpc_apply_calls",
+    "rpc_apply_misses", "rpc_set_calls", "rpc_hash_hit_calls",
+    "rpc_fused_calls", "rpc_apply_bytes", "rpc_set_bytes",
+    "rpc_hash_hit_bytes", "rpc_apply_ms", "rpc_apply_miss_ms",
+    "rpc_set_ms", "rpc_hash_hit_ms", "rpc_fused_ms",
+    "src_host", "dst_host",
+)
+
+
+def write_phone_copy_timeline(folder: Path):
+    entries = records(folder / "metrics.jsonl")
+    markers = [i for i, row in enumerate(entries)
+               if row.get("type") == "measurement_start"]
+    measured = entries[markers[-1] + 1:] if markers else entries
+    rows = [
+        {field: row.get(field) for field in PHONE_COPY_TRACE_FIELDS}
+        for row in measured if row.get("type") == "region_ring_phone_copy"
+    ]
+    if not rows:
+        return 0
+    rows.sort(key=lambda row: (
+        int(row.get("ubatch") or 0), int(row.get("region") or 0),
+        int(row.get("chunk") or 0), int(row.get("split") or 0),
+        str(row.get("tensor") or "")))
+    path = folder / "phone_copy_timeline.csv"
+    with path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=PHONE_COPY_TRACE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def match_last(pattern, string):
     matches = re.findall(pattern, string, flags=re.I)
     return matches[-1] if matches else None
@@ -233,6 +274,8 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
                if r.get("type") == "measurement_start"]
     measured = entries[markers[-1] + 1:] if markers else entries
     ring = [r for r in measured if r.get("type") == "region_ring"]
+    phone_copy = [r for r in measured
+                  if r.get("type") == "region_ring_phone_copy"]
     logs = ""
     for file in ("engine.stderr.log", "output.stdout.txt"):
         path = folder / file
@@ -425,6 +468,27 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             if row["meta_available"] and any(key in x for x in ring)
             else None
         )
+    # These are CPU host-call durations, not Phone GPU kernel time. The
+    # logical copy bytes may already exist on Phone via PUSH_APPLY.
+    if phone_copy:
+        row["phone_copy_records"] = len(phone_copy)
+        row["phone_copy_call_ms"] = total(phone_copy, "copy_call_ms")
+        row["phone_copy_apply_calls"] = int(sum(
+            int(r.get("rpc_apply_calls") or 0) for r in phone_copy))
+        row["phone_copy_apply_ms"] = total(phone_copy, "rpc_apply_ms")
+        row["phone_copy_apply_misses"] = int(sum(
+            int(r.get("rpc_apply_misses") or 0) for r in phone_copy))
+        row["phone_copy_rpc_set_calls"] = int(sum(
+            int(r.get("rpc_set_calls") or 0) for r in phone_copy))
+        row["phone_copy_rpc_set_ms"] = total(phone_copy, "rpc_set_ms")
+        row["phone_copy_rpc_set_mib"] = round(
+            sum(int(r.get("rpc_set_bytes") or 0) for r in phone_copy)
+            / 1048576.0, 3)
+        row["phone_copy_hash_hit_calls"] = int(sum(
+            int(r.get("rpc_hash_hit_calls") or 0) for r in phone_copy))
+        row["phone_copy_other_calls"] = sum(
+            r.get("kind") in ("OTHER_COPY", "LOCAL_COPY") for r in phone_copy)
+
     # Region-level Phone Full RPC counters are recorded only for threaded
     # all-Full layouts. Keep the individual UBatch/Region identities in CSV.
     phone_rpc_rows = [
@@ -612,6 +676,7 @@ def main():
         row = result_row(args, folder, prompt, hint, ctx, exitcode, elapsed, commit)
         if not args.dry_run:
             write_phone_input_push_timeline(folder)
+            write_phone_copy_timeline(folder)
         if args.dry_run:
             row["status"], row["exit_code"] = "DRY_RUN", ""
         (folder / "result.json").write_text(
