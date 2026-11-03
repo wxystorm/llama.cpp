@@ -63,6 +63,16 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
     diag = dict(cases=0, cpu=0, gpu=0, phone=0,
                 phone_missing=0, setup_missing=0, trace_missing=0)
     for case in cases:
+        # Only finished PASS probes are valid anchors for ranking. A failed
+        # run can contain plausible-looking partial Chunk timing records.
+        result_file = case / "result.json"
+        if result_file.is_file():
+            try:
+                if json.loads(result_file.read_text(
+                        encoding="utf-8")).get("status") != "PASS":
+                    continue
+            except (ValueError, OSError):
+                continue
         traces = []
         for line in (case / "metrics.jsonl").read_text(
                 encoding="utf-8", errors="replace").splitlines():
