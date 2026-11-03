@@ -82,6 +82,30 @@ class JupiterPromptSuiteTests(unittest.TestCase):
             self.assertNotIn("[JUPITER_SEQUENCE_DECISION]", shown)
             self.assertIn("[JUPITER_SEQUENCE_DECISION]", full_log)
 
+    def test_child_refiner_error_shown_in_parent_not_hidden_in_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "stage3-run.log"
+            code = (
+                "import sys;"
+                "print('[JUPITER_REFINE_SAMPLE] target=56:208', flush=True);"
+                "print('[JUPITER_SEQUENCE_PLAN] previous sample', flush=True);"
+                "print('[JUPITER_REFINE_ERROR] llama-cli failed (exit 1) "
+                "for q(56,208): q-x56-y208-r1.log', file=sys.stderr, flush=True);"
+                "sys.exit(1)"
+            )
+            shown = io.StringIO()
+            with contextlib.redirect_stdout(shown):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"primary_error=.*q\(56,208\)"
+                ):
+                    launch_logged(
+                        [sys.executable, "-c", code], log, "STAGE3"
+                    )
+            self.assertIn("[JUPITER_REFINE_ERROR]", shown.getvalue())
+            self.assertIn(
+                "[JUPITER_SEQUENCE_PLAN]", log.read_text(encoding="utf-8")
+            )
+
     def test_summary_checks_complete_repeat_sets(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "results.csv"
