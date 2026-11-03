@@ -625,6 +625,7 @@ int main() {
         overlap.hidden = 32;
         overlap.slot_pool = 0;
         overlap.phone_autonomous_prebuild = true;
+        overlap.phone_autonomous_final = true;
         overlap.phone_full_return_stream = true;
         overlap.phone_autonomous_prepare_overlap = true;
         overlap.phone_registration_cost =

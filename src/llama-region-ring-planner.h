@@ -1157,8 +1157,13 @@ inline bool simulate(const model & m,
     int phone_slots_in_use = 0;
     double phone_prepare_busy_ms = 0.0;
     const auto is_auto_phone = [&](const task & t) {
+        // The terminal Phone remains a legacy Meta Graph unless the
+        // explicit autonomous-final mode is enabled.
         return m.phone_autonomous_prebuild &&
             m.phone_autonomous_prepare_overlap &&
+            t.region > 0 &&
+            ((size_t) t.region + 1 < regions.size() ||
+             m.phone_autonomous_final) &&
             regions[(size_t) t.region].kind ==
                 llama_region_ring_stage_kind::PHONE;
     };

@@ -51,6 +51,11 @@ public:
         int line_number = 0;
         while (std::getline(in, line)) {
             ++line_number;
+            // Python csv.DictWriter uses CRLF on Windows. std::getline
+            // strips LF only; strip CR before schema/numeric validation.
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
             if (line.empty() || line[0] == '#') {
                 continue;
             }
