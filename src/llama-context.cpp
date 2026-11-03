@@ -4261,9 +4261,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const size_t slot_pool_size = 0;
     const char * phone_input_push_env =
         std::getenv("LLAMA_REGION_RING_PHONE_INPUT_PUSH");
+    const char * phone_input_stream_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_INPUT_STREAM");
+    const bool phone_input_stream_requested =
+        phone_input_stream_env != nullptr &&
+        std::strcmp(phone_input_stream_env, "1") == 0;
     const bool phone_input_push_requested =
-        phone_input_push_env != nullptr &&
-        std::strcmp(phone_input_push_env, "1") == 0 &&
+        ((phone_input_push_env != nullptr &&
+          std::strcmp(phone_input_push_env, "1") == 0) ||
+         phone_input_stream_requested) &&
         ubatch.n_tokens > 1 && pc_phone_overlap &&
         threaded_execution && !directional_runtime && slot_pool_size == 0;
     // Optional PC-clock timeline. READY/CLAIM/DEFER/COMPLETE are observed
@@ -4389,7 +4395,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         regions, (int) ubatch.n_tokens,
         region_chunk_tokens, slot_pool_size,
         gpu_weight_streaming, std::move(ring_event_observer),
-        phone_input_push_requested);
+        phone_input_push_requested, phone_input_stream_requested);
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
         "XC=%d XG=%d XP=%d dependency=TOKEN_INTERVAL "
@@ -4898,6 +4904,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // normal Phone Worker still owns the eventual GPU tensor write/compute
         // and retains its original KV order and Meta scheduler.
         ggml_backend_rpc_phone_input_push_t phone_input_push = nullptr;
+        ggml_backend_rpc_phone_input_stream_run_t phone_input_stream_run = nullptr;
+        ggml_backend_rpc_phone_input_stream_push_t phone_input_stream_push = nullptr;
         ggml_backend_rpc_phone_input_consume_begin_t phone_input_consume_begin = nullptr;
         ggml_backend_rpc_phone_input_consume_end_t phone_input_consume_end = nullptr;
         ggml_backend_rpc_phone_input_drop_t phone_input_drop = nullptr;
@@ -4909,6 +4917,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_input_push = reinterpret_cast<ggml_backend_rpc_phone_input_push_t>(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_INPUT_PUSH_PROC));
+                if (phone_input_stream_requested) {
+                    phone_input_stream_run =
+                        reinterpret_cast<ggml_backend_rpc_phone_input_stream_run_t>(
+                            ggml_backend_reg_get_proc_address(
+                                rpc_reg, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC));
+                    phone_input_stream_push =
+                        reinterpret_cast<ggml_backend_rpc_phone_input_stream_push_t>(
+                            ggml_backend_reg_get_proc_address(
+                                rpc_reg, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_PUSH_PROC));
+                }
                 phone_input_consume_begin =
                     reinterpret_cast<ggml_backend_rpc_phone_input_consume_begin_t>(
                         ggml_backend_reg_get_proc_address(
@@ -4923,27 +4941,46 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             rpc_reg, GGML_BACKEND_RPC_PHONE_INPUT_DROP_PROC));
             }
         }
-        const bool phone_input_push_enabled =
-            phone_input_push_requested &&
-            phone_input_push != nullptr &&
-            phone_input_consume_begin != nullptr &&
-            phone_input_consume_end != nullptr &&
-            phone_input_drop != nullptr &&
-            phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr);
         static std::atomic<uint64_t> next_phone_input_push_run {
             static_cast<uint64_t>(ggml_time_us()) + 1
         };
         const uint64_t phone_input_push_run_id =
-            phone_input_push_enabled ?
+            phone_input_push_requested ?
                 next_phone_input_push_run.fetch_add(
                     1, std::memory_order_relaxed) : 0;
+        const bool phone_input_stream_enabled =
+            phone_input_stream_requested &&
+            phone_input_push_requested &&
+            phone_input_stream_run != nullptr &&
+            phone_input_stream_push != nullptr &&
+            phone_input_consume_begin != nullptr &&
+            phone_input_consume_end != nullptr &&
+            phone_input_drop != nullptr &&
+            phone_input_stream_run(phone_rpc_backend, phone_input_push_run_id, true);
+        // An explicit stream request must never silently run the legacy
+        // two-slot ACK transport: the scheduler has different admission limits.
+        if (phone_input_stream_requested && !phone_input_stream_enabled) {
+            LLAMA_LOG_ERROR("[PHONE_INPUT_STREAM] event=INIT status=FAIL reason=UNSUPPORTED_OR_INELIGIBLE\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        const bool phone_input_push_enabled =
+            phone_input_stream_enabled ||
+            (!phone_input_stream_requested && phone_input_push_requested &&
+             phone_input_push != nullptr &&
+             phone_input_consume_begin != nullptr &&
+             phone_input_consume_end != nullptr &&
+             phone_input_drop != nullptr &&
+             phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr));
         if (phone_input_push_requested) {
             LLAMA_LOG_INFO(
                 "[PHONE_INPUT_PUSH] event=INIT requested=1 enabled=%d "
-                "slots_per_region=2 landing=PHONE_HOST "
-                "policy=UPSTREAM_READY_BEFORE_KV_COMMIT "
+                "slots_per_region=%s landing=PHONE_HOST "
+                "policy=UPSTREAM_READY_BEFORE_KV_COMMIT transport=%s "
                 "status=%s\n",
                 phone_input_push_enabled ? 1 : 0,
+                phone_input_stream_enabled ? "BYTE_BUDGET_128M" : "2",
+                phone_input_stream_enabled ? "STREAM_NO_ACK" : "LEGACY_ACK",
                 phone_input_push_enabled ? "READY" : "FALLBACK_LEGACY");
         }
 
@@ -5633,10 +5670,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         (size_t) job.token_begin * (size_t) n_embd;
                     const int64_t begin_us = ggml_time_us();
                     ggml_backend_rpc_phone_input_push_timing profile {};
-                    const bool accepted = phone_input_push(
-                        phone_rpc_backend, phone_input_push_run_id,
-                        (uint32_t) job.region, (uint32_t) job.chunk,
-                        source, bytes, &profile);
+                    // In stream mode this return means only sent to TCP,
+                    // never that the Phone has verified the payload.
+                    const bool accepted = phone_input_stream_enabled ?
+                        phone_input_stream_push(
+                            phone_rpc_backend, phone_input_push_run_id,
+                            (uint32_t) job.region, (uint32_t) job.chunk,
+                            source, bytes, &profile) :
+                        phone_input_push(
+                            phone_rpc_backend, phone_input_push_run_id,
+                            (uint32_t) job.region, (uint32_t) job.chunk,
+                            source, bytes, &profile);
                     const int64_t end_us = ggml_time_us();
                     phone_push_wall_us += end_us - begin_us;
                     const int64_t accounted_pc_us =
@@ -6773,6 +6817,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         if (phone_push_thread.joinable()) {
             phone_push_thread.join();
+        }
+        // END is a once-per-run control message. No per-Chunk success ACK.
+        // On failure, release queued host bytes as well as the run marker.
+        if (phone_input_stream_enabled &&
+                !phone_input_stream_run(phone_rpc_backend,
+                                        phone_input_push_run_id, false)) {
+            LLAMA_LOG_ERROR("[PHONE_INPUT_STREAM] event=END status=FAIL\n");
+            ready.cancel();
         }
         // Recover abandoned host landing buffers if execution was cancelled
         // while a future Chunk was already staged on Phone.
