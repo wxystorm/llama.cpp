@@ -4266,6 +4266,27 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_input_stream_requested =
         phone_input_stream_env != nullptr &&
         std::strcmp(phone_input_stream_env, "1") == 0;
+    // Until the Phone owns a causal admission policy, do not let a full
+    // 128MiB queue block a still-unreceived predecessor. Keep an 8MiB margin
+    // for per-frame headers and system buffers. This is a deliberate Phase-A
+    // safety restriction, not the final intended streaming limit.
+    const size_t phone_stream_region_count = std::count_if(
+        stages.begin(), stages.end(), [](const auto & s) {
+            return s.kind == llama_hybrid_runtime_stage_kind::PHONE;
+        });
+    const long double phone_stream_bytes =
+        (long double) ubatch.n_tokens * (long double) n_embd *
+        sizeof(float) * (long double) phone_stream_region_count;
+    if (phone_input_stream_requested &&
+            phone_stream_bytes + 4096.0L * phone_stream_region_count >
+                120.0L * 1024.0L * 1024.0L) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_INPUT_STREAM] event=REJECT reason=PHASE_A_BACKLOG_BUDGET "
+            "tokens=%u phone_regions=%zu status=FAIL\\n",
+            ubatch.n_tokens, phone_stream_region_count);
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     const bool phone_input_push_requested =
         ((phone_input_push_env != nullptr &&
           std::strcmp(phone_input_push_env, "1") == 0) ||
