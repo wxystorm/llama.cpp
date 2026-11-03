@@ -217,7 +217,9 @@ void test_framing_and_partial_receive_failure() {
 // its PC Output Head is decoupled. Exercise both Arena and PC Receiver.
 void test_terminal_phone_region_full_return() {
     constexpr uint32_t all_regions = 9;
-    constexpr uint32_t terminal_region = all_regions - 1;
+    // P2C Receiver callbacks must be captureless function pointers.
+    // Static storage lets both callbacks access this test's terminal ID.
+    static constexpr uint32_t terminal_region = all_regions - 1;
     constexpr uint32_t begin = 6;
     constexpr uint32_t count = 2;
     const float expected[hidden * count] = {31,32,33,34,35,36,37,38};
