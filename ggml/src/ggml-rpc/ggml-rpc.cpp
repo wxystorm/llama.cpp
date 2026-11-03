@@ -2102,6 +2102,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
 
     const rpc_tensor serialized_tensor =
         serialize_tensor(tensor);
+    const bool copy_trace = ggml_backend_sched_copy_trace_active();
 
     // Stage payload arrives on the independent PC push socket. Apply it to
     // this exact destination only when the ordinary scheduler is preparing
@@ -2116,9 +2117,17 @@ static void ggml_backend_rpc_buffer_set_tensor(
         request.size = size;
         request.hash = fnv_hash(static_cast<const uint8_t *>(data), size);
         rpc_msg_phone_input_ack response {};
-        if (send_rpc_cmd(ctx->sock, RPC_CMD_PHONE_INPUT_APPLY,
+        const int64_t apply_begin_us = copy_trace ? ggml_time_us() : 0;
+        const bool applied = send_rpc_cmd(ctx->sock, RPC_CMD_PHONE_INPUT_APPLY,
                 &request, sizeof(request), &response, sizeof(response)) &&
-                response.accepted) {
+                response.accepted;
+        if (copy_trace) {
+            ggml_backend_sched_copy_trace_rpc_note(
+                applied ? GGML_BACKEND_SCHED_COPY_RPC_APPLY_OK :
+                          GGML_BACKEND_SCHED_COPY_RPC_APPLY_MISS,
+                size, ggml_time_us() - apply_begin_us);
+        }
+        if (applied) {
             consumer.applied = true;
             return;
         }
@@ -2168,7 +2177,10 @@ static void ggml_backend_rpc_buffer_set_tensor(
             }
 
             fused.data_size = size;
-
+            if (copy_trace) {
+                ggml_backend_sched_copy_trace_rpc_note(
+                    GGML_BACKEND_SCHED_COPY_RPC_FUSED, size, 0);
+            }
             return;
         }
     }
@@ -2178,6 +2190,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
      * 服务端已经有相同数据时，无须再次传输。
      */
     if (size > HASH_THRESHOLD) {
+        const int64_t hash_rpc_begin_us = copy_trace ? ggml_time_us() : 0;
         rpc_msg_set_tensor_hash_req request {};
 
         request.tensor = serialized_tensor;
@@ -2199,6 +2212,11 @@ static void ggml_backend_rpc_buffer_set_tensor(
         RPC_STATUS_ASSERT(status);
 
         if (response.result) {
+            if (copy_trace) {
+                ggml_backend_sched_copy_trace_rpc_note(
+                    GGML_BACKEND_SCHED_COPY_RPC_HASH_HIT,
+                    size, ggml_time_us() - hash_rpc_begin_us);
+            }
             return;
         }
     }
@@ -2208,6 +2226,7 @@ static void ggml_backend_rpc_buffer_set_tensor(
      *
      * | rpc_tensor | uint64_t offset | data[size] |
      */
+    const int64_t set_begin_us = copy_trace ? ggml_time_us() : 0;
     const uint64_t wire_offset =
         static_cast<uint64_t>(offset);
 
@@ -2247,6 +2266,11 @@ static void ggml_backend_rpc_buffer_set_tensor(
         input.data(),
         input.size());
 
+    if (copy_trace) {
+        ggml_backend_sched_copy_trace_rpc_note(
+            GGML_BACKEND_SCHED_COPY_RPC_SET, size,
+            ggml_time_us() - set_begin_us);
+    }
     RPC_STATUS_ASSERT(status);
     if (status && rpc_region_ring_metrics_enabled() && ctx->device_ctx != nullptr) {
         auto & commands = ctx->device_ctx->region_ring_command_stats;
