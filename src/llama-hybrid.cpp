@@ -10457,6 +10457,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 model, baseline_regions, baseline_chunk,
                 1, wide_e_margin, wide_min_simulations);
             LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_CPU_OPTIONAL] mode=APPLY_WIDE "
+                "zero_cpu=ELIGIBLE cycles=2..4 enumerated=%zu "
+                "profiled=%zu simulated=%zu dag_cap=64 "
+                "search=AFTER_LEGACY_LOCAL status=COMPARED\n",
+                result.cpu_optional_enumerated,
+                result.cpu_optional_profiled,
+                result.cpu_optional_simulated);
+            LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
@@ -10732,8 +10740,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     forced_regions, model.layers);
             const bool multi_cycle =
                 llama_region_ring_apply_topology_compatible(
-                    forced_regions, model.layers) &&
-                forced_regions.size() % 3 == 0;
+                    forced_regions, model.layers);
             const auto forced_counts =
                 llama_region_ring_layer_counts(forced_regions);
             const int zero_devices =
@@ -10758,22 +10765,27 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
 
             forced_single_cycle = single_cycle;
-            const int cycles = single_cycle ?
-                1 : (int) forced_regions.size() / 3;
+            const int cycles = single_cycle ? 1 :
+                (int) std::count_if(forced_regions.begin(),
+                    forced_regions.end(), [](const auto & r) {
+                        return r.device == llama_region_ring_device::PHONE;
+                    });
             llama_ring_planner::candidate forced;
             forced.cycles = cycles;
+            const bool first_cycle_has_cpu =
+                !single_cycle && forced_regions.size() > 1 &&
+                forced_regions[1].device == llama_region_ring_device::CPU;
             forced.g = single_cycle ?
                 forced_counts[(size_t) llama_region_ring_device::GPU] :
-                forced_regions[0].layer_end -
-                    forced_regions[0].layer_begin;
+                forced_regions[0].layer_end - forced_regions[0].layer_begin;
             forced.c = single_cycle ?
                 forced_counts[(size_t) llama_region_ring_device::CPU] :
-                forced_regions[1].layer_end -
-                    forced_regions[1].layer_begin;
+                first_cycle_has_cpu ?
+                    forced_regions[1].layer_end - forced_regions[1].layer_begin : 0;
             forced.p = single_cycle ?
                 forced_counts[(size_t) llama_region_ring_device::PHONE] :
-                forced_regions[2].layer_end -
-                    forced_regions[2].layer_begin;
+                forced_regions[first_cycle_has_cpu ? 2 : 1].layer_end -
+                    forced_regions[first_cycle_has_cpu ? 2 : 1].layer_begin;
             forced.tail_c = 0;
             forced.tail_g = 0;
             forced.xc = force_xc;
@@ -10878,7 +10890,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
 
         bool boundary_tensor_selected = false;
-        if (!forced_ab) {
+        if (!forced_ab && !best.cpu_optional_seed) {
             // The new Full-Frame Sender and directional Tensor return workers
             // are mutually exclusive runtime modes; do not score impossible
             // directional refiner candidates while the Full stream is on.
@@ -11144,6 +11156,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             forced_ab ? "FORCED_AB" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
+            best.cpu_optional_seed ? "AUTO_RUNTIME_V2_CPU_OPTIONAL" :
             best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
             best.throughput_seed ? "AUTO_RUNTIME_V2_THROUGHPUT" :
                 "AUTO_RUNTIME_V2",
@@ -11371,6 +11384,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             forced_ab ? "FORCED_AB" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
+            best.cpu_optional_seed ? "AUTO_RUNTIME_V2_CPU_OPTIONAL" :
             best.local_refined ? "AUTO_RUNTIME_V2_LOCAL" :
             best.throughput_seed ? "AUTO_RUNTIME_V2_THROUGHPUT" :
                 "AUTO_RUNTIME_V2",
