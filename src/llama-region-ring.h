@@ -920,12 +920,13 @@ public:
             size_t slot_pool_size = 0,
             bool gpu_two_bank_lifetime = false,
             task_event_observer observer = {},
-            bool track_phone_input_push = false) :
+            bool track_phone_input_push = false,
+            bool phone_input_stream = false) :
         llama_region_ring_ready(
             regions, n_tokens,
             std::vector<int>(regions.size(), chunk_tokens),
             slot_pool_size, gpu_two_bank_lifetime, std::move(observer),
-            track_phone_input_push) {
+            track_phone_input_push, phone_input_stream) {
     }
 
     llama_region_ring_ready(
@@ -935,11 +936,13 @@ public:
             size_t slot_pool_size = 0,
             bool gpu_two_bank_lifetime = false,
             task_event_observer observer = {},
-            bool track_phone_input_push = false) :
+            bool track_phone_input_push = false,
+            bool phone_input_stream = false) :
         regions_(regions),
         region_chunk_tokens_(region_chunk_tokens),
         slot_pool_size_(slot_pool_size),
         track_phone_input_push_(track_phone_input_push),
+        phone_input_stream_(phone_input_stream),
         n_tokens_(n_tokens),
         gpu_two_bank_lifetime_(gpu_two_bank_lifetime),
         task_event_observer_(std::move(observer)) {
@@ -1164,7 +1167,7 @@ public:
             return failed_ || all_done_locked() ||
                 std::any_of(phone_push_queue_.begin(), phone_push_queue_.end(),
                     [&](const auto & job) {
-                        return phone_push_inflight_[job.region] < 2;
+                        return (phone_input_stream_ || phone_push_inflight_[job.region] < 2);
                     });
         });
         if (failed_ || all_done_locked()) {
@@ -1173,7 +1176,7 @@ public:
         const auto it = std::find_if(
             phone_push_queue_.begin(), phone_push_queue_.end(),
             [&](const auto & job) {
-                return phone_push_inflight_[job.region] < 2;
+                return (phone_input_stream_ || phone_push_inflight_[job.region] < 2);
             });
         if (it == phone_push_queue_.end()) {
             return std::nullopt;
@@ -1194,7 +1197,7 @@ public:
         const auto it = std::find_if(
             phone_push_queue_.begin(), phone_push_queue_.end(),
             [&](const auto & job) {
-                return phone_push_inflight_[job.region] < 2;
+                return (phone_input_stream_ || phone_push_inflight_[job.region] < 2);
             });
         if (it == phone_push_queue_.end()) { return std::nullopt; }
         const auto job = *it;
@@ -1623,6 +1626,9 @@ private:
     const std::vector<int> region_chunk_tokens_;
     const size_t slot_pool_size_ = 0;
     const bool track_phone_input_push_ = false;
+    // Stream transport is bounded by the Phone's host byte budget/TCP backpressure,
+    // not an RPC credit for each staged Chunk.
+    const bool phone_input_stream_ = false;
     std::vector<std::vector<uint8_t>> phone_push_state_;
     std::vector<size_t> phone_push_inflight_;
     std::deque<llama_region_ring_task> phone_push_queue_;
