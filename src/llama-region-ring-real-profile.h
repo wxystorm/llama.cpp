@@ -13,7 +13,9 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <iterator>
 #include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <vector>

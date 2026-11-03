@@ -1,6 +1,8 @@
 // Standalone, deterministic Planner DAG tests; no model, CUDA or Phone needed.
 #include "llama-region-ring-planner.h"
+#include "llama-region-ring-real-profile.h"
 #include <cstdlib>
+#include <fstream>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -53,6 +55,47 @@ static model mock_profile() {
 }
 
 int main() {
+    // Service costs are real Stage samples, distinct from DAG queue wait.
+    {
+        const char * file = "region-ring-real-stage-profile-test.csv";
+        {
+            std::ofstream out(file);
+            out << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                   "prepare_ms,compute_ms,terminal,samples\n";
+            out << "CPU,2,16,32,0,0,1,4,0,3\n";
+            out << "CPU,2,32,64,0,0,2,8,0,3\n";
+            out << "CPU,4,16,32,0,0,2,7,0,3\n";
+            out << "CPU,4,32,64,0,0,3,14,0,3\n";
+            out << "PHONE,1,64,64,24,6,4,44,1,1\n";
+            out << "PHONE,1,64,128,25,6,4,45,1,1\n";
+        }
+        real_stage_profile measurements;
+        std::string error;
+        REQUIRE(measurements.load(file, error));
+        REQUIRE(measurements.size() == 6);
+        double ms = 0.0;
+        REQUIRE(measurements.estimate(
+            device::CPU, 3, 24, 48, false,
+            real_stage_phase::COMPUTE, ms));
+        REQUIRE(std::fabs(ms - 8.25) < 1e-6);
+        REQUIRE(measurements.estimate(
+            device::PHONE, 1, 64, 96, true,
+            real_stage_phase::COMPUTE, ms));
+        REQUIRE(std::fabs(ms - 44.5) < 1e-6);
+        REQUIRE(measurements.estimate(
+            device::PHONE, 1, 64, 64, true,
+            real_stage_phase::PREPARE, ms));
+        REQUIRE(std::fabs(ms - 10.0) < 1e-6);
+        REQUIRE(measurements.estimate(
+            device::PHONE, 1, 64, 64, true,
+            real_stage_phase::SETUP, ms));
+        REQUIRE(std::fabs(ms - 24.0) < 1e-6);
+        REQUIRE(!measurements.estimate(
+            device::GPU, 6, 64, 64, false,
+            real_stage_phase::COMPUTE, ms));
+        std::remove(file);
+    }
+
     model m = mock_profile();
 
     // First-cycle fine X candidates are available to deterministic A/B
