@@ -231,6 +231,9 @@ ECHO_PROGRESS_PREFIXES = (
     "[JUPITER_REFINE_MEASURED]",
     "[JUPITER_REFINE_DONE]",
     "[JUPITER_REFINE_INCOMPLETE]",
+    "[JUPITER_REFINE_ERROR]",
+    "[JUPITER_SWEEP_ERROR]",
+    "[JUPITER_BENCH_ERROR]",
     "[JUPITER_BENCH_VERIFY]",
     "[JUPITER_BENCH_RUN]",
     "[JUPITER_BENCH_RESULT]",
@@ -262,12 +265,26 @@ def launch_logged(command: list[str], log_path: Path, phase: str) -> None:
                     print(line.rstrip("\r\n"), flush=True)
             rc = process.wait()
     if rc:
-        tail = "\n".join(
-            log_path.read_text(encoding="utf-8", errors="replace")
-            .splitlines()[-18:]
-        )
+        lines = log_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines()
+        # The final stderr summary often only says "targeted q failed".
+        # Show the innermost diagnosis (and exact q-sample log path) first
+        # rather than truncating it after 500 chars of unrelated runtime logs.
+        diagnoses = []
+        for marker in (
+            "[JUPITER_REFINE_ERROR]",
+            "[JUPITER_SWEEP_ERROR]",
+            "[JUPITER_BENCH_ERROR]",
+            "[JUPITER_STAGE3_ERROR]",
+        ):
+            matches = [line.strip() for line in lines if marker in line]
+            if matches:
+                diagnoses.append(matches[-1])
+        diagnosis = "\n".join(diagnoses[:4]) or "\n".join(lines[-10:])
         raise RuntimeError(
-            f"{phase} exited {rc}; log={log_path}\n{tail}"
+            f"{phase} exited {rc}; log={log_path}\n"
+            f"primary_error={diagnosis}"
         )
     print(f"[JUPITER_SUITE_PHASE] phase={phase} action=DONE", flush=True)
 
