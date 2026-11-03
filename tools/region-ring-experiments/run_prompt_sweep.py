@@ -54,7 +54,8 @@ FIELDS = [
     "phone_copy_apply_calls", "phone_copy_apply_ms",
     "phone_copy_apply_misses", "phone_copy_rpc_set_calls",
     "phone_copy_rpc_set_ms", "phone_copy_rpc_set_mib",
-    "phone_copy_hash_hit_calls", "phone_copy_other_calls",
+    "phone_copy_hash_hit_calls", "phone_copy_local_calls",
+    "phone_copy_other_calls",
     "phone_input_push_phone_recv_header_ms",
     "phone_input_push_phone_recv_alloc_ms",
     "phone_input_push_phone_recv_payload_ms",
@@ -486,8 +487,10 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
             / 1048576.0, 3)
         row["phone_copy_hash_hit_calls"] = int(sum(
             int(r.get("rpc_hash_hit_calls") or 0) for r in phone_copy))
+        row["phone_copy_local_calls"] = sum(
+            r.get("kind") == "LOCAL_COPY" for r in phone_copy)
         row["phone_copy_other_calls"] = sum(
-            r.get("kind") in ("OTHER_COPY", "LOCAL_COPY") for r in phone_copy)
+            r.get("kind") == "OTHER_COPY" for r in phone_copy)
 
     # Region-level Phone Full RPC counters are recorded only for threaded
     # all-Full layouts. Keep the individual UBatch/Region identities in CSV.
