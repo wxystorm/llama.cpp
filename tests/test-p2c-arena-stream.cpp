@@ -121,6 +121,23 @@ void test_arena_publication_and_send_order() {
     arena.shutdown();
 }
 
+void test_abort_unblocks_sender() {
+    ggml_rpc_p2c_arena_queue arena;
+    REQUIRE(arena.initialize(run_id, regions, tokens, hidden));
+    bool got_frame = true;
+    std::thread sender([&] {
+        ggml_rpc_p2c_arena_queue::item item;
+        got_frame = arena.take(item);
+    });
+    arena.abort();
+    sender.join();
+    REQUIRE(!got_frame);
+    REQUIRE(arena.failed());
+    REQUIRE(!arena.capture(make_frame(0, 0, 0, 2),
+        [](uint8_t *, size_t) { return true; }));
+    arena.shutdown();
+}
+
 struct fake_socket {
     std::vector<uint8_t> bytes;
     size_t offset = 0;
@@ -205,6 +222,8 @@ int main(int argc, char ** argv) {
     }
     std::fprintf(stderr, "[P2C_TEST] arena publication and FIFO order\n");
     test_arena_publication_and_send_order();
+    std::fprintf(stderr, "[P2C_TEST] Phone compute failure abort\n");
+    test_abort_unblocks_sender();
     std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\n");
     test_framing_and_partial_receive_failure();
     std::fprintf(stderr, "[P2C_TEST] PASS\n");

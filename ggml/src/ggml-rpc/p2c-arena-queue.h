@@ -179,6 +179,18 @@ public:
         cv_.notify_all();
     }
 
+    // A Phone autonomous compute or capture failure must release the
+    // already subscribed receiver immediately with a P2C_ERROR frame.
+    // finish() alone would emit an ordinary END and hide the failure.
+    void abort() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_) { return; }
+        failed_ = true;
+        finishing_ = true;
+        queue_.clear();
+        cv_.notify_all();
+    }
+
     bool failed() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return failed_;

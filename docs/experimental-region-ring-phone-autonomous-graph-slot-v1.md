@@ -13,38 +13,41 @@ return. Its two goals are:
    OpenCL Stage Slot while Chunk N computes. KV-dependent graph execution
    remains in strict Chunk order.
 
-## Runtime Meta bypass (patch 25)
+## Runtime Meta bypass + Phone-owned P2C publication (patch 26)
 
 Meta stays on PC for **initial Phone Full graph building** and RPC graph
 registration. For **non-final** Phone Full Regions only, PC runtime does not
 call Meta Graph Compute or look up Meta KV View mappings. The existing Phone
-Autonomous thread handles VERIFIED input -> Slot PREPARE -> Compute; the PC
-Phone Worker uses a dedicated completion socket for a direct
-`PHONE_AUTO_WAIT_CAPTURE` request keyed by (input run, region, chunk,
-graph UID) plus the separate P2C stream run ID. Phone validates exactly
-one contiguous F32 output with the expected token count and bytes, and
-uses the existing Arena to snapshot GPU output before replying. The PC
-P2C receiver (unchanged) fills the downstream host edge and publishes
-READY. The global PC PREPARE lock is released before WAIT_CAPTURE.
+Autonomous thread handles VERIFIED input -> Slot PREPARE -> Compute and
+**automatically captures** the registered output into P2C Arena on successful
+compute completion, without a per-Chunk PC WAIT/CAPTURE request. The separate
+network sender publishes the ready frame immediately. PC pre-registers every
+non-final Phone Chunk's destination **before starting input PUSH** so fast
+outputs never reach the receiver before destination registration. PC's Ring
+Worker only delegates the chunk and defers it; PC Receiver (unchanged)
+publishes downstream READY **after the entire frame is received**.
+The global PC PREPARE lock is not held during Phone compute or P2C.
 
 The final Phone Region and PC vocabulary head still use the legacy Meta
 compute path; final Phone graphs are forcibly reset and rebuilt just-in-time
 before each final-region Chunk to avoid reusing long-lived KV View mappings. Decode, directional/Tensor paths, and
-legacy Phone execution remain unchanged. This phase intentionally retains
-one PC WAIT_CAPTURE RPC per Chunk; proactive Phone P2C publication is a
-separate next phase, after data correctness is validated.
+legacy Phone execution remain unchanged. There is no per-Chunk PC WAIT_CAPTURE RPC in patch26 autonomous mode.
+The final Phone Region and PC Head continue on the legacy path.
 
 New diagnostics:
-- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE ... meta_compute=0 status=PASS` on PC
-- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE ... status=PASS` on Phone
-- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE_REJECT ... reason=...` on failure
+- `[PHONE_AUTO_P2C] event=PREBIND ... status=READY` on PC
+- `[PHONE_AUTO_DIRECT] event=DELEGATE ... per_chunk_rpc=0` (debug level)
+- `[PHONE_AUTO_DIRECT] event=AUTO_CAPTURE ... status=PASS` on Phone
+- `[PHONE_AUTO_P2C] event=ABORT ...` on Phone failure (P2C ERROR to PC)
+- `[P2C_STREAM] side=PC phase=RECEIVER_DONE ... status=OK` once at teardown
 
 ## Enabling
 
-**Build both PC and Phone from this branch.** RPC patch 25 adds command 52
-(Phone autonomous WAIT_CAPTURE), preserving the patch24 49/50/51 commands.
-Older patch24 Phone binaries are rejected during the preflight probe;
-PC and Phone MUST both be rebuilt from the same version.
+**Build both PC and Phone from this branch.** RPC patch 26 extends task
+registration (command 50) with P2C run ID, token interval and output byte
+contract. Commands 49/51/52 remain allocated, but autonomous mode no longer
+issues the per-Chunk 52. Older Phone binaries are rejected by the registration
+capability check; PC and Phone MUST both be rebuilt from the same version.
 
 Start the Phone RPC server with:
 
@@ -121,11 +124,12 @@ conservative: Host -> private original OpenCL input -> staged Slot.
 This extra local OpenCL copy is not yet optimized away; the objective is
 to validate local triggering and upload/compute overlap first.
 
-PC's Phone Worker now invokes a `PHONE_AUTO_WAIT` RPC for its matching
-logical job, **not** APPLY or Graph Compute. On success it resumes the
-unchanged Meta output handoff (including optional asynchronous return).
-This is **not yet** Phase C's fully independent output event: the PC still
-owns downstream READY publication.
+PC's Phone Worker no longer invokes `PHONE_AUTO_WAIT` or
+`PHONE_AUTO_WAIT_CAPTURE`. Phone's Compute Worker captures the verified
+output into the Arena, while the dedicated P2C sender streams the frame.
+PC Receiver remains the only owner of downstream READY, after full frame
+receipt. A failed Phone prepare/compute/capture aborts the Arena, sending a
+P2C ERROR rather than silently hanging the PC Receiver.
 
 Only **non-final Phone Full Regions** run autonomously in this phase.
 The final Phone Full Region, any tiny startup/warmup request and one-token
@@ -178,7 +182,8 @@ autonomous setup: **12 registered and completed jobs** (Regions 2 and 5,
 `prepare_compute_overlap_ms`, and `prepared_ahead`.
 The overlap metric measures intersection of next Chunk upload/prepare with
 the previous Chunk's compute for the same Region, not guaranteed wall-time
-savings. Detailed Phone execute logs are opt-in via
+savings. `capture_ms` and `published` report Phone-owned Arena capture
+cost and output frame count (not TCP send completion). Detailed Phone execute logs are opt-in via
 `GGML_RPC_PHONE_AUTO_TRACE=1`.
 
 On PC, ensure non-final Phone Regions' `PUSH_APPLY` Copy count drops,

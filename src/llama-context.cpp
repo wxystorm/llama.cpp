@@ -5186,7 +5186,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
              phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr));
         const bool phone_auto_enabled =
             phone_auto_eligible && phone_input_stream_enabled;
-        ggml_backend_rpc_phone_auto_wait_capture_t phone_auto_wait_capture = nullptr;
+        static std::atomic<uint64_t> next_phone_stream_run_id { 1 };
+        const uint64_t phone_stream_run_id =
+            phone_stream_requested && has_phone_full_return ?
+                next_phone_stream_run_id.fetch_add(
+                    1, std::memory_order_relaxed) : 0;
         if (phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
             auto * rpc_reg = rpc_dev != nullptr ?
@@ -5196,24 +5200,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC)) :
                 nullptr;
-            phone_auto_wait_capture = rpc_reg != nullptr ?
-                reinterpret_cast<ggml_backend_rpc_phone_auto_wait_capture_t>(
-                    ggml_backend_reg_get_proc_address(
-                        rpc_reg,
-                        GGML_BACKEND_RPC_PHONE_AUTO_WAIT_CAPTURE_PROC)) :
-                nullptr;
-            // The probe opens the independent completion socket and verifies
-            // server patch 25 before any autonomous task can run.
+            // Patch26 registration performs the capability check before any
+            // output-bound task is admitted. No runtime WAIT RPC remains.
             bool bound = register_task != nullptr &&
-                phone_auto_wait_capture != nullptr &&
-                phone_auto_wait_capture(phone_rpc_backend,
-                                        0, 0, 0, 0, 0, 0, 0, 0);
+                phone_stream_run_id != 0;
             if (bound) {
                 for (const auto & item : phone_auto_templates) {
                     if (!register_task(
                             phone_rpc_backend, phone_input_push_run_id,
                             (uint32_t) item.region, (uint32_t) item.chunk,
                             item.graph_uid,
+                            (size_t) item.tokens * (size_t) n_embd * sizeof(float),
+                            phone_stream_run_id, item.token_begin, item.tokens,
                             (size_t) item.tokens * (size_t) n_embd * sizeof(float))) {
                         LLAMA_LOG_ERROR(
                             "[PHONE_AUTO] event=BIND_FAIL region=%zu "
@@ -5302,10 +5300,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
-            static std::atomic<uint64_t> next_phone_stream_run_id { 1 };
-            phone_stream_session.run_id =
-                next_phone_stream_run_id.fetch_add(
-                    1, std::memory_order_relaxed);
+            phone_stream_session.run_id = phone_stream_run_id;
             phone_stream_session.ready = &ready;
             phone_stream_handle = start(
                 phone_rpc_backend,
@@ -5326,6 +5321,51 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[P2C_STREAM] phase=START run=%" PRIu64
                 " regions=%zu tokens=%u policy=PHONE_FULL_OPT_IN status=READY\n",
                 phone_stream_session.run_id, stages.size(), ubatch.n_tokens);
+        }
+        if (phone_auto_enabled) {
+            if (phone_stream_handle == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_AUTO_P2C] event=PREBIND status=REJECT "
+                    "reason=P2C_STREAM_NOT_READY\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            // A Phone Chunk can finish while the host Phone Worker has not
+            // yet claimed its logical task. Register every receiver target
+            // BEFORE starting the PUSH producer or any Ring worker.
+            for (const auto & item : phone_auto_templates) {
+                if (item.region + 1 >= stages.size() ||
+                        item.token_begin + item.tokens > ubatch.n_tokens ||
+                        outputs[item.region].size() <
+                            (size_t) (item.token_begin + item.tokens) * (size_t) n_embd) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO_P2C] event=PREBIND status=REJECT "
+                        "reason=OUTPUT_RANGE region=%zu chunk=%zu\n",
+                        item.region, item.chunk);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                llama_region_ring_phone_full_return_job job {};
+                job.task = {item.region, item.chunk,
+                            (int) item.token_begin, (int) item.tokens};
+                job.destination = outputs[item.region].data() +
+                    (size_t) item.token_begin * (size_t) n_embd;
+                job.bytes = (size_t) item.tokens * (size_t) n_embd * sizeof(float);
+                const uint64_t key = llama_region_ring_phone_full_return_key(
+                    item.region, item.chunk);
+                if (!phone_stream_session.pending.emplace(key, job).second) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO_P2C] event=PREBIND status=REJECT "
+                        "reason=DUPLICATE_KEY region=%zu chunk=%zu\n",
+                        item.region, item.chunk);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_AUTO_P2C] event=PREBIND p2c_run=%" PRIu64
+                " outputs=%zu policy=REGISTER_BEFORE_PUSH status=READY\n",
+                phone_stream_session.run_id, phone_stream_session.pending.size());
         }
 
         const std::array<llama_region_ring_device, 3> devices = {
@@ -5920,6 +5960,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         int64_t phone_push_pc_other_us = 0;
         size_t phone_push_accepted = 0;
         size_t phone_push_applied = 0;
+        size_t phone_push_auto_delegated = 0;
         size_t phone_push_missed = 0;
         uint64_t phone_push_bytes = 0;
         auto run_phone_input_pusher = [&]() {
@@ -6327,8 +6368,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         if (ready.failed()) {
                             cancelled_before_compute = true;
                         } else {
-                            // Register before sending the capture command: a fast
-                            // network return can arrive before ready.defer().
+                            // Proactive Phone tasks already have a destination
+                            // registered before any input PUSH; legacy tasks
+                            // still register at worker claim before CAPTURE.
                             if (phone_stream_handle != nullptr &&
                                     dev == (size_t)
                                         llama_region_ring_device::PHONE &&
@@ -6350,7 +6392,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 {
                                     std::lock_guard<std::mutex> lock(
                                         phone_stream_session.mutex);
-                                    if (!phone_stream_session.pending.emplace(
+                                    if (phone_auto_task) {
+                                        // Prebound at setup; the Receiver may
+                                        // already have delivered the frame.
+                                        auto it = phone_stream_session.pending.find(key);
+                                        if (it == phone_stream_session.pending.end() ||
+                                                it->second.destination != output ||
+                                                it->second.bytes != job.bytes ||
+                                                it->second.task.token_begin != task.token_begin ||
+                                                it->second.task.n_tokens != task.n_tokens ||
+                                                it->second.deferred) {
+                                            throw std::runtime_error(
+                                                "Phone proactive P2C binding mismatch");
+                                        }
+                                        it->second.task = task;
+                                    } else if (!phone_stream_session.pending.emplace(
                                             key, job).second) {
                                         throw std::runtime_error(
                                             "duplicate Phone stream task");
@@ -6391,55 +6447,38 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 // with Meta and registered before the worker DAG.
                                 // Runtime MUST NOT enter Meta compute: its
                                 // rotating KV View maps may have been cleared.
-                                // Also do not hold the global PREPARE mutex
-                                // through a potentially long Phone WAIT.
+                                // Phone is already computing from VERIFIED
+                                // PUSH. Host dispatch just releases the
+                                // logical FIFO and arranges receiver delivery;
+                                // it never waits for Phone compute or P2C.
                                 if (prepare_gate.owns_lock()) {
                                     prepare_gate.unlock();
                                 }
-                                const int64_t direct_begin_us = ggml_time_us();
-                                const bool valid_bridge =
-                                    phone_auto_wait_capture != nullptr &&
+                                const bool delegated =
                                     phone_stream_handle != nullptr &&
                                     phone_auto_graph_uid != 0 &&
                                     task_res != nullptr &&
                                     output != nullptr &&
                                     llama_region_ring_tls_phone_full_stream.enabled;
-                                const size_t expected_bytes =
-                                    (size_t) task.n_tokens *
-                                    (size_t) n_embd * sizeof(float);
-                                const bool captured = valid_bridge &&
-                                    phone_auto_wait_capture(
-                                        phone_rpc_backend, phone_input_push_run_id,
-                                        (uint32_t) task.region,
-                                        (uint32_t) task.chunk, phone_auto_graph_uid,
-                                        phone_stream_session.run_id,
-                                        (uint32_t) task.token_begin,
-                                        (uint32_t) task.n_tokens, expected_bytes);
-                                task_status = captured ? GGML_STATUS_SUCCESS :
+                                task_status = delegated ? GGML_STATUS_SUCCESS :
                                     GGML_STATUS_FAILED;
-                                task_result = captured ? task_res : nullptr;
-                                if (captured) {
-                                    // The P2C Arena owns a finished host
-                                    // snapshot, not a live GPU Slot. The
-                                    // Receiver publishes downstream READY.
+                                task_result = delegated ? task_res : nullptr;
+                                if (delegated) {
+                                    // A prebound Receiver will publish
+                                    // downstream READY only after its entire
+                                    // P2C frame is in the host output buffer.
                                     llama_region_ring_tls_phone_full_stream.deferred = true;
                                 }
-                                task_timing.compute_range_us =
-                                    ggml_time_us() - direct_begin_us;
                                 if (task_timing.capture_timeline) {
-                                    task_timing.output_begin_us = direct_begin_us;
-                                    task_timing.output_end_us = ggml_time_us();
                                     task_timing.output_kind = 2;
                                 }
-                                LLAMA_LOG_INFO(
-                                    "[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE "
+                                LLAMA_LOG_DEBUG(
+                                    "[PHONE_AUTO_DIRECT] event=DELEGATE "
                                     "region=%zu chunk=%zu uid=%" PRIu64
-                                    " bytes=%zu wait_capture_ms=%.3f "
-                                    "meta_compute=0 status=%s\n",
+                                    " meta_compute=0 per_chunk_rpc=0 status=%s\n",
                                     task.region, task.chunk,
-                                    phone_auto_graph_uid, expected_bytes,
-                                    task_timing.compute_range_us / 1000.0,
-                                    captured ? "PASS" : "FAIL");
+                                    phone_auto_graph_uid,
+                                    delegated ? "READY" : "REJECT");
                             } else {
                                 // Final Phone Region / PC Head and all other
                                 // modes retain their existing Meta execution.
@@ -6862,12 +6901,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         // The Phone-owned path consumed the Host payload
                         // before locally computing the registered graph.
                         // No PC-side APPLY request was issued.
-                        const bool applied = phone_auto_task ?
+                        const bool handled = phone_auto_task ?
                             (task_status == GGML_STATUS_SUCCESS &&
                              task_result != nullptr) :
                             phone_input_consume_end();
-                        if (applied) {
-                            ++phone_push_applied;
+                        if (handled) {
+                            if (phone_auto_task) {
+                                // Computation/APPLY is asynchronous; the
+                                // Phone report counts actual verified APPLYs.
+                                ++phone_push_auto_delegated;
+                            } else {
+                                ++phone_push_applied;
+                            }
                         } else {
                             ++phone_push_missed;
                             (void) phone_input_drop(
@@ -7233,11 +7278,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             LLAMA_LOG_INFO(
                 "[PHONE_INPUT_PUSH] event=SUMMARY run=%" PRIu64
-                " accepted=%zu applied=%zu fallback=%zu abandoned=%zu"
+                " accepted=%zu applied=%zu delegated=%zu fallback=%zu abandoned=%zu"
                 " upload_mib=%.3f push_wall_ms=%.3f worker_wait_ms=%.3f"
                 " thread_started=%d status=%s\n",
                 phone_input_push_run_id,
-                phone_push_accepted, phone_push_applied, phone_push_missed,
+                phone_push_accepted, phone_push_applied,
+                phone_push_auto_delegated, phone_push_missed,
                 abandoned, phone_push_bytes / 1048576.0,
                 phone_push_wall_us / 1000.0, phone_push_wait_us / 1000.0,
                 phone_push_thread_started ? 1 : 0,
