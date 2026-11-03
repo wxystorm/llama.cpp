@@ -29,6 +29,7 @@ param(
     [string] $Planner = "apply-wide",
     [ValidateRange(0, 5)]
     [int] $LogVerbosity = 4,
+    [switch] $NoMmap,
     [switch] $DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -67,6 +68,9 @@ if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
         "--force-xg", "$ForceXG",
         "--force-xp", "$ForceXP"
     )
+}
+if ($NoMmap) {
+    $callArgs += "--no-mmap"
 }
 if ($DryRun) {
     $callArgs += "--dry-run"
