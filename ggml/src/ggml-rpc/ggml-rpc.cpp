@@ -6633,6 +6633,13 @@ bool rpc_server::phone_input_stream_run(
                                 job.prepare_done_us <= p.compute_end_us ? 1 : 0;
                         }
                     }
+                    ++it;
+                } else { ++it; }
+            }
+            // Keep predecessor records alive through overlap accounting.
+            for (auto it = phone_auto_jobs.begin();
+                    it != phone_auto_jobs.end();) {
+                if (std::get<0>(it->first) == request.run_id) {
                     it = phone_auto_jobs.erase(it);
                 } else { ++it; }
             }
@@ -6650,7 +6657,7 @@ bool rpc_server::phone_input_stream_run(
                 " registered=%zu completed=%zu failed=%zu"
                 " upload_ms=%.3f prepare_ms=%.3f compute_ms=%.3f"
                 " prepare_compute_overlap_ms=%.3f prepared_ahead=%zu"
-                " mode=VERIFIED_TRIGGER_KV_FIFO_DUAL_SLOT status=%s\\n",
+                " mode=VERIFIED_TRIGGER_KV_FIFO_DUAL_SLOT status=%s\n",
                 request.run_id, auto_jobs_total, auto_jobs_complete,
                 auto_jobs_failed, auto_upload_us / 1000.0,
                 auto_prepare_us / 1000.0, auto_compute_us / 1000.0,
