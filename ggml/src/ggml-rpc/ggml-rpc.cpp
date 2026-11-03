@@ -6641,6 +6641,7 @@ bool rpc_server::phone_auto_task_register(
     }
     const auto & plan = it->second.slot0;
     ggml_tensor * input = nullptr;
+    bool ambiguous_input = false;
     std::unordered_set<const ggml_tensor *> seen;
     std::function<void(ggml_tensor *)> visit = [&](ggml_tensor * t) {
         if (t == nullptr || !seen.insert(t).second) { return; }
@@ -6649,7 +6650,7 @@ bool rpc_server::phone_auto_task_register(
                 t->buffer != nullptr && is_opencl_tensor(t) &&
                 ggml_nbytes(t) == request.input_bytes) {
             if (input == nullptr) { input = t; }
-            else if (input != t) { input = nullptr; } // reject ambiguity
+            else if (input != t) { ambiguous_input = true; }
         }
         for (ggml_tensor * src : t->src) { visit(src); }
         if (t->view_src != nullptr) { visit(t->view_src); }
@@ -6657,7 +6658,7 @@ bool rpc_server::phone_auto_task_register(
     for (int i = 0; i < it->second.graph->n_nodes; ++i) {
         visit(it->second.graph->nodes[i]);
     }
-    if (input == nullptr) {
+    if (input == nullptr || ambiguous_input) {
         return false;
     }
     rpc_tensor wire = serialize_tensor(input);
