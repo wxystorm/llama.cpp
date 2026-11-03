@@ -1,5 +1,9 @@
 #include "../ggml/src/ggml-rpc/phone-autonomous-policy.h"
 
+// Keep assertions active under Release/MSVC NDEBUG builds.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cstdint>
 #include <limits>
