@@ -13,11 +13,38 @@ return. Its two goals are:
    OpenCL Stage Slot while Chunk N computes. KV-dependent graph execution
    remains in strict Chunk order.
 
+## Runtime Meta bypass (patch 25)
+
+Meta stays on PC for **initial Phone Full graph building** and RPC graph
+registration. For **non-final** Phone Full Regions only, PC runtime does not
+call Meta Graph Compute or look up Meta KV View mappings. The existing Phone
+Autonomous thread handles VERIFIED input -> Slot PREPARE -> Compute; the PC
+Phone Worker uses a dedicated completion socket for a direct
+`PHONE_AUTO_WAIT_CAPTURE` request keyed by (input run, region, chunk,
+graph UID) plus the separate P2C stream run ID. Phone validates exactly
+one contiguous F32 output with the expected token count and bytes, and
+uses the existing Arena to snapshot GPU output before replying. The PC
+P2C receiver (unchanged) fills the downstream host edge and publishes
+READY. The global PC PREPARE lock is released before WAIT_CAPTURE.
+
+The final Phone Region and PC vocabulary head still use the legacy Meta
+compute path; final Phone graphs are prepared just-in-time to avoid
+long-lived KV View mappings. Decode, directional/Tensor paths, and
+legacy Phone execution remain unchanged. This phase intentionally retains
+one PC WAIT_CAPTURE RPC per Chunk; proactive Phone P2C publication is a
+separate next phase, after data correctness is validated.
+
+New diagnostics:
+- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE ... meta_compute=0 status=PASS` on PC
+- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE ... status=PASS` on Phone
+- `[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE_REJECT ... reason=...` on failure
+
 ## Enabling
 
-**Build both PC and Phone from this branch.** RPC patch 24 adds command IDs
-49/50/51. Running old patch23 binaries will fail eligibility/capability
-checks; it must not silently run the new protocol.
+**Build both PC and Phone from this branch.** RPC patch 25 adds command 52
+(Phone autonomous WAIT_CAPTURE), preserving the patch24 49/50/51 commands.
+Older patch24 Phone binaries are rejected during the preflight probe;
+PC and Phone MUST both be rebuilt from the same version.
 
 Start the Phone RPC server with:
 

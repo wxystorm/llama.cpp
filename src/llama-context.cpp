@@ -4707,8 +4707,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_static_templates =
         phone_static_requested && phone_static_eligible &&
         single_terminal_output;
+    const char * phone_auto_p2c_env =
+        std::getenv("LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
+    const bool phone_auto_p2c_required =
+        phone_auto_p2c_env != nullptr && std::atoi(phone_auto_p2c_env) != 0;
     const bool phone_auto_eligible =
         phone_auto_requested && phone_static_templates &&
+        phone_auto_p2c_required &&
         phone_input_stream_requested && pc_phone_overlap &&
         threaded_execution && !directional_runtime &&
         ubatch.n_tokens > 1 && stages.size() > 2 &&
@@ -5181,6 +5186,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
              phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr));
         const bool phone_auto_enabled =
             phone_auto_eligible && phone_input_stream_enabled;
+        ggml_backend_rpc_phone_auto_wait_capture_t phone_auto_wait_capture = nullptr;
         if (phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
             auto * rpc_reg = rpc_dev != nullptr ?
@@ -5190,7 +5196,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC)) :
                 nullptr;
-            bool bound = register_task != nullptr;
+            phone_auto_wait_capture = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_auto_wait_capture_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg,
+                        GGML_BACKEND_RPC_PHONE_AUTO_WAIT_CAPTURE_PROC)) :
+                nullptr;
+            // The probe opens the independent completion socket and verifies
+            // server patch 25 before any autonomous task can run.
+            bool bound = register_task != nullptr &&
+                phone_auto_wait_capture != nullptr &&
+                phone_auto_wait_capture(phone_rpc_backend,
+                                        0, 0, 0, 0, 0, 0, 0, 0);
             if (bound) {
                 for (const auto & item : phone_auto_templates) {
                     if (!register_task(
@@ -6077,6 +6094,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ring_res[dev];
                     bool phone_prebuilt_task = false;
                     bool phone_auto_task = false;
+                    uint64_t phone_auto_graph_uid = 0;
                     if (phone_auto_enabled &&
                             dev == (size_t) llama_region_ring_device::PHONE &&
                             stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
@@ -6100,8 +6118,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         task_res = it->owned_res.get();
                         phone_prebuilt_task = true;
                         phone_auto_task = true;
+                        phone_auto_graph_uid = it->graph_uid;
+                    }
+                    // Dynamic final Phone Graph preparation retains the
+                    // canonical PC Head and keeps its short-lived Meta KV
+                    // views valid. The long-lived prebuilt final templates
+                    // could otherwise outlive Meta's three mapping epochs.
+                    if (phone_auto_enabled && last &&
+                            stage.kind == llama_hybrid_runtime_stage_kind::PHONE) {
+                        task_sched = sched_use;
+                        task_res = res_use;
                     }
                     if (!phone_auto_task && phone_static_templates &&
+                            !(phone_auto_enabled && last) &&
                             dev == (size_t) llama_region_ring_device::PHONE &&
                             stage.kind == llama_hybrid_runtime_stage_kind::PHONE) {
                         const auto it = std::find_if(
@@ -6357,53 +6386,87 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 phone_copy_trace_enabled &&
                                 dev == (size_t) llama_region_ring_device::PHONE &&
                                 stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
-                            // During this phase, the normal PC Phone
-                            // Worker still owns output publication and the
-                            // existing P2C stream, but not Phone computation.
-                            // The Phone compute loop is triggered by VERIFIED
-                            // PUSH independently of this host Worker.
-                            struct phone_auto_wait_scope {
-                                bool active;
-                                phone_auto_wait_scope(bool enabled,
-                                        uint64_t run, uint32_t region,
-                                        uint32_t chunk) : active(enabled) {
-                                    if (active) {
-                                        ggml_backend_meta_phone_auto_context(
-                                            2, run, region, chunk);
-                                    }
+                            if (phone_auto_task) {
+                                // The complete per-Chunk Phone Graph was built
+                                // with Meta and registered before the worker DAG.
+                                // Runtime MUST NOT enter Meta compute: its
+                                // rotating KV View maps may have been cleared.
+                                // Also do not hold the global PREPARE mutex
+                                // through a potentially long Phone WAIT.
+                                if (prepare_gate.owns_lock()) {
+                                    prepare_gate.unlock();
                                 }
-                                ~phone_auto_wait_scope() {
-                                    if (active) {
-                                        ggml_backend_meta_phone_auto_context(
-                                            0, 0, 0, 0);
-                                    }
+                                const int64_t direct_begin_us = ggml_time_us();
+                                const bool valid_bridge =
+                                    phone_auto_wait_capture != nullptr &&
+                                    phone_stream_handle != nullptr &&
+                                    phone_auto_graph_uid != 0 &&
+                                    task_res != nullptr &&
+                                    output != nullptr &&
+                                    llama_region_ring_tls_phone_full_stream.enabled;
+                                const size_t expected_bytes =
+                                    (size_t) task.n_tokens *
+                                    (size_t) n_embd * sizeof(float);
+                                const bool captured = valid_bridge &&
+                                    phone_auto_wait_capture(
+                                        phone_rpc_backend, phone_input_push_run_id,
+                                        (uint32_t) task.region,
+                                        (uint32_t) task.chunk, phone_auto_graph_uid,
+                                        phone_stream_session.run_id,
+                                        (uint32_t) task.token_begin,
+                                        (uint32_t) task.n_tokens, expected_bytes);
+                                task_status = captured ? GGML_STATUS_SUCCESS :
+                                    GGML_STATUS_FAILED;
+                                task_result = captured ? task_res : nullptr;
+                                if (captured) {
+                                    // The P2C Arena owns a finished host
+                                    // snapshot, not a live GPU Slot. The
+                                    // Receiver publishes downstream READY.
+                                    llama_region_ring_tls_phone_full_stream.deferred = true;
                                 }
-                            } phone_auto_scope(
-                                phone_auto_task, phone_input_push_run_id,
-                                (uint32_t) task.region, (uint32_t) task.chunk);
-                            task_result = run_hybrid_stage_block(
-                                ubatch, stage, task.token_begin, task.n_tokens,
-                                input, output, gtype, worker_kv_views[dev].get(),
-                                task_sched, task_res,
-                                ubatch_id, task.region, task.chunk,
-                                llama_hybrid_boundary_action::PASS,
-                                block_outputs, worker_apply_mctx, true,
-                                task_status, &task_timing, true,
-                                pc_phone_overlap,
-                                pc_phone_overlap ? &prepare_gate : nullptr,
-                                &lane_compute_begin_us, &lane_compute_end_us,
-                                pc_phone_overlap && dev == 1 ?
-                                    backend_ptrs[1] : nullptr,
-                                pc_phone_overlap ? (int) dev : -1,
-                                pc_phone_overlap ? &cpu_gate : nullptr,
-                                pc_phone_overlap && dev == 1 ?
-                                    &cuda_gate : nullptr,
-                                pc_phone_overlap ? &state.prepare_wait_us : nullptr,
-                                pc_phone_overlap ? &state.cpu_wait_us : nullptr,
-                                pc_phone_overlap ? &state.cuda_wait_us : nullptr,
-                                dev == 1 && gpu_weight_streaming &&
-                                    gpu_bank_resident,
-                                phone_prebuilt_task, phone_auto_task);
+                                task_timing.compute_range_us =
+                                    ggml_time_us() - direct_begin_us;
+                                if (task_timing.capture_timeline) {
+                                    task_timing.output_begin_us = direct_begin_us;
+                                    task_timing.output_end_us = ggml_time_us();
+                                    task_timing.output_kind = 2;
+                                }
+                                LLAMA_LOG_INFO(
+                                    "[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE "
+                                    "region=%zu chunk=%zu uid=%" PRIu64
+                                    " bytes=%zu wait_capture_ms=%.3f "
+                                    "meta_compute=0 status=%s\n",
+                                    task.region, task.chunk,
+                                    phone_auto_graph_uid, expected_bytes,
+                                    task_timing.compute_range_us / 1000.0,
+                                    captured ? "PASS" : "FAIL");
+                            } else {
+                                // Final Phone Region / PC Head and all other
+                                // modes retain their existing Meta execution.
+                                task_result = run_hybrid_stage_block(
+                                    ubatch, stage, task.token_begin, task.n_tokens,
+                                    input, output, gtype, worker_kv_views[dev].get(),
+                                    task_sched, task_res,
+                                    ubatch_id, task.region, task.chunk,
+                                    llama_hybrid_boundary_action::PASS,
+                                    block_outputs, worker_apply_mctx, true,
+                                    task_status, &task_timing, true,
+                                    pc_phone_overlap,
+                                    pc_phone_overlap ? &prepare_gate : nullptr,
+                                    &lane_compute_begin_us, &lane_compute_end_us,
+                                    pc_phone_overlap && dev == 1 ?
+                                        backend_ptrs[1] : nullptr,
+                                    pc_phone_overlap ? (int) dev : -1,
+                                    pc_phone_overlap ? &cpu_gate : nullptr,
+                                    pc_phone_overlap && dev == 1 ?
+                                        &cuda_gate : nullptr,
+                                    pc_phone_overlap ? &state.prepare_wait_us : nullptr,
+                                    pc_phone_overlap ? &state.cpu_wait_us : nullptr,
+                                    pc_phone_overlap ? &state.cuda_wait_us : nullptr,
+                                    dev == 1 && gpu_weight_streaming &&
+                                        gpu_bank_resident,
+                                    phone_prebuilt_task, false);
+                            }
                             const int64_t compute_end_us = ggml_time_us();
                             if (task_trace != nullptr) {
                                 task_trace->host_execute_end_us = compute_end_us;

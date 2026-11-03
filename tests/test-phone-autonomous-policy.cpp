@@ -75,10 +75,24 @@ static void test_server_native_storage_binding() {
     assert(wire_data != first_data);
 }
 
+static void test_direct_wait_capture_contract() {
+    using ggml_phone_auto::valid_capture_contract;
+    assert(valid_capture_contract(64, 64, 1, 1310720, 1310720, true, true));
+    assert(valid_capture_contract(38, 38, 1, 778240, 778240, true, true));
+    assert(!valid_capture_contract(64, 38, 1, 778240, 778240, true, true));
+    assert(!valid_capture_contract(64, 64, 0, 1310720, 1310720, true, true));
+    assert(!valid_capture_contract(64, 64, 2, 1310720, 1310720, true, true));
+    assert(!valid_capture_contract(64, 64, 1, 0, 0, true, true));
+    assert(!valid_capture_contract(64, 64, 1, 1310720, 655360, true, true));
+    assert(!valid_capture_contract(64, 64, 1, 1310720, 1310720, false, true));
+    assert(!valid_capture_contract(64, 64, 1, 1310720, 1310720, true, false));
+}
+
 int main() {
     test_one_chunk_lookahead();
     test_strict_kv_fifo();
     test_stage_input_name_contract();
     test_server_native_storage_binding();
+    test_direct_wait_capture_contract();
     return 0;
 }

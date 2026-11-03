@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 
 namespace ggml_phone_auto {
@@ -39,6 +40,17 @@ inline bool bind_native_storage(uint64_t & wire_buffer, uint64_t & wire_data,
     wire_buffer = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer));
     wire_data = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(data));
     return true;
+}
+
+// Fail-closed capture admission: only the exact registered, single F32
+// contiguous output of the same Chunk may be exposed to the P2C receiver.
+constexpr bool valid_capture_contract(uint32_t registered_tokens,
+        uint32_t requested_tokens, size_t outputs, uint64_t output_bytes,
+        uint64_t expected_bytes, bool f32, bool contiguous) {
+    return registered_tokens > 0 &&
+        registered_tokens == requested_tokens && outputs == 1 &&
+        output_bytes > 0 && output_bytes == expected_bytes &&
+        f32 && contiguous;
 }
 
 } // namespace ggml_phone_auto

@@ -355,6 +355,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_GRAPH_REGISTER,
     RPC_CMD_PHONE_AUTO_TASK_REGISTER,
     RPC_CMD_PHONE_AUTO_WAIT,
+    RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
     RPC_CMD_COUNT,
 };
 
@@ -391,6 +392,7 @@ static_assert(RPC_CMD_PHONE_INPUT_STREAM_PUSH == 48, "RPC_CMD_PHONE_INPUT_STREAM
 static_assert(RPC_CMD_PHONE_AUTO_GRAPH_REGISTER == 49, "RPC_CMD_PHONE_AUTO_GRAPH_REGISTER index");
 static_assert(RPC_CMD_PHONE_AUTO_TASK_REGISTER == 50, "RPC_CMD_PHONE_AUTO_TASK_REGISTER index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
+static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -429,6 +431,18 @@ struct rpc_msg_phone_auto_task_req {
 struct rpc_msg_phone_auto_wait_req {
     rpc_phone_input_key key {};
 };
+struct rpc_msg_phone_auto_wait_capture_req {
+    rpc_phone_input_key key {};
+    uint64_t graph_uid = 0;
+    uint64_t p2c_run_id = 0;
+    uint64_t expected_bytes = 0;
+    uint32_t device = 0;
+    uint32_t token_begin = 0;
+    uint32_t n_tokens = 0;
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(rpc_msg_phone_auto_wait_capture_req) == 56,
+              "Phone autonomous capture ABI changed; update RPC version");
 
 // These are independent server-side durations returned with PUSH ACK.
 // A Phone timestamp is NEVER directly subtracted from a PC timestamp.
@@ -4240,6 +4254,47 @@ static bool ggml_backend_rpc_phone_auto_wait(
                &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted;
 }
 
+// Capture the already completed Phone-owned Chunk output without asking PC
+// Meta to rebuild or map a single KV View. The server owns the registered
+// output Tensor. Use the completion socket so the RPC compute channel remains
+// available for independent Phone graph operations.
+static bool ggml_backend_rpc_phone_auto_wait_capture(
+        ggml_backend_t backend, uint64_t input_run_id,
+        uint32_t region, uint32_t chunk, uint64_t graph_uid,
+        uint64_t p2c_run_id, uint32_t token_begin, uint32_t n_tokens,
+        size_t expected_bytes) {
+    if (!ggml_backend_is_rpc(backend)) { return false; }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPLETION_WAIT);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_completion_wait") < 25) {
+        return false;
+    }
+    // No command is sent for the preflight probe.
+    if (input_run_id == 0) {
+        return region == 0 && chunk == 0 && graph_uid == 0 &&
+            p2c_run_id == 0 && token_begin == 0 && n_tokens == 0 &&
+            expected_bytes == 0;
+    }
+    if (region >= 64 || graph_uid == 0 || p2c_run_id == 0 ||
+            n_tokens == 0 || expected_bytes == 0 ||
+            expected_bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return false;
+    }
+    rpc_msg_phone_auto_wait_capture_req req {};
+    req.key = { input_run_id, region, chunk };
+    req.device = ctx->device;
+    req.graph_uid = graph_uid;
+    req.p2c_run_id = p2c_run_id;
+    req.token_begin = token_begin;
+    req.n_tokens = n_tokens;
+    req.expected_bytes = static_cast<uint64_t>(expected_bytes);
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
+                        &req, sizeof(req), &rsp, sizeof(rsp)) &&
+        rsp.accepted != 0;
+}
+
 // Stream session has one setup/teardown RPC, never a per-Chunk ACK.
 static bool ggml_backend_rpc_phone_input_stream_run(
         ggml_backend_t backend, uint64_t run_id, bool active) {
@@ -5585,6 +5640,7 @@ public:
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
     bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
+    bool phone_auto_wait_capture(const rpc_msg_phone_auto_wait_capture_req & request);
     void phone_auto_input_verified(const rpc_phone_input_key & key);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop();
@@ -5718,6 +5774,8 @@ private:
         std::shared_ptr<phone_stage_prepare_job> prepared_job;
         std::optional<phone_stage_prepared_input> prepared;
         phone_auto_status state = phone_auto_status::REGISTERED;
+        bool capture_in_progress = false;
+        bool capture_done = false;
         int64_t verified_us = 0;
         int64_t upload_begin_us = 0;
         int64_t upload_done_us = 0;
@@ -6879,6 +6937,120 @@ bool rpc_server::phone_auto_wait(const rpc_msg_phone_auto_wait_req & request) {
         });
     return done && !phone_auto_stop &&
         it->second->state == phone_auto_status::COMPLETE;
+}
+
+// The only per-Chunk Phone Full output bridge on the PC hot path. The
+// registered Phone graph has already executed and copied its output back to
+// private, persistent remote storage. Nothing here recompiles a Meta graph.
+bool rpc_server::phone_auto_wait_capture(
+        const rpc_msg_phone_auto_wait_capture_req & request) {
+    const auto reject = [&](const char * why) -> bool {
+        GGML_LOG_ERROR(
+            "[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE_REJECT "
+            "run=%" PRIu64 " p2c_run=%" PRIu64
+            " region=%u chunk=%u uid=%" PRIu64 " reason=%s\n",
+            request.key.run_id, request.p2c_run_id,
+            request.key.region, request.key.chunk, request.graph_uid, why);
+        return false;
+    };
+    if (request.key.run_id == 0 || request.key.region >= 64 ||
+            request.p2c_run_id == 0 || request.graph_uid == 0 ||
+            request.device >= backends.size() ||
+            request.n_tokens == 0 || request.expected_bytes == 0 ||
+            request.expected_bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return reject("INVALID_REQUEST");
+    }
+    rpc_msg_phone_auto_wait_req wait {};
+    wait.key = request.key;
+    if (!phone_auto_wait(wait)) {
+        return reject("PHONE_TASK_NOT_COMPLETE");
+    }
+    std::shared_ptr<phone_auto_job> task;
+    {
+        std::lock_guard<std::mutex> lock(phone_auto_mutex);
+        const auto it = phone_auto_jobs.find(auto_key(request.key));
+        if (it == phone_auto_jobs.end() ||
+                it->second->state != phone_auto_status::COMPLETE ||
+                it->second->request.graph_uid != request.graph_uid ||
+                it->second->request.device != request.device) {
+            return reject("TASK_UID_OR_DEVICE_MISMATCH");
+        }
+        if (it->second->capture_in_progress || it->second->capture_done) {
+            return reject("CAPTURE_ALREADY_REQUESTED");
+        }
+        task = it->second;
+        task->capture_in_progress = true;
+    }
+
+    rpc_msg_p2c_stream_capture_req capture {};
+    capture.device = request.device;
+    capture.run_id = request.p2c_run_id;
+    capture.region_id = request.key.region;
+    capture.chunk_id = request.key.chunk;
+    capture.token_begin = request.token_begin;
+    capture.n_tokens = request.n_tokens;
+    bool valid_output = false;
+    {
+        // Only inspect immutable graph metadata while holding the graph
+        // registry lock. Release it before the GPU->Host capture so other
+        // Phone Chunks can compute concurrently with P2C transfer.
+        std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
+        auto it = stored_graphs[request.device].find(request.graph_uid);
+        if (it != stored_graphs[request.device].end() &&
+                it->second.graph != nullptr &&
+                it->second.slot0.ready &&
+                !it->second.slot0.kv_only_output) {
+            const auto & plan = it->second.slot0;
+            const phone_stage_slot0_tensor * output = nullptr;
+            size_t count = 0;
+            for (const auto & item : plan.tensors) {
+                if (!item.output) { continue; }
+                ++count;
+                output = &item;
+            }
+            if (output != nullptr && output->tensor != nullptr &&
+                    buffers.find(output->original_buffer) != buffers.end() &&
+                    output->tensor->buffer == output->original_buffer &&
+                    output->tensor->data == output->original_data &&
+                    output->tensor->extra == output->original_extra) {
+                const ggml_tensor * tensor = output->tensor;
+                const uint64_t output_bytes = ggml_nbytes(tensor);
+                valid_output = ggml_phone_auto::valid_capture_contract(
+                    plan.tokens, request.n_tokens, count, output_bytes,
+                    request.expected_bytes,
+                    tensor->type == GGML_TYPE_F32,
+                    ggml_is_contiguous(tensor)) &&
+                    tensor->ne[1] == request.n_tokens &&
+                    tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+                    output_bytes == request.expected_bytes;
+                if (valid_output) {
+                    capture.tensor = serialize_tensor(tensor);
+                    valid_output = ggml_phone_auto::bind_native_storage(
+                        capture.tensor.buffer, capture.tensor.data,
+                        output->original_buffer, output->original_data);
+                }
+            }
+        }
+    }
+    // The output allocation is per-Chunk and lives through RUN teardown.
+    // The Arena snapshots bytes before publishing the corresponding frame;
+    // Graph/Slot reuse does not have to wait for TCP send completion.
+    const int64_t begin_us = ggml_time_us();
+    const bool captured = valid_output && capture_p2c_stream(capture);
+    {
+        std::lock_guard<std::mutex> lock(phone_auto_mutex);
+        task->capture_in_progress = false;
+        task->capture_done = captured;
+    }
+    GGML_LOG_INFO(
+        "[PHONE_AUTO_DIRECT] event=WAIT_CAPTURE run=%" PRIu64
+        " p2c_run=%" PRIu64 " region=%u chunk=%u uid=%" PRIu64
+        " bytes=%" PRIu64 " capture_ms=%.3f status=%s\n",
+        request.key.run_id, request.p2c_run_id, request.key.region,
+        request.key.chunk, request.graph_uid, request.expected_bytes,
+        (ggml_time_us() - begin_us) / 1000.0,
+        captured ? "PASS" : valid_output ? "CAPTURE_FAILED" : "INVALID_OUTPUT");
+    return captured;
 }
 
 // A verified input may upload to the next local Slot while Phone is still
@@ -12125,6 +12297,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_AUTO_WAIT_CAPTURE: {
+                rpc_msg_phone_auto_wait_capture_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_auto_wait_capture(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_INPUT_STREAM_RUN: {
                 rpc_msg_phone_input_stream_run_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -12550,6 +12731,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
                 rpc_msg_phone_input_ack response {};
                 response.accepted = server.phone_auto_wait(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_AUTO_WAIT_CAPTURE: {
+                rpc_msg_phone_auto_wait_capture_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_auto_wait_capture(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
@@ -13654,6 +13844,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_wait);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_WAIT_CAPTURE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_wait_capture);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_stream_run);

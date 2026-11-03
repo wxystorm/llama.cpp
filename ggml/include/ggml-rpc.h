@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    24
+#define RPC_PROTO_PATCH_VERSION    25
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -173,13 +173,18 @@ using ggml_backend_rpc_phone_input_stream_push_t = bool (*)(
 // graph before streaming; a verified PUSH is the only compute trigger.
 // The Phone prepares two local GPU slots, then executes chunks in KV order.
 // Non-final Phone Regions retain the existing PC-side output handoff.
-// RPC patch 24; unsupported servers fail closed.
+// RPC patch 24 registration; patch 25 direct output bridge. Unsupported servers fail closed.
 #define GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC \
     "ggml_backend_rpc_phone_auto_graph_register"
 #define GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC \
     "ggml_backend_rpc_phone_auto_task_register"
 #define GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC \
     "ggml_backend_rpc_phone_auto_wait"
+// Patch 25: non-final Phone Full runtime avoids Meta graph execution.
+// WAIT_CAPTURE validates the exact registered output and publishes it into
+// the existing Phone->PC Arena before acknowledging the PC Phone Worker.
+#define GGML_BACKEND_RPC_PHONE_AUTO_WAIT_CAPTURE_PROC \
+    "ggml_backend_rpc_phone_auto_wait_capture"
 using ggml_backend_rpc_phone_auto_graph_register_t = bool (*)(
     ggml_backend_t backend, const ggml_cgraph * graph,
     uint64_t * registered_uid);
@@ -189,6 +194,12 @@ using ggml_backend_rpc_phone_auto_task_register_t = bool (*)(
 using ggml_backend_rpc_phone_auto_wait_t = bool (*)(
     ggml_backend_t backend, uint64_t run_id, uint32_t region,
     uint32_t chunk);
+// A zeroed request is a capability probe (RPC patch >=25). Real requests
+// must identify both the Phone input run and the independent P2C stream run.
+using ggml_backend_rpc_phone_auto_wait_capture_t = bool (*)(
+    ggml_backend_t backend, uint64_t input_run_id, uint32_t region,
+    uint32_t chunk, uint64_t graph_uid, uint64_t p2c_run_id,
+    uint32_t token_begin, uint32_t n_tokens, size_t expected_bytes);
 
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
