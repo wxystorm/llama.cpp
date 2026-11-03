@@ -6443,6 +6443,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             } else {
                                 // Final Phone Region / PC Head and all other
                                 // modes retain their existing Meta execution.
+                                if (phone_auto_enabled && last &&
+                                        stage.kind == llama_hybrid_runtime_stage_kind::PHONE) {
+                                    // The canonical result was prebuilt before
+                                    // the twelve immutable autonomous Graphs
+                                    // and may still pass can_reuse() even if
+                                    // Meta's rotating KV View maps were reset.
+                                    // Force a fresh short-lived final graph,
+                                    // preserving PC-owned vocabulary projection.
+                                    task_res->reset();
+                                    ggml_backend_sched_reset(task_sched);
+                                    if (task.chunk == 0) {
+                                        LLAMA_LOG_INFO(
+                                            "[PHONE_AUTO_DIRECT] event=FINAL_META_REBUILD "
+                                            "region=%zu reason=STALE_PREBUILD_KV_VIEWS "
+                                            "mode=JUST_IN_TIME status=READY\n",
+                                            task.region);
+                                    }
+                                }
                                 task_result = run_hybrid_stage_block(
                                     ubatch, stage, task.token_begin, task.n_tokens,
                                     input, output, gtype, worker_kv_views[dev].get(),

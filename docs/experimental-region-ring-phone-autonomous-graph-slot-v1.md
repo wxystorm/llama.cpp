@@ -28,8 +28,8 @@ P2C receiver (unchanged) fills the downstream host edge and publishes
 READY. The global PC PREPARE lock is released before WAIT_CAPTURE.
 
 The final Phone Region and PC vocabulary head still use the legacy Meta
-compute path; final Phone graphs are prepared just-in-time to avoid
-long-lived KV View mappings. Decode, directional/Tensor paths, and
+compute path; final Phone graphs are forcibly reset and rebuilt just-in-time
+before each final-region Chunk to avoid reusing long-lived KV View mappings. Decode, directional/Tensor paths, and
 legacy Phone execution remain unchanged. This phase intentionally retains
 one PC WAIT_CAPTURE RPC per Chunk; proactive Phone P2C publication is a
 separate next phase, after data correctness is validated.
