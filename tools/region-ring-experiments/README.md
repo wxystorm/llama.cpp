@@ -712,3 +712,55 @@ runs before changing transport rankings.
 Tests: build/run `test-region-ring-planner` offline; Python audit tests
 are `python -m unittest test_audit_plan_calibration.py` from the same
 tools directory.
+
+
+## Real-path Stage Profile for Planner candidate ranking (experimental)
+
+Use actual CPU/GPU Stage Graphs and Phone autonomous Graph registration,
+Slot Upload/Prepare and Compute. Only service time is imported. Queue wait
+(verified_to_upload_ms, prepare_queue_ms and compute_queue_ms) is diagnostic,
+not added to the Profile, because DAG models queuing separately.
+
+### Bounded sampling
+
+The first bootstrap reuses the one-pass fixed-layout runner, so each
+probe still executes one complete prefill. This is once per model/hardware
+Profile, NEVER per Planner candidate. A completely isolated Stage-only
+microbenchmark requires disposable KV state and remains future work.
+
+Rebuild PC and Termux RPC Server at the same commit, and start the Phone
+RPC Server with environment GGML_RPC_REAL_STAGE_PROFILE=1. Then run on PC:
+
+~~~powershell
+.\tools\region-ring-experiments\run_real_stage_profile.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_358.txt" -Grid small
+~~~
+
+Grid small does one known-layout, 64-token one-pass probe. Grid medium
+does 16 one-pass probes across P1/P3/P5, CPU1/4/8 and Token sizes
+16/32/64/128. All runs save their own metrics and logs. The runner sets
+and restores the Phone autonomous and task-trace flags.
+
+After copying the Phone RPC log to PC, build a CSV from all probes:
+
+~~~powershell
+python .\tools\region-ring-experiments\build_real_stage_profile.py --run ".\real-stage-profile-results" --rpc-log ".\rpc.log" --output ".\real-stage-profile.csv"
+$env:LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV = (Resolve-Path ".\real-stage-profile.csv").Path
+~~~
+
+The CSV fields are device, layers, tokens, kv_tokens, setup_ms, upload_ms,
+prepare_ms, compute_ms, terminal, samples. CPU/GPU use actual Chunk Trace
+service; Phone uses PC build/register and Phone Upload/Prepare/Compute.
+Missing shapes use the existing independent Profile instead of invented
+zeroes. Never mix Profile samples from a different model or hardware.
+
+### DAG resources
+
+Phone autonomous Graph registration is upfront Setup. Phone Upload/Prepare
+runs on a dedicated lane and may overlap the single Phone Compute worker
+by one KV-ordered Chunk, with two shared Phone Slots across regions.
+Phone P2C Sender frames are serialized; six terminal l_out frames drain
+before the PC Head. Uniform, Prefix and Local search budgets and the
+single final real inference are unchanged. Network curves are not refitted.
+
+Offline tests: test-region-ring-planner; from tools/region-ring-experiments
+run python -m unittest test_build_real_stage_profile.py.
