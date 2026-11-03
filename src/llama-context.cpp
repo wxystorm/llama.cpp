@@ -7562,6 +7562,63 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         << t.output_sync_cost_us / 1000.0
                         << "}\n";
                     region_ring_experiment_records.push_back(out.str());
+                    for (const auto & copy : t.copy_traces) {
+                        const auto & e = copy.event;
+                        // An uninstrumented buffer path is OTHER_COPY, not
+                        // automatically a local copy or a second network send.
+                        const char * kind =
+                            e.rpc_apply_calls > 0 && e.rpc_set_calls > 0 ? "MIXED" :
+                            e.rpc_apply_calls > 0 ? "PUSH_APPLY" :
+                            e.rpc_set_calls > 0 ? "RPC_SET" :
+                            e.rpc_hash_hit_calls > 0 ? "RPC_HASH_HIT" :
+                            e.rpc_fused_calls > 0 ? "RPC_FUSED" :
+                            e.src_is_host && e.dst_is_host ? "LOCAL_COPY" :
+                            "OTHER_COPY";
+                        const auto json_name = [](const std::string & name) {
+                            std::string escaped;
+                            escaped.reserve(name.size());
+                            for (unsigned char c : name) {
+                                if (c == '"' || c == '\\') {
+                                    escaped.push_back('\\');
+                                    escaped.push_back((char) c);
+                                } else if (c < 0x20) {
+                                    escaped.push_back('?');
+                                } else {
+                                    escaped.push_back((char) c);
+                                }
+                            }
+                            return escaped;
+                        };
+                        std::ostringstream item;
+                        item << std::fixed << std::setprecision(3)
+                             << R"({"type":"region_ring_phone_copy","schema":1,"ubatch":)"
+                             << ubatch_id
+                             << R"(,"region":)" << r
+                             << R"(,"chunk":)" << chunk
+                             << R"(,"split":)" << e.split
+                             << R"(,"tensor":")" << json_name(copy.tensor)
+                             << R"(","dst_tensor":")" << json_name(copy.dst_tensor)
+                             << R"(","kind":")" << kind << '"'
+                             << R"(,"bytes":)" << e.logical_bytes
+                             << R"(,"copy_call_ms":)" << e.call_us / 1000.0
+                             << R"(,"rpc_apply_calls":)" << e.rpc_apply_calls
+                             << R"(,"rpc_apply_misses":)" << e.rpc_apply_misses
+                             << R"(,"rpc_set_calls":)" << e.rpc_set_calls
+                             << R"(,"rpc_hash_hit_calls":)" << e.rpc_hash_hit_calls
+                             << R"(,"rpc_fused_calls":)" << e.rpc_fused_calls
+                             << R"(,"rpc_apply_bytes":)" << e.rpc_apply_bytes
+                             << R"(,"rpc_set_bytes":)" << e.rpc_set_bytes
+                             << R"(,"rpc_hash_hit_bytes":)" << e.rpc_hash_hit_bytes
+                             << R"(,"rpc_apply_ms":)" << e.rpc_apply_us / 1000.0
+                             << R"(,"rpc_apply_miss_ms":)" << e.rpc_apply_miss_us / 1000.0
+                             << R"(,"rpc_set_ms":)" << e.rpc_set_us / 1000.0
+                             << R"(,"rpc_hash_hit_ms":)" << e.rpc_hash_hit_us / 1000.0
+                             << R"(,"rpc_fused_ms":)" << e.rpc_fused_us / 1000.0
+                             << R"(,"src_host":)" << (e.src_is_host ? "true" : "false")
+                             << R"(,"dst_host":)" << (e.dst_is_host ? "true" : "false")
+                             << "}\n";
+                        region_ring_experiment_records.push_back(item.str());
+                    }
                 }
             }
 
