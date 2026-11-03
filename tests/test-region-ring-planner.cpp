@@ -572,6 +572,54 @@ int main() {
         REQUIRE(final_only.phone_auto_terminal_bytes ==
                 uint64_t(358) * 5120 * sizeof(float));
         REQUIRE(final_only.tasks == 12);
+
+        // Real autonomy runs a separate Phone PREPARE worker and a separate
+        // Compute worker. Two successive 64-token Chunks can overlap a
+        // 10ms Upload/Prepare with the preceding 20ms compute. A fake
+        // shared PREPARE lock would overestimate 60ms vs the true 50ms.
+        model overlap = mock_profile();
+        overlap.tokens = 128;
+        overlap.hidden = 32;
+        overlap.slot_pool = 0;
+        overlap.phone_autonomous_prebuild = true;
+        overlap.phone_full_return_stream = true;
+        overlap.phone_autonomous_prepare_overlap = true;
+        overlap.phone_registration_cost =
+            [](llama_region_ring_stage_kind, int, int, bool,
+               double & ms) { ms = 0.0; return true; };
+        overlap.compute_ms =
+            [](device d, int, int, int, double & ms) {
+                ms = d == device::PHONE ? 20.0 : 0.0;
+                return true;
+            };
+        overlap.prepare_ms =
+            [](device d, int, int, int, double & ms) {
+                ms = d == device::PHONE ? 10.0 : 0.0;
+                return true;
+            };
+        overlap.transfer_ms =
+            [](device, device, size_t, double & ms) {
+                ms = 0.0;
+                return true;
+            };
+        const std::vector<llama_region_ring_region> overlap_layout {
+            {device::CPU, 0, 1}, {device::PHONE, 1, 2}
+        };
+        candidate prepared_overlap;
+        prepared_overlap.xc = prepared_overlap.xg =
+            prepared_overlap.xp = 64;
+        REQUIRE(simulate(
+            overlap, overlap_layout, prepared_overlap, &why));
+        REQUIRE(std::fabs(prepared_overlap.wall_ms - 50.0) < 1e-6);
+        REQUIRE(std::fabs(
+            prepared_overlap.phone_prepare_busy_ms - 20.0) < 1e-6);
+        REQUIRE(std::fabs(
+            prepared_overlap.busy_ms[(size_t) device::PHONE] - 40.0) < 1e-6);
+
+        overlap.phone_autonomous_prepare_overlap = false;
+        candidate gated = prepared_overlap;
+        REQUIRE(simulate(overlap, overlap_layout, gated, &why));
+        REQUIRE(std::fabs(gated.wall_ms - 60.0) < 1e-6);
     }
 
     // A big Phone Chunk must NOT unblock an early small GPU Chunk at the

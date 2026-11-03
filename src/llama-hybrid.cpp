@@ -9434,6 +9434,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         flag_on("LLAMA_REGION_RING_PHONE_INPUT_STREAM");
     model.phone_autonomous_final = model.phone_autonomous_prebuild &&
         flag_on("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
+    model.phone_autonomous_prepare_overlap =
+        model.phone_autonomous_prebuild;
     // Explicit empirical overrides are opt-in: network conditions fluctuate,
     // so never silently bake one run's measurements into a persisted Profile.
     const auto optional_ms = [](const char * name, double & target) {
@@ -11010,6 +11012,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "return=%s frames=%d bytes=%" PRIu64 " "
             "terminal_frames=%d terminal_bytes=%" PRIu64 " "
             "auto_setup_ms=%.3f final_head_ms=%.3f "
+            "phone_prepare_lane=%s phone_prepare_busy_ms=%.3f "
             "sender=%s dependencies=%s transfer_curve=PHONE_TO_PC_PROXY "
             "arena_capture=UNCALIBRATED status=MODELED\n",
             model.phone_full_return_stream ?
@@ -11017,6 +11020,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best.phone_full_stream_frames, best.phone_full_stream_bytes,
             best.phone_auto_terminal_frames, best.phone_auto_terminal_bytes,
             best.phone_auto_setup_ms, best.phone_auto_head_ms,
+            model.phone_autonomous_prepare_overlap ? "SEPARATE_DUAL_SLOT" : "LEGACY_GATED",
+            best.phone_prepare_busy_ms,
             model.phone_full_return_stream ?
                 "PUBLICATION_FIFO_SINGLE_LANE" : "LEGACY_EDGE_ORDER",
             model.phone_full_return_stream ?
@@ -11123,6 +11128,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << best.phone_auto_setup_ms
                             << ",\"phone_auto_head_pred_ms\":"
                             << best.phone_auto_head_ms
+                            << ",\"phone_prepare_lane_pred_ms\":"
+                            << best.phone_prepare_busy_ms
                             << ",\"phone_auto_terminal_frames\":"
                             << best.phone_auto_terminal_frames
                             << ",\"phone_auto_terminal_bytes\":"

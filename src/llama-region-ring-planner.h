@@ -111,6 +111,7 @@ struct candidate {
     // an RPC registration delay on the critical path of each Phone Chunk.
     double phone_auto_setup_ms = 0.0;
     double phone_auto_head_ms = 0.0;
+    double phone_prepare_busy_ms = 0.0;
     int phone_auto_terminal_frames = 0;
     uint64_t phone_auto_terminal_bytes = 0;
 };
@@ -146,6 +147,14 @@ struct model {
     // Measured wall time for the PC-owned zero-layer Head (prepare+compute+
     // synchronize), scheduled only after ALL terminal P2C frames arrive.
     double phone_auto_final_head_ms = 0.0;
+    // A Phone-owned preparation worker can upload/bind Chunk N+1 while
+    // its independent compute worker executes Chunk N. Two shared Slots
+    // still limit the number of prepared or executing Phone Chunks.
+    bool phone_autonomous_prepare_overlap = false;
+    // Optional setup service time for a concrete autonomous graph shape.
+    // If absent, the existing registration Profile is retained.
+    std::function<bool(int, int, bool, double &)>
+        phone_autonomous_graph_setup_ms;
     // Current Region Ring runtime has independent CPU and CUDA compute lanes.
     // Keep this switch only so tests can compare the historical gated model.
     bool pc_compute_gate = false;
@@ -632,6 +641,8 @@ struct task {
     double prepare_duration = 0.0;
     double duration = 0.0;
     bool queued = false;
+    bool preparing = false;
+    bool prepared = false;
     bool started = false;
     bool done = false;
 };
@@ -653,6 +664,7 @@ enum class event_kind : uint8_t {
     TASK = 0,
     EDGE = 1,
     WEIGHT = 2,
+    PHONE_PREPARE = 3,
 };
 
 struct event {
@@ -708,6 +720,7 @@ inline bool simulate(const model & m,
     }
     c.phone_auto_setup_ms = 0.0;
     c.phone_auto_head_ms = 0.0;
+    c.phone_prepare_busy_ms = 0.0;
     c.phone_auto_terminal_frames = 0;
     c.phone_auto_terminal_bytes = 0;
     c.phone_full_stream_frames = 0;
@@ -791,9 +804,16 @@ inline bool simulate(const model & m,
                 r > 0 && (r + 1 < regions.size() ||
                           m.phone_autonomous_final);
             if (autonomous_graph) {
+                double setup_ms = registration_ms;
+                if (m.phone_autonomous_graph_setup_ms &&
+                        !m.phone_autonomous_graph_setup_ms(
+                            layers, end - begin,
+                            r + 1 == regions.size(), setup_ms)) {
+                    return reject("PHONE_AUTONOMOUS_SETUP_PROFILE_MISSING");
+                }
                 c.phone_auto_setup_ms +=
                     m.phone_auto_setup_per_graph_ms >= 0.0 ?
-                        m.phone_auto_setup_per_graph_ms : registration_ms;
+                        m.phone_auto_setup_per_graph_ms : setup_ms;
             } else {
                 ms += registration_ms;
             }
@@ -1110,6 +1130,20 @@ inline bool simulate(const model & m,
 
     std::priority_queue<event> events;
     std::array<std::deque<int>, 3> ready_queues;
+    // Phone verification/prepare runs on a separate worker from GPU compute.
+    // Task admission is still gated by the prior Chunk entering compute,
+    // which permits only ONE ahead per KV-ordered Region. A global two-Slot
+    // pool limits all Phone Regions together.
+    std::deque<int> phone_prepare_queue;
+    bool phone_prepare_busy = false;
+    int phone_slots_in_use = 0;
+    double phone_prepare_busy_ms = 0.0;
+    const auto is_auto_phone = [&](const task & t) {
+        return m.phone_autonomous_prebuild &&
+            m.phone_autonomous_prepare_overlap &&
+            regions[(size_t) t.region].kind ==
+                llama_region_ring_stage_kind::PHONE;
+    };
     // Min edge-id per lane replicates the old src-major full scan order.
     // Producers enqueue only their own edges at completion; no global
     // O(total_edges) polling on every simulated event.
@@ -1146,8 +1180,12 @@ inline bool simulate(const model & m,
             return false;
         }
         const auto & t = tasks[(size_t) id];
+        const bool predecessor_ready = t.previous < 0 ||
+            (is_auto_phone(t) ?
+                tasks[(size_t) t.previous].started :
+                tasks[(size_t) t.previous].done);
         return !t.started && !t.done && t.inputs == 0 &&
-               (t.previous < 0 || tasks[(size_t) t.previous].done);
+               predecessor_ready;
     };
     auto task_ready = [&](int id) -> bool {
         return task_dependencies_ready(id) &&
@@ -1159,7 +1197,11 @@ inline bool simulate(const model & m,
         }
         auto & t = tasks[(size_t) id];
         t.queued = true;
-        ready_queues[(size_t) t.queue_device].push_back(id);
+        if (is_auto_phone(t)) {
+            phone_prepare_queue.push_back(id);
+        } else {
+            ready_queues[(size_t) t.queue_device].push_back(id);
+        }
     };
     // Publish one complete frame to all consumers. Legacy Phone GET owns
     // the Phone worker until this event; asynchronous Arena Stream does not.
@@ -1201,6 +1243,12 @@ inline bool simulate(const model & m,
     auto claimable = [&](int id) -> bool {
         const auto & t = tasks[(size_t) id];
         const int r = t.region;
+        if (is_auto_phone(t) &&
+                (!t.prepared ||
+                 (t.previous >= 0 &&
+                  !tasks[(size_t) t.previous].done))) {
+            return false;
+        }
 
         if (regions[(size_t) r].device == device::GPU &&
                 m.gpu_weight_streaming) {
@@ -1298,6 +1346,34 @@ inline bool simulate(const model & m,
             scheduled = true;
         }
 
+        // Autonomous Upload and Slot Prepare have a dedicated worker and
+        // a two-Slot capacity, independent from Phone Graph compute.
+        // A PREPARED task can wait for KV FIFO without blocking preparation.
+        if (m.phone_autonomous_prepare_overlap &&
+                !phone_prepare_busy && phone_slots_in_use < 2 &&
+                !phone_prepare_queue.empty()) {
+            // The runtime searches its ordered (run,region,chunk) job map.
+            const auto chosen = std::min_element(
+                phone_prepare_queue.begin(), phone_prepare_queue.end(),
+                [&](int a, int b) {
+                    const task & left = tasks[(size_t) a];
+                    const task & right = tasks[(size_t) b];
+                    return std::tie(left.region, left.begin) <
+                           std::tie(right.region, right.begin);
+                });
+            const int id = *chosen;
+            phone_prepare_queue.erase(chosen);
+            auto & t = tasks[(size_t) id];
+            t.preparing = true;
+            phone_prepare_busy = true;
+            ++phone_slots_in_use;
+            phone_prepare_busy_ms += t.prepare_duration;
+            events.push({
+                now + t.prepare_duration, id, event_kind::PHONE_PREPARE
+            });
+            scheduled = true;
+        }
+
         // One transfer at a time per link lane. Arena Stream sends frames
         // in actual READY-publication FIFO order; legacy mode retains the
         // previous source-major edge-ID priority for exact A/B comparison.
@@ -1371,6 +1447,20 @@ inline bool simulate(const model & m,
             auto & q = ready_queues[(size_t) dev];
             auto it = std::find_if(q.begin(), q.end(),
                 [&](int id) { return claimable(id); });
+            if (dev == (int) device::PHONE &&
+                    m.phone_autonomous_prepare_overlap) {
+                for (auto candidate_it = q.begin();
+                        candidate_it != q.end(); ++candidate_it) {
+                    if (claimable(*candidate_it) &&
+                            (it == q.end() ||
+                             std::tie(tasks[(size_t) *candidate_it].region,
+                                      tasks[(size_t) *candidate_it].begin) <
+                             std::tie(tasks[(size_t) *it].region,
+                                      tasks[(size_t) *it].begin))) {
+                        it = candidate_it;
+                    }
+                }
+            }
             if (it == q.end()) {
                 continue;
             }
@@ -1408,12 +1498,20 @@ inline bool simulate(const model & m,
                 }
             }
 
-            const double prepare_start =
-                std::max(now, prepare_available_ms);
-            const double prepare_end =
-                prepare_start + t.prepare_duration;
-            prepare_available_ms = prepare_end;
-            prepare_busy_ms += t.prepare_duration;
+            const bool already_phone_prepared = is_auto_phone(t);
+            const double prepare_start = already_phone_prepared ?
+                now : std::max(now, prepare_available_ms);
+            const double prepare_end = already_phone_prepared ?
+                now : prepare_start + t.prepare_duration;
+            if (!already_phone_prepared) {
+                prepare_available_ms = prepare_end;
+                prepare_busy_ms += t.prepare_duration;
+            }
+            if (already_phone_prepared) {
+                // Allow the next Chunk to PREPARE while this one COMPUTES;
+                // only its compute is gated by this Chunk completing.
+                offer(t.next);
+            }
 
             // The worker has already claimed this task, so it cannot claim
             // another while queued on PREPARE. CPU/CUDA/Phone compute lanes
@@ -1499,6 +1597,19 @@ inline bool simulate(const model & m,
                 continue;
             }
 
+            if (current.kind == event_kind::PHONE_PREPARE) {
+                auto & t = tasks[(size_t) current.id];
+                if (!t.preparing || !phone_prepare_busy ||
+                        !is_auto_phone(t)) {
+                    return reject("PHONE_PREPARE_EVENT_INVALID");
+                }
+                t.preparing = false;
+                t.prepared = true;
+                phone_prepare_busy = false;
+                ready_queues[(size_t) device::PHONE].push_back(current.id);
+                continue;
+            }
+
             if (current.kind == event_kind::WEIGHT) {
                 const int r = current.id;
                 if (r < 0 || r >= (int) regions.size() ||
@@ -1516,6 +1627,12 @@ inline bool simulate(const model & m,
                 return reject("DUPLICATE_TASK_DONE");
             }
             t.done = true;
+            if (is_auto_phone(t)) {
+                if (phone_slots_in_use <= 0) {
+                    return reject("PHONE_SLOT_COUNT_UNDERFLOW");
+                }
+                --phone_slots_in_use;
+            }
             bool keep_phone_worker_for_get = false;
             for (int edge_id : outgoing_edges[(size_t) current.id]) {
                 const int lane = edges[(size_t) edge_id].lane;
@@ -1617,6 +1734,11 @@ inline bool simulate(const model & m,
         }
     }
 
+    if (m.phone_autonomous_prepare_overlap &&
+            (phone_prepare_busy || phone_slots_in_use != 0 ||
+             !phone_prepare_queue.empty())) {
+        return reject("PHONE_PREPARE_NOT_DRAINED");
+    }
     if (m.slot_pool > 0 &&
             std::any_of(live_slots.begin(), live_slots.end(),
                 [](int x) { return x != 0; })) {
@@ -1644,6 +1766,7 @@ inline bool simulate(const model & m,
     c.transfer_busy_ms = transfer_busy_ms;
     c.duplex_overlap_ms = duplex_overlap_ms;
     c.prepare_busy_ms = prepare_busy_ms;
+    c.phone_prepare_busy_ms = phone_prepare_busy_ms;
     c.weight_prepare_busy_ms = weight_prepare_busy_ms;
     c.weight_h2d_busy_ms = weight_h2d_busy_ms;
     c.weight_h2d_startup_ms = weight_h2d_startup_ms;
