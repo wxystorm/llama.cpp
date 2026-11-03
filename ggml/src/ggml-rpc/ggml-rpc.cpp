@@ -5461,7 +5461,8 @@ public:
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_input_stream_reserve(size_t bytes);
     void phone_input_stream_cancel_reserve(size_t bytes);
-    void phone_input_stream_complete(std::vector<uint8_t> && packet);
+    void phone_input_stream_complete(std::vector<uint8_t> && packet,
+                                      int64_t recv_us);
     bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
                            rpc_msg_phone_input_ack & response);
     void phone_input_drop(const rpc_phone_input_key & key,
@@ -5714,6 +5715,17 @@ private:
     std::unordered_set<uint64_t> phone_input_stream_runs;
     std::vector<rpc_phone_input_key> phone_input_stream_failed;
     size_t phone_input_stream_held_bytes = 0;
+    struct phone_input_stream_profile {
+        uint64_t frames = 0;
+        uint64_t verified = 0;
+        uint64_t applied = 0;
+        uint64_t payload_bytes = 0;
+        uint64_t errors = 0;
+        int64_t recv_us = 0;
+        int64_t hash_us = 0;
+        int64_t apply_wait_us = 0;
+    };
+    std::unordered_map<uint64_t, phone_input_stream_profile> phone_input_stream_profiles;
 
     struct phone_stage_rx_write {
         ggml_backend_buffer_t buffer = nullptr;
@@ -6428,7 +6440,8 @@ void rpc_server::phone_input_stream_cancel_reserve(size_t bytes) {
     phone_input_stream_cv.notify_all();
 }
 
-void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet) {
+void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
+                                              int64_t recv_us) {
     const size_t bytes = packet.size();
     rpc_msg_phone_input_push_req request {};
     bool valid = bytes >= sizeof(request);
@@ -6438,12 +6451,24 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet) {
                 request.size != 0 && request.size <= RPC_PHONE_INPUT_MAX_BYTES &&
                 bytes - sizeof(request) == request.size;
     }
+    const int64_t hash_begin_us = ggml_time_us();
     if (valid) {
         valid = fnv_hash(packet.data() + sizeof(request),
                          (size_t) request.size) == request.hash;
     }
+    const int64_t hash_us = ggml_time_us() - hash_begin_us;
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (request.key.run_id != 0 &&
+                phone_input_stream_runs.count(request.key.run_id) != 0) {
+            auto & profile = phone_input_stream_profiles[request.key.run_id];
+            ++profile.frames;
+            profile.payload_bytes += request.size;
+            profile.recv_us += recv_us;
+            profile.hash_us += hash_us;
+            profile.verified += valid ? 1 : 0;
+            profile.errors += valid ? 0 : 1;
+        }
         if (valid && phone_input_stream_runs.count(request.key.run_id) != 0) {
             const auto same = [&](const phone_input_staged & e) {
                 return e.key.run_id == request.key.run_id &&
@@ -6526,6 +6551,12 @@ bool rpc_server::phone_input_apply(
         staged.payload.data() + staged.payload_offset,
         staged.payload.size() - staged.payload_offset) ? 1 : 0;
     if (staged.reserved_bytes != 0) {
+        {
+            std::lock_guard<std::mutex> lock(phone_input_mutex);
+            if (response.accepted) {
+                ++phone_input_stream_profiles[request.key.run_id].applied;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(phone_input_mutex);
             GGML_ASSERT(phone_input_stream_held_bytes >= staged.reserved_bytes);
@@ -11385,11 +11416,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     server.phone_input_stream_cancel_reserve((size_t) bytes);
                     return;
                 }
-                if (!sock->recv_data(packet.data(), packet.size())) {
-                    server.phone_input_stream_complete(std::move(packet));
-                    return;
-                }
-                server.phone_input_stream_complete(std::move(packet));
+                const int64_t recv_begin_us = ggml_time_us();
+                const bool received = sock->recv_data(packet.data(), packet.size());
+                const int64_t recv_us = ggml_time_us() - recv_begin_us;
+                server.phone_input_stream_complete(std::move(packet), recv_us);
+                if (!received) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
@@ -11787,11 +11818,11 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     server.phone_input_stream_cancel_reserve((size_t) bytes);
                     return;
                 }
-                if (!sock->recv_data(packet.data(), packet.size())) {
-                    server.phone_input_stream_complete(std::move(packet));
-                    return;
-                }
-                server.phone_input_stream_complete(std::move(packet));
+                const int64_t recv_begin_us = ggml_time_us();
+                const bool received = sock->recv_data(packet.data(), packet.size());
+                const int64_t recv_us = ggml_time_us() - recv_begin_us;
+                server.phone_input_stream_complete(std::move(packet), recv_us);
+                if (!received) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
