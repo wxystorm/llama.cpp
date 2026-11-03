@@ -5433,7 +5433,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         "[PHONE_AUTO_P2C] event=PREBIND status=REJECT "
                         "reason=OUTPUT_RANGE region=%zu chunk=%zu "
                         "begin=%u tokens=%u regions=%zu buffers=%zu "
-                        "host_floats=%zu total_tokens=%u hidden=%u final=%d\n",
+                        "host_floats=%zu total_tokens=%u hidden=%d final=%d\n",
                         item.region, item.chunk, item.token_begin, item.tokens,
                         stages.size(), outputs.size(), host_floats,
                         ubatch.n_tokens, n_embd,
