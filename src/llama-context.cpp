@@ -6070,7 +6070,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     llm_graph_result * task_res =
                         ring_res[dev];
                     bool phone_prebuilt_task = false;
-                    if (phone_static_templates &&
+                    bool phone_auto_task = false;
+                    if (phone_auto_enabled &&
+                            dev == (size_t) llama_region_ring_device::PHONE &&
+                            stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+                            !last) {
+                        const auto it = std::find_if(
+                            phone_auto_templates.begin(),
+                            phone_auto_templates.end(),
+                            [&](const phone_auto_template & item) {
+                                return item.region == task.region &&
+                                       item.chunk == task.chunk &&
+                                       item.token_begin == (uint32_t) task.token_begin &&
+                                       item.tokens == (uint32_t) task.n_tokens;
+                            });
+                        if (it == phone_auto_templates.end() ||
+                                it->owned_sched == nullptr ||
+                                it->owned_res == nullptr || it->graph_uid == 0) {
+                            throw std::runtime_error(
+                                "missing exact Phone autonomous Chunk graph");
+                        }
+                        task_sched = it->owned_sched.get();
+                        task_res = it->owned_res.get();
+                        phone_prebuilt_task = true;
+                        phone_auto_task = true;
+                    }
+                    if (!phone_auto_task && phone_static_templates &&
                             dev == (size_t) llama_region_ring_device::PHONE &&
                             stage.kind == llama_hybrid_runtime_stage_kind::PHONE) {
                         const auto it = std::find_if(
@@ -6326,6 +6351,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 phone_copy_trace_enabled &&
                                 dev == (size_t) llama_region_ring_device::PHONE &&
                                 stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
+                            // During this phase, the normal PC Phone
+                            // Worker still owns output publication and the
+                            // existing P2C stream, but not Phone computation.
+                            // The Phone compute loop is triggered by VERIFIED
+                            // PUSH independently of this host Worker.
+                            struct phone_auto_wait_scope {
+                                bool active;
+                                phone_auto_wait_scope(bool enabled,
+                                        uint64_t run, uint32_t region,
+                                        uint32_t chunk) : active(enabled) {
+                                    if (active) {
+                                        ggml_backend_meta_phone_auto_context(
+                                            2, run, region, chunk);
+                                    }
+                                }
+                                ~phone_auto_wait_scope() {
+                                    if (active) {
+                                        ggml_backend_meta_phone_auto_context(
+                                            0, 0, 0, 0);
+                                    }
+                                }
+                            } phone_auto_scope(
+                                phone_auto_task, phone_input_push_run_id,
+                                (uint32_t) task.region, (uint32_t) task.chunk);
                             task_result = run_hybrid_stage_block(
                                 ubatch, stage, task.token_begin, task.n_tokens,
                                 input, output, gtype, worker_kv_views[dev].get(),
@@ -6348,7 +6397,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 pc_phone_overlap ? &state.cuda_wait_us : nullptr,
                                 dev == 1 && gpu_weight_streaming &&
                                     gpu_bank_resident,
-                                phone_prebuilt_task);
+                                phone_prebuilt_task, phone_auto_task);
                             const int64_t compute_end_us = ggml_time_us();
                             if (task_trace != nullptr) {
                                 task_trace->host_execute_end_us = compute_end_us;
@@ -6645,7 +6694,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     return task_status;
                     };
 
-                    if (pushed_phone_input) {
+                    if (pushed_phone_input && !phone_auto_task) {
                         phone_input_consume_begin(
                             phone_input_push_run_id,
                             (uint32_t) task.region, (uint32_t) task.chunk,
@@ -6723,7 +6772,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         // The RPC setter may have consumed the staged hidden
                         // input by APPLY; all other inputs use original SET.
                         // On a miss, the ordinary compute was still correct.
-                        const bool applied = phone_input_consume_end();
+                        // The Phone-owned path consumed the Host payload
+                        // before locally computing the registered graph.
+                        // No PC-side APPLY request was issued.
+                        const bool applied = phone_auto_task ?
+                            (task_status == GGML_STATUS_SUCCESS &&
+                             task_result != nullptr) :
+                            phone_input_consume_end();
                         if (applied) {
                             ++phone_push_applied;
                         } else {
