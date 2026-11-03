@@ -7515,6 +7515,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             params.hybrid_chunk_tokens = 1;
             params.hybrid_hidden_input = true;
             params.hybrid_output_head = true;
+            // Pin every named Head node to the PC CPU backend, including
+            // inp_stage, RMSNorm, and result_output. The ordinary Meta-first
+            // scheduler otherwise might select its Phone backend for an
+            // unassigned intermediate in this new zero-layer graph.
+            const llm_graph_cb original_cb = params.cb;
+            params.cb = [original_cb, sched_use, local_cpu = backend_cpu](
+                    const llama_ubatch & batch, ggml_tensor * tensor,
+                    const char * name, int il) {
+                original_cb(batch, tensor, name, il);
+                if (local_cpu != nullptr &&
+                        ggml_backend_supports_op(local_cpu, tensor)) {
+                    ggml_backend_sched_set_tensor_backend(
+                        sched_use, tensor, local_cpu);
+                }
+            };
             ggml_cgraph * head = model.build_graph(params);
             bool head_ok = head != nullptr && res_use->get_logits() != nullptr &&
                 ggml_backend_sched_alloc_graph(sched_use, head);
@@ -7525,7 +7540,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // Never fall back to Phone Meta during PC Head execution.
                     const ggml_backend_t backend =
                         ggml_backend_sched_get_split_backend(sched_use, split);
-                    head_ok = backend != nullptr && !ggml_backend_is_meta(backend);
+                    const bool pc_owned =
+                        backend != nullptr && !ggml_backend_is_meta(backend);
+                    LLAMA_LOG_INFO(
+                        "[PHONE_AUTO_FINAL_HEAD] event=SPLIT "
+                        "index=%d backend=%s pc_owned=%d status=%s\n",
+                        split, backend != nullptr ? ggml_backend_name(backend) : "NULL",
+                        pc_owned ? 1 : 0, pc_owned ? "PASS" : "REJECT");
+                    head_ok = pc_owned;
                 }
                 if (head_ok) {
                     res_use->set_inputs(&head_ubatch);
