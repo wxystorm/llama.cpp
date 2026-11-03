@@ -36,22 +36,40 @@ $old = @{}
 foreach ($key in $keys) { $old[$key] = [Environment]::GetEnvironmentVariable($key) }
 try {
     foreach ($key in $keys) { [Environment]::SetEnvironmentVariable($key,"1") }
+    # PowerShell unwraps a single nested @(...). Use named probe objects
+    # instead of indexable arrays so -Grid small cannot turn "phone3" into
+    # separate strings (and accidentally pass ForceLayout="h").
     $probes = @(
-        @("phone3","G10,C1,P3,G11,C1,P1,G11,C1,P1")
+        [PSCustomObject]@{
+            Name = "phone3"
+            Layout = "G10,C1,P3,G11,C1,P1,G11,C1,P1"
+        }
     )
     $sizes = @(64)
     if ($Grid -eq "medium") {
         $probes += @(
-            @("phone5","G10,C1,P5,G11,C1,P1,G9,C1,P1"),
-            @("cpu4","G10,C4,P3,G11,C1,P1,G8,C1,P1"),
-            @("cpu8","G10,C8,P1,G10,C1,P1,G7,C1,P1")
+            [PSCustomObject]@{
+                Name = "phone5"
+                Layout = "G10,C1,P5,G11,C1,P1,G9,C1,P1"
+            }
+            [PSCustomObject]@{
+                Name = "cpu4"
+                Layout = "G10,C4,P3,G11,C1,P1,G8,C1,P1"
+            }
+            [PSCustomObject]@{
+                Name = "cpu8"
+                Layout = "G10,C8,P1,G10,C1,P1,G7,C1,P1"
+            }
         )
         $sizes = @(16,32,64,128)
     }
     foreach ($probe in $probes) {
         foreach ($x in $sizes) {
-            $label = $probe[0]
-            $layout = $probe[1]
+            $label = [string] $probe.Name
+            $layout = [string] $probe.Layout
+            if ($label.Length -lt 2 -or $layout -notmatch '^G[0-9]+,C[0-9]+,P[0-9]+') {
+                throw "Invalid real Stage probe: name='$label', layout='$layout'"
+            }
             $opt = @{
                 Model=$Model; Rpc=$Rpc; PromptDir=$inputDir
                 Out=(Join-Path $folder "$label-x$x")
@@ -61,7 +79,7 @@ try {
             }
             if ($Exe -ne "") { $opt["Exe"] = $Exe }
             if ($DryRun) { $opt["DryRun"] = $true }
-            Write-Host "[REAL_STAGE_PROFILE] profile=$label chunk=$x"
+            Write-Host "[REAL_STAGE_PROFILE] profile=$label chunk=$x layout=$layout rpc=$Rpc"
             & (Join-Path $PSScriptRoot "run_prompt_sweep.ps1") @opt
             if ($LASTEXITCODE -ne 0) {
                 throw "Stage profile failed for $label X=$x, exit=$LASTEXITCODE"
