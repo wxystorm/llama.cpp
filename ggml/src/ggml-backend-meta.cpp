@@ -21531,6 +21531,17 @@ auto prefill_norm_sg_has_prework =
                     "[PHONE_AUTO] event=REGISTER_REJECT reason=NOT_FULL_REGION\n");
                 return GGML_STATUS_FAILED;
             }
+            // The default fused UID is derived from graph topology and
+            // can be identical for different 64-token Chunk positions.
+            // This experiment owns one remote Graph/Buffer per Chunk, so
+            // salt registration IDs with Region+Chunk (KV position).
+            // Action=WAIT uses the logical job key, not this UID.
+            phone_graph->uid ^= UINT64_C(0x50484f4e455f4155) ^
+                (uint64_t(ggml_meta_phone_auto_tls.region) + 1) *
+                    UINT64_C(0x9e3779b97f4a7c15) ^
+                (uint64_t(ggml_meta_phone_auto_tls.chunk) + 1) *
+                    UINT64_C(0xc2b2ae3d27d4eb4f);
+            if (phone_graph->uid == 0) { phone_graph->uid = 1; }
             auto * dev = ggml_backend_get_device(
                 backend_ctx->backend_configs[1].backend);
             auto * reg = dev != nullptr ?
