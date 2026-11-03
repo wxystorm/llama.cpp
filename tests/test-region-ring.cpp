@@ -1228,6 +1228,53 @@ static void test_phone_input_push_ahead() {
           "Phone PUSH mock did not drain");
 }
 
+static void test_phone_input_stream_no_host_credits() {
+    const auto regions = llama_region_ring_parse_single_cycle_force("G1,C1,P1", 3);
+    llama_region_ring_ready ready(
+        regions, 192, std::vector<int>{16, 16, 64},
+        0, false, {}, true, true);
+    // Upstream token dependencies must be preserved even without credits.
+    for (int i = 0; i < 3; ++i) {
+        const auto g = ready.try_take(llama_region_ring_device::GPU);
+        check(g.has_value(), "stream GPU producer missing");
+        ready.complete(*g);
+        const auto c = ready.try_take(llama_region_ring_device::CPU);
+        check(c.has_value(), "stream CPU producer missing");
+        ready.complete(*c);
+    }
+    check(!ready.try_take_input_push().has_value(),
+          "stream PUSH bypassed an incomplete upstream token interval");
+    for (int i = 3; i < 12; ++i) {
+        const auto g = ready.try_take(llama_region_ring_device::GPU);
+        check(g.has_value(), "stream GPU producer missing");
+        ready.complete(*g);
+        const auto c = ready.try_take(llama_region_ring_device::CPU);
+        check(c.has_value(), "stream CPU producer missing");
+        ready.complete(*c);
+    }
+    // All three Phone inputs can be sent before the first is consumed:
+    // the remote 128 MiB byte budget, not a PC-side slot count, backpressures.
+    const auto push0 = ready.try_take_input_push();
+    const auto push1 = ready.try_take_input_push();
+    const auto push2 = ready.try_take_input_push();
+    check(push0 && push1 && push2 &&
+          push0->chunk == 0 && push1->chunk == 1 && push2->chunk == 2,
+          "stream transport still enforced two per-Region host credits");
+    check(!ready.try_take_input_push().has_value(),
+          "stream transport claimed a nonexistent chunk");
+    for (int i = 0; i < 3; ++i) {
+        const auto phone = ready.try_take(llama_region_ring_device::PHONE);
+        check(phone && phone->chunk == (size_t) i,
+              "Phone stream bypassed KV FIFO");
+        ready.complete(*phone);
+    }
+    ready.release_input_push(*push0);
+    ready.release_input_push(*push1);
+    ready.release_input_push(*push2);
+    check(ready.all_done() && !ready.failed(),
+          "Phone stream scheduler failed to drain");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1287,6 +1334,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] phone_static_template_shapes=PASS\n");
         test_pc_phone_overlap_intervals();
         std::fprintf(stderr, "[REGION_RING_TEST] pc_phone_overlap_intervals=PASS\n");
+        test_phone_input_stream_no_host_credits();
+        std::fprintf(stderr, "[REGION_RING_TEST] phone_input_stream=PASS\\n");
         test_phone_input_push_ahead();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_input_push_ahead=PASS\n");
         std::fprintf(stderr, "[REGION_RING_TEST] status=PASS\n");
