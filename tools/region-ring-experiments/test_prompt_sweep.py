@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Offline regression test for sweep CSV parsing. No GGUF, RPC or CUDA required."""
 import csv
+from contextlib import redirect_stdout
 import importlib.util
+import io
+import sys
 import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).with_name("run_prompt_sweep.py")
 SPEC = importlib.util.spec_from_file_location("run_prompt_sweep", MODULE_PATH)
@@ -16,6 +20,36 @@ SPEC.loader.exec_module(SWEEP)
 
 
 class ExperimentReportTests(unittest.TestCase):
+    def test_no_mmap_flag_reaches_runner_and_report(self):
+        # Dry-run uses stub files: no model is loaded or inference performed.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "completion.exe"
+            exe.write_bytes(b"stub")
+            model = root / "model.gguf"
+            model.write_bytes(b"stub")
+            prompts = root / "prompts"
+            prompts.mkdir()
+            (prompts / "prompt_358.txt").write_text("test", encoding="utf-8")
+            for enabled in (False, True):
+                out = root / ("no-mmap" if enabled else "default-mmap")
+                argv = ["run_prompt_sweep.py", "--exe", str(exe),
+                        "--model", str(model), "--rpc", "127.0.0.1:10031",
+                        "--prompt-dir", str(prompts), "--out", str(out),
+                        "--dry-run"]
+                if enabled:
+                    argv.append("--no-mmap")
+                with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+                    self.assertEqual(SWEEP.main(), 0)
+                config_path = next(out.glob("*/prompt_358/config.json"))
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual("--no-mmap" in config["command"], enabled)
+                self.assertEqual(config["no_mmap"], enabled)
+                with (config_path.parent.parent / "summary.csv").open(
+                        encoding="utf-8-sig", newline="") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual(rows[0]["no_mmap"], str(enabled))
+
     def test_phone_input_push_timeline_only_measured_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
