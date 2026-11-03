@@ -4122,6 +4122,89 @@ static bool ggml_backend_rpc_wait_ready_seq(
 }
 
 
+// Stream session has one setup/teardown RPC, never a per-Chunk ACK.
+static bool ggml_backend_rpc_phone_input_stream_run(
+        ggml_backend_t backend, uint64_t run_id, bool active) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            run_id == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 23) {
+        return false;
+    }
+    rpc_msg_phone_input_stream_run_req req {};
+    req.run_id = run_id;
+    req.active = active ? 1 : 0;
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_INPUT_STREAM_RUN,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted;
+}
+
+static bool ggml_backend_rpc_phone_input_stream_push(
+        ggml_backend_t backend, uint64_t run_id, uint32_t region,
+        uint32_t chunk, const void * input, size_t bytes,
+        ggml_backend_rpc_phone_input_push_timing * timing) {
+    if (timing != nullptr) { *timing = {}; }
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            run_id == 0 || input == nullptr || bytes == 0 ||
+            bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    auto * dev = ggml_backend_get_device(backend);
+    auto * dc = dev != nullptr ?
+        static_cast<ggml_backend_rpc_device_context *>(dev->context) : nullptr;
+    if (ctx == nullptr || dc == nullptr) { return false; }
+    const int64_t lock_begin = ggml_time_us();
+    std::lock_guard<std::mutex> guard(dc->phone_input_push_connection_mutex);
+    if (timing != nullptr) {
+        timing->pc_socket_lock_wait_us = ggml_time_us() - lock_begin;
+    }
+    auto & sock = dc->phone_input_push_socket;
+    if (sock == nullptr) {
+        sock = get_socket_role(ctx->endpoint, rpc_socket_role::PHONE_INPUT_PUSH);
+    }
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_phone_input_push") < 23) {
+        return false;
+    }
+    rpc_msg_phone_input_push_req req {};
+    req.key = {run_id, region, chunk};
+    req.size = bytes;
+    const int64_t hash_begin = ggml_time_us();
+    req.hash = fnv_hash(static_cast<const uint8_t *>(input), bytes);
+    if (timing != nullptr) {
+        timing->pc_hash_us = ggml_time_us() - hash_begin;
+    }
+    const int64_t pack_begin = ggml_time_us();
+    std::vector<uint8_t> packet(sizeof(req) + bytes);
+    memcpy(packet.data(), &req, sizeof(req));
+    memcpy(packet.data() + sizeof(req), input, bytes);
+    if (timing != nullptr) {
+        timing->pc_pack_us = ggml_time_us() - pack_begin;
+    }
+    std::array<uint8_t, 1 + sizeof(uint64_t)> header {};
+    header[0] = static_cast<uint8_t>(RPC_CMD_PHONE_INPUT_STREAM_PUSH);
+    const uint64_t size = packet.size();
+    memcpy(header.data() + 1, &size, sizeof(size));
+    const int64_t header_begin = ggml_time_us();
+    bool ok = sock->send_data(header.data(), header.size());
+    if (timing != nullptr) {
+        timing->pc_header_send_us = ggml_time_us() - header_begin;
+    }
+    if (ok) {
+        const int64_t payload_begin = ggml_time_us();
+        ok = sock->send_data(packet.data(), packet.size());
+        if (timing != nullptr) {
+            timing->pc_payload_send_us = ggml_time_us() - payload_begin;
+        }
+    }
+    if (!ok) { sock.reset(); }
+    return ok;
+}
+
 static bool ggml_backend_rpc_phone_input_push(
         ggml_backend_t backend, uint64_t run_id,
         uint32_t region, uint32_t chunk,
@@ -12771,6 +12854,12 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_phone_region_partial_get);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_stream_run);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_PUSH_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_stream_push);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_PUSH_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_push);
