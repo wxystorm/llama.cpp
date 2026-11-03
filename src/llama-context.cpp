@@ -4659,6 +4659,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         llm_graph_result * result = nullptr;
     };
     std::vector<phone_prefill_template> phone_prefill_templates;
+    struct phone_auto_template {
+        size_t region = 0;
+        size_t chunk = 0;
+        uint32_t tokens = 0;
+        uint32_t token_begin = 0;
+        uint64_t graph_uid = 0;
+        ggml_backend_sched_ptr owned_sched;
+        std::unique_ptr<llm_graph_result> owned_res;
+    };
+    std::vector<phone_auto_template> phone_auto_templates;
+    const char * phone_auto_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS");
+    const bool phone_auto_requested =
+        phone_auto_env != nullptr && std::strcmp(phone_auto_env, "1") == 0;
     const char * phone_static_env =
         std::getenv("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES");
     const bool phone_static_requested =
@@ -4687,6 +4701,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_static_templates =
         phone_static_requested && phone_static_eligible &&
         single_terminal_output;
+    const bool phone_auto_eligible =
+        phone_auto_requested && phone_static_templates &&
+        phone_input_stream_requested && pc_phone_overlap &&
+        threaded_execution && !directional_runtime &&
+        ubatch.n_tokens > 1 && stages.size() > 2 &&
+        ggml_backend_is_meta(backend_ptrs[0]) &&
+        ggml_backend_meta_n_backends(backend_ptrs[0]) == 2;
+    if (phone_auto_requested && !phone_auto_eligible) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_AUTO] event=INIT status=REJECT "
+            "reason=REQUIRES_PHONE_STATIC_TEMPLATES_INPUT_STREAM_AND_FULL_REGIONS\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     int64_t phone_static_prebuild_us = 0;
     if (phone_static_requested && !phone_static_templates) {
         LLAMA_LOG_INFO(
@@ -4804,6 +4832,112 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "phone_rpc_registration=LAZY status=OK\n",
             phone_prefill_templates.size(),
             phone_static_prebuild_us / 1000.0);
+    }
+
+    // Phone-autonomous Phase 1/2: one immutable Graph and remote input
+    // allocation per logical Chunk. This costs setup memory/time, but ensures
+    // dynamic KV offsets, attention masks and late-tail shapes are never
+    // accidentally reused across distinct Chunk positions.
+    if (phone_auto_eligible) {
+        const int64_t t0 = ggml_time_us();
+        const size_t max_nodes =
+            graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        std::set<uint64_t> registered_uids;
+        for (size_t r = 1; r + 1 < stages.size(); ++r) {
+            if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                continue;
+            }
+            const auto & stage = stages[r];
+            const uint32_t size = (uint32_t) stage.macro_tokens;
+            if (size == 0) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            for (uint32_t begin = 0, chunk = 0;
+                    begin < ubatch.n_tokens; begin += size, ++chunk) {
+                phone_auto_template item;
+                item.region = r;
+                item.chunk = chunk;
+                item.token_begin = begin;
+                item.tokens = std::min<uint32_t>(
+                    size, ubatch.n_tokens - begin);
+                item.owned_sched.reset(ggml_backend_sched_new(
+                    backend_ptrs.data(), backend_buft.data(),
+                    (int) backend_ptrs.size(), max_nodes,
+                    false, cparams.op_offload));
+                item.owned_res.reset(new llm_graph_result(max_nodes));
+                if (item.owned_sched == nullptr ||
+                        !worker_kv_views[2]->set_stage_range(
+                            ubatch_id, begin, item.tokens)) {
+                    ret = GGML_STATUS_ALLOC_FAILED;
+                    return nullptr;
+                }
+                float * placeholder = outputs[r - 1].data() +
+                    (size_t) begin * (size_t) n_embd;
+                const llama_ubatch sample = llama_hybrid_slice_ubatch(
+                    ubatch, begin, item.tokens, placeholder);
+                ggml_status status = GGML_STATUS_SUCCESS;
+                llm_graph_result * result = prepare_ubatch(
+                    item.owned_res.get(), item.owned_sched.get(),
+                    sample, gtype, worker_kv_views[2].get(),
+                    status, false, &stage, 0, true);
+                worker_kv_views[2]->clear_stage_range();
+                if (result != item.owned_res.get() ||
+                        status != GGML_STATUS_SUCCESS ||
+                        ggml_backend_sched_get_n_splits(item.owned_sched.get()) != 1 ||
+                        ggml_backend_sched_get_split_backend(
+                            item.owned_sched.get(), 0) != backend_ptrs[0]) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu "
+                        "chunk=%u reason=PHONE_META_SPLIT\n", r, chunk);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                // Other dynamic leaves have real values now. inp_stage is
+                // intentionally uninitialized until the upstream PC PUSH.
+                status = ggml_backend_sched_prepare_split_skip_input(
+                    item.owned_sched.get(), 0, "inp_stage");
+                if (status != GGML_STATUS_SUCCESS) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu chunk=%u "
+                        "reason=SIDE_INPUT_TRANSFER\n", r, chunk);
+                    ret = status;
+                    return nullptr;
+                }
+                ggml_backend_meta_phone_auto_context(1, 0, (uint32_t) r, chunk);
+                status = ggml_backend_sched_compute_split(
+                    item.owned_sched.get(), 0);
+                item.graph_uid =
+                    ggml_backend_meta_phone_auto_registered_uid();
+                ggml_backend_meta_phone_auto_context(0, 0, 0, 0);
+                if (status != GGML_STATUS_SUCCESS ||
+                        item.graph_uid == 0 ||
+                        !registered_uids.insert(item.graph_uid).second) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu "
+                        "chunk=%u uid=%" PRIu64 " reason=GRAPH_REGISTER_OR_UID_COLLISION\n",
+                        r, chunk, item.graph_uid);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                LLAMA_LOG_INFO(
+                    "[PHONE_AUTO] event=GRAPH_READY region=%zu chunk=%u "
+                    "tokens=%u begin=%u uid=%" PRIu64 " status=REGISTERED\n",
+                    r, chunk, item.tokens, item.token_begin,
+                    item.graph_uid);
+                phone_auto_templates.emplace_back(std::move(item));
+            }
+        }
+        if (phone_auto_templates.empty()) {
+            LLAMA_LOG_ERROR("[PHONE_AUTO] event=PREBUILD_FAIL reason=NO_NONFINAL_PHONE_REGIONS\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        LLAMA_LOG_INFO(
+            "[PHONE_AUTO] event=GRAPH_SETUP_DONE count=%zu setup_ms=%.3f "
+            "policy=ONE_GRAPH_PER_CHUNK_KV_SAFE status=OK\n",
+            phone_auto_templates.size(),
+            (ggml_time_us() - t0) / 1000.0);
     }
 
     if (threaded_execution) {
