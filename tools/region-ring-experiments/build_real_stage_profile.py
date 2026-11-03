@@ -76,15 +76,11 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
             diag["trace_missing"] += 1
             continue
         diag["cases"] += 1
-        logs = profile_lines(case / "engine.stderr.log", "")
-        session = next((r.get("run") for r in logs
-                        if r.get("event") == "SESSION_READY"), None)
-        # The general event parser doesn't retain the log prefix. Read the
-        # true session marker to prevent joining stale Phone measurements.
+        # Match the PC-run session ID to the Phone autonomous job table;
+        # otherwise a stale Phone log could contaminate the Profile.
         session_lines = profile_lines(case / "engine.stderr.log",
                                       "[PHONE_AUTO] event=SESSION_READY")
-        if session_lines:
-            session = session_lines[0].get("run")
+        session = session_lines[0].get("run") if session_lines else None
         setup = {}
         for p in profile_lines(case / "engine.stderr.log",
                                "[REAL_STAGE_PROFILE]"):
