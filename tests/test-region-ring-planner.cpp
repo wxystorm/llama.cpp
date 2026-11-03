@@ -654,6 +654,17 @@ int main() {
             prepared_overlap.xp = 64;
         REQUIRE(simulate(
             overlap, overlap_layout, prepared_overlap, &why));
+        if (std::fabs(prepared_overlap.wall_ms - 50.0) >= 1e-6) {
+            std::fprintf(stderr,
+                "[PHONE_PREPARE_DAG_DIAG] actual_wall_ms=%.6f "
+                "expected_wall_ms=50.000000 prepare_busy_ms=%.6f "
+                "compute_busy_ms=%.6f tasks=%d events=%d reason=%s\n",
+                prepared_overlap.wall_ms,
+                prepared_overlap.phone_prepare_busy_ms,
+                prepared_overlap.busy_ms[(size_t) device::PHONE],
+                prepared_overlap.tasks, prepared_overlap.edges,
+                why.c_str());
+        }
         REQUIRE(std::fabs(prepared_overlap.wall_ms - 50.0) < 1e-6);
         REQUIRE(std::fabs(
             prepared_overlap.phone_prepare_busy_ms - 20.0) < 1e-6);

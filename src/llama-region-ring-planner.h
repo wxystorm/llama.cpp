@@ -1369,34 +1369,6 @@ inline bool simulate(const model & m,
             scheduled = true;
         }
 
-        // Autonomous Upload and Slot Prepare have a dedicated worker and
-        // a two-Slot capacity, independent from Phone Graph compute.
-        // A PREPARED task can wait for KV FIFO without blocking preparation.
-        if (m.phone_autonomous_prepare_overlap &&
-                !phone_prepare_busy && phone_slots_in_use < 2 &&
-                !phone_prepare_queue.empty()) {
-            // The runtime searches its ordered (run,region,chunk) job map.
-            const auto chosen = std::min_element(
-                phone_prepare_queue.begin(), phone_prepare_queue.end(),
-                [&](int a, int b) {
-                    const task & left = tasks[(size_t) a];
-                    const task & right = tasks[(size_t) b];
-                    return std::tie(left.region, left.begin) <
-                           std::tie(right.region, right.begin);
-                });
-            const int id = *chosen;
-            phone_prepare_queue.erase(chosen);
-            auto & t = tasks[(size_t) id];
-            t.preparing = true;
-            phone_prepare_busy = true;
-            ++phone_slots_in_use;
-            phone_prepare_busy_ms += t.prepare_duration;
-            events.push({
-                now + t.prepare_duration, id, event_kind::PHONE_PREPARE
-            });
-            scheduled = true;
-        }
-
         // One transfer at a time per link lane. Arena Stream sends frames
         // in actual READY-publication FIFO order; legacy mode retains the
         // previous source-major edge-ID priority for exact A/B comparison.
@@ -1552,6 +1524,40 @@ inline bool simulate(const model & m,
             });
             scheduled = true;
         }
+
+        // Dispatch Phone Prepare AFTER compute claims at this same logical
+        // instant. A Phone compute start can make the next KV-ordered Chunk
+        // eligible for one-ahead preparation; postponing this check until
+        // the next event would falsely serialize Prepare behind Compute.
+        // Other resource claims and transport links remain independent.
+        // Autonomous Upload and Slot Prepare have a dedicated worker and
+        // a two-Slot capacity, independent from Phone Graph compute.
+        // A PREPARED task can wait for KV FIFO without blocking preparation.
+        if (m.phone_autonomous_prepare_overlap &&
+                !phone_prepare_busy && phone_slots_in_use < 2 &&
+                !phone_prepare_queue.empty()) {
+            // The runtime searches its ordered (run,region,chunk) job map.
+            const auto chosen = std::min_element(
+                phone_prepare_queue.begin(), phone_prepare_queue.end(),
+                [&](int a, int b) {
+                    const task & left = tasks[(size_t) a];
+                    const task & right = tasks[(size_t) b];
+                    return std::tie(left.region, left.begin) <
+                           std::tie(right.region, right.begin);
+                });
+            const int id = *chosen;
+            phone_prepare_queue.erase(chosen);
+            auto & t = tasks[(size_t) id];
+            t.preparing = true;
+            phone_prepare_busy = true;
+            ++phone_slots_in_use;
+            phone_prepare_busy_ms += t.prepare_duration;
+            events.push({
+                now + t.prepare_duration, id, event_kind::PHONE_PREPARE
+            });
+            scheduled = true;
+        }
+
 
         // Find the earliest task/weight/local-link completion OR a phone
         // transport completion. A duplex edge is not pinned to a deadline:
