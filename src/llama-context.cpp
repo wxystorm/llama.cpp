@@ -4685,6 +4685,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS");
     const bool phone_auto_requested =
         phone_auto_env != nullptr && std::strcmp(phone_auto_env, "1") == 0;
+    // Real-path Stage measurements are opt-in and do not execute extra graphs.
+    const char * stage_profile_env =
+        std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE");
+    const bool stage_profile_enabled =
+        stage_profile_env != nullptr &&
+        std::strcmp(stage_profile_env, "1") == 0;
     const char * phone_static_env =
         std::getenv("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES");
     const bool phone_static_requested =
@@ -4930,6 +4936,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             for (uint32_t begin = 0, chunk = 0;
                     begin < ubatch.n_tokens; begin += size, ++chunk) {
+                const int64_t graph_setup_begin_us = ggml_time_us();
                 phone_auto_template item;
                 item.region = r;
                 item.chunk = chunk;
@@ -4981,6 +4988,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         status, false, &stage, 0, true);
                 }
                 worker_kv_views[2]->clear_stage_range();
+                const int64_t graph_alloc_end_us = ggml_time_us();
                 if (result != item.owned_res.get() ||
                         status != GGML_STATUS_SUCCESS ||
                         ggml_backend_sched_get_n_splits(item.owned_sched.get()) != 1 ||
@@ -4994,8 +5002,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
                 // Other dynamic leaves have real values now. inp_stage is
                 // intentionally uninitialized until the upstream PC PUSH.
+                const int64_t side_input_begin_us = ggml_time_us();
                 status = ggml_backend_sched_prepare_split_skip_input(
                     item.owned_sched.get(), 0, "inp_stage");
+                const int64_t side_input_end_us = ggml_time_us();
                 if (status != GGML_STATUS_SUCCESS) {
                     LLAMA_LOG_ERROR(
                         "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu chunk=%u "
@@ -5003,12 +5013,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ret = status;
                     return nullptr;
                 }
+                const int64_t rpc_register_begin_us = ggml_time_us();
                 ggml_backend_meta_phone_auto_context(1, 0, (uint32_t) r, chunk);
                 status = ggml_backend_sched_compute_split(
                     item.owned_sched.get(), 0);
                 item.graph_uid =
                     ggml_backend_meta_phone_auto_registered_uid();
                 ggml_backend_meta_phone_auto_context(0, 0, 0, 0);
+                const int64_t rpc_register_end_us = ggml_time_us();
                 if (status != GGML_STATUS_SUCCESS ||
                         item.graph_uid == 0 ||
                         !registered_uids.insert(item.graph_uid).second) {
@@ -5018,6 +5030,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         r, chunk, item.graph_uid);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
+                }
+                if (stage_profile_enabled) {
+                    LLAMA_LOG_INFO(
+                        "[REAL_STAGE_PROFILE] side=PC device=PHONE "
+                        "phase=GRAPH_SETUP region=%zu chunk=%u "
+                        "layers=%d tokens=%u token_begin=%u "
+                        "kv_tokens=%d terminal=%d "
+                        "build_alloc_ms=%.3f side_input_ms=%.3f "
+                        "rpc_register_ms=%.3f setup_ms=%.3f "
+                        "status=PASS\n",
+                        r, chunk, stage.layer_end - stage.layer_begin,
+                        item.tokens, item.token_begin,
+                        (int) sample.pos[item.tokens - 1] + 1,
+                        r + 1 == stages.size() ? 1 : 0,
+                        (graph_alloc_end_us - graph_setup_begin_us) / 1000.0,
+                        (side_input_end_us - side_input_begin_us) / 1000.0,
+                        (rpc_register_end_us - rpc_register_begin_us) / 1000.0,
+                        (rpc_register_end_us - graph_setup_begin_us) / 1000.0);
                 }
                 LLAMA_LOG_INFO(
                     "[PHONE_AUTO] event=GRAPH_READY region=%zu chunk=%u "

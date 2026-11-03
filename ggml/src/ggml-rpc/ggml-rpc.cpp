@@ -6678,6 +6678,44 @@ bool rpc_server::phone_input_stream_run(
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
+                    // Report after all jobs finish, not on the hot worker
+                    // path. Separate measured service from queue delay.
+                    const char * stage_env =
+                        std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
+                    if (stage_env != nullptr &&
+                            std::strcmp(stage_env, "1") == 0) {
+                        const auto millis = [](int64_t first, int64_t last) {
+                            return first > 0 && last >= first ?
+                                (last - first) / 1000.0 : -1.0;
+                        };
+                        const double prep_service =
+                            job.prepared.has_value() ?
+                                millis(job.prepared->prepare_begin_us,
+                                       job.prepared->prepare_end_us) : -1.0;
+                        const double post_upload =
+                            millis(job.upload_done_us, job.prepare_done_us);
+                        GGML_LOG_INFO(
+                            "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK "
+                            "run=%" PRIu64 " region=%u chunk=%u "
+                            "tokens=%u token_begin=%u "
+                            "verified_to_upload_ms=%.3f upload_ms=%.3f "
+                            "prepare_ms=%.3f prepare_queue_ms=%.3f "
+                            "compute_queue_ms=%.3f compute_ms=%.3f "
+                            "capture_ms=%.3f status=%s\n",
+                            request.run_id, job.request.key.region,
+                            job.request.key.chunk, job.request.n_tokens,
+                            job.request.token_begin,
+                            millis(job.verified_us, job.upload_begin_us),
+                            millis(job.upload_begin_us, job.upload_done_us),
+                            prep_service,
+                            prep_service >= 0.0 && post_upload >= 0.0 ?
+                                std::max(0.0, post_upload - prep_service) : -1.0,
+                            millis(job.prepare_done_us, job.compute_begin_us),
+                            millis(job.compute_begin_us, job.compute_end_us),
+                            millis(job.capture_begin_us, job.capture_end_us),
+                            job.state == phone_auto_status::COMPLETE ?
+                                "PASS" : "FAIL");
+                    }
                     if (job.state == phone_auto_status::COMPLETE) {
                         ++auto_jobs_complete;
                     } else {
