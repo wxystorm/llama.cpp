@@ -4282,7 +4282,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 120.0L * 1024.0L * 1024.0L) {
         LLAMA_LOG_ERROR(
             "[PHONE_INPUT_STREAM] event=REJECT reason=PHASE_A_BACKLOG_BUDGET "
-            "tokens=%u phone_regions=%zu status=FAIL\\n",
+            "tokens=%u phone_regions=%zu status=FAIL\n",
             ubatch.n_tokens, phone_stream_region_count);
         ret = GGML_STATUS_FAILED;
         return nullptr;
