@@ -663,3 +663,52 @@ To run a reproducible fixed-plan study with the PowerShell wrapper:
 
 The fixed example contains 48 layers; substitute a layout whose counts
 sum to your actual model depth.
+
+
+## Phone-autonomous final: offline Planner calibration (2026-11-03)
+
+The autonomous 358-token experiment registers 18 phone graphs *before*
+launching the Region Ring workers and returns 18 P2C frames (6 from the
+terminal L39) *before* running the PC-only Head. A historical planner that
+charges graph registration on the Phone compute lane and omits the terminal
+return/head under-predicts the true runtime.
+
+The exact DAG simulator now opts into these semantics only when the
+\`LLAMA_REGION_RING_PHONE_AUTONOMOUS\`,
+\`LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES\`,
+\`LLAMA_REGION_RING_PHONE_INPUT_STREAM\`, and
+\`LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM\` flags are on. With
+\`LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL=1\`, the terminal Phone region
+sends its six l_out frames and the Head executes after *all* frames drain.
+The legacy Meta/GET paths are unchanged.
+
+Offline audit of an existing run (no network, model or inference needed):
+
+\`\`\`powershell
+python .\tools\region-ring-experiments\audit_plan_calibration.py \`
+  --run "E:\llama\llama-tensor-v2\planner-test-results-full-region-v7\20261103-190834-41376" \`
+  --case "prompt_358" --rpc-log .\rpc.log
+\`\`\`
+
+The audit prints observed-vs-recorded Planner wall times and CPU/GPU/Phone
+service demand when available, and suggests *optional* calibration
+overrides. For the single 2026-11-03 autonomous-final 358-token sample,
+Graph setup was 432.766 ms for 18 graphs (24.043 ms/graph), PC Head was
+184.839 ms, and the Phone P2C Sender emitted 18 frames. The overrides
+for a later Planner-only simulation are:
+
+\`\`\`powershell
+$env:LLAMA_REGION_RING_PLAN_PHONE_AUTO_SETUP_PER_GRAPH_MS = "24.043"
+$env:LLAMA_REGION_RING_PLAN_PHONE_AUTO_HEAD_MS = "184.839"
+\`\`\`
+
+Do not treat the old \`final_dag_sim_ms\` as the new calibrated prediction:
+a new event DAG pass is required, not a scalar correction. The existing
+Phone-to-PC GET curve is *still a proxy* for P2C Stream, and the scoring
+still uses conservative shared-link serialization; do not encode one noisy
+Wi-Fi run as a permanent throughput multiplier. Validate a few stable
+runs before changing transport rankings.
+
+Tests: build/run \`test-region-ring-planner\` offline; Python audit tests
+are \`python -m unittest test_audit_plan_calibration.py\` from the same
+tools directory.
