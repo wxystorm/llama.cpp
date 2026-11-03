@@ -6390,25 +6390,56 @@ bool rpc_server::phone_input_apply(
     }
     phone_input_staged staged {};
     {
-        std::lock_guard<std::mutex> lock(phone_input_mutex);
-        const auto it = std::find_if(
-            phone_input_staged_slots.begin(), phone_input_staged_slots.end(),
-            [&](const phone_input_staged & e) {
-                return e.key.run_id == request.key.run_id &&
-                    e.key.region == request.key.region &&
-                    e.key.chunk == request.key.chunk;
-            });
+        std::unique_lock<std::mutex> lock(phone_input_mutex);
+        const auto matching = [&]() {
+            return std::find_if(phone_input_staged_slots.begin(),
+                phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
+                    return e.key.run_id == request.key.run_id &&
+                        e.key.region == request.key.region &&
+                        e.key.chunk == request.key.chunk;
+                });
+        };
+        if (phone_input_stream_runs.count(request.key.run_id) != 0) {
+            const auto has_error = [&]() {
+                return std::any_of(phone_input_stream_failed.begin(),
+                    phone_input_stream_failed.end(),
+                    [&](const rpc_phone_input_key & e) {
+                        return e.run_id == request.key.run_id &&
+                            e.region == request.key.region &&
+                            e.chunk == request.key.chunk;
+                    });
+            };
+            // PC send() returning does not mean Phone received/verified input.
+            const bool available = phone_input_stream_cv.wait_for(
+                lock, std::chrono::seconds(30), [&]() {
+                    return matching() != phone_input_staged_slots.end() ||
+                           has_error() ||
+                           phone_input_stream_runs.count(request.key.run_id) == 0;
+                });
+            if (!available || has_error()) { return true; }
+        }
+        auto it = matching();
         if (it == phone_input_staged_slots.end() ||
                 it->hash != request.hash ||
-                it->payload.size() != request.size) {
-            return true; // Wrong input: keep bytes for the matching tensor.
+                it->payload.size() - it->payload_offset != request.size) {
+            return true; // Legacy SET_TENSOR fallback if no matching bytes.
         }
         staged = std::move(*it);
         phone_input_staged_slots.erase(it);
     }
+    // Keep the host bytes charged during device upload.
     response.accepted = set_tensor_direct(
         request.tensor, request.offset,
-        staged.payload.data(), staged.payload.size()) ? 1 : 0;
+        staged.payload.data() + staged.payload_offset,
+        staged.payload.size() - staged.payload_offset) ? 1 : 0;
+    if (staged.reserved_bytes != 0) {
+        {
+            std::lock_guard<std::mutex> lock(phone_input_mutex);
+            GGML_ASSERT(phone_input_stream_held_bytes >= staged.reserved_bytes);
+            phone_input_stream_held_bytes -= staged.reserved_bytes;
+        }
+        phone_input_stream_cv.notify_all();
+    }
     return true;
 }
 
@@ -6416,15 +6447,21 @@ void rpc_server::phone_input_drop(
         const rpc_phone_input_key & key,
         rpc_msg_phone_input_ack & response) {
     response = {};
-    std::lock_guard<std::mutex> lock(phone_input_mutex);
-    phone_input_staged_slots.erase(
-        std::remove_if(phone_input_staged_slots.begin(),
-                       phone_input_staged_slots.end(),
-            [&](const phone_input_staged & e) {
-                return e.key.run_id == key.run_id &&
-                    e.key.region == key.region && e.key.chunk == key.chunk;
-            }),
-        phone_input_staged_slots.end());
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        auto it = phone_input_staged_slots.begin();
+        while (it != phone_input_staged_slots.end()) {
+            if (it->key.run_id == key.run_id &&
+                    it->key.region == key.region && it->key.chunk == key.chunk) {
+                GGML_ASSERT(phone_input_stream_held_bytes >= it->reserved_bytes);
+                phone_input_stream_held_bytes -= it->reserved_bytes;
+                it = phone_input_staged_slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    phone_input_stream_cv.notify_all();
     response.accepted = 1;
 }
 
