@@ -730,6 +730,72 @@ inline bool llama_region_ring_single_cycle_force_compatible(
     return active_devices >= 2;
 }
 
+// The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
+// Ordinary fixed/legacy parsing stays strict and unchanged.
+inline bool llama_region_ring_apply_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer);
+
+inline std::vector<llama_region_ring_region>
+llama_region_ring_parse_optional_cpu_cycles(
+        const std::string & spec, int n_layer) {
+    if (n_layer <= 0 || spec.empty()) {
+        throw std::runtime_error("invalid optional-CPU ring layout");
+    }
+    std::vector<llama_region_ring_region> regions;
+    size_t pos = 0;
+    int layer = 0;
+    while (pos < spec.size()) {
+        while (pos < spec.size() && std::isspace((unsigned char) spec[pos])) {
+            ++pos;
+        }
+        if (pos == spec.size()) { break; }
+        const char kind = spec[pos++];
+        if (kind != 'G' && kind != 'C' && kind != 'P') {
+            throw std::runtime_error("optional-CPU ring supports only G, C, P");
+        }
+        const size_t begin = pos;
+        int depth = 0;
+        while (pos < spec.size() && std::isdigit((unsigned char) spec[pos])) {
+            depth = depth * 10 + (spec[pos++] - '0');
+            if (depth > n_layer) {
+                throw std::runtime_error("optional-CPU ring depth overflow");
+            }
+        }
+        if (pos == begin || (depth == 0 && kind != 'C') ||
+                layer + depth > n_layer) {
+            throw std::runtime_error("invalid optional-CPU ring depth");
+        }
+        if (depth != 0) {
+            regions.emplace_back(
+                kind == 'G' ? llama_region_ring_device::GPU :
+                kind == 'C' ? llama_region_ring_device::CPU :
+                              llama_region_ring_device::PHONE,
+                layer, layer + depth);
+            layer += depth;
+        }
+        while (pos < spec.size() && std::isspace((unsigned char) spec[pos])) {
+            ++pos;
+        }
+        if (pos == spec.size()) { break; }
+        if (spec[pos++] != ',') {
+            throw std::runtime_error("optional-CPU ring needs commas");
+        }
+        while (pos < spec.size() && std::isspace((unsigned char) spec[pos])) {
+            ++pos;
+        }
+        if (pos == spec.size()) {
+            throw std::runtime_error("trailing comma in optional-CPU ring");
+        }
+    }
+    if (layer != n_layer ||
+            !llama_region_ring_apply_topology_compatible(regions, n_layer) ||
+            regions.back().device != llama_region_ring_device::PHONE) {
+        throw std::runtime_error("invalid optional-CPU G,C?,P cycle topology");
+    }
+    return regions;
+}
+
 inline std::vector<llama_region_ring_region>
 llama_region_ring_parse_apply_wide_layout(
         const std::string & spec, int n_layer) {
@@ -737,12 +803,16 @@ llama_region_ring_parse_apply_wide_layout(
         return llama_region_ring_parse(spec, n_layer);
     } catch (const std::exception & strict_error) {
         try {
-            return llama_region_ring_parse_single_cycle_force(
-                spec, n_layer);
-        } catch (const std::exception & single_error) {
-            throw std::runtime_error(
-                std::string(strict_error.what()) +
-                "; single-cycle override: " + single_error.what());
+            return llama_region_ring_parse_optional_cpu_cycles(spec, n_layer);
+        } catch (const std::exception & optional_error) {
+            try {
+                return llama_region_ring_parse_single_cycle_force(spec, n_layer);
+            } catch (const std::exception & single_error) {
+                throw std::runtime_error(
+                    std::string(strict_error.what()) +
+                    "; optional-CPU cycles: " + optional_error.what() +
+                    "; single-cycle override: " + single_error.what());
+            }
         }
     }
 }
@@ -752,29 +822,48 @@ llama_region_ring_parse_apply_wide_layout(
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
-    if (regions.size() < 6 || regions.size() > 14 ||
+    if (regions.size() < 4 || regions.size() > 14 ||
             n_layer <= 0 || regions.front().layer_begin != 0 ||
             regions.back().layer_end != n_layer) {
         return false;
     }
-    const size_t cycles = regions.size() / 3;
-    if (cycles < 2 || cycles > 4) {
-        return false;
-    }
-    int next_layer = 0;
-    for (size_t i = 0; i < regions.size(); ++i) {
-        const auto & r = regions[i];
-        const auto expected = LLAMA_REGION_RING_CYCLE_ORDER[i % 3];
-        if (r.device != expected || r.layer_begin != next_layer ||
-                r.layer_end <= r.layer_begin || r.layer_end > n_layer) {
+    // Each complete Cycle is GPU -> [CPU] -> Phone. A zero-layer CPU is
+    // absent from this list: it is NEVER an executable Region. Preserve
+    // legacy trailing GPU or GPU+CPU after at least two complete Cycles.
+    size_t i = 0;
+    int layer = 0;
+    int cycles = 0;
+    auto take = [&](llama_region_ring_device d) {
+        if (i == regions.size() || regions[i].device != d ||
+                regions[i].kind != llama_region_ring_device_stage(d) ||
+                regions[i].layer_begin != layer ||
+                regions[i].layer_end <= layer ||
+                regions[i].layer_end > n_layer) {
             return false;
         }
-        // Do not impose an arbitrary Phone stage depth limit here:
-        // positive lengths are checked above; the Planner separately
-        // validates profiled cost and runtime memory feasibility.
-        next_layer = r.layer_end;
+        layer = regions[i++].layer_end;
+        return true;
+    };
+    while (i < regions.size()) {
+        if (!take(llama_region_ring_device::GPU)) {
+            return false;
+        }
+        if (i < regions.size() &&
+                regions[i].device == llama_region_ring_device::CPU &&
+                !take(llama_region_ring_device::CPU)) {
+            return false;
+        }
+        if (i == regions.size()) { // Legacy PC tail (never final Phone).
+            return cycles >= 2 && cycles <= 4 && layer == n_layer;
+        }
+        if (!take(llama_region_ring_device::PHONE)) {
+            return false;
+        }
+        if (++cycles > 4) {
+            return false;
+        }
     }
-    return next_layer == n_layer;
+    return cycles >= 2 && cycles <= 4 && layer == n_layer;
 }
 
 // Canonical Ring layout spelling, shared by the model loader, runtime
