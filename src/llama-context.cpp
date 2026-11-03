@@ -5173,6 +5173,49 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
              phone_input_consume_end != nullptr &&
              phone_input_drop != nullptr &&
              phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr));
+        const bool phone_auto_enabled =
+            phone_auto_eligible && phone_input_stream_enabled;
+        if (phone_auto_enabled) {
+            auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * rpc_reg = rpc_dev != nullptr ?
+                ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+            auto register_task = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_auto_task_register_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC)) :
+                nullptr;
+            bool bound = register_task != nullptr;
+            if (bound) {
+                for (const auto & item : phone_auto_templates) {
+                    if (!register_task(
+                            phone_rpc_backend, phone_input_push_run_id,
+                            (uint32_t) item.region, (uint32_t) item.chunk,
+                            item.graph_uid,
+                            (size_t) item.tokens * (size_t) n_embd * sizeof(float))) {
+                        LLAMA_LOG_ERROR(
+                            "[PHONE_AUTO] event=BIND_FAIL region=%zu "
+                            "chunk=%zu uid=%" PRIu64 "\n",
+                            item.region, item.chunk, item.graph_uid);
+                        bound = false;
+                        break;
+                    }
+                }
+            }
+            if (!bound) {
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                LLAMA_LOG_ERROR(
+                    "[PHONE_AUTO] event=INIT status=REJECT "
+                    "reason=PHONE_GRAPH_BIND_NOT_READY\n");
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_AUTO] event=SESSION_READY run=%" PRIu64
+                " graphs=%zu two_slot=ON trigger=VERIFIED_PUSH "
+                "status=READY\n",
+                phone_input_push_run_id, phone_auto_templates.size());
+        }
         if (phone_input_push_requested) {
             LLAMA_LOG_INFO(
                 "[PHONE_INPUT_PUSH] event=INIT requested=1 enabled=%d "
