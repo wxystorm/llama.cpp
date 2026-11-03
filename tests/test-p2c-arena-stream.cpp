@@ -212,6 +212,67 @@ void test_framing_and_partial_receive_failure() {
     REQUIRE(!broken_receiver.receive(broken));
     REQUIRE(failed_ctx.failed);
 }
+
+// The terminal Phone stage (region==n_regions-1) is a producer too when
+// its PC Output Head is decoupled. Exercise both Arena and PC Receiver.
+void test_terminal_phone_region_full_return() {
+    constexpr uint32_t all_regions = 9;
+    constexpr uint32_t terminal_region = all_regions - 1;
+    constexpr uint32_t begin = 6;
+    constexpr uint32_t count = 2;
+    const float expected[hidden * count] = {31,32,33,34,35,36,37,38};
+
+    ggml_rpc_p2c_arena_queue arena;
+    REQUIRE(arena.initialize(run_id, all_regions, tokens, hidden));
+    REQUIRE(arena.capture(make_frame(terminal_region, 5, begin, count),
+        [&](uint8_t * out, size_t n) {
+            REQUIRE(n == sizeof(expected));
+            std::memcpy(out, expected, n);
+            return true;
+        }));
+    ggml_rpc_p2c_arena_queue::item published;
+    REQUIRE(arena.take_for(published, std::chrono::milliseconds(2000)));
+    REQUIRE(published.frame.region_id == terminal_region);
+    REQUIRE(published.frame.seq == 1);
+
+    frame end {};
+    end.run_id = run_id;
+    end.seq = 2;
+    end.kind = GGML_BACKEND_RPC_P2C_END;
+    auto sock = std::make_shared<fake_socket>();
+    append(sock->bytes, &published.frame, sizeof(published.frame));
+    append(sock->bytes, published.data, sizeof(expected));
+    append(sock->bytes, &end, sizeof(end));
+    arena.complete_send(true);
+    arena.finish();
+
+    struct target {
+        float data[tokens * hidden] {};
+        int completed = 0;
+        bool error = false;
+    } result {};
+    auto resolve_final = +[](void * userdata, const frame * f) -> void * {
+        auto * t = static_cast<target *>(userdata);
+        return f->region_id == terminal_region ?
+            t->data + f->token_begin * hidden : nullptr;
+    };
+    auto complete_final = +[](void * userdata, const frame * f, bool ok) {
+        auto * t = static_cast<target *>(userdata);
+        if (ok && f != nullptr && f->region_id == terminal_region) {
+            ++t->completed;
+        } else {
+            t->error = true;
+        }
+    };
+    ggml_rpc_p2c_stream_receiver receiver(
+        run_id, all_regions, tokens, hidden,
+        resolve_final, complete_final, &result);
+    REQUIRE(receiver.receive(sock));
+    REQUIRE(!result.error && result.completed == 1);
+    REQUIRE(std::memcmp(
+        result.data + begin * hidden, expected, sizeof(expected)) == 0);
+    arena.shutdown();
+}
 }
 
 int main(int argc, char ** argv) {
@@ -226,6 +287,8 @@ int main(int argc, char ** argv) {
     test_abort_unblocks_sender();
     std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\n");
     test_framing_and_partial_receive_failure();
+    std::fprintf(stderr, "[P2C_TEST] terminal Phone Region P2C\n");
+    test_terminal_phone_region_full_return();
     std::fprintf(stderr, "[P2C_TEST] PASS\n");
     return 0;
 }
