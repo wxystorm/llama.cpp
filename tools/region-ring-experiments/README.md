@@ -30,6 +30,12 @@ For the shorter PowerShell entrypoint, use:
 The wrapper defaults to `build-tensor-v2\bin\Release\llama-completion.exe`
 and saves `summary.csv` under `region-ring-results`.
 
+For a model-loading A/B comparison, add `-NoMmap` to the PowerShell
+wrapper (or `--no-mmap` to the Python script) to pass `--no-mmap` to
+`llama-completion.exe`. Without this switch, the runner retains its
+normal mmap default. The selected mode is recorded in each case's
+`config.json` and the `no_mmap` column in `summary.csv`.
+
 ### Automatic per-model Region Ring baseline
 
 An unset `LLAMA_HYBRID_REGION_RING_LAYOUT` is now resolved **inside the
