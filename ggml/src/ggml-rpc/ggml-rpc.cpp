@@ -349,6 +349,9 @@ enum rpc_cmd {
     RPC_CMD_PHONE_INPUT_DROP,
     RPC_CMD_PHONE_INPUT_STREAM_RUN,
     RPC_CMD_PHONE_INPUT_STREAM_PUSH,
+    RPC_CMD_PHONE_AUTO_GRAPH_REGISTER,
+    RPC_CMD_PHONE_AUTO_TASK_REGISTER,
+    RPC_CMD_PHONE_AUTO_WAIT,
     RPC_CMD_COUNT,
 };
 
@@ -382,6 +385,9 @@ static_assert(RPC_CMD_PHONE_INPUT_APPLY == 45, "RPC_CMD_PHONE_INPUT_APPLY index"
 static_assert(RPC_CMD_PHONE_INPUT_DROP == 46, "RPC_CMD_PHONE_INPUT_DROP index");
 static_assert(RPC_CMD_PHONE_INPUT_STREAM_RUN == 47, "RPC_CMD_PHONE_INPUT_STREAM_RUN index");
 static_assert(RPC_CMD_PHONE_INPUT_STREAM_PUSH == 48, "RPC_CMD_PHONE_INPUT_STREAM_PUSH index");
+static_assert(RPC_CMD_PHONE_AUTO_GRAPH_REGISTER == 49, "RPC_CMD_PHONE_AUTO_GRAPH_REGISTER index");
+static_assert(RPC_CMD_PHONE_AUTO_TASK_REGISTER == 50, "RPC_CMD_PHONE_AUTO_TASK_REGISTER index");
+static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -411,6 +417,16 @@ struct rpc_msg_phone_input_stream_run_req {
     uint64_t run_id = 0;
     uint8_t active = 0;
 };
+struct rpc_msg_phone_auto_task_req {
+    rpc_phone_input_key key {};
+    uint32_t device = 0;
+    uint64_t graph_uid = 0;
+    uint64_t input_bytes = 0;
+};
+struct rpc_msg_phone_auto_wait_req {
+    rpc_phone_input_key key {};
+};
+
 // These are independent server-side durations returned with PUSH ACK.
 // A Phone timestamp is NEVER directly subtracted from a PC timestamp.
 struct rpc_msg_phone_input_push_ack {
@@ -4145,6 +4161,81 @@ static bool ggml_backend_rpc_wait_ready_seq(
     return status;
 }
 
+
+// Register the complete RPC graph without executing it. The caller must
+// register a different Graph UID for every KV-distinct Chunk; cacheable UIDs
+// and the existing server graph reconstruction are reused.
+static bool ggml_backend_rpc_phone_auto_graph_register(
+        ggml_backend_t backend, const ggml_cgraph * graph,
+        uint64_t * registered_uid) {
+    if (registered_uid != nullptr) { *registered_uid = 0; }
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            graph == nullptr || graph->n_nodes == 0 || graph->uid == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 24) {
+        return false;
+    }
+    const uint64_t uid = rpc_graph_effective_uid(graph);
+    std::vector<uint8_t> payload;
+    serialize_graph(ctx->device, uid, graph, payload);
+    rpc_msg_phone_input_ack rsp {};
+    const bool ok = send_rpc_cmd(
+        sock, RPC_CMD_PHONE_AUTO_GRAPH_REGISTER, payload.data(),
+        payload.size(), &rsp, sizeof(rsp)) && rsp.accepted;
+    if (ok && registered_uid != nullptr) {
+        *registered_uid = uid;
+    }
+    return ok;
+}
+
+static bool ggml_backend_rpc_phone_auto_task_register(
+        ggml_backend_t backend, uint64_t run_id, uint32_t region,
+        uint32_t chunk, uint64_t graph_uid, size_t expected_input_bytes) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            run_id == 0 || graph_uid == 0 || region >= 64 ||
+            expected_input_bytes == 0 ||
+            expected_input_bytes > RPC_PHONE_INPUT_MAX_BYTES) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 24) {
+        return false;
+    }
+    rpc_msg_phone_auto_task_req req {};
+    req.key = { run_id, region, chunk };
+    req.device = ctx->device;
+    req.graph_uid = graph_uid;
+    req.input_bytes = expected_input_bytes;
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_AUTO_TASK_REGISTER,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted;
+}
+
+static bool ggml_backend_rpc_phone_auto_wait(
+        ggml_backend_t backend, uint64_t run_id,
+        uint32_t region, uint32_t chunk) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            run_id == 0 || region >= 64) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 24) {
+        return false;
+    }
+    rpc_msg_phone_auto_wait_req req {};
+    req.key = { run_id, region, chunk };
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_AUTO_WAIT,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted;
+}
 
 // Stream session has one setup/teardown RPC, never a per-Chunk ACK.
 static bool ggml_backend_rpc_phone_input_stream_run(
@@ -12933,6 +13024,15 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
             GGML_BACKEND_RPC_PHONE_REGION_PARTIAL_GET_PROC) == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_rpc_phone_region_partial_get);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_graph_register);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_task_register);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_wait);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_stream_run);
