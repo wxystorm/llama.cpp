@@ -4714,7 +4714,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens > 1 && stages.size() > 2 &&
         ggml_backend_is_meta(backend_ptrs[0]) &&
         ggml_backend_meta_n_backends(backend_ptrs[0]) == 2;
-    if (phone_auto_requested && !phone_auto_eligible) {
+    // Tiny startup/warmup and one-token decode keep the proven legacy
+    // path even while the full-UBatch autonomous experiment is requested.
+    // Do not fail the entire test suite before reaching its target prompt.
+    const bool phone_auto_candidate = ubatch.n_tokens >= 32;
+    if (phone_auto_requested && phone_auto_candidate &&
+            !phone_auto_eligible) {
         LLAMA_LOG_ERROR(
             "[PHONE_AUTO] event=INIT status=REJECT "
             "reason=REQUIRES_PHONE_STATIC_TEMPLATES_INPUT_STREAM_AND_FULL_REGIONS\n");
