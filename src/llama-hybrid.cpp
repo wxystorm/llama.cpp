@@ -9424,6 +9424,60 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM");
     model.phone_full_return_stream =
         phone_stream_env != nullptr && std::atoi(phone_stream_env) != 0;
+    const auto flag_on = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    model.phone_autonomous_prebuild = model.phone_full_return_stream &&
+        flag_on("LLAMA_REGION_RING_PHONE_AUTONOMOUS") &&
+        flag_on("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES") &&
+        flag_on("LLAMA_REGION_RING_PHONE_INPUT_STREAM");
+    model.phone_autonomous_final = model.phone_autonomous_prebuild &&
+        flag_on("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
+    // Explicit empirical overrides are opt-in: network conditions fluctuate,
+    // so never silently bake one run's measurements into a persisted Profile.
+    const auto optional_ms = [](const char * name, double & target) {
+        const char * value = std::getenv(name);
+        if (value == nullptr || *value == '\0') {
+            return true;
+        }
+        char * end = nullptr;
+        const double parsed = std::strtod(value, &end);
+        if (end == value || *end != '\0' ||
+                !std::isfinite(parsed) || parsed < 0.0 ||
+                parsed > 100000.0) {
+            return false;
+        }
+        target = parsed;
+        return true;
+    };
+    if (model.phone_autonomous_prebuild &&
+            !optional_ms("LLAMA_REGION_RING_PLAN_PHONE_AUTO_SETUP_PER_GRAPH_MS",
+                         model.phone_auto_setup_per_graph_ms)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_REJECT] reason=INVALID_PHONE_AUTO_SETUP_MS\n");
+        return false;
+    }
+    if (model.phone_autonomous_final &&
+            !optional_ms("LLAMA_REGION_RING_PLAN_PHONE_AUTO_HEAD_MS",
+                         model.phone_auto_final_head_ms)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_REJECT] reason=INVALID_PHONE_AUTO_HEAD_MS\n");
+        return false;
+    }
+    LLAMA_LOG_INFO(
+        "[REGION_RING_PLAN_AUTONOMOUS] prebuild=%d final=%d "
+        "setup_per_graph_ms=%.3f setup_source=%s head_ms=%.3f "
+        "head_source=%s network_source=EXISTING_PROFILE "
+        "status=MODELED\n",
+        model.phone_autonomous_prebuild ? 1 : 0,
+        model.phone_autonomous_final ? 1 : 0,
+        model.phone_auto_setup_per_graph_ms,
+        model.phone_auto_setup_per_graph_ms >= 0.0 ?
+            "EXPLICIT_MEASUREMENT" : "REGISTRATION_PROFILE",
+        model.phone_auto_final_head_ms,
+        std::getenv("LLAMA_REGION_RING_PLAN_PHONE_AUTO_HEAD_MS") != nullptr ?
+            "EXPLICIT_MEASUREMENT" : "UNCALIBRATED_ZERO");
     // Stream uses the legacy Phone->PC GET curve as a timing proxy.
     // Frame count, payload bytes, Sender ordering and dependency fan-out are
     // modeled exactly, but synchronous Arena capture/readback is not separately
@@ -10954,11 +11008,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_P2C_MODEL] mode=APPLY_WIDE "
             "return=%s frames=%d bytes=%" PRIu64 " "
+            "terminal_frames=%d terminal_bytes=%" PRIu64 " "
+            "auto_setup_ms=%.3f final_head_ms=%.3f "
             "sender=%s dependencies=%s transfer_curve=PHONE_TO_PC_PROXY "
             "arena_capture=UNCALIBRATED status=MODELED\n",
             model.phone_full_return_stream ?
                 "PHONE_FULL_ARENA_FRAME" : "LEGACY_PRODUCER_GET",
             best.phone_full_stream_frames, best.phone_full_stream_bytes,
+            best.phone_auto_terminal_frames, best.phone_auto_terminal_bytes,
+            best.phone_auto_setup_ms, best.phone_auto_head_ms,
             model.phone_full_return_stream ?
                 "PUBLICATION_FIFO_SINGLE_LANE" : "LEGACY_EDGE_ORDER",
             model.phone_full_return_stream ?
@@ -11057,6 +11115,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"gpu_weight_streaming\":"
                             << (model.gpu_weight_streaming ? "true" : "false")
                             << ",\"predicted_ms\":" << best.wall_ms
+                            << ",\"phone_auto_prebuild\":"
+                            << (model.phone_autonomous_prebuild ? "true" : "false")
+                            << ",\"phone_auto_final\":"
+                            << (model.phone_autonomous_final ? "true" : "false")
+                            << ",\"phone_auto_setup_pred_ms\":"
+                            << best.phone_auto_setup_ms
+                            << ",\"phone_auto_head_pred_ms\":"
+                            << best.phone_auto_head_ms
+                            << ",\"phone_auto_terminal_frames\":"
+                            << best.phone_auto_terminal_frames
+                            << ",\"phone_auto_terminal_bytes\":"
+                            << best.phone_auto_terminal_bytes
                             << ",\"link_ab_serial_ms\":" << best.wall_ms
                             << ",\"link_ab_independent_ms\":"
                             << (independent_link_ok ?

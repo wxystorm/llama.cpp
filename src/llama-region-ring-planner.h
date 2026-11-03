@@ -107,6 +107,12 @@ struct candidate {
     // Each frame covers exactly one Phone Chunk, regardless of downstream X.
     int phone_full_stream_frames = 0;
     uint64_t phone_full_stream_bytes = 0;
+    // Autonomous Phone owns a whole-UBatch pre-registration phase, not
+    // an RPC registration delay on the critical path of each Phone Chunk.
+    double phone_auto_setup_ms = 0.0;
+    double phone_auto_head_ms = 0.0;
+    int phone_auto_terminal_frames = 0;
+    uint64_t phone_auto_terminal_bytes = 0;
 };
 
 struct model {
@@ -129,6 +135,17 @@ struct model {
     // The Receiver publishes all overlapping PC Chunk dependencies only after
     // the entire frame arrives. Legacy GET and directional Tensor remain off.
     bool phone_full_return_stream = false;
+    // Full autonomous Phone graphs are registered before the first Ring
+    // worker. The terminal Phone can publish its final hidden states to an
+    // independent PC Head. Both switches are opt-in; legacy paths unchanged.
+    bool phone_autonomous_prebuild = false;
+    bool phone_autonomous_final = false;
+    // Negative: use the existing registration Profile cost per graph.
+    // Nonnegative: measured PC registration cost per immutable Chunk graph.
+    double phone_auto_setup_per_graph_ms = -1.0;
+    // Measured wall time for the PC-owned zero-layer Head (prepare+compute+
+    // synchronize), scheduled only after ALL terminal P2C frames arrive.
+    double phone_auto_final_head_ms = 0.0;
     // Current Region Ring runtime has independent CPU and CUDA compute lanes.
     // Keep this switch only so tests can compare the historical gated model.
     bool pc_compute_gate = false;
@@ -678,6 +695,21 @@ inline bool simulate(const model & m,
             llama_region_ring_has_directional_stages(regions)) {
         return reject("PHONE_FULL_STREAM_DIRECTIONAL_UNSUPPORTED");
     }
+    if ((m.phone_autonomous_prebuild &&
+            (!m.phone_full_return_stream || m.slot_pool != 0)) ||
+        (m.phone_autonomous_final &&
+            (!m.phone_autonomous_prebuild ||
+             regions.back().kind != llama_region_ring_stage_kind::PHONE)) ||
+        !std::isfinite(m.phone_auto_final_head_ms) ||
+        m.phone_auto_final_head_ms < 0.0 ||
+        !std::isfinite(m.phone_auto_setup_per_graph_ms) ||
+        m.phone_auto_setup_per_graph_ms < -1.0) {
+        return reject("PHONE_AUTONOMOUS_MODEL_INVALID");
+    }
+    c.phone_auto_setup_ms = 0.0;
+    c.phone_auto_head_ms = 0.0;
+    c.phone_auto_terminal_frames = 0;
+    c.phone_auto_terminal_bytes = 0;
     c.phone_full_stream_frames = 0;
     c.phone_full_stream_bytes = 0;
     c.transfer_event_count = {};
@@ -753,7 +785,18 @@ inline bool simulate(const model & m,
                     embedded_directional, registration_ms)) {
                 return reject("PHONE_REGISTRATION_PROFILE_MISSING");
             }
-            ms += registration_ms;
+            const bool autonomous_graph =
+                m.phone_autonomous_prebuild &&
+                region.kind == llama_region_ring_stage_kind::PHONE &&
+                r > 0 && (r + 1 < regions.size() ||
+                          m.phone_autonomous_final);
+            if (autonomous_graph) {
+                c.phone_auto_setup_ms +=
+                    m.phone_auto_setup_per_graph_ms >= 0.0 ?
+                        m.phone_auto_setup_per_graph_ms : registration_ms;
+            } else {
+                ms += registration_ms;
+            }
 
             task t;
             t.region = (int) r;
@@ -970,6 +1013,44 @@ inline bool simulate(const model & m,
             }
         }
     }
+    // Final autonomous Phone also publishes a full l_out frame for EVERY
+    // Chunk, including the 38-token tail. There is no downstream Region,
+    // but the PC Head can start only after all frames are drained. This
+    // mirrors the real PC "ready.all_done() -> Head" barrier.
+    int terminal_returns_pending = 0;
+    if (m.phone_autonomous_final) {
+        const size_t r = regions.size() - 1;
+        for (const int src : by_region[r]) {
+            const auto & producer = tasks[(size_t) src];
+            const size_t bytes =
+                (size_t) (producer.end - producer.begin) *
+                (size_t) m.hidden * sizeof(float);
+            double ms = 0.0;
+            if (!m.transfer_ms(device::PHONE, device::CPU, bytes, ms) ||
+                    !std::isfinite(ms) || ms < 0.0) {
+                return reject("TERMINAL_PHONE_RETURN_PROFILE_MISSING");
+            }
+            edge frame;
+            frame.producer = src;
+            frame.consumer = -1; // P2C to PC Head, not another Region task.
+            frame.lane = m.shared_phone_link ? 1 : 2;
+            frame.duration = ms;
+            frame.payload_bytes = bytes;
+            const int edge_id = (int) edges.size();
+            edges.push_back(std::move(frame));
+            outgoing_edges[(size_t) src].push_back(edge_id);
+            ++terminal_returns_pending;
+            ++c.transfer_event_count[2];
+            ++c.stage_copy_call_proxy_count[2];
+            c.transfer_service_ms[2] += ms;
+            c.transfer_payload_bytes[2] += (uint64_t) bytes;
+            ++c.phone_full_stream_frames;
+            c.phone_full_stream_bytes += (uint64_t) bytes;
+            ++c.phone_auto_terminal_frames;
+            c.phone_auto_terminal_bytes += (uint64_t) bytes;
+        }
+    }
+
     for (auto & t : tasks) {
         t.remaining_outputs = t.outputs;
     }
@@ -1088,6 +1169,16 @@ inline bool simulate(const model & m,
         if (e.release_phone_worker_on_complete) {
             device_busy[(size_t) device::PHONE] = false;
         }
+        if (e.consumer < 0) {
+            // Terminal P2C frame completed. It has no Region consumer, but
+            // must drain before the zero-layer PC Head may be scheduled.
+            if (!m.phone_autonomous_final ||
+                    terminal_returns_pending <= 0) {
+                return false;
+            }
+            --terminal_returns_pending;
+            return true;
+        }
         const auto publish = [&](int consumer_id) {
             auto & consumer = tasks[(size_t) consumer_id];
             if (--consumer.inputs < 0) {
@@ -1177,7 +1268,7 @@ inline bool simulate(const model & m,
     int max_live = 0;
     const int n_tasks = (int) tasks.size();
 
-    while (completed < n_tasks) {
+    while (completed < n_tasks || terminal_returns_pending > 0) {
         bool scheduled = false;
 
         if (m.gpu_weight_streaming &&
@@ -1537,7 +1628,12 @@ inline bool simulate(const model & m,
         return reject("PC_GATE_OVERCOMMITTED");
     }
 
-    c.wall_ms = now;
+    // Registration ran BEFORE workers; Head executes AFTER all P2C frames.
+    // Keep both outside Phone compute/CPU Lane demand. In particular, their
+    // fixed setup cost cannot artificially occupy the per-Chunk Phone lane.
+    c.phone_auto_head_ms = m.phone_autonomous_final ?
+        m.phone_auto_final_head_ms : 0.0;
+    c.wall_ms = now + c.phone_auto_setup_ms + c.phone_auto_head_ms;
     c.pc_gate_busy_ms = m.pc_compute_gate ?
         busy_ms[(int) device::CPU] + busy_ms[(int) device::GPU] : 0.0;
     c.pc_compute_bound_ms = m.pc_compute_gate ?
@@ -2065,7 +2161,12 @@ inline bool estimate_region_ring_balance(
                 registration_ms)) {
             return false;
         }
-        ms += registration_ms;
+        if (!(m.phone_autonomous_prebuild &&
+              region.kind == llama_region_ring_stage_kind::PHONE &&
+              ri > 0 && (ri + 1 < regions.size() ||
+                         m.phone_autonomous_final))) {
+            ms += registration_ms;
+        }
         stage_sum[(size_t) d] += ms / x;
         ++stage_count[(size_t) d];
     }
@@ -2133,7 +2234,9 @@ inline bool estimate_balance(const model & m, candidate & c) {
             c.p, c.xp, false, registration_ms)) {
         return false;
     }
-    tp += registration_ms;
+    if (!m.phone_autonomous_prebuild) {
+        tp += registration_ms;
+    }
 
     // Same E equations as before; the link terms now account for the
     // producer/consumer interval intersections, including non-multiple X.
@@ -3238,7 +3341,9 @@ inline result search_runtime_applicable(
                             layers, x, false, reg_ms)) {
                         continue;
                     }
-                    duration_ms += reg_ms;
+                    if (!m.phone_autonomous_prebuild) {
+                        duration_ms += reg_ms;
+                    }
                 }
                 service[(size_t) dev][xi][(size_t) layers] =
                     duration_ms / x;

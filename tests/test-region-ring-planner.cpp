@@ -508,6 +508,70 @@ int main() {
         REQUIRE(all64.phone_full_stream_bytes ==
                 uint64_t(2) * 358 * 5120 * sizeof(float));
         REQUIRE(phone_to_gpu_payloads.size() == 12);
+
+        // Phone-autonomous final L39 returns six additional frames to the
+        // PC Head. Pre-registration happens before the DAG, so no Graph
+        // registration time is charged to the Phone compute lane.
+        model final = stream;
+        final.phone_autonomous_prebuild = true;
+        final.phone_autonomous_final = true;
+        final.phone_auto_setup_per_graph_ms = 7.0;
+        final.phone_auto_final_head_ms = 11.0;
+        final.phone_registration_cost =
+            [](llama_region_ring_stage_kind kind, int, int, bool,
+               double & ms) {
+                ms = kind == llama_region_ring_stage_kind::PHONE ? 5.0 : 0.0;
+                return true;
+            };
+        candidate autonomous = all64;
+        REQUIRE(simulate(final, layout, autonomous, &why));
+        REQUIRE(autonomous.tasks == all64.tasks);
+        REQUIRE(autonomous.phone_full_stream_frames == 18);
+        REQUIRE(autonomous.phone_auto_terminal_frames == 6);
+        REQUIRE(autonomous.phone_auto_terminal_bytes ==
+                uint64_t(358) * 5120 * sizeof(float));
+        REQUIRE(autonomous.phone_full_stream_bytes ==
+                uint64_t(3) * 358 * 5120 * sizeof(float));
+        REQUIRE(autonomous.transfer_event_count[2] ==
+                all64.transfer_event_count[2] + 6);
+        REQUIRE(std::fabs(autonomous.phone_auto_setup_ms - 126.0) < 1e-6);
+        REQUIRE(std::fabs(autonomous.phone_auto_head_ms - 11.0) < 1e-6);
+
+        model no_head = final;
+        no_head.phone_auto_final_head_ms = 0.0;
+        candidate no_head_plan = all64;
+        REQUIRE(simulate(no_head, layout, no_head_plan, &why));
+        REQUIRE(std::fabs(autonomous.wall_ms -
+                no_head_plan.wall_ms - 11.0) < 1e-6);
+        REQUIRE(std::fabs(autonomous.busy_ms[(size_t) device::PHONE] -
+                no_head_plan.busy_ms[(size_t) device::PHONE]) < 1e-6);
+
+        model more_setup = final;
+        more_setup.phone_auto_setup_per_graph_ms = 9.0;
+        candidate more_setup_plan = all64;
+        REQUIRE(simulate(more_setup, layout, more_setup_plan, &why));
+        REQUIRE(std::fabs(more_setup_plan.wall_ms -
+                autonomous.wall_ms - 36.0) < 1e-6);
+
+        model invalid_autonomous = final;
+        invalid_autonomous.phone_full_return_stream = false;
+        candidate invalid_plan = all64;
+        REQUIRE(!simulate(invalid_autonomous, layout, invalid_plan, &why));
+        REQUIRE(why == "PHONE_AUTONOMOUS_MODEL_INVALID");
+
+        // A single final Phone Region also drains all its P2C frames.
+        const std::vector<llama_region_ring_region> one_final {
+            {device::CPU, 0, 1}, {device::PHONE, 1, 2}
+        };
+        final.layers = 2;
+        candidate final_only;
+        final_only.xc = final_only.xg = final_only.xp = 64;
+        REQUIRE(simulate(final, one_final, final_only, &why));
+        REQUIRE(final_only.phone_full_stream_frames == 6);
+        REQUIRE(final_only.phone_auto_terminal_frames == 6);
+        REQUIRE(final_only.phone_auto_terminal_bytes ==
+                uint64_t(358) * 5120 * sizeof(float));
+        REQUIRE(final_only.tasks == 12);
     }
 
     // A big Phone Chunk must NOT unblock an early small GPU Chunk at the
