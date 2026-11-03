@@ -50,9 +50,12 @@ configurations.
 Phase A is an experimental transport path and has **not** been validated on the
 Windows/Android hardware yet. In particular, a full 128 MiB backlog of chunks
 with unfavorable causal ordering can still need a protocol-level scheduling
-guarantee to avoid an input-dependency deadlock; initial validation should use
-the 358-token / 20.977 MiB case, then 1024-token experiments before larger
-contexts. The aggregate Phone recv/hash timing fields in the old ACK are zero
+guarantee to avoid an input-dependency deadlock. Until the autonomous local
+scheduler is implemented, this build therefore rejects a single ubatch whose
+total predicted Phone input payload exceeds 120 MiB (8 MiB safety headroom).
+Initial validation should use the 358-token / 20.977 MiB case, then 1024-token
+experiments. The Phone emits one [PHONE_INPUT_STREAM_SUM] line at run end with
+receiver, hash and APPLY-wait costs. The aggregate Phone recv/hash timing fields in the old ACK are zero
 for stream mode, because there is no ACK. Do not interpret them as zero cost.
 
 ## Phase B requirements: true Phone-local execution
