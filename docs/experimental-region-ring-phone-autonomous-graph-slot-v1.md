@@ -128,8 +128,8 @@ PC's Phone Worker no longer invokes `PHONE_AUTO_WAIT` or
 `PHONE_AUTO_WAIT_CAPTURE`. Phone's Compute Worker captures the verified
 output into the Arena, while the dedicated P2C sender streams the frame.
 PC Receiver remains the only owner of downstream READY, after full frame
-receipt. A failed Phone prepare/compute/capture aborts the Arena, sending a
-P2C ERROR rather than silently hanging the PC Receiver.
+receipt. A failed Phone input verification, prepare, compute or capture aborts
+the Arena, sending a P2C ERROR rather than silently hanging the PC Receiver.
 
 Only **non-final Phone Full Regions** run autonomously in this phase.
 The final Phone Full Region, any tiny startup/warmup request and one-token

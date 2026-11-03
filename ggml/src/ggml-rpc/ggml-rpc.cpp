@@ -6995,9 +6995,9 @@ bool rpc_server::phone_auto_wait(const rpc_msg_phone_auto_wait_req & request) {
         it->second->state == phone_auto_status::COMPLETE;
 }
 
-// The only per-Chunk Phone Full output bridge on the PC hot path. The
-// registered Phone graph has already executed and copied its output back to
-// private, persistent remote storage. Nothing here recompiles a Meta graph.
+// Common checked P2C capture for the old explicit WAIT_CAPTURE RPC and
+// the patch26 Phone-owned completion event. The proactive caller skips WAIT
+// and never sends a per-Chunk command to PC. Nothing recompiles Meta Graph.
 bool rpc_server::phone_auto_wait_capture(
         const rpc_msg_phone_auto_wait_capture_req & request,
         bool phone_owned) {
@@ -7461,6 +7461,27 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
         // The callback never holds phone_input_mutex while taking the
         // autonomous scheduler mutex; lock order stays acyclic.
         phone_auto_input_verified(request.key);
+    } else if (request.key.run_id != 0) {
+        // In proactive mode no PC WAIT exists to surface a verification
+        // failure. An invalid/duplicate PUSH for a registered job must
+        // cancel its P2C session rather than deadlocking the PC Receiver.
+        bool autonomous_failure = false;
+        {
+            std::lock_guard<std::mutex> guard(phone_auto_mutex);
+            const auto it = phone_auto_jobs.find(auto_key(request.key));
+            if (it != phone_auto_jobs.end()) {
+                autonomous_failure = true;
+                it->second->state = phone_auto_status::FAILED;
+            }
+        }
+        if (autonomous_failure) {
+            GGML_LOG_ERROR(
+                "[PHONE_AUTO_P2C] event=ABORT run=%" PRIu64
+                " region=%u chunk=%u reason=INPUT_VERIFY_OR_DUPLICATE\n",
+                request.key.run_id, request.key.region, request.key.chunk);
+            phone_auto_cv.notify_all();
+            p2c_arena.abort();
+        }
     }
 }
 
