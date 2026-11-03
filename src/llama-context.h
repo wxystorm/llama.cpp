@@ -9,6 +9,7 @@
 #include "llama-memory.h"
 
 #include "ggml-cpp.h"
+#include "ggml-backend.h"
 #include "ggml-opt.h"
 
 #include <array>
