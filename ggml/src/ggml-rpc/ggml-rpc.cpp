@@ -6424,7 +6424,7 @@ bool rpc_server::phone_input_stream_run(
             " frames=%" PRIu64 " verified=%" PRIu64
             " applied=%" PRIu64 " errors=%" PRIu64
             " payload_mib=%.3f recv_ms=%.3f hash_ms=%.3f"
-            " apply_wait_ms=%.3f status=END\\n",
+            " apply_wait_ms=%.3f status=END\n",
             request.run_id, report.frames, report.verified,
             report.applied, report.errors,
             report.payload_bytes / 1048576.0,
