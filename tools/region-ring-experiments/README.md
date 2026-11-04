@@ -647,6 +647,32 @@ The experiment data logger is opt-in via
 messages are saved to `engine.stderr.log`. No raw CLI content or detailed
 per-Chunk traces appear in the terminal.
 
+## Fixed layout without startup profiling
+
+For a repeatable PC/Phone runtime trace, use `-SkipProfile` together with
+`-Planner apply-wide`, `-ForceLayout`, and all three `-ForceXC/-ForceXG/-ForceXP`
+arguments. This skips the model-load Hybrid synthetic compute/network profile
+and automatic Planner search; it does **not** disable runtime timing,
+Phone autonomous Graph registration, or the mandatory GPU Bank preload.
+The model adopts the explicit layout before weights are placed. Missing or
+invalid forced parameters abort instead of falling back to an implicit plan.
+
+~~~powershell
+.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
+  -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir ".\single-prompt-512" `
+  -Out ".\planner-test-results-512-trace" `
+  -Planner apply-wide -SkipProfile `
+  -ForceLayout "G9,P1,G9,P1,G9,P1,G9,P1" `
+  -ForceXC 64 -ForceXG 128 -ForceXP 128
+~~~
+
+The sweep reports `skip_profile=True` and the actual runtime layout.
+DAG predicted time is intentionally empty in this mode (no Planner search
+has run). Rebuild the PC executable after updating C++, otherwise the
+new script flag cannot bypass profiling in the older binary.
+
 ## Timing interpretation
 
 - **Official prefill throughput** is `actual_prefill_tokens * 1000 / prefill_ms`.
