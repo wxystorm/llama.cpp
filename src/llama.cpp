@@ -408,6 +408,23 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const bool ring_plan_topology_preview =
             ring_planner_env != nullptr &&
             std::strcmp(ring_planner_env,"topology-preview") == 0;
+        // Fixed-layout benchmarks can bypass the synthetic Hybrid Profile and
+        // the Planner search entirely. Unlike FORCE_LAYOUT in APPLY_WIDE, this
+        // branch runs before weight placement and owns the model's exact chunks.
+        const char * ring_skip_profile_raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_SKIP_PROFILE");
+        const bool ring_skip_profile =
+            ring_skip_profile_raw != nullptr &&
+            std::strcmp(ring_skip_profile_raw, "1") == 0;
+        if (ring_skip_profile &&
+                (!ring_plan_apply_wide || !llama_region_ring_enabled() ||
+                 params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
+                 params.hybrid_auto)) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_REJECT] mode=SKIP_PROFILE "
+                "reason=REQUIRES_APPLY_WIDE_RING_TENSOR_WITHOUT_HYBRID_AUTO\n");
+            return {-1, nullptr};
+        }
         if (ring_plan_apply_requested &&
                 (!llama_region_ring_enabled() ||
                  params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
@@ -435,7 +452,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             llama_region_ring_enabled() &&
             (ring_plan_dry_run || ring_plan_apply_requested ||
              ring_plan_topology_preview);
-        if ((params.hybrid_auto || ring_planner_profile_requested) &&
+        if (!ring_skip_profile &&
+                (params.hybrid_auto || ring_planner_profile_requested) &&
                 params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             llama_hybrid_plan best;
             LLAMA_LOG_INFO("[HYBRID_AUTO] profiling begins, target_ctx=%u target_ubatch=%u "
@@ -495,7 +513,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             (void) llama_hybrid_region_ring_planner_topology_preview(
                 target_tokens,0,chunk_tokens);
         }
-        if (ring_plan_apply_requested) {
+        if (ring_plan_apply_requested && !ring_skip_profile) {
             if (ring_plan_apply_baseline) {
                 if (const char * requested =
                         std::getenv("LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT")) {
@@ -611,6 +629,77 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             model->load_hparams(ml); //这个函数是将加载好的gguf文件中的hparams信息加载到model->hparams中，llama_model_loader只是加载数据，而这个函数会对其进行解析
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (ring_skip_profile) {
+            const char * layout_raw =
+                std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+            const char * xc_raw =
+                std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XC");
+            const char * xg_raw =
+                std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XG");
+            const char * xp_raw =
+                std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XP");
+            auto parse_chunk = [](const char * raw, int & chunk) {
+                if (raw == nullptr || *raw == '\0') {
+                    return false;
+                }
+                char * end = nullptr;
+                const long value = std::strtol(raw, &end, 10);
+                if (end == raw || *end != '\0' || value < 1 || value > 1024) {
+                    return false;
+                }
+                chunk = (int) value;
+                return true;
+            };
+            int xc = 0;
+            int xg = 0;
+            int xp = 0;
+            if (layout_raw == nullptr || *layout_raw == '\0' ||
+                    !parse_chunk(xc_raw, xc) ||
+                    !parse_chunk(xg_raw, xg) ||
+                    !parse_chunk(xp_raw, xp)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=SKIP_PROFILE "
+                    "reason=REQUIRES_FORCE_LAYOUT_XC_XG_XP\n");
+                return {-1, nullptr};
+            }
+            std::vector<llama_region_ring_region> fixed_regions;
+            try {
+                fixed_regions = llama_region_ring_parse_apply_wide_layout(
+                    layout_raw, model->hparams.n_layer());
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=SKIP_PROFILE "
+                    "reason=INVALID_LAYOUT detail=%s\n", e.what());
+                return {-1, nullptr};
+            }
+            const bool topology_ok =
+                llama_region_ring_apply_topology_compatible(
+                    fixed_regions, model->hparams.n_layer()) ||
+                llama_region_ring_single_cycle_force_compatible(
+                    fixed_regions, model->hparams.n_layer());
+            if (!topology_ok || fixed_regions.empty() ||
+                    fixed_regions.back().device !=
+                        llama_region_ring_device::PHONE) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_REJECT] mode=SKIP_PROFILE "
+                    "reason=UNSUPPORTED_TOPOLOGY_OR_FINAL_OWNER\n");
+                return {-1, nullptr};
+            }
+            llama_hybrid_runtime_plan_clear();
+            model->hybrid_ring_plan_layout =
+                llama_region_ring_layout_string(fixed_regions);
+            model->hybrid_ring_plan_mode = "APPLY_WIDE";
+            model->hybrid_ring_plan_chunk_tokens = 0;
+            model->hybrid_ring_plan_cpu_chunk_tokens = xc;
+            model->hybrid_ring_plan_gpu_chunk_tokens = xg;
+            model->hybrid_ring_plan_phone_chunk_tokens = xp;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
+                "phase=MODEL_LOAD applied=1 source=FORCED_SKIP_PROFILE "
+                "layout=%s XC=%d XG=%d XP=%d "
+                "profile=SKIPPED search=SKIPPED status=MODEL_OWNED\n",
+                model->hybrid_ring_plan_layout.c_str(), xc, xg, xp);
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
