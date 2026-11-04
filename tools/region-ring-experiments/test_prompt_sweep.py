@@ -50,6 +50,42 @@ class ExperimentReportTests(unittest.TestCase):
                     rows = list(csv.DictReader(f))
                 self.assertEqual(rows[0]["no_mmap"], str(enabled))
 
+    def test_skip_profile_requires_force_and_sets_environment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "completion.exe"
+            exe.write_bytes(b"stub")
+            model = root / "model.gguf"
+            model.write_bytes(b"stub")
+            prompts = root / "prompts"
+            prompts.mkdir()
+            (prompts / "prompt_512.txt").write_text("test", encoding="utf-8")
+            base = ["run_prompt_sweep.py", "--exe", str(exe),
+                    "--model", str(model), "--rpc", "127.0.0.1:10031",
+                    "--prompt-dir", str(prompts), "--out", str(root / "runs"),
+                    "--dry-run", "--skip-profile"]
+            with patch.object(sys, "argv", base), redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    SWEEP.main()
+            self.assertEqual(error.exception.code, 2)
+            force = ["--force-layout", "G9,P1,G9,P1,G9,P1,G9,P1",
+                     "--force-xc", "64", "--force-xg", "128",
+                     "--force-xp", "128"]
+            with patch.object(sys, "argv", base + force), redirect_stdout(io.StringIO()):
+                self.assertEqual(SWEEP.main(), 0)
+            config_path = next((root / "runs").glob("*/prompt_512/config.json"))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertTrue(config["skip_profile"])
+            self.assertEqual(config["ring_environment"][
+                "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE"], "1")
+            self.assertEqual(config["ring_environment"][
+                "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
+                "G9,P1,G9,P1,G9,P1,G9,P1")
+            with (config_path.parent.parent / "summary.csv").open(
+                    encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["skip_profile"], "True")
+
     def test_phone_input_push_timeline_only_measured_chunks(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
