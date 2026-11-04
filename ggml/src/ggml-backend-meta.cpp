@@ -62,6 +62,14 @@ uint64_t ggml_backend_meta_phone_auto_registered_uid() {
     return ggml_meta_phone_auto_tls.registered_uid;
 }
 
+// Scope compact scratch tensor metadata to autonomous Phone template
+// allocation. This is independent of the registration/wait action state.
+static thread_local bool ggml_meta_phone_auto_compact_alloc = false;
+
+void ggml_backend_meta_phone_auto_compact_alloc(bool enabled) {
+    ggml_meta_phone_auto_compact_alloc = enabled;
+}
+
 // The outer Region Ring Phone worker owns this scope. Never derive it from
 // a process-global environment variable: other worker threads and decode
 // must continue to execute ordinary Meta output handoffs.
@@ -2253,11 +2261,32 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     const int64_t total_begin_us = ggml_time_us();
     const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
 
+    // The legacy budget preallocates one million tensor metadata slots
+    // for each of three scratch containers and each simple backend.
+    // Phone-autonomous graph registration retains one Meta Buffer per
+    // Chunk; use a bounded budget for those short immutable graphs only.
+    constexpr size_t normal_tensor_capacity = 1024 * 1024;
+    constexpr size_t phone_auto_tensor_capacity = 8192;
+    const size_t tensor_capacity =
+        ggml_meta_phone_auto_compact_alloc ?
+            phone_auto_tensor_capacity : normal_tensor_capacity;
     const ggml_init_params params = {
-        /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+        /*.mem_size   =*/ tensor_capacity * ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
+    if (ggml_meta_phone_auto_compact_alloc) {
+        static thread_local bool logged_compact = false;
+        if (!logged_compact) {
+            GGML_LOG_INFO(
+                "[META_PHONE_AUTO_CONTEXT] mode=COMPACT "
+                "tensors_per_context=%zu contexts_per_buffer=%zu "
+                "scratch_metadata_mib=%.3f status=READY\n",
+                tensor_capacity, n_simple_bufts * 3,
+                (n_simple_bufts * 3 * params.mem_size) / 1048576.0);
+            logged_compact = true;
+        }
+    }
     ggml_backend_meta_simple_tensor_container stc_static;
     ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
     ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
