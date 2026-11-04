@@ -6968,10 +6968,11 @@ bool rpc_server::phone_auto_task_register(
         }
         phone_npu_region_layer[request.key.region] = layer;
         GGML_LOG_INFO(
-            "[PHONE_NPU_SERIAL] event=REGISTER region=%u layer=%d "
-            "chunk=%u uid=%" PRIu64 " backend=HTP0 status=READY\n",
-            request.key.region, layer, request.key.chunk,
-            request.graph_uid);
+            "[PHONE_NPU_SERIAL] event=REGISTER run=%" PRIu64
+            " region=%u layer=%d chunk=%u tokens=%u "
+            "uid=%" PRIu64 " backend=HTP0 status=READY\n",
+            request.key.run_id, request.key.region, layer,
+            request.key.chunk, request.n_tokens, request.graph_uid);
     }
     const auto & slot_plan = it->second.slot0;
     size_t output_count = 0;
@@ -7495,15 +7496,17 @@ void rpc_server::phone_auto_compute_loop() {
                     why = "HTP_OUTPUT_NOT_UNIQUE";
                 }
                 GGML_LOG_INFO(
-                    "[PHONE_NPU_SERIAL] event=EXECUTE region=%u layer=%d "
-                    "chunk=%u uid=%" PRIu64 " backend=HTP0 "
+                    "[PHONE_NPU_SERIAL] event=EXECUTE run=%" PRIu64
+                    " region=%u layer=%d chunk=%u tokens=%u "
+                    "uid=%" PRIu64 " backend=HTP0 "
                     "stage_ms=%.3f compute_ms=%.3f return_ms=%.3f "
                     "status=%s reason=%s\n",
-                    req.key.region,
+                    req.key.run_id, req.key.region,
                     phone_npu_region_layer.count(req.key.region) ?
                         phone_npu_region_layer.at(req.key.region) : -1,
-                    req.key.chunk, req.graph_uid, stage_ms, htp_ms,
-                    return_ms, ok ? "PASS" : "FAIL",
+                    req.key.chunk, req.n_tokens, req.graph_uid,
+                    stage_ms, htp_ms, return_ms,
+                    ok ? "PASS" : "FAIL",
                     ok ? "NONE" : why.c_str());
             } else if (it != stored_graphs[req.device].end() &&
                     it->second.graph != nullptr &&
