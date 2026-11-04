@@ -26,7 +26,7 @@ FIELDS = [
     "prefill_ms", "prefill_tps", "decode_ms", "decode_tps",
     "load_ms", "total_llama_ms", "process_wall_ms", "status", "exit_code",
     "model", "model_size_bytes", "commit", "prompt_sha256",
-    "planner_mode", "plan_applied", "plan_layout", "runtime_layout",
+    "planner_mode", "skip_profile", "plan_applied", "plan_layout", "runtime_layout",
     "gpu_layers", "cpu_layers", "phone_layers", "tensor_layers",
     "xc", "xg", "xp", "context", "batch", "ubatch", "threads", "seed",
     "n_predict", "gpu_weight_streaming", "no_mmap", "predicted_ms", "baseline_predicted_ms",
@@ -350,6 +350,7 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "commit": commit,
         "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
         "planner_mode": args.planner,
+        "skip_profile": args.skip_profile,
         "plan_applied": plan.get("applied"),
         "plan_layout": plan.get("selected_layout"),
         "runtime_layout": runtime_layout,
@@ -573,6 +574,8 @@ def main():
     ap.add_argument("--force-xc", type=int)
     ap.add_argument("--force-xg", type=int)
     ap.add_argument("--force-xp", type=int)
+    ap.add_argument("--skip-profile", action="store_true",
+                    help="skip Hybrid profiling and Planner search for a forced layout")
     ap.add_argument("--no-mmap", action="store_true",
                     help="disable memory mapping when loading the model")
     ap.add_argument("--dry-run", action="store_true")
@@ -596,6 +599,11 @@ def main():
     prompts.sort(key=lambda x: (x[0], x[1].name))
     if not prompts:
         ap.error(f"no prompt_*.txt files found in {args.prompt_dir}")
+    if args.skip_profile and (
+            args.planner != "apply-wide" or not args.force_layout or
+            not all(isinstance(x, int) and x > 0
+                    for x in (args.force_xc, args.force_xg, args.force_xp))):
+        ap.error("--skip-profile requires --planner apply-wide and full --force-layout/xc/xg/xp")
     root = Path(__file__).resolve().parents[2]
     commit = git_head(root)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -615,12 +623,15 @@ def main():
                     "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XC",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XG",
-                    "LLAMA_HYBRID_REGION_RING_FORCE_XP"):
+                    "LLAMA_HYBRID_REGION_RING_FORCE_XP",
+                    "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE"):
             env.pop(key, None)
         env.update({
             "LLAMA_HYBRID_REGION_RING_V1": "1",
             "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
             "LLAMA_HYBRID_REGION_RING_PLANNER": args.planner,
+            "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE":
+                "1" if args.skip_profile else "0",
             "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(hint),
             "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS":
                 str(args.baseline_chunk_tokens),
@@ -657,6 +668,7 @@ def main():
             "prompt_file": str(prompt), "prompt_hint": hint,
             "commit": commit, "log_verbosity": args.log_verbosity,
             "no_mmap": args.no_mmap,
+            "skip_profile": args.skip_profile,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
