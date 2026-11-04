@@ -1641,6 +1641,81 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    // A fixed Region Ring plan must be installed before layer ownership is
+    // derived below. Doing this after load_hparams() would leave the default
+    // Ring placement embedded in hybrid_layer_modes and pc_layer_backends.
+    const char * skip_profile_raw =
+        std::getenv("LLAMA_HYBRID_REGION_RING_SKIP_PROFILE");
+    if (skip_profile_raw != nullptr &&
+            std::strcmp(skip_profile_raw, "1") == 0) {
+        if (!llama_region_ring_enabled() ||
+                params.split_mode != LLAMA_SPLIT_MODE_TENSOR ||
+                !llama_hybrid_arch_supported(arch)) {
+            throw std::runtime_error(
+                "SKIP_PROFILE requires a supported Region Ring TENSOR model");
+        }
+        const char * layout_raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+        const char * xc_raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XC");
+        const char * xg_raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XG");
+        const char * xp_raw =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XP");
+        const auto parse_chunk = [](const char * raw, int & chunk) -> bool {
+            if (raw == nullptr || *raw == '\0') {
+                return false;
+            }
+            char * end = nullptr;
+            const long value = std::strtol(raw, &end, 10);
+            if (end == raw || *end != '\0' ||
+                    value < 1 || value > 1024) {
+                return false;
+            }
+            chunk = (int) value;
+            return true;
+        };
+        int xc = 0;
+        int xg = 0;
+        int xp = 0;
+        if (layout_raw == nullptr || *layout_raw == '\0' ||
+                !parse_chunk(xc_raw, xc) ||
+                !parse_chunk(xg_raw, xg) ||
+                !parse_chunk(xp_raw, xp)) {
+            throw std::runtime_error(
+                "SKIP_PROFILE requires FORCE_LAYOUT and valid FORCE_XC/XG/XP");
+        }
+        const auto forced_regions =
+            llama_region_ring_parse_apply_wide_layout(
+                layout_raw, hparams.n_layer());
+        const bool topology_ok =
+            llama_region_ring_apply_topology_compatible(
+                forced_regions, hparams.n_layer()) ||
+            llama_region_ring_single_cycle_force_compatible(
+                forced_regions, hparams.n_layer());
+        if (!topology_ok || forced_regions.empty() ||
+                forced_regions.back().device !=
+                    llama_region_ring_device::PHONE) {
+            throw std::runtime_error(
+                "SKIP_PROFILE forced layout is not a supported Phone-final topology");
+        }
+        llama_hybrid_runtime_plan_clear();
+        hybrid_ring_plan_layout =
+            llama_region_ring_layout_string(forced_regions);
+        hybrid_ring_plan_mode = "APPLY_WIDE";
+        hybrid_ring_plan_chunk_tokens = 0;
+        hybrid_ring_plan_cpu_chunk_tokens = xc;
+        hybrid_ring_plan_gpu_chunk_tokens = xg;
+        hybrid_ring_plan_phone_chunk_tokens = xp;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
+            "phase=MODEL_LOAD applied=1 source=FORCED_SKIP_PROFILE "
+            "layout=%s XC=%d XG=%d XP=%d "
+            "profile=SKIPPED search=SKIPPED "
+            "placement_policy=PRE_HPARAMS_FINALIZED status=MODEL_OWNED\n",
+            hybrid_ring_plan_layout.c_str(), xc, xg, xp);
+    }
+
     const bool hybrid_arch =
         llama_hybrid_arch_supported(arch);
     if (hybrid_arch && params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
