@@ -484,6 +484,9 @@ extern "C" {
     GGML_API void ggml_backend_meta_phone_auto_context(
         int action, uint64_t run_id, uint32_t region, uint32_t chunk);
     GGML_API uint64_t ggml_backend_meta_phone_auto_registered_uid();
+    // Scope compact Meta scratch-tensor contexts to Phone autonomous graph
+    // pre-registration. Other Meta allocations retain their normal budget.
+    GGML_API void ggml_backend_meta_phone_auto_compact_alloc(bool enabled);
 
     enum ggml_backend_meta_split_axis {
         // tensor split by tensor dimensions:
