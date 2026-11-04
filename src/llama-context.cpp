@@ -3856,18 +3856,47 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // only the load-time preload path could restore the global flag.
     // Validate the actual resident pair instead of rejecting a correct pair
     // merely because the redundant global flag was left false.
-    const std::array<bool, 2> initial_bank_ready = {{
-        region_ring_worker_resources[1].bank_ready,
-        region_ring_worker_resources[2].bank_ready,
-    }};
-    const std::array<size_t, 2> initial_bank_regions = {{
-        region_ring_worker_resources[1].bank_region,
-        region_ring_worker_resources[2].bank_region,
-    }};
-    const bool initial_banks_ready =
-        gpu_bank_streaming &&
-        llama_region_ring_gpu_initial_banks_match(
-            gpu_region_order, initial_bank_ready, initial_bank_regions);
+    const auto initial_banks_match = [&]() {
+        const std::array<bool, 2> ready = {{
+            region_ring_worker_resources[1].bank_ready,
+            region_ring_worker_resources[2].bank_ready,
+        }};
+        const std::array<size_t, 2> owners = {{
+            region_ring_worker_resources[1].bank_region,
+            region_ring_worker_resources[2].bank_region,
+        }};
+        return llama_region_ring_gpu_initial_banks_match(
+            gpu_region_order, ready, owners);
+    };
+    bool initial_banks_ready =
+        gpu_bank_streaming && initial_banks_match();
+
+    // A completed UBatch may finish with later GPU Regions in Banks A/B.
+    // The next UBatch restarts at its first two GPU Regions. Recover the
+    // initial window before dispatch, after the preceding UBatch workers
+    // and Bank mover have all joined. Cold-start failures remain strict.
+    if (gpu_bank_streaming && !initial_banks_ready &&
+            region_ring_initial_banks_loaded) {
+        const size_t old_a = region_ring_worker_resources[1].bank_region;
+        const size_t old_b = region_ring_worker_resources[2].bank_region;
+        const int64_t reload_begin_us = ggml_time_us();
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_BANK] phase=UBATCH_BOUNDARY "
+            "event=RESTORE_START bankA_region=%zu bankB_region=%zu "
+            "expectedA=%zu expectedB=%zu status=RELOADING\n",
+            old_a, old_b, gpu_region_order[0], gpu_region_order[1]);
+        const bool restored = region_ring_load_initial_gpu_banks();
+        initial_banks_ready = restored && initial_banks_match();
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_BANK] phase=UBATCH_BOUNDARY "
+            "event=RESTORE_DONE bankA_region=%zu bankB_region=%zu "
+            "expectedA=%zu expectedB=%zu wall_ms=%.3f status=%s\n",
+            region_ring_worker_resources[1].bank_region,
+            region_ring_worker_resources[2].bank_region,
+            gpu_region_order[0], gpu_region_order[1],
+            (ggml_time_us() - reload_begin_us) / 1000.0,
+            initial_banks_ready ? "READY" : "FAIL");
+    }
 
     if (gpu_bank_streaming && !initial_banks_ready) {
         LLAMA_LOG_ERROR(
