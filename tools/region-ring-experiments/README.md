@@ -921,6 +921,23 @@ op or allocation error is a **FAIL**, not a silent GPU fallback.
 4. Run a multi-Chunk / multi-UBatch context and compare final logits,
    especially the first Decode token after KV synchronization.
 
+For an automated **routing/KV** check after recording the Phone RPC log:
+
+```powershell
+python .\tools\region-ring-experiments\check_phone_npu_serial.py `
+  --phone-log .\phone-rpc-512.log `
+  --regions 3,7 --chunks 4
+```
+
+For a single-Layer first run, use `--regions 7` and set the
+Phone environment variable to `7`. This checker cannot prove logits
+parity; compare model outputs and per-layer tensors separately.
+The checker has an offline test:
+
+```powershell
+python .\tools\region-ring-experiments\test_check_phone_npu_serial.py
+```
+
 This is experimental and has **not** been compiled or tested on the
 Snapdragon/HTP device in this patch. The initial implementation
 intentionally copies full Layer weights and KV into private HTP
