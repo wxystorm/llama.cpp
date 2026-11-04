@@ -5056,7 +5056,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 // release remote RPC buffers still referenced by Phone
                 // stored_graphs. Count actual retained bytes so memory
                 // pressure is visible before the next registration.
-                const ggml_cgraph * created_graph =
+                ggml_cgraph * created_graph =
                     item.owned_res->get_gf();
                 const size_t metadata_bytes =
                     item.owned_res->buf_compute_meta.size();
@@ -5074,7 +5074,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         begin + item.tokens >= ubatch.n_tokens) {
                     LLAMA_LOG_INFO(
                         "[PHONE_AUTO_GRAPH_MEMORY] region=%zu chunk=%u "
-                        "tokens=%u graph_nodes=%d graph_leafs=%d "
+                        "tokens=%u graph_nodes=%d "
                         "node_budget=%zu graph_meta_mib=%.3f "
                         "meta_backend_mib=%.3f gpu_backend_mib=%.3f "
                         "cpu_backend_mib=%.3f registered=%zu "
@@ -5084,8 +5084,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         "cumulative_cpu_backend_mib=%.3f "
                         "status=RETAINED\n",
                         r, chunk, item.tokens,
-                        created_graph != nullptr ? created_graph->n_nodes : -1,
-                        created_graph != nullptr ? created_graph->n_leafs : -1,
+                        created_graph != nullptr ? ggml_graph_n_nodes(created_graph) : -1,
                         stage_max_nodes, metadata_bytes / 1048576.0,
                         allocated_bytes[0] / 1048576.0,
                         allocated_bytes[1] / 1048576.0,
