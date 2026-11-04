@@ -7479,6 +7479,12 @@ void rpc_server::phone_auto_compute_loop() {
                 double stage_ms = 0.0;
                 double htp_ms = 0.0;
                 double return_ms = 0.0;
+                // INPUT_APPLY may enqueue an asynchronous OpenCL write.
+                // The HTP mirror must not read it until that queue has
+                // completed. This is a required cross-device fence.
+                if (outputs == 1 && output != nullptr) {
+                    ggml_backend_synchronize(backends[req.device]);
+                }
                 const bool ok = outputs == 1 && output != nullptr &&
                     phone_npu_executor != nullptr &&
                     phone_npu_executor->run(it->second.graph, output, why,
