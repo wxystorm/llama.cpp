@@ -2261,7 +2261,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
     LLAMA_LOG_INFO("load_tensors: finished assigning layers to devices");
     // assign the output layer
-    if (!hybrid_layer_modes.empty()) {
+    // Autonomous terminal Phone Full publishes l_out to host memory, then
+    // executes RMSNorm + LM Head only on the PC CPU. Keep the Head weights
+    // on that same physical backend: Meta output weight buffers can contain
+    // multi-buffers which Meta cannot initialize in this CPU-only graph.
+    // Other hybrid modes retain their existing Meta output placement.
+    const char * phone_final_output_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
+    const bool phone_final_pc_head =
+        llama_region_ring_enabled() &&
+        arch == LLM_ARCH_QWEN3 &&
+        !hybrid_layer_modes.empty() &&
+        hybrid_layer_modes.back() == llama_hybrid_layer_mode::PHONE_ONLY &&
+        phone_final_output_env != nullptr &&
+        std::strcmp(phone_final_output_env, "1") == 0;
+    if (phone_final_pc_head) {
+        pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
+        LLAMA_LOG_INFO(
+            "[PHONE_AUTO_FINAL_HEAD] event=WEIGHT_PLACEMENT "
+            "backend=CPU reason=PC_ONLY_HEAD status=READY\n");
+    } else if (!hybrid_layer_modes.empty()) {
         if (meta_dev == nullptr) {
             throw std::runtime_error(format(
                 "%s: no Meta backend found for hybrid output", __func__));
