@@ -33,6 +33,7 @@
 #include <filesystem>
 #include <functional>
 #include <algorithm>
+#include <stdexcept>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
