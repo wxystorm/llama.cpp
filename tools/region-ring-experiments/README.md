@@ -833,3 +833,99 @@ single final real inference are unchanged. Network curves are not refitted.
 
 Offline tests: test-region-ring-planner; from tools/region-ring-experiments
 run python -m unittest test_build_real_stage_profile.py.
+
+## Experimental serial Phone GPU / Hexagon NPU Layer assignment
+
+The opt-in serial Phone HTP path lives on
+`feat/region-ring-phone-npu-layer-serial-20261104`.
+It preserves the **existing PC visible topology** (CPU + RPC0 / Phone
+GPUOpenCL), the `G/C/P` Layer parser, PC PUSH and P2C stream. A selected
+**whole Phone Region** executes on a privately initialized HTP0 backend
+instead of the OpenCL backend. All Phone GPU/HTP graphs share **one compute
+worker**, and cannot compute concurrently. This is Layer/Region ownership,
+**not** tensor parallelism or individual Attention/FFN splitting.
+
+The old NPU `Q4_K` / `Q6_K` support was restored from
+`feat/phone-gpu-npu-20261012`. Both the Android OpenCL and Hexagon
+backends need to be built and registered on the Phone. The HTP repack
+buffer must be enabled (`GGML_HEXAGON_HOSTBUF=1`, the default).
+
+### Phone RPC configuration
+
+Set this **on the Phone, before launching RPC Server**:
+
+```sh
+# Alternate complete Phone layers: P region 1 and 5 on GPU,
+# P region 3 and 7 on HTP. Indices are 0-based Region IDs.
+export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=3,7
+export GGML_RPC_REAL_STAGE_PROFILE=1
+
+# Use the Phone RPC Server already built with OpenCL + HTP support.
+./ggml-rpc-server --device GPUOpenCL -H 0.0.0.0 -p 50052
+```
+
+For the exact 40-layer `G9,P1,G9,P1,G9,P1,G9,P1` layout:
+
+| Region ID | Full Layer | Phone execution backend |
+| --- | --- | --- |
+| 1 | L9 | Adreno / OpenCL |
+| 3 | L19 | Hexagon / HTP0 |
+| 5 | L29 | Adreno / OpenCL |
+| 7 | L39 | Hexagon / HTP0 |
+
+Setting `GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7` routes all four
+Phone Layers to HTP; leaving it **unset** keeps the existing GPU-only
+behavior. Invalid region indices, missing HTP0, a non-OpenCL visible RPC
+device, multi-layer NPU Region or inconsistent Layer binding fail closed.
+
+### PC fixed-layout run
+
+The PC uses the same benchmark commands as GPU-only; **do not** expose
+HTP0 as a second RPC device on the PC. Use `-SkipProfile` so fixed
+Layout testing does not rerun the Planner's synthetic Profile:
+
+```powershell
+.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
+  -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir ".\single-prompt-512" `
+  -Out ".\planner-test-results-512-npu-serial" `
+  -Planner apply-wide -SkipProfile -Streaming on `
+  -NPredict 32 -Threads 8 -Batch 512 -UBatch 512 `
+  -ForceLayout "G9,P1,G9,P1,G9,P1,G9,P1" `
+  -ForceXC 64 -ForceXG 128 -ForceXP 128 `
+  -LogVerbosity 2
+```
+
+Phone-side evidence required before calling it an NPU run:
+`[PHONE_NPU_SERIAL] event=BACKEND_INIT`, one `REGISTER` for
+every selected Chunk, and `EXECUTE ... backend=HTP0 status=PASS`.
+The Phone serial NPU executor explicitly fences OpenCL input writes,
+copies dynamic inputs to HTP, runs one full-Layer graph, and copies the
+terminal `l_out` back into its original OpenCL output buffer before the
+unchanged P2C capture. At input-stream teardown it copies HTP KV back
+to the canonical OpenCL cache for the existing Decode path; verify
+`[PHONE_NPU_SERIAL] event=KV_SYNC ... status=PASS`. An HTP unsupported
+op or allocation error is a **FAIL**, not a silent GPU fallback.
+
+### First validation: correctness before throughput
+
+1. Run GPU-only with the same fixed Layout, prompt and seed; keep the
+   generated output, Prefill and Decode timing as baseline.
+2. Restart Phone Server with `GGML_RPC_PHONE_NPU_SERIAL_REGIONS=7` to
+   test one complete terminal Layer on HTP. Inspect registration,
+   `EXECUTE`, `KV_SYNC`, and numeric/output parity. Do not assume
+   a PASS status implies logits parity.
+3. Try `3,7` only if one-layer HTP correctness passes. Compare
+   Prefill, Phone `stage_ms / compute_ms / return_ms`, and Decode.
+4. Run a multi-Chunk / multi-UBatch context and compare final logits,
+   especially the first Decode token after KV synchronization.
+
+This is experimental and has **not** been compiled or tested on the
+Snapdragon/HTP device in this patch. The initial implementation
+intentionally copies full Layer weights and KV into private HTP
+allocations, so first-use HTP preparation may be slower than GPU-only.
+Do not report a speedup until full-graph support, KV parity, and
+end-to-end Prefill are measured. A stand-alone host policy test is at
+`tools/region-ring-experiments/test_phone_npu_serial_policy.cpp`.
+
