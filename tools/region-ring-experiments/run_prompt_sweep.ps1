@@ -22,6 +22,7 @@ param(
     [int] $ForceXC = 0,
     [int] $ForceXG = 0,
     [int] $ForceXP = 0,
+    [switch] $SkipProfile,
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
     [ValidateSet("on", "off")]
@@ -58,6 +59,13 @@ $callArgs = @(
     "--planner", $Planner,
     "--log-verbosity", "$LogVerbosity"
 )
+if ($SkipProfile) {
+    if ($Planner -ne "apply-wide" -or [string]::IsNullOrWhiteSpace($ForceLayout) -or
+        $ForceXC -le 0 -or $ForceXG -le 0 -or $ForceXP -le 0) {
+        throw "-SkipProfile requires -Planner apply-wide and full -ForceLayout/-ForceXC/-ForceXG/-ForceXP."
+    }
+    $callArgs += "--skip-profile"
+}
 if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
     if ($ForceXC -le 0 -or $ForceXG -le 0 -or $ForceXP -le 0) {
         throw "-ForceLayout requires positive -ForceXC, -ForceXG, and -ForceXP."
