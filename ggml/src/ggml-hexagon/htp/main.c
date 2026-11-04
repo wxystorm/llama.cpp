@@ -598,6 +598,7 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_RMS_NORM:
         case HTP_OP_RMS_NORM_MUL:
         case HTP_OP_SCALE:
+        case HTP_OP_CLAMP:
         case HTP_OP_SQR:
         case HTP_OP_SQRT:
         case HTP_OP_UNARY_SOFTPLUS:
@@ -795,11 +796,128 @@ static void prep_tensors(struct htp_context *ctx, struct htp_buf_desc *bufs, str
     }
 }
 
-static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op) {
+// Host-tagged K14 MatMul diagnostics. The DSP has no GGML tensor names,
+// so htp_op_desc.flags marks only the K14 op selected on the host.
+// FNV-1a matches the host ggml_hexagon_k14_fnv64 byte-for-byte.
+// Volatile loads ensure the DSP observes the mapped data for each invocation;
+// this tracing itself can perturb cache state and must not be used for timing.
+static uint64_t htp_k14_diag_fnv64(const void * data, uint32_t size) {
+    const volatile uint8_t * p = (const volatile uint8_t *) data;
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (uint32_t i = 0; i < size; ++i) {
+        hash ^= p[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static void htp_k14_diag_tensor(uint32_t seq, const char * phase,
+                                const char * role, const struct htp_tensor * t) {
+    if (!t || !t->data || t->type != HTP_TYPE_F32 ||
+        !t->size || t->size > (1u << 20) ||
+        t->nb[0] != sizeof(float) || (t->size % sizeof(float)) != 0) {
+        FARF(ALWAYS, "[HTP_K14_TENSOR] seq=%u phase=%s role=%s status=SKIP"
+             " type=%u bytes=%u", seq, phase, role,
+             t ? (unsigned) t->type : 0xffffu, t ? t->size : 0u);
+        return;
+    }
+
+    const uint8_t * p = (const uint8_t *)(uintptr_t) t->data;
+    const uint64_t hash = htp_k14_diag_fnv64(p, t->size);
+    uint32_t sample0 = 0, sample1 = 0;
+    memcpy(&sample0, p, sizeof(sample0));
+    if (t->size >= 2 * sizeof(float)) {
+        memcpy(&sample1, p + sizeof(sample0), sizeof(sample1));
+    }
+    FARF(ALWAYS, "[HTP_K14_TENSOR] seq=%u phase=%s role=%s"
+         " ptr=%p type=%u flags=0x%x bi=%u bytes=%u ne0=%u ne1=%u"
+         " fnv64=%08x%08x sample0_bits=%08x sample1_bits=%08x",
+         seq, phase, role, (void *) p, (unsigned) t->type,
+         (unsigned) t->flags, (unsigned) t->bi, (unsigned) t->size,
+         (unsigned) t->ne[0], (unsigned) t->ne[1],
+         (unsigned) (hash >> 32), (unsigned) hash,
+         sample0, sample1);
+}
+
+// Optional K14 DSP -> host diagnostic piggybacked on htp_opbatch_rsp.
+//
+// When the DSP profiler is disabled, rsp.n_traces[] is unused. We encode
+// four DSP-observed FNV64 digests there, plus flags, status and a valid mask.
+// rsp.pad[0..3] is 'K14D' and pad[4..7] carries the K14 seq. This avoids
+// depending on device-specific FARF/logcat routing and does not change ABI.
+// A profiled/trace run deliberately does not send this side-channel data.
+struct htp_k14_rsp_probe {
+    uint32_t seq;
+    uint32_t input_flags;
+    uint32_t valid_mask;
+    bool     input_force_flush_done;
+    int      status;
+    bool     present;
+    uint64_t hash[4]; // input, output_before, output_after, output_after_flush
+};
+
+static bool htp_k14_probe_hash_tensor(
+        const struct htp_tensor * tensor, uint64_t * out_hash) {
+    if (tensor == NULL || tensor->data == 0 || tensor->type != HTP_TYPE_F32 ||
+        tensor->size == 0 || tensor->size > (1u << 20) ||
+        tensor->nb[0] != sizeof(float) ||
+        tensor->size % sizeof(float) != 0) {
+        return false;
+    }
+    *out_hash = htp_k14_diag_fnv64(
+        (const void *) (uintptr_t) tensor->data, tensor->size);
+    return true;
+}
+
+static void htp_k14_rsp_probe_sample(struct htp_k14_rsp_probe * probe,
+                                     unsigned slot, const struct htp_tensor * tensor) {
+    if (probe == NULL || !probe->present || slot >= 4) {
+        return;
+    }
+    uint64_t hash = 0;
+    if (htp_k14_probe_hash_tensor(tensor, &hash)) {
+        probe->hash[slot] = hash;
+        probe->valid_mask |= 1u << slot;
+    }
+}
+
+// Optional input-cache flush timing. qtimer ticks avoid rounding each
+// individual flush to a whole microsecond before aggregation.
+struct htp_set_rows_sync_stats {
+    uint64_t flush_qtimer_ticks;
+    uint32_t bytes;
+    uint32_t calls;
+    uint32_t global_flush_calls;
+};
+
+static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, uint32_t idx, struct htp_op_desc * op,
+                       struct htp_k14_rsp_probe * k14_probe,
+                       struct htp_set_rows_sync_stats * sync_stats) {
     memcpy(octx->op_params, op->params, sizeof(octx->op_params));
     memcpy(octx->kernel_params, op->kernel_params, sizeof(octx->kernel_params));
     octx->flags = op->flags;
     octx->op    = op->opcode;
+
+    const bool k14_diag = (op->flags & HTP_OPFLAGS_DIAG_K14) != 0 &&
+                          op->opcode == HTP_OP_MUL_MAT;
+    const bool k14_force_input_flush = k14_diag &&
+                          (op->flags & HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH) != 0;
+    const bool kv14_set_rows_diag = op->opcode == HTP_OP_SET_ROWS &&
+                            (op->flags & HTP_OPFLAGS_DIAG_KV14_SET_ROWS) != 0;
+    const bool kv14_set_rows_force_input_flush = kv14_set_rows_diag &&
+                            (op->flags & HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH) != 0;
+    const bool sync_set_rows_host_inputs = op->opcode == HTP_OP_SET_ROWS &&
+                            (op->flags & HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT) != 0 &&
+                            (op->flags & HTP_OPFLAGS_SKIP_COMPUTE) == 0;
+    const bool profile_set_rows_sync = sync_set_rows_host_inputs &&
+                            (op->flags & HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC) != 0;
+    const uint32_t k14_seq = (uint32_t) op->pad[0] |
+                             ((uint32_t) op->pad[1] << 16);
+    if (k14_diag && k14_probe != NULL) {
+        memset(k14_probe, 0, sizeof(*k14_probe));
+        k14_probe->present = true;
+        k14_probe->seq = k14_seq;
+    }
 
     FARF(HIGH, "proc-op #%u: opcode %u flags 0x%x", idx, octx->op, octx->flags);
 
@@ -810,13 +928,121 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
         octx->src[i] = src;
         if (!src) continue;
 
-        if (!(src->flags & HTP_TENSOR_FLUSHED) && (src->flags & HTP_TENSOR_COMPUTE)) {
-            // flush compute buffers on input
-            hex_l2flush((void *) src->data, src->size);
+        const bool regular_flush = !(src->flags & HTP_TENSOR_FLUSHED) &&
+                                   (src->flags & HTP_TENSOR_COMPUTE);
+        // Debug experiment: bypass the COMPUTE/FLUSHED usage predicate ONLY
+        // for the host-tagged K14 MatMul's F32 src[1]. Flush before hashing
+        // or invoking the kernel. This tests DSP-side cache maintenance; it
+        // cannot clean dirty Android CPU cache lines.
+        const bool force_flush = k14_force_input_flush && i == 1 &&
+                                 src->type == HTP_TYPE_F32 && src->data != 0 &&
+                                 src->size > 0 && src->size <= (1u << 20);
+        // K14 cache SET_ROWS src[0] is the F32 data that CPU RoPE sent
+        // back over RPC. Bypass the COMPUTE/FLUSHED predicate only if the
+        // diagnostic force switch is on, to test stale DSP cache lines.
+        const bool kv14_force_flush = kv14_set_rows_force_input_flush && i == 0 &&
+                                      src->type == HTP_TYPE_F32 && src->data != 0 &&
+                                      src->size > 0 && src->size <= (1u << 20);
+        // Host / RPC-produced inputs are not necessarily marked COMPUTE by
+        // GGML. The old regular_flush predicate misses these updates. This
+        // experimental path applies the same flush used in the K14 probe to
+        // all SET_ROWS F32 values and I32/I64 indices while leaving the
+        // destination (src[2]) untouched.
+        const bool sync_external_set_rows_src =
+            sync_set_rows_host_inputs && !(src->flags & HTP_TENSOR_COMPUTE) &&
+            src->data != 0 && src->size > 0 && src->size <= (16u << 20) &&
+            ((i == 0 && src->type == HTP_TYPE_F32) ||
+             (i == 1 && (src->type == HTP_TYPE_I32 ||
+                          src->type == HTP_TYPE_I64)));
+        if (sync_set_rows_host_inputs && !(src->flags & HTP_TENSOR_COMPUTE) &&
+            (i == 0 || i == 1) && src->size > (16u << 20)) {
+            FARF(ALWAYS, "[HTP_SET_ROWS_HOST_SYNC] status=SKIP"
+                 " reason=SOURCE_TOO_LARGE bytes=%u input=%u", src->size, i);
+        }
+        if (force_flush || kv14_force_flush || sync_external_set_rows_src || regular_flush) {
+            // One flush even if multiple sync reasons are active. Profile the
+            // extra host/RPC coherency path, not the legacy COMPUTE flushes.
+            if (profile_set_rows_sync && sync_external_set_rows_src && sync_stats) {
+                const uint64_t start = HAP_perf_get_qtimer_count();
+                hex_l2flush((void *) (uintptr_t) src->data, src->size);
+                sync_stats->flush_qtimer_ticks += HAP_perf_get_qtimer_count() - start;
+                sync_stats->bytes += src->size;
+                sync_stats->calls++;
+                if (src->size > HEX_L2_FLUSH_SIZE) {
+                    sync_stats->global_flush_calls++;
+                }
+            } else {
+                hex_l2flush((void *) (uintptr_t) src->data, src->size);
+            }
+        }
+        if (sync_external_set_rows_src) {
+            FARF(HIGH, "[HTP_SET_ROWS_HOST_SYNC] status=FLUSH"
+                 " input=%u bytes=%u type=%u flags=0x%x",
+                 i, (unsigned) src->size, (unsigned) src->type,
+                 (unsigned) src->flags);
+        }
+        if (force_flush && k14_probe != NULL) {
+            k14_probe->input_force_flush_done = true;
+        }
+
+        if (kv14_set_rows_diag && i == 0) {
+            const bool readable = src->type == HTP_TYPE_F32 &&
+                                  src->data != 0 && src->size > 0 &&
+                                  src->size <= (1u << 20) &&
+                                  src->nb[0] == sizeof(float);
+            uint64_t hash = readable ?
+                htp_k14_diag_fnv64((const void *) (uintptr_t) src->data, src->size) : 0;
+            uint32_t sample0 = 0, sample1 = 0;
+            if (readable && src->size >= sizeof(sample0)) {
+                memcpy(&sample0, (const void *) (uintptr_t) src->data, sizeof(sample0));
+            }
+            if (readable && src->size >= 2u * sizeof(sample1)) {
+                memcpy(&sample1,
+                       (const void *) (uintptr_t) (src->data + sizeof(sample0)),
+                       sizeof(sample1));
+            }
+            FARF(ALWAYS, "[HTP_KV14_SET_ROWS_SOURCE]"
+                 " opcode=%u flags=0x%x src_type=%u src_flags=0x%x"
+                 " bytes=%u ne0=%u ne1=%u regular_flush=%u forced_flush=%u"
+                 " readable=%u values_fnv64=%08x%08x"
+                 " sample0_bits=%08x sample1_bits=%08x",
+                 (unsigned) op->opcode, (unsigned) op->flags,
+                 (unsigned) src->type, (unsigned) src->flags,
+                 (unsigned) src->size, (unsigned) src->ne[0], (unsigned) src->ne[1],
+                 regular_flush ? 1u : 0u, kv14_force_flush ? 1u : 0u,
+                 readable ? 1u : 0u,
+                 (unsigned) (hash >> 32), (unsigned) hash, sample0, sample1);
         }
 
         FARF(HIGH, "prep-src #%u: data %p size %u : %u:%u:%u:%u", op->src[i], (void*) src->data, src->size,
             src->ne[0], src->ne[1], src->ne[3], src->ne[3]);
+    }
+
+    if (k14_diag) {
+        const struct htp_tensor * input = octx->src[1];
+        const struct htp_tensor * weight = octx->src[0];
+        const uint32_t input_flags = input ? input->flags : 0u;
+        const bool normal_input_flush = input != NULL &&
+                !(input_flags & HTP_TENSOR_FLUSHED) &&
+                (input_flags & HTP_TENSOR_COMPUTE);
+        FARF(ALWAYS, "[HTP_K14_META] seq=%u op=%u op_flags=0x%x"
+             " weight_type=%u weight_flags=0x%x"
+             " input_flags=0x%x normal_input_flush=%u"
+             " forced_input_flush=%u"
+             " input_bi=%u output_idx=%u",
+             k14_seq, op->opcode, op->flags,
+             weight ? (unsigned) weight->type : 0xffffu,
+             weight ? (unsigned) weight->flags : 0u,
+             (unsigned) input_flags, normal_input_flush ? 1u : 0u,
+             k14_probe && k14_probe->input_force_flush_done ? 1u : 0u,
+             input ? (unsigned) input->bi : 0xffffu,
+             (unsigned) op->dst[0]);
+        // Read after the backend's existing input-cache handling.
+        if (k14_probe != NULL) {
+            k14_probe->input_flags = input_flags;
+            htp_k14_rsp_probe_sample(k14_probe, 0, input);
+        }
+        htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "input", input);
     }
 
     // Prep output tensors
@@ -833,7 +1059,28 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
+    if (k14_diag) {
+        htp_k14_rsp_probe_sample(k14_probe, 1, octx->dsts[0]);
+        htp_k14_diag_tensor(k14_seq, "PRE_EXEC", "output", octx->dsts[0]);
+    }
+
     int status = execute_op(octx);
+
+    if (kv14_set_rows_diag) {
+        FARF(ALWAYS, "[HTP_KV14_SET_ROWS_EXEC] status=%d op_flags=0x%x"
+             " src0_index=%u src1_index=%u dst_index=%u",
+             status, (unsigned) op->flags,
+             (unsigned) op->src[0], (unsigned) op->src[1], (unsigned) op->dst[0]);
+    }
+
+    if (k14_diag) {
+        if (k14_probe != NULL) {
+            k14_probe->status = status;
+        }
+        htp_k14_rsp_probe_sample(k14_probe, 2, octx->dsts[0]);
+        htp_k14_diag_tensor(k14_seq, "POST_EXEC", "output", octx->dsts[0]);
+        FARF(ALWAYS, "[HTP_K14_EXEC_STATUS] seq=%u status=%d", k14_seq, status);
+    }
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
@@ -851,6 +1098,11 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_tensor *tens, u
             FARF(HIGH, "post-dst[%u] #%u: data %p size %u : %u:%u:%u:%u", i, op->dst[i], (void*) dst->data, dst->size,
                 dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
         }
+    }
+
+    if (k14_diag) {
+        htp_k14_rsp_probe_sample(k14_probe, 3, octx->dsts[0]);
+        htp_k14_diag_tensor(k14_seq, "POST_FLUSH", "output", octx->dsts[0]);
     }
 
     return status;
@@ -946,12 +1198,14 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
         }
 
         int      op_status = HTP_STATUS_OK;
+        struct htp_k14_rsp_probe k14_probe = {0};
         uint32_t op_wakeup = n_ops / 2; // half-way throgh the batch
 
         hmx_queue_wakeup(ctx->hmx_queue);
 
         for (uint32_t i=0; i < n_ops; i++) {
             struct profile_data prof;
+            struct htp_set_rows_sync_stats sync_stats = {0};
 
             if (i == op_wakeup) {
                 dspqueue_write_early_wakeup_noblock(queue, 0, 0);
@@ -959,7 +1213,7 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
 
             profile_start(ctx->profiler, &prof);
 
-            op_status = proc_op_req(octx, tens, i, &ops[i]);
+            op_status = proc_op_req(octx, tens, i, &ops[i], &k14_probe, &sync_stats);
 
             profile_stop(ctx->profiler, &prof);
 
@@ -972,6 +1226,11 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
                 pds[i].usecs  = prof.usecs;
                 pds[i].cycles_start = prof.cycles_start;
                 pds[i].cycles_stop = prof.cycles_stop;
+                pds[i].sync_input_us =
+                    (uint32_t) HAP_perf_qtimer_count_to_us(sync_stats.flush_qtimer_ticks);
+                pds[i].sync_input_bytes = sync_stats.bytes;
+                pds[i].sync_input_calls = sync_stats.calls;
+                pds[i].sync_global_flush_calls = sync_stats.global_flush_calls;
                 for (int j = 0; j < HEX_NUM_PMU_COUNTERS; j++) {
                     pds[i].pmu[j] = prof.pmu_counters[j];
                 }
@@ -993,6 +1252,22 @@ static void htp_packet_callback(dspqueue_t queue, int error, void * context) {
             }
         } else {
             memset(rsp.n_traces, 0, sizeof(rsp.n_traces));
+        }
+
+        if (ctx->profiler == HTP_PROF_DISABLED && k14_probe.present) {
+            const uint32_t magic = 0x4b313444u; // ASCII 'K14D'
+            memcpy(rsp.pad, &magic, sizeof(magic));
+            memcpy(rsp.pad + sizeof(magic), &k14_probe.seq, sizeof(k14_probe.seq));
+            for (unsigned i = 0; i < 4; ++i) {
+                rsp.n_traces[2 * i]     = (uint32_t) k14_probe.hash[i];
+                rsp.n_traces[2 * i + 1] = (uint32_t) (k14_probe.hash[i] >> 32);
+            }
+            rsp.n_traces[8]  = k14_probe.input_flags;
+            rsp.n_traces[9]  = (uint32_t) k14_probe.status;
+            // Bit 4 acknowledges that the DSP actually called hex_l2flush
+            // on K14 src[1]. Bits 0..3 keep the existing hash-valid mask.
+            rsp.n_traces[10] = k14_probe.valid_mask |
+                    (k14_probe.input_force_flush_done ? 0x10u : 0u);
         }
 
         dbuf.flags = DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT;
