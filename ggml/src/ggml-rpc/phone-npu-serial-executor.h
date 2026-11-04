@@ -192,6 +192,25 @@ public:
         ggml_backend_synchronize(backend_);
         const int64_t compute_end_us = ggml_time_us();
         compute_ms = (compute_end_us - compute_begin_us) / 1000.0;
+        // SET_ROWS produces an updated cache tensor. In the original Phone
+        // graph the scheduler publishes it into the KV-owned allocation.
+        // The mirrored graph must perform the same writeback explicitly or
+        // later Chunks (and the GPU decode fallback) will read stale KV.
+        for (int i = 0; i < source->n_nodes; ++i) {
+            const ggml_tensor * op = source->nodes[i];
+            if (op->op != GGML_OP_SET_ROWS ||
+                    op->src[1] == nullptr || !is_kv(op->src[1])) {
+                continue;
+            }
+            const auto result = mapped.find(op);
+            const auto cache = mapped.find(op->src[1]);
+            if (result == mapped.end() || cache == mapped.end() ||
+                    !ggml_are_same_layout(result->second, cache->second)) {
+                reason = "HTP_KV_WRITEBACK_LAYOUT";
+                return false;
+            }
+            ggml_backend_tensor_copy(result->second, cache->second);
+        }
         // Keep immutable OpenCL output allocation / P2C contract unchanged.
         if (!ggml_are_same_layout(out->second, output)) {
             reason = "HTP_OUTPUT_LAYOUT_MISMATCH";
