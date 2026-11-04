@@ -22,6 +22,8 @@ enum htp_data_type {
     HTP_TYPE_Q4_0   = 2,
     HTP_TYPE_Q4_1   = 3,
     HTP_TYPE_Q8_0   = 8,
+    HTP_TYPE_Q4_K   = 12,
+    HTP_TYPE_Q6_K   = 14,
     HTP_TYPE_IQ4_NL = 20,
     HTP_TYPE_I32    = 26,
     HTP_TYPE_I64    = 27,
@@ -97,6 +99,7 @@ enum htp_op_code {
     HTP_OP_PAD,
     HTP_OP_NORM,
     HTP_OP_CONCAT,
+    HTP_OP_CLAMP,
 
     HTP_OP_INVALID
 };
@@ -141,6 +144,12 @@ struct htp_buf_desc {
 
 enum htp_op_flags {
     HTP_OPFLAGS_SKIP_COMPUTE  = (1U << 0), // Skip actual computation (used for profiling)
+    HTP_OPFLAGS_DIAG_K14     = (1U << 1), // Host-tagged K14 input/output fingerprint diagnostic
+    HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH = (1U << 2), // Debug-only K14 src[1] DSP cache flush before execution
+    HTP_OPFLAGS_DIAG_KV14_SET_ROWS = (1U << 3), // Debug-only K14 cache SET_ROWS input digest
+    HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH = (1U << 4), // Debug-only K14 cache SET_ROWS src[0] flush
+    HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT = (1U << 5), // Opt-in: sync externally staged SET_ROWS F32 data and indices
+    HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC = (1U << 6), // Opt-in: measure source sync in DSP per-op profiler
 };
 
 // Op descriptor
@@ -200,6 +209,12 @@ struct htp_prof_desc {
     uint32_t cycles_start;           // Start cycle counter
     uint32_t cycles_stop;            // Stop cycle counter
     uint32_t pmu[HTP_PROF_PMU_NCNT]; // PMU counters
+    // Only nonzero for opt-in profiling of SET_ROWS host-input coherency.
+    // Four uint32 fields keep sizeof(htp_prof_desc) divisible by 8.
+    uint32_t sync_input_us;
+    uint32_t sync_input_bytes;
+    uint32_t sync_input_calls;
+    uint32_t sync_global_flush_calls;
 };
 
 struct htp_opbatch_req {
