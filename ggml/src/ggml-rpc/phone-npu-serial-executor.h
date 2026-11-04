@@ -192,24 +192,24 @@ public:
         ggml_backend_synchronize(backend_);
         const int64_t compute_end_us = ggml_time_us();
         compute_ms = (compute_end_us - compute_begin_us) / 1000.0;
-        // SET_ROWS produces an updated cache tensor. In the original Phone
-        // graph the scheduler publishes it into the KV-owned allocation.
-        // The mirrored graph must perform the same writeback explicitly or
-        // later Chunks (and the GPU decode fallback) will read stale KV.
+        // ggml_set_rows(ctx, base_cache, updates, indices) creates a VIEW
+        // of the base cache; legacy op source order is updates=src[0],
+        // indices=src[1], base_cache=src[2]. The mirrored SET_ROWS must
+        // therefore alias the HTP-owned persistent cache allocation, not
+        // copy the output into the indices tensor after execution.
         for (int i = 0; i < source->n_nodes; ++i) {
             const ggml_tensor * op = source->nodes[i];
-            if (op->op != GGML_OP_SET_ROWS ||
-                    op->src[1] == nullptr || !is_kv(op->src[1])) {
+            if (op->op != GGML_OP_SET_ROWS || op->src[2] == nullptr) {
                 continue;
             }
             const auto result = mapped.find(op);
-            const auto cache = mapped.find(op->src[1]);
-            if (result == mapped.end() || cache == mapped.end() ||
-                    !ggml_are_same_layout(result->second, cache->second)) {
-                reason = "HTP_KV_WRITEBACK_LAYOUT";
+            const auto base = mapped.find(op->src[2]);
+            if (result == mapped.end() || base == mapped.end() ||
+                    result->second->buffer != base->second->buffer ||
+                    result->second->data != base->second->data) {
+                reason = "HTP_SET_ROWS_KV_ALIAS_MISMATCH";
                 return false;
             }
-            ggml_backend_tensor_copy(result->second, cache->second);
         }
         // Keep immutable OpenCL output allocation / P2C contract unchanged.
         if (!ggml_are_same_layout(out->second, output)) {
