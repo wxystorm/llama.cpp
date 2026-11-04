@@ -9,6 +9,8 @@
 #include "phone-stage-binding-pool.h"
 #include "phone-stage-binding-map.h"
 #include "phone-autonomous-policy.h"
+#include "phone-npu-serial-policy.h"
+#include "phone-npu-serial-executor.h"
 
 #include <array>
 #include <chrono>
@@ -5631,6 +5633,48 @@ public:
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
         }
+        const char * serial_spec =
+            std::getenv("GGML_RPC_PHONE_NPU_SERIAL_REGIONS");
+        if (!ggml_phone_npu_serial::parse_regions(
+                serial_spec, phone_npu_serial_regions)) {
+            throw std::runtime_error(
+                "GGML_RPC_PHONE_NPU_SERIAL_REGIONS expects distinct comma-separated "
+                "Region indices in [0,63]");
+        }
+        if (!phone_npu_serial_regions.empty()) {
+            if (backends.size() != 1) {
+                throw std::runtime_error(
+                    "Serial NPU requires one RPC-visible GPUOpenCL device");
+            }
+            ggml_backend_dev_t gpu =
+                ggml_backend_get_device(backends[0]);
+            const char * gpu_name = ggml_backend_dev_name(gpu);
+            if (gpu_name == nullptr ||
+                    std::strstr(gpu_name, "OpenCL") == nullptr) {
+                throw std::runtime_error(
+                    "Serial NPU requires the visible backend to be GPUOpenCL");
+            }
+            ggml_backend_dev_t htp =
+                ggml_backend_dev_by_name("HTP0");
+            if (htp == nullptr) {
+                throw std::runtime_error(
+                    "Serial NPU requested but HTP0 is not available");
+            }
+            phone_npu_backend.reset(
+                ggml_backend_dev_init(htp, nullptr));
+            if (!phone_npu_backend) {
+                throw std::runtime_error(
+                    "Failed to initialize private HTP0 backend");
+            }
+            phone_npu_executor = std::make_unique<
+                ggml_phone_npu_serial::full_region_executor>(
+                    phone_npu_backend.get());
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SERIAL] event=BACKEND_INIT device=HTP0 "
+                "region_count=%zu policy=SERIAL_FULL_REGION "
+                "rpc_visible=GPUOpenCL status=READY\n",
+                phone_npu_serial_regions.size());
+        }
         phone_region_main_thread =
             std::thread([this]() { phone_region_main_loop(); });
         // Server-side autonomous queue is dormant until patch24 task
@@ -5874,6 +5918,14 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+
+    // One private HTP backend and one phone-owned compute thread. Explicit
+    // regions are evaluated on HTP instead of GPU, never concurrently.
+    std::set<uint32_t> phone_npu_serial_regions;
+    std::unordered_map<uint32_t, int> phone_npu_region_layer;
+    ggml_backend_ptr phone_npu_backend;
+    std::unique_ptr<ggml_phone_npu_serial::full_region_executor>
+        phone_npu_executor;
 
     std::mutex phone_region_main_mutex;
     std::condition_variable phone_region_main_cv;
@@ -6628,6 +6680,28 @@ bool rpc_server::phone_input_push(
 bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
+    if (phone_npu_executor != nullptr) {
+        // The PC may use the ordinary OpenCL decode Graph after prefill.
+        // Without this copy its Phone KV would be stale after HTP execution.
+        std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+        if (request.active) {
+            phone_npu_executor->reset_kv();
+        } else {
+            std::string reason;
+            size_t kv_bytes = 0;
+            if (!phone_npu_executor->synchronize_kv(reason, kv_bytes)) {
+                GGML_LOG_ERROR(
+                    "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
+                    " status=FAIL reason=%s\n",
+                    request.run_id, reason.c_str());
+                return false;
+            }
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
+                " bytes=%zu status=PASS\n",
+                request.run_id, kv_bytes);
+        }
+    }
     phone_input_stream_profile report {};
     size_t auto_jobs_total = 0;
     size_t auto_jobs_complete = 0;
@@ -6857,6 +6931,46 @@ bool rpc_server::phone_auto_task_register(
     }
     if (it->second.slot0.kv_only_output) {
         return reject("KV_ONLY_OUTPUT");
+    }
+    if (ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region)) {
+        if (!phone_npu_executor || !phone_npu_executor->has_backend()) {
+            return reject("HTP_BACKEND_UNAVAILABLE");
+        }
+        // Never use an arbitrary subgraph or a multi-layer GPU Region as an
+        // NPU layer. Every op in the registered Region must belong to one
+        // complete Transformer layer. The existing full-output contract is
+        // checked below and remains unchanged.
+        std::set<int> layer_ids;
+        std::unordered_set<const ggml_tensor *> visited;
+        std::function<void(const ggml_tensor *)> scan =
+            [&](const ggml_tensor * t) {
+                if (t == nullptr || !visited.insert(t).second) { return; }
+                const int layer =
+                    ggml_phone_npu_serial::layer_from_tensor_name(t->name);
+                if (layer >= 0) { layer_ids.insert(layer); }
+                for (const ggml_tensor * src : t->src) { scan(src); }
+                if (t->view_src != nullptr) { scan(t->view_src); }
+            };
+        for (int i = 0; i < it->second.graph->n_nodes; ++i) {
+            scan(it->second.graph->nodes[i]);
+        }
+        if (layer_ids.size() != 1) {
+            return reject("HTP_REQUIRES_ONE_COMPLETE_LAYER");
+        }
+        const int layer = *layer_ids.begin();
+        const auto existing = phone_npu_region_layer.find(
+            request.key.region);
+        if (existing != phone_npu_region_layer.end() &&
+                existing->second != layer) {
+            return reject("HTP_REGION_LAYER_CHANGED");
+        }
+        phone_npu_region_layer[request.key.region] = layer;
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SERIAL] event=REGISTER region=%u layer=%d "
+            "chunk=%u uid=%" PRIu64 " backend=HTP0 status=READY\n",
+            request.key.region, layer, request.key.chunk,
+            request.graph_uid);
     }
     const auto & slot_plan = it->second.slot0;
     size_t output_count = 0;
@@ -7233,6 +7347,19 @@ void rpc_server::phone_auto_prepare_loop() {
             }
             task->upload_done_us = ggml_time_us();
         }
+        if (ok && ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, req.key.region)) {
+            // NPU keeps its own KV/weight allocations and reads the verified
+            // canonical OpenCL input at the compute boundary. Do not acquire
+            // an OpenCL Slot or schedule concurrent HTP/GPU work.
+            task->prepare_done_us = ggml_time_us();
+            {
+                std::lock_guard<std::mutex> lock(phone_auto_mutex);
+                task->state = phone_auto_status::PREPARED;
+            }
+            phone_auto_cv.notify_all();
+            continue;
+        }
         bool busy = false;
         std::optional<phone_stage_prepared_input> prepared;
         if (ok) {
@@ -7335,6 +7462,43 @@ void rpc_server::phone_auto_compute_loop() {
                 graph_compute_mutex);
             const auto it = stored_graphs[req.device].find(req.graph_uid);
             if (it != stored_graphs[req.device].end() &&
+                    it->second.graph != nullptr &&
+                    ggml_phone_npu_serial::htp_region(
+                        phone_npu_serial_regions, req.key.region)) {
+                // True whole-Layer NPU execution. The same Phone compute
+                // thread handles GPU and HTP Regions sequentially, so their
+                // compute stages cannot race for shared activation buffers.
+                ggml_tensor * output = nullptr;
+                size_t outputs = 0;
+                for (const auto & item : it->second.slot0.tensors) {
+                    if (!item.output) { continue; }
+                    output = item.tensor;
+                    ++outputs;
+                }
+                std::string why;
+                double stage_ms = 0.0;
+                double htp_ms = 0.0;
+                double return_ms = 0.0;
+                const bool ok = outputs == 1 && output != nullptr &&
+                    phone_npu_executor != nullptr &&
+                    phone_npu_executor->run(it->second.graph, output, why,
+                                            stage_ms, htp_ms, return_ms);
+                status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+                if (!ok && why.empty()) {
+                    why = "HTP_OUTPUT_NOT_UNIQUE";
+                }
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_SERIAL] event=EXECUTE region=%u layer=%d "
+                    "chunk=%u uid=%" PRIu64 " backend=HTP0 "
+                    "stage_ms=%.3f compute_ms=%.3f return_ms=%.3f "
+                    "status=%s reason=%s\n",
+                    req.key.region,
+                    phone_npu_region_layer.count(req.key.region) ?
+                        phone_npu_region_layer.at(req.key.region) : -1,
+                    req.key.chunk, req.graph_uid, stage_ms, htp_ms,
+                    return_ms, ok ? "PASS" : "FAIL",
+                    ok ? "NONE" : why.c_str());
+            } else if (it != stored_graphs[req.device].end() &&
                     it->second.graph != nullptr &&
                     task->prepared.has_value()) {
                 const auto computed = phone_stage_slot0_compute(
