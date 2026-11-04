@@ -2,6 +2,7 @@
 // Windows (Developer PowerShell): cl /nologo /std:c++17 /EHsc /I src /Fe:test_cpu_optional_planner.exe tools/region-ring-experiments/test_cpu_optional_planner.cpp
 // Linux: c++ -std=c++17 -O2 -Isrc tools/region-ring-experiments/test_cpu_optional_planner.cpp -o /tmp/test_cpu_optional_planner
 #include "llama-region-ring-planner.h"
+#include <array>
 #include <cassert>
 #include <iostream>
 #include <string>
@@ -136,8 +137,22 @@ static void test_optional_cpu_dag_and_memory() {
     }
 }
 
+// A previous 512-token UBatch can leave A/B holding later GPU Regions.
+// A stale "initial banks loaded" flag must not be considered sufficient.
+static void test_gpu_bank_pair_after_ubatch() {
+    const std::vector<size_t> gpu_regions = {0, 2, 4, 6};
+    std::array<bool, 2> ready = {{true, true}};
+    std::array<size_t, 2> owners = {{4, 6}};
+    assert(!llama_region_ring_gpu_initial_banks_match(gpu_regions, ready, owners));
+    owners = {{0, 2}}; // the boundary restore loaded the first two Regions
+    assert(llama_region_ring_gpu_initial_banks_match(gpu_regions, ready, owners));
+    ready[1] = false;
+    assert(!llama_region_ring_gpu_initial_banks_match(gpu_regions, ready, owners));
+}
+
 int main() {
     test_layouts();
     test_optional_cpu_dag_and_memory();
+    test_gpu_bank_pair_after_ubatch();
     std::cout << "CPU optional Planner offline tests: PASS\n";
 }
