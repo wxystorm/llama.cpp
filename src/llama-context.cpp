@@ -4936,6 +4936,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // dynamic KV offsets, attention masks and late-tail shapes are never
     // accidentally reused across distinct Chunk positions.
     if (phone_auto_eligible) {
+        // Pre-registering many immutable Phone Chunk graphs retains their
+        // Scheduler/Meta buffers. Allocate compact Meta scratch tensor
+        // contexts only in this prebuild thread, never in normal Meta work.
+        // RAII clears the thread-local override on every failure path.
+        struct compact_phone_meta_alloc_scope {
+            compact_phone_meta_alloc_scope() {
+                ggml_backend_meta_phone_auto_compact_alloc(true);
+            }
+            ~compact_phone_meta_alloc_scope() {
+                ggml_backend_meta_phone_auto_compact_alloc(false);
+            }
+        } compact_meta_alloc_scope;
+
         const int64_t t0 = ggml_time_us();
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
