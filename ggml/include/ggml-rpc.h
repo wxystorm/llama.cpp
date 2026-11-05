@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    26
+#define RPC_PROTO_PATCH_VERSION    27
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -205,6 +205,31 @@ using ggml_backend_rpc_phone_auto_wait_capture_t = bool (*)(
     ggml_backend_t backend, uint64_t input_run_id, uint32_t region,
     uint32_t chunk, uint64_t graph_uid, uint64_t p2c_run_id,
     uint32_t token_begin, uint32_t n_tokens, size_t expected_bytes);
+
+// Patch 27: optional shadow registration of an immutable Phone-owned
+// execution plan. This does not switch off the PC-built Graph path; a local
+// Qwen3 Layer Builder and parity validation are required before that cutover.
+struct ggml_backend_rpc_phone_owned_plan {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t layer;
+    uint32_t total_tokens;
+    uint32_t chunk_tokens;
+    uint32_t n_embd;
+    uint32_t position_base;
+    uint32_t kv_capacity;
+    uint32_t n_heads;
+    uint32_t n_heads_kv;
+    uint32_t head_dim;
+};
+#define GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC \
+    "ggml_backend_rpc_phone_owned_plan_register"
+using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
+    ggml_backend_t backend,
+    const ggml_backend_rpc_phone_owned_plan * plan);
 
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
