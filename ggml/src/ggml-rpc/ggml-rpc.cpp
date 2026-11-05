@@ -7426,6 +7426,32 @@ bool rpc_server::phone_auto_task_register(
             request.device >= phone_stage_device_arenas.size()) {
         return reject("INVALID_DEVICE");
     }
+    // If a Phone-owned shadow plan exists, validate every legacy Graph TASK
+    // against the independently parsed Plan before admitting any Activation.
+    // The legacy graph still computes; this proves the control-plane mapping
+    // for arbitrary Chunk widths, including a short last Chunk.
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_qwen3_mutex);
+        auto it = phone_owned_qwen3_plans.find(request.key.run_id);
+        if (it != phone_owned_qwen3_plans.end()) {
+            const auto & p = it->second;
+            const auto found = std::find_if(
+                p.chunks.begin(), p.chunks.end(),
+                [&](const ggml_phone_owned_qwen3::chunk & c) {
+                    return c.region == request.key.region &&
+                        c.index == request.key.chunk;
+                });
+            const uint64_t expected_bytes =
+                uint64_t(request.n_tokens) * p.n_embd * sizeof(float);
+            if (found == p.chunks.end() ||
+                    found->token_begin != request.token_begin ||
+                    found->n_tokens != request.n_tokens ||
+                    request.input_bytes != expected_bytes ||
+                    request.output_bytes != expected_bytes) {
+                return reject("SHADOW_PLAN_TASK_CONTRACT_MISMATCH");
+            }
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (!phone_input_stream_runs.count(request.key.run_id)) {
