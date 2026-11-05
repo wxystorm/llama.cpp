@@ -103,6 +103,8 @@ enum rpc_cmd {
     RPC_CMD_JUPITER_EVENT_RECORD,
     RPC_CMD_JUPITER_EVENT_WAIT,
     RPC_CMD_JUPITER_SYNC,
+    // Opt-in: construct/store a remote Graph without executing it.
+    RPC_CMD_GRAPH_REGISTER,
     RPC_CMD_COUNT,
 };
 
@@ -1904,6 +1906,7 @@ public:
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
+    bool graph_register(const std::vector<uint8_t> & input);
     bool graph_recompute(const rpc_msg_graph_recompute_req & request);
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
@@ -1917,6 +1920,7 @@ public:
         ggml_cgraph          * graph;
     };
 private:
+    bool graph_decode(const std::vector<uint8_t> & input, bool execute);
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
     ggml_tensor * create_node(uint64_t id,
@@ -2530,6 +2534,14 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    return graph_decode(input, true);
+}
+
+bool rpc_server::graph_register(const std::vector<uint8_t> & input) {
+    return graph_decode(input, false);
+}
+
+bool rpc_server::graph_decode(const std::vector<uint8_t> & input, bool execute) {
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
@@ -2607,6 +2619,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         GGML_LOG_INFO(
                 "[JUPITER_RPC_STAGE] event=BEGIN uid=%" PRIu64 " device=%u nodes=%u\n",
                 graph_uid, device, n_nodes);
+    }
+
+    if (!execute) {
+        // Registration modifies only the stored Graph metadata. It MUST NOT
+        // call the backend or write KV; a later GRAPH_RECOMPUTE executes it.
+        graph_entry.graph = graph;
+        if (phone_timeline || jupiter_trace) {
+            GGML_LOG_INFO(
+                "[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER uid=%" PRIu64
+                " nodes=%u status=READY prepare_ms=%.3f\n",
+                graph_uid, n_nodes, (ggml_time_us() - phone_start_us)/1000.0);
+        }
+        return true;
     }
 
     const int64_t phone_compute_start_us = phone_timeline ? ggml_time_us() : 0;
@@ -3538,6 +3563,21 @@ static void rpc_serve_client(rpc_server & server,
                     return;
                 }
                 if (!server.graph_compute(input)) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_GRAPH_REGISTER: {
+                std::vector<uint8_t> input;
+                if (!recv_msg(sock, input)) {
+                    return;
+                }
+                rpc_msg_jupiter_rsp response {};
+                response.ok = server.graph_register(input) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                if (!response.ok) {
                     return;
                 }
                 break;
