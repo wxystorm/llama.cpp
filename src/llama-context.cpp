@@ -19,6 +19,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -1903,7 +1904,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // Metadata-only, opt-in prebuild for single-stream dense Qwen3. Other
     // memory implementations / architectures keep the established path.
     const char * jupiter_prebuild_env = getenv("LLAMA_JUPITER_GRAPH_PREBUILD");
-    const bool jupiter_prebuild_requested = llama_jupiter::enabled() &&
+    const char * jupiter_prefill_opt_in = getenv("LLAMA_JUPITER_PREFILL");
+    const bool jupiter_prefill_active =
+            jupiter_prefill_opt_in != nullptr && atoi(jupiter_prefill_opt_in) != 0;
+    const bool jupiter_prebuild_requested = jupiter_prefill_active &&
             n_tokens_all > 1 && model.arch == LLM_ARCH_QWEN3 &&
             jupiter_prebuild_env != nullptr && atoi(jupiter_prebuild_env) != 0;
     if (jupiter_prebuild_requested) {
@@ -1952,12 +1956,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // scheduler placement maps for the next template.
                 std::vector<std::pair<ggml_tensor *, ggml_backend_t>> placements;
                 auto * graph = prepared->get_gf();
-                for (int j = 0; j < graph->n_nodes + graph->n_leafs; ++j) {
-                    auto * tensor = j < graph->n_nodes
-                            ? graph->nodes[j] : graph->leafs[j - graph->n_nodes];
+                // ggml_cgraph is opaque in public ggml.h. Visit every graph
+                // node and reachable source/view to include weight leaves.
+                std::unordered_set<ggml_tensor *> seen;
+                std::vector<ggml_tensor *> pending;
+                const int n_graph_nodes = ggml_graph_n_nodes(graph);
+                pending.reserve(n_graph_nodes);
+                for (int j = 0; j < n_graph_nodes; ++j) {
+                    pending.push_back(ggml_graph_node(graph, j));
+                }
+                while (!pending.empty()) {
+                    auto * tensor = pending.back();
+                    pending.pop_back();
+                    if (tensor == nullptr || !seen.insert(tensor).second) {
+                        continue;
+                    }
                     auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
                     if (backend != nullptr) {
                         placements.emplace_back(tensor, backend);
+                    }
+                    if (tensor->view_src != nullptr) {
+                        pending.push_back(tensor->view_src);
+                    }
+                    for (auto * source : tensor->src) {
+                        if (source != nullptr) {
+                            pending.push_back(source);
+                        }
                     }
                 }
                 jupiter_prebuilt_graphs.emplace_back(std::move(prepared));
@@ -2279,7 +2303,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // Debug-only correctness oracle for an A/B prebuild comparison.
     // The extra synchronization is deliberately excluded from formal timings.
     if (const char * hash_env = getenv("LLAMA_JUPITER_LOGITS_HASH")) {
-        if (llama_jupiter::enabled() && atoi(hash_env) != 0 &&
+        if (jupiter_prefill_active && atoi(hash_env) != 0 &&
             n_outputs_all > 0 && logits.data && n_vocab > 0) {
             synchronize();
             const float * row = logits.data + (size_t) (n_outputs_all - 1) * n_vocab;
