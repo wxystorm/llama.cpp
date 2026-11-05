@@ -7052,6 +7052,51 @@ bool rpc_server::phone_auto_task_register(
             wire.buffer, wire.data, input->buffer, input->data)) {
         return reject("INPUT_ADDRESS_INVALID");
     }
+
+    // Opt-in, synchronous setup-time HTP weight preload. Unlike run(), this
+    // does not touch KV, per-Chunk activations, or the immutable OpenCL
+    // output/P2C buffers. Task registration precedes any Chunk execution,
+    // and graph_compute_mutex already serializes this with HTP compute.
+    // The persistent key deduplicates weights across all Chunk graph UIDs.
+    const char * npu_preload_env =
+        std::getenv("GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS");
+    if (ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region) &&
+            npu_preload_env != nullptr &&
+            std::strcmp(npu_preload_env, "1") == 0) {
+        ggml_phone_npu_serial::full_region_executor::weight_preload_stats
+            preload_stats {};
+        std::string preload_reason;
+        const int64_t preload_begin_us = ggml_time_us();
+        const bool preloaded = phone_npu_executor != nullptr &&
+            phone_npu_executor->preload_weights(
+                it->second.graph, backends[request.device],
+                preload_reason, preload_stats);
+        const double preload_wall_ms =
+            (ggml_time_us() - preload_begin_us) / 1000.0;
+        if (preload_stats.new_weights != 0 || request.key.chunk == 0 ||
+                !preloaded) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SERIAL] event=WEIGHTS_PRELOAD "
+                "run=%" PRIu64 " region=%u layer=%d chunk=%u "
+                "uid=%" PRIu64 " backend=HTP0 "
+                "new_weights=%zu reused_weights=%zu "
+                "source_bytes=%zu sync_ms=%.3f copy_ms=%.3f "
+                "wall_ms=%.3f status=%s reason=%s\n",
+                request.key.run_id, request.key.region,
+                phone_npu_region_layer.at(request.key.region),
+                request.key.chunk, request.graph_uid,
+                preload_stats.new_weights, preload_stats.reused_weights,
+                preload_stats.new_bytes, preload_stats.sync_ms,
+                preload_stats.copy_ms, preload_wall_ms,
+                preloaded ? "PASS" : "FAIL",
+                preloaded ? "NONE" : preload_reason.c_str());
+        }
+        if (!preloaded) {
+            return reject("HTP_WEIGHT_PRELOAD_FAILED");
+        }
+    }
+
     const phone_auto_key key = auto_key(request.key);
     bool already_verified = false;
     {
