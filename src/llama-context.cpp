@@ -246,11 +246,19 @@ llama_context::llama_context(
         const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
         const bool jupiter_prefill = jupiter_env != nullptr && atoi(jupiter_env) != 0;
         if (jupiter_prefill) {
-            // Jupiter Prefill V1 rotates scheduler copies between sub-sequences.
-            // Reusing one allocated graph would pin every ubatch to the same copy
-            // and force a full synchronization before set_inputs().
-            graph_reuse_disable = true;
-            LLAMA_LOG_INFO("[JUPITER_PIPE] local_graph_reuse=DISABLED reason=ROTATE_CHUNK_SLOTS remote_slot_graph_cache=ENABLED\n");
+            // Opt-in experiment only. A reused graph is tied to its existing
+            // scheduler copy, so the next chunk must wait before rebinding inputs.
+            // Incompatible shapes and KV/mask layouts still rebuild the graph.
+            const char * reuse_env = getenv("LLAMA_JUPITER_LOCAL_GRAPH_REUSE");
+            const bool reuse_requested = reuse_env != nullptr && atoi(reuse_env) != 0;
+            if (!reuse_requested) {
+                graph_reuse_disable = true;
+                LLAMA_LOG_INFO("[JUPITER_PIPE] local_graph_reuse=DISABLED reason=ROTATE_CHUNK_SLOTS remote_slot_graph_cache=ENABLED\n");
+            } else {
+                LLAMA_LOG_INFO(
+                    "[JUPITER_PIPE] local_graph_reuse=%s mode=SYNC_BEFORE_REBIND remote_slot_graph_cache=ENABLED\n",
+                    graph_reuse_disable ? "DISABLED_BY_GLOBAL_FLAG" : "OPT_IN");
+            }
         }
 
         if (graph_reuse_disable) {
@@ -1314,10 +1322,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        // A reused graph keeps its allocated scheduler copy. Jupiter's
+        // preceding RPC/CUDA work may still be in flight: always fence before
+        // overwriting its inputs, even if pipeline_parallel was disabled.
+        // This trades pipeline overlap for reuse and is intentional for A/B.
+        const bool jupiter_prefill = prefill_env != nullptr && atoi(prefill_env) != 0;
+        if (cparams.pipeline_parallel || jupiter_prefill) {
             ggml_backend_sched_synchronize(sched.get());
         }
 
