@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,6 +51,91 @@ public:
                 }
             }
         }
+    }
+
+    struct weight_preload_stats {
+        size_t new_weights = 0;
+        size_t reused_weights = 0;
+        size_t new_bytes = 0;
+        double sync_ms = 0.0;
+        double copy_ms = 0.0;
+    };
+
+    // Called during Phone AUTO task registration, before any selected NPU
+    // Chunk can execute. The reconstructed RPC Graph owns valid OpenCL
+    // weight sources at this point. Do not preload activations or KV: their
+    // values and lifetime depend on the actual Chunk and input stream.
+    //
+    // The same original OpenCL buffer/address is shared by Chunk UIDs, so
+    // persistence keys guarantee one allocation/repack/copy per weight,
+    // rather than repeating work for each 128-token Chunk.
+    // The caller holds graph_compute_mutex, as for run()/reset_kv().
+    bool preload_weights(const ggml_cgraph * source,
+                         ggml_backend_t source_backend,
+                         std::string & reason,
+                         weight_preload_stats & stats) {
+        reason.clear();
+        stats = {};
+        if (backend_ == nullptr || source == nullptr ||
+                source->n_nodes <= 0 || source_backend == nullptr) {
+            reason = "HTP_PRELOAD_INVALID_SOURCE";
+            return false;
+        }
+        std::unordered_set<const ggml_tensor *> visited;
+        std::unordered_set<std::string> weight_keys;
+        std::vector<const ggml_tensor *> missing;
+        std::function<void(const ggml_tensor *)> scan =
+            [&](const ggml_tensor * t) {
+                if (t == nullptr || !visited.insert(t).second) {
+                    return;
+                }
+                if (t->op == GGML_OP_NONE && t->view_src == nullptr &&
+                        is_weight(t) && !is_kv(t)) {
+                    const std::string key = storage_key(t, false);
+                    if (weight_keys.insert(key).second) {
+                        if (persistent_.find(key) == persistent_.end()) {
+                            missing.push_back(t);
+                        } else {
+                            ++stats.reused_weights;
+                        }
+                    }
+                }
+                if (t->view_src != nullptr) {
+                    scan(t->view_src);
+                }
+                for (const ggml_tensor * src : t->src) {
+                    scan(src);
+                }
+            };
+        for (int i = 0; i < source->n_nodes; ++i) {
+            scan(source->nodes[i]);
+        }
+        if (missing.empty() && stats.reused_weights == 0) {
+            reason = "HTP_PRELOAD_NO_WEIGHTS";
+            return false;
+        }
+        if (missing.empty()) {
+            return true;
+        }
+
+        // RPC uploads to the OpenCL weight buffers can be asynchronous.
+        // Fence them before the first cross-backend copy, but only when
+        // a weight genuinely needs to be loaded.
+        const int64_t sync_begin_us = ggml_time_us();
+        ggml_backend_synchronize(source_backend);
+        stats.sync_ms = (ggml_time_us() - sync_begin_us) / 1000.0;
+
+        const int64_t copy_begin_us = ggml_time_us();
+        for (const ggml_tensor * t : missing) {
+            if (persistent_copy(t, false, reason) == nullptr) {
+                stats.copy_ms = (ggml_time_us() - copy_begin_us) / 1000.0;
+                return false;
+            }
+            ++stats.new_weights;
+            stats.new_bytes += ggml_nbytes(t);
+        }
+        stats.copy_ms = (ggml_time_us() - copy_begin_us) / 1000.0;
+        return true;
     }
 
     // Caller holds the server's single Phone graph-compute mutex. Only one
