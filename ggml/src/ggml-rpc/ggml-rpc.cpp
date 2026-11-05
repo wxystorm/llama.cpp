@@ -5700,6 +5700,69 @@ public:
                 "region_count=%zu policy=SERIAL_FULL_REGION "
                 "rpc_visible=GPUOpenCL status=READY\n",
                 phone_npu_serial_regions.size());
+
+            // Optional model-load-time HTP residency. The Phone -m GGUF
+            // loader is already constructed before the RPC server starts.
+            // These layers are the *actual Transformer layer IDs*, NOT
+            // Region numbers. A miss retains the existing async/on-demand
+            // Graph preload path; no RPC protocol or PC model loader change.
+            const char * model_layers_env =
+                std::getenv("GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS");
+            if (model_layers_env != nullptr && model_layers_env[0] != '\0') {
+                std::set<uint32_t> model_layers;
+                if (!ggml_phone_npu_serial::parse_regions(
+                        model_layers_env, model_layers) ||
+                        model_layers.empty()) {
+                    throw std::runtime_error(
+                        "GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS expects "
+                        "distinct layer IDs (e.g. 19,39)");
+                }
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_SERIAL] event=MODEL_LOAD_START "
+                    "layers=%zu source=%s model_equivalence=UNVERIFIED "
+                    "backend=HTP0\n",
+                    model_layers.size(),
+                    local_tensor_source.get_info != nullptr &&
+                        local_tensor_source.read != nullptr ?
+                        "PHONE_LOCAL_GGUF" : "UNAVAILABLE");
+                const int64_t model_begin_us = ggml_time_us();
+                size_t layers_ok = 0;
+                size_t resident_bytes = 0;
+                for (uint32_t layer : model_layers) {
+                    ggml_phone_npu_serial::full_region_executor::
+                        model_load_stats stats {};
+                    std::string why;
+                    const int64_t layer_begin_us = ggml_time_us();
+                    const bool ok = phone_npu_executor->load_model_layer(
+                        local_tensor_source, layer, why, stats);
+                    const double wall_ms =
+                        (ggml_time_us() - layer_begin_us) / 1000.0;
+                    if (ok) {
+                        ++layers_ok;
+                        resident_bytes += stats.new_bytes;
+                    }
+                    GGML_LOG_INFO(
+                        "[PHONE_NPU_SERIAL] event=MODEL_LOAD_LAYER "
+                        "layer=%u backend=HTP0 weights=%zu "
+                        "source_bytes=%zu read_ms=%.3f repack_ms=%.3f "
+                        "wall_ms=%.3f status=%s reason=%s\n",
+                        layer, stats.new_weights, stats.new_bytes,
+                        stats.file_read_ms, stats.htp_repack_ms,
+                        wall_ms, ok ? "PASS" : "FALLBACK",
+                        ok ? "NONE" : why.c_str());
+                }
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_SERIAL] event=MODEL_LOAD_SUM "
+                    "layers_requested=%zu layers_ready=%zu "
+                    "resident_weights=%zu source_bytes=%zu "
+                    "wall_ms=%.3f status=%s\n",
+                    model_layers.size(), layers_ok,
+                    phone_npu_executor->model_resident_weights(),
+                    resident_bytes,
+                    (ggml_time_us() - model_begin_us) / 1000.0,
+                    layers_ok == model_layers.size() ?
+                        "PASS" : "PARTIAL_FALLBACK");
+            }
         }
         phone_region_main_thread =
             std::thread([this]() { phone_region_main_loop(); });
