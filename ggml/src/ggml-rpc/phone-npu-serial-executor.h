@@ -366,6 +366,410 @@ public:
         return preload_weights(snapshots, source_backend, reason, stats);
     }
 
+    // A separate HTP graph is registered for each PC Chunk UID. Its topology,
+    // KV views, op_params and input destinations remain fixed for the RUN.
+    // Different graphs share a preallocated HTP activation arena because
+    // HTP execution is serialized (no compute/prepare overlap on that arena).
+    //
+    // Caller locks HTP before graph_compute_mutex. Only use registered source
+    // graphs for which model weights have already been made resident.
+    bool register_chunk(uint64_t uid, const ggml_cgraph * source,
+                        const ggml_tensor * output,
+                        std::string & reason, double & prepare_ms,
+                        size_t & arena_bytes, bool & arena_reused) {
+        reason.clear();
+        prepare_ms = 0.0;
+        arena_bytes = 0;
+        arena_reused = false;
+        if (uid == 0 || source == nullptr || source->n_nodes <= 0 ||
+                output == nullptr || backend_ == nullptr ||
+                registered_graphs_.size() >= 256) {
+            reason = "HTP_FIXED_REGISTER_INVALID";
+            return false;
+        }
+        if (registered_graphs_.count(uid)) {
+            reason = "HTP_FIXED_DUPLICATE_UID";
+            return false;
+        }
+        const int64_t begin_us = ggml_time_us();
+        // Never snapshot a weight that the PC has not finished uploading.
+        // The existing async preload/legacy execution remains the fallback.
+        std::unordered_set<const ggml_tensor *> visited;
+        bool weights_ready = true;
+        std::function<void(const ggml_tensor *)> check =
+            [&](const ggml_tensor * t) {
+            if (t == nullptr || !visited.insert(t).second) { return; }
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr &&
+                    is_weight(t) && !is_kv(t) &&
+                    !has_model_weight(t) &&
+                    persistent_.count(storage_key(t, false)) == 0) {
+                weights_ready = false;
+            }
+            if (t->view_src != nullptr) { check(t->view_src); }
+            for (const ggml_tensor * src : t->src) { check(src); }
+        };
+        for (int i = 0; i < source->n_nodes; ++i) { check(source->nodes[i]); }
+        if (!weights_ready) {
+            reason = "HTP_FIXED_WEIGHTS_NOT_RESIDENT";
+            return false;
+        }
+
+        auto prepared = std::make_unique<registered_graph>();
+        prepared->source = source;
+        prepared->source_output = output;
+        const size_t n_tensors = source->visited_hash_set.size + 64;
+        const size_t mem_bytes =
+            ggml_tensor_overhead() * n_tensors * 2 +
+            ggml_graph_overhead_custom(source->size, false) + 4096;
+        ggml_init_params params = {mem_bytes, nullptr, true};
+        prepared->ctx.reset(ggml_init(params));
+        if (!prepared->ctx) {
+            reason = "HTP_FIXED_CONTEXT_ALLOC";
+            return false;
+        }
+
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> mapped;
+        bool valid = true;
+        std::function<ggml_tensor *(const ggml_tensor *)> mirror =
+            [&](const ggml_tensor * t) -> ggml_tensor * {
+            if (t == nullptr || !valid) { return nullptr; }
+            const auto found = mapped.find(t);
+            if (found != mapped.end()) { return found->second; }
+            const bool kv = is_kv(t);
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr &&
+                    (is_weight(t) || kv)) {
+                // KV storage is allocated during registration, but its initial
+                // OpenCL contents are copied at first compute. PC may still
+                // reset/populate canonical KV after TASK_REGISTER.
+                ggml_tensor * cached = persistent_copy(
+                    t, kv, reason, nullptr, !kv);
+                if (cached == nullptr) { valid = false; return nullptr; }
+                mapped.emplace(t, cached);
+                if (kv) {
+                    prepared->kv_sources.emplace_back(storage_key(t, true), t);
+                }
+                return cached;
+            }
+            ggml_tensor * copy = ggml_dup_tensor(prepared->ctx.get(), t);
+            if (copy == nullptr) {
+                reason = "HTP_FIXED_DUP_TENSOR";
+                valid = false;
+                return nullptr;
+            }
+            mapped.emplace(t, copy);
+            copy->op = t->op;
+            copy->flags = t->flags;
+            std::memcpy(copy->nb, t->nb, sizeof(copy->nb));
+            std::memcpy(copy->op_params, t->op_params,
+                        sizeof(copy->op_params));
+            ggml_set_name(copy, t->name);
+            if (t->view_src != nullptr) {
+                copy->view_src = mirror(t->view_src);
+                copy->view_offs = t->view_offs;
+                if (copy->view_src == nullptr) {
+                    valid = false;
+                    return nullptr;
+                }
+            }
+            for (int i = 0; i < GGML_MAX_SRC; ++i) {
+                if (t->src[i] == nullptr) { continue; }
+                copy->src[i] = mirror(t->src[i]);
+                if (copy->src[i] == nullptr) {
+                    valid = false;
+                    return nullptr;
+                }
+            }
+            if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                prepared->inputs.push_back({
+                    t, copy, t->buffer, t->data
+                });
+            }
+            return copy;
+        };
+        ggml_cgraph * graph = ggml_new_graph_custom(
+            prepared->ctx.get(), source->size, false);
+        if (graph == nullptr) {
+            reason = "HTP_FIXED_GRAPH_ALLOC";
+            return false;
+        }
+        prepared->graph = graph;
+        for (int i = 0; i < source->n_nodes && valid; ++i) {
+            ggml_tensor * cloned = mirror(source->nodes[i]);
+            if (cloned == nullptr) { break; }
+            ggml_build_forward_expand(graph, cloned);
+        }
+        auto out = mapped.find(output);
+        if (!valid || out == mapped.end() || graph->n_nodes == 0) {
+            if (reason.empty()) { reason = "HTP_FIXED_MIRROR_INCOMPLETE"; }
+            return false;
+        }
+        prepared->output = out->second;
+        if (!ggml_are_same_layout(prepared->output, output)) {
+            reason = "HTP_FIXED_OUTPUT_LAYOUT";
+            return false;
+        }
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (!ggml_backend_supports_op(backend_, graph->nodes[i])) {
+                reason = std::string("HTP_FIXED_UNSUPPORTED_OP:") +
+                    graph->nodes[i]->name;
+                return false;
+            }
+        }
+        // A SET_ROWS result must remain a VIEW of the same persistent KV.
+        for (int i = 0; i < source->n_nodes; ++i) {
+            const ggml_tensor * t = source->nodes[i];
+            if (t->op != GGML_OP_SET_ROWS || t->src[2] == nullptr) { continue; }
+            auto result = mapped.find(t);
+            auto base = mapped.find(t->src[2]);
+            if (result == mapped.end() || base == mapped.end() ||
+                    result->second->view_src != base->second) {
+                reason = "HTP_FIXED_SET_ROWS_VIEW";
+                return false;
+            }
+        }
+
+        // Plan fixed offsets in context allocation order. Views get their
+        // canonical parent's address, not independent arena allocations.
+        const auto buft = ggml_backend_get_default_buffer_type(backend_);
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
+            reason = "HTP_FIXED_BAD_ALIGNMENT";
+            return false;
+        }
+        size_t offset = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(prepared->ctx.get());
+             t != nullptr;
+             t = ggml_get_next_tensor(prepared->ctx.get(), t)) {
+            if (t->view_src != nullptr) {
+                prepared->views.push_back(t);
+            } else if (t->data == nullptr) {
+                const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t);
+                if (offset > SIZE_MAX - (alignment - 1) ||
+                        bytes > SIZE_MAX - offset - (alignment - 1)) {
+                    reason = "HTP_FIXED_SIZE_OVERFLOW";
+                    return false;
+                }
+                offset = (offset + alignment - 1) & ~(alignment - 1);
+                prepared->roots.push_back({ t, offset });
+                offset += bytes;
+            }
+        }
+        if (offset == 0 || offset > SIZE_MAX - alignment) {
+            reason = "HTP_FIXED_NO_ACTIVATION_STORAGE";
+            return false;
+        }
+        const size_t needed = offset + alignment;
+        registered_arena * chosen = nullptr;
+        for (auto & candidate : arenas_) {
+            if (candidate->capacity >= needed &&
+                    (chosen == nullptr ||
+                     candidate->capacity < chosen->capacity)) {
+                chosen = candidate.get();
+            }
+        }
+        if (chosen == nullptr) {
+            // Power-of-two size class preserves addresses of previously
+            // registered graphs: a larger tail never relocates an active plan.
+            size_t capacity = 4096;
+            while (capacity < needed && capacity <= SIZE_MAX / 2) {
+                capacity *= 2;
+            }
+            if (capacity < needed ||
+                    capacity > ggml_backend_buft_get_max_size(buft)) {
+                reason = "HTP_FIXED_ARENA_SIZE_LIMIT";
+                return false;
+            }
+            auto next = std::make_unique<registered_arena>();
+            next->buffer.reset(ggml_backend_buft_alloc_buffer(buft, capacity));
+            if (!next->buffer) {
+                reason = "HTP_FIXED_ARENA_ALLOC_FAILED";
+                return false;
+            }
+            next->capacity = capacity;
+            chosen = next.get();
+            arenas_.push_back(std::move(next));
+        } else {
+            arena_reused = true;
+        }
+        prepared->arena = chosen;
+        arena_bytes = chosen->capacity;
+        const size_t base = reinterpret_cast<size_t>(
+            ggml_backend_buffer_get_base(chosen->buffer.get()));
+        if (base == 0) {
+            reason = "HTP_FIXED_ARENA_NO_BASE";
+            return false;
+        }
+        const size_t padding = (alignment - (base & (alignment - 1))) &
+            (alignment - 1);
+        for (const auto & binding : prepared->roots) {
+            ggml_tensor * t = binding.first;
+            if (padding > chosen->capacity ||
+                    binding.second > chosen->capacity - padding ||
+                    ggml_backend_buft_get_alloc_size(buft, t) >
+                        chosen->capacity - padding - binding.second) {
+                reason = "HTP_FIXED_ARENA_BOUNDS";
+                return false;
+            }
+            if (ggml_backend_tensor_alloc(chosen->buffer.get(), t,
+                    reinterpret_cast<void *>(
+                        base + padding + binding.second)) !=
+                    GGML_STATUS_SUCCESS) {
+                reason = "HTP_FIXED_TENSOR_BIND";
+                return false;
+            }
+        }
+        // Registration is allowed to encounter a VIEW before its parent in
+        // metadata order. Resolve views recursively in dependency order.
+        std::unordered_set<ggml_tensor *> initialized;
+        std::unordered_set<ggml_tensor *> visiting;
+        std::function<bool(ggml_tensor *)> init_view =
+            [&](ggml_tensor * t) {
+            if (t->buffer != nullptr && t->data != nullptr) { return true; }
+            if (t->view_src == nullptr || !visiting.insert(t).second) {
+                return false;
+            }
+            bool ok = init_view(t->view_src) &&
+                ggml_backend_view_init(t) == GGML_STATUS_SUCCESS;
+            visiting.erase(t);
+            if (ok) { initialized.insert(t); }
+            return ok;
+        };
+        for (ggml_tensor * t : prepared->views) {
+            if (!init_view(t)) {
+                reason = "HTP_FIXED_VIEW_BIND";
+                return false;
+            }
+        }
+        for (const auto & item : prepared->inputs) {
+            if (item.source->buffer == nullptr ||
+                    item.source->data == nullptr ||
+                    item.target->buffer == nullptr ||
+                    !ggml_is_contiguous(item.source)) {
+                reason = std::string("HTP_FIXED_INPUT_INVALID:") +
+                    item.source->name;
+                return false;
+            }
+        }
+        for (int i = 0; i < source->n_nodes; ++i) {
+            const ggml_tensor * op = source->nodes[i];
+            if (op->op != GGML_OP_SET_ROWS || op->src[2] == nullptr) { continue; }
+            const auto result = mapped.find(op);
+            const auto kv = mapped.find(op->src[2]);
+            if (result == mapped.end() || kv == mapped.end() ||
+                    result->second->data != kv->second->data ||
+                    result->second->buffer != kv->second->buffer) {
+                reason = "HTP_FIXED_KV_ALIAS";
+                return false;
+            }
+        }
+        // High bit reserves a dedicated backend graph-cache namespace for
+        // persistent fixed Chunk graphs. Never reuse within server lifetime.
+        if (next_fixed_uid_ == 0 ||
+                next_fixed_uid_ >= (UINT64_C(1) << 63)) {
+            reason = "HTP_FIXED_UID_EXHAUSTED";
+            return false;
+        }
+        graph->uid = (UINT64_C(1) << 63) | next_fixed_uid_++;
+        registered_graphs_.emplace(uid, std::move(prepared));
+        prepare_ms = (ggml_time_us() - begin_us) / 1000.0;
+        return true;
+    }
+
+    bool has_registered_chunk(uint64_t uid) const {
+        return registered_graphs_.count(uid) != 0;
+    }
+
+    bool run_registered_chunk(uint64_t uid, ggml_cgraph * source,
+                              ggml_tensor * output, std::string & reason,
+                              double & stage_ms, double & compute_ms,
+                              double & output_ms,
+                              stage_profile_stats * profile = nullptr) {
+        reason.clear();
+        stage_ms = compute_ms = output_ms = 0.0;
+        if (profile != nullptr) { *profile = {}; }
+        const auto it = registered_graphs_.find(uid);
+        if (it == registered_graphs_.end()) {
+            reason = "HTP_FIXED_UID_NOT_FOUND";
+            return false;
+        }
+        registered_graph & item = *it->second;
+        if (item.source != source || item.source_output != output) {
+            reason = "HTP_FIXED_SOURCE_CHANGED";
+            return false;
+        }
+        const int64_t start_us = ggml_time_us();
+        // Keep canonical OpenCL KV writeback target fresh and defer the first
+        // KV upload until the producer's runtime OpenCL writes are complete.
+        for (const auto & binding : item.kv_sources) {
+            const auto found = persistent_.find(binding.first);
+            if (found == persistent_.end() ||
+                    found->second->tensor == nullptr) {
+                reason = "HTP_FIXED_KV_GONE";
+                return false;
+            }
+            found->second->original = binding.second;
+            if (deferred_kv_.count(binding.first)) {
+                const int64_t t0 = profile != nullptr ? ggml_time_us() : 0;
+                ggml_backend_tensor_copy(binding.second,
+                                         found->second->tensor);
+                if (profile != nullptr) {
+                    profile->kv_bind_ms +=
+                        (ggml_time_us() - t0) / 1000.0;
+                    ++profile->kv_new;
+                }
+                deferred_kv_.erase(binding.first);
+            } else if (profile != nullptr) {
+                ++profile->kv_reused;
+            }
+        }
+        if (profile != nullptr) {
+            profile->persistent_bind_ms = profile->kv_bind_ms;
+            profile->graph_nodes = static_cast<size_t>(item.graph->n_nodes);
+            profile->input_tensors = item.inputs.size();
+        }
+        const int64_t copy_begin = ggml_time_us();
+        for (const auto & in : item.inputs) {
+            if (in.source->data != in.source_data ||
+                    in.source->buffer != in.source_buffer ||
+                    !ggml_are_same_layout(in.source, in.target)) {
+                reason = "HTP_FIXED_INPUT_BINDING_DRIFT";
+                return false;
+            }
+            ggml_backend_tensor_copy(in.source, in.target);
+        }
+        const int64_t compute_begin = ggml_time_us();
+        stage_ms = (compute_begin - start_us) / 1000.0;
+        if (profile != nullptr) {
+            profile->input_copy_ms =
+                (compute_begin - copy_begin) / 1000.0;
+            profile->other_ms = std::max(0.0, stage_ms -
+                profile->input_copy_ms - profile->persistent_bind_ms);
+        }
+        if (ggml_backend_graph_compute(backend_, item.graph) !=
+                GGML_STATUS_SUCCESS) {
+            reason = "HTP_FIXED_GRAPH_COMPUTE";
+            return false;
+        }
+        ggml_backend_synchronize(backend_);
+        const int64_t compute_end = ggml_time_us();
+        compute_ms = (compute_end - compute_begin) / 1000.0;
+        ggml_backend_tensor_copy(item.output, output);
+        output_ms = (ggml_time_us() - compute_end) / 1000.0;
+        return true;
+    }
+
+    // Invalidate backend plans BEFORE releasing their referenced tensors/KV.
+    // The HTP backend proc is optional for older libraries, so fixed-graph
+    // registration is enabled only when that invalidation hook exists.
+    bool fixed_graph_cache_supported() const {
+        if (backend_ == nullptr) { return false; }
+        const auto reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_));
+        return reg != nullptr &&
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_hexagon_clear_fixed_graph_cache") != nullptr;
+    }
+
     // Caller holds the server's single Phone graph-compute mutex. Only one
     // full-region execution is in progress at any moment, on either device.
     bool run(ggml_cgraph * source, ggml_tensor * output,
@@ -628,9 +1032,26 @@ public:
     }
 
     void reset_kv() {
+        // This is called at a new RUN boundary while HTP and Graph locks are
+        // held. Cached Hexagon nodes point to the per-Chunk tensor metadata.
+        const auto reg = backend_ != nullptr ?
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_)) :
+            nullptr;
+        if (reg != nullptr) {
+            using clear_fn = void (*)(ggml_backend_t);
+            auto clear = reinterpret_cast<clear_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_clear_fixed_graph_cache"));
+            if (clear != nullptr) { clear(backend_); }
+        }
+        registered_graphs_.clear();
+        deferred_kv_.clear();
         for (auto it = persistent_.begin(); it != persistent_.end();) {
             it = it->second->kv ? persistent_.erase(it) : ++it;
         }
+        // Keep standalone scratch arenas resident across RUNs; only graph
+        // metadata and per-Prompt KV are invalidated. Their addresses stay
+        // stable until server teardown.
     }
 
     bool has_backend() const { return backend_ != nullptr; }
@@ -696,7 +1117,8 @@ private:
 
     ggml_tensor * persistent_copy(const ggml_tensor * src, bool kv,
                                   std::string & reason,
-                                  bool * created = nullptr) {
+                                  bool * created = nullptr,
+                                  bool initialize_from_source = true) {
         if (created != nullptr) { *created = false; }
         if (src->buffer == nullptr || src->data == nullptr ||
                 !ggml_is_contiguous(src)) {
@@ -752,7 +1174,11 @@ private:
             ggml_backend_buffer_set_usage(
                 entry->buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
-        ggml_backend_tensor_copy(src, entry->tensor);
+        if (initialize_from_source) {
+            ggml_backend_tensor_copy(src, entry->tensor);
+        } else if (kv) {
+            deferred_kv_.insert(key);
+        }
         // Weight preload may use a detached, short-lived metadata snapshot.
         // Only KV needs the canonical OpenCL destination for final sync.
         entry->original = kv ? src : nullptr;
@@ -762,6 +1188,36 @@ private:
         if (created != nullptr) { *created = true; }
         return result;
     }
+
+    struct registered_input {
+        const ggml_tensor * source = nullptr;
+        ggml_tensor * target = nullptr;
+        ggml_backend_buffer_t source_buffer = nullptr;
+        const void * source_data = nullptr;
+    };
+    struct registered_arena {
+        ggml_backend_buffer_ptr buffer;
+        size_t capacity = 0;
+    };
+    struct registered_graph {
+        ggml_context_ptr ctx;
+        ggml_cgraph * graph = nullptr;
+        const ggml_cgraph * source = nullptr;
+        const ggml_tensor * source_output = nullptr;
+        ggml_tensor * output = nullptr;
+        registered_arena * arena = nullptr;
+        std::vector<registered_input> inputs;
+        std::vector<std::pair<std::string, const ggml_tensor *>> kv_sources;
+        std::vector<std::pair<ggml_tensor *, size_t>> roots;
+        std::vector<ggml_tensor *> views;
+    };
+    // Arenas are declared BEFORE graph entries so graphs are destroyed first
+    // in the C++ destruction sequence; HTP weights/KV outlive the entries.
+    std::vector<std::unique_ptr<registered_arena>> arenas_;
+    std::unordered_map<uint64_t, std::unique_ptr<registered_graph>>
+        registered_graphs_;
+    std::unordered_set<std::string> deferred_kv_;
+    uint64_t next_fixed_uid_ = 1;
 
     ggml_backend_t backend_ = nullptr;  // non-owning; RPC server owns it
     ggml_backend_buffer_type_t repack_buft_ = nullptr;
