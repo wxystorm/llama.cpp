@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-rpc.h"
+#include "../ggml/src/ggml-rpc/phone-owned-qwen3-plan.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hybrid.h"
@@ -5501,6 +5502,96 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
              phone_input_push(phone_rpc_backend, 0, 0, 0, nullptr, 0, nullptr));
         const bool phone_auto_enabled =
             phone_auto_eligible && phone_input_stream_enabled;
+        // Patch27 shadow validation: the PC sends a small, explicit Qwen3
+        // Prefill plan with *per-Region* variable Chunk boundaries and actual
+        // token positions. The Phone validates local GGUF weight shapes and
+        // keeps the plan separate from the legacy RPC graph registry.
+        // Nothing in this path authorizes Phone-local compute or GRAPH_READY.
+        // Until local Graph parity passes, the proven PC-built Graph path
+        // remains the only execution source.
+        const char * phone_owned_shadow_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_OWNED_QWEN3_PLAN_SHADOW");
+        const bool phone_owned_shadow =
+            phone_owned_shadow_env != nullptr &&
+            std::strcmp(phone_owned_shadow_env, "1") == 0;
+        if (phone_owned_shadow) {
+            const auto & hp = model.hparams;
+            bool valid = phone_auto_enabled && phone_auto_final_enabled &&
+                model.arch == LLM_ARCH_QWEN3 &&
+                ubatch.n_pos == 1 && ubatch.n_seqs_unq == 1 &&
+                ubatch.pos != nullptr && !phone_auto_templates.empty();
+            ggml_phone_owned_qwen3::plan p {};
+            if (valid) {
+                const auto & first = stages[phone_auto_templates.front().region];
+                const uint32_t layer = (uint32_t) first.layer_begin;
+                p.run_id = phone_input_push_run_id;
+                p.n_ctx = (uint32_t) cparams.n_ctx;
+                p.n_tokens = (uint32_t) ubatch.n_tokens;
+                p.n_embd = (uint32_t) n_embd;
+                p.n_layer = hp.n_layer();
+                p.n_head = hp.n_head(layer);
+                p.n_head_kv = hp.n_head_kv(layer);
+                p.head_dim = hp.n_embd_head_k(layer);
+                p.n_ff = hp.n_ff(layer);
+                p.seq_id = 0;  // this v1 path supports one causal sequence
+                p.rope_type = (uint32_t) hp.rope_type;
+                p.rms_eps = hp.f_norm_rms_eps;
+                p.rope_base = hp.rope_freq_base_train;
+                p.rope_scale = hp.rope_freq_scale_train;
+                p.positions.reserve(ubatch.n_tokens);
+                for (uint32_t t = 0; t < ubatch.n_tokens; ++t) {
+                    p.positions.push_back(ubatch.pos[t]);
+                }
+                for (const auto & item : phone_auto_templates) {
+                    const auto & stage = stages[item.region];
+                    if (stage.layer_end != stage.layer_begin + 1 ||
+                            hp.n_head(stage.layer_begin) != p.n_head ||
+                            hp.n_head_kv(stage.layer_begin) != p.n_head_kv ||
+                            hp.n_embd_head_k(stage.layer_begin) != p.head_dim ||
+                            hp.n_ff(stage.layer_begin) != p.n_ff) {
+                        valid = false;
+                        break;
+                    }
+                    p.chunks.push_back({
+                        (uint32_t) item.region,
+                        (uint32_t) stage.layer_begin,
+                        (uint32_t) item.chunk,
+                        item.token_begin, item.tokens
+                    });
+                }
+            }
+            std::vector<uint8_t> payload;
+            std::string reason;
+            valid = valid &&
+                ggml_phone_owned_qwen3::encode(p, payload, reason);
+            auto * dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * reg = dev != nullptr ?
+                ggml_backend_dev_backend_reg(dev) : nullptr;
+            const auto register_plan = reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_owned_qwen3_plan_t>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_RPC_PHONE_OWNED_QWEN3_PLAN_PROC)) :
+                nullptr;
+            if (!valid || register_plan == nullptr ||
+                    !register_plan(phone_rpc_backend,
+                        payload.data(), payload.size())) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_OWNED_QWEN3_PLAN] side=PC event=REJECT "
+                    "reason=%s status=FAIL\n",
+                    reason.empty() ? "INELIGIBLE_OR_PHONE_REJECTED" :
+                        reason.c_str());
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_OWNED_QWEN3_PLAN] side=PC event=ACCEPT "
+                "run=%" PRIu64 " chunks=%zu positions=%zu wire_bytes=%zu "
+                "graph_owner=LEGACY_PC_SHADOW status=PASS\n",
+                p.run_id, p.chunks.size(), p.positions.size(),
+                payload.size());
+        }
         static std::atomic<uint64_t> next_phone_stream_run_id { 1 };
         const uint64_t phone_stream_run_id =
             phone_stream_requested && has_phone_full_return ?
