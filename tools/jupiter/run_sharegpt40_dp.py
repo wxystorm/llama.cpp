@@ -329,6 +329,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     if (args.pc_layers <= 0 or args.min_chunk <= 0 or args.max_chunk <= 0
+            or args.min_chunk > args.max_chunk
             or args.max_chunk > args.ubatch or args.ubatch > args.batch
             or args.batch > args.context or args.q_repeats < 1
             or args.refine_repeats < 1 or args.bench_repeats < 1
