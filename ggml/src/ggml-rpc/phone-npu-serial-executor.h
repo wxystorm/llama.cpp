@@ -56,6 +56,22 @@ public:
         }
     }
 
+    ~full_region_executor() {
+        // rpc_server destroys this executor before its private HTP backend.
+        // Drop any backend opnodes that still reference registered Graphs.
+        if (backend_ != nullptr) {
+            const auto reg = ggml_backend_dev_backend_reg(
+                ggml_backend_get_device(backend_));
+            if (reg != nullptr) {
+                using clear_fn = void (*)(ggml_backend_t);
+                const auto clear = reinterpret_cast<clear_fn>(
+                    ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_hexagon_clear_fixed_graph_cache"));
+                if (clear != nullptr) { clear(backend_); }
+            }
+        }
+    }
+
     struct weight_preload_stats {
         size_t new_weights = 0;
         size_t reused_weights = 0;
