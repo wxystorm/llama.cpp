@@ -52,6 +52,11 @@ static bool jupiter_async_c2p_enabled() {
     return jupiter_prefill_enabled() && value != nullptr && std::atoi(value) != 0;
 }
 
+static bool jupiter_graph_prebuild_enabled() {
+    const char * value = std::getenv("LLAMA_JUPITER_GRAPH_PREBUILD");
+    return jupiter_prefill_enabled() && value != nullptr && std::atoi(value) != 0;
+}
+
 namespace fs = std::filesystem;
 
 // macro for nicer error messages on server crash
@@ -1603,6 +1608,47 @@ static bool ggml_backend_rpc_cpy_tensor_async(
             (t_read - t_sync)/1000.0, (t_queued - t_read)/1000.0,
             (t_queued - t0)/1000.0, t_queued);
     }
+    return true;
+}
+
+// Invoked by the scheduler immediately after graph allocation, before any
+// split executes or its dynamic inputs are copied. The Phone registers the
+// shape/slot-specific graph but does not touch activation or KV data.
+static bool ggml_backend_rpc_graph_prebuild(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    if (!jupiter_graph_prebuild_enabled()) {
+        return true;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx->comm) {
+        GGML_LOG_WARN("[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER status=SKIP_ASYNC_C2P\n");
+        return true;
+    }
+    auto * dev = ggml_backend_get_device(backend);
+    auto * dev_ctx = static_cast<ggml_backend_rpc_device_context *>(dev->context);
+    const uint64_t uid = rpc_graph_effective_uid(cgraph);
+    if (dev_ctx->graph_uids.find(uid) != dev_ctx->graph_uids.end()) {
+        return true;
+    }
+
+    std::vector<uint8_t> payload;
+    serialize_graph(ctx->device, uid, cgraph, payload);
+    const int64_t t0 = ggml_time_us();
+    std::lock_guard<std::mutex> lock(ctx->legacy_compute_mutex);
+    const auto sock = jupiter_legacy_compute_socket(ctx);
+    rpc_msg_jupiter_rsp rsp {};
+    const bool ok = sock && send_rpc_cmd(
+        sock, RPC_CMD_GRAPH_REGISTER, payload.data(), payload.size(),
+        &rsp, sizeof(rsp)) && rsp.ok == 1;
+    if (!ok) {
+        GGML_LOG_ERROR("[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER uid=%" PRIu64
+                       " status=FAILED (rebuild the Phone RPC server)\n", uid);
+        return false;
+    }
+    dev_ctx->graph_uids.insert(uid);
+    GGML_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER uid=%" PRIu64
+                  " slot=%d nodes=%d bytes=%zu wall_ms=%.3f status=READY\n",
+                  uid, rpc_graph_jupiter_slot(cgraph), cgraph->n_nodes,
+                  payload.size(), (ggml_time_us() - t0)/1000.0);
     return true;
 }
 
@@ -4004,6 +4050,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
+    }
+    if (std::strcmp(name, "ggml_backend_rpc_graph_prebuild") == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_graph_prebuild);
     }
     if (std::strcmp(
             name,
