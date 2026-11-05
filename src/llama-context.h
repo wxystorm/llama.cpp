@@ -138,7 +138,9 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                 llm_graph_result_ptr * prebuilt = nullptr,
+                         uint32_t      prebuilt_n_kv = 0);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -366,6 +368,11 @@ private:
 
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // Keep prepared/retired graph metadata alive across asynchronous chunk
+    // dispatches. Released only after synchronize() at the next prebuild.
+    std::vector<llm_graph_result_ptr> jupiter_prebuilt_graphs;
+    std::vector<llama_memory_context_ptr> jupiter_prebuilt_snapshots;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
