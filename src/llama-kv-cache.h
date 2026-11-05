@@ -42,6 +42,10 @@ public:
         std::vector<llama_seq_id> strm; // [ns]
         std::vector<idx_vec_t>    idxs; // [ns]
 
+        // Predicted padded KV length while preparing all ubatches. Metadata
+        // only: allows Jupiter to construct a graph without applying KV writes.
+        uint32_t prebuild_n_kv = 0;
+
         uint32_t head() const {
             GGML_ASSERT(idxs.size() == 1);
             GGML_ASSERT(!idxs[0].empty());
@@ -357,6 +361,10 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    // Read-only Jupiter graph template preview. Does not mutate KV cells.
+    size_t prebuild_batch_count() const;
+    std::unique_ptr<llama_kv_cache_context> prebuild_batch_snapshot(size_t index) const;
 
     //
     // llama_kv_cache_context specific API
