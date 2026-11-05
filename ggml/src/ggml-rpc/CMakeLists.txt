@@ -5,6 +5,14 @@ ggml_add_backend_library(ggml-rpc
                          transport.cpp
                         )
 
+# Phone serial HTP execution is an Android-only extension.  Do not link the
+# global ggml registry (libggml.so): ggml already depends on ggml-rpc.
+# The Hexagon backend registry is independent and provides HTP0 directly.
+if (ANDROID AND GGML_HEXAGON AND NOT GGML_BACKEND_DL)
+    target_link_libraries(ggml-rpc PRIVATE ggml-hexagon)
+    target_compile_definitions(ggml-rpc PRIVATE GGML_RPC_WITH_HEXAGON)
+endif()
+
 if (WIN32)
     target_link_libraries(ggml-rpc PRIVATE ws2_32)
 endif()
