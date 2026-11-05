@@ -99,8 +99,12 @@ def run_one(
             check=False,
         )
     if proc.returncode:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        tail = "\n".join(lines[-45:])
         raise RuntimeError(
-            f"llama-cli exited {proc.returncode}; inspect log: {log}"
+            f"llama-cli exited {proc.returncode} (0x{proc.returncode & 0xffffffff:08X}); "
+            f"inspect log: {log}\n"
+            f"--- last 45 lines of llama-cli ---\n{tail}"
         )
 
 
