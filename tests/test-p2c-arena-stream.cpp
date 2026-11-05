@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -213,6 +214,58 @@ void test_framing_and_partial_receive_failure() {
     REQUIRE(failed_ctx.failed);
 }
 
+// This binary is deliberately not linked against ggml-base. Enabling the
+// receiver timeline must not introduce a link-time dependency on ggml_time_us.
+int test_clock_calls = 0;
+
+int64_t standalone_trace_clock_us() {
+    return 1000000 + ++test_clock_calls;
+}
+
+void test_receiver_trace_with_injected_clock() {
+    const char * original = std::getenv("GGML_RPC_P2C_CHUNK_TIMELINE");
+    const bool had_original = original != nullptr;
+    const std::string original_value = had_original ? original : "";
+#if defined(_WIN32)
+    REQUIRE(_putenv_s("GGML_RPC_P2C_CHUNK_TIMELINE", "1") == 0);
+#else
+    REQUIRE(setenv("GGML_RPC_P2C_CHUNK_TIMELINE", "1", 1) == 0);
+#endif
+
+    frame f = make_frame(0, 0, 0, 2, 1);
+    frame end {};
+    end.run_id = run_id;
+    end.seq = 2;
+    end.kind = GGML_BACKEND_RPC_P2C_END;
+    const float data[hidden * 2] = {1,2,3,4,5,6,7,8};
+    auto sock = std::make_shared<fake_socket>();
+    append(sock->bytes, &f, sizeof(f));
+    append(sock->bytes, data, sizeof(data));
+    append(sock->bytes, &end, sizeof(end));
+    receive_context ctx;
+    test_clock_calls = 0;
+    {
+        ggml_rpc_p2c_stream_receiver receiver(
+            run_id, regions, tokens, hidden, resolve, complete, &ctx,
+            standalone_trace_clock_us);
+        REQUIRE(receiver.receive(sock));
+        REQUIRE((ctx.completed == std::vector<uint64_t>{ 1 }));
+        REQUIRE(test_clock_calls >= 6);
+        REQUIRE(std::memcmp(ctx.outputs[0], data, sizeof(data)) == 0);
+    }
+#if defined(_WIN32)
+    REQUIRE(_putenv_s("GGML_RPC_P2C_CHUNK_TIMELINE",
+                      had_original ? original_value.c_str() : "") == 0);
+#else
+    if (had_original) {
+        REQUIRE(setenv("GGML_RPC_P2C_CHUNK_TIMELINE",
+                       original_value.c_str(), 1) == 0);
+    } else {
+        REQUIRE(unsetenv("GGML_RPC_P2C_CHUNK_TIMELINE") == 0);
+    }
+#endif
+}
+
 // The terminal Phone stage (region==n_regions-1) is a producer too when
 // its PC Output Head is decoupled. Exercise both Arena and PC Receiver.
 void test_terminal_phone_region_full_return() {
@@ -289,6 +342,8 @@ int main(int argc, char ** argv) {
     test_abort_unblocks_sender();
     std::fprintf(stderr, "[P2C_TEST] framed receive and truncated payload\n");
     test_framing_and_partial_receive_failure();
+    std::fprintf(stderr, "[P2C_TEST] receiver standalone trace clock\n");
+    test_receiver_trace_with_injected_clock();
     std::fprintf(stderr, "[P2C_TEST] terminal Phone Region P2C\n");
     test_terminal_phone_region_full_return();
     std::fprintf(stderr, "[P2C_TEST] PASS\n");
