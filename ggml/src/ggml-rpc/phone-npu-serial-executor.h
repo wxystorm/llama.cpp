@@ -326,7 +326,11 @@ public:
                 reason = "HTP_KV_SNAPSHOT_INVALID";
                 return false;
             }
-            ggml_backend_tensor_copy(entry->tensor, entry->original);
+            // The RPC graph owns this mutable OpenCL KV tensor. We keep
+            // only a const view for identity/layout checks, but this is the
+            // explicit end-of-prefill writeback destination.
+            ggml_backend_tensor_copy(entry->tensor,
+                                     const_cast<ggml_tensor *>(entry->original));
             n_bytes += ggml_nbytes(entry->tensor);
         }
         return true;
