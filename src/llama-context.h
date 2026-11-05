@@ -140,7 +140,8 @@ struct llama_context {
             llama_memory_context_i * mctx,
                        ggml_status & ret,
                  llm_graph_result_ptr * prebuilt = nullptr,
-                         uint32_t      prebuilt_n_kv = 0);
+                         uint32_t      prebuilt_n_kv = 0,
+    const std::vector<std::pair<ggml_tensor *, ggml_backend_t>> * prebuilt_placements = nullptr);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -373,6 +374,7 @@ private:
     // dispatches. Released only after synchronize() at the next prebuild.
     std::vector<llm_graph_result_ptr> jupiter_prebuilt_graphs;
     std::vector<llama_memory_context_ptr> jupiter_prebuilt_snapshots;
+    std::vector<std::vector<std::pair<ggml_tensor *, ggml_backend_t>>> jupiter_prebuilt_placements;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
