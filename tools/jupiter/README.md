@@ -346,6 +346,105 @@ compile, correctness and runtime timing still require verification.
 **Do not reuse pre-fix min-chunk or q(x,y) measurements**; recalibrate
 in a fresh output directory after validating the fence.
 
+## Jupiter graph prebuild experiment (PC metadata + Phone registration)
+
+**Status: experimental, off by default.** Implemented on
+`feat/jupiter-graph-prebuild-20261105`; requires rebuilding the PC CLI **and
+the Phone RPC server** from this branch. The new `GRAPH_REGISTER` opcode is
+appended after the existing Jupiter opcodes (RPC patch version 4). Never run
+`--graph-prebuild` against an old Phone binary.
+
+The opt-in `LLAMA_JUPITER_GRAPH_PREBUILD=1` path has two distinct stages:
+
+1. Before processing the real Prefill chunks, the Qwen3 dense KV allocator's
+   tentative slot simulation records each chunk's padded KV length. The PC
+   creates **metadata-only** Graph templates for all chunks. It neither
+   allocates all device graphs simultaneously nor writes KV early. At runtime
+   the real KV span, graph topology/inputs and forced backend placements are
+   checked, then the scheduler allocates the actual rotating Slot. A failed
+   compatibility check falls back to the established graph builder.
+2. After each runtime split graph is allocated, but **before C2P inputs are
+   copied or kernels are launched**, the PC registers that Phone split
+   using `RPC_CMD_GRAPH_REGISTER`. The Phone only deserializes/stores the
+   graph, returns an ACK and does not execute or touch KV. The subsequent
+   execution uses `GRAPH_RECOMPUTE` on the existing persistent compute
+   connection, retaining the corrected FIFO completion fence.
+
+This is **not yet** a persistent PC CUDA executable cache or an ahead-of-time
+allocation of all Phone graph shapes at model load. It is an incremental,
+safe-first way to move CPU graph construction out of per-chunk execution and
+separate Phone registration from execution. Only dense Qwen3 single-stream KV
+contexts use the PC preview; all other architectures stay on the original PC
+path. The `--graph-prebuild` benchmark flag is not compatible with
+`--async-c2p` or `--local-graph-reuse` in this initial version.
+
+### Rebuild and verify parity first
+
+On the PC (PowerShell):
+
+```powershell
+cd E:\llama\llama-jupiter
+git fetch origin
+git switch feat/jupiter-graph-prebuild-20261105
+git pull --ff-only
+cmake --build build-jupiter --config Release -j
+python -m unittest discover -s .\tools\jupiter -p test_run_prefill_bench.py -v
+python -m unittest discover -s .\tools\jupiter -p test_graph_prebuild_parity.py -v
+```
+
+Rebuild/restart the Phone RPC server from the **same branch** (protocol patch
+version 4). Then run one read-only parity sweep:
+
+```powershell
+python .\tools\jupiter\run_graph_prebuild_parity.py `
+  --exe .\build-jupiter\bin\Release\llama-cli.exe `
+  --model E:\llama\models\Qwen3-14B-Q4_K_M.gguf `
+  --rpc 10.39.52.114:10139 `
+  --prompt-file D:\prima.cpp\prompts\prompt_358.txt `
+  --plan .\jupiter-stage3-syncfix.plan `
+  --target-tokens 366 --pc-layers 24 `
+  --out-dir .\jupiter-prebuild-parity
+```
+
+Expect `[JUPITER_GRAPH_PREBUILD] phase=PREPARE ... status=READY`,
+`phase=USE ... status=HIT`, and
+`phase=PHONE_REGISTER ... status=READY` in the opt-in PC logs. The Phone
+server also logs `phase=PHONE_REGISTER` when its timeline or trace is
+enabled, **without a matching Phone compute event during registration**.
+The parity runner reports `[JUPITER_PREBUILD_PARITY_DONE] status=PASS`
+only if baseline and prebuilt final-logit checksums match for both Default
+and DP. If the digest differs, inspect the Top-1 result and do not proceed to
+performance claims.
+
+### Formal throughput A/B (separate from parity)
+
+Run `run_prefill_bench.py` with the same model/plan/prompt/settings twice,
+using **different output directories**, once without any prebuild flag and
+once adding `--graph-prebuild`. Keep `--comm-timing` off for formal runs.
+
+```powershell
+$common = @(
+  "--exe", ".\build-jupiter\bin\Release\llama-cli.exe",
+  "--model", "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
+  "--rpc", "10.39.52.114:10139",
+  "--prompt-file", "D:\prima.cpp\prompts\prompt_358.txt",
+  "--plan", ".\jupiter-stage3-syncfix.plan",
+  "--target-tokens", "366", "--pc-layers", "24",
+  "--modes", "default,dp", "--repeats", "5",
+  "--batch", "2048", "--context", "2048", "--ubatch", "128",
+  "--threads", "8", "--window", "2",
+  "--timing-token-tolerance", "1"
+)
+python .\tools\jupiter\run_prefill_bench.py @common --out-dir .\jupiter-prebuild-off
+python .\tools\jupiter\run_prefill_bench.py @common --graph-prebuild --out-dir .\jupiter-prebuild-on
+```
+
+`host_ms` on `phase=PREPARE` covers the PC's upfront Graph topology
+construction; the actual measured Prefill still includes this overhead.
+`graph_build_ms`, `graph_alloc_ms`, and Phone registration `wall_ms`
+are available when running diagnostics with `--comm-timing`. No speedup is
+assumed until the parity and A/B checks succeed on the actual PC+Phone setup.
+
 ## Jupiter communication and graph timeline (diagnostic only)
 
 To distinguish CPU waiting, GPU readback, socket sends, remote transfer
