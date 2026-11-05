@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    26
+#define RPC_PROTO_PATCH_VERSION    27
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -179,6 +179,14 @@ using ggml_backend_rpc_phone_input_stream_push_t = bool (*)(
     "ggml_backend_rpc_phone_auto_graph_register"
 #define GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC \
     "ggml_backend_rpc_phone_auto_task_register"
+
+// Patch 27: PC sends only a validated Qwen3 single-sequence Prefill Plan.
+// This capability registers metadata; it does not claim that an independently
+// generated HTP Graph is compiled or ready for Activation.
+#define GGML_BACKEND_RPC_PHONE_OWNED_QWEN3_PLAN_PROC \
+    "ggml_backend_rpc_phone_owned_qwen3_plan"
+using ggml_backend_rpc_phone_owned_qwen3_plan_t = bool (*)(
+    ggml_backend_t backend, const uint8_t * data, size_t size);
 #define GGML_BACKEND_RPC_PHONE_AUTO_WAIT_PROC \
     "ggml_backend_rpc_phone_auto_wait"
 // Patch 25: non-final Phone Full runtime avoids Meta graph execution.
