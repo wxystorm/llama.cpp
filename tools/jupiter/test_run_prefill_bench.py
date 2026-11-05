@@ -86,6 +86,11 @@ class PrefillBenchTests(unittest.TestCase):
             reused = env_for_mode(reuse_base, mode, plan, chunks)
             self.assertEqual(reused["LLAMA_JUPITER_LOCAL_GRAPH_REUSE"], "1")
 
+        prebuild_base = dict(base, LLAMA_JUPITER_GRAPH_PREBUILD="1")
+        for mode in ("default", "fixed64", "dp"):
+            prebuilt = env_for_mode(prebuild_base, mode, plan, chunks)
+            self.assertEqual(prebuilt["LLAMA_JUPITER_GRAPH_PREBUILD"], "1")
+
     def test_opt_in_async_c2p_flag_is_disabled_by_default(self) -> None:
         common = [
             "--exe", "cli.exe", "--model", "test.gguf",
@@ -95,6 +100,8 @@ class PrefillBenchTests(unittest.TestCase):
         self.assertTrue(parser().parse_args(common + ["--async-c2p"]).async_c2p)
         self.assertFalse(parser().parse_args(common).local_graph_reuse)
         self.assertTrue(parser().parse_args(common + ["--local-graph-reuse"]).local_graph_reuse)
+        self.assertFalse(parser().parse_args(common).graph_prebuild)
+        self.assertTrue(parser().parse_args(common + ["--graph-prebuild"]).graph_prebuild)
         self.assertFalse(parser().parse_args(common).comm_timing)
         self.assertTrue(parser().parse_args(common + ["--comm-timing"]).comm_timing)
 
