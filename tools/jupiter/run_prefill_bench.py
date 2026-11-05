@@ -170,6 +170,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--local-graph-reuse", action="store_true",
                    help="opt in to the existing local graph can_reuse path; "
                         "synchronizes before input rebinding and can reduce overlap")
+    p.add_argument("--graph-prebuild", action="store_true",
+                   help="opt in to PC graph metadata prebuild + Phone GRAPH_REGISTER "
+                        "(requires rebuilt Phone RPC server, legacy C2P only)")
     p.add_argument("--comm-timing", action="store_true",
                    help="opt in to per-chunk host/RPC timing (diagnostic runs only)")
     p.add_argument(
@@ -196,6 +199,9 @@ def main() -> int:
         raise ValueError("use --verbosity 2, 3 or 4; 3 is recommended")
     if args.ubatch > args.batch or args.batch > args.context:
         raise ValueError("require ubatch <= batch <= context")
+    if args.graph_prebuild and (args.async_c2p or args.local_graph_reuse):
+        raise ValueError("--graph-prebuild is independent of and currently "
+                         "incompatible with --async-c2p / --local-graph-reuse")
 
     prompt = prompt_path.read_text(encoding="utf-8-sig").rstrip("\r\n")
     if not prompt:
@@ -234,6 +240,7 @@ def main() -> int:
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
         "LLAMA_JUPITER_ASYNC_C2P": "1" if args.async_c2p else "0",
         "LLAMA_JUPITER_LOCAL_GRAPH_REUSE": "1" if args.local_graph_reuse else "0",
+        "LLAMA_JUPITER_GRAPH_PREBUILD": "1" if args.graph_prebuild else "0",
         "LLAMA_GRAPH_REUSE_DISABLE": "0",
         "LLAMA_JUPITER_TIMELINE": "1" if args.comm_timing else "0",
     })
@@ -253,6 +260,7 @@ def main() -> int:
         "window": args.window,
         "async_c2p": args.async_c2p,
         "local_graph_reuse": args.local_graph_reuse,
+        "graph_prebuild": args.graph_prebuild,
         "comm_timing": args.comm_timing,
         "profile_stage": 0,
         "trace": 0,
@@ -295,6 +303,7 @@ def main() -> int:
         f"repeats={args.repeats} lv={args.verbosity} "
         f"window={args.window} async_c2p={int(args.async_c2p)} "
         f"local_graph_reuse={int(args.local_graph_reuse)} "
+        f"graph_prebuild={int(args.graph_prebuild)} "
         f"comm_timing={int(args.comm_timing)} trace=0 profile_stage=0",
         flush=True,
     )
