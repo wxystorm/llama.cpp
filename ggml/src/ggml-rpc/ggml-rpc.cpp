@@ -7266,13 +7266,14 @@ bool rpc_server::phone_auto_task_register(
                 "run=%" PRIu64 " region=%u layer=%d chunk=%u "
                 "uid=%" PRIu64 " backend=HTP0 "
                 "new_weights=%zu reused_weights=%zu "
-                "source_bytes=%zu sync_ms=%.3f copy_ms=%.3f "
-                "wall_ms=%.3f status=%s reason=%s\n",
+                "model_hits=%zu source_bytes=%zu sync_ms=%.3f "
+                "copy_ms=%.3f wall_ms=%.3f status=%s reason=%s\n",
                 request.key.run_id, request.key.region,
                 phone_npu_region_layer.at(request.key.region),
                 request.key.chunk, request.graph_uid,
                 preload_stats.new_weights, preload_stats.reused_weights,
-                preload_stats.new_bytes, preload_stats.sync_ms,
+                preload_stats.model_hits, preload_stats.new_bytes,
+                preload_stats.sync_ms,
                 preload_stats.copy_ms, preload_wall_ms,
                 preloaded ? "PASS" : "FAIL",
                 preloaded ? "NONE" : preload_reason.c_str());
@@ -7649,12 +7650,12 @@ void rpc_server::phone_npu_preload_loop() {
             "run=%" PRIu64 " region=%u layer=%d chunk=%u "
             "uid=%" PRIu64 " backend=HTP0 mode=ASYNC "
             "new_weights=%zu reused_weights=%zu "
-            "source_bytes=%zu queue_ms=%.3f lock_wait_ms=%.3f "
-            "sync_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
+            "model_hits=%zu source_bytes=%zu queue_ms=%.3f "
+            "lock_wait_ms=%.3f sync_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
             "status=%s reason=%s\n",
             task.run_id, task.region, task.layer, task.chunk,
             task.uid, stats.new_weights, stats.reused_weights,
-            stats.new_bytes,
+            stats.model_hits, stats.new_bytes,
             (begin_us - task.enqueued_us) / 1000.0,
             (service_begin_us - begin_us) / 1000.0,
             stats.sync_ms, stats.copy_ms,
