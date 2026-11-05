@@ -13374,7 +13374,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
-                const int64_t handler_begin_us = ggml_time_us();
+                const int64_t handler_begin_us =
+                    server.phone_chunk_timeline_tracing() ? ggml_time_us() : 0;
                 // The Phone receiver itself owns the bounded host budget.
                 // Do not emit an ACK: send_data()/TCP backpressure is the
                 // only normal feedback to the PC producer.
@@ -13819,7 +13820,8 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
-                const int64_t handler_begin_us = ggml_time_us();
+                const int64_t handler_begin_us =
+                    server.phone_chunk_timeline_tracing() ? ggml_time_us() : 0;
                 // The Phone receiver itself owns the bounded host budget.
                 // Do not emit an ACK: send_data()/TCP backpressure is the
                 // only normal feedback to the PC producer.
