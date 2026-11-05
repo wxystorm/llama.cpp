@@ -5506,6 +5506,73 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_stream_requested && has_phone_full_return ?
                 next_phone_stream_run_id.fetch_add(
                     1, std::memory_order_relaxed) : 0;
+        // First migration step: send immutable Region descriptors ahead of
+        // the existing PC-built per-Chunk Graph path. This is intentionally
+        // a SHADOW contract; Phone-local graph building is not enabled yet.
+        const char * owned_plan_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+        const bool owned_plan_requested =
+            owned_plan_env != nullptr &&
+            std::strcmp(owned_plan_env, "1") == 0;
+        if (owned_plan_requested && phone_auto_enabled) {
+            auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * rpc_reg = rpc_dev != nullptr ?
+                ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+            const auto register_plan = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_owned_plan_register_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC)) :
+                nullptr;
+            bool valid = register_plan != nullptr &&
+                phone_stream_run_id != 0 &&
+                model.arch == LLM_ARCH_QWEN3 &&
+                ubatch.pos != nullptr && ubatch.pos[0] == 0 &&
+                cparams.n_ctx >= ubatch.n_tokens;
+            // v1 permits only a single contiguous sequence beginning at 0.
+            for (uint32_t i = 0; valid && i < ubatch.n_tokens; ++i) {
+                valid = ubatch.pos[i] == (llama_pos) i;
+            }
+            size_t published = 0;
+            for (size_t r = 1; valid && r < stages.size(); ++r) {
+                const auto & stage = stages[r];
+                if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                    continue;
+                }
+                valid = stage.layer_end == stage.layer_begin + 1 &&
+                    stage.layer_begin >= 0 &&
+                    stage.macro_tokens > 0 &&
+                    (uint32_t) stage.layer_begin < model.hparams.n_layer();
+                if (!valid) { break; }
+                const uint32_t layer = (uint32_t) stage.layer_begin;
+                ggml_backend_rpc_phone_owned_plan plan {};
+                plan.version = 1;
+                plan.flags = 0;
+                plan.run_id = phone_input_push_run_id;
+                plan.p2c_run_id = phone_stream_run_id;
+                plan.region = (uint32_t) r;
+                plan.layer = layer;
+                plan.total_tokens = ubatch.n_tokens;
+                plan.chunk_tokens = (uint32_t) stage.macro_tokens;
+                plan.n_embd = (uint32_t) n_embd;
+                plan.position_base = 0;
+                plan.kv_capacity = cparams.n_ctx;
+                plan.n_heads = model.hparams.n_head(layer);
+                plan.n_heads_kv = model.hparams.n_head_kv(layer);
+                plan.head_dim = model.hparams.n_embd_head_k(layer);
+                valid = register_plan(phone_rpc_backend, &plan);
+                if (valid) { ++published; }
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_OWNED_PLAN] side=pc mode=SHADOW_PC_BUILT "
+                "registered=%zu status=%s\n",
+                published, valid ? "PASS" : "FAIL");
+            if (!valid || published == 0) {
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
         ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
         if (phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
