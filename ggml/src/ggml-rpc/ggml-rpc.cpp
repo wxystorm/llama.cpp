@@ -7458,6 +7458,138 @@ bool rpc_server::phone_auto_wait_capture(
     return captured;
 }
 
+// Called with phone_auto_mutex held. A prepared NPU Chunk cannot enter
+// COMPUTING until that Region's HTP weight transfer has completed.
+bool rpc_server::phone_npu_preload_ready_locked(
+        const phone_auto_job & job) const {
+    if (!phone_npu_async_preload ||
+            !ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, job.request.key.region)) {
+        return true;
+    }
+    const auto it = phone_npu_preload_jobs.find(
+        {job.request.key.run_id, job.request.key.region});
+    return it != phone_npu_preload_jobs.end() &&
+        it->second.state == phone_npu_preload_status::READY;
+}
+
+// Dedicated HTP weight worker. It never touches the original RPC Graph:
+// only detached ggml_tensor metadata and live, immutable OpenCL buffers.
+// Backend operations are serialized with HTP run()/KV_SYNC separately from
+// graph_compute_mutex, allowing Graph/Task registration to keep progressing.
+void rpc_server::phone_npu_preload_loop() {
+    for (;;) {
+        phone_npu_preload_job task {};
+        {
+            std::unique_lock<std::mutex> lock(phone_auto_mutex);
+            phone_auto_cv.wait(lock, [&]() {
+                if (phone_auto_stop) { return true; }
+                for (const auto & entry : phone_npu_preload_jobs) {
+                    if (entry.second.state ==
+                            phone_npu_preload_status::QUEUED) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (phone_auto_stop) { return; }
+            auto it = std::find_if(phone_npu_preload_jobs.begin(),
+                phone_npu_preload_jobs.end(), [](const auto & entry) {
+                    return entry.second.state ==
+                        phone_npu_preload_status::QUEUED;
+                });
+            if (it == phone_npu_preload_jobs.end()) { continue; }
+            it->second.state = phone_npu_preload_status::RUNNING;
+            task = std::move(it->second);
+        }
+
+        const int64_t begin_us = ggml_time_us();
+        int64_t service_begin_us = begin_us;
+        std::string reason;
+        ggml_phone_npu_serial::full_region_executor::weight_preload_stats
+            stats {};
+        bool ok = false;
+        {
+            // free_buffer()/buffer_clear() must not invalidate a source
+            // while HTP copies its payload. Do not take graph_compute_mutex.
+            std::lock_guard<std::mutex> source_guard(
+                phone_npu_weight_source_mutex);
+            bool sources_live = true;
+            for (const ggml_tensor & src : task.weights) {
+                if (buffers.find(src.buffer) == buffers.end()) {
+                    sources_live = false;
+                    break;
+                }
+            }
+            if (!sources_live) {
+                reason = "HTP_PRELOAD_SOURCE_FREED";
+            } else {
+                std::lock_guard<std::mutex> htp_guard(
+                    phone_npu_backend_mutex);
+                service_begin_us = ggml_time_us();
+                ok = phone_npu_executor != nullptr &&
+                    phone_npu_executor->preload_weights(
+                        task.weights, backends[task.device],
+                        reason, stats);
+            }
+        }
+        if (!ok && reason.empty()) {
+            reason = "HTP_PRELOAD_UNKNOWN_FAILURE";
+        }
+        const int64_t end_us = ggml_time_us();
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            const auto key = std::make_pair(task.run_id, task.region);
+            const auto it = phone_npu_preload_jobs.find(key);
+            if (it != phone_npu_preload_jobs.end() &&
+                    it->second.state ==
+                        phone_npu_preload_status::RUNNING &&
+                    it->second.uid == task.uid) {
+                active = true;
+                it->second.state = ok ?
+                    phone_npu_preload_status::READY :
+                    phone_npu_preload_status::FAILED;
+                if (!ok) {
+                    for (auto & entry : phone_auto_jobs) {
+                        auto & job = *entry.second;
+                        if (job.request.key.run_id == task.run_id &&
+                                job.request.key.region == task.region &&
+                                job.state != phone_auto_status::COMPLETE) {
+                            job.state = phone_auto_status::FAILED;
+                        }
+                    }
+                }
+            }
+        }
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SERIAL] event=WEIGHTS_PRELOAD "
+            "run=%" PRIu64 " region=%u layer=%d chunk=%u "
+            "uid=%" PRIu64 " backend=HTP0 mode=ASYNC "
+            "new_weights=%zu reused_weights=%zu "
+            "source_bytes=%zu queue_ms=%.3f lock_wait_ms=%.3f "
+            "sync_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
+            "status=%s reason=%s\n",
+            task.run_id, task.region, task.layer, task.chunk,
+            task.uid, stats.new_weights, stats.reused_weights,
+            stats.new_bytes,
+            (begin_us - task.enqueued_us) / 1000.0,
+            (service_begin_us - begin_us) / 1000.0,
+            stats.sync_ms, stats.copy_ms,
+            (end_us - begin_us) / 1000.0,
+            ok ? "PASS" : "FAIL",
+            ok ? "NONE" : reason.c_str());
+        phone_auto_cv.notify_all();
+        if (!ok && active) {
+            GGML_LOG_ERROR(
+                "[PHONE_AUTO_P2C] event=ABORT run=%" PRIu64
+                " region=%u reason=HTP_WEIGHT_PRELOAD_FAILED\n",
+                task.run_id, task.region);
+            p2c_arena.abort();
+        }
+    }
+}
+
 // A verified input may upload to the next local Slot while Phone is still
 // running the preceding Chunk. The original remote input tensors are private
 // per Chunk. Slot admission uses the existing two_slot_pool state machine.
@@ -7617,7 +7749,8 @@ void rpc_server::phone_auto_compute_loop() {
                     if (next != phone_auto_next_chunk.end() &&
                             ggml_phone_auto::can_compute(
                                 next->second, job.request.key.chunk) &&
-                            job.state == phone_auto_status::PREPARED) {
+                            job.state == phone_auto_status::PREPARED &&
+                            phone_npu_preload_ready_locked(job)) {
                         return true;
                     }
                 }
@@ -7631,7 +7764,8 @@ void rpc_server::phone_auto_compute_loop() {
                 if (next != phone_auto_next_chunk.end() &&
                         ggml_phone_auto::can_compute(
                                 next->second, job.request.key.chunk) &&
-                        job.state == phone_auto_status::PREPARED) {
+                        job.state == phone_auto_status::PREPARED &&
+                            phone_npu_preload_ready_locked(job)) {
                     task = item.second;
                     job.state = phone_auto_status::COMPUTING;
                     break;
@@ -7670,10 +7804,15 @@ void rpc_server::phone_auto_compute_loop() {
                 if (outputs == 1 && output != nullptr) {
                     ggml_backend_synchronize(backends[req.device]);
                 }
-                const bool ok = outputs == 1 && output != nullptr &&
-                    phone_npu_executor != nullptr &&
-                    phone_npu_executor->run(it->second.graph, output, why,
-                                            stage_ms, htp_ms, return_ms);
+                bool ok = false;
+                if (outputs == 1 && output != nullptr &&
+                        phone_npu_executor != nullptr) {
+                    std::lock_guard<std::mutex> htp_guard(
+                        phone_npu_backend_mutex);
+                    ok = phone_npu_executor->run(
+                        it->second.graph, output, why,
+                        stage_ms, htp_ms, return_ms);
+                }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
                 if (!ok && why.empty()) {
                     why = "HTP_OUTPUT_NOT_UNIQUE";
