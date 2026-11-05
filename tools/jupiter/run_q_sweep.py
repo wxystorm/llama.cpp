@@ -502,6 +502,7 @@ def main() -> int:
     # Keep q(x,y) calibration on the original communication contract; a
     # transport A/B needs fresh measurements and should use the bench runner.
     base_env["LLAMA_JUPITER_ASYNC_C2P"] = "0"
+    base_env["LLAMA_JUPITER_GRAPH_PREBUILD"] = "0"
     base_env.pop("LLAMA_JUPITER_PLAN_FILE", None)
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
 
