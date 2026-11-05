@@ -6763,8 +6763,11 @@ bool rpc_server::phone_input_stream_run(
     if (phone_npu_executor != nullptr) {
         // The PC may use the ordinary OpenCL decode Graph after prefill.
         // Without this copy its Phone KV would be stale after HTP execution.
-        std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+        // Keep one global lock order: HTP before Graph, so an NPU compute
+        // awaiting the background preloader never holds graph_compute_mutex
+        // and blocks subsequent RPC task registration.
         std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
         if (request.active) {
             phone_npu_executor->reset_kv();
         } else {
@@ -7181,7 +7184,8 @@ bool rpc_server::phone_auto_task_register(
             !phone_npu_async_preload &&
             npu_preload_env != nullptr &&
             std::strcmp(npu_preload_env, "1") == 0) {
-        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        // graph_compute_mutex already serializes the synchronous baseline.
+        // Avoid a reverse Graph->HTP lock order with the async compute path.
         ggml_phone_npu_serial::full_region_executor::weight_preload_stats
             preload_stats {};
         std::string preload_reason;
@@ -7791,6 +7795,13 @@ void rpc_server::phone_auto_compute_loop() {
         const auto & req = task->request;
         task->compute_begin_us = ggml_time_us();
         ggml_status status = GGML_STATUS_FAILED;
+        // A READY L19 Chunk may arrive while the preloader is working on
+        // L39. Wait for HTP without retaining the Graph registry lock.
+        const bool npu_task = ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, req.key.region);
+        std::unique_lock<std::mutex> htp_guard(
+            phone_npu_backend_mutex, std::defer_lock);
+        if (npu_task) { htp_guard.lock(); }
         {
             std::lock_guard<std::recursive_mutex> graph_guard(
                 graph_compute_mutex);
@@ -7821,9 +7832,8 @@ void rpc_server::phone_auto_compute_loop() {
                 }
                 bool ok = false;
                 if (outputs == 1 && output != nullptr &&
-                        phone_npu_executor != nullptr) {
-                    std::lock_guard<std::mutex> htp_guard(
-                        phone_npu_backend_mutex);
+                        phone_npu_executor != nullptr && npu_task) {
+                    // htp_guard was acquired before graph_compute_mutex.
                     ok = phone_npu_executor->run(
                         it->second.graph, output, why,
                         stage_ms, htp_ms, return_ms);
