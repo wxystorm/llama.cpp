@@ -25,6 +25,17 @@ static region_plan make_plan() {
     p.n_heads = 40;
     p.n_heads_kv = 8;
     p.head_dim = 128;
+    p.n_kv = 512;
+    p.rope_type = k_rope_neox;
+    p.n_ctx_orig = 32768;
+    p.kv_type = k_f16;
+    p.rms_norm_eps = 1.0e-6f;
+    p.rope_freq_base = 1000000.0f;
+    p.rope_freq_scale = 1.0f;
+    p.rope_ext_factor = -1.0f;
+    p.rope_attn_factor = 1.0f;
+    p.rope_beta_fast = 32.0f;
+    p.rope_beta_slow = 1.0f;
     return p;
 }
 
@@ -53,10 +64,10 @@ int main() {
     CHECK(plans.size() == 2);
 
     auto invalid = a;
-    invalid.version = 2;
+    invalid.version = 3;
     CHECK(!validate(invalid, reason));
     invalid = a;
-    invalid.flags = 1;
+    invalid.flags = 0;
     CHECK(!validate(invalid, reason));
     invalid = a;
     invalid.position_base = 2000;
@@ -66,6 +77,12 @@ int main() {
     CHECK(!validate(invalid, reason));
     invalid = a;
     invalid.chunk_tokens = 0;
+    CHECK(!validate(invalid, reason));
+    invalid = a;
+    invalid.n_kv = 256;
+    CHECK(!validate(invalid, reason));
+    invalid = a;
+    invalid.rope_freq_base = 0;
     CHECK(!validate(invalid, reason));
     invalid = a;
     invalid.chunk_tokens = 100;
