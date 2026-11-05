@@ -155,13 +155,13 @@ def build_cli(
     model: Path,
     prompt: str,
     verbosity: int,
-    ubatch: int,
+    ubatch: int | None = None,
 ) -> list[str]:
     return [
         str(exe), "-m", str(model),
         "--rpc", args.rpc, "--split-mode", "layer",
         "-ngl", "all",
-        "-ub", str(ubatch), "-b", str(args.batch),
+        "-ub", str(args.ubatch if ubatch is None else ubatch), "-b", str(args.batch),
         "-c", str(args.context), "-n", "1",
         "-t", str(args.threads),
         "--flash-attn", "on",
