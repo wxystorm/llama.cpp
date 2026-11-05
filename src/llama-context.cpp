@@ -5527,7 +5527,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_stream_run_id != 0 &&
                 model.arch == LLM_ARCH_QWEN3 &&
                 ubatch.pos != nullptr && ubatch.pos[0] == 0 &&
-                cparams.n_ctx >= ubatch.n_tokens;
+                cparams.n_ctx >= ubatch.n_tokens &&
+                cparams.flash_attn &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
             // v1 permits only a single contiguous sequence beginning at 0.
             for (uint32_t i = 0; valid && i < ubatch.n_tokens; ++i) {
                 valid = ubatch.pos[i] == (llama_pos) i;
@@ -5545,8 +5547,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 if (!valid) { break; }
                 const uint32_t layer = (uint32_t) stage.layer_begin;
                 ggml_backend_rpc_phone_owned_plan plan {};
-                plan.version = 1;
-                plan.flags = 0;
+                plan.version = 2;
+                plan.flags = 1; // Qwen3 Flash Attention with F16 KV
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
@@ -5559,7 +5561,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.n_heads = model.hparams.n_head(layer);
                 plan.n_heads_kv = model.hparams.n_head_kv(layer);
                 plan.head_dim = model.hparams.n_embd_head_k(layer);
-                valid = register_plan(phone_rpc_backend, &plan);
+                // The first Phone-local Builder has an intentionally narrow
+                // contract: fresh single-sequence prefill, full-head RoPE,
+                // flash-attn, F16 KV. A wider KV format needs a new ABI.
+                valid = model.hparams.n_embd_head_v(layer) == plan.head_dim;
+                const uint64_t padded_kv =
+                    (uint64_t(ubatch.n_tokens) + 255) / 256 * 256;
+                plan.n_kv = (uint32_t) std::min<uint64_t>(
+                    cparams.n_ctx, std::max<uint64_t>(256, padded_kv));
+                plan.rope_type = (uint32_t) model.hparams.rope_type;
+                plan.n_ctx_orig = cparams.n_ctx_orig_yarn;
+                plan.kv_type = (uint32_t) GGML_TYPE_F16;
+                plan.rms_norm_eps = model.hparams.f_norm_rms_eps;
+                plan.rope_freq_base = cparams.rope_freq_base;
+                plan.rope_freq_scale = cparams.rope_freq_scale;
+                plan.rope_ext_factor = cparams.yarn_ext_factor;
+                plan.rope_attn_factor = cparams.yarn_attn_factor;
+                plan.rope_beta_fast = cparams.yarn_beta_fast;
+                plan.rope_beta_slow = cparams.yarn_beta_slow;
+                valid = valid && register_plan(phone_rpc_backend, &plan);
                 if (valid) { ++published; }
             }
             LLAMA_LOG_INFO(
