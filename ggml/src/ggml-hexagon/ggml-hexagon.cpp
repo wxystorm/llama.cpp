@@ -4606,6 +4606,68 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
     return false;
 }
 
+static std::vector<htp_opnode> ggml_hexagon_build_nodes(
+        ggml_hexagon_session * sess, ggml_cgraph * graph) {
+    std::vector<htp_opnode> computed_nodes;
+    computed_nodes.reserve(graph->n_nodes);
+
+    // Fuse and finalize
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * n = graph->nodes[i];
+        if (!op_is_compute(n)) {
+            continue;
+        }
+
+        if (try_fuse_node(sess, graph, i, computed_nodes)) {
+            continue;
+        }
+
+        htp_opnode node(n, {}, HTP_OP_INVALID);
+        node.opcode = op_remap_to_htp(n);
+        if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
+            ggml_hexagon_precompute_matmul_params(sess,
+                node.node->src[0], node.node->src[1], node.node,
+                (struct htp_mm_kernel_params *)node.kernel_params
+            );
+        } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
+            ggml_hexagon_precompute_flash_attn_params(sess,
+                node.node,
+                (struct htp_fa_kernel_params *)node.kernel_params
+            );
+        } else if (htp_op_is_unary(node.opcode)) {
+            auto inputs = node.get_inputs();
+            const struct ggml_tensor * src0 = inputs[0];
+            const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
+            ggml_hexagon_precompute_unary_params(sess,
+                node.opcode, src0, src1, node.dst(),
+                (struct htp_unary_kernel_params *)node.kernel_params
+            );
+        }
+        computed_nodes.push_back(std::move(node));
+    }
+
+    return computed_nodes;
+}
+
+static bool ggml_backend_hexagon_precompile_fixed_graph(
+        ggml_backend_t backend, ggml_cgraph * graph) {
+    if (backend == nullptr || graph == nullptr ||
+            (graph->uid & (UINT64_C(1) << 63)) == 0 ||
+            graph->n_nodes <= 0) {
+        return false;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (sess->fixed_graph_cache.count(graph->uid) != 0) {
+        return true;
+    }
+    if (sess->fixed_graph_cache.size() >= 256) {
+        return false;
+    }
+    auto nodes = ggml_hexagon_build_nodes(sess, graph);
+    sess->fixed_graph_cache.emplace(graph->uid, std::move(nodes));
+    return true;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -4630,42 +4692,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     } else if (cache_hit) {
         nodes_ptr = &sess->cached_graph.htp_nodes;
     } else {
-        computed_nodes.reserve(graph->n_nodes);
-
-        // Fuse and finalize
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            ggml_tensor * n = graph->nodes[i];
-            if (!op_is_compute(n)) {
-                continue;
-            }
-
-            if (try_fuse_node(sess, graph, i, computed_nodes)) {
-                continue;
-            }
-
-            htp_opnode node(n, {}, HTP_OP_INVALID);
-            node.opcode = op_remap_to_htp(n);
-            if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
-                ggml_hexagon_precompute_matmul_params(sess,
-                    node.node->src[0], node.node->src[1], node.node,
-                    (struct htp_mm_kernel_params *)node.kernel_params
-                );
-            } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
-                ggml_hexagon_precompute_flash_attn_params(sess,
-                    node.node,
-                    (struct htp_fa_kernel_params *)node.kernel_params
-                );
-            } else if (htp_op_is_unary(node.opcode)) {
-                auto inputs = node.get_inputs();
-                const struct ggml_tensor * src0 = inputs[0];
-                const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
-                ggml_hexagon_precompute_unary_params(sess,
-                    node.opcode, src0, src1, node.dst(),
-                    (struct htp_unary_kernel_params *)node.kernel_params
-                );
-            }
-            computed_nodes.push_back(std::move(node));
-        }
+        computed_nodes = ggml_hexagon_build_nodes(sess, graph);
 
         if (fixed_uid && sess->fixed_graph_cache.size() < 256) {
             const auto inserted = sess->fixed_graph_cache.emplace(
@@ -5440,6 +5467,10 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     if (strcmp(name, "ggml_backend_hexagon_clear_fixed_graph_cache") == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_hexagon_clear_fixed_graph_cache);
+    }
+    if (strcmp(name, "ggml_backend_hexagon_precompile_fixed_graph") == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_hexagon_precompile_fixed_graph);
     }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
