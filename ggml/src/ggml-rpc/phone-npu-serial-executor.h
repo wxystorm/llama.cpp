@@ -4,6 +4,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
+#include "phone-qwen3-local-builder.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -260,6 +261,112 @@ public:
 
     size_t model_resident_weights() const {
         return model_weights_.size();
+    }
+
+    struct local_graph_shadow_stats {
+        uint32_t chunks = 0;
+        size_t total_nodes = 0;
+        size_t kv_writes = 0;
+        size_t flash_nodes = 0;
+        size_t rope_nodes = 0;
+    };
+
+    // Phase 2: build every Qwen3 Chunk graph from Phone-local immutable
+    // weights, without reading or mirroring the PC's RPC graph. No backend
+    // memory is allocated and nothing is compiled/executed in this check.
+    // A later cutover will bind fixed activation buffers and shared KV to
+    // these same graph shapes before precompiling on HTP.
+    bool validate_owned_local_graphs(
+            const ggml_phone_owned::region_plan & plan,
+            std::string & reason,
+            local_graph_shadow_stats & stats) const {
+        stats = {};
+        const char * why = "NONE";
+        if (!ggml_phone_owned::validate(plan, why)) {
+            reason = why;
+            return false;
+        }
+        ggml_phone_qwen3::layer_weights weights {};
+        const auto find_weight = [&](const char * suffix) -> ggml_tensor * {
+            char name[GGML_MAX_NAME] = {};
+            std::snprintf(name, sizeof(name), "blk.%u.%s", plan.layer, suffix);
+            ggml_tensor * selected = nullptr;
+            for (const auto & entry : model_weights_) {
+                ggml_tensor * tensor = entry.second->tensor;
+                if (tensor == nullptr ||
+                        std::strcmp(tensor->name, name) != 0) {
+                    continue;
+                }
+                if (selected != nullptr) { return nullptr; }
+                selected = tensor;
+            }
+            return selected;
+        };
+        weights.attn_norm = find_weight("attn_norm.weight");
+        weights.wq = find_weight("attn_q.weight");
+        weights.wk = find_weight("attn_k.weight");
+        weights.wv = find_weight("attn_v.weight");
+        weights.wo = find_weight("attn_output.weight");
+        weights.ffn_norm = find_weight("ffn_norm.weight");
+        weights.ffn_gate = find_weight("ffn_gate.weight");
+        weights.ffn_up = find_weight("ffn_up.weight");
+        weights.ffn_down = find_weight("ffn_down.weight");
+        weights.q_norm = find_weight("attn_q_norm.weight");
+        weights.k_norm = find_weight("attn_k_norm.weight");
+        if (!ggml_phone_qwen3::validate_weights(plan, weights, why)) {
+            reason = std::string("PHONE_LOCAL_MODEL_") + why;
+            return false;
+        }
+        const size_t meta_bytes = ggml_tensor_overhead() * 1024 +
+            ggml_graph_overhead_custom(512, false) + 4096;
+        for (uint32_t chunk = 0;
+                chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
+            ggml_init_params params = {meta_bytes, nullptr, true};
+            ggml_context_ptr ctx { ggml_init(params) };
+            if (!ctx) {
+                reason = "PHONE_LOCAL_CONTEXT_ALLOC";
+                return false;
+            }
+            ggml_phone_qwen3::graph_result built {};
+            if (!ggml_phone_qwen3::build_graph(
+                    ctx.get(), plan, chunk, weights, built, why)) {
+                reason = std::string("PHONE_LOCAL_BUILD:") + why;
+                return false;
+            }
+            ggml_phone_qwen3::side_inputs input {};
+            if (!ggml_phone_qwen3::make_side_inputs(
+                    plan, chunk, input, why)) {
+                reason = std::string("PHONE_LOCAL_SIDE_INPUTS:") + why;
+                return false;
+            }
+            size_t set_rows = 0;
+            size_t flash = 0;
+            size_t rope = 0;
+            size_t glu = 0;
+            for (int i = 0; i < built.graph->n_nodes; ++i) {
+                const auto * op = built.graph->nodes[i];
+                set_rows += op->op == GGML_OP_SET_ROWS ? 1 : 0;
+                flash += op->op == GGML_OP_FLASH_ATTN_EXT ? 1 : 0;
+                rope += op->op == GGML_OP_ROPE ? 1 : 0;
+                glu += op->op == GGML_OP_GLU ? 1 : 0;
+            }
+            if (set_rows != 2 || flash != 1 || rope != 2 || glu != 1 ||
+                    input.positions.size() != built.tokens ||
+                    input.k_indices.size() != built.tokens ||
+                    input.v_indices.size() != built.tokens ||
+                    input.causal_mask_f16.size() !=
+                        uint64_t(plan.n_kv) * built.tokens) {
+                reason = "PHONE_LOCAL_OPERATOR_OR_MASK_PARITY";
+                return false;
+            }
+            ++stats.chunks;
+            stats.total_nodes += built.graph->n_nodes;
+            stats.kv_writes += set_rows;
+            stats.flash_nodes += flash;
+            stats.rope_nodes += rope;
+        }
+        reason.clear();
+        return true;
     }
 
     // Capture only immutable weight-source metadata while the RPC graph
