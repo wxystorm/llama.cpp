@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #ifdef _WIN32
@@ -454,6 +455,11 @@ struct ggml_hexagon_session {
         uint64_t uid = 0;
         std::vector<htp_opnode> htp_nodes;
     } cached_graph;
+
+    // Dedicated plans for stable, per-Chunk HTP graphs. They retain tensor
+    // metadata pointers, so the RPC owner MUST clear this cache before
+    // releasing its fixed-graph contexts, KV, or activation arenas.
+    std::unordered_map<uint64_t, std::vector<htp_opnode>> fixed_graph_cache;
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -4608,9 +4614,20 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
-    // Check for cache hit
-    bool cache_hit = (graph->uid != 0 && sess->cached_graph.uid == graph->uid);
-    if (cache_hit) {
+    // The high bit marks stable fixed-Chunk HTP graphs. Unlike the normal
+    // single-entry cache, these plans must coexist for all registered
+    // Region/Chunk UIDs. Every graph keeps its own fixed tensor addresses.
+    const bool fixed_uid = (graph->uid & (UINT64_C(1) << 63)) != 0;
+    const auto fixed = fixed_uid ?
+        sess->fixed_graph_cache.find(graph->uid) :
+        sess->fixed_graph_cache.end();
+    const bool fixed_hit = fixed != sess->fixed_graph_cache.end();
+    const bool cache_hit = fixed_hit ||
+        (!fixed_uid && graph->uid != 0 &&
+         sess->cached_graph.uid == graph->uid);
+    if (fixed_hit) {
+        nodes_ptr = &fixed->second;
+    } else if (cache_hit) {
         nodes_ptr = &sess->cached_graph.htp_nodes;
     } else {
         computed_nodes.reserve(graph->n_nodes);
@@ -4650,13 +4667,25 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             computed_nodes.push_back(std::move(node));
         }
 
-        if (graph->uid != 0) {
+        if (fixed_uid && sess->fixed_graph_cache.size() < 256) {
+            const auto inserted = sess->fixed_graph_cache.emplace(
+                graph->uid, std::move(computed_nodes));
+            nodes_ptr = &inserted.first->second;
+        } else if (!fixed_uid && graph->uid != 0) {
             sess->cached_graph.uid = graph->uid;
             sess->cached_graph.htp_nodes = std::move(computed_nodes);
             nodes_ptr = &sess->cached_graph.htp_nodes;
         } else {
             nodes_ptr = &computed_nodes;
         }
+    }
+    if (fixed_uid &&
+            std::getenv("GGML_HEXAGON_FIXED_GRAPH_CACHE_TRACE") != nullptr) {
+        GGML_LOG_INFO(
+            "[HEXAGON_FIXED_GRAPH_CACHE] uid=%" PRIu64
+            " hit=%d entries=%zu nodes=%zu\n",
+            graph->uid, fixed_hit ? 1 : 0,
+            sess->fixed_graph_cache.size(), nodes_ptr->size());
     }
 
     // Observe only the K14 matmul, including cached graphs. Keep OPFUSION=0
@@ -5397,7 +5426,21 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
     return &hreg->devices[index];
 }
 
+static void ggml_backend_hexagon_clear_fixed_graph_cache(
+        ggml_backend_t backend) {
+    if (backend == nullptr) { return; }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (sess == nullptr) { return; }
+    sess->fixed_graph_cache.clear();
+    sess->cached_graph.uid = 0;
+    sess->cached_graph.htp_nodes.clear();
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_hexagon_clear_fixed_graph_cache") == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_hexagon_clear_fixed_graph_cache);
+    }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
         return (void *) fct;
