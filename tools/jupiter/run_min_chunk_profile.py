@@ -178,6 +178,7 @@ def calibration_env(pc_layers: int) -> dict[str, str]:
         "LLAMA_JUPITER_PROFILE_STAGE": "1",
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
         "LLAMA_JUPITER_ASYNC_C2P": "0",
+        "LLAMA_JUPITER_GRAPH_PREBUILD": "0",
         "LLAMA_JUPITER_TIMELINE": "0",
     })
     env.pop("LLAMA_JUPITER_PLAN_FILE", None)
