@@ -5,7 +5,6 @@
 // A single receive loop gives deterministic frame boundaries and naturally
 // serializes the P2C payload traffic.
 #include "ggml-rpc.h"
-#include "ggml.h"
 #include "transport.h"
 
 #include <chrono>
@@ -19,13 +18,20 @@
 
 class ggml_rpc_p2c_stream_receiver {
 public:
+    using clock_us_fn = int64_t (*)();
+
+    // The production RPC caller injects ggml_time_us so these timestamps
+    // share the exact PC_GGML_TIME_US origin of region_ring_chunk_trace.
+    // Standalone unit tests need no ggml-base linkage and use steady_clock.
     ggml_rpc_p2c_stream_receiver(
             uint64_t run_id, uint32_t n_regions, uint32_t n_tokens,
             uint32_t n_embd, ggml_backend_rpc_p2c_resolve_t resolve,
-            ggml_backend_rpc_p2c_complete_t complete, void * userdata)
+            ggml_backend_rpc_p2c_complete_t complete, void * userdata,
+            clock_us_fn clock_us = nullptr)
         : run_id_(run_id), n_regions_(n_regions), n_tokens_(n_tokens),
           n_embd_(n_embd), resolve_(resolve),
-          complete_(complete), userdata_(userdata) {}
+          complete_(complete), userdata_(userdata),
+          clock_us_(clock_us) {}
 
     ~ggml_rpc_p2c_stream_receiver() {
         // Flush only after the receive loop exits. Never write trace logs
@@ -71,12 +77,12 @@ public:
         for (;;) {
             ggml_backend_rpc_p2c_frame frame {};
             const int64_t header_begin_us =
-                trace_enabled_ ? ggml_time_us() : 0;
+                trace_enabled_ ? trace_now_us() : 0;
             if (!socket->recv_data(&frame, sizeof(frame))) {
                 return false;
             }
             const int64_t header_end_us =
-                trace_enabled_ ? ggml_time_us() : 0;
+                trace_enabled_ ? trace_now_us() : 0;
             if (frame.run_id != run_id_ || frame.reserved != 0 ||
                 frame.seq <= last_seq_) {
                 return false;
@@ -105,13 +111,13 @@ public:
                 return false;
             }
             const int64_t payload_begin_us =
-                trace_enabled_ ? ggml_time_us() : 0;
+                trace_enabled_ ? trace_now_us() : 0;
             const auto recv_begin = std::chrono::steady_clock::now();
             const bool ok = socket->recv_data(
                 destination, size_t(frame.payload_bytes));
             const auto recv_end = std::chrono::steady_clock::now();
             const int64_t payload_end_us =
-                trace_enabled_ ? ggml_time_us() : 0;
+                trace_enabled_ ? trace_now_us() : 0;
             payload_recv_us_ +=
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     recv_end - recv_begin).count();
@@ -120,7 +126,7 @@ public:
                 payload_bytes_ += frame.payload_bytes;
             }
             const int64_t callback_begin_us =
-                trace_enabled_ ? ggml_time_us() : 0;
+                trace_enabled_ ? trace_now_us() : 0;
             complete_(userdata_, &frame, ok);
             if (trace_enabled_) {
                 frame_trace t {};
@@ -135,7 +141,7 @@ public:
                 t.payload_begin_us = payload_begin_us;
                 t.payload_end_us = payload_end_us;
                 t.callback_begin_us = callback_begin_us;
-                t.callback_end_us = ggml_time_us();
+                t.callback_end_us = trace_now_us();
                 t.ok = ok;
                 trace_.push_back(t);
             }
@@ -147,6 +153,12 @@ public:
     }
 
 private:
+    int64_t trace_now_us() const {
+        if (clock_us_ != nullptr) { return clock_us_(); }
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     struct frame_trace {
         uint32_t region = 0;
         uint32_t chunk = 0;
@@ -162,6 +174,7 @@ private:
         int64_t callback_end_us = 0;
         bool ok = false;
     };
+    clock_us_fn clock_us_ = nullptr;
     bool trace_enabled_ = false;
     std::vector<frame_trace> trace_;
     uint64_t run_id_;
