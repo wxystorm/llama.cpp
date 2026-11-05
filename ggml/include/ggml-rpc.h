@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    27
+#define RPC_PROTO_PATCH_VERSION    28
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -206,7 +206,7 @@ using ggml_backend_rpc_phone_auto_wait_capture_t = bool (*)(
     uint32_t chunk, uint64_t graph_uid, uint64_t p2c_run_id,
     uint32_t token_begin, uint32_t n_tokens, size_t expected_bytes);
 
-// Patch 27: optional shadow registration of an immutable Phone-owned
+// Patch 28: optional shadow registration of an immutable Phone-owned
 // execution plan. This does not switch off the PC-built Graph path; a local
 // Qwen3 Layer Builder and parity validation are required before that cutover.
 struct ggml_backend_rpc_phone_owned_plan {
@@ -224,6 +224,17 @@ struct ggml_backend_rpc_phone_owned_plan {
     uint32_t n_heads;
     uint32_t n_heads_kv;
     uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t rope_type;
+    uint32_t n_ctx_orig;
+    uint32_t kv_type;
+    float rms_norm_eps;
+    float rope_freq_base;
+    float rope_freq_scale;
+    float rope_ext_factor;
+    float rope_attn_factor;
+    float rope_beta_fast;
+    float rope_beta_slow;
 };
 #define GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC \
     "ggml_backend_rpc_phone_owned_plan_register"
