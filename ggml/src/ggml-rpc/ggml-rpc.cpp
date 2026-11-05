@@ -12065,6 +12065,16 @@ bool rpc_server::graph_compute(
     LOG_DBG("[%s] device: %u, graph_uid: %" PRIu64 ", n_nodes: %u, n_tensors: %u\n", __func__, device, graph_uid, n_nodes, n_tensors);
 
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false); //计算缓冲区大小
+    // A fixed HTP stage retains source tensor pointers from this RPC graph.
+    // Never overwrite those graph metadata bytes while the stage is live.
+    // The next RUN calls reset_kv(), which clears fixed stages beforehand.
+    if (register_only && phone_npu_executor != nullptr &&
+            phone_npu_executor->has_registered_chunk(graph_uid)) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_FIXED] event=REGISTER_REJECT uid=%" PRIu64
+            " reason=ACTIVE_FIXED_UID_REUSED status=REJECT\n", graph_uid);
+        return false;
+    }
     stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
     graph_entry.slot0 = {};
     if (graph_entry.buffer.size() < buf_size) {
