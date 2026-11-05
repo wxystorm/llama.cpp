@@ -6963,6 +6963,10 @@ bool rpc_server::phone_input_stream_run(
     phone_input_stream_cv.notify_all();
     if (!request.active) {
         {
+            std::lock_guard<std::mutex> lock(phone_owned_qwen3_mutex);
+            phone_owned_qwen3_plans.erase(request.run_id);
+        }
+        {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
             for (auto it = phone_auto_jobs.begin();
                     it != phone_auto_jobs.end();) {
@@ -7158,6 +7162,115 @@ bool rpc_server::phone_input_stream_run(
             report.hash_us / 1000.0,
             report.apply_wait_us / 1000.0);
     }
+    return true;
+}
+
+// Phone-owned Qwen3 v1 plan validation. This is a shadow-mode prerequisite,
+// not an independent Graph compiler. A successful ACK means that the Plan,
+// positions, chunk tilings and local GGUF weight shapes were accepted; it does
+// NOT allow the client to skip PC graph registration or dispatch Activation to
+// a non-existent Phone-local graph.
+bool rpc_server::phone_owned_qwen3_plan_register(
+        const std::vector<uint8_t> & data) {
+    ggml_phone_owned_qwen3::plan p;
+    std::string why;
+    const auto reject = [&](const char * reason) -> bool {
+        GGML_LOG_ERROR(
+            "[PHONE_OWNED_QWEN3_PLAN] event=REJECT run=%" PRIu64
+            " reason=%s status=REJECT\n",
+            p.run_id, reason);
+        return false;
+    };
+    if (!ggml_phone_owned_qwen3::decode(
+            data.data(), data.size(), p, why)) {
+        return reject(why.c_str());
+    }
+    if (phone_npu_executor == nullptr ||
+            local_tensor_source.get_info == nullptr ||
+            local_tensor_source.read == nullptr) {
+        return reject("HTP_OR_LOCAL_GGUF_UNAVAILABLE");
+    }
+    {
+        std::lock_guard<std::mutex> input_guard(phone_input_mutex);
+        if (phone_input_stream_runs.count(p.run_id) == 0) {
+            return reject("INPUT_STREAM_NOT_ACTIVE");
+        }
+    }
+    // Check the exact Qwen3 dense layer tensor contract against the Phone's
+    // own GGUF, rather than trusting the PC's shape declarations alone.
+    struct required_tensor {
+        const char * suffix;
+        uint64_t ne0;
+        uint64_t ne1;
+        bool vector;
+    };
+    std::set<uint32_t> visited_layers;
+    for (const auto & c : p.chunks) {
+        if (!visited_layers.insert(c.layer).second) { continue; }
+        const uint64_t q_dim = uint64_t(p.n_head) * p.head_dim;
+        const uint64_t kv_dim = uint64_t(p.n_head_kv) * p.head_dim;
+        const required_tensor expected[] = {
+            {"attn_norm.weight", p.n_embd, 1, true},
+            {"attn_q.weight", p.n_embd, q_dim, false},
+            {"attn_k.weight", p.n_embd, kv_dim, false},
+            {"attn_v.weight", p.n_embd, kv_dim, false},
+            {"attn_output.weight", q_dim, p.n_embd, false},
+            {"ffn_norm.weight", p.n_embd, 1, true},
+            {"ffn_gate.weight", p.n_embd, p.n_ff, false},
+            {"ffn_up.weight", p.n_embd, p.n_ff, false},
+            {"ffn_down.weight", p.n_ff, p.n_embd, false},
+            {"attn_q_norm.weight", p.head_dim, 1, true},
+            {"attn_k_norm.weight", p.head_dim, 1, true},
+        };
+        for (const auto & item : expected) {
+            char name[GGML_MAX_NAME] {};
+            if (std::snprintf(name, sizeof(name), "blk.%u.%s",
+                    c.layer, item.suffix) >= int(sizeof(name))) {
+                return reject("WEIGHT_NAME_TOO_LONG");
+            }
+            ggml_rpc_local_tensor_info info {};
+            if (!local_tensor_source.get_info(
+                    local_tensor_source.user_data, name, &info)) {
+                GGML_LOG_ERROR(
+                    "[PHONE_OWNED_QWEN3_PLAN] event=WEIGHT_NOT_FOUND "
+                    "layer=%u name=%s\n", c.layer, name);
+                return reject("PHONE_LOCAL_WEIGHT_NOT_FOUND");
+            }
+            if (info.n_dims != (item.vector ? 1u : 2u) ||
+                    info.ne[0] != item.ne0 ||
+                    (!item.vector && info.ne[1] != item.ne1) ||
+                    info.type >= GGML_TYPE_COUNT ||
+                    info.nbytes == 0) {
+                GGML_LOG_ERROR(
+                    "[PHONE_OWNED_QWEN3_PLAN] event=WEIGHT_SHAPE "
+                    "layer=%u name=%s dims=%u first=%" PRIu64
+                    " second=%" PRIu64 " expected=%" PRIu64
+                    "x%" PRIu64 "\n",
+                    c.layer, name, info.n_dims, info.ne[0], info.ne[1],
+                    item.ne0, item.ne1);
+                return reject("PHONE_LOCAL_WEIGHT_SHAPE_MISMATCH");
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_owned_qwen3_mutex);
+        if (phone_owned_qwen3_plans.count(p.run_id) != 0 ||
+                phone_owned_qwen3_plans.size() >= 2) {
+            return reject("DUPLICATE_OR_TOO_MANY_ACTIVE_PLANS");
+        }
+        phone_owned_qwen3_plans.emplace(p.run_id, std::move(p));
+    }
+    GGML_LOG_INFO(
+        "[PHONE_OWNED_QWEN3_PLAN] event=ACCEPT "
+        "run=%" PRIu64 " layers=%zu chunks=%zu tokens=%u "
+        "local_gguf=VERIFIED_SHAPES kv_owner=PLANNED "
+        "graph_ready=0 mode=SHADOW_NO_EXEC status=PASS\n",
+        phone_owned_qwen3_plans.begin()->first,
+        visited_layers.size(), data.size() > 0 ?
+            (data.size() - 80 - 4 * size_t(
+                phone_owned_qwen3_plans.begin()->second.n_tokens)) / 20 :
+            0,
+        phone_owned_qwen3_plans.begin()->second.n_tokens);
     return true;
 }
 
