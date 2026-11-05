@@ -5,11 +5,17 @@
 // A single receive loop gives deterministic frame boundaries and naturally
 // serializes the P2C payload traffic.
 #include "ggml-rpc.h"
+#include "ggml.h"
 #include "transport.h"
 
 #include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 class ggml_rpc_p2c_stream_receiver {
 public:
@@ -20,6 +26,32 @@ public:
         : run_id_(run_id), n_regions_(n_regions), n_tokens_(n_tokens),
           n_embd_(n_embd), resolve_(resolve),
           complete_(complete), userdata_(userdata) {}
+
+    ~ggml_rpc_p2c_stream_receiver() {
+        // Flush only after the receive loop exits. Never write trace logs
+        // between a frame header and its payload or while frames are queued.
+        if (!trace_enabled_) { return; }
+        for (const auto & t : trace_) {
+            std::fprintf(stderr,
+                "[PC_CHUNK_P2C_RECV] clock=PC_GGML_TIME_US "
+                "p2c_run=%" PRIu64 " region=%u chunk=%u"
+                " token_begin=%u tokens=%u seq=%" PRIu64
+                " bytes=%" PRIu64
+                " frame_wait_begin_us=%" PRId64
+                " frame_header_end_us=%" PRId64
+                " payload_begin_us=%" PRId64
+                " payload_end_us=%" PRId64
+                " callback_begin_us=%" PRId64
+                " callback_end_us=%" PRId64
+                " status=%s\n",
+                run_id_, t.region, t.chunk, t.token_begin,
+                t.n_tokens, t.seq, t.bytes,
+                t.frame_wait_begin_us, t.frame_header_end_us,
+                t.payload_begin_us, t.payload_end_us,
+                t.callback_begin_us, t.callback_end_us,
+                t.ok ? "PASS" : "FAIL");
+        }
+    }
 
     uint64_t frames_received() const { return frames_; }
     uint64_t payload_bytes_received() const { return payload_bytes_; }
@@ -33,11 +65,18 @@ public:
             n_regions_ == 0 || n_tokens_ == 0 || n_embd_ == 0) {
             return false;
         }
+        const char * env = std::getenv("GGML_RPC_P2C_CHUNK_TIMELINE");
+        trace_enabled_ = env != nullptr && std::strcmp(env, "1") == 0;
+        if (trace_enabled_) { trace_.reserve(64); }
         for (;;) {
             ggml_backend_rpc_p2c_frame frame {};
+            const int64_t header_begin_us =
+                trace_enabled_ ? ggml_time_us() : 0;
             if (!socket->recv_data(&frame, sizeof(frame))) {
                 return false;
             }
+            const int64_t header_end_us =
+                trace_enabled_ ? ggml_time_us() : 0;
             if (frame.run_id != run_id_ || frame.reserved != 0 ||
                 frame.seq <= last_seq_) {
                 return false;
@@ -65,10 +104,14 @@ public:
                 complete_(userdata_, &frame, false);
                 return false;
             }
+            const int64_t payload_begin_us =
+                trace_enabled_ ? ggml_time_us() : 0;
             const auto recv_begin = std::chrono::steady_clock::now();
             const bool ok = socket->recv_data(
                 destination, size_t(frame.payload_bytes));
             const auto recv_end = std::chrono::steady_clock::now();
+            const int64_t payload_end_us =
+                trace_enabled_ ? ggml_time_us() : 0;
             payload_recv_us_ +=
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     recv_end - recv_begin).count();
@@ -76,7 +119,26 @@ public:
                 ++frames_;
                 payload_bytes_ += frame.payload_bytes;
             }
+            const int64_t callback_begin_us =
+                trace_enabled_ ? ggml_time_us() : 0;
             complete_(userdata_, &frame, ok);
+            if (trace_enabled_) {
+                frame_trace t {};
+                t.region = frame.region_id;
+                t.chunk = frame.chunk_id;
+                t.token_begin = frame.token_begin;
+                t.n_tokens = frame.n_tokens;
+                t.seq = frame.seq;
+                t.bytes = frame.payload_bytes;
+                t.frame_wait_begin_us = header_begin_us;
+                t.frame_header_end_us = header_end_us;
+                t.payload_begin_us = payload_begin_us;
+                t.payload_end_us = payload_end_us;
+                t.callback_begin_us = callback_begin_us;
+                t.callback_end_us = ggml_time_us();
+                t.ok = ok;
+                trace_.push_back(t);
+            }
             if (!ok) {
                 return false;
             }
@@ -85,6 +147,23 @@ public:
     }
 
 private:
+    struct frame_trace {
+        uint32_t region = 0;
+        uint32_t chunk = 0;
+        uint32_t token_begin = 0;
+        uint32_t n_tokens = 0;
+        uint64_t seq = 0;
+        uint64_t bytes = 0;
+        int64_t frame_wait_begin_us = 0;
+        int64_t frame_header_end_us = 0;
+        int64_t payload_begin_us = 0;
+        int64_t payload_end_us = 0;
+        int64_t callback_begin_us = 0;
+        int64_t callback_end_us = 0;
+        bool ok = false;
+    };
+    bool trace_enabled_ = false;
+    std::vector<frame_trace> trace_;
     uint64_t run_id_;
     uint64_t last_seq_ = 0;
     uint32_t n_regions_;
