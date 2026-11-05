@@ -590,6 +590,25 @@ public:
         return true;
     }
 
+    // Called after an input RUN has fully ended while HTP is serialized.
+    // Shadow graphs never contribute to decode KV, so release their scratch
+    // and KV immediately instead of reserving Phone HTP RAM until next RUN.
+    void release_owned_htp_graphs() {
+        if (owned_graphs_.empty() && owned_kv_.empty()) { return; }
+        const auto reg = backend_ != nullptr ?
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_)) :
+            nullptr;
+        if (reg != nullptr) {
+            using clear_fn = void (*)(ggml_backend_t);
+            auto clear = reinterpret_cast<clear_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_clear_fixed_graph_cache"));
+            if (clear) { clear(backend_); }
+        }
+        owned_graphs_.clear();
+        owned_kv_.clear();
+    }
+
     // Capture only immutable weight-source metadata while the RPC graph
     // registry is locked. The async worker must not retain graph/tensor
     // pointers: a subsequent GRAPH_REGISTER may reallocate graph storage.
