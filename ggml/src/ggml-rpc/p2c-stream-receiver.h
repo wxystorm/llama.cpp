@@ -174,7 +174,6 @@ private:
         int64_t callback_end_us = 0;
         bool ok = false;
     };
-    clock_us_fn clock_us_ = nullptr;
     bool trace_enabled_ = false;
     std::vector<frame_trace> trace_;
     uint64_t run_id_;
@@ -185,6 +184,7 @@ private:
     ggml_backend_rpc_p2c_resolve_t resolve_;
     ggml_backend_rpc_p2c_complete_t complete_;
     void * userdata_;
+    clock_us_fn clock_us_ = nullptr;
     uint64_t frames_ = 0;
     uint64_t payload_bytes_ = 0;
     int64_t payload_recv_us_ = 0;
