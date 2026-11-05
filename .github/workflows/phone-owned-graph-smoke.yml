@@ -1,0 +1,20 @@
+name: Phone-owned Qwen3 graph smoke
+
+on:
+  push:
+    branches:
+      - feat/phone-owned-plan-bootstrap-20261106
+  workflow_dispatch:
+
+jobs:
+  linux-graph-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-phone-owned -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+      - name: Compile local graph, RPC and context
+        run: cmake --build build-phone-owned --target llama-cli test-phone-owned-execution-plan test-phone-qwen3-local-builder --parallel 4
+      - name: Test local graph and plan
+        run: ctest --test-dir build-phone-owned -R 'test-phone-(owned-execution-plan|qwen3-local-builder)' --output-on-failure
