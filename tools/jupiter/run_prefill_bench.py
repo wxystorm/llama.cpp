@@ -5,6 +5,10 @@ The calibration runner (run_q_sweep.py) deliberately synchronizes backends to
 measure q(x,y). Do not use it to benchmark actual pipeline throughput. This
 runner disables that synchronization, runs normal async inference and collects
 the server-side "prompt eval time" from each independent llama-cli process.
+
+The benchmark's Default mode deliberately processes the entire prompt as a
+single ubatch (traditional PC/Phone layer split). DP and fixed64 continue to
+use their own chunked sequence plans with --ubatch.
 """
 
 from __future__ import annotations
@@ -30,6 +34,43 @@ PLAN_RE = re.compile(
     r"\[JUPITER_SEQUENCE_PLAN\].*?total=(\d+).*?chunks=([0-9,]+)"
 )
 MODES = ("default", "fixed64", "dp")
+UBATCH_BEGIN_RE = re.compile(
+    r"\[JUPITER_UBATCH\] event=BEGIN chunk=(\d+) "
+    r"slot=\d+ prefix_tokens=(\d+) tokens=(\d+)"
+)
+
+
+def single_chunk_ubatch(target: int) -> int:
+    """A power-of-two ubatch large enough for one full-prompt microbatch."""
+    if target < 1:
+        raise ValueError("target must be positive")
+    return 1 << (target - 1).bit_length()
+
+
+def extract_prefill_chunks(log_text: str, target: int) -> list[int] | None:
+    """Recover actual prefill ubatches from TRACE; ignore warmup/decode calls."""
+    current: list[int] = []
+    prefix = 0
+    matched = None
+    for entry in UBATCH_BEGIN_RE.finditer(log_text):
+        index, beginning, count = (int(x) for x in entry.groups())
+        if index == 0 and beginning == 0:
+            current = []
+            prefix = 0
+        if index != len(current) or beginning != prefix:
+            current = []
+            prefix = 0
+            continue
+        current.append(count)
+        prefix += count
+        if prefix == target:
+            matched = current.copy()
+            current = []
+            prefix = 0
+        elif prefix > target:
+            current = []
+            prefix = 0
+    return matched
 
 
 def read_plan(path: Path) -> dict[int, list[int]]:
@@ -114,12 +155,13 @@ def build_cli(
     model: Path,
     prompt: str,
     verbosity: int,
+    ubatch: int,
 ) -> list[str]:
     return [
         str(exe), "-m", str(model),
         "--rpc", args.rpc, "--split-mode", "layer",
         "-ngl", "all",
-        "-ub", str(args.ubatch), "-b", str(args.batch),
+        "-ub", str(ubatch), "-b", str(args.batch),
         "-c", str(args.context), "-n", "1",
         "-t", str(args.threads),
         "--flash-attn", "on",
@@ -163,7 +205,12 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--modes", type=modes_arg, default=list(MODES))
     p.add_argument("--out-dir", default="jupiter-bench-formal")
-    p.add_argument("--ubatch", type=int, default=128)
+    p.add_argument("--ubatch", type=int, default=128,
+                   help="ubatch for chunked DP/fixed64 runs (default: 128)")
+    p.add_argument("--default-ubatch", type=int, default=None,
+                   help="ubatch for unchunked Default; must be >= target tokens. "
+                        "Automatically rounds up to the next power of two "
+                        "(366 tokens -> 512) if omitted")
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--threads", type=int, default=8)
@@ -201,8 +248,8 @@ def main() -> int:
         raise ValueError("repeats, pc-layers and window must be positive")
     if args.verbosity < 2 or args.verbosity > 4:
         raise ValueError("use --verbosity 2, 3 or 4; 3 is recommended")
-    if args.ubatch > args.batch or args.batch > args.context:
-        raise ValueError("require ubatch <= batch <= context")
+    if args.ubatch <= 0 or args.ubatch > args.batch or args.batch > args.context:
+        raise ValueError("require 0 < ubatch <= batch <= context")
     if args.graph_prebuild and (args.async_c2p or args.local_graph_reuse):
         raise ValueError("--graph-prebuild is independent of and currently "
                          "incompatible with --async-c2p / --local-graph-reuse")
@@ -222,6 +269,17 @@ def main() -> int:
         )
     if target <= 1 or target > args.batch or target > args.context:
         raise ValueError(f"invalid target prefill token count: {target}")
+    default_ubatch = (args.default_ubatch if args.default_ubatch is not None
+                      else single_chunk_ubatch(target))
+    if "default" in args.modes and not target <= default_ubatch <= args.batch:
+        raise ValueError(
+            f"Default must run one whole prompt: require {target} <= "
+            f"--default-ubatch <= --batch ({args.batch}); got {default_ubatch}"
+        )
+    mode_ubatch = {
+        mode: default_ubatch if mode == "default" else args.ubatch
+        for mode in args.modes
+    }
     if "dp" in args.modes:
         if target not in plans:
             raise ValueError(f"{plan_path} has no sequence.{target} entry")
@@ -273,6 +331,9 @@ def main() -> int:
         "context": args.context,
         "batch": args.batch,
         "ubatch": args.ubatch,
+        "default_ubatch": default_ubatch,
+        "mode_ubatch": mode_ubatch,
+        "default_chunks": [target] if "default" in args.modes else None,
         "modes": args.modes,
         "repeats": args.repeats,
         "plan": str(plan_path),
@@ -308,6 +369,7 @@ def main() -> int:
         f"window={args.window} async_c2p={int(args.async_c2p)} "
         f"local_graph_reuse={int(args.local_graph_reuse)} "
         f"graph_prebuild={int(args.graph_prebuild)} "
+        f"default_ubatch={default_ubatch} chunk_ubatch={args.ubatch} "
         f"comm_timing={int(args.comm_timing)} trace=0 profile_stage=0",
         flush=True,
     )
@@ -316,9 +378,8 @@ def main() -> int:
         # Only verification uses TRACE verbosity. It is not included in the
         # formal results and never enables per-stage synchronous profiling.
         for mode in args.modes:
-            if mode == "default" and not args.async_c2p and not args.graph_prebuild:
-                continue
-            wanted = plans[target] if mode == "dp" else fixed
+            wanted = ([target] if mode == "default" else
+                      plans[target] if mode == "dp" else fixed)
             check_log = out / f"verify-{mode}.log"
             verify_env = env_for_mode(
                 base_env, mode, plan_path, fixed
@@ -326,7 +387,7 @@ def main() -> int:
             verify_env["LLAMA_JUPITER_TRACE"] = "1"
             print(f"[JUPITER_BENCH_VERIFY] mode={mode}", flush=True)
             run_one(
-                build_cli(args, exe, model, prompt, 4),
+                build_cli(args, exe, model, prompt, 4, mode_ubatch[mode]),
                 verify_env, check_log,
             )
             text = check_log.read_text(encoding="utf-8", errors="replace")
@@ -340,6 +401,12 @@ def main() -> int:
                 raise RuntimeError(
                     f"{mode} did not report the expected Jupiter sequence plan; "
                     f"inspect {check_log}"
+                )
+            actual_chunks = extract_prefill_chunks(text, target)
+            if actual_chunks != wanted:
+                raise RuntimeError(
+                    f"{mode}: actual prefill chunks {actual_chunks} != "
+                    f"expected {wanted}; inspect {check_log}"
                 )
             if args.async_c2p and (
                 "[JUPITER_COMM] mode=ASYNC_C2P_NETWORK status=ENABLED" not in text
@@ -363,13 +430,11 @@ def main() -> int:
                         f"hits={hits}, phone_registered={registered}; "
                         f"inspect {check_log}"
                     )
-            verified_chunks = (
-                "DEFAULT_RUNTIME" if mode == "default"
-                else ",".join(map(str, wanted))
-            )
+            verified_chunks = ",".join(map(str, wanted))
             print(
                 f"[JUPITER_BENCH_VERIFY] mode={mode} status=PASS "
-                f"chunks={verified_chunks} async_c2p={int(args.async_c2p)}",
+                f"chunks={verified_chunks} ubatch={mode_ubatch[mode]} "
+                f"async_c2p={int(args.async_c2p)}",
                 flush=True,
             )
 
@@ -404,7 +469,7 @@ def main() -> int:
                 )
                 env = env_for_mode(base_env, mode, plan_path, fixed)
                 run_one(
-                    build_cli(args, exe, model, prompt, args.verbosity),
+                    build_cli(args, exe, model, prompt, args.verbosity, mode_ubatch[mode]),
                     env, log_path,
                 )
                 ms, n_tokens = parse_timing(log_path)
@@ -424,6 +489,7 @@ def main() -> int:
             speed = target * 1000.0 / ms
             rows.append({
                 "mode": mode, "repeat": repeat, "tokens": target,
+                "ubatch": mode_ubatch[mode],
                 "timing_tokens": n_tokens,
                 "prefill_ms": round(ms, 3),
                 "prefill_tok_s": round(speed, 3),
@@ -439,7 +505,7 @@ def main() -> int:
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["mode", "repeat", "tokens", "timing_tokens",
+            fieldnames=["mode", "repeat", "tokens", "ubatch", "timing_tokens",
                         "prefill_ms", "prefill_tok_s", "log"],
         )
         writer.writeheader()
