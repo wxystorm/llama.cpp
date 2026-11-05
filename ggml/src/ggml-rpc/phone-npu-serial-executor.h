@@ -1028,7 +1028,10 @@ public:
         }
         ggml_backend_synchronize(backend_);
         for (auto & [key, entry] : persistent_) {
-            if (!entry->kv) {
+            if (!entry->kv || deferred_kv_.count(key) != 0) {
+                // Fixed Chunk registration allocates KV storage early.
+                // A never-executed graph must not write uninitialized HTP
+                // KV bytes back to the canonical OpenCL decode cache.
                 continue;
             }
             if (entry->tensor == nullptr || entry->original == nullptr ||
