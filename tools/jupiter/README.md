@@ -319,6 +319,33 @@ and `--resume` rejects an incompatible configuration.
 **Implementation status:** source committed, but the C++ build, on-device
 correctness and throughput A/B must be run on the actual PC+Phone system.
 
+### Legacy Jupiter RPC compute-completion fence
+
+For `LLAMA_JUPITER_PREFILL=1` with `LLAMA_JUPITER_ASYNC_C2P=0`,
+the PC's `GRAPH_COMPUTE` / `GRAPH_RECOMPUTE`, `EVENT_RECORD` and
+`JUPITER_SYNC` **must share one ordered TCP connection**. The RPC
+server's `JUPITER_SYNC` is a per-connection FIFO fence; it is *not*
+a global GPU barrier. Previously, the `weak_ptr` lane cache could
+drop the compute connection immediately after graph submission, so
+a sync on a new connection could acknowledge before Phone computation
+finished. This understated PC-side RPC `compute_ms` and invalidated
+the calibrated Phone service times.
+
+The legacy path now holds a dedicated strong compute-socket reference
+for each RPC backend and serializes graph, event and sync commands on
+that socket. The async-C2P worker path and the non-Jupiter RPC path
+are unchanged. This is a PC-side change; the wire protocol is unchanged.
+
+After updating and rebuilding the PC executable, run one diagnostic
+with `--comm-timing` and check `[JUPITER_REMOTE_SYNC]
+reason=LEGACY_BACKEND wait_ms=...` against the Phone server's
+`[JUPITER_PHONE_TIMELINE] phone_compute_ms=...` for the same run.
+The PC wait covers the remote FIFO work and can include communication
+overhead; it need not equal the Phone compute time exactly. On-device
+compile, correctness and runtime timing still require verification.
+**Do not reuse pre-fix min-chunk or q(x,y) measurements**; recalibrate
+in a fresh output directory after validating the fence.
+
 ## Jupiter communication and graph timeline (diagnostic only)
 
 To distinguish CPU waiting, GPU readback, socket sends, remote transfer
