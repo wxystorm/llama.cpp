@@ -1054,6 +1054,20 @@ static bool recv_msg(socket_ptr sock, void * msg, size_t msg_size) {
     return sock->recv_data(msg, msg_size);
 }
 
+// Versioned local graph Plans are small. Reject the byte length before
+// allocating host memory (the generic RPC vector receiver is unbounded).
+static bool recv_bounded_phone_plan(socket_ptr sock,
+                                    std::vector<uint8_t> & input) {
+    uint64_t bytes = 0;
+    if (!sock->recv_data(&bytes, sizeof(bytes)) ||
+            bytes < 80 ||
+            bytes > ggml_phone_owned_qwen3::max_wire_bytes) {
+        return false;
+    }
+    input.resize(static_cast<size_t>(bytes));
+    return sock->recv_data(input.data(), input.size());
+}
+
 static bool recv_msg(
         socket_ptr sock, std::vector<uint8_t> & input,
         int64_t * header_us = nullptr,
@@ -13633,7 +13647,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
             }
             case RPC_CMD_PHONE_OWNED_QWEN3_PLAN: {
                 std::vector<uint8_t> payload;
-                if (!recv_msg(sock, payload)) { return; }
+                if (!recv_bounded_phone_plan(sock, payload)) { return; }
                 rpc_msg_phone_input_ack rsp {};
                 rsp.accepted =
                     server.phone_owned_qwen3_plan_register(payload) ? 1 : 0;
@@ -14088,7 +14102,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
             }
             case RPC_CMD_PHONE_OWNED_QWEN3_PLAN: {
                 std::vector<uint8_t> payload;
-                if (!recv_msg(sock, payload)) { return; }
+                if (!recv_bounded_phone_plan(sock, payload)) { return; }
                 rpc_msg_phone_input_ack rsp {};
                 rsp.accepted =
                     server.phone_owned_qwen3_plan_register(payload) ? 1 : 0;
