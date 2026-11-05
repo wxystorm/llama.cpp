@@ -7128,6 +7128,32 @@ bool rpc_server::phone_auto_task_register(
         return reject("INPUT_ADDRESS_INVALID");
     }
 
+    const bool npu_async_task = phone_npu_async_preload &&
+        ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region);
+    std::vector<ggml_tensor> async_weight_sources;
+    if (npu_async_task) {
+        // Snapshot the source metadata while the registered Graph is valid.
+        // No Graph pointer is sent to the asynchronous worker.
+        std::string why;
+        if (!ggml_phone_npu_serial::full_region_executor::
+                capture_weight_sources(
+                    it->second.graph, async_weight_sources, why)) {
+            GGML_LOG_ERROR(
+                "[PHONE_NPU_SERIAL] event=PRELOAD_CAPTURE_REJECT "
+                "run=%" PRIu64 " region=%u uid=%" PRIu64
+                " reason=%s\n",
+                request.key.run_id, request.key.region,
+                request.graph_uid, why.c_str());
+            return reject("HTP_PRELOAD_CAPTURE_FAILED");
+        }
+        for (const ggml_tensor & weight : async_weight_sources) {
+            if (buffers.find(weight.buffer) == buffers.end()) {
+                return reject("HTP_PRELOAD_WEIGHT_BUFFER_NOT_LIVE");
+            }
+        }
+    }
+
     // Opt-in, synchronous setup-time HTP weight preload. Unlike run(), this
     // does not touch KV, per-Chunk activations, or the immutable OpenCL
     // output/P2C buffers. Task registration precedes any Chunk execution,
@@ -7137,8 +7163,10 @@ bool rpc_server::phone_auto_task_register(
         std::getenv("GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS");
     if (ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, request.key.region) &&
+            !phone_npu_async_preload &&
             npu_preload_env != nullptr &&
             std::strcmp(npu_preload_env, "1") == 0) {
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
         ggml_phone_npu_serial::full_region_executor::weight_preload_stats
             preload_stats {};
         std::string preload_reason;
@@ -7189,6 +7217,15 @@ bool rpc_server::phone_auto_task_register(
         if (phone_auto_jobs.count(key) != 0) {
             return reject("TASK_ALREADY_REGISTERED");
         }
+        if (npu_async_task) {
+            const auto preload_it = phone_npu_preload_jobs.find(
+                {request.key.run_id, request.key.region});
+            if (preload_it != phone_npu_preload_jobs.end() &&
+                    preload_it->second.state ==
+                        phone_npu_preload_status::FAILED) {
+                return reject("HTP_WEIGHT_PRELOAD_FAILED");
+            }
+        }
         for (const auto & candidate : phone_auto_jobs) {
             const auto & other = *candidate.second;
             if (other.request.device != request.device) { continue; }
@@ -7227,6 +7264,32 @@ bool rpc_server::phone_auto_task_register(
         phone_auto_jobs.emplace(key, std::move(job));
         phone_auto_next_chunk.try_emplace(
             std::make_pair(request.key.run_id, request.key.region), 0);
+        if (npu_async_task) {
+            const auto preload_key = std::make_pair(
+                request.key.run_id, request.key.region);
+            if (phone_npu_preload_jobs.find(preload_key) ==
+                    phone_npu_preload_jobs.end()) {
+                phone_npu_preload_job preload {};
+                preload.run_id = request.key.run_id;
+                preload.region = request.key.region;
+                preload.device = request.device;
+                preload.layer = phone_npu_region_layer.at(request.key.region);
+                preload.uid = request.graph_uid;
+                preload.chunk = request.key.chunk;
+                preload.enqueued_us = ggml_time_us();
+                preload.weights = std::move(async_weight_sources);
+                const size_t n_weights = preload.weights.size();
+                phone_npu_preload_jobs.emplace(preload_key,
+                                               std::move(preload));
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_SERIAL] event=WEIGHTS_PRELOAD_ENQUEUE "
+                    "run=%" PRIu64 " region=%u layer=%d uid=%" PRIu64
+                    " chunk=%u weights=%zu mode=ASYNC status=QUEUED\n",
+                    request.key.run_id, request.key.region,
+                    phone_npu_region_layer.at(request.key.region),
+                    request.graph_uid, request.key.chunk, n_weights);
+            }
+        }
     }
     phone_auto_cv.notify_all();
     GGML_LOG_INFO(
