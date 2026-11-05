@@ -7075,6 +7075,17 @@ bool rpc_server::phone_auto_task_register(
             return reject("STREAM_NOT_ACTIVE");
         }
     }
+    // Match compute/KV_RESET lock order: HTP before Graph. A registered HTP
+    // graph must not race its shared scratch arena or weight preload.
+    const char * fixed_env =
+        std::getenv("GGML_RPC_PHONE_NPU_FIXED_CHUNK_GRAPHS");
+    const bool fixed_npu_requested =
+        fixed_env != nullptr && std::strcmp(fixed_env, "1") == 0 &&
+        ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region);
+    std::unique_lock<std::mutex> fixed_htp_guard(
+        phone_npu_backend_mutex, std::defer_lock);
+    if (fixed_npu_requested) { fixed_htp_guard.lock(); }
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     auto it = stored_graphs[request.device].find(request.graph_uid);
     if (it == stored_graphs[request.device].end()) {
@@ -7280,6 +7291,38 @@ bool rpc_server::phone_auto_task_register(
         }
         if (!preloaded) {
             return reject("HTP_WEIGHT_PRELOAD_FAILED");
+        }
+    }
+
+    // Task registration is already performed once for each fixed Chunk UID.
+    // Prebuild before exposing the job to the Phone prepare/compute workers.
+    if (fixed_npu_requested) {
+        if (!phone_npu_executor ||
+                !phone_npu_executor->fixed_graph_cache_supported()) {
+            return reject("HTP_FIXED_GRAPH_CACHE_API_UNAVAILABLE");
+        }
+        std::string why;
+        double prepare_ms = 0.0;
+        size_t arena_bytes = 0;
+        bool arena_reused = false;
+        const bool ready = phone_npu_executor->register_chunk(
+            request.graph_uid, it->second.graph, output,
+            why, prepare_ms, arena_bytes, arena_reused);
+        GGML_LOG_INFO(
+            "[PHONE_NPU_FIXED] event=GRAPH_PREBUILD run=%" PRIu64
+            " region=%u layer=%d chunk=%u uid=%" PRIu64
+            " arena_bytes=%zu arena_reused=%d prebuild_ms=%.3f"
+            " status=%s reason=%s\n",
+            request.key.run_id, request.key.region,
+            phone_npu_region_layer.at(request.key.region),
+            request.key.chunk, request.graph_uid,
+            arena_bytes, arena_reused ? 1 : 0, prepare_ms,
+            ready ? "READY" :
+                why == "HTP_FIXED_WEIGHTS_NOT_RESIDENT" ?
+                "FALLBACK_LEGACY" : "FAIL",
+            ready ? "NONE" : why.c_str());
+        if (!ready && why != "HTP_FIXED_WEIGHTS_NOT_RESIDENT") {
+            return reject("HTP_FIXED_GRAPH_PREBUILD_FAILED");
         }
     }
 
@@ -7926,10 +7969,18 @@ void rpc_server::phone_auto_compute_loop() {
                 if (outputs == 1 && output != nullptr &&
                         phone_npu_executor != nullptr && npu_task) {
                     // htp_guard was acquired before graph_compute_mutex.
-                    ok = phone_npu_executor->run(
-                        it->second.graph, output, why,
-                        stage_ms, htp_ms, return_ms,
-                        stage_profile_enabled ? &stage_profile : nullptr);
+                    if (phone_npu_executor->has_registered_chunk(
+                            req.graph_uid)) {
+                        ok = phone_npu_executor->run_registered_chunk(
+                            req.graph_uid, it->second.graph, output, why,
+                            stage_ms, htp_ms, return_ms,
+                            stage_profile_enabled ? &stage_profile : nullptr);
+                    } else {
+                        ok = phone_npu_executor->run(
+                            it->second.graph, output, why,
+                            stage_ms, htp_ms, return_ms,
+                            stage_profile_enabled ? &stage_profile : nullptr);
+                    }
                 }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
                 if (!ok && why.empty()) {
@@ -7973,12 +8024,15 @@ void rpc_server::phone_auto_compute_loop() {
                     " region=%u layer=%d chunk=%u tokens=%u "
                     "uid=%" PRIu64 " backend=HTP0 "
                     "stage_ms=%.3f compute_ms=%.3f return_ms=%.3f "
-                    "status=%s reason=%s\n",
+                    "mode=%s status=%s reason=%s\n",
                     req.key.run_id, req.key.region,
                     phone_npu_region_layer.count(req.key.region) ?
                         phone_npu_region_layer.at(req.key.region) : -1,
                     req.key.chunk, req.n_tokens, req.graph_uid,
                     stage_ms, htp_ms, return_ms,
+                    phone_npu_executor != nullptr &&
+                        phone_npu_executor->has_registered_chunk(
+                            req.graph_uid) ? "FIXED_GRAPH" : "LEGACY",
                     ok ? "PASS" : "FAIL",
                     ok ? "NONE" : why.c_str());
             } else if (it != stored_graphs[req.device].end() &&
