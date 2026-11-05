@@ -577,8 +577,14 @@ private:
     }
 
     static std::string model_weight_key(const ggml_tensor * t) {
+        // Meta RPC may namespace a weight leaf as
+        // "Meta(CPU,RPC0)#blk.19.attn_q.weight", whereas the local GGUF
+        // loader returns "blk.19.attn_q.weight". Match the canonical
+        // layer-scoped suffix, but still require equal type and layout.
+        const std::string name(t->name);
+        const size_t at = name.find("blk.");
         std::string key = "MODEL:";
-        key += t->name;
+        key += at == std::string::npos ? name : name.substr(at);
         key += ":" + std::to_string(static_cast<int>(t->type));
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             key += ":" + std::to_string(t->ne[d]);
