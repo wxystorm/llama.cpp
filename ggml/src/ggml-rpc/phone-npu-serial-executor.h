@@ -538,7 +538,7 @@ public:
             auto result = mapped.find(t);
             auto base = mapped.find(t->src[2]);
             if (result == mapped.end() || base == mapped.end() ||
-                    result->second->view_src != base->second) {
+                    result->second->view_src == nullptr) {
                 reason = "HTP_FIXED_SET_ROWS_VIEW";
                 return false;
             }
@@ -636,7 +636,6 @@ public:
         }
         // Registration is allowed to encounter a VIEW before its parent in
         // metadata order. Resolve views recursively in dependency order.
-        std::unordered_set<ggml_tensor *> initialized;
         std::unordered_set<ggml_tensor *> visiting;
         std::function<bool(ggml_tensor *)> init_view =
             [&](ggml_tensor * t) {
@@ -647,7 +646,6 @@ public:
             bool ok = init_view(t->view_src) &&
                 ggml_backend_view_init(t) == GGML_STATUS_SUCCESS;
             visiting.erase(t);
-            if (ok) { initialized.insert(t); }
             return ok;
         };
         for (ggml_tensor * t : prepared->views) {
