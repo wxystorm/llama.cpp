@@ -121,6 +121,12 @@ endfunction()
 add_executable(test-phone-autonomous-policy test-phone-autonomous-policy.cpp)
 llama_test(test-phone-autonomous-policy LABEL region-ring)
 
+# Architecture-neutral Phone-owned Qwen3 prefill Plan v1 wire/partition tests.
+# Does not load a model or link an RPC backend; run on Windows and Android.
+add_executable(test-phone-owned-qwen3-plan test-phone-owned-qwen3-plan.cpp)
+target_compile_features(test-phone-owned-qwen3-plan PRIVATE cxx_std_17)
+llama_test(test-phone-owned-qwen3-plan LABEL region-ring)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
