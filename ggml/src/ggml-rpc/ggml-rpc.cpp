@@ -3397,7 +3397,8 @@ static void * ggml_backend_rpc_p2c_stream_start(
             [stream, n_regions, n_tokens, n_embd, resolve]() {
                 ggml_rpc_p2c_stream_receiver receiver(
                     stream->run_id, n_regions, n_tokens, n_embd,
-                    resolve, stream->complete, stream->userdata);
+                    resolve, stream->complete, stream->userdata,
+                    ggml_time_us);
                 const bool ok = receiver.receive(stream->socket);
                 GGML_LOG_INFO(
                     "[P2C_STREAM] side=PC phase=RECEIVER_DONE run=%" PRIu64
