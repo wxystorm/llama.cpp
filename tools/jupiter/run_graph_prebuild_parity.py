@@ -14,8 +14,8 @@ import subprocess
 import sys
 
 HASH_RE = re.compile(
-    r"\\[JUPITER_LOGITS_HASH\\].*?tokens=(\\d+).*?outputs=(\\d+)"
-    r".*?top1_id=(-?\\d+).*?digest=([0-9a-fA-F]+)"
+    r"\[JUPITER_LOGITS_HASH\].*?tokens=(\d+).*?outputs=(\d+)"
+    r".*?top1_id=(-?\d+).*?digest=([0-9a-fA-F]+)"
 )
 
 def parser() -> argparse.ArgumentParser:
