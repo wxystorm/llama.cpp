@@ -1296,7 +1296,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, llm_graph_result_ptr * prebuilt, uint32_t prebuilt_n_kv) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, llm_graph_result_ptr * prebuilt, uint32_t prebuilt_n_kv, const std::vector<std::pair<ggml_tensor *, ggml_backend_t>> * prebuilt_placements) {
     const char * timeline_env = getenv("LLAMA_JUPITER_TIMELINE");
     const char * prefill_env = getenv("LLAMA_JUPITER_PREFILL");
     const bool jupiter_timeline = ubatch.n_tokens > 1 &&
@@ -1345,6 +1345,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (jupiter_graph_prebuilt) {
         ggml_backend_sched_reset(sched.get());
+        // Forced backend placement is recorded during template construction.
+        // Resetting the scheduler would otherwise discard those assignments.
+        if (prebuilt_placements) {
+            for (const auto & [node, backend] : *prebuilt_placements) {
+                ggml_backend_sched_set_tensor_backend(sched.get(), node, backend);
+            }
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         const int64_t jupiter_alloc_begin_us = jupiter_timeline ? ggml_time_us() : 0;
         const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
@@ -1908,6 +1915,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             gf_res_prev->reset();
             jupiter_prebuilt_graphs.clear();
             jupiter_prebuilt_snapshots.clear();
+            jupiter_prebuilt_placements.clear();
             const uint32_t saved_n_outputs = n_outputs;
             const int64_t prebuild_begin = ggml_time_us();
             const size_t count = kv_ctx->prebuild_batch_count();
@@ -1937,8 +1945,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     all_ready = false;
                     break;
                 }
+                // Save explicit per-node/leaf backend choices before resetting
+                // scheduler placement maps for the next template.
+                std::vector<std::pair<ggml_tensor *, ggml_backend_t>> placements;
+                auto * graph = prepared->get_gf();
+                for (int j = 0; j < graph->n_nodes + graph->n_leafs; ++j) {
+                    auto * tensor = j < graph->n_nodes
+                            ? graph->nodes[j] : graph->leafs[j - graph->n_nodes];
+                    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+                    if (backend != nullptr) {
+                        placements.emplace_back(tensor, backend);
+                    }
+                }
                 jupiter_prebuilt_graphs.emplace_back(std::move(prepared));
                 jupiter_prebuilt_snapshots.emplace_back(std::move(snapshot));
+                jupiter_prebuilt_placements.emplace_back(std::move(placements));
             }
             n_outputs = saved_n_outputs;
             // Drop graph-build backend placement hints; the scheduler will
@@ -1947,6 +1968,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (!all_ready) {
                 jupiter_prebuilt_graphs.clear();
                 jupiter_prebuilt_snapshots.clear();
+                jupiter_prebuilt_placements.clear();
             }
             LLAMA_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=PREPARE planned=%zu ready=%zu "
                            "host_ms=%.3f status=%s\n", count, jupiter_prebuilt_graphs.size(),
@@ -2018,8 +2040,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     jupiter_prebuilt_snapshots[jupiter_chunk_idx].get());
             prepared_n_kv = preview ? preview->get_n_kv() : 0;
         }
+        const auto * placements = jupiter_chunk_idx < jupiter_prebuilt_placements.size()
+                ? &jupiter_prebuilt_placements[jupiter_chunk_idx] : nullptr;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
-                mctx.get(), status, prepared, prepared_n_kv);
+                mctx.get(), status, prepared, prepared_n_kv, placements);
 
         if (jupiter_trace && n_tokens_all > 1 && res != nullptr) {
             LLAMA_LOG_INFO(
