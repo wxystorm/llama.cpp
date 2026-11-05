@@ -59,6 +59,7 @@ public:
     struct weight_preload_stats {
         size_t new_weights = 0;
         size_t reused_weights = 0;
+        size_t model_hits = 0;
         size_t new_bytes = 0;
         double sync_ms = 0.0;
         double copy_ms = 0.0;
@@ -303,11 +304,13 @@ public:
         std::vector<const ggml_tensor *> missing;
         for (const ggml_tensor & snapshot : snapshots) {
             const std::string key = storage_key(&snapshot, false);
-            if (persistent_.find(key) == persistent_.end() &&
-                    !has_model_weight(&snapshot)) {
-                missing.push_back(&snapshot);
-            } else {
+            if (persistent_.find(key) != persistent_.end()) {
                 ++stats.reused_weights;
+            } else if (has_model_weight(&snapshot)) {
+                ++stats.reused_weights;
+                ++stats.model_hits;
+            } else {
+                missing.push_back(&snapshot);
             }
         }
         if (missing.empty()) {
