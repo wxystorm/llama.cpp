@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -1295,7 +1296,7 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, llm_graph_result_ptr * prebuilt, uint32_t prebuilt_n_kv) {
     const char * timeline_env = getenv("LLAMA_JUPITER_TIMELINE");
     const char * prefill_env = getenv("LLAMA_JUPITER_PREFILL");
     const bool jupiter_timeline = ubatch.n_tokens > 1 &&
@@ -1313,13 +1314,48 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     auto * res = gf_res_prev.get();
-    auto * gf  = res->get_gf();
+    bool jupiter_graph_prebuilt = false;
+
+    // Graph templates are built without allocating device buffers. Apply the
+    // real KV state first, then validate the predicted attention span and all
+    // graph inputs before assigning a scheduler copy / binding actual data.
+    if (prebuilt != nullptr && *prebuilt) {
+        const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx);
+        auto * candidate = prebuilt->get();
+        const bool kv_match = kv_ctx != nullptr &&
+                prebuilt_n_kv != 0 && kv_ctx->get_n_kv() == prebuilt_n_kv;
+        if (kv_match && candidate->can_reuse(graph_params(candidate, ubatch, mctx, gtype))) {
+            gf_res_prev.swap(*prebuilt);
+            res = gf_res_prev.get();
+            jupiter_graph_prebuilt = true;
+            LLAMA_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=USE tokens=%u n_kv=%u status=HIT\n",
+                           ubatch.n_tokens, prebuilt_n_kv);
+        } else {
+            LLAMA_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=USE tokens=%u n_kv=%u status=FALLBACK\n",
+                           ubatch.n_tokens, kv_ctx ? kv_ctx->get_n_kv() : 0);
+        }
+    }
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
-    // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+    // in order to correctly reuse a graph, its topology and KV/mask layout
+    // must agree with the current ubatch and memory context.
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (jupiter_graph_prebuilt) {
+        ggml_backend_sched_reset(sched.get());
+        const int64_t jupiter_alloc_begin_us = jupiter_timeline ? ggml_time_us() : 0;
+        const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (jupiter_timeline) {
+            jupiter_graph_alloc_us = ggml_time_us() - jupiter_alloc_begin_us;
+        }
+        if (!allocated) {
+            LLAMA_LOG_ERROR("%s: failed to allocate prebuilt graph\n", __func__);
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
+    } else if (!graph_reuse_disable && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // A reused graph keeps its allocated scheduler copy. Jupiter's
@@ -1856,6 +1892,65 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // Metadata-only, opt-in prebuild for single-stream dense Qwen3. Other
+    // memory implementations / architectures keep the established path.
+    const char * jupiter_prebuild_env = getenv("LLAMA_JUPITER_GRAPH_PREBUILD");
+    const bool jupiter_prebuild_requested = llama_jupiter::enabled() &&
+            n_tokens_all > 1 && model.arch == LLM_ARCH_QWEN3 &&
+            jupiter_prebuild_env != nullptr && atoi(jupiter_prebuild_env) != 0;
+    if (jupiter_prebuild_requested) {
+        const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx.get());
+        if (kv_ctx != nullptr && kv_ctx->prebuild_batch_count() > 0) {
+            // Previous decode may still be in flight; do not retire graph
+            // metadata referenced by GPU/RPC until all work has completed.
+            synchronize();
+            gf_res_prev->reset();
+            jupiter_prebuilt_graphs.clear();
+            jupiter_prebuilt_snapshots.clear();
+            const uint32_t saved_n_outputs = n_outputs;
+            const int64_t prebuild_begin = ggml_time_us();
+            const size_t count = kv_ctx->prebuild_batch_count();
+            bool all_ready = true;
+            for (size_t i = 0; i < count; ++i) {
+                auto snapshot = kv_ctx->prebuild_batch_snapshot(i);
+                if (!snapshot) {
+                    all_ready = false;
+                    break;
+                }
+                const auto & sub = snapshot->get_ubatch();
+                n_outputs = 0;
+                if (n_outputs_all == n_tokens_all) {
+                    n_outputs = sub.n_tokens;
+                } else {
+                    for (uint32_t j = 0; j < sub.n_tokens; ++j) {
+                        n_outputs += (uint32_t) (sub.output[j] != 0);
+                    }
+                }
+                auto prepared = std::make_unique<llm_graph_result>(gf_res_prev->get_max_nodes());
+                const auto params = graph_params(prepared.get(), sub, snapshot.get(),
+                        ctx_type_to_graph_type(cparams.ctx_type));
+                if (!model.build_graph(params)) {
+                    all_ready = false;
+                    break;
+                }
+                jupiter_prebuilt_graphs.emplace_back(std::move(prepared));
+                jupiter_prebuilt_snapshots.emplace_back(std::move(snapshot));
+            }
+            n_outputs = saved_n_outputs;
+            // Drop graph-build backend placement hints; the scheduler will
+            // allocate a fresh rotating copy when each template is executed.
+            ggml_backend_sched_reset(sched.get());
+            if (!all_ready) {
+                jupiter_prebuilt_graphs.clear();
+                jupiter_prebuilt_snapshots.clear();
+            }
+            LLAMA_LOG_INFO("[JUPITER_GRAPH_PREBUILD] phase=PREPARE planned=%zu ready=%zu "
+                           "host_ms=%.3f status=%s\n", count, jupiter_prebuilt_graphs.size(),
+                           (ggml_time_us() - prebuild_begin)/1000.0,
+                           all_ready ? "READY" : "FALLBACK");
+        }
+    }
+
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     int jupiter_window = 2;
@@ -1911,7 +2006,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // 统计有多少个输出 token ，构建计算图依赖n_outputs
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        llm_graph_result_ptr * prepared = jupiter_chunk_idx < jupiter_prebuilt_graphs.size()
+                ? &jupiter_prebuilt_graphs[jupiter_chunk_idx] : nullptr;
+        uint32_t prepared_n_kv = 0;
+        if (prepared != nullptr && jupiter_chunk_idx < jupiter_prebuilt_snapshots.size()) {
+            const auto * preview = dynamic_cast<const llama_kv_cache_context *>(
+                    jupiter_prebuilt_snapshots[jupiter_chunk_idx].get());
+            prepared_n_kv = preview ? preview->get_n_kv() : 0;
+        }
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type),
+                mctx.get(), status, prepared, prepared_n_kv);
 
         if (jupiter_trace && n_tokens_all > 1 && res != nullptr) {
             LLAMA_LOG_INFO(
