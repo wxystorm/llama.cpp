@@ -6536,7 +6536,12 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
         response.remote_size = buffer->size;
         GGML_LOG_INFO("[%s] device: %d, size: %" PRIu64 " -> remote_ptr: %" PRIx64 ", remote_size: %" PRIu64 "\n", __func__, dev_id, request.size, response.remote_ptr, response.remote_size);
-        buffers.insert(buffer);
+        {
+            // Paired with the async HTP preloader's source-lifetime guard.
+            std::lock_guard<std::mutex> weight_guard(
+                phone_npu_weight_source_mutex);
+            buffers.insert(buffer);
+        }
     } else {
         //LOG_DBG("[%s] device: %d, size: %" PRIu64 " -> failed\n", __func__, dev_id, request.size);
     }
@@ -6923,6 +6928,16 @@ bool rpc_server::phone_input_stream_run(
                     it != phone_auto_next_chunk.end();) {
                 if (it->first.first == request.run_id) {
                     it = phone_auto_next_chunk.erase(it);
+                } else { ++it; }
+            }
+            // Discard any queued, no-longer-relevant preload. A RUNNING
+            // worker owns only detached metadata and checks buffer liveness
+            // while holding phone_npu_weight_source_mutex. It cannot
+            // publish a stale READY status after this map entry is removed.
+            for (auto it = phone_npu_preload_jobs.begin();
+                    it != phone_npu_preload_jobs.end();) {
+                if (it->first.first == request.run_id) {
+                    it = phone_npu_preload_jobs.erase(it);
                 } else { ++it; }
             }
         }
