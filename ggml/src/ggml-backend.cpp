@@ -1987,6 +1987,32 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    // Opt-in: the RPC backend may register its graph metadata while no split
+    // has executed yet. This keeps prebuild out of the dynamic C2P/compute
+    // path and does not require a link-time dependency on ggml-rpc.
+    const char * prebuild_env = getenv("LLAMA_JUPITER_GRAPH_PREBUILD");
+    const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
+    if (prebuild_env && atoi(prebuild_env) != 0 &&
+        jupiter_env && atoi(jupiter_env) != 0) {
+        using graph_prebuild_fn = bool (*)(ggml_backend_t, ggml_cgraph *);
+        for (int i = 0; i < sched->n_splits; ++i) {
+            auto & split = sched->splits[i];
+            ggml_backend_t backend = sched->backends[split.backend_id];
+            const char * backend_name = ggml_backend_name(backend);
+            if (backend_name == nullptr || strncmp(backend_name, "RPC", 3) != 0) {
+                continue;
+            }
+            auto * dev = ggml_backend_get_device(backend);
+            auto * reg = ggml_backend_dev_backend_reg(dev);
+            const auto fn = reinterpret_cast<graph_prebuild_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_rpc_graph_prebuild"));
+            if (fn == nullptr || !fn(backend, &split.graph)) {
+                GGML_LOG_ERROR("[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER status=FAILED\n");
+                return GGML_STATUS_FAILED;
+            }
+        }
+    }
+
     return ggml_backend_sched_compute_splits(sched);
 }
 
