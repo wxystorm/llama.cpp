@@ -459,8 +459,19 @@ struct rpc_msg_phone_owned_plan_req {
     uint32_t n_heads = 0;
     uint32_t n_heads_kv = 0;
     uint32_t head_dim = 0;
+    uint32_t n_kv = 0;
+    uint32_t rope_type = 0;
+    uint32_t n_ctx_orig = 0;
+    uint32_t kv_type = 0;
+    float rms_norm_eps = 0;
+    float rope_freq_base = 0;
+    float rope_freq_scale = 0;
+    float rope_ext_factor = 0;
+    float rope_attn_factor = 0;
+    float rope_beta_fast = 0;
+    float rope_beta_slow = 0;
 };
-static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 64,
+static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 108,
               "Phone-owned plan wire ABI changed; bump RPC protocol");
 static_assert(sizeof(rpc_msg_phone_auto_task_req) == 60,
               "Autonomous task registration ABI changed; bump RPC protocol");
@@ -4277,6 +4288,17 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
     req.n_heads       = plan->n_heads;
     req.n_heads_kv    = plan->n_heads_kv;
     req.head_dim      = plan->head_dim;
+    req.n_kv          = plan->n_kv;
+    req.rope_type     = plan->rope_type;
+    req.n_ctx_orig    = plan->n_ctx_orig;
+    req.kv_type       = plan->kv_type;
+    req.rms_norm_eps  = plan->rms_norm_eps;
+    req.rope_freq_base  = plan->rope_freq_base;
+    req.rope_freq_scale = plan->rope_freq_scale;
+    req.rope_ext_factor = plan->rope_ext_factor;
+    req.rope_attn_factor = plan->rope_attn_factor;
+    req.rope_beta_fast = plan->rope_beta_fast;
+    req.rope_beta_slow = plan->rope_beta_slow;
     rpc_msg_phone_input_ack rsp {};
     return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
                &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
@@ -7216,6 +7238,17 @@ bool rpc_server::phone_owned_plan_register(
     plan.n_heads       = request.n_heads;
     plan.n_heads_kv    = request.n_heads_kv;
     plan.head_dim      = request.head_dim;
+    plan.n_kv          = request.n_kv;
+    plan.rope_type     = request.rope_type;
+    plan.n_ctx_orig    = request.n_ctx_orig;
+    plan.kv_type       = request.kv_type;
+    plan.rms_norm_eps  = request.rms_norm_eps;
+    plan.rope_freq_base  = request.rope_freq_base;
+    plan.rope_freq_scale = request.rope_freq_scale;
+    plan.rope_ext_factor = request.rope_ext_factor;
+    plan.rope_attn_factor = request.rope_attn_factor;
+    plan.rope_beta_fast = request.rope_beta_fast;
+    plan.rope_beta_slow = request.rope_beta_slow;
 
     const char * reason = "NONE";
     if (!ggml_phone_owned::validate(plan, reason)) {
@@ -7242,6 +7275,32 @@ bool rpc_server::phone_owned_plan_register(
             return false;
         }
     }
+    // Optional Phone-local Qwen3 graph construction check. No RPC graph is
+    // consulted, and no NPU kernel is dispatched from this shadow path.
+    const char * local_builder_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW");
+    const bool local_builder_check = local_builder_env != nullptr &&
+        std::strcmp(local_builder_env, "1") == 0;
+    if (local_builder_check) {
+        ggml_phone_npu_serial::full_region_executor::
+            local_graph_shadow_stats stats {};
+        std::string why;
+        const int64_t begin_us = ggml_time_us();
+        const bool built = phone_npu_executor->validate_owned_local_graphs(
+            plan, why, stats);
+        GGML_LOG_INFO(
+            "[PHONE_QWEN3_LOCAL] event=GRAPH_BUILD run=%" PRIu64
+            " region=%u layer=%u chunks=%u graph_nodes=%zu "
+            "kv_writes=%zu flash_nodes=%zu rope_nodes=%zu "
+            "builder_ms=%.3f mode=SHADOW_NO_HTP_ALLOC status=%s reason=%s\n",
+            plan.run_id, plan.region, plan.layer,
+            stats.chunks, stats.total_nodes, stats.kv_writes,
+            stats.flash_nodes, stats.rope_nodes,
+            (ggml_time_us() - begin_us) / 1000.0,
+            built ? "PASS" : "FAIL",
+            built ? "NONE" : why.c_str());
+        if (!built) { return false; }
+    }
     // Shadow-only: avoid racing the existing Graph and NPU life cycle.
     std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
     if (!phone_owned_plans.add(plan, reason)) {
@@ -7254,7 +7313,8 @@ bool rpc_server::phone_owned_plan_register(
                   " p2c_run=%" PRIu64
                   " region=%u layer=%u chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
-                  " graph_mode=SHADOW_PC_BUILT status=READY\n",
+                  " graph_mode=SHADOW_PC_BUILT local_builder=%s status=READY\n",
+                  local_builder_check ? "GRAPH_BUILT" : "OFF",
                   plan.run_id, plan.p2c_run_id, plan.region,
                   plan.layer, ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
