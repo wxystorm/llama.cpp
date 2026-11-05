@@ -14,6 +14,8 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <map>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -364,6 +366,225 @@ public:
             stats.kv_writes += set_rows;
             stats.flash_nodes += flash;
             stats.rope_nodes += rope;
+        }
+        reason.clear();
+        return true;
+    }
+
+    struct local_htp_prepare_stats {
+        uint32_t chunks = 0;
+        size_t graph_nodes = 0;
+        size_t kv_bytes = 0;
+        size_t graph_storage_bytes = 0;
+        double precompile_ms = 0.0;
+    };
+
+    // Opt-in precompile stage. The Phone allocates KV once per assigned Layer,
+    // fixes every Chunk's input/side-input/output Tensor storage, then invokes
+    // the same HTP fixed-graph precompiler used by PC-built Graphs. No PC
+    // Graph is consulted. This prepares graphs only: input PUSH and P2C still
+    // follow the legacy path until a later cutover.
+    //
+    // Caller holds phone_npu_backend_mutex, and may not call this while a
+    // different RUN is executing. Stream reset clears these plans first.
+    bool prepare_owned_htp_graphs(
+            const ggml_phone_owned::region_plan & plan,
+            std::string & reason,
+            local_htp_prepare_stats & stats) {
+        stats = {};
+        const char * why = "NONE";
+        if (!ggml_phone_owned::validate(plan, why)) {
+            reason = why;
+            return false;
+        }
+        if (!fixed_graph_cache_supported()) {
+            reason = "PHONE_OWNED_HTP_FIXED_CACHE_UNAVAILABLE";
+            return false;
+        }
+        const auto key = std::make_pair(plan.run_id, plan.region);
+        auto existing = owned_kv_.find(key);
+        if (existing != owned_kv_.end()) {
+            if (!ggml_phone_owned::equal(existing->second->plan, plan)) {
+                reason = "PHONE_OWNED_HTP_PLAN_CONFLICT";
+                return false;
+            }
+            for (uint32_t chunk = 0;
+                    chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
+                if (owned_graphs_.count(
+                        std::make_tuple(plan.run_id, plan.region, chunk)) == 0) {
+                    reason = "PHONE_OWNED_HTP_PARTIAL_REGISTRATION";
+                    return false;
+                }
+            }
+            stats.chunks = ggml_phone_owned::chunk_count(plan);
+            return true;
+        }
+
+        ggml_phone_qwen3::layer_weights w {};
+        const auto load = [&](const char * suffix) -> ggml_tensor * {
+            char name[GGML_MAX_NAME] = {};
+            std::snprintf(name, sizeof(name), "blk.%u.%s", plan.layer, suffix);
+            for (const auto & entry : model_weights_) {
+                ggml_tensor * t = entry.second->tensor;
+                if (t && std::strcmp(t->name, name) == 0 &&
+                        t->buffer && t->data) {
+                    return t;
+                }
+            }
+            return nullptr;
+        };
+        w.attn_norm = load("attn_norm.weight");
+        w.wq = load("attn_q.weight");
+        w.wk = load("attn_k.weight");
+        w.wv = load("attn_v.weight");
+        w.wo = load("attn_output.weight");
+        w.ffn_norm = load("ffn_norm.weight");
+        w.ffn_gate = load("ffn_gate.weight");
+        w.ffn_up = load("ffn_up.weight");
+        w.ffn_down = load("ffn_down.weight");
+        w.q_norm = load("attn_q_norm.weight");
+        w.k_norm = load("attn_k_norm.weight");
+        if (!ggml_phone_qwen3::validate_weights(plan, w, why)) {
+            reason = std::string("PHONE_OWNED_HTP_WEIGHTS:") + why;
+            return false;
+        }
+
+        auto kv = std::make_unique<owned_layer_kv>();
+        kv->plan = plan;
+        const size_t kv_ctx_bytes = ggml_tensor_overhead() * 8 + 4096;
+        ggml_init_params kv_params = {kv_ctx_bytes, nullptr, true};
+        kv->ctx.reset(ggml_init(kv_params));
+        if (!kv->ctx) {
+            reason = "PHONE_OWNED_HTP_KV_CONTEXT";
+            return false;
+        }
+        const int64_t width = int64_t(plan.n_heads_kv) * plan.head_dim;
+        kv->k = ggml_new_tensor_2d(
+            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+        kv->v = ggml_new_tensor_2d(
+            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+        if (!kv->k || !kv->v) {
+            reason = "PHONE_OWNED_HTP_KV_METADATA";
+            return false;
+        }
+        char name[GGML_MAX_NAME] = {};
+        std::snprintf(name, sizeof(name), "cache_k_l%u", plan.layer);
+        ggml_set_name(kv->k, name);
+        std::snprintf(name, sizeof(name), "cache_v_l%u", plan.layer);
+        ggml_set_name(kv->v, name);
+        kv->buffer.reset(ggml_backend_alloc_ctx_tensors(
+            kv->ctx.get(), backend_));
+        if (!kv->buffer) {
+            reason = "PHONE_OWNED_HTP_KV_ALLOC";
+            return false;
+        }
+        ggml_backend_buffer_clear(kv->buffer.get(), 0);
+        stats.kv_bytes = ggml_backend_buffer_get_size(kv->buffer.get());
+
+        const auto reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_));
+        using compile_fn = bool (*)(ggml_backend_t, ggml_cgraph *);
+        const auto compile = reg == nullptr ? nullptr :
+            reinterpret_cast<compile_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_precompile_fixed_graph"));
+        if (compile == nullptr) {
+            reason = "PHONE_OWNED_HTP_COMPILE_PROC";
+            return false;
+        }
+        // Holding temporary Graphs through the entire loop ensures a
+        // successful HTP compilation never sees prematurely released memory.
+        std::vector<std::unique_ptr<owned_chunk_graph>> pending;
+        pending.reserve(ggml_phone_owned::chunk_count(plan));
+        const size_t graph_ctx_bytes =
+            ggml_tensor_overhead() * 1024 +
+            ggml_graph_overhead_custom(512, false) + 4096;
+        for (uint32_t chunk = 0;
+                chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
+            auto item = std::make_unique<owned_chunk_graph>();
+            ggml_init_params params = {graph_ctx_bytes, nullptr, true};
+            item->ctx.reset(ggml_init(params));
+            if (!item->ctx) {
+                reason = "PHONE_OWNED_HTP_GRAPH_CONTEXT";
+                break;
+            }
+            if (!ggml_phone_qwen3::build_graph(
+                    item->ctx.get(), plan, chunk, w, item->built, why,
+                    kv->k, kv->v)) {
+                reason = std::string("PHONE_OWNED_HTP_BUILD:") + why;
+                break;
+            }
+            item->buffer.reset(ggml_backend_alloc_ctx_tensors(
+                item->ctx.get(), backend_));
+            if (!item->buffer) {
+                reason = "PHONE_OWNED_HTP_GRAPH_ALLOC";
+                break;
+            }
+            ggml_phone_qwen3::side_inputs side {};
+            if (!ggml_phone_qwen3::make_side_inputs(
+                    plan, chunk, side, why)) {
+                reason = std::string("PHONE_OWNED_HTP_INPUTS:") + why;
+                break;
+            }
+            ggml_backend_tensor_set(
+                item->built.positions, side.positions.data(), 0,
+                side.positions.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(
+                item->built.k_indices, side.k_indices.data(), 0,
+                side.k_indices.size() * sizeof(int64_t));
+            ggml_backend_tensor_set(
+                item->built.v_indices, side.v_indices.data(), 0,
+                side.v_indices.size() * sizeof(int64_t));
+            ggml_backend_tensor_set(
+                item->built.mask, side.causal_mask_f16.data(), 0,
+                side.causal_mask_f16.size() * sizeof(uint16_t));
+            bool supported = true;
+            for (int i = 0; i < item->built.graph->n_nodes; ++i) {
+                if (!ggml_backend_supports_op(
+                        backend_, item->built.graph->nodes[i])) {
+                    supported = false;
+                    reason = std::string("PHONE_OWNED_HTP_UNSUPPORTED_OP:") +
+                        item->built.graph->nodes[i]->name;
+                    break;
+                }
+            }
+            if (!supported) { break; }
+            if (next_owned_uid_ == 0 ||
+                    next_owned_uid_ >= (UINT64_C(1) << 62)) {
+                reason = "PHONE_OWNED_HTP_GRAPH_UID_EXHAUSTED";
+                break;
+            }
+            item->built.graph->uid = (UINT64_C(3) << 62) |
+                next_owned_uid_++;
+            const int64_t t0 = ggml_time_us();
+            const bool compiled = compile(backend_, item->built.graph);
+            stats.precompile_ms += (ggml_time_us() - t0) / 1000.0;
+            if (!compiled) {
+                reason = "PHONE_OWNED_HTP_COMPILE_FAILED";
+                break;
+            }
+            ++stats.chunks;
+            stats.graph_nodes += item->built.graph->n_nodes;
+            stats.graph_storage_bytes +=
+                ggml_backend_buffer_get_size(item->buffer.get());
+            pending.push_back(std::move(item));
+        }
+        if (stats.chunks != ggml_phone_owned::chunk_count(plan)) {
+            // The optional precompiler caches Tensor addresses. Invalidate
+            // cached plans before releasing any partially built objects.
+            using clear_fn = void (*)(ggml_backend_t);
+            auto clear = reinterpret_cast<clear_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_clear_fixed_graph_cache"));
+            if (clear) { clear(backend_); }
+            if (reason.empty()) { reason = "PHONE_OWNED_HTP_PARTIAL"; }
+            return false;
+        }
+        owned_kv_.emplace(key, std::move(kv));
+        for (uint32_t chunk = 0; chunk < pending.size(); ++chunk) {
+            owned_graphs_.emplace(
+                std::make_tuple(plan.run_id, plan.region, chunk),
+                std::move(pending[chunk]));
         }
         reason.clear();
         return true;
@@ -1185,6 +1406,8 @@ public:
             if (clear != nullptr) { clear(backend_); }
         }
         registered_graphs_.clear();
+        owned_graphs_.clear();
+        owned_kv_.clear();
         deferred_kv_.clear();
         for (auto it = persistent_.begin(); it != persistent_.end();) {
             it = it->second->kv ? persistent_.erase(it) : ++it;
@@ -1366,6 +1589,26 @@ private:
     // Dedicated model-lifetime cache, never reset by a new Prompt.
     std::unordered_map<std::string, std::unique_ptr<persistent_tensor>>
         model_weights_;
+
+    struct owned_layer_kv {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_phone_owned::region_plan plan {};
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+    };
+    struct owned_chunk_graph {
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buffer;
+        ggml_phone_qwen3::graph_result built {};
+    };
+    // Declare after model_weights_, and graph after KV, so destruction
+    // order is graph -> KV -> model weights.
+    std::map<std::pair<uint64_t, uint32_t>,
+             std::unique_ptr<owned_layer_kv>> owned_kv_;
+    std::map<std::tuple<uint64_t, uint32_t, uint32_t>,
+             std::unique_ptr<owned_chunk_graph>> owned_graphs_;
+    uint64_t next_owned_uid_ = 1;
 };
 
 }  // namespace ggml_phone_npu_serial
