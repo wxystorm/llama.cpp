@@ -7301,6 +7301,34 @@ bool rpc_server::phone_owned_plan_register(
             built ? "NONE" : why.c_str());
         if (!built) { return false; }
     }
+    // Explicit precompile A/B. Prepared HTP graphs do not consume streamed
+    // activations yet: the proven PC Graph remains the only compute owner.
+    const char * precompile_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE");
+    const bool precompile_requested = precompile_env != nullptr &&
+        std::strcmp(precompile_env, "1") == 0;
+    if (precompile_requested) {
+        ggml_phone_npu_serial::full_region_executor::
+            local_htp_prepare_stats stats {};
+        std::string why;
+        const int64_t begin_us = ggml_time_us();
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        const bool precompiled = phone_npu_executor->prepare_owned_htp_graphs(
+            plan, why, stats);
+        GGML_LOG_INFO(
+            "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
+            " region=%u layer=%u chunks=%u graph_nodes=%zu"
+            " kv_bytes=%zu graph_storage_bytes=%zu"
+            " compile_ms=%.3f wall_ms=%.3f"
+            " mode=SHADOW_FIXED_STORAGE status=%s reason=%s\n",
+            plan.run_id, plan.region, plan.layer, stats.chunks,
+            stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
+            stats.precompile_ms,
+            (ggml_time_us() - begin_us) / 1000.0,
+            precompiled ? "PASS" : "FAIL",
+            precompiled ? "NONE" : why.c_str());
+        if (!precompiled) { return false; }
+    }
     // Shadow-only: avoid racing the existing Graph and NPU life cycle.
     std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
     if (!phone_owned_plans.add(plan, reason)) {
@@ -7313,12 +7341,14 @@ bool rpc_server::phone_owned_plan_register(
                   " p2c_run=%" PRIu64
                   " region=%u layer=%u chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
-                  " graph_mode=SHADOW_PC_BUILT local_builder=%s status=READY\n",
+                  " graph_mode=SHADOW_PC_BUILT local_builder=%s"
+                  " local_htp=%s status=READY\n",
                   plan.run_id, plan.p2c_run_id, plan.region,
                   plan.layer, ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
                   plan.position_base, plan.kv_capacity,
-                  local_builder_check ? "GRAPH_BUILT" : "OFF");
+                  local_builder_check ? "GRAPH_BUILT" : "OFF",
+                  precompile_requested ? "PRECOMPILED" : "OFF");
     return true;
 }
 
