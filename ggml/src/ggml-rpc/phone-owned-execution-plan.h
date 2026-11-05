@@ -96,7 +96,8 @@ inline bool validate(const region_plan & p, const char * & reason) {
     }
     if (!p.n_embd || p.n_embd > 65536 ||
             !p.n_heads || !p.n_heads_kv ||
-            p.n_heads_kv > p.n_heads || !p.head_dim ||
+            p.n_heads_kv > p.n_heads ||
+            p.n_heads % p.n_heads_kv != 0 || !p.head_dim ||
             p.head_dim > 512 || (p.head_dim & 1) != 0 ||
             p.n_embd % p.n_heads != 0 ||
             p.n_embd / p.n_heads != p.head_dim) {
