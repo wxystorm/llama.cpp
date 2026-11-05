@@ -76,7 +76,8 @@ inline bool validate(const plan & p, std::string & why) {
             p.n_head % p.n_head_kv != 0 ||
             p.head_dim == 0 || p.head_dim > 512 ||
             p.n_ff == 0 || p.n_ff > (1u << 18) ||
-            uint64_t(p.n_head) * p.head_dim != p.n_embd ||
+            uint64_t(p.n_head) * p.head_dim > (1u << 20) ||
+            uint64_t(p.n_head_kv) * p.head_dim > (1u << 20) ||
             !std::isfinite(p.rms_eps) || p.rms_eps <= 0.0f ||
             !std::isfinite(p.rope_base) || p.rope_base <= 0.0f ||
             !std::isfinite(p.rope_scale) || p.rope_scale <= 0.0f) {
