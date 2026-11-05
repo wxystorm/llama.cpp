@@ -7252,25 +7252,24 @@ bool rpc_server::phone_owned_qwen3_plan_register(
             }
         }
     }
+    const uint64_t registered_run = p.run_id;
+    const uint32_t registered_tokens = p.n_tokens;
+    const size_t registered_chunks = p.chunks.size();
     {
         std::lock_guard<std::mutex> lock(phone_owned_qwen3_mutex);
-        if (phone_owned_qwen3_plans.count(p.run_id) != 0 ||
+        if (phone_owned_qwen3_plans.count(registered_run) != 0 ||
                 phone_owned_qwen3_plans.size() >= 2) {
             return reject("DUPLICATE_OR_TOO_MANY_ACTIVE_PLANS");
         }
-        phone_owned_qwen3_plans.emplace(p.run_id, std::move(p));
+        phone_owned_qwen3_plans.emplace(registered_run, std::move(p));
     }
     GGML_LOG_INFO(
         "[PHONE_OWNED_QWEN3_PLAN] event=ACCEPT "
         "run=%" PRIu64 " layers=%zu chunks=%zu tokens=%u "
         "local_gguf=VERIFIED_SHAPES kv_owner=PLANNED "
         "graph_ready=0 mode=SHADOW_NO_EXEC status=PASS\n",
-        phone_owned_qwen3_plans.begin()->first,
-        visited_layers.size(), data.size() > 0 ?
-            (data.size() - 80 - 4 * size_t(
-                phone_owned_qwen3_plans.begin()->second.n_tokens)) / 20 :
-            0,
-        phone_owned_qwen3_plans.begin()->second.n_tokens);
+        registered_run, visited_layers.size(),
+        registered_chunks, registered_tokens);
     return true;
 }
 
