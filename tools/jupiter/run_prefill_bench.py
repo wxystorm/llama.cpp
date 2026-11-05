@@ -312,7 +312,7 @@ def main() -> int:
         # Only verification uses TRACE verbosity. It is not included in the
         # formal results and never enables per-stage synchronous profiling.
         for mode in args.modes:
-            if mode == "default" and not args.async_c2p:
+            if mode == "default" and not args.async_c2p and not args.graph_prebuild:
                 continue
             wanted = plans[target] if mode == "dp" else fixed
             check_log = out / f"verify-{mode}.log"
@@ -345,6 +345,20 @@ def main() -> int:
                     f"{mode} did not execute the asynchronous C2P path; "
                     f"inspect {check_log}"
                 )
+            if args.graph_prebuild:
+                prep = re.findall(
+                    r"\[JUPITER_GRAPH_PREBUILD\] phase=PREPARE "
+                    r"planned=(\d+) ready=(\d+).*status=READY", text,
+                )
+                hits = text.count("status=HIT")
+                registered = "[JUPITER_GRAPH_PREBUILD] phase=PHONE_REGISTER" in text
+                if not prep or not registered or hits < int(prep[-1][1]):
+                    raise RuntimeError(
+                        f"{mode}: graph prebuild did not cover all planned chunks; "
+                        f"prepared={prep[-1] if prep else None}, "
+                        f"hits={hits}, phone_registered={registered}; "
+                        f"inspect {check_log}"
+                    )
             verified_chunks = (
                 "DEFAULT_RUNTIME" if mode == "default"
                 else ",".join(map(str, wanted))
