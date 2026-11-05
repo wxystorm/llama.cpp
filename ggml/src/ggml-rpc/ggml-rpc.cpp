@@ -7691,7 +7691,11 @@ void rpc_server::phone_auto_prepare_loop() {
             task->prepare_done_us = ggml_time_us();
             {
                 std::lock_guard<std::mutex> lock(phone_auto_mutex);
-                task->state = phone_auto_status::PREPARED;
+                // The background HTP preload may have failed while INPUT
+                // APPLY was running. Do not resurrect a failed job.
+                if (task->state != phone_auto_status::FAILED) {
+                    task->state = phone_auto_status::PREPARED;
+                }
             }
             phone_auto_cv.notify_all();
             continue;
@@ -7731,7 +7735,9 @@ void rpc_server::phone_auto_prepare_loop() {
         {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
             if (phone_auto_stop) { return; }
-            if (failed_prepare) {
+            if (task->state == phone_auto_status::FAILED) {
+                // Preserve a terminal failure set by another worker.
+            } else if (failed_prepare) {
                 task->state = phone_auto_status::FAILED;
             } else if (prepared) {
                 task->prepared = std::move(prepared);
