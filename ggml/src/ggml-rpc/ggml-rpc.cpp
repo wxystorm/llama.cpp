@@ -7314,11 +7314,11 @@ bool rpc_server::phone_owned_plan_register(
                   " region=%u layer=%u chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
                   " graph_mode=SHADOW_PC_BUILT local_builder=%s status=READY\n",
-                  local_builder_check ? "GRAPH_BUILT" : "OFF",
                   plan.run_id, plan.p2c_run_id, plan.region,
                   plan.layer, ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
-                  plan.position_base, plan.kv_capacity);
+                  plan.position_base, plan.kv_capacity,
+                  local_builder_check ? "GRAPH_BUILT" : "OFF");
     return true;
 }
 
