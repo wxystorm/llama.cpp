@@ -81,6 +81,11 @@ class PrefillBenchTests(unittest.TestCase):
         self.assertNotIn("LLAMA_JUPITER_SEQUENCE_PLAN", dp)
         self.assertEqual(dp["LLAMA_JUPITER_PROFILE_STAGE"], "0")
 
+        reuse_base = dict(base, LLAMA_JUPITER_LOCAL_GRAPH_REUSE="1")
+        for mode in ("default", "fixed64", "dp"):
+            reused = env_for_mode(reuse_base, mode, plan, chunks)
+            self.assertEqual(reused["LLAMA_JUPITER_LOCAL_GRAPH_REUSE"], "1")
+
     def test_opt_in_async_c2p_flag_is_disabled_by_default(self) -> None:
         common = [
             "--exe", "cli.exe", "--model", "test.gguf",
@@ -88,6 +93,8 @@ class PrefillBenchTests(unittest.TestCase):
         ]
         self.assertFalse(parser().parse_args(common).async_c2p)
         self.assertTrue(parser().parse_args(common + ["--async-c2p"]).async_c2p)
+        self.assertFalse(parser().parse_args(common).local_graph_reuse)
+        self.assertTrue(parser().parse_args(common + ["--local-graph-reuse"]).local_graph_reuse)
         self.assertFalse(parser().parse_args(common).comm_timing)
         self.assertTrue(parser().parse_args(common + ["--comm-timing"]).comm_timing)
 
