@@ -5832,6 +5832,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 if (phone_graph_thread.worker.joinable()) {
                     phone_graph_thread.worker.join();
                 }
+                if (phone_input_stream_enabled) {
+                    (void) phone_input_stream_run(
+                        phone_rpc_backend, phone_input_push_run_id, false);
+                }
                 if (phone_stream_handle != nullptr) {
                     (void) phone_stream_stop(phone_rpc_backend, phone_stream_handle);
                     phone_stream_handle = nullptr;
@@ -6196,6 +6200,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 ready.cancel();
                 if (phone_graph_thread.worker.joinable()) {
                     phone_graph_thread.worker.join();
+                }
+                if (phone_input_stream_enabled) {
+                    (void) phone_input_stream_run(
+                        phone_rpc_backend, phone_input_push_run_id, false);
                 }
                 if (phone_stream_handle != nullptr) {
                     (void) phone_stream_stop(phone_rpc_backend, phone_stream_handle);
