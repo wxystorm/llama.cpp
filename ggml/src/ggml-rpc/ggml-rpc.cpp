@@ -1,5 +1,8 @@
 #include "ggml-rpc.h"
 #include "ggml-opencl.h"
+#if defined(GGML_RPC_WITH_HEXAGON)
+#include "ggml-hexagon.h"
+#endif
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
@@ -5655,11 +5658,33 @@ public:
                 throw std::runtime_error(
                     "Serial NPU requires the visible backend to be GPUOpenCL");
             }
-            ggml_backend_dev_t htp =
-                ggml_backend_dev_by_name("HTP0");
+            ggml_backend_dev_t htp = nullptr;
+#if defined(GGML_RPC_WITH_HEXAGON)
+            // ggml-rpc is linked only with ggml-base; the global device
+            // registry ggml_backend_dev_by_name() lives in libggml.so.
+            // Query the explicitly linked Hexagon registry instead, avoiding
+            // a circular ggml <-> ggml-rpc link dependency.
+            if (ggml_backend_reg_t hexagon_reg =
+                    ggml_backend_hexagon_reg()) {
+                const size_t n_htp =
+                    ggml_backend_reg_dev_count(hexagon_reg);
+                for (size_t i = 0; i < n_htp; ++i) {
+                    ggml_backend_dev_t candidate =
+                        ggml_backend_reg_dev_get(hexagon_reg, i);
+                    const char * name =
+                        ggml_backend_dev_name(candidate);
+                    if (name != nullptr &&
+                            std::strcmp(name, "HTP0") == 0) {
+                        htp = candidate;
+                        break;
+                    }
+                }
+            }
+#endif
             if (htp == nullptr) {
                 throw std::runtime_error(
-                    "Serial NPU requested but HTP0 is not available");
+                    "Serial NPU requested but HTP0 is not available "
+                    "(requires Android build with GGML_HEXAGON=ON)");
             }
             phone_npu_backend.reset(
                 ggml_backend_dev_init(htp, nullptr));
