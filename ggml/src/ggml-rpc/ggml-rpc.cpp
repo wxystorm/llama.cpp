@@ -5807,6 +5807,7 @@ public:
     bool buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response);
     bool free_buffer(const rpc_msg_free_buffer_req & request);
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
+    struct phone_chunk_input_timing;
     bool phone_input_push(const std::vector<uint8_t> & input,
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
