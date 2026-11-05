@@ -1345,6 +1345,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     if (jupiter_graph_prebuilt) {
         ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         const int64_t jupiter_alloc_begin_us = jupiter_timeline ? ggml_time_us() : 0;
         const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
         if (jupiter_timeline) {
