@@ -538,6 +538,9 @@ public:
             ggml_backend_tensor_set(
                 item->built.mask, side.causal_mask_f16.data(), 0,
                 side.causal_mask_f16.size() * sizeof(uint16_t));
+            // Ensure fixed-position/mask bytes are visible to any backend
+            // compile-time specialization before registering this graph.
+            ggml_backend_synchronize(backend_);
             bool supported = true;
             for (int i = 0; i < item->built.graph->n_nodes; ++i) {
                 if (!ggml_backend_supports_op(
