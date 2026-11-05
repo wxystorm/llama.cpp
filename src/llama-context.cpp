@@ -2273,6 +2273,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // Debug-only correctness oracle for an A/B prebuild comparison.
+    // The extra synchronization is deliberately excluded from formal timings.
+    if (const char * hash_env = getenv("LLAMA_JUPITER_LOGITS_HASH")) {
+        if (llama_jupiter::enabled() && atoi(hash_env) != 0 &&
+            n_outputs_all > 0 && logits.data && n_vocab > 0) {
+            synchronize();
+            const float * row = logits.data + (size_t) (n_outputs_all - 1) * n_vocab;
+            const uint8_t * bytes = reinterpret_cast<const uint8_t *>(row);
+            const size_t nbytes = (size_t) n_vocab * sizeof(float);
+            uint64_t digest = 14695981039346656037ULL; // FNV-1a
+            for (size_t i = 0; i < nbytes; ++i) {
+                digest = (digest ^ bytes[i]) * 1099511628211ULL;
+            }
+            int64_t top1 = 0;
+            for (int64_t i = 1; i < n_vocab; ++i) {
+                if (row[i] > row[top1]) {
+                    top1 = i;
+                }
+            }
+            LLAMA_LOG_INFO("[JUPITER_LOGITS_HASH] tokens=%u outputs=%u "
+                           "top1_id=%lld top1_logit=%.7g digest=%016" PRIx64 "\n",
+                           n_tokens_all, n_outputs_all,
+                           (long long) top1, row[top1], digest);
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
