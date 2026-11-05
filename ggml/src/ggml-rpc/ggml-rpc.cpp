@@ -296,6 +296,11 @@ struct ggml_backend_rpc_context {
     uint32_t    device;
     std::string name;
     std::unique_ptr<jupiter_rpc_comm_worker> comm;
+    // Legacy Jupiter must keep GRAPH and SYNC on the same ordered TCP stream.
+    // The global lane cache holds weak_ptrs only, so it cannot own the socket.
+    std::string legacy_compute_lane;
+    socket_ptr legacy_compute_sock;
+    std::mutex legacy_compute_mutex;
 };
 
 struct ggml_backend_rpc_event_context {
@@ -305,6 +310,7 @@ struct ggml_backend_rpc_event_context {
 };
 
 static std::atomic<uint64_t> g_jupiter_event_id {1};
+static std::atomic<uint64_t> g_jupiter_legacy_compute_lane_id {1};
 
 struct ggml_backend_rpc_buffer_context {
     std::shared_ptr<socket_t> sock;
@@ -506,6 +512,31 @@ static std::shared_ptr<socket_t> get_socket_lane(const std::string & endpoint, c
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     return get_socket_lane(endpoint, "control");
+}
+
+// The caller must hold legacy_compute_mutex. Keep a strong reference for
+// the entire RPC backend lifetime: a SYNC sent on a fresh TCP connection
+// cannot fence a GRAPH submitted on another connection.
+static socket_ptr jupiter_legacy_compute_socket(ggml_backend_rpc_context * ctx) {
+    if (!ctx->legacy_compute_sock) {
+        GGML_ASSERT(!ctx->legacy_compute_lane.empty());
+        ctx->legacy_compute_sock = get_socket_lane(
+            ctx->endpoint, ctx->legacy_compute_lane.c_str());
+    }
+    return ctx->legacy_compute_sock;
+}
+
+// Serialize GRAPH and event-record commands with the legacy SYNC command.
+// Non-Jupiter RPC retains its existing control-channel behavior.
+static bool send_rpc_compute_cmd(ggml_backend_rpc_context * ctx, enum rpc_cmd cmd,
+                                 const void * input, size_t input_size) {
+    if (!jupiter_prefill_enabled()) {
+        auto sock = get_socket(ctx->endpoint);
+        return sock && send_rpc_cmd(sock, cmd, input, input_size);
+    }
+    std::lock_guard<std::mutex> lock(ctx->legacy_compute_mutex);
+    auto sock = jupiter_legacy_compute_socket(ctx);
+    return sock && send_rpc_cmd(sock, cmd, input, input_size);
 }
 
 static std::atomic<uint64_t> g_jupiter_comm_worker_id {1};
@@ -1309,9 +1340,21 @@ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
         RPC_STATUS_ASSERT(ok);
         return;
     }
-    auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
+    const bool timing = jupiter_timeline_enabled();
+    const int64_t t0 = timing ? ggml_time_us() : 0;
+    std::lock_guard<std::mutex> lock(rpc_ctx->legacy_compute_mutex);
+    auto sock = jupiter_legacy_compute_socket(rpc_ctx);
     rpc_msg_jupiter_rsp response {};
-    const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_SYNC, nullptr, 0, &response, sizeof(response));
+    const bool status = sock && send_rpc_cmd(
+        sock, RPC_CMD_JUPITER_SYNC, nullptr, 0, &response, sizeof(response));
+    if (timing) {
+        const int64_t t1 = ggml_time_us();
+        GGML_LOG_INFO(
+            "[JUPITER_REMOTE_SYNC] reason=LEGACY_BACKEND wait_ms=%.3f "
+            "t_us=%" PRId64 " status=%s\n",
+            (t1 - t0)/1000.0, t1,
+            status && response.ok == 1 ? "OK" : "FAIL");
+    }
     RPC_STATUS_ASSERT(status && response.ok == 1);
 }
 
@@ -1629,10 +1672,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
         request.graph_uid = graph_uid;
-        auto sock = jupiter_prefill_enabled()
-                ? get_socket_lane(rpc_ctx->endpoint, "compute")
-                : get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+        bool status = send_rpc_compute_cmd(
+            rpc_ctx, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
         GGML_LOG_INFO(
             "[RPC_GRAPH] endpoint=%s device=%u graph=%p uid=%" PRIu64
             " nodes=%d tensors=reused bytes=%zu cmd=GRAPH_RECOMPUTE\n",
@@ -1647,10 +1688,8 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
         rpc_dev_ctx->graph_uids.insert(graph_uid);
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, graph_uid, cgraph, input);
-        auto sock = jupiter_prefill_enabled()
-                ? get_socket_lane(rpc_ctx->endpoint, "compute")
-                : get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+        bool status = send_rpc_compute_cmd(
+            rpc_ctx, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
         uint32_t n_tensors = 0;
         const size_t n_tensors_offset = 2*sizeof(uint32_t) + sizeof(uint64_t) + (size_t) cgraph->n_nodes*sizeof(uint64_t);
         if (input.size() >= n_tensors_offset + sizeof(n_tensors)) {
@@ -1692,8 +1731,8 @@ static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_e
         }
         return;
     }
-    auto sock = get_socket_lane(rpc_ctx->endpoint, "compute");
-    const bool status = send_rpc_cmd(sock, RPC_CMD_JUPITER_EVENT_RECORD, &request, sizeof(request));
+    const bool status = send_rpc_compute_cmd(
+        rpc_ctx, RPC_CMD_JUPITER_EVENT_RECORD, &request, sizeof(request));
     RPC_STATUS_ASSERT(status);
 
     if (jupiter_trace_enabled()) {
@@ -1797,6 +1836,10 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
         /* .device         = */ device,
         /* .name           = */ dev_name,
     };
+    if (jupiter_prefill_enabled() && !jupiter_async_c2p_enabled()) {
+        ctx->legacy_compute_lane = "jupiter-legacy-compute-" +
+                std::to_string(g_jupiter_legacy_compute_lane_id.fetch_add(1));
+    }
     if (jupiter_async_c2p_enabled()) {
         ctx->comm = std::make_unique<jupiter_rpc_comm_worker>(ctx->endpoint);
         jupiter_comm_registry_add(ctx->endpoint, ctx->comm.get());
