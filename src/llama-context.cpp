@@ -5488,6 +5488,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_stream_requested && has_phone_full_return ?
                 next_phone_stream_run_id.fetch_add(
                     1, std::memory_order_relaxed) : 0;
+        ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
         if (phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
             auto * rpc_reg = rpc_dev != nullptr ?
@@ -5499,9 +5500,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 nullptr;
             // Patch26 registration performs the capability check before any
             // output-bound task is admitted. No runtime WAIT RPC remains.
+            phone_auto_register_task = register_task;
             bool bound = register_task != nullptr &&
                 phone_stream_run_id != 0;
-            if (bound) {
+            if (bound && !phone_async_graph_setup) {
                 for (const auto & item : phone_auto_templates) {
                     if (!register_task(
                             phone_rpc_backend, phone_input_push_run_id,
@@ -5529,9 +5531,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 return nullptr;
             }
             LLAMA_LOG_INFO(
-                "[PHONE_AUTO] event=SESSION_READY run=%" PRIu64
+                "[PHONE_AUTO] event=%s run=%" PRIu64
                 " graphs=%zu two_slot=ON trigger=VERIFIED_PUSH "
                 "status=READY\n",
+                phone_async_graph_setup ? "SESSION_PREPARING" : "SESSION_READY",
                 phone_input_push_run_id, phone_auto_templates.size());
         }
         if (phone_input_push_requested) {
@@ -5673,6 +5676,90 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[PHONE_AUTO_P2C] event=PREBIND p2c_run=%" PRIu64
                 " outputs=%zu policy=REGISTER_BEFORE_PUSH status=READY\n",
                 phone_stream_session.run_id, phone_stream_session.pending.size());
+        }
+
+        // The P2C receiver's full destination map is already fixed here.
+        // Build/register one Phone graph per Chunk on a dedicated thread;
+        // publish readiness only after Phone TASK_REGISTER returns successfully.
+        // This owner joins on every early-return and normal exit path.
+        struct phone_auto_graph_thread_owner {
+            std::thread worker;
+            ~phone_auto_graph_thread_owner() {
+                if (worker.joinable()) { worker.join(); }
+            }
+        } phone_graph_thread;
+        if (phone_async_graph_setup) {
+            auto background_build = [&]() {
+                const int64_t begin_us = ggml_time_us();
+                bool ok = false;
+                try {
+                    const auto bind_and_publish =
+                        [&](const phone_auto_template & item) -> bool {
+                        const bool bound = phone_auto_register_task != nullptr &&
+                            phone_auto_register_task(
+                                phone_rpc_backend, phone_input_push_run_id,
+                                (uint32_t) item.region, (uint32_t) item.chunk,
+                                item.graph_uid,
+                                (size_t) item.tokens * (size_t) n_embd * sizeof(float),
+                                phone_stream_run_id, item.token_begin, item.tokens,
+                                (size_t) item.tokens * (size_t) n_embd * sizeof(float));
+                        if (!bound) {
+                            LLAMA_LOG_ERROR(
+                                "[PHONE_AUTO_GRAPH_ASYNC] event=BIND_FAIL "
+                                "region=%zu chunk=%zu uid=%" PRIu64 "\n",
+                                item.region, item.chunk, item.graph_uid);
+                            return false;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(phone_graph_ready_mutex);
+                            phone_graph_ready[item.region][item.chunk] = 1;
+                        }
+                        phone_graph_ready_cv.notify_all();
+                        LLAMA_LOG_INFO(
+                            "[PHONE_AUTO_GRAPH_ASYNC] event=CHUNK_READY "
+                            "region=%zu chunk=%zu uid=%" PRIu64
+                            " elapsed_ms=%.3f status=READY\n",
+                            item.region, item.chunk, item.graph_uid,
+                            (ggml_time_us() - begin_us) / 1000.0);
+                        return true;
+                    };
+                    ok = build_phone_auto_graphs(bind_and_publish);
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO_GRAPH_ASYNC] event=EXCEPTION reason=%s\n",
+                        e.what());
+                } catch (...) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_AUTO_GRAPH_ASYNC] event=EXCEPTION reason=UNKNOWN\n");
+                }
+                if (!ok) {
+                    phone_graph_build_failed.store(true, std::memory_order_release);
+                    ready.cancel();
+                }
+                phone_graph_ready_cv.notify_all();
+                LLAMA_LOG_INFO(
+                    "[PHONE_AUTO_GRAPH_ASYNC] event=DONE count=%zu "
+                    "wall_ms=%.3f status=%s\n",
+                    phone_auto_templates.size(),
+                    (ggml_time_us() - begin_us) / 1000.0,
+                    ok ? "PASS" : "FAIL");
+            };
+            try {
+                phone_graph_thread.worker = std::thread(background_build);
+            } catch (...) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_AUTO_GRAPH_ASYNC] event=LAUNCH_FAIL status=FAIL\n");
+                ready.cancel();
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                if (phone_stream_handle != nullptr) {
+                    (void) phone_stream_stop(
+                        phone_rpc_backend, phone_stream_handle);
+                    phone_stream_handle = nullptr;
+                }
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
         }
 
         const std::array<llama_region_ring_device, 3> devices = {
@@ -6084,6 +6171,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "status=FAIL\n");
             }
             if (!gpu_bank_mover_started) {
+                ready.cancel();
+                if (phone_graph_thread.worker.joinable()) {
+                    phone_graph_thread.worker.join();
+                }
                 if (phone_stream_handle != nullptr) {
                     (void) phone_stream_stop(phone_rpc_backend, phone_stream_handle);
                     phone_stream_handle = nullptr;
@@ -6278,6 +6369,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             job.chunk >= phone_push_state[job.region].size()) {
                         throw std::runtime_error("invalid Phone push input interval");
                     }
+                    if (phone_auto_enabled &&
+                            !wait_phone_graph_bound(job.region, job.chunk)) {
+                        throw std::runtime_error(
+                            "Phone graph not bound before input PUSH");
+                    }
                     const size_t bytes = (size_t) job.n_tokens *
                         (size_t) n_embd * sizeof(float);
                     const void * source =
@@ -6448,6 +6544,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             dev == (size_t) llama_region_ring_device::PHONE &&
                             stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
                             (!last || phone_auto_final_enabled)) {
+                        if (!wait_phone_graph_bound(task.region, task.chunk)) {
+                            throw std::runtime_error(
+                                "Phone worker claimed an unregistered graph");
+                        }
                         const auto it = std::find_if(
                             phone_auto_templates.begin(),
                             phone_auto_templates.end(),
@@ -7561,6 +7661,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         if (phone_push_thread.joinable()) {
             phone_push_thread.join();
+        }
+        if (phone_graph_thread.worker.joinable()) {
+            phone_graph_thread.worker.join();
+        }
+        if (phone_graph_build_failed.load(std::memory_order_acquire)) {
+            ready.cancel();
+            ret = GGML_STATUS_FAILED;
         }
         // END is a once-per-run control message. No per-Chunk success ACK.
         // On failure, release queued host bytes as well as the run marker.
