@@ -1926,6 +1926,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         n_outputs += (uint32_t) (sub.output[j] != 0);
                     }
                 }
+                // model.build_graph may assign per-node backend preferences.
+                // Isolate each metadata template from the previous preview.
+                ggml_backend_sched_reset(sched.get());
                 auto prepared = std::make_unique<llm_graph_result>(gf_res_prev->get_max_nodes());
                 const auto params = graph_params(prepared.get(), sub, snapshot.get(),
                         ctx_type_to_graph_type(cparams.ctx_type));
