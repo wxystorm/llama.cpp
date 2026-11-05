@@ -7869,12 +7869,25 @@ void rpc_server::phone_auto_compute_loop() {
         // L39. Wait for HTP without retaining the Graph registry lock.
         const bool npu_task = ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, req.key.region);
+        const char * stage_profile_env =
+            std::getenv("GGML_RPC_PHONE_NPU_STAGE_PROFILE");
+        const bool stage_profile_enabled = npu_task &&
+            stage_profile_env != nullptr &&
+            std::strcmp(stage_profile_env, "1") == 0;
+        const int64_t htp_lock_begin_us =
+            stage_profile_enabled ? ggml_time_us() : 0;
         std::unique_lock<std::mutex> htp_guard(
             phone_npu_backend_mutex, std::defer_lock);
         if (npu_task) { htp_guard.lock(); }
+        const double htp_lock_wait_ms = stage_profile_enabled ?
+            (ggml_time_us() - htp_lock_begin_us) / 1000.0 : 0.0;
+        const int64_t graph_lock_begin_us =
+            stage_profile_enabled ? ggml_time_us() : 0;
         {
             std::lock_guard<std::recursive_mutex> graph_guard(
                 graph_compute_mutex);
+            const double graph_lock_wait_ms = stage_profile_enabled ?
+                (ggml_time_us() - graph_lock_begin_us) / 1000.0 : 0.0;
             const auto it = stored_graphs[req.device].find(req.graph_uid);
             if (it != stored_graphs[req.device].end() &&
                     it->second.graph != nullptr &&
@@ -7894,11 +7907,20 @@ void rpc_server::phone_auto_compute_loop() {
                 double stage_ms = 0.0;
                 double htp_ms = 0.0;
                 double return_ms = 0.0;
+                ggml_phone_npu_serial::full_region_executor::
+                    stage_profile_stats stage_profile {};
+                double opencl_sync_ms = 0.0;
                 // INPUT_APPLY may enqueue an asynchronous OpenCL write.
                 // The HTP mirror must not read it until that queue has
                 // completed. This is a required cross-device fence.
                 if (outputs == 1 && output != nullptr) {
+                    const int64_t sync_begin_us =
+                        stage_profile_enabled ? ggml_time_us() : 0;
                     ggml_backend_synchronize(backends[req.device]);
+                    if (stage_profile_enabled) {
+                        opencl_sync_ms =
+                            (ggml_time_us() - sync_begin_us) / 1000.0;
+                    }
                 }
                 bool ok = false;
                 if (outputs == 1 && output != nullptr &&
@@ -7906,11 +7928,45 @@ void rpc_server::phone_auto_compute_loop() {
                     // htp_guard was acquired before graph_compute_mutex.
                     ok = phone_npu_executor->run(
                         it->second.graph, output, why,
-                        stage_ms, htp_ms, return_ms);
+                        stage_ms, htp_ms, return_ms,
+                        stage_profile_enabled ? &stage_profile : nullptr);
                 }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
                 if (!ok && why.empty()) {
                     why = "HTP_OUTPUT_NOT_UNIQUE";
+                }
+                if (stage_profile_enabled) {
+                    GGML_LOG_INFO(
+                        "[PHONE_NPU_SERIAL] event=STAGE_PROFILE run=%" PRIu64
+                        " region=%u layer=%d chunk=%u uid=%" PRIu64
+                        " htp_lock_wait_ms=%.3f graph_lock_wait_ms=%.3f"
+                        " opencl_sync_ms=%.3f context_create_ms=%.3f"
+                        " graph_mirror_ms=%.3f persistent_bind_ms=%.3f"
+                        " weight_bind_ms=%.3f kv_bind_ms=%.3f"
+                        " temporary_alloc_ms=%.3f input_copy_ms=%.3f"
+                        " op_check_ms=%.3f other_ms=%.3f"
+                        " graph_nodes=%zu input_tensors=%zu"
+                        " kv_new=%zu kv_reused=%zu"
+                        " stage_total_ms=%.3f status=%s reason=%s\n",
+                        req.key.run_id, req.key.region,
+                        phone_npu_region_layer.count(req.key.region) ?
+                            phone_npu_region_layer.at(req.key.region) : -1,
+                        req.key.chunk, req.graph_uid,
+                        htp_lock_wait_ms, graph_lock_wait_ms, opencl_sync_ms,
+                        stage_profile.context_create_ms,
+                        stage_profile.graph_mirror_ms,
+                        stage_profile.persistent_bind_ms,
+                        stage_profile.weight_bind_ms,
+                        stage_profile.kv_bind_ms,
+                        stage_profile.temporary_alloc_ms,
+                        stage_profile.input_copy_ms,
+                        stage_profile.op_check_ms,
+                        stage_profile.other_ms,
+                        stage_profile.graph_nodes,
+                        stage_profile.input_tensors,
+                        stage_profile.kv_new, stage_profile.kv_reused,
+                        stage_ms, ok ? "PASS" : "FAIL",
+                        ok ? "NONE" : why.c_str());
                 }
                 GGML_LOG_INFO(
                     "[PHONE_NPU_SERIAL] event=EXECUTE run=%" PRIu64
