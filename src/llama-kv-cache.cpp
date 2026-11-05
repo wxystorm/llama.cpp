@@ -859,6 +859,9 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // now emplace the ubatch
         apply_ubatch(sinfo_new, ubatch);
+        // Capture the padded attention span while the tentative KV state
+        // includes this ubatch. The prepare() rollback below remains intact.
+        res.back().prebuild_n_kv = get_n_kv(sinfo_new);
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -2634,6 +2637,24 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+size_t llama_kv_cache_context::prebuild_batch_count() const {
+    return status == LLAMA_MEMORY_STATUS_SUCCESS ? ubatches.size() : 0;
+}
+
+std::unique_ptr<llama_kv_cache_context> llama_kv_cache_context::prebuild_batch_snapshot(size_t index) const {
+    if (status != LLAMA_MEMORY_STATUS_SUCCESS || index >= ubatches.size() ||
+        index >= sinfos.size() || sinfos[index].prebuild_n_kv == 0) {
+        return nullptr;
+    }
+
+    // Share the owned ubatch backing storage but copy slot metadata. This
+    // context is used for topology only: never call apply() on this snapshot.
+    auto snapshot = std::make_unique<llama_kv_cache_context>(
+        kv, slot_info_vec_t { sinfos[index] }, std::vector<llama_ubatch> { ubatches[index] });
+    snapshot->n_kv = sinfos[index].prebuild_n_kv;
+    return snapshot;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
