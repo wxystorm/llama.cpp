@@ -5514,6 +5514,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool owned_plan_requested =
             owned_plan_env != nullptr &&
             std::strcmp(owned_plan_env, "1") == 0;
+        // Tiny warmup/decode keeps the normal path. A real prefill that
+        // explicitly requests Plan shadow must never silently skip it.
+        if (owned_plan_requested && ubatch.n_tokens >= 32 &&
+                !phone_auto_enabled) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_OWNED_PLAN] side=pc event=REJECT "
+                "reason=PHONE_AUTO_STREAM_REQUIRED status=FAIL\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
         if (owned_plan_requested && phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
             auto * rpc_reg = rpc_dev != nullptr ?
