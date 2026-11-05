@@ -6968,6 +6968,9 @@ bool rpc_server::phone_input_stream_run(
                 "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
                 " bytes=%zu status=PASS\n",
                 request.run_id, kv_bytes);
+            // The optional Phone-owned Graphs have not executed in this
+            // phase; reclaim their fixed buffers after all legacy work.
+            phone_npu_executor->release_owned_htp_graphs();
         }
     }
     phone_input_stream_profile report {};
