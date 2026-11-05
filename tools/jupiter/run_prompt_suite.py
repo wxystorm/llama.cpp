@@ -181,6 +181,7 @@ def probe_tokens(
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_Q_SWEEP": "1",
         "LLAMA_JUPITER_ASYNC_C2P": "0",
+        "LLAMA_JUPITER_GRAPH_PREBUILD": "0",
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
     })
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
