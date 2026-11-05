@@ -14,6 +14,7 @@
 #include "phone-autonomous-policy.h"
 #include "phone-npu-serial-policy.h"
 #include "phone-npu-serial-executor.h"
+#include "phone-owned-qwen3-plan.h"
 
 #include <array>
 #include <chrono>
@@ -362,6 +363,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_TASK_REGISTER,
     RPC_CMD_PHONE_AUTO_WAIT,
     RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
+    RPC_CMD_PHONE_OWNED_QWEN3_PLAN,
     RPC_CMD_COUNT,
 };
 
@@ -399,6 +401,7 @@ static_assert(RPC_CMD_PHONE_AUTO_GRAPH_REGISTER == 49, "RPC_CMD_PHONE_AUTO_GRAPH
 static_assert(RPC_CMD_PHONE_AUTO_TASK_REGISTER == 50, "RPC_CMD_PHONE_AUTO_TASK_REGISTER index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
+static_assert(RPC_CMD_PHONE_OWNED_QWEN3_PLAN == 53, "RPC_CMD_PHONE_OWNED_QWEN3_PLAN index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -4224,6 +4227,29 @@ static bool ggml_backend_rpc_phone_auto_graph_register(
     return ok;
 }
 
+// Metadata-only registration in patch27. The Phone validates the exact
+// arbitrary-width Qwen3 plan and its local layer weights but MUST NOT
+// pretend that a locally generated HTP Graph is compiled or ready.
+static bool ggml_backend_rpc_phone_owned_qwen3_plan(
+        ggml_backend_t backend, const uint8_t * data, size_t size) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            data == nullptr || size == 0 ||
+            size > ggml_phone_owned_qwen3::max_wire_bytes) {
+        return false;
+    }
+    const auto * ctx =
+        static_cast<const ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock ||
+            rpc_get_remote_patch(ctx->endpoint + "_compute") < 27) {
+        return false;
+    }
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_QWEN3_PLAN,
+        data, size, &rsp, sizeof(rsp)) && rsp.accepted != 0;
+}
+
 static bool ggml_backend_rpc_phone_auto_task_register(
         ggml_backend_t backend, uint64_t run_id, uint32_t region,
         uint32_t chunk, uint64_t graph_uid, size_t expected_input_bytes,
@@ -5813,6 +5839,7 @@ public:
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
+    bool phone_owned_qwen3_plan_register(const std::vector<uint8_t> & data);
     bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
     bool phone_auto_wait_capture(
         const rpc_msg_phone_auto_wait_capture_req & request,
@@ -6263,6 +6290,11 @@ private:
     std::mutex snapshot_breakdown_mutex;
     //新加的
     ggml_rpc_local_tensor_source local_tensor_source {};
+
+    // Shadow-only Plan store. Never used as an execution/GRAPH_READY signal.
+    std::mutex phone_owned_qwen3_mutex;
+    std::unordered_map<uint64_t, ggml_phone_owned_qwen3::plan>
+        phone_owned_qwen3_plans;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -13340,6 +13372,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_OWNED_QWEN3_PLAN: {
+                std::vector<uint8_t> payload;
+                if (!recv_msg(sock, payload)) { return; }
+                rpc_msg_phone_input_ack rsp {};
+                rsp.accepted =
+                    server.phone_owned_qwen3_plan_register(payload) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
                 rpc_msg_phone_auto_task_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -13784,6 +13825,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 response.accepted =
                     server.graph_compute(graph, true) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_QWEN3_PLAN: {
+                std::vector<uint8_t> payload;
+                if (!recv_msg(sock, payload)) { return; }
+                rpc_msg_phone_input_ack rsp {};
+                rsp.accepted =
+                    server.phone_owned_qwen3_plan_register(payload) ? 1 : 0;
+                if (!send_msg(sock, &rsp, sizeof(rsp))) { return; }
                 break;
             }
             case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
@@ -14916,6 +14966,11 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_graph_register);
+    }
+    if (std::strcmp(
+            name, GGML_BACKEND_RPC_PHONE_OWNED_QWEN3_PLAN_PROC) == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_rpc_phone_owned_qwen3_plan);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_task_register);
