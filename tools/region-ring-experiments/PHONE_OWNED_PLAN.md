@@ -18,8 +18,12 @@ Phone without changing the currently working PC-built Graph execution path.
   from the immutable plan. No PC-supplied attention mask is required in this
   **fresh single-sequence prefill** subset.
 - An optional Phone-side check creates one local graph per exact Chunk shape
-  and checks the generated graph's operator counts. This **does not** bind HTP
-  buffers, compile HTP kernels or execute the new graphs yet.
+  and verifies operator counts without HTP allocations.
+- A **separate opt-in** HTP prepare step allocates persistent Phone-owned
+  KV and fixed input/side-input/output buffers, fills positions/masks locally,
+  and precompiles every local Chunk graph via the Hexagon fixed-graph API.
+  It still does **not execute** these graphs or publish their results; the
+  existing PC-built Graph path remains the only live execution path.
 
 ## Strict first-slice restrictions
 
@@ -44,6 +48,8 @@ Phone environment, shown for a four-Region layout with Phone Layers
 export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7
 export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=9,19,29,39
 export GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW=1
+# Additional memory/time-intensive HTP precompile smoke only:
+# export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
 ```
 
 PC environment (in addition to existing autonomous, input PUSH stream, and
@@ -62,11 +68,17 @@ Expected new Phone log:
 
 ```
 [PHONE_QWEN3_LOCAL] event=GRAPH_BUILD ... mode=SHADOW_NO_HTP_ALLOC status=PASS
+# Only with GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1:
+[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE ... mode=SHADOW_FIXED_STORAGE status=PASS
 [PHONE_OWNED_PLAN] event=REGISTER ... graph_mode=SHADOW_PC_BUILT local_builder=GRAPH_BUILT status=READY
 ```
 
-These messages indicate **local graph construction validated**, not local HTP
-compilation or numerical parity. The legacy graph continues to execute.
+The GRAPH_BUILD message indicates **local graph construction validated**.
+The optional HTP_PRECOMPILE message indicates backend allocation and graph
+precompilation, **not** numerical parity or local compute execution.
+Both modes retain the original PC-built Graph as the only compute owner.
+Precompilation currently occurs synchronously during plan registration and
+is therefore intentionally not a performance optimization yet.
 
 ## Model-free unit tests
 
@@ -82,12 +94,12 @@ presence of two `SET_ROWS`, two RoPE nodes, one Flash Attention and one SwiGLU.
 
 ## Remaining work before runtime cutover
 
-1. Allocate independent, persistent HTP KV per assigned Layer and bind
-   each predeclared Chunk graph to stable input/output/side-input storage.
-2. Precompile HTP graphs, prepare next input without overwriting in-flight
-   slots, and add a Graph READY barrier to the Phone-side scheduler.
-3. Let the input PUSH trigger the Phone-local graph directly, then publish
-   its output to P2C without looking up the old RPC-registered Graph.
+1. Validate HTP precompilation on the real Phone and establish a
+   Graph READY barrier, then move compilation off the synchronous RPC path.
+2. Feed verified PC PUSH activations into the fixed Phone-owned input tensors;
+   respect the existing per-Layer KV FIFO before executing the HTP Graph.
+3. Publish the Phone-owned Graph output to P2C without looking up the old
+   RPC-registered Graph, and implement safe slot reuse/backpressure.
 4. Preserve PC decode compatibility (KV ownership/synchronization) and
-   test per-Layer activations and final logits against the old path.
+   compare per-Layer activations and final logits against the old path.
 5. Only then make the PC skip building/registering Phone RPC Graphs.
