@@ -65,6 +65,24 @@ public:
         double copy_ms = 0.0;
     };
 
+    // Opt-in timing for HTP preparation in run(). graph_mirror_ms excludes
+    // persistent_bind_ms, so all phase durations can be summed.
+    struct stage_profile_stats {
+        double context_create_ms = 0.0;
+        double graph_mirror_ms = 0.0;
+        double persistent_bind_ms = 0.0;
+        double weight_bind_ms = 0.0;
+        double kv_bind_ms = 0.0;
+        double temporary_alloc_ms = 0.0;
+        double input_copy_ms = 0.0;
+        double op_check_ms = 0.0;
+        double other_ms = 0.0;
+        size_t graph_nodes = 0;
+        size_t input_tensors = 0;
+        size_t kv_new = 0;
+        size_t kv_reused = 0;
+    };
+
     struct model_load_stats {
         size_t new_weights = 0;
         size_t new_bytes = 0;
@@ -352,9 +370,11 @@ public:
     // full-region execution is in progress at any moment, on either device.
     bool run(ggml_cgraph * source, ggml_tensor * output,
              std::string & reason, double & stage_ms,
-             double & compute_ms, double & output_ms) {
+             double & compute_ms, double & output_ms,
+             stage_profile_stats * stage_profile = nullptr) {
         reason.clear();
         stage_ms = compute_ms = output_ms = 0;
+        if (stage_profile != nullptr) { *stage_profile = {}; }
         if (backend_ == nullptr || source == nullptr || output == nullptr) {
             reason = "MISSING_HTP_BACKEND_OR_GRAPH";
             return false;
@@ -375,6 +395,12 @@ public:
             reason = "HTP_GRAPH_CONTEXT_ALLOC";
             return false;
         }
+        if (stage_profile != nullptr) {
+            stage_profile->context_create_ms =
+                (ggml_time_us() - start_us) / 1000.0;
+        }
+        const int64_t mirror_begin_us =
+            stage_profile != nullptr ? ggml_time_us() : 0;
         std::unordered_map<const ggml_tensor *, ggml_tensor *> mapped;
         std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> inputs;
         bool valid = true;
@@ -391,7 +417,28 @@ public:
             // intermediate activations and per-Chunk inputs are not.
             if (t->op == GGML_OP_NONE && t->view_src == nullptr &&
                     (is_weight(t) || is_kv(t))) {
-                ggml_tensor * cached = persistent_copy(t, is_kv(t), reason);
+                const bool kv = is_kv(t);
+                const int64_t bind_begin_us =
+                    stage_profile != nullptr ? ggml_time_us() : 0;
+                bool new_persistent = false;
+                ggml_tensor * cached = persistent_copy(
+                    t, kv, reason,
+                    stage_profile != nullptr ? &new_persistent : nullptr);
+                if (stage_profile != nullptr) {
+                    const double bind_ms =
+                        (ggml_time_us() - bind_begin_us) / 1000.0;
+                    stage_profile->persistent_bind_ms += bind_ms;
+                    if (kv) {
+                        stage_profile->kv_bind_ms += bind_ms;
+                        if (new_persistent) {
+                            ++stage_profile->kv_new;
+                        } else if (cached != nullptr) {
+                            ++stage_profile->kv_reused;
+                        }
+                    } else {
+                        stage_profile->weight_bind_ms += bind_ms;
+                    }
+                }
                 if (cached == nullptr) {
                     valid = false;
                     return nullptr;
@@ -455,6 +502,16 @@ public:
             }
             return false;
         }
+        if (stage_profile != nullptr) {
+            const double mirror_wall_ms =
+                (ggml_time_us() - mirror_begin_us) / 1000.0;
+            stage_profile->graph_mirror_ms = std::max(
+                0.0, mirror_wall_ms - stage_profile->persistent_bind_ms);
+            stage_profile->graph_nodes = static_cast<size_t>(graph->n_nodes);
+            stage_profile->input_tensors = inputs.size();
+        }
+        const int64_t alloc_begin_us =
+            stage_profile != nullptr ? ggml_time_us() : 0;
         ggml_backend_buffer_ptr temporary {
             ggml_backend_alloc_ctx_tensors(ctx.get(), backend_)
         };
@@ -462,6 +519,12 @@ public:
             reason = "HTP_STAGE_BUFFER_ALLOC";
             return false;
         }
+        if (stage_profile != nullptr) {
+            stage_profile->temporary_alloc_ms =
+                (ggml_time_us() - alloc_begin_us) / 1000.0;
+        }
+        const int64_t input_begin_us =
+            stage_profile != nullptr ? ggml_time_us() : 0;
         for (const auto & item : inputs) {
             if (item.first->data == nullptr || item.second->buffer == nullptr ||
                     !ggml_is_contiguous(item.first)) {
@@ -470,6 +533,12 @@ public:
             }
             ggml_backend_tensor_copy(item.first, item.second);
         }
+        if (stage_profile != nullptr) {
+            stage_profile->input_copy_ms =
+                (ggml_time_us() - input_begin_us) / 1000.0;
+        }
+        const int64_t check_begin_us =
+            stage_profile != nullptr ? ggml_time_us() : 0;
         for (int i = 0; i < graph->n_nodes; ++i) {
             const ggml_tensor * op = graph->nodes[i];
             if (!ggml_backend_supports_op(backend_, op)) {
@@ -480,6 +549,18 @@ public:
         }
         const int64_t compute_begin_us = ggml_time_us();
         stage_ms = (compute_begin_us - start_us) / 1000.0;
+        if (stage_profile != nullptr) {
+            stage_profile->op_check_ms =
+                (compute_begin_us - check_begin_us) / 1000.0;
+            const double accounted_ms =
+                stage_profile->context_create_ms +
+                stage_profile->graph_mirror_ms +
+                stage_profile->persistent_bind_ms +
+                stage_profile->temporary_alloc_ms +
+                stage_profile->input_copy_ms +
+                stage_profile->op_check_ms;
+            stage_profile->other_ms = std::max(0.0, stage_ms - accounted_ms);
+        }
         if (ggml_backend_graph_compute(backend_, graph) !=
                 GGML_STATUS_SUCCESS) {
             reason = "HTP_GRAPH_COMPUTE_FAILED";
@@ -614,7 +695,9 @@ private:
     }
 
     ggml_tensor * persistent_copy(const ggml_tensor * src, bool kv,
-                                  std::string & reason) {
+                                  std::string & reason,
+                                  bool * created = nullptr) {
+        if (created != nullptr) { *created = false; }
         if (src->buffer == nullptr || src->data == nullptr ||
                 !ggml_is_contiguous(src)) {
             reason = std::string("HTP_PERSISTENT_SOURCE_INVALID:") + src->name;
@@ -676,6 +759,7 @@ private:
         entry->kv = kv;
         ggml_tensor * result = entry->tensor;
         persistent_.emplace(key, std::move(entry));
+        if (created != nullptr) { *created = true; }
         return result;
     }
 
