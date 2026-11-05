@@ -4931,11 +4931,80 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_static_prebuild_us / 1000.0);
     }
 
+    // Publish fixed (region, chunk) descriptors before any async producer or
+    // Ring worker. Only the per-Chuck Scheduler/Result/UID fields are mutable.
+    const char * async_graph_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_ASYNC_GRAPH_SETUP");
+    const bool phone_async_graph_requested =
+        async_graph_env != nullptr && std::strcmp(async_graph_env, "1") == 0;
+    // The final Phone Region must already be an autonomous output producer.
+    // Other modes retain the original eager graph and binding lifecycle.
+    const bool phone_async_graph_setup =
+        phone_async_graph_requested && phone_auto_eligible &&
+        phone_auto_final_enabled;
+    std::mutex phone_graph_ready_mutex;
+    std::condition_variable phone_graph_ready_cv;
+    std::vector<std::vector<uint8_t>> phone_graph_ready(stages.size());
+    std::atomic<bool> phone_graph_build_failed { false };
+    if (phone_auto_eligible) {
+        for (size_t r = 1; r < stages.size(); ++r) {
+            if (r + 1 == stages.size() && !phone_auto_final_enabled) { continue; }
+            if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                continue;
+            }
+            const uint32_t size = (uint32_t) stages[r].macro_tokens;
+            if (size == 0) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            for (uint32_t begin = 0, chunk = 0;
+                    begin < ubatch.n_tokens; begin += size, ++chunk) {
+                phone_auto_template item;
+                item.region = r;
+                item.chunk = chunk;
+                item.token_begin = begin;
+                item.tokens = std::min<uint32_t>(
+                    size, ubatch.n_tokens - begin);
+                phone_auto_templates.emplace_back(std::move(item));
+                phone_graph_ready[r].push_back(0);
+            }
+        }
+        if (phone_auto_templates.empty()) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_AUTO] event=PREBUILD_FAIL reason=NO_PHONE_CHUNKS\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        LLAMA_LOG_INFO(
+            "[PHONE_AUTO_GRAPH_ASYNC] event=CONFIG requested=%d enabled=%d "
+            "chunks=%zu policy=BOUND_BEFORE_PUSH status=READY\n",
+            phone_async_graph_requested ? 1 : 0,
+            phone_async_graph_setup ? 1 : 0, phone_auto_templates.size());
+    }
+    auto wait_phone_graph_bound = [&](size_t region, size_t chunk) -> bool {
+        if (!phone_async_graph_setup) { return true; }
+        if (region >= phone_graph_ready.size() ||
+                chunk >= phone_graph_ready[region].size()) {
+            return false;
+        }
+        std::unique_lock<std::mutex> lock(phone_graph_ready_mutex);
+        while (phone_graph_ready[region][chunk] == 0 &&
+                !phone_graph_build_failed.load(std::memory_order_acquire) &&
+                !ready.failed()) {
+            phone_graph_ready_cv.wait_for(
+                lock, std::chrono::milliseconds(20));
+        }
+        return phone_graph_ready[region][chunk] == 1 &&
+            !phone_graph_build_failed.load(std::memory_order_acquire) &&
+            !ready.failed();
+    };
+
     // Phone-autonomous Phase 1/2: one immutable Graph and remote input
     // allocation per logical Chunk. This costs setup memory/time, but ensures
     // dynamic KV offsets, attention masks and late-tail shapes are never
     // accidentally reused across distinct Chunk positions.
-    if (phone_auto_eligible) {
+    auto build_phone_auto_graphs = [&](const auto & on_built) -> bool {
+        if (!phone_auto_eligible) { return true; }
         // Pre-registering many immutable Phone Chunk graphs retains their
         // Scheduler/Meta buffers. Allocate compact Meta scratch tensor
         // contexts only in this prebuild thread, never in normal Meta work.
@@ -4953,6 +5022,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const size_t max_nodes =
             graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
         std::set<uint64_t> registered_uids;
+        size_t template_index = 0;
         size_t phone_graph_meta_total_bytes = 0;
         std::array<size_t, 3> phone_graph_backend_total_bytes {};
         for (size_t r = 1; r < stages.size(); ++r) {
@@ -4975,18 +5045,26 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_auto_final_enabled ? "REGION_SCALED" : "FULL_LEGACY");
             const uint32_t size = (uint32_t) stage.macro_tokens;
             if (size == 0) {
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
+                return false;
             }
             for (uint32_t begin = 0, chunk = 0;
                     begin < ubatch.n_tokens; begin += size, ++chunk) {
                 const int64_t graph_setup_begin_us = ggml_time_us();
-                phone_auto_template item;
-                item.region = r;
-                item.chunk = chunk;
-                item.token_begin = begin;
-                item.tokens = std::min<uint32_t>(
-                    size, ubatch.n_tokens - begin);
+                std::unique_lock<std::mutex> async_prepare_gate(
+                    region_ring_prepare_mutex, std::defer_lock);
+                if (phone_async_graph_setup) { async_prepare_gate.lock(); }
+                // Descriptors stay immutable once their indices are visible
+                // to a running Phone worker.
+                if (template_index >= phone_auto_templates.size()) {
+                    return false;
+                }
+                auto & item = phone_auto_templates[template_index++];
+                if (item.region != r || item.chunk != chunk ||
+                        item.token_begin != begin ||
+                        item.tokens != std::min<uint32_t>(
+                            size, ubatch.n_tokens - begin)) {
+                    return false;
+                }
                 item.owned_sched.reset(ggml_backend_sched_new(
                     backend_ptrs.data(), backend_buft.data(),
                     (int) backend_ptrs.size(), stage_max_nodes,
@@ -4995,8 +5073,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 if (item.owned_sched == nullptr ||
                         !worker_kv_views[2]->set_stage_range(
                             ubatch_id, begin, item.tokens)) {
-                    ret = GGML_STATUS_ALLOC_FAILED;
-                    return nullptr;
+                    return false;
                 }
                 float * placeholder = outputs[r - 1].data() +
                     (size_t) begin * (size_t) n_embd;
@@ -5041,8 +5118,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     LLAMA_LOG_ERROR(
                         "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu "
                         "chunk=%u reason=PHONE_META_SPLIT\n", r, chunk);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
+                    return false;
                 }
                 // Other dynamic leaves have real values now. inp_stage is
                 // intentionally uninitialized until the upstream PC PUSH.
@@ -5054,8 +5130,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     LLAMA_LOG_ERROR(
                         "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu chunk=%u "
                         "reason=SIDE_INPUT_TRANSFER\n", r, chunk);
-                    ret = status;
-                    return nullptr;
+                    return false;
                 }
                 const int64_t rpc_register_begin_us = ggml_time_us();
                 ggml_backend_meta_phone_auto_context(1, 0, (uint32_t) r, chunk);
@@ -5072,8 +5147,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         "[PHONE_AUTO] event=PREBUILD_FAIL region=%zu "
                         "chunk=%u uid=%" PRIu64 " reason=GRAPH_REGISTER_OR_UID_COLLISION\n",
                         r, chunk, item.graph_uid);
-                    ret = GGML_STATUS_FAILED;
-                    return nullptr;
+                    return false;
                 }
                 if (stage_profile_enabled) {
                     LLAMA_LOG_INFO(
@@ -5142,13 +5216,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "tokens=%u begin=%u uid=%" PRIu64 " status=REGISTERED\n",
                     r, chunk, item.tokens, item.token_begin,
                     item.graph_uid);
-                phone_auto_templates.emplace_back(std::move(item));
+                if (async_prepare_gate.owns_lock()) { async_prepare_gate.unlock(); }
+                if (!on_built(item)) { return false; }
             }
         }
         if (phone_auto_templates.empty()) {
             LLAMA_LOG_ERROR("[PHONE_AUTO] event=PREBUILD_FAIL reason=NO_NONFINAL_PHONE_REGIONS\n");
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
+            return false;
         }
         LLAMA_LOG_INFO(
             "[PHONE_AUTO_GRAPH_MEMORY_SUM] graphs=%zu "
@@ -5165,6 +5239,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "policy=ONE_GRAPH_PER_CHUNK_KV_SAFE status=OK\n",
             phone_auto_templates.size(),
             (ggml_time_us() - t0) / 1000.0);
+        return template_index == phone_auto_templates.size();
+    };
+
+    if (phone_auto_eligible && !phone_async_graph_setup) {
+        const auto no_binding = [](const phone_auto_template &) { return true; };
+        if (!build_phone_auto_graphs(no_binding)) {
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     if (threaded_execution) {
