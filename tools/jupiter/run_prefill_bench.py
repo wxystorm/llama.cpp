@@ -167,6 +167,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--window", type=int, default=2)
     p.add_argument("--async-c2p", action="store_true",
                    help="opt in to the Region Ring-style Jupiter RPC transport worker")
+    p.add_argument("--local-graph-reuse", action="store_true",
+                   help="opt in to the existing local graph can_reuse path; "
+                        "synchronizes before input rebinding and can reduce overlap")
     p.add_argument("--comm-timing", action="store_true",
                    help="opt in to per-chunk host/RPC timing (diagnostic runs only)")
     p.add_argument(
@@ -230,6 +233,8 @@ def main() -> int:
         "LLAMA_JUPITER_TRACE": "0",
         "LLAMA_JUPITER_LOGITS_TOP10": "0",
         "LLAMA_JUPITER_ASYNC_C2P": "1" if args.async_c2p else "0",
+        "LLAMA_JUPITER_LOCAL_GRAPH_REUSE": "1" if args.local_graph_reuse else "0",
+        "LLAMA_GRAPH_REUSE_DISABLE": "0",
         "LLAMA_JUPITER_TIMELINE": "1" if args.comm_timing else "0",
     })
     base_env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
@@ -247,6 +252,7 @@ def main() -> int:
         "pc_layers": args.pc_layers,
         "window": args.window,
         "async_c2p": args.async_c2p,
+        "local_graph_reuse": args.local_graph_reuse,
         "comm_timing": args.comm_timing,
         "profile_stage": 0,
         "trace": 0,
@@ -288,6 +294,7 @@ def main() -> int:
         f"[JUPITER_BENCH_CONFIG] tokens={target} modes={','.join(args.modes)} "
         f"repeats={args.repeats} lv={args.verbosity} "
         f"window={args.window} async_c2p={int(args.async_c2p)} "
+        f"local_graph_reuse={int(args.local_graph_reuse)} "
         f"comm_timing={int(args.comm_timing)} trace=0 profile_stage=0",
         flush=True,
     )
