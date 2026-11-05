@@ -5620,6 +5620,9 @@ class rpc_server {
 public:
     rpc_server(std::vector<ggml_backend_t> all_backends, const char * cache_dir, const ggml_rpc_local_tensor_source * tensor_source = nullptr)
         : backends(std::move(all_backends)), cache_dir(cache_dir) {
+        const char * timeline_env = std::getenv("GGML_RPC_PHONE_CHUNK_TIMELINE");
+        phone_chunk_timeline_enabled = timeline_env != nullptr &&
+            std::strcmp(timeline_env, "1") == 0;
         stored_graphs.resize(backends.size());
         phone_stage_plan_cache.resize(backends.size());
         phone_stage_slot_policy.resize(backends.size());
@@ -5812,16 +5815,24 @@ public:
     bool phone_auto_wait_capture(
         const rpc_msg_phone_auto_wait_capture_req & request,
         bool phone_owned = false);
-    void phone_auto_input_verified(const rpc_phone_input_key & key);
+    void phone_auto_input_verified(
+        const rpc_phone_input_key & key,
+        const phone_chunk_input_timing & timing);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop();
     void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
     void phone_input_stream_cancel_reserve(size_t bytes);
+    bool phone_chunk_timeline_tracing() const {
+        return phone_chunk_timeline_enabled;
+    }
     void phone_input_stream_complete(std::vector<uint8_t> && packet,
-                                      int64_t recv_us);
+                                     int64_t recv_us,
+                                     const phone_chunk_input_timing & timing);
     bool phone_input_apply(const rpc_msg_phone_input_apply_req & request,
-                           rpc_msg_phone_input_ack & response);
+                           rpc_msg_phone_input_ack & response,
+                           int64_t * copy_begin_us = nullptr,
+                           int64_t * copy_end_us = nullptr);
     void phone_input_drop(const rpc_phone_input_key & key,
                           rpc_msg_phone_input_ack & response);
     bool set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us = 0);
@@ -5940,6 +5951,18 @@ private:
         REGISTERED, VERIFIED, UPLOADING, UPLOADED, PREPARING,
         PREPARED, COMPUTING, CAPTURING, COMPLETE, FAILED,
     };
+public:
+    // A small read-only timestamp carrier shared with the socket dispatcher.
+    // Only Phone timestamps are recorded here. The PC has a separate
+    // monotonic clock; never subtract PC and Phone *_us values directly.
+    struct phone_chunk_input_timing {
+        int64_t handler_begin_us = 0; // command received, before length/budget
+        int64_t recv_begin_us = 0;    // payload recv_data() begins
+        int64_t recv_end_us = 0;      // payload recv_data() completes
+        int64_t hash_end_us = 0;      // FNV verification completes
+        int64_t verified_us = 0;      // host landing accepted
+    };
+private:
     struct phone_auto_job {
         rpc_msg_phone_auto_task_req request {};
         rpc_tensor input_wire {};
@@ -5949,10 +5972,17 @@ private:
         bool capture_in_progress = false;
         bool capture_done = false;
         int64_t verified_us = 0;
+        phone_chunk_input_timing input_timing {};
+        int64_t register_begin_us = 0;
+        int64_t register_end_us = 0;
         int64_t upload_begin_us = 0;
+        int64_t input_copy_begin_us = 0;
+        int64_t input_copy_end_us = 0;
         int64_t upload_done_us = 0;
         int64_t prepare_done_us = 0;
         int64_t compute_begin_us = 0;
+        int64_t npu_exec_begin_us = 0;
+        int64_t npu_exec_end_us = 0;
         int64_t compute_end_us = 0;
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
@@ -6114,6 +6144,7 @@ private:
 
     struct phone_input_staged {
         rpc_phone_input_key key {};
+        phone_chunk_input_timing timing {};
         uint64_t hash = 0;
         std::vector<uint8_t> payload;
         size_t payload_offset = 0;
@@ -6140,6 +6171,7 @@ private:
         int64_t apply_wait_us = 0;
     };
     std::unordered_map<uint64_t, phone_input_stream_profile> phone_input_stream_profiles;
+    bool phone_chunk_timeline_enabled = false;
 
     // Patch24: incoming VERIFIED frames trigger local preparation and Graph
     // execution. The two separate workers overlap next-slot upload and
@@ -7044,6 +7076,8 @@ bool rpc_server::phone_input_stream_run(
 // dual-slot plan: never guess graph UID, KV offsets, or tensor ownership.
 bool rpc_server::phone_auto_task_register(
         const rpc_msg_phone_auto_task_req & request) {
+    const int64_t register_begin_us =
+        phone_chunk_timeline_enabled ? ggml_time_us() : 0;
     // Reject explicitly; a PC-side BIND_FAIL otherwise conceals the reason
     // the registered Phone graph cannot accept a task.
     const auto reject = [&](const char * reason) -> bool {
@@ -7328,12 +7362,17 @@ bool rpc_server::phone_auto_task_register(
 
     const phone_auto_key key = auto_key(request.key);
     bool already_verified = false;
+    phone_chunk_input_timing staged_timing {};
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
-        already_verified = std::any_of(phone_input_staged_slots.begin(),
-                phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
-            return auto_key(e.key) == key;
-        });
+        const auto staged = std::find_if(phone_input_staged_slots.begin(),
+            phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
+                return auto_key(e.key) == key;
+            });
+        already_verified = staged != phone_input_staged_slots.end();
+        if (already_verified && phone_chunk_timeline_enabled) {
+            staged_timing = staged->timing;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(phone_auto_mutex);
@@ -7384,6 +7423,11 @@ bool rpc_server::phone_auto_task_register(
         auto job = std::make_shared<phone_auto_job>();
         job->request = request;
         job->input_wire = wire;
+        if (phone_chunk_timeline_enabled) {
+            job->register_begin_us = register_begin_us;
+            job->register_end_us = ggml_time_us();
+            if (already_verified) { job->input_timing = staged_timing; }
+        }
         job->state = already_verified ?
             phone_auto_status::VERIFIED : phone_auto_status::REGISTERED;
         if (already_verified) { job->verified_us = ggml_time_us(); }
@@ -7430,7 +7474,9 @@ bool rpc_server::phone_auto_task_register(
     return true;
 }
 
-void rpc_server::phone_auto_input_verified(const rpc_phone_input_key & key) {
+void rpc_server::phone_auto_input_verified(
+        const rpc_phone_input_key & key,
+        const phone_chunk_input_timing & timing) {
     {
         std::lock_guard<std::mutex> guard(phone_auto_mutex);
         const auto it = phone_auto_jobs.find(auto_key(key));
@@ -7438,6 +7484,11 @@ void rpc_server::phone_auto_input_verified(const rpc_phone_input_key & key) {
                 it->second->state == phone_auto_status::REGISTERED) {
             it->second->state = phone_auto_status::VERIFIED;
             it->second->verified_us = ggml_time_us();
+            if (phone_chunk_timeline_enabled) {
+                it->second->input_timing = timing;
+                it->second->input_timing.verified_us =
+                    it->second->verified_us;
+            }
         }
     }
     phone_auto_cv.notify_all();
@@ -7786,7 +7837,11 @@ void rpc_server::phone_auto_prepare_loop() {
             }
             if (ok) {
                 rpc_msg_phone_input_ack rsp {};
-                ok = phone_input_apply(apply, rsp) && rsp.accepted;
+                ok = phone_input_apply(apply, rsp,
+                    phone_chunk_timeline_enabled ?
+                        &task->input_copy_begin_us : nullptr,
+                    phone_chunk_timeline_enabled ?
+                        &task->input_copy_end_us : nullptr) && rsp.accepted;
             }
             task->upload_done_us = ggml_time_us();
         }
@@ -7969,6 +8024,9 @@ void rpc_server::phone_auto_compute_loop() {
                 if (outputs == 1 && output != nullptr &&
                         phone_npu_executor != nullptr && npu_task) {
                     // htp_guard was acquired before graph_compute_mutex.
+                    if (phone_chunk_timeline_enabled) {
+                        task->npu_exec_begin_us = ggml_time_us();
+                    }
                     if (phone_npu_executor->has_registered_chunk(
                             req.graph_uid)) {
                         ok = phone_npu_executor->run_registered_chunk(
@@ -7980,6 +8038,9 @@ void rpc_server::phone_auto_compute_loop() {
                             it->second.graph, output, why,
                             stage_ms, htp_ms, return_ms,
                             stage_profile_enabled ? &stage_profile : nullptr);
+                    }
+                    if (phone_chunk_timeline_enabled) {
+                        task->npu_exec_end_us = ggml_time_us();
                     }
                 }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
@@ -8139,7 +8200,8 @@ void rpc_server::phone_input_stream_cancel_reserve(size_t bytes) {
 }
 
 void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
-                                              int64_t recv_us) {
+                                              int64_t recv_us,
+                                              const phone_chunk_input_timing & timing) {
     const size_t bytes = packet.size();
     rpc_msg_phone_input_push_req request {};
     bool valid = bytes >= sizeof(request);
@@ -8154,7 +8216,12 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
         valid = fnv_hash(packet.data() + sizeof(request),
                          (size_t) request.size) == request.hash;
     }
-    const int64_t hash_us = ggml_time_us() - hash_begin_us;
+    const int64_t hash_end_us = ggml_time_us();
+    const int64_t hash_us = hash_end_us - hash_begin_us;
+    phone_chunk_input_timing stamped = timing;
+    if (phone_chunk_timeline_enabled) {
+        stamped.hash_end_us = hash_end_us;
+    }
     bool enqueued_verified = false;
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
@@ -8178,6 +8245,10 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
                              phone_input_staged_slots.end(), same)) {
                 phone_input_staged entry {};
                 entry.key = request.key;
+                if (phone_chunk_timeline_enabled) {
+                    stamped.verified_us = ggml_time_us();
+                    entry.timing = stamped;
+                }
                 entry.hash = request.hash;
                 entry.payload_offset = sizeof(request);
                 entry.reserved_bytes = bytes;
@@ -8199,7 +8270,7 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
     if (enqueued_verified) {
         // The callback never holds phone_input_mutex while taking the
         // autonomous scheduler mutex; lock order stays acyclic.
-        phone_auto_input_verified(request.key);
+        phone_auto_input_verified(request.key, stamped);
     } else if (request.key.run_id != 0) {
         // In proactive mode no PC WAIT exists to surface a verification
         // failure. An invalid/duplicate PUSH for a registered job must
@@ -8226,7 +8297,8 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
 
 bool rpc_server::phone_input_apply(
         const rpc_msg_phone_input_apply_req & request,
-        rpc_msg_phone_input_ack & response) {
+        rpc_msg_phone_input_ack & response,
+        int64_t * copy_begin_us, int64_t * copy_end_us) {
     response = {};
     if (request.key.run_id == 0 || request.size == 0 ||
             request.offset != 0 || request.size > RPC_PHONE_INPUT_MAX_BYTES) {
@@ -8275,10 +8347,12 @@ bool rpc_server::phone_input_apply(
         phone_input_staged_slots.erase(it);
     }
     // Keep the host bytes charged during device upload.
+    if (copy_begin_us != nullptr) { *copy_begin_us = ggml_time_us(); }
     response.accepted = set_tensor_direct(
         request.tensor, request.offset,
         staged.payload.data() + staged.payload_offset,
         staged.payload.size() - staged.payload_offset) ? 1 : 0;
+    if (copy_end_us != nullptr) { *copy_end_us = ggml_time_us(); }
     if (staged.reserved_bytes != 0) {
         {
             std::lock_guard<std::mutex> lock(phone_input_mutex);
@@ -13193,6 +13267,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
+                const int64_t handler_begin_us = ggml_time_us();
                 // The Phone receiver itself owns the bounded host budget.
                 // Do not emit an ACK: send_data()/TCP backpressure is the
                 // only normal feedback to the PC producer.
@@ -13211,8 +13286,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 const int64_t recv_begin_us = ggml_time_us();
                 const bool received = sock->recv_data(packet.data(), packet.size());
-                const int64_t recv_us = ggml_time_us() - recv_begin_us;
-                server.phone_input_stream_complete(std::move(packet), recv_us);
+                const int64_t recv_end_us = ggml_time_us();
+                rpc_server::phone_chunk_input_timing timing {};
+                if (server.phone_chunk_timeline_tracing()) {
+                    timing.handler_begin_us = handler_begin_us;
+                    timing.recv_begin_us = recv_begin_us;
+                    timing.recv_end_us = recv_end_us;
+                }
+                server.phone_input_stream_complete(
+                    std::move(packet), recv_end_us - recv_begin_us, timing);
                 if (!received) { return; }
                 break;
             }
@@ -13630,6 +13712,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
+                const int64_t handler_begin_us = ggml_time_us();
                 // The Phone receiver itself owns the bounded host budget.
                 // Do not emit an ACK: send_data()/TCP backpressure is the
                 // only normal feedback to the PC producer.
@@ -13648,8 +13731,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 }
                 const int64_t recv_begin_us = ggml_time_us();
                 const bool received = sock->recv_data(packet.data(), packet.size());
-                const int64_t recv_us = ggml_time_us() - recv_begin_us;
-                server.phone_input_stream_complete(std::move(packet), recv_us);
+                const int64_t recv_end_us = ggml_time_us();
+                rpc_server::phone_chunk_input_timing timing {};
+                if (server.phone_chunk_timeline_tracing()) {
+                    timing.handler_begin_us = handler_begin_us;
+                    timing.recv_begin_us = recv_begin_us;
+                    timing.recv_end_us = recv_end_us;
+                }
+                server.phone_input_stream_complete(
+                    std::move(packet), recv_end_us - recv_begin_us, timing);
                 if (!received) { return; }
                 break;
             }
