@@ -5927,6 +5927,8 @@ public:
         std::vector<uint8_t> buffer;
         ggml_cgraph * graph = nullptr;
         phone_stage_slot0_graph slot0;
+        int64_t register_begin_us = 0;
+        int64_t register_end_us = 0;
         // One warmup + three measured synthetic runs: retain last three.
         std::array<int64_t, 3> recent_compute_wall_us {};
         uint64_t compute_samples = 0;
@@ -5976,6 +5978,8 @@ private:
         phone_chunk_input_timing input_timing {};
         int64_t register_begin_us = 0;
         int64_t register_end_us = 0;
+        int64_t graph_register_begin_us = 0;
+        int64_t graph_register_end_us = 0;
         int64_t upload_begin_us = 0;
         int64_t input_copy_begin_us = 0;
         int64_t input_copy_end_us = 0;
@@ -6932,6 +6936,58 @@ bool rpc_server::phone_input_stream_run(
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
+                    // Opt-in exact phone monotonic timestamps. Emit only
+                    // at stream teardown, never in the hot Chunk path.
+                    // P2C socket times are separately emitted by the sender
+                    // thread with the matching p2c_run/region/chunk key.
+                    if (phone_chunk_timeline_enabled) {
+                        const auto & t = job.input_timing;
+                        GGML_LOG_INFO(
+                            "[PHONE_CHUNK_TIMELINE] clock=PHONE_GGML_TIME_US "
+                            "run=%" PRIu64 " p2c_run=%" PRIu64
+                            " region=%u chunk=%u uid=%" PRIu64
+                            " tokens=%u bytes=%" PRIu64
+                            " graph_reg_begin_us=%" PRId64
+                            " graph_reg_end_us=%" PRId64
+                            " task_reg_begin_us=%" PRId64
+                            " task_reg_end_us=%" PRId64
+                            " rx_handler_begin_us=%" PRId64
+                            " recv_begin_us=%" PRId64
+                            " recv_end_us=%" PRId64
+                            " hash_end_us=%" PRId64
+                            " input_verified_us=%" PRId64
+                            " job_ready_us=%" PRId64
+                            " upload_begin_us=%" PRId64
+                            " input_copy_begin_us=%" PRId64
+                            " input_copy_end_us=%" PRId64
+                            " upload_end_us=%" PRId64
+                            " prepare_done_us=%" PRId64
+                            " compute_begin_us=%" PRId64
+                            " htp_exec_begin_us=%" PRId64
+                            " htp_exec_end_us=%" PRId64
+                            " compute_end_us=%" PRId64
+                            " capture_begin_us=%" PRId64
+                            " capture_end_us=%" PRId64
+                            " status=%s\n",
+                            request.run_id, job.request.p2c_run_id,
+                            job.request.key.region, job.request.key.chunk,
+                            job.request.graph_uid, job.request.n_tokens,
+                            job.request.input_bytes,
+                            job.graph_register_begin_us,
+                            job.graph_register_end_us,
+                            job.register_begin_us, job.register_end_us,
+                            t.handler_begin_us, t.recv_begin_us,
+                            t.recv_end_us, t.hash_end_us, t.verified_us,
+                            job.verified_us,
+                            job.upload_begin_us, job.input_copy_begin_us,
+                            job.input_copy_end_us, job.upload_done_us,
+                            job.prepare_done_us, job.compute_begin_us,
+                            job.npu_exec_begin_us, job.npu_exec_end_us,
+                            job.compute_end_us, job.capture_begin_us,
+                            job.capture_end_us,
+                            job.state == phone_auto_status::COMPLETE ?
+                                "PASS" : "FAIL");
+                    }
                     // Report after all jobs finish, not on the hot worker
                     // path. Separate measured service from queue delay.
                     const char * stage_env =
@@ -7427,6 +7483,8 @@ bool rpc_server::phone_auto_task_register(
         if (phone_chunk_timeline_enabled) {
             job->register_begin_us = register_begin_us;
             job->register_end_us = ggml_time_us();
+            job->graph_register_begin_us = it->second.register_begin_us;
+            job->graph_register_end_us = it->second.register_end_us;
             if (already_verified) { job->input_timing = staged_timing; }
         }
         job->state = already_verified ?
@@ -12091,6 +12149,8 @@ std::optional<ggml_status> rpc_server::phone_stage_slot0_compute(
 bool rpc_server::graph_compute(
         const std::vector<uint8_t> & input, bool register_only,
         int64_t command_rx_us) {
+    const int64_t graph_register_begin_us =
+        phone_chunk_timeline_enabled && register_only ? ggml_time_us() : 0;
     std::unique_lock<std::mutex> registry_lock;
     std::unique_lock<std::recursive_mutex> graph_lock(
         graph_compute_mutex, std::defer_lock);
@@ -12152,6 +12212,8 @@ bool rpc_server::graph_compute(
     }
     stored_graph & graph_entry = stored_graphs[device][graph_uid];  //存储计算图以用于复用
     graph_entry.slot0 = {};
+    graph_entry.register_begin_us = graph_register_begin_us;
+    graph_entry.register_end_us = 0;
     if (graph_entry.buffer.size() < buf_size) {
         graph_entry.buffer.resize(buf_size);
     }
@@ -12193,6 +12255,9 @@ bool rpc_server::graph_compute(
         // The server reconstructs and owns this graph, but does not run it.
         // INPUT_READY will enqueue graph_recompute on Phone MAIN.
         graph_entry.graph = graph;
+        if (phone_chunk_timeline_enabled) {
+            graph_entry.register_end_us = ggml_time_us();
+        }
         std::fprintf(stderr,
             "[PHONE_RING_AUTO] side=phone event=GRAPH_REGISTERED "
             "device=%u uid=%" PRIu64 " nodes=%u status=OK\n",
@@ -12404,13 +12469,37 @@ bool rpc_server::send_p2c_stream(
     size_t frames = 0;
     uint64_t sent_bytes = 0;
     int64_t send_us = 0;
+    struct phone_p2c_send_trace {
+        ggml_backend_rpc_p2c_frame frame {};
+        int64_t take_us = 0;
+        int64_t send_begin_us = 0;
+        int64_t header_end_us = 0;
+        int64_t send_end_us = 0;
+        bool ok = false;
+    };
+    std::vector<phone_p2c_send_trace> send_trace;
+    if (phone_chunk_timeline_enabled) { send_trace.reserve(64); }
     ggml_rpc_p2c_arena_queue::item item;
     while (p2c_arena.take(item)) {
         const int64_t t0 = ggml_time_us();
-        const bool ok =
-            sock->send_data(&item.frame, sizeof(item.frame)) &&
+        const bool header_ok =
+            sock->send_data(&item.frame, sizeof(item.frame));
+        const int64_t header_end_us =
+            phone_chunk_timeline_enabled ? ggml_time_us() : 0;
+        const bool ok = header_ok &&
             sock->send_data(item.data, size_t(item.frame.payload_bytes));
-        send_us += ggml_time_us() - t0;
+        const int64_t send_end_us = ggml_time_us();
+        send_us += send_end_us - t0;
+        if (phone_chunk_timeline_enabled) {
+            phone_p2c_send_trace e {};
+            e.frame = item.frame;
+            e.take_us = t0;
+            e.send_begin_us = t0;
+            e.header_end_us = header_end_us;
+            e.send_end_us = send_end_us;
+            e.ok = ok;
+            send_trace.push_back(e);
+        }
         p2c_arena.complete_send(ok);
         if (!ok) {
             sent_ok = false;
@@ -12434,6 +12523,23 @@ bool rpc_server::send_p2c_stream(
         p2c_arena.shutdown();
         p2c_stream_active = false;
         p2c_stream_run_id = 0;
+    }
+    // These frame events are written after the entire stream finishes, so
+    // logging does not delay a later P2C frame's socket send().
+    if (phone_chunk_timeline_enabled) {
+        for (const auto & e : send_trace) {
+            GGML_LOG_INFO(
+                "[PHONE_CHUNK_P2C_SEND] clock=PHONE_GGML_TIME_US "
+                "p2c_run=%" PRIu64 " region=%u chunk=%u"
+                " token_begin=%u tokens=%u seq=%" PRIu64
+                " bytes=%" PRIu64 " queue_take_us=%" PRId64
+                " send_begin_us=%" PRId64 " header_end_us=%" PRId64
+                " send_end_us=%" PRId64 " status=%s\n",
+                e.frame.run_id, e.frame.region_id, e.frame.chunk_id,
+                e.frame.token_begin, e.frame.n_tokens, e.frame.seq,
+                e.frame.payload_bytes, e.take_us, e.send_begin_us,
+                e.header_end_us, e.send_end_us, e.ok ? "PASS" : "FAIL");
+        }
     }
     GGML_LOG_INFO(
         "[P2C_STREAM] side=PHONE phase=STOP run=%" PRIu64
