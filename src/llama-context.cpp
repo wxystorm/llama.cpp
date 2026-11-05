@@ -4981,12 +4981,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_async_graph_requested ? 1 : 0,
             phone_async_graph_setup ? 1 : 0, phone_auto_templates.size());
     }
-    auto wait_phone_graph_bound = [&](size_t region, size_t chunk) -> bool {
+    auto wait_phone_graph_bound = [&](size_t region, size_t chunk,
+                                      const char * consumer) -> bool {
         if (!phone_async_graph_setup) { return true; }
         if (region >= phone_graph_ready.size() ||
                 chunk >= phone_graph_ready[region].size()) {
             return false;
         }
+        const int64_t begin_us = ggml_time_us();
         std::unique_lock<std::mutex> lock(phone_graph_ready_mutex);
         while (phone_graph_ready[region][chunk] == 0 &&
                 !phone_graph_build_failed.load(std::memory_order_acquire) &&
@@ -4994,9 +4996,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_graph_ready_cv.wait_for(
                 lock, std::chrono::milliseconds(20));
         }
-        return phone_graph_ready[region][chunk] == 1 &&
+        const bool success = phone_graph_ready[region][chunk] == 1 &&
             !phone_graph_build_failed.load(std::memory_order_acquire) &&
             !ready.failed();
+        lock.unlock();
+        const double wait_ms = (ggml_time_us() - begin_us) / 1000.0;
+        if (wait_ms >= 1.0 || !success) {
+            LLAMA_LOG_INFO(
+                "[PHONE_AUTO_GRAPH_ASYNC] event=WAIT consumer=%s "
+                "region=%zu chunk=%zu wait_ms=%.3f status=%s\n",
+                consumer, region, chunk, wait_ms,
+                success ? "READY" : "FAIL");
+        }
+        return success;
     };
 
     // Phone-autonomous Phase 1/2: one immutable Graph and remote input
@@ -6380,7 +6392,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         throw std::runtime_error("invalid Phone push input interval");
                     }
                     if (phone_auto_enabled &&
-                            !wait_phone_graph_bound(job.region, job.chunk)) {
+                            !wait_phone_graph_bound(job.region, job.chunk, "PUSH")) {
                         throw std::runtime_error(
                             "Phone graph not bound before input PUSH");
                     }
@@ -6554,7 +6566,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             dev == (size_t) llama_region_ring_device::PHONE &&
                             stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
                             (!last || phone_auto_final_enabled)) {
-                        if (!wait_phone_graph_bound(task.region, task.chunk)) {
+                        if (!wait_phone_graph_bound(task.region, task.chunk, "PHONE_WORKER")) {
                             throw std::runtime_error(
                                 "Phone worker claimed an unregistered graph");
                         }
