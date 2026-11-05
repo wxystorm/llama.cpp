@@ -686,6 +686,20 @@ public:
             return false;
         }
         graph->uid = (UINT64_C(1) << 63) | next_fixed_uid_++;
+        // Compile fused HTP opnodes and fixed kernel parameters now, not
+        // during the first Chunk compute. Every referenced Tensor address is
+        // already bound to either persistent KV/weights or the arena pool.
+        const auto reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_));
+        using compile_fn = bool (*)(ggml_backend_t, ggml_cgraph *);
+        auto compile = reg != nullptr ? reinterpret_cast<compile_fn>(
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_hexagon_precompile_fixed_graph")) :
+            nullptr;
+        if (compile == nullptr || !compile(backend_, graph)) {
+            reason = "HTP_FIXED_PLAN_PRECOMPILE";
+            return false;
+        }
         registered_graphs_.emplace(uid, std::move(prepared));
         prepare_ms = (ggml_time_us() - begin_us) / 1000.0;
         return true;
@@ -783,7 +797,9 @@ public:
             ggml_backend_get_device(backend_));
         return reg != nullptr &&
             ggml_backend_reg_get_proc_address(
-                reg, "ggml_backend_hexagon_clear_fixed_graph_cache") != nullptr;
+                reg, "ggml_backend_hexagon_clear_fixed_graph_cache") != nullptr &&
+            ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_hexagon_precompile_fixed_graph") != nullptr;
     }
 
     // Caller holds the server's single Phone graph-compute mutex. Only one
