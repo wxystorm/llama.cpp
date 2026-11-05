@@ -1911,7 +1911,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (kv_ctx != nullptr && kv_ctx->prebuild_batch_count() > 0) {
             // Previous decode may still be in flight; do not retire graph
             // metadata referenced by GPU/RPC until all work has completed.
-            synchronize();
+            // Do NOT call llama_context::synchronize() here: decode() has
+            // already started Prefill timing and queued tokens, and that
+            // method resets the performance accounting mid-prefill.
+            ggml_backend_sched_synchronize(sched.get());
             gf_res_prev->reset();
             jupiter_prebuilt_graphs.clear();
             jupiter_prebuilt_snapshots.clear();
