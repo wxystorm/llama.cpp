@@ -195,7 +195,7 @@ def verify_runtime(args: argparse.Namespace, plan: Path, chunks: list[int],
     })
     env.pop("LLAMA_JUPITER_SEQUENCE_PLAN", None)
     command = build_cli(args, Path(args.exe).resolve(),
-                        Path(args.model).resolve(), prompt, 4)
+                        Path(args.model).resolve(), prompt, 4, args.ubatch)
     run_one(command, env, log_path)
     text = log_path.read_text(encoding="utf-8", errors="replace")
     observed = [
@@ -218,6 +218,13 @@ def parser() -> argparse.ArgumentParser:
     for key in ("exe", "model", "rpc", "prompt-file"):
         p.add_argument("--" + key, required=True)
     p.add_argument("--min-chunk-json", default="jupiter-min-chunk/min-chunk.json")
+    p.add_argument("--fixed-stage3", action="store_true",
+                   help="run measured q-sweep/DP/refinement from explicit "
+                        "chunk constraints, without requiring Stage-2 JSON. "
+                        "Requires --pc-layers, --target-tokens, "
+                        "--min-chunk and --max-chunk")
+    p.add_argument("--max-chunk", type=int, default=None,
+                   help="maximum sequence chunk for --fixed-stage3")
     p.add_argument("--pc-layers", type=int, default=None,
                    help="override only when it equals stage-2 PC layer count")
     p.add_argument("--target-tokens", type=int, default=None)
@@ -249,32 +256,64 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    source = Path(args.min_chunk_json).resolve()
-    if not source.is_file():
-        raise ValueError(f"stage-2 min-chunk JSON not found: {source}")
-    summary = json.loads(source.read_text(encoding="utf-8-sig"))
-    measured_prompt_tokens = int(summary["prompt_tokens"])
-    if (args.target_tokens is not None and
-            args.target_tokens != measured_prompt_tokens and
-            not args.reuse_b_profile_for_new_length):
-        raise ValueError(
-            "target tokens differ from Stage-2 calibration; pass "
-            "--reuse-b-profile-for-new-length to reuse the measured "
-            "hardware chunk-efficiency curve explicitly"
+    if args.fixed_stage3:
+        # A controlled fixed-b experiment: the following q(x,y) profile and
+        # final DP cuts are still measured, but b is user supplied rather
+        # than inferred from the Stage-2 saturation curve.
+        if any(value is None for value in (
+                args.pc_layers, args.target_tokens,
+                args.min_chunk, args.max_chunk)):
+            raise ValueError(
+                "--fixed-stage3 requires --pc-layers, --target-tokens, "
+                "--min-chunk and --max-chunk"
+            )
+        pc, total, b, max_chunk = (
+            args.pc_layers, args.target_tokens, args.min_chunk, args.max_chunk
         )
-    pc, total, b, max_chunk, status = resolve_stage2(
-        summary,
-        target_tokens=args.target_tokens,
-        fixed_min_chunk=args.min_chunk,
-    )
-    if args.pc_layers is not None and args.pc_layers != pc:
-        raise ValueError("PC layer override mismatches calibrated stage-2 result")
-    if total != measured_prompt_tokens:
+        if pc <= 0 or total <= 1 or b <= 0 or max_chunk < b:
+            raise ValueError("invalid fixed Stage-3 parameters")
+        if not partition_feasible(total, b, max_chunk):
+            raise ValueError(
+                f"cannot partition {total} tokens with "
+                f"min_chunk={b} max_chunk={max_chunk}"
+            )
+        status = "FIXED_B_NOT_STAGE2_MEASURED"
+        old_b = None
+        measured_prompt_tokens = None
         print(
-            f"[JUPITER_STAGE3_B_PROFILE_REUSE] profile_tokens={measured_prompt_tokens} "
-            f"actual_prompt_tokens={total} status=REUSE_HARDWARE_CURVE",
+            f"[JUPITER_STAGE3_FIXED] total={total} pc_layers={pc} "
+            f"min_chunk={b} max_chunk={max_chunk} "
+            "source=USER_FIXED_NOT_STAGE2_MEASURED",
             flush=True,
         )
+    else:
+        source = Path(args.min_chunk_json).resolve()
+        if not source.is_file():
+            raise ValueError(f"stage-2 min-chunk JSON not found: {source}")
+        summary = json.loads(source.read_text(encoding="utf-8-sig"))
+        measured_prompt_tokens = int(summary["prompt_tokens"])
+        if (args.target_tokens is not None and
+                args.target_tokens != measured_prompt_tokens and
+                not args.reuse_b_profile_for_new_length):
+            raise ValueError(
+                "target tokens differ from Stage-2 calibration; pass "
+                "--reuse-b-profile-for-new-length to reuse the measured "
+                "hardware chunk-efficiency curve explicitly"
+            )
+        pc, total, b, max_chunk, status = resolve_stage2(
+            summary,
+            target_tokens=args.target_tokens,
+            fixed_min_chunk=args.min_chunk,
+        )
+        if args.pc_layers is not None and args.pc_layers != pc:
+            raise ValueError("PC layer override mismatches calibrated stage-2 result")
+        old_b = int(summary["min_chunk"])
+        if total != measured_prompt_tokens:
+            print(
+                f"[JUPITER_STAGE3_B_PROFILE_REUSE] profile_tokens={measured_prompt_tokens} "
+                f"actual_prompt_tokens={total} status=REUSE_HARDWARE_CURVE",
+                flush=True,
+            )
     if (args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 1 or
             args.ubatch < max_chunk or args.batch < args.ubatch or
             args.context < args.batch):
@@ -300,8 +339,7 @@ def main() -> int:
     q_out = out / "q-sweep"
     initial = out / "initial-dp.plan"
 
-    old_b = int(summary["min_chunk"])
-    if old_b != b:
+    if old_b is not None and old_b != b:
         print(f"[JUPITER_STAGE3_B_CORRECTION] measured_b={old_b} "
               f"feasible_b={b} reason=FULL_PROMPT_PARTITION", flush=True)
     print(f"[JUPITER_STAGE3_CONFIG] pc_layers={pc} phone_layers=remaining "
@@ -398,7 +436,10 @@ def main() -> int:
         "max_chunk": max_chunk, "min_chunk_status": status,
         "initial_b_from_json": old_b,
         "b_profile_prompt_tokens": measured_prompt_tokens,
-        "reused_b_profile_at_new_length": total != measured_prompt_tokens,
+        "reused_b_profile_at_new_length": (
+            measured_prompt_tokens is not None and total != measured_prompt_tokens
+        ),
+        "setup_source": "FIXED_EXPLICIT" if args.fixed_stage3 else "STAGE2_JSON",
         "chunks": chunks, "q_points": len(chunks),
         "q_profile": str(refine_out / "q-profile-refined.csv"),
         "refinement_dir": str(refine_out),
