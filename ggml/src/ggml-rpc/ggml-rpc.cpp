@@ -6295,6 +6295,27 @@ private:
     std::mutex phone_owned_qwen3_mutex;
     std::unordered_map<uint64_t, ggml_phone_owned_qwen3::plan>
         phone_owned_qwen3_plans;
+
+    // Optional resource-reservation experiment. Buffers belong exclusively
+    // to the Phone HTP backend; the legacy RPC graphs do not reference them.
+    struct phone_owned_qwen3_storage {
+        struct layer {
+            uint32_t id = 0;
+            ggml_backend_buffer_ptr k;
+            ggml_backend_buffer_ptr v;
+        };
+        struct region {
+            uint32_t id = 0;
+            uint32_t max_chunk_tokens = 0;
+            std::array<ggml_backend_buffer_ptr, 2> inputs {};
+            std::array<ggml_backend_buffer_ptr, 2> outputs {};
+        };
+        std::vector<layer> layers;
+        std::vector<region> regions;
+        uint64_t bytes = 0;
+    };
+    std::unordered_map<uint64_t, phone_owned_qwen3_storage>
+        phone_owned_qwen3_buffers;
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -6965,6 +6986,7 @@ bool rpc_server::phone_input_stream_run(
         {
             std::lock_guard<std::mutex> lock(phone_owned_qwen3_mutex);
             phone_owned_qwen3_plans.erase(request.run_id);
+            phone_owned_qwen3_buffers.erase(request.run_id);
         }
         {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
@@ -7252,6 +7274,97 @@ bool rpc_server::phone_owned_qwen3_plan_register(
             }
         }
     }
+    // Optional standalone reservation experiment: the actual Phone-native
+    // Graph builder will bind its weights, KV and inputs to these resources.
+    // This never causes a false GRAPH_READY or changes the legacy execute path.
+    phone_owned_qwen3_storage storage;
+    const char * reserve_env =
+        std::getenv("GGML_RPC_PHONE_OWNED_QWEN3_RESERVE_SHADOW");
+    const bool reserve =
+        reserve_env != nullptr && std::strcmp(reserve_env, "1") == 0;
+    if (reserve) {
+        // The reserved KV starts empty. A non-zero prefix would require
+        // explicit state transfer/restore from the originating context.
+        if (p.positions.front() != 0) {
+            return reject("NONEMPTY_KV_RESTORE_NOT_IMPLEMENTED");
+        }
+        const auto buft = ggml_backend_get_default_buffer_type(
+            phone_npu_backend.get());
+        if (buft == nullptr) {
+            return reject("HTP_DEFAULT_BUFFER_TYPE_UNAVAILABLE");
+        }
+        const uint64_t kv_bytes =
+            uint64_t(p.n_ctx) * p.n_head_kv * p.head_dim *
+            ggml_type_size(GGML_TYPE_F16);
+        if (kv_bytes == 0 || kv_bytes > (1ull << 30)) {
+            return reject("HTP_KV_BYTES_INVALID");
+        }
+        uint64_t requested_total = kv_bytes * 2 *
+            visited_layers.size();
+        std::vector<uint32_t> distinct_regions;
+        for (const auto & c : p.chunks) {
+            if (distinct_regions.empty() ||
+                    distinct_regions.back() != c.region) {
+                distinct_regions.push_back(c.region);
+            }
+        }
+        for (uint32_t region : distinct_regions) {
+            uint32_t max_chunk = 0;
+            for (const auto & c : p.chunks) {
+                if (c.region == region) {
+                    max_chunk = std::max(max_chunk, c.n_tokens);
+                }
+            }
+            requested_total += uint64_t(max_chunk) * p.n_embd *
+                sizeof(float) * 4;
+        }
+        if (requested_total > 512ull * 1024 * 1024) {
+            return reject("HTP_PLAN_RESERVED_MEMORY_BUDGET");
+        }
+        const auto alloc = [&](ggml_backend_buffer_ptr & dst,
+                               size_t bytes) -> bool {
+            if (bytes == 0 || bytes > ggml_backend_buft_get_max_size(buft)) {
+                return false;
+            }
+            dst.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
+            if (!dst) { return false; }
+            ggml_backend_buffer_clear(dst.get(), 0);
+            return true;
+        };
+        // HTP resource creation is serialized with fixed-graph compilation,
+        // execution and the independent HTP weight preloader.
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        for (uint32_t layer : visited_layers) {
+            phone_owned_qwen3_storage::layer item {};
+            item.id = layer;
+            if (!alloc(item.k, (size_t) kv_bytes) ||
+                    !alloc(item.v, (size_t) kv_bytes)) {
+                return reject("HTP_KV_RESERVE_FAILED");
+            }
+            storage.layers.emplace_back(std::move(item));
+        }
+        for (uint32_t region : distinct_regions) {
+            phone_owned_qwen3_storage::region item {};
+            item.id = region;
+            for (const auto & c : p.chunks) {
+                if (c.region == region) {
+                    item.max_chunk_tokens =
+                        std::max(item.max_chunk_tokens, c.n_tokens);
+                }
+            }
+            const size_t bytes =
+                size_t(item.max_chunk_tokens) * p.n_embd * sizeof(float);
+            for (size_t slot = 0; slot < 2; ++slot) {
+                if (!alloc(item.inputs[slot], bytes) ||
+                        !alloc(item.outputs[slot], bytes)) {
+                    return reject("HTP_ACTIVATION_SLOT_RESERVE_FAILED");
+                }
+            }
+            storage.regions.emplace_back(std::move(item));
+        }
+        storage.bytes = requested_total;
+    }
+
     const uint64_t registered_run = p.run_id;
     const uint32_t registered_tokens = p.n_tokens;
     const size_t registered_chunks = p.chunks.size();
@@ -7261,15 +7374,23 @@ bool rpc_server::phone_owned_qwen3_plan_register(
                 phone_owned_qwen3_plans.size() >= 2) {
             return reject("DUPLICATE_OR_TOO_MANY_ACTIVE_PLANS");
         }
+    const double requested_total_mib = reserve ?
+        storage.bytes / 1048576.0 : 0.0;
         phone_owned_qwen3_plans.emplace(registered_run, std::move(p));
+        if (reserve) {
+            phone_owned_qwen3_buffers.emplace(
+                registered_run, std::move(storage));
+        }
     }
     GGML_LOG_INFO(
         "[PHONE_OWNED_QWEN3_PLAN] event=ACCEPT "
         "run=%" PRIu64 " layers=%zu chunks=%zu tokens=%u "
-        "local_gguf=VERIFIED_SHAPES kv_owner=PLANNED "
-        "graph_ready=0 mode=SHADOW_NO_EXEC status=PASS\n",
+        "local_gguf=VERIFIED_SHAPES kv_owner=%s "
+        "reserved_mib=%.3f graph_ready=0 mode=SHADOW_NO_EXEC status=PASS\n",
         registered_run, visited_layers.size(),
-        registered_chunks, registered_tokens);
+        registered_chunks, registered_tokens,
+        reserve ? "PHONE_HTP_ALLOCATED" : "PHONE_PLAN_ONLY",
+        reserve ? requested_total_mib : 0.0);
     return true;
 }
 
