@@ -5709,6 +5709,24 @@ public:
             std::thread([this]() { phone_auto_prepare_loop(); });
         phone_auto_compute_thread =
             std::thread([this]() { phone_auto_compute_loop(); });
+        // Async mode is an explicit extension of the existing opt-in
+        // weight preload. Leave the synchronous A/B baseline unchanged.
+        const char * preload_env =
+            std::getenv("GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS");
+        const char * async_env =
+            std::getenv("GGML_RPC_PHONE_NPU_PRELOAD_ASYNC");
+        phone_npu_async_preload = !phone_npu_serial_regions.empty() &&
+            preload_env != nullptr && async_env != nullptr &&
+            std::strcmp(preload_env, "1") == 0 &&
+            std::strcmp(async_env, "1") == 0;
+        if (phone_npu_async_preload) {
+            phone_npu_preload_thread =
+                std::thread([this]() { phone_npu_preload_loop(); });
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SERIAL] event=PRELOAD_MODE "
+                "mode=ASYNC policy=PER_REGION_KV_INDEPENDENT "
+                "status=READY\n");
+        }
         if (rpc_phone_stage_prepare_ahead_enabled()) {
             phone_stage_prepare_thread =
                 std::thread([this]() { phone_stage_prepare_loop(); });
@@ -5734,6 +5752,7 @@ public:
     void phone_auto_input_verified(const rpc_phone_input_key & key);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop();
+    void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
     void phone_input_stream_cancel_reserve(size_t bytes);
     void phone_input_stream_complete(std::vector<uint8_t> && packet,
@@ -5875,6 +5894,22 @@ private:
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
     };
+    enum class phone_npu_preload_status : uint8_t {
+        QUEUED, RUNNING, READY, FAILED,
+    };
+    struct phone_npu_preload_job {
+        uint64_t run_id = 0;
+        uint32_t region = 0;
+        uint32_t device = 0;
+        uint32_t chunk = 0;
+        int layer = -1;
+        uint64_t uid = 0;
+        int64_t enqueued_us = 0;
+        phone_npu_preload_status state = phone_npu_preload_status::QUEUED;
+        std::vector<ggml_tensor> weights;
+    };
+    bool phone_npu_preload_ready_locked(const phone_auto_job & job) const;
+
     using phone_auto_key = std::tuple<uint64_t, uint32_t, uint32_t>;
     static phone_auto_key auto_key(const rpc_phone_input_key & key) {
         return std::make_tuple(key.run_id, key.region, key.chunk);
@@ -5952,6 +5987,13 @@ private:
     ggml_backend_ptr phone_npu_backend;
     std::unique_ptr<ggml_phone_npu_serial::full_region_executor>
         phone_npu_executor;
+    bool phone_npu_async_preload = false;
+    // The async preloader never takes graph_compute_mutex during REPACK,
+    // so PC graph/task registration cannot be serialized behind ~2s of
+    // HTP weight copies. Backend operations and source-buffer lifetime are
+    // guarded separately.
+    std::mutex phone_npu_backend_mutex;
+    std::mutex phone_npu_weight_source_mutex;
 
     std::mutex phone_region_main_mutex;
     std::condition_variable phone_region_main_cv;
@@ -6045,6 +6087,9 @@ private:
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
+    std::thread phone_npu_preload_thread;
+    std::map<std::pair<uint64_t, uint32_t>, phone_npu_preload_job>
+        phone_npu_preload_jobs; // guarded by phone_auto_mutex
     bool phone_auto_stop = false;
 
     struct phone_stage_rx_write {
@@ -6537,6 +6582,9 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     phone_stage_wait_idle();
     std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
+    // A detached preload job may still be copying a weight from this
+    // OpenCL buffer. Never release its backing storage until copy ends.
+    std::lock_guard<std::mutex> weight_guard(phone_npu_weight_source_mutex);
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -6559,6 +6607,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     phone_stage_wait_idle();
     std::lock_guard<std::mutex> source_guard(phone_stage_source_mutex);
+    std::lock_guard<std::mutex> weight_guard(phone_npu_weight_source_mutex);
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
@@ -6710,6 +6759,7 @@ bool rpc_server::phone_input_stream_run(
         // The PC may use the ordinary OpenCL decode Graph after prefill.
         // Without this copy its Phone KV would be stale after HTP execution.
         std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
         if (request.active) {
             phone_npu_executor->reset_kv();
         } else {
@@ -12107,6 +12157,9 @@ rpc_server::~rpc_server() {
     }
     if (phone_auto_compute_thread.joinable()) {
         phone_auto_compute_thread.join();
+    }
+    if (phone_npu_preload_thread.joinable()) {
+        phone_npu_preload_thread.join();
     }
     {
         std::lock_guard<std::mutex> lock(phone_region_main_mutex);
