@@ -8112,6 +8112,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                  << R"(,"tokens":)" << ubatch.n_tokens
                  << R"(,"clock":"PC_GGML_TIME_US")"
                  << R"(,"time_origin":"BEFORE_READY_INIT")"
+                 << R"(,"clock_origin_us":)" << ring_trace_origin_us
                  << R"(,"ring_start_ms":)"
                  << (begin_us - ring_trace_origin_us) / 1000.0
                  << R"(,"ring_wall_ms":)"
