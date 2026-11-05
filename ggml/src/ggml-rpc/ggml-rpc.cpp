@@ -14,6 +14,7 @@
 #include "phone-autonomous-policy.h"
 #include "phone-npu-serial-policy.h"
 #include "phone-npu-serial-executor.h"
+#include "phone-owned-execution-plan.h"
 
 #include <array>
 #include <chrono>
@@ -362,6 +363,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_TASK_REGISTER,
     RPC_CMD_PHONE_AUTO_WAIT,
     RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
+    RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
     RPC_CMD_COUNT,
 };
 
@@ -399,6 +401,7 @@ static_assert(RPC_CMD_PHONE_AUTO_GRAPH_REGISTER == 49, "RPC_CMD_PHONE_AUTO_GRAPH
 static_assert(RPC_CMD_PHONE_AUTO_TASK_REGISTER == 50, "RPC_CMD_PHONE_AUTO_TASK_REGISTER index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
+static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -440,6 +443,25 @@ struct rpc_msg_phone_auto_task_req {
     uint32_t token_begin = 0;
     uint32_t n_tokens = 0;
 };
+// Explicit packed wire type; the public API struct is not a wire ABI.
+struct rpc_msg_phone_owned_plan_req {
+    uint32_t version = 0;
+    uint32_t flags = 0;
+    uint64_t run_id = 0;
+    uint64_t p2c_run_id = 0;
+    uint32_t region = 0;
+    uint32_t layer = 0;
+    uint32_t total_tokens = 0;
+    uint32_t chunk_tokens = 0;
+    uint32_t n_embd = 0;
+    uint32_t position_base = 0;
+    uint32_t kv_capacity = 0;
+    uint32_t n_heads = 0;
+    uint32_t n_heads_kv = 0;
+    uint32_t head_dim = 0;
+};
+static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 64,
+              "Phone-owned plan wire ABI changed; bump RPC protocol");
 static_assert(sizeof(rpc_msg_phone_auto_task_req) == 60,
               "Autonomous task registration ABI changed; bump RPC protocol");
 struct rpc_msg_phone_auto_wait_req {
@@ -4224,6 +4246,42 @@ static bool ggml_backend_rpc_phone_auto_graph_register(
     return ok;
 }
 
+// A plan is registered once per Phone Region before its individual Chunk
+// graphs. The RPC-visible client remains a simple transport; Phone owns the
+// authoritative validation and registry.
+static bool ggml_backend_rpc_phone_owned_plan_register(
+        ggml_backend_t backend,
+        const ggml_backend_rpc_phone_owned_plan * plan) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
+            plan == nullptr) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (ctx == nullptr) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 27) {
+        return false;
+    }
+    rpc_msg_phone_owned_plan_req req {};
+    req.version       = plan->version;
+    req.flags         = plan->flags;
+    req.run_id        = plan->run_id;
+    req.p2c_run_id    = plan->p2c_run_id;
+    req.region        = plan->region;
+    req.layer         = plan->layer;
+    req.total_tokens  = plan->total_tokens;
+    req.chunk_tokens  = plan->chunk_tokens;
+    req.n_embd        = plan->n_embd;
+    req.position_base = plan->position_base;
+    req.kv_capacity   = plan->kv_capacity;
+    req.n_heads       = plan->n_heads;
+    req.n_heads_kv    = plan->n_heads_kv;
+    req.head_dim      = plan->head_dim;
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
+}
+
 static bool ggml_backend_rpc_phone_auto_task_register(
         ggml_backend_t backend, uint64_t run_id, uint32_t region,
         uint32_t chunk, uint64_t graph_uid, size_t expected_input_bytes,
@@ -5812,6 +5870,7 @@ public:
     bool phone_input_push(const std::vector<uint8_t> & input,
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
+    bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
     bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
     bool phone_auto_wait_capture(
@@ -6083,6 +6142,8 @@ private:
     // regions are evaluated on HTP instead of GPU, never concurrently.
     std::set<uint32_t> phone_npu_serial_regions;
     std::unordered_map<uint32_t, int> phone_npu_region_layer;
+    // Immutable shadow plans, guarded by graph_compute_mutex.
+    ggml_phone_owned::registry phone_owned_plans;
     ggml_backend_ptr phone_npu_backend;
     std::unique_ptr<ggml_phone_npu_serial::full_region_executor>
         phone_npu_executor;
@@ -7097,6 +7158,12 @@ bool rpc_server::phone_input_stream_run(
                 } else { ++it; }
             }
         }
+        // Clear shadow descriptors on the same stream teardown as the
+        // Phone autonomous jobs. No state is retained across RUN IDs.
+        {
+            std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
+            phone_owned_plans.erase_run(request.run_id);
+        }
         phone_auto_cv.notify_all();
         if (auto_jobs_total > 0) {
             GGML_LOG_INFO(
@@ -7132,6 +7199,69 @@ bool rpc_server::phone_input_stream_run(
 // Bind an exact per-Chunk RPC graph to the verified input stream. The
 // registered graph must have a private, writable inp_stage leaf and a complete
 // dual-slot plan: never guess graph UID, KV offsets, or tensor ownership.
+bool rpc_server::phone_owned_plan_register(
+        const rpc_msg_phone_owned_plan_req & request) {
+    ggml_phone_owned::region_plan plan {};
+    plan.version       = request.version;
+    plan.flags         = request.flags;
+    plan.run_id        = request.run_id;
+    plan.p2c_run_id    = request.p2c_run_id;
+    plan.region        = request.region;
+    plan.layer         = request.layer;
+    plan.total_tokens  = request.total_tokens;
+    plan.chunk_tokens  = request.chunk_tokens;
+    plan.n_embd        = request.n_embd;
+    plan.position_base = request.position_base;
+    plan.kv_capacity   = request.kv_capacity;
+    plan.n_heads       = request.n_heads;
+    plan.n_heads_kv    = request.n_heads_kv;
+    plan.head_dim      = request.head_dim;
+
+    const char * reason = "NONE";
+    if (!ggml_phone_owned::validate(plan, reason)) {
+        GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
+                       " region=%u reason=%s\n",
+                       plan.run_id, plan.region, reason);
+        return false;
+    }
+    if (!ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, plan.region) ||
+            phone_npu_executor == nullptr ||
+            !phone_npu_executor->has_backend()) {
+        GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
+                       " region=%u reason=HTP_REGION_UNAVAILABLE\n",
+                       plan.run_id, plan.region);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (!phone_input_stream_runs.count(plan.run_id)) {
+            GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
+                           " region=%u reason=INPUT_SESSION_NOT_ACTIVE\n",
+                           plan.run_id, plan.region);
+            return false;
+        }
+    }
+    // Shadow-only: avoid racing the existing Graph and NPU life cycle.
+    std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+    if (!phone_owned_plans.add(plan, reason)) {
+        GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
+                       " region=%u reason=%s\n",
+                       plan.run_id, plan.region, reason);
+        return false;
+    }
+    GGML_LOG_INFO("[PHONE_OWNED_PLAN] event=REGISTER run=%" PRIu64
+                  " p2c_run=%" PRIu64
+                  " region=%u layer=%u chunks=%u chunk_tokens=%u"
+                  " n_embd=%u pos=%u kv_capacity=%u"
+                  " graph_mode=SHADOW_PC_BUILT status=READY\n",
+                  plan.run_id, plan.p2c_run_id, plan.region,
+                  plan.layer, ggml_phone_owned::chunk_count(plan),
+                  plan.chunk_tokens, plan.n_embd,
+                  plan.position_base, plan.kv_capacity);
+    return true;
+}
+
 bool rpc_server::phone_auto_task_register(
         const rpc_msg_phone_auto_task_req & request) {
     const int64_t register_begin_us =
@@ -7156,6 +7286,20 @@ bool rpc_server::phone_auto_task_register(
             request.token_begin > UINT32_MAX - request.n_tokens ||
             request.input_bytes != request.output_bytes) {
         return reject("INVALID_REQUEST_OR_OUTPUT_SHAPE");
+    }
+    // A registered shadow plan constrains legacy graph admission too. This
+    // establishes exact Chunk/KV metadata parity before local construction.
+    {
+        std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+        const auto * plan = phone_owned_plans.find(
+            request.key.run_id, request.key.region);
+        if (plan != nullptr &&
+                !ggml_phone_owned::matches_chunk(
+                    *plan, request.key.chunk, request.token_begin,
+                    request.n_tokens, request.p2c_run_id,
+                    request.input_bytes, request.output_bytes)) {
+            return reject("PHONE_OWNED_PLAN_CHUNK_MISMATCH");
+        }
     }
     if (request.device >= stored_graphs.size() ||
             request.device >= phone_stage_device_arenas.size()) {
@@ -13340,6 +13484,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_OWNED_PLAN_REGISTER: {
+                rpc_msg_phone_owned_plan_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_owned_plan_register(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
                 rpc_msg_phone_auto_task_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -13783,6 +13936,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_input_ack response {};
                 response.accepted =
                     server.graph_compute(graph, true) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_PLAN_REGISTER: {
+                rpc_msg_phone_owned_plan_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_owned_plan_register(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
@@ -14916,6 +15078,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_graph_register);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_plan_register);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_task_register);
