@@ -600,6 +600,7 @@ public:
         double compute_ms = 0.0;
         double compare_ms = 0.0;
         ggml_phone_qwen3::parity_stats parity {};
+        ggml_phone_qwen3::feature_error_stats feature {};
         uint32_t tokens = 0;
         uint32_t layer = 0;
     };
@@ -686,6 +687,12 @@ public:
         profile.layer = p.layer;
         if (!finite) {
             reason = "PHONE_LOCAL_EXEC_NONFINITE_OUTPUT";
+            return false;
+        }
+        if (!ggml_phone_qwen3::compare_feature_errors(
+                ref.data(), got.data(), count, p.n_embd,
+                profile.parity, profile.feature)) {
+            reason = "PHONE_LOCAL_EXEC_FEATURE_ATTRIBUTION_FAILED";
             return false;
         }
         // Only commit this state after a completed HTP run and comparison.
