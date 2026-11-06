@@ -39,6 +39,34 @@
 #include <algorithm>
 #include <stdexcept>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
+// Shared with llama-context.cpp's independent Bank Mover and PUSH switches.
+// Server-side Android binaries do not change scheduler priority.
+static void rpc_p2c_maybe_raise_current_thread_priority() {
+#if defined(_WIN32)
+    const char * value =
+        std::getenv("LLAMA_REGION_RING_PRIORITY_P2C_RECV");
+    if (value == nullptr || std::strcmp(value, "1") != 0) {
+        return;
+    }
+    const BOOL ok = SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    const DWORD error = ok ? 0 : GetLastError();
+    GGML_LOG_INFO(
+        "[REGION_RING_THREAD_PRIORITY] role=P2C_RECV tid=%lu"
+        " requested=ABOVE_NORMAL status=%s error=%lu\n",
+        static_cast<unsigned long>(GetCurrentThreadId()),
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long>(error));
+#endif
+}
+
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
 static bool rpc_phone_stage_prepare_ahead_enabled() {
@@ -3442,6 +3470,7 @@ static void * ggml_backend_rpc_p2c_stream_start(
     try {
         stream->receiver = std::thread(
             [stream, n_regions, n_tokens, n_embd, resolve]() {
+                rpc_p2c_maybe_raise_current_thread_priority();
                 ggml_rpc_p2c_stream_receiver receiver(
                     stream->run_id, n_regions, n_tokens, n_embd,
                     resolve, stream->complete, stream->userdata,

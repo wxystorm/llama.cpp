@@ -678,6 +678,9 @@ def main():
                                           "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL",
                                           "LLAMA_REGION_RING_PHONE_INPUT_PUSH",
                                           "LLAMA_REGION_RING_PHONE_INPUT_STREAM",
+                                          "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
+                                          "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH",
+                                          "LLAMA_REGION_RING_PRIORITY_P2C_RECV",
                                           "LLAMA_REGION_RING_PHONE_COPY_TRACE",
                                           "LLAMA_REGION_RING_PREPARE_BREAKDOWN")
                                  or k in ("GGML_META_PHONE_FULL_ADD_FUSION",

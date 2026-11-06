@@ -613,6 +613,56 @@ Expect **16** measured Phone Chunk timeline rows, **16** P2C send rows,
 **16** PC P2C receive rows, and all 32 Ring task traces, without a
 change to Prefill output or Decode.
 
+## Opt-in PC thread-priority A/B (Windows only)
+
+Three independent environment switches raise **only the current role's
+thread** from Windows `THREAD_PRIORITY_NORMAL` to
+`THREAD_PRIORITY_ABOVE_NORMAL`. They are applied at the **thread entry**,
+before its first task, and are disabled by default. No scheduling behavior,
+RPC bytes, CUDA APIs, phone HTP priority, process priority class, or thread
+affinity changes when the switches are unset. Linux/Android builds ignore
+these switches.
+
+PC PowerShell, configure **before running** the existing 512-token sweep:
+
+```powershell
+# A: unmodified baseline (recommended first)
+Remove-Item Env:LLAMA_REGION_RING_PRIORITY_BANK_MOVER -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_REGION_RING_PRIORITY_PHONE_PUSH -ErrorAction SilentlyContinue
+Remove-Item Env:LLAMA_REGION_RING_PRIORITY_P2C_RECV -ErrorAction SilentlyContinue
+
+# B: only the CPU/pinned staging Bank Mover
+$env:LLAMA_REGION_RING_PRIORITY_BANK_MOVER = "1"
+
+# C: only the C2P network PUSH thread (disable BANK_MOVER first)
+# $env:LLAMA_REGION_RING_PRIORITY_PHONE_PUSH = "1"
+
+# D: only the P2C PC receiver (disable other switches first)
+# $env:LLAMA_REGION_RING_PRIORITY_P2C_RECV = "1"
+```
+
+Enabled threads emit exactly one entry per thread instance in
+`engine.stderr.log`:
+
+`[REGION_RING_THREAD_PRIORITY] role=BANK_MOVER|PHONE_PUSH|P2C_RECV
+tid=<Windows thread ID> requested=ABOVE_NORMAL status=PASS error=0`
+
+The sweep also records all three flags in
+`prompt_512/config.json -> ring_environment` when set.
+This helps match WPR context switches to the exact role and verify
+that a run did not accidentally inherit flags from an older session.
+
+Run each configuration at least 5 times with identical model, prompt,
+layout, warmup, CUDA bank and Phone settings. Compare median and p95
+`prefill_ms`, `bank_stage_cpu_copy_ms`,
+`gpu_bank_wait_ms` and P2C/C2P long tails. When the Bank Mover thread
+is not runnable due to a hard page fault, CUDA event synchronization,
+or another blocking wait, raising thread priority cannot make it run.
+Priorities also do not increase PCIe or memory bandwidth. Do **not** set
+`REALTIME_PRIORITY_CLASS` or `THREAD_PRIORITY_TIME_CRITICAL`.
+If only enabled roles improve, keep them optional until repeated parity
+and performance testing confirms the benefit.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a

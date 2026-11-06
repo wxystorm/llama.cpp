@@ -40,6 +40,13 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 //
 // llama_context
 //
@@ -50,6 +57,31 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+// Opt-in per-role Windows scheduler A/B. Leave the process priority class
+// unchanged so Bank Mover/PUSH can be compared independently. Setting the
+// priority inside each thread guarantees it precedes its first Chunk.
+static void llama_region_ring_maybe_raise_current_thread_priority(
+        const char * env_name, const char * role) {
+#if defined(_WIN32)
+    const char * value = std::getenv(env_name);
+    if (value == nullptr || std::strcmp(value, "1") != 0) {
+        return;
+    }
+    const BOOL ok = SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    const DWORD error = ok ? 0 : GetLastError();
+    LLAMA_LOG_INFO(
+        "[REGION_RING_THREAD_PRIORITY] role=%s tid=%lu"
+        " requested=ABOVE_NORMAL status=%s error=%lu\n",
+        role, static_cast<unsigned long>(GetCurrentThreadId()),
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long>(error));
+#else
+    (void) env_name;
+    (void) role;
+#endif
 }
 
 static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_kind kind) {
@@ -6401,6 +6433,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             };
 
         auto run_gpu_bank_mover = [&]() {
+            llama_region_ring_maybe_raise_current_thread_priority(
+                "LLAMA_REGION_RING_PRIORITY_BANK_MOVER", "BANK_MOVER");
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_BANK_MOVER] event=START "
                 "role=CPU_SINGLE banks=2 mapping=FIXED_PARITY "
@@ -6669,6 +6703,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         size_t phone_push_missed = 0;
         uint64_t phone_push_bytes = 0;
         auto run_phone_input_pusher = [&]() {
+            llama_region_ring_maybe_raise_current_thread_priority(
+                "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
             try {
                 while (const auto next = ready.wait_take_input_push()) {
                     const auto & job = *next;
