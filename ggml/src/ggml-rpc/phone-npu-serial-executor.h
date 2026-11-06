@@ -675,8 +675,8 @@ public:
                 ggml_backend_buffer_is_host(t->buffer) == false;
         };
         if (ambiguous || !valid(canonical_k) || !valid(canonical_v) ||
-                canonical_k->buffer == canonical_v->buffer &&
-                canonical_k->data == canonical_v->data) {
+                (canonical_k->buffer == canonical_v->buffer &&
+                 canonical_k->data == canonical_v->data)) {
             reason = ambiguous ?
                 "PHONE_LOCAL_KV_AMBIGUOUS_CANONICAL" :
                 "PHONE_LOCAL_KV_CANONICAL_LAYOUT_MISMATCH";
@@ -707,6 +707,10 @@ public:
                 return false;
             }
             *dst = op->src[1];
+        }
+        if (chunk >= ggml_phone_owned::chunk_count(p)) {
+            reason = "PHONE_LOCAL_KV_CHUNK_OUT_OF_RANGE";
+            return false;
         }
         const uint32_t expected_tokens =
             std::min<uint32_t>(
@@ -857,12 +861,11 @@ public:
                 chunk_state.canonical_v_indices }) {
             ggml_backend_tensor_get(src, slot_indices.data(), 0,
                                     slot_indices.size() * sizeof(int64_t));
-            for (uint32_t t = 0; t < g.tokens; ++t) {
-                const int64_t expected = int64_t(g.token_begin) + t;
-                if (slot_indices[t] != expected) {
-                    reason = "PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS";
-                    return false;
-                }
+            if (!ggml_phone_owned::identity_kv_slots(
+                    slot_indices.data(), slot_indices.size(),
+                    g.token_begin)) {
+                reason = "PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS";
+                return false;
             }
         }
         const size_t bytes =
@@ -890,6 +893,12 @@ public:
         // aliasing bug found in the initial post-compute A/B experiment.
         ggml_backend_tensor_get(input, activation.data(), 0, bytes);
         profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
+        for (float value : activation) {
+            if (!std::isfinite(value)) {
+                reason = "PHONE_LOCAL_ONLY_NONFINITE_INPUT";
+                return false;
+            }
+        }
 
         const int64_t upload_begin = ggml_time_us();
         ggml_backend_tensor_set(g.input, activation.data(), 0, bytes);
