@@ -8572,6 +8572,13 @@ void rpc_server::phone_auto_compute_loop() {
                                 "PHONE_LOCAL_EXEC_FAILED" : local_reason;
                             ok = false;
                         }
+                        // In actual local-P2C mode, the compute lane remains
+                        // occupied through local HTP compute and output
+                        // publication. Excluding this work from the Chunk
+                        // timeline would overstate pipeline overlap.
+                        if (local_p2c && phone_chunk_timeline_enabled) {
+                            task->npu_exec_end_us = ggml_time_us();
+                        }
                     }
                 }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
