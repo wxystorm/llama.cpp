@@ -79,8 +79,8 @@ int main() {
         CHECK(g.cache_v->ne[0] == 1024);
         CHECK(g.output->ne[0] == 5120 && g.output->ne[1] == 128);
         int set_rows = 0, flash = 0, rope = 0, glu = 0;
-        for (int n = 0; n < g.graph->n_nodes; ++n) {
-            switch (g.graph->nodes[n]->op) {
+        for (int n = 0; n < ggml_graph_n_nodes(g.graph); ++n) {
+            switch (ggml_graph_node(g.graph, n)->op) {
                 case GGML_OP_SET_ROWS: ++set_rows; break;
                 case GGML_OP_FLASH_ATTN_EXT: ++flash; break;
                 case GGML_OP_ROPE: ++rope; break;
