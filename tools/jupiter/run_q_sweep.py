@@ -421,6 +421,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-chunk", type=int, default=32)
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--pc-layers", type=int, default=25)
+    p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--repeats", type=int, default=1)
 
     p.add_argument("--out-dir", default="jupiter-q-sweep")
@@ -445,7 +446,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    if args.min_chunk <= 0 or args.max_chunk < args.min_chunk:
+    if (args.min_chunk <= 0 or args.max_chunk < args.min_chunk
+            or args.cpu_layers < 0 or args.cpu_layers >= args.pc_layers):
         raise SystemExit(
             f"invalid chunk range [{args.min_chunk},{args.max_chunk}]"
         )
@@ -494,6 +496,7 @@ def main() -> int:
     base_env = os.environ.copy()
     base_env["LLAMA_JUPITER_PREFILL"] = "1"
     base_env["LLAMA_JUPITER_PC_LAYERS"] = str(args.pc_layers)
+    base_env["LLAMA_JUPITER_CPU_LAYERS"] = str(args.cpu_layers)
     base_env["LLAMA_JUPITER_WINDOW"] = "1"
     base_env["LLAMA_JUPITER_TRACE"] = "1"
     base_env["LLAMA_JUPITER_PROFILE_STAGE"] = "1"
@@ -597,7 +600,7 @@ def run_sweep_for_length(
     # will not reuse CSVs from a different prompt, hardware split or length.
     signature_input = "\\n".join([
         prompt_text, str(model), args.rpc,
-        str(args.pc_layers), str(args.batch),
+        str(args.pc_layers), str(args.cpu_layers), str(args.batch),
         str(args.context), str(args.threads),
         str(args.max_chunk), str(args.min_chunk),
     ])
@@ -761,7 +764,8 @@ def run_sweep_for_length(
             "sequence",
             "--profile", str(profile_path),
             "--output", str(plan_output),
-            "--devices", "2",
+            "--devices", str(3 if args.cpu_layers else 2),
+            *(["--require-cpu-stage"] if args.cpu_layers else []),
             "--min-chunk", str(args.min_chunk),
             "--max-chunk", str(args.max_chunk),
             "--target-length", str(total_tokens),
@@ -770,8 +774,12 @@ def run_sweep_for_length(
         # profiling. Keep both decisions in the same runtime plan, rather
         # than silently inheriting an older model.pc_layers value.
         from jupiter_planner import _write_plan
-        _write_plan(str(plan_output), {"model.pc_layers": str(args.pc_layers)})
-        print(f"[JUPITER_SWEEP_DP] plan={plan_output} pc_layers={args.pc_layers}", flush=True)
+        _write_plan(str(plan_output), {
+            "model.pc_layers": str(args.pc_layers),
+            "model.cpu_layers": str(args.cpu_layers),
+        })
+        print(f"[JUPITER_SWEEP_DP] plan={plan_output} pc_layers={args.pc_layers} "
+              f"cpu_layers={args.cpu_layers}", flush=True)
         print(plan_output.read_text(encoding="utf-8"), end="")
 
     return 0
