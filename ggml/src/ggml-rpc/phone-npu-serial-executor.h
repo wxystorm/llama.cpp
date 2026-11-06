@@ -878,6 +878,7 @@ public:
                 (!direct && direct_input_floats != 0) ||
                 !g.input || !g.output ||
                 !g.input->buffer || !g.output->buffer ||
+                g.input->type != GGML_TYPE_F32 ||
                 g.output->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(g.input) ||
                 !ggml_is_contiguous(g.output) ||
