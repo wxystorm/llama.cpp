@@ -103,13 +103,17 @@ public:
         return true;
     }
 
-    bool begin_chunk(size_t rank, uint32_t chunk) {
+    bool begin_chunk(size_t rank, uint32_t chunk,
+                     uint64_t graph_bank_generation) {
         if (rank >= regions_.size() || active_rank_.has_value()) {
             return false; // one HTP compute lane, never dual Graph compute
         }
         auto & b = states_[bank_for_rank(rank)];
+        // A precompiled Graph bound to an older Bank generation must never
+        // be executed after the physical storage has been recycled.
         if (b.state != phase::READY || b.rank != rank ||
-                chunk != b.next_chunk) { return false; }
+                chunk != b.next_chunk ||
+                graph_bank_generation != b.generation) { return false; }
         b.state = phase::COMPUTING;
         active_rank_ = rank;
         return true;
