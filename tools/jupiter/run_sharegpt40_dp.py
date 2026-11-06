@@ -67,13 +67,12 @@ def feasible_min_chunk(total: int, preferred: int, maximum: int) -> int:
 
 
 def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
-    return {
+    identity = {
         "group": group, "prompt": str(prompt),
         "prompt_sha256": sha256_bytes(prompt.read_bytes()),
         "exe": input_identity(Path(args.exe)),
         "model": input_identity(Path(args.model)),
         "rpc": args.rpc, "pc_layers": args.pc_layers,
-        "cpu_layers": args.cpu_layers,
         "preferred_min_chunk": args.min_chunk,
         "max_chunk": args.max_chunk, "ubatch": args.ubatch,
         "batch": args.batch, "context": args.context,
@@ -82,6 +81,10 @@ def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
         "refine_repeats": args.refine_repeats,
         "graph_prebuild": args.graph_prebuild,
     }
+    # Preserve legacy two-device case hashes for CPU=0 resumes.
+    if args.cpu_layers:
+        identity["cpu_layers"] = args.cpu_layers
+    return identity
 
 
 def existing_rows(path: Path) -> dict[str, dict[str, str]]:
