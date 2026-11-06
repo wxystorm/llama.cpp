@@ -75,6 +75,13 @@ inline bool compare_outputs(const float * reference,
 }
 
 
+// A fail-closed gate for the first local-output P2C switch. No tolerance
+// expansion is allowed until a new explicit, measured parity policy exists.
+inline bool can_publish_exact(const parity_stats & stats) {
+    return stats.count != 0 && stats.nonfinite == 0 &&
+        std::isfinite(stats.max_abs) && stats.max_abs == 0.0;
+}
+
 struct feature_error_stats {
     size_t feature = 0;
     size_t worst_token = 0;
