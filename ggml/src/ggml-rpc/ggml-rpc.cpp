@@ -6971,8 +6971,37 @@ bool rpc_server::phone_input_stream_run(
                 "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
                 " bytes=%zu status=PASS\n",
                 request.run_id, kv_bytes);
-            // The optional Phone-owned Graphs have not executed in this
-            // phase; reclaim their fixed buffers after all legacy work.
+            const char * local_only_env =
+                std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+            const bool local_only = local_only_env != nullptr &&
+                std::strcmp(local_only_env, "1") == 0;
+            if (local_only) {
+                // At this boundary the PC has received every Phone P2C
+                // Chunk and is about to start decode. The baseline HTP
+                // Graph was never run, so *only* local HTP KV is valid.
+                size_t owned_bytes = 0;
+                size_t owned_regions = 0;
+                std::string owned_reason;
+                const bool synced =
+                    phone_npu_executor->synchronize_owned_decode_kv(
+                        request.run_id, owned_reason,
+                        owned_bytes, owned_regions);
+                if (synced && !backends.empty()) {
+                    ggml_backend_synchronize(backends[0]);
+                }
+                GGML_LOG_INFO(
+                    "[PHONE_QWEN3_LOCAL] event=KV_SYNC"
+                    " run=%" PRIu64 " regions=%zu bytes=%zu"
+                    " from=PHONE_LOCAL_HTP to=OPENCL_DECODE"
+                    " mode=LOCAL_ONLY status=%s reason=%s\n",
+                    request.run_id, owned_regions, owned_bytes,
+                    synced ? "PASS" : "FAIL",
+                    synced ? "NONE" : owned_reason.c_str());
+                if (!synced) { return false; }
+            }
+            // In local-only mode this releases the owned HTP KV only AFTER
+            // writeback and OpenCL synchronization. In the A/B path it
+            // merely releases experiment scratch after legacy KV sync.
             phone_npu_executor->release_owned_htp_graphs();
         }
     }
