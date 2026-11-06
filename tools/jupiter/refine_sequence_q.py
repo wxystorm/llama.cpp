@@ -179,7 +179,7 @@ def build_resume_config(
     Used by the Stage-3 wrapper as well as by this standalone refiner so
     they cannot disagree about resume eligibility.
     """
-    return {
+    config = {
         "exe": str(exe), "exe_size": exe.stat().st_size,
         "exe_mtime_ns": exe.stat().st_mtime_ns,
         "model": str(model), "rpc": args.rpc,
@@ -188,13 +188,15 @@ def build_resume_config(
         "profile_sha256": hashlib.sha256(source_profile.read_bytes()).hexdigest(),
         "total": total, "metric": args.metric,
         "pc_layers": args.pc_layers,
-        "cpu_layers": getattr(args, "cpu_layers", 0),
         "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
         "max_subsequences": args.max_subsequences,
         "repeats": args.repeats,
         "batch": args.batch, "context": args.context,
         "threads": args.threads, "extra_arg": args.extra_arg,
     }
+    if getattr(args, "cpu_layers", 0):
+        config["cpu_layers"] = args.cpu_layers
+    return config
 
 
 def main() -> int:
