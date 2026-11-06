@@ -8363,6 +8363,7 @@ void rpc_server::phone_auto_compute_loop() {
                     const bool fixed_reference =
                         phone_npu_executor->has_registered_chunk(req.graph_uid);
                     std::vector<float> pre_compute_activation;
+                    double pre_compute_capture_ms = 0.0;
                     if (local_ab && !fixed_reference) {
                         why = "PHONE_LOCAL_AB_REQUIRES_FIXED_REFERENCE_GRAPH";
                         ok = false;
@@ -8372,7 +8373,8 @@ void rpc_server::phone_auto_compute_loop() {
                             stage_ms, htp_ms, return_ms,
                             stage_profile_enabled ? &stage_profile : nullptr,
                             local_ab ? task->input_graph_tensor : nullptr,
-                            local_ab ? &pre_compute_activation : nullptr);
+                            local_ab ? &pre_compute_activation : nullptr,
+                            local_ab ? &pre_compute_capture_ms : nullptr);
                     } else {
                         ok = phone_npu_executor->run(
                             it->second.graph, output, why,
@@ -8398,6 +8400,10 @@ void rpc_server::phone_auto_compute_loop() {
                                 req.key.chunk, pre_compute_activation.data(),
                                 pre_compute_activation.size(),
                                 output, local_reason, local_stats);
+                        // Measurement is captured during baseline input
+                        // binding; the local executor deliberately performs
+                        // no extra OpenCL input read after baseline compute.
+                        local_stats.input_read_ms = pre_compute_capture_ms;
                         GGML_LOG_INFO(
                             "[PHONE_QWEN3_LOCAL] event=EXECUTE_AB"
                             " run=%" PRIu64 " region=%u layer=%u"
