@@ -7641,7 +7641,7 @@ bool rpc_server::phone_auto_task_register(
         const bool bound = phone_npu_executor != nullptr &&
             phone_npu_executor->bind_owned_decode_kv(
                 request.key.run_id, request.key.region,
-                it->second.graph, bind_reason);
+                request.key.chunk, it->second.graph, bind_reason);
         GGML_LOG_INFO(
             "[PHONE_QWEN3_LOCAL] event=KV_BIND run=%" PRIu64
             " region=%u chunk=%u layer=%d"
