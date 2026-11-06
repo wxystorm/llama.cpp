@@ -130,6 +130,10 @@ add_executable(test-phone-qwen3-local-builder test-phone-qwen3-local-builder.cpp
 target_link_libraries(test-phone-qwen3-local-builder PRIVATE ggml)
 llama_test(test-phone-qwen3-local-builder LABEL region-ring)
 
+# Pure F32 output parity metrics, including invalid/nonfinite cases.
+add_executable(test-phone-qwen3-local-parity test-phone-qwen3-local-parity.cpp)
+llama_test(test-phone-qwen3-local-parity LABEL region-ring)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 
