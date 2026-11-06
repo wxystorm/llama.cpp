@@ -152,6 +152,7 @@ static offline_config parse_args(int argc, char ** argv) {
     o.limits.local_max_anchors = read_size(args, "--local-anchors", 32);
     o.limits.throughput_per_cycle = read_size(args, "--throughput-dag", 12);
     o.limits.retain_top = read_size(args, "--top", 100);
+    o.limits.include_baseline_candidate = true;
     if (o.layers < 6 || o.tokens < 1 || o.hidden < 1 || o.kv_start < 0 ||
             o.max_npu_region_layers < 1 || o.e_margin < 0 ||
             o.max_dag <= 0 || o.min_dag < 0 ||
