@@ -736,7 +736,7 @@ public:
             });
             return records;
         }
-        const auto find_named = [&](const ggml_cgraph * graph,
+        const auto find_named = [&](ggml_cgraph * graph,
                                     const char * stage,
                                     bool & ambiguous) -> const ggml_tensor * {
             ambiguous = false;
