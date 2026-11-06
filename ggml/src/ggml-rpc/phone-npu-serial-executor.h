@@ -5,6 +5,7 @@
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "phone-qwen3-local-builder.h"
+#include "phone-qwen3-local-parity.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -590,6 +591,106 @@ public:
                 std::move(pending[chunk]));
         }
         reason.clear();
+        return true;
+    }
+
+    struct local_exec_profile {
+        double input_read_ms = 0.0;
+        double input_upload_ms = 0.0;
+        double compute_ms = 0.0;
+        double compare_ms = 0.0;
+        parity_stats parity {};
+        uint32_t tokens = 0;
+        uint32_t layer = 0;
+    };
+
+    // REAL HTP execution of the Phone-constructed graph. The caller has
+    // synchronized the canonical OpenCL input and holds the HTP mutex.
+    // This path has its OWN KV and DOES NOT change the canonical OpenCL
+    // output or the legacy HTP KV: the old path remains the P2C producer.
+    // A/B measurements cover the same input activation and the complete
+    // per-region FIFO sequence (including dependencies on earlier KV rows).
+    bool run_owned_htp_chunk(uint64_t run_id, uint32_t region, uint32_t chunk,
+                             const ggml_tensor * input,
+                             const ggml_tensor * reference_output,
+                             std::string & reason,
+                             local_exec_profile & profile) {
+        reason.clear();
+        profile = {};
+        const auto key = std::make_pair(run_id, region);
+        const auto kit = owned_kv_.find(key);
+        const auto git = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (kit == owned_kv_.end() || git == owned_graphs_.end()) {
+            reason = "PHONE_LOCAL_EXEC_GRAPH_NOT_PREPARED";
+            return false;
+        }
+        auto & state = *kit->second;
+        auto & item = *git->second;
+        const auto & p = state.plan;
+        const auto & g = item.built;
+        if (state.next_chunk != chunk ||
+                chunk >= ggml_phone_owned::chunk_count(p) ||
+                g.token_begin != uint64_t(chunk) * p.chunk_tokens ||
+                g.tokens != std::min<uint32_t>(
+                    p.chunk_tokens, p.total_tokens - g.token_begin) ||
+                g.cache_k != state.k || g.cache_v != state.v) {
+            reason = "PHONE_LOCAL_EXEC_KV_FIFO_OR_BINDING_MISMATCH";
+            return false;
+        }
+        const size_t bytes = uint64_t(g.tokens) * p.n_embd * sizeof(float);
+        if (!input || !reference_output || !g.input || !g.output ||
+                g.input->buffer == nullptr || g.output->buffer == nullptr ||
+                input->type != GGML_TYPE_F32 ||
+                reference_output->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(input) ||
+                !ggml_is_contiguous(reference_output) ||
+                !ggml_is_contiguous(g.input) ||
+                !ggml_is_contiguous(g.output) ||
+                ggml_nbytes(input) != bytes ||
+                ggml_nbytes(g.input) != bytes ||
+                ggml_nbytes(g.output) != bytes ||
+                ggml_nbytes(reference_output) != bytes) {
+            reason = "PHONE_LOCAL_EXEC_ACTIVATION_CONTRACT";
+            return false;
+        }
+        const size_t count = bytes / sizeof(float);
+        std::vector<float> src(count);
+        std::vector<float> ref(count);
+        std::vector<float> got(count);
+
+        const int64_t read_begin = ggml_time_us();
+        ggml_backend_tensor_get(input, src.data(), 0, bytes);
+        profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
+        const int64_t upload_begin = ggml_time_us();
+        ggml_backend_tensor_set(g.input, src.data(), 0, bytes);
+        ggml_backend_synchronize(backend_);
+        profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
+
+        const int64_t compute_begin = ggml_time_us();
+        const ggml_status code = ggml_backend_graph_compute(backend_, g.graph);
+        ggml_backend_synchronize(backend_);
+        profile.compute_ms = (ggml_time_us() - compute_begin) / 1000.0;
+        if (code != GGML_STATUS_SUCCESS) {
+            reason = "PHONE_LOCAL_EXEC_HTP_COMPUTE_FAILED";
+            return false;
+        }
+
+        const int64_t compare_begin = ggml_time_us();
+        ggml_backend_tensor_get(reference_output, ref.data(), 0, bytes);
+        ggml_backend_tensor_get(g.output, got.data(), 0, bytes);
+        const bool finite = compare_outputs(
+            ref.data(), got.data(), count, profile.parity);
+        profile.compare_ms = (ggml_time_us() - compare_begin) / 1000.0;
+        profile.tokens = g.tokens;
+        profile.layer = p.layer;
+        if (!finite) {
+            reason = "PHONE_LOCAL_EXEC_NONFINITE_OUTPUT";
+            return false;
+        }
+        // Only commit this state after a completed HTP run and comparison.
+        // It is local-only and never aliases the PC/legacy decode KV.
+        ++state.next_chunk;
         return true;
     }
 
@@ -1616,6 +1717,7 @@ private:
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
         ggml_phone_owned::region_plan plan {};
+        uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
     };
