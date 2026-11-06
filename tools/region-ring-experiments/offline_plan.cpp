@@ -179,15 +179,15 @@ static bool memory_fits(
         const int width = r.layer_end - r.layer_begin;
         if (width <= 0) { return false; }
         if (r.device == device::GPU) {
-            gpu_bank[g++ % 2] = std::max(
-                gpu_bank[(g - 1) % 2],
-                width * o.gpu_weight_layer_mib);
+            const size_t bank = g++ % 2;
+            gpu_bank[bank] = std::max(
+                gpu_bank[bank], width * o.gpu_weight_layer_mib);
             gpu_layers += width;
         } else if (r.device == device::PHONE) {
             if (width > o.max_npu_region_layers) { return false; }
-            npu_bank[p++ % 2] = std::max(
-                npu_bank[(p - 1) % 2],
-                width * o.npu_weight_layer_mib);
+            const size_t bank = p++ % 2;
+            npu_bank[bank] = std::max(
+                npu_bank[bank], width * o.npu_weight_layer_mib);
             npu_layers += width;
         }
     }
