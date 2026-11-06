@@ -146,6 +146,57 @@ Safety and limitations:
   ownership and decode transition.
 - This stage does not implement two-slot overlap or local-output P2C.
 
+## Diagnosing HTP stage mismatch (after FEATURE_DIAG)
+
+The 512-token Qwen3-14B A/B test showed the worst absolute error at
+hidden feature `731` across all 16 (Region, Chunk) outputs. The FEATURE_DIAG
+metrics confirmed that this feature accounts for only 17-19% of L39
+squared error, and excluding it does not repair L39 cosine similarity.
+
+To locate the **first divergent HTP stage**, optionally trace one Layer/Chunk:
+
+```sh
+# On Phone, in addition to the existing three local A/B switches:
+export GGML_RPC_PHONE_QWEN3_STAGE_DIAG=1
+export GGML_RPC_PHONE_QWEN3_STAGE_DIAG_LAYER=39
+export GGML_RPC_PHONE_QWEN3_STAGE_DIAG_CHUNK=0
+```
+
+Restart the Phone RPC server, and run the exact same 512-token PC sweep.
+Inspect:
+
+```powershell
+Select-String -Path ".\\npu.log" -Pattern "event=STAGE_DIAG" |
+    ForEach-Object { $_.Line }
+```
+
+The stage rows (where present in both Graphs) are:
+`inp_stage`, `attn_norm`, `Qcur`, `Kcur`, `Vcur`,
+`attn_out`, `ffn_inp`, `ffn_norm`, `ffn_up`,
+`ffn_gate`, `ffn_swiglu`, `ffn_down`.
+Every row reports element count, MaxAbs, RMSE, Cosine,
+reference/local RMS and a non-numeric `state`.
+
+This diagnosis reads **both sets of intermediate tensors from the HTP
+backend** after the two graphs have executed. It requires the original
+PC-derived graph to use `GGML_RPC_PHONE_NPU_FIXED_CHUNK_GRAPHS=1`;
+otherwise the baseline scratch graph no longer exists for comparison,
+and a `REFERENCE_FIXED_GRAPH_NOT_AVAILABLE` row is reported.
+Intermediate tensors with missing/ambiguous labels or incompatible
+layout are reported explicitly, never treated as equal.
+
+First examine `inp_stage`. A mismatch here means the two HTP graphs
+consumed different input activations, independent of attention math.
+If input matches but `attn_norm` diverges, focus on RMSNorm/weights;
+if `Qcur`/`Kcur` diverge, examine Q/K projections, normalization and
+RoPE; if `attn_out` is the first divergence, check KV/mask/FA.
+If attention matches but FFN diverges, inspect gate/up/swiglu/down.
+
+CAUTION: this is an expensive, diagnostic-only readback of intermediate
+HTP tensors. Target L39 Chunk 0 first rather than all 16 Chunk graphs.
+Stage data are observational only: the original Graph remains the
+sole P2C publisher.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
