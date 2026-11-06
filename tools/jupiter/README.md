@@ -1134,3 +1134,41 @@ Prefill timers should exclude planner calibration and model loading.
 A single Region Ring run versus a multi-run Jupiter median is exploratory,
 not a stable statistical effect. If the preliminary trend is useful,
 collect repeated measurements under one controlled protocol.
+
+## ShareGPT quick8: PC CPU + CUDA + Phone (experimental)
+
+The quick runner can automatically assign GGUF model layers to three contiguous
+regions when 32B weights exceed PC GPU and Phone GPU free memory:
+
+- PC CPU: layers [0, cpu_layers)
+- PC CUDA: layers [cpu_layers, pc_layers)
+- Phone RPC: layers [pc_layers, n_layers), including the output head.
+
+CPU RAM is read from Windows GlobalMemoryStatusEx, PC VRAM from nvidia-smi,
+and Phone VRAM from the existing RPC GET_DEVICE_MEMORY command. The GGUF
+tensor directory determines per-layer weight sizes. The planner minimizes
+CPU layers first, then balances GPU/Phone utilization. It reserves 2048 MiB
+host RAM and 512 MiB on each accelerator by default. These are conservative
+weight-only estimates; runtime buffer, KV cache, and GPU max-allocation checks
+must still be tested on the target devices.
+
+After pulling this branch rebuild the PC executable, because model placement
+in src/llama-model.cpp changed. Phone RPC protocol is unchanged.
+
+```powershell
+cmake --build .\build-jupiter --config Release --target llama-cli --parallel 8
+python .\tools\jupiter\run_sharegpt_quick8.py `
+    --model "E:\llama\models\Qwen2.5-32B-Q4_K_M.gguf" `
+    --memory-check-only
+python .\tools\jupiter\run_sharegpt_quick8.py `
+    --model "E:\llama\models\Qwen2.5-32B-Q4_K_M.gguf" `
+    --graph-prebuild `
+    --out-dir .\jupiter-sharegpt-quick8-32b-cpu
+```
+
+The run saves memory-plan.json and tags all calibration/benchmark identities
+with both CPU and PC boundaries. Stage 3 requires CPU+CUDA+RPC samples and
+uses a 3-stage DP cost whenever CPU layers are nonzero. Existing 2-stage
+runs remain unchanged when cpu_layers=0. The 3-device path has not been
+validated on the user's actual PC+Phone rig; verify model load and correct
+plan application before relying on performance results.
