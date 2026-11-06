@@ -8531,9 +8531,9 @@ void rpc_server::phone_auto_compute_loop() {
                             // local output must be bitwise identical to the
                             // canonical Reference before replacing the
                             // OpenCL tensor consumed by existing P2C.
-                            const bool exact = local_stats.parity.count != 0 &&
-                                local_stats.parity.nonfinite == 0 &&
-                                local_stats.parity.max_abs == 0.0;
+                            const bool exact =
+                                ggml_phone_qwen3::can_publish_exact(
+                                    local_stats.parity);
                             double copy_ms = 0.0;
                             std::string publish_reason;
                             bool published = false;
