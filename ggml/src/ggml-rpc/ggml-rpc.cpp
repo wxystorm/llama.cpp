@@ -4548,14 +4548,20 @@ static bool ggml_backend_rpc_phone_input_stream_push(
     memcpy(header.data() + 1, &size, sizeof(size));
     const int64_t header_begin = ggml_time_us();
     bool ok = sock->send_data(header.data(), header.size());
+    const int64_t header_end = ggml_time_us();
     if (timing != nullptr) {
-        timing->pc_header_send_us = ggml_time_us() - header_begin;
+        timing->pc_header_send_us = header_end - header_begin;
+        timing->pc_header_begin_us = header_begin;
+        timing->pc_header_end_us = header_end;
     }
     if (ok) {
         const int64_t payload_begin = ggml_time_us();
         ok = sock->send_data(packet.data(), packet.size());
+        const int64_t payload_end = ggml_time_us();
         if (timing != nullptr) {
-            timing->pc_payload_send_us = ggml_time_us() - payload_begin;
+            timing->pc_payload_send_us = payload_end - payload_begin;
+            timing->pc_payload_begin_us = payload_begin;
+            timing->pc_payload_end_us = payload_end;
         }
     }
     if (!ok) { sock.reset(); }
@@ -6125,6 +6131,12 @@ public:
     // monotonic clock; never subtract PC and Phone *_us values directly.
     struct phone_chunk_input_timing {
         int64_t handler_begin_us = 0; // command received, before length/budget
+        int64_t length_recv_begin_us = 0; // wire byte-count recv begins
+        int64_t length_recv_end_us = 0;
+        int64_t reserve_begin_us = 0; // host budget admission begins
+        int64_t reserve_end_us = 0;   // may include 30s condition wait
+        int64_t alloc_begin_us = 0;   // host packet allocation starts
+        int64_t alloc_end_us = 0;
         int64_t recv_begin_us = 0;    // payload recv_data() begins
         int64_t recv_end_us = 0;      // payload recv_data() completes
         int64_t hash_end_us = 0;      // FNV verification completes
@@ -7171,6 +7183,12 @@ bool rpc_server::phone_input_stream_run(
                             " task_reg_begin_us=%" PRId64
                             " task_reg_end_us=%" PRId64
                             " rx_handler_begin_us=%" PRId64
+                            " length_recv_begin_us=%" PRId64
+                            " length_recv_end_us=%" PRId64
+                            " reserve_begin_us=%" PRId64
+                            " reserve_end_us=%" PRId64
+                            " alloc_begin_us=%" PRId64
+                            " alloc_end_us=%" PRId64
                             " recv_begin_us=%" PRId64
                             " recv_end_us=%" PRId64
                             " hash_end_us=%" PRId64
@@ -7195,8 +7213,12 @@ bool rpc_server::phone_input_stream_run(
                             job.graph_register_begin_us,
                             job.graph_register_end_us,
                             job.register_begin_us, job.register_end_us,
-                            t.handler_begin_us, t.recv_begin_us,
-                            t.recv_end_us, t.hash_end_us, t.verified_us,
+                            t.handler_begin_us,
+                            t.length_recv_begin_us, t.length_recv_end_us,
+                            t.reserve_begin_us, t.reserve_end_us,
+                            t.alloc_begin_us, t.alloc_end_us,
+                            t.recv_begin_us, t.recv_end_us,
+                            t.hash_end_us, t.verified_us,
                             job.verified_us,
                             job.upload_begin_us, job.input_copy_begin_us,
                             job.input_copy_end_us, job.upload_done_us,
@@ -14519,17 +14541,26 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
-                const int64_t handler_begin_us =
-                    server.phone_chunk_timeline_tracing() ? ggml_time_us() : 0;
-                // The Phone receiver itself owns the bounded host budget.
-                // Do not emit an ACK: send_data()/TCP backpressure is the
-                // only normal feedback to the PC producer.
+                const bool trace = server.phone_chunk_timeline_tracing();
+                const int64_t handler_begin_us = trace ? ggml_time_us() : 0;
+                // No input ACK, and no additional socket round trip. Keep
+                // admission + allocation timestamps on Phone's clock.
+                const int64_t length_recv_begin_us =
+                    trace ? ggml_time_us() : 0;
                 uint64_t bytes = 0;
-                if (!sock->recv_data(&bytes, sizeof(bytes)) ||
-                        bytes > SIZE_MAX ||
-                        !server.phone_input_stream_reserve((size_t) bytes)) {
+                if (!sock->recv_data(&bytes, sizeof(bytes))) { return; }
+                const int64_t length_recv_end_us =
+                    trace ? ggml_time_us() : 0;
+                if (bytes > SIZE_MAX) { return; }
+                const int64_t reserve_begin_us =
+                    trace ? ggml_time_us() : 0;
+                if (!server.phone_input_stream_reserve((size_t) bytes)) {
                     return;
                 }
+                const int64_t reserve_end_us =
+                    trace ? ggml_time_us() : 0;
+                const int64_t alloc_begin_us =
+                    trace ? ggml_time_us() : 0;
                 std::vector<uint8_t> packet;
                 try {
                     packet.resize((size_t) bytes);
@@ -14537,12 +14568,19 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     server.phone_input_stream_cancel_reserve((size_t) bytes);
                     return;
                 }
+                const int64_t alloc_end_us = trace ? ggml_time_us() : 0;
                 const int64_t recv_begin_us = ggml_time_us();
                 const bool received = sock->recv_data(packet.data(), packet.size());
                 const int64_t recv_end_us = ggml_time_us();
                 rpc_server::phone_chunk_input_timing timing {};
-                if (server.phone_chunk_timeline_tracing()) {
+                if (trace) {
                     timing.handler_begin_us = handler_begin_us;
+                    timing.length_recv_begin_us = length_recv_begin_us;
+                    timing.length_recv_end_us = length_recv_end_us;
+                    timing.reserve_begin_us = reserve_begin_us;
+                    timing.reserve_end_us = reserve_end_us;
+                    timing.alloc_begin_us = alloc_begin_us;
+                    timing.alloc_end_us = alloc_end_us;
                     timing.recv_begin_us = recv_begin_us;
                     timing.recv_end_us = recv_end_us;
                 }
@@ -14983,17 +15021,26 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 break;
             }
             case RPC_CMD_PHONE_INPUT_STREAM_PUSH: {
-                const int64_t handler_begin_us =
-                    server.phone_chunk_timeline_tracing() ? ggml_time_us() : 0;
-                // The Phone receiver itself owns the bounded host budget.
-                // Do not emit an ACK: send_data()/TCP backpressure is the
-                // only normal feedback to the PC producer.
+                const bool trace = server.phone_chunk_timeline_tracing();
+                const int64_t handler_begin_us = trace ? ggml_time_us() : 0;
+                // No input ACK, and no additional socket round trip. Keep
+                // admission + allocation timestamps on Phone's clock.
+                const int64_t length_recv_begin_us =
+                    trace ? ggml_time_us() : 0;
                 uint64_t bytes = 0;
-                if (!sock->recv_data(&bytes, sizeof(bytes)) ||
-                        bytes > SIZE_MAX ||
-                        !server.phone_input_stream_reserve((size_t) bytes)) {
+                if (!sock->recv_data(&bytes, sizeof(bytes))) { return; }
+                const int64_t length_recv_end_us =
+                    trace ? ggml_time_us() : 0;
+                if (bytes > SIZE_MAX) { return; }
+                const int64_t reserve_begin_us =
+                    trace ? ggml_time_us() : 0;
+                if (!server.phone_input_stream_reserve((size_t) bytes)) {
                     return;
                 }
+                const int64_t reserve_end_us =
+                    trace ? ggml_time_us() : 0;
+                const int64_t alloc_begin_us =
+                    trace ? ggml_time_us() : 0;
                 std::vector<uint8_t> packet;
                 try {
                     packet.resize((size_t) bytes);
@@ -15001,12 +15048,19 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     server.phone_input_stream_cancel_reserve((size_t) bytes);
                     return;
                 }
+                const int64_t alloc_end_us = trace ? ggml_time_us() : 0;
                 const int64_t recv_begin_us = ggml_time_us();
                 const bool received = sock->recv_data(packet.data(), packet.size());
                 const int64_t recv_end_us = ggml_time_us();
                 rpc_server::phone_chunk_input_timing timing {};
-                if (server.phone_chunk_timeline_tracing()) {
+                if (trace) {
                     timing.handler_begin_us = handler_begin_us;
+                    timing.length_recv_begin_us = length_recv_begin_us;
+                    timing.length_recv_end_us = length_recv_end_us;
+                    timing.reserve_begin_us = reserve_begin_us;
+                    timing.reserve_end_us = reserve_end_us;
+                    timing.alloc_begin_us = alloc_begin_us;
+                    timing.alloc_end_us = alloc_end_us;
                     timing.recv_begin_us = recv_begin_us;
                     timing.recv_end_us = recv_end_us;
                 }

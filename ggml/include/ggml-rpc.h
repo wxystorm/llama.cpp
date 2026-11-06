@@ -476,6 +476,12 @@ struct ggml_backend_rpc_phone_input_push_timing {
     int64_t pc_pack_us = 0;
     int64_t pc_header_send_us = 0;
     int64_t pc_payload_send_us = 0;
+    // PC-clock absolute boundaries, for TASK_TRACE JSON only. The values
+    // are not sent to the Phone and must never be subtracted from Phone time.
+    int64_t pc_header_begin_us = 0;
+    int64_t pc_header_end_us = 0;
+    int64_t pc_payload_begin_us = 0;
+    int64_t pc_payload_end_us = 0;
     int64_t pc_ack_wait_us = 0;
     int64_t phone_recv_header_us = 0;
     int64_t phone_recv_alloc_us = 0;
