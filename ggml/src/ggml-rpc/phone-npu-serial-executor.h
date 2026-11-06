@@ -1306,17 +1306,20 @@ public:
                               double & output_ms,
                               stage_profile_stats * profile = nullptr,
                               const ggml_tensor * ab_source = nullptr,
-                              std::vector<float> * ab_input_snapshot = nullptr) {
+                              std::vector<float> * ab_input_snapshot = nullptr,
+                              double * ab_capture_ms = nullptr) {
         reason.clear();
         stage_ms = compute_ms = output_ms = 0.0;
         if (profile != nullptr) { *profile = {}; }
-        if ((ab_source == nullptr) != (ab_input_snapshot == nullptr)) {
+        if ((ab_source == nullptr) != (ab_input_snapshot == nullptr) ||
+                (ab_capture_ms != nullptr && ab_input_snapshot == nullptr)) {
             reason = "HTP_FIXED_AB_INCOMPLETE_SNAPSHOT_CONTRACT";
             return false;
         }
         if (ab_input_snapshot != nullptr) {
             ab_input_snapshot->clear();
         }
+        if (ab_capture_ms != nullptr) { *ab_capture_ms = 0.0; }
         const auto it = registered_graphs_.find(uid);
         if (it == registered_graphs_.end()) {
             reason = "HTP_FIXED_UID_NOT_FOUND";
@@ -1394,9 +1397,14 @@ public:
             }
             const size_t bytes = ggml_nbytes(htp_snapshot_target);
             ab_input_snapshot->resize(bytes / sizeof(float));
+            const int64_t capture_begin_us = ggml_time_us();
             ggml_backend_synchronize(backend_);
             ggml_backend_tensor_get(htp_snapshot_target,
                                     ab_input_snapshot->data(), 0, bytes);
+            if (ab_capture_ms != nullptr) {
+                *ab_capture_ms =
+                    (ggml_time_us() - capture_begin_us) / 1000.0;
+            }
             for (float x : *ab_input_snapshot) {
                 if (!std::isfinite(x)) {
                     reason = "HTP_FIXED_AB_NONFINITE_BASELINE_INPUT";
