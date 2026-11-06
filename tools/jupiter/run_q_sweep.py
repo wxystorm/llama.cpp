@@ -600,10 +600,12 @@ def run_sweep_for_length(
     # will not reuse CSVs from a different prompt, hardware split or length.
     signature_input = "\\n".join([
         prompt_text, str(model), args.rpc,
-        str(args.pc_layers), str(args.cpu_layers), str(args.batch),
+        str(args.pc_layers), str(args.batch),
         str(args.context), str(args.threads),
         str(args.max_chunk), str(args.min_chunk),
     ])
+    if args.cpu_layers:
+        signature_input += "\nCPU_LAYERS=" + str(args.cpu_layers)
     signature = hashlib.sha256(
         signature_input.encode("utf-8")
     ).hexdigest()[:12]
