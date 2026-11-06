@@ -7468,6 +7468,17 @@ bool rpc_server::phone_owned_plan_register(
             plan.run_id, plan.region);
         return false;
     }
+    const char * graphless_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
+    if (graphless_env && std::strcmp(graphless_env, "1") == 0 &&
+            (!local_only_requested || !direct_p2c_requested ||
+             !direct_input_requested)) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=GRAPHLESS_REQUIRES_HOST_IO_AND_LOCAL_ONLY\n",
+            plan.run_id, plan.region);
+        return false;
+    }
     if (local_p2c_requested &&
             (!local_exec_requested || !precompile_requested)) {
         GGML_LOG_ERROR(
@@ -7696,6 +7707,13 @@ bool rpc_server::phone_auto_task_register(
             request.token_begin > UINT32_MAX - request.n_tokens ||
             request.input_bytes != request.output_bytes) {
         return reject("INVALID_REQUEST_OR_OUTPUT_SHAPE");
+    }
+    const char * graphless_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
+    if (graphless_env && std::strcmp(graphless_env, "1") == 0 &&
+            ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, request.key.region)) {
+        return reject("GRAPHLESS_REJECTS_PC_TASK_REGISTER");
     }
     // Register the local graph contract before accepting A/B execution.
     // No best-effort fallback is allowed when the experimental switch is
@@ -8773,6 +8791,49 @@ void rpc_server::phone_auto_compute_loop() {
             (ggml_time_us() - htp_lock_begin_us) / 1000.0 : 0.0;
         const int64_t graph_lock_begin_us =
             stage_profile_enabled ? ggml_time_us() : 0;
+        if (task->graphless_owned) {
+            // Only the native Phone-local HTP Graph exists in this path.
+            // No stored_graph lookup, PC Graph tensor or per-Chunk RPC.
+            const bool valid_input = local_only && local_direct_input &&
+                local_direct_p2c && npu_task &&
+                phone_npu_executor != nullptr &&
+                req.device < backends.size() &&
+                task->direct_input_activation.size() ==
+                    req.input_bytes / sizeof(float) &&
+                req.input_bytes % sizeof(float) == 0;
+            ggml_phone_npu_serial::full_region_executor::
+                local_only_profile profile {};
+            std::string why;
+            const bool ok = valid_input &&
+                phone_npu_executor->run_owned_only_chunk(
+                    req.key.run_id, req.key.region, req.key.chunk,
+                    nullptr, nullptr, why, profile,
+                    &task->direct_p2c_payload,
+                    task->direct_input_activation.data(),
+                    task->direct_input_activation.size());
+            std::vector<float>().swap(task->direct_input_activation);
+            if (phone_chunk_timeline_enabled) {
+                task->npu_exec_begin_us = task->compute_begin_us;
+                task->npu_exec_end_us = ggml_time_us();
+            }
+            status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+            GGML_LOG_INFO(
+                "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
+                " run=%" PRIu64 " region=%u layer=%u chunk=%u tokens=%u"
+                " backend=HTP0 source=PHONE_LOCAL_HTP kv_owner=PHONE_LOCAL"
+                " input_read_ms=%.3f input_upload_ms=%.3f"
+                " htp_compute_ms=%.3f output_copy_ms=%.3f"
+                " legacy_htp_compute=SKIPPED input=VERIFIED_PUSH_HOST"
+                " p2c=PHONE_OWNED_HOST graph_lookup=SKIPPED"
+                " status=%s reason=%s\n",
+                req.key.run_id, req.key.region, profile.layer,
+                req.key.chunk, req.n_tokens,
+                profile.input_read_ms, profile.input_upload_ms,
+                profile.htp_compute_ms, profile.output_copy_ms,
+                ok ? "PASS" : "FAIL",
+                ok ? "NONE" : valid_input ?
+                    why.c_str() : "GRAPHLESS_TASK_CONTRACT");
+        } else {
         {
             std::lock_guard<std::recursive_mutex> graph_guard(
                 graph_compute_mutex);
@@ -9179,6 +9240,7 @@ void rpc_server::phone_auto_compute_loop() {
                 }
             }
         }
+        } // legacy PC-registered Graph path
         task->compute_end_us = ggml_time_us();
         if (status == GGML_STATUS_SUCCESS) {
             // This is the Phone-owned publication event: no PC per-Chunk
