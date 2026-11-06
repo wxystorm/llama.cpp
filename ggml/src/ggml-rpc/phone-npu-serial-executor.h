@@ -827,6 +827,13 @@ public:
                         ref_values.data(), local_values.data(),
                         count, row.parity)) {
                     row.state = "NONFINITE_STAGE_DATA";
+                } else if (row.parity.reference_rms == 0.0 &&
+                           row.parity.candidate_rms == 0.0 &&
+                           std::strcmp(stage, "inp_stage") != 0) {
+                    // Fused HTP kernels may never materialize some
+                    // intermediates even when their metadata is present.
+                    // Two untouched zero buffers are not parity proof.
+                    row.state = "ZERO_INTERMEDIATE_UNVERIFIED";
                 } else {
                     row.state = "MEASURED";
                 }
