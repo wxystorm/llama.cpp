@@ -351,6 +351,13 @@ target_link_libraries(test-region-ring PRIVATE Threads::Threads)
 llama_test(test-region-ring)
 
 # Standalone dry-run Planner: no model/backend dependencies.
+# Standalone Phone NPU weight-bank policy; no Android/HTP backend dependency.
+add_executable(test-phone-npu-weight-banks test-phone-npu-weight-banks.cpp)
+target_include_directories(test-phone-npu-weight-banks PRIVATE
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
+set_target_properties(test-phone-npu-weight-banks PROPERTIES CXX_STANDARD 17)
+llama_test(test-phone-npu-weight-banks)
+
 add_executable(test-region-ring-planner test-region-ring-planner.cpp)
 set_target_properties(test-region-ring-planner PROPERTIES
     CXX_STANDARD 17
