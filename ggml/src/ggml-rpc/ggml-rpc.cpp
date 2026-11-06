@@ -8374,6 +8374,10 @@ void rpc_server::phone_auto_compute_loop() {
                     const bool local_ab = local_exec_env != nullptr &&
                         std::strcmp(local_exec_env, "1") == 0;
                     if (ok && local_ab) {
+                        // run_registered_chunk() may enqueue its final
+                        // HTP->OpenCL output copy. Establish a reference
+                        // fence before comparing it against the local Graph.
+                        ggml_backend_synchronize(backends[req.device]);
                         ggml_phone_npu_serial::full_region_executor::
                             local_exec_profile local_stats {};
                         std::string local_reason;
