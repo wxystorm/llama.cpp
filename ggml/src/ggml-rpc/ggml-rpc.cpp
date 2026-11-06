@@ -8412,6 +8412,49 @@ void rpc_server::phone_auto_compute_loop() {
                             local_stats.parity.max_index,
                             local_ok ? "PASS" : "FAIL",
                             local_ok ? "NONE" : local_reason.c_str());
+                        // Optional bounded stage trace, disabled by
+                        // default. The PC-derived fixed HTP graph must have
+                        // executed first; local HTP graph executed above.
+                        // Only one (Layer, Chunk) is traced by default to
+                        // avoid repeated multi-MiB intermediate readback.
+                        const char * diag_env =
+                            std::getenv("GGML_RPC_PHONE_QWEN3_STAGE_DIAG");
+                        const char * diag_layer_env =
+                            std::getenv("GGML_RPC_PHONE_QWEN3_STAGE_DIAG_LAYER");
+                        const char * diag_chunk_env =
+                            std::getenv("GGML_RPC_PHONE_QWEN3_STAGE_DIAG_CHUNK");
+                        const int diag_layer = diag_layer_env ?
+                            std::atoi(diag_layer_env) : 39;
+                        const int diag_chunk = diag_chunk_env ?
+                            std::atoi(diag_chunk_env) : 0;
+                        if (local_ok && diag_env != nullptr &&
+                                std::strcmp(diag_env, "1") == 0 &&
+                                local_stats.layer == (uint32_t) diag_layer &&
+                                req.key.chunk == (uint32_t) diag_chunk) {
+                            const auto rows =
+                                phone_npu_executor->compare_owned_htp_stages(
+                                    req.graph_uid, req.key.run_id,
+                                    req.key.region, req.key.chunk,
+                                    local_stats.layer);
+                            for (const auto & row : rows) {
+                                GGML_LOG_INFO(
+                                    "[PHONE_QWEN3_LOCAL] event=STAGE_DIAG"
+                                    " run=%" PRIu64 " region=%u layer=%u"
+                                    " chunk=%u stage=%s elements=%zu"
+                                    " max_abs=%.9g rmse=%.9g"
+                                    " cosine=%.9f ref_rms=%.9g"
+                                    " local_rms=%.9g"
+                                    " nonfinite=%zu state=%s\n",
+                                    req.key.run_id, req.key.region,
+                                    local_stats.layer, req.key.chunk,
+                                    row.stage, row.count,
+                                    row.parity.max_abs, row.parity.rmse,
+                                    row.parity.cosine,
+                                    row.parity.reference_rms,
+                                    row.parity.candidate_rms,
+                                    row.parity.nonfinite, row.state);
+                            }
+                        }
                         // Attribute the worst-index feature across all
                         // tokens. No extra HTP readback: these metrics use
                         // the same host arrays already used for RMSE.
