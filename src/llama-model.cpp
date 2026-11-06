@@ -1283,6 +1283,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool jupiter_pc_layers_env = std::getenv("LLAMA_JUPITER_PC_LAYERS") != nullptr;
     const bool jupiter_plan_file = std::getenv("LLAMA_JUPITER_PLAN_FILE") != nullptr;
     const int jupiter_pc_layers = llama_jupiter::model_pc_layers(n_layer_all / 2);
+    const int jupiter_cpu_layers = llama_jupiter::model_cpu_layers();
 
     ggml_backend_dev_t jupiter_pc_dev = nullptr;
     ggml_backend_dev_t jupiter_phone_dev = nullptr;
@@ -1297,6 +1298,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (jupiter_pc_layers <= 0 || jupiter_pc_layers >= n_layer_all) {
             throw std::runtime_error(format("invalid LLAMA_JUPITER_PC_LAYERS=%d for %d-layer model",
                                             jupiter_pc_layers, n_layer_all));
+        }
+        if (jupiter_cpu_layers < 0 || jupiter_cpu_layers >= jupiter_pc_layers) {
+            throw std::runtime_error(format(
+                    "invalid LLAMA_JUPITER_CPU_LAYERS=%d: need 0 <= CPU < PC=%d "
+                    "(GPU and Phone must each retain at least one layer)",
+                    jupiter_cpu_layers, jupiter_pc_layers));
         }
 
         for (const auto & dev_info : devices) {
@@ -1322,11 +1329,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 jupiter_plan_file     ? "PAPER_DP" :
                                         "DEFAULT_HALF";
 
-        LLAMA_LOG_INFO(
-                "[JUPITER_STAGE_PLAN] mode=%s pc_device=%s pc_layers=0..%d phone_device=%s phone_layers=%d..%d output=PHONE\n",
-                plan_source,
-                ggml_backend_dev_name(jupiter_pc_dev), jupiter_pc_layers - 1,
-                ggml_backend_dev_name(jupiter_phone_dev), jupiter_pc_layers, n_layer_all - 1);
+        if (jupiter_cpu_layers > 0) {
+            LLAMA_LOG_INFO(
+                    "[JUPITER_STAGE_PLAN] mode=%s cpu_device=%s cpu_layers=0..%d "
+                    "pc_device=%s pc_gpu_layers=%d..%d phone_device=%s "
+                    "phone_layers=%d..%d output=PHONE stages=3\n",
+                    plan_source, ggml_backend_dev_name(cpu_dev),
+                    jupiter_cpu_layers - 1,
+                    ggml_backend_dev_name(jupiter_pc_dev),
+                    jupiter_cpu_layers, jupiter_pc_layers - 1,
+                    ggml_backend_dev_name(jupiter_phone_dev),
+                    jupiter_pc_layers, n_layer_all - 1);
+        } else {
+            LLAMA_LOG_INFO(
+                    "[JUPITER_STAGE_PLAN] mode=%s pc_device=%s pc_layers=0..%d phone_device=%s phone_layers=%d..%d output=PHONE stages=2\n",
+                    plan_source,
+                    ggml_backend_dev_name(jupiter_pc_dev), jupiter_pc_layers - 1,
+                    ggml_backend_dev_name(jupiter_phone_dev), jupiter_pc_layers, n_layer_all - 1);
+        }
     }
 
     // calculate the split points
@@ -1368,14 +1388,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
 
         if (jupiter_prefill) {
-            ggml_backend_dev_t dev = il < jupiter_pc_layers ? jupiter_pc_dev : jupiter_phone_dev;
+            const bool on_cpu = il < jupiter_cpu_layers;
+            ggml_backend_dev_t dev = on_cpu ? cpu_dev :
+                    (il < jupiter_pc_layers ? jupiter_pc_dev : jupiter_phone_dev);
+            const char * stage = on_cpu ? "PC_CPU" :
+                    (il < jupiter_pc_layers ? "PC_GPU" : "PHONE");
             LLAMA_LOG_INFO(
                     "[JUPITER_STAGE_LAYER] layer=%d stage=%s device=%s output=%d\n",
-                    il,
-                    il < jupiter_pc_layers ? "PC" : "PHONE",
-                    ggml_backend_dev_name(dev),
-                    il == n_layer_all ? 1 : 0);
-            return {dev, &pimpl->gpu_buft_list.at(dev)};
+                    il, stage, ggml_backend_dev_name(dev), il == n_layer_all ? 1 : 0);
+            return on_cpu ?
+                    llama_model::impl::layer_dev{cpu_dev, &pimpl->cpu_buft_list} :
+                    llama_model::impl::layer_dev{dev, &pimpl->gpu_buft_list.at(dev)};
         }
 
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
