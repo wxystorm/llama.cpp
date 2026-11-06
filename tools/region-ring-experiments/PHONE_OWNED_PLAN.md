@@ -516,6 +516,103 @@ physical identity slots, a one-layer Phone HTP Region, Phone-resident
 weights and precompiled fixed Chunk Graphs. This does **not** add
 sliding-window, shared-prefix or nonidentity cache-slot support.
 
+## Phase 9: optional PC/Phone socket and bootstrap time line (Patch 29)
+
+Use the **same** known-good 512-token Graphless configuration as Phase 8.
+This is strictly instrumentation: no extra messages, ACKs, synchronization,
+HTP graph rebuilds, scheduling modes, or device KV transfers.
+
+On **PC** before starting the experiment (the runner creates
+`prompt_512/metrics.jsonl` using
+`LLAMA_REGION_RING_METRICS_FILE`):
+
+```powershell
+$env:LLAMA_REGION_RING_TASK_TRACE = "1"
+$env:GGML_RPC_P2C_CHUNK_TIMELINE = "1"
+```
+
+On **Phone** before launching the RPC server:
+
+```sh
+export GGML_RPC_PHONE_CHUNK_TIMELINE=1
+# Optional additional duration summaries:
+export GGML_RPC_REAL_STAGE_PROFILE=1
+```
+
+Rebuild and deploy **both** sides after a trace instrumentation commit.
+Keep the previous Phase 8 Phone and PC Graphless switches enabled.
+
+### PC measurements
+
+The `region_ring_chunk_trace` JSONL entries now include
+`push_header_begin_ms`, `push_header_end_ms`,
+`push_payload_begin_ms`, `push_payload_end_ms`; each is relative to
+the existing `region_ring_trace_meta.clock_origin_us` with
+`clock=PC_GGML_TIME_US`. These mark **socket send call boundaries**,
+not TCP delivery/ACK times. Values are `null` when the operation did
+not run.
+
+The single `region_ring_trace_meta` entry adds
+`embed_begin_ms`/`embed_end_ms`,
+`owned_plan_begin_ms`/`owned_plan_end_ms`,
+`p2c_subscribe_begin_ms`/`p2c_subscribe_end_ms`,
+`workers_launch_begin_ms`/`workers_launch_end_ms` and
+`cpu_worker_enter_ms`, `gpu_worker_enter_ms`,
+`phone_worker_enter_ms`. Compare with the first GPU Chunk's
+`ready_ms`/`claim_ms` to explain startup idle time.
+
+With `GGML_RPC_P2C_CHUNK_TIMELINE=1`, `engine.stderr.log` also
+contains one deferred `[PC_CHUNK_P2C_RECV]` record per P2C frame:
+`frame_wait_begin_us`, `frame_header_end_us`,
+`resolve_begin_us`, `resolve_end_us`, `payload_begin_us`,
+`payload_end_us`, `callback_begin_us`, `callback_end_us`.
+`frame_wait_begin_us` is the time the PC began waiting for the next
+header, and may include *intentional* idle time while Phone computes.
+`payload_begin_us -> payload_end_us` is the socket receive call
+duration. These are raw PC monotonic microseconds.
+
+### Phone measurements
+
+`[PHONE_CHUNK_TIMELINE]` is emitted once per task on input-stream
+RUN END. It now distinguishes:
+
+- `length_recv_begin_us -> length_recv_end_us`: framed RPC length
+- `reserve_begin_us -> reserve_end_us`: Phone Host landing-credit
+  admission, including any bounded-buffer wait
+- `alloc_begin_us -> alloc_end_us`: Host packet allocation
+- `recv_begin_us -> recv_end_us`: packet data socket receive
+- `hash_end_us`, `input_verified_us`, `htp_exec_begin_us`,
+  `htp_exec_end_us`, `capture_begin_us`, `capture_end_us`:
+  unchanged computation and capture boundaries
+
+`[PHONE_CHUNK_P2C_SEND]` retains `queue_take_us`,
+`send_begin_us`, `header_end_us`, `send_end_us` for each frame.
+All these are raw **Phone** monotonic microseconds.
+
+Join `[PC_CHUNK_P2C_RECV]` and `[PHONE_CHUNK_P2C_SEND]` by
+`p2c_run,region,chunk`; join `[PHONE_CHUNK_TIMELINE]` by
+`run,region,chunk`, making sure to use the **measured** RUN and
+exclude the 2-token warmup. Do **not** subtract an absolute PC
+timestamp from a Phone timestamp: the clocks have independent epochs.
+Use the duration measured on each host to locate network/backpressure
+delays. A long `send_data()` call can include TCP receiver backpressure;
+it is **not** equal to wire transmission time.
+
+After the run:
+
+```powershell
+$dir = "E:\\path\\to\\experiment\\prompt_512"
+Select-String "$dir\\engine.stderr.log" -Pattern "PC_CHUNK_P2C_RECV|P2C_STREAM.*RECEIVER_DONE" |
+  ForEach-Object { $_.Line } | Set-Content "$dir\\pc_p2c_recv.log"
+
+Select-String ".\\npu.log" -Pattern "PHONE_CHUNK_TIMELINE|PHONE_CHUNK_P2C_SEND|PHONE_OWNED_KV|KV_SYNC" |
+  ForEach-Object { $_.Line } | Set-Content ".\\phone_timeline.log"
+```
+
+Expect **16** measured Phone Chunk timeline rows, **16** P2C send rows,
+**16** PC P2C receive rows, and all 32 Ring task traces, without a
+change to Prefill output or Decode.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
