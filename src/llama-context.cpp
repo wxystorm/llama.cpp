@@ -441,7 +441,10 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
             const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
             if (jupiter_env != nullptr && atoi(jupiter_env) != 0) {
-                LLAMA_LOG_INFO("[JUPITER_PIPE] mode=ASYNC_TWO_STAGE status=ENABLED\n");
+                const char * cpu_layers = getenv("LLAMA_JUPITER_CPU_LAYERS");
+                const bool cpu_stage = cpu_layers != nullptr && atoi(cpu_layers) > 0;
+                LLAMA_LOG_INFO("[JUPITER_PIPE] mode=%s status=ENABLED\n",
+                        cpu_stage ? "ASYNC_THREE_STAGE" : "ASYNC_TWO_STAGE");
             }
         } else {
             const char * jupiter_env = getenv("LLAMA_JUPITER_PREFILL");
