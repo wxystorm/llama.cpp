@@ -79,6 +79,20 @@ class JupiterInterpolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             QProfile(bad, metric="wall_ms")
 
+    def test_three_stage_cpu_required_when_explicit(self) -> None:
+        rows = [
+            row(96, 0, 120, "CUDA0"), row(96, 0, 80, "RPC0"),
+        ]
+        self.assertTrue(QProfile(rows).is_measured(96, 0))
+        self.assertFalse(QProfile(rows, require_cpu=True).is_measured(96, 0))
+        rows.append(row(96, 0, 240, "CPU"))
+        three = QProfile(rows, require_cpu=True)
+        self.assertTrue(three.is_measured(96, 0))
+        self.assertEqual(three.q(96, 0), 240)
+        result = solve_sequence(three, 96, 3, 96, 96, None)
+        self.assertEqual(result.chunks, [96])
+        self.assertEqual(result.predicted_ms, 240 * 3)
+
     def test_missing_backend_is_not_full_measurement(self) -> None:
         profile = QProfile([
             row(32, 0, 100, "RPC0"), row(32, 0, 70, "CUDA0"),
