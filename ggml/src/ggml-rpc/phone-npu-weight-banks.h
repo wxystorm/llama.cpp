@@ -104,11 +104,14 @@ public:
     }
 
     bool begin_chunk(size_t rank, uint32_t chunk) {
-        if (rank >= regions_.size()) { return false; }
+        if (rank >= regions_.size() || active_rank_.has_value()) {
+            return false; // one HTP compute lane, never dual Graph compute
+        }
         auto & b = states_[bank_for_rank(rank)];
         if (b.state != phase::READY || b.rank != rank ||
                 chunk != b.next_chunk) { return false; }
         b.state = phase::COMPUTING;
+        active_rank_ = rank;
         return true;
     }
 
@@ -119,7 +122,10 @@ public:
         if (rank >= regions_.size()) { return std::nullopt; }
         auto & b = states_[bank_for_rank(rank)];
         if (b.state != phase::COMPUTING || b.rank != rank ||
-                b.next_chunk != chunk) { return std::nullopt; }
+                b.next_chunk != chunk || active_rank_ != rank) {
+            return std::nullopt;
+        }
+        active_rank_.reset();
         ++b.next_chunk;
         b.state = last_chunk ? phase::DRAINED : phase::READY;
         if (!last_chunk || rank + 2 >= regions_.size()) {
@@ -180,6 +186,7 @@ public:
         kv_bytes_ = 0;
         scratch_bytes_ = 0;
         required_bytes_ = 0;
+        active_rank_.reset();
     }
     size_t total_required_bytes() const { return required_bytes_; }
     size_t kv_resident_bytes() const { return kv_bytes_; }
@@ -199,6 +206,7 @@ private:
     size_t kv_bytes_ = 0;
     size_t scratch_bytes_ = 0;
     size_t required_bytes_ = 0;
+    std::optional<size_t> active_rank_;
 };
 
 } // namespace ggml_phone_npu_serial
