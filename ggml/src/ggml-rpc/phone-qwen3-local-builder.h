@@ -275,7 +275,7 @@ inline bool build_graph(ggml_context * ctx,
     ggml_set_output(result);
     ggml_build_forward_expand(graph, result);
 
-    if (graph->n_nodes < 10) {
+    if (ggml_graph_n_nodes(graph) < 10) {
         reason = "LOCAL_GRAPH_EMPTY";
         return false;
     }
