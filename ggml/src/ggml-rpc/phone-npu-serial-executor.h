@@ -779,15 +779,15 @@ public:
                         continue;
                     }
                     const std::string input_name(in.source->name);
-                    if (input_name != "inp_stage" &&
-                            input_name.find("#inp_stage#") ==
-                                std::string::npos &&
-                            input_name.rfind("#inp_stage") !=
-                                input_name.size() -
-                                    std::min(input_name.size(),
-                                             std::strlen("#inp_stage"))) {
-                        continue;
-                    }
+                    const std::string suffix("#inp_stage");
+                    const bool name_match =
+                        input_name == "inp_stage" ||
+                        input_name.find("#inp_stage#") !=
+                            std::string::npos ||
+                        (input_name.size() >= suffix.size() &&
+                         input_name.compare(input_name.size() - suffix.size(),
+                                            suffix.size(), suffix) == 0);
+                    if (!name_match) { continue; }
                     if (a != nullptr && a != in.target) {
                         ambiguous_ref = true;
                         break;
