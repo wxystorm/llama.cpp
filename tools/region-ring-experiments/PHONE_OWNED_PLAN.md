@@ -113,11 +113,21 @@ Every verified 128-token Chunk now undergoes **two real HTP computations**:
    pre-bound HTP activation buffer, executes with independent Phone-owned KV
    (strict Region FIFO), then compares against the baseline OpenCL output.
 
-The new per-Chunk log is:
+The new per-Chunk logs are:
 
 ```
 [PHONE_QWEN3_LOCAL] event=EXECUTE_AB ... htp_compute_ms=... max_abs=... mean_abs=... rmse=... cosine=... nonfinite=0 parity=MEASURED_ONLY p2c=LEGACY status=PASS reason=NONE
+[PHONE_QWEN3_LOCAL] event=FEATURE_DIAG ... worst_feature=731 worst_token=... ref_worst=... local_worst=... feature_rmse=... feature_mse_share=... dominant_feature=... dominant_mse_share=... rmse_excl=... cosine_excl=... max_abs_excl=... status=PASS
 ```
+
+The additional FEATURE_DIAG line reuses the already downloaded F32
+activations. It identifies the feature at the worst absolute difference,
+attributes total squared error to that feature, finds the highest-energy
+mismatched feature, and recomputes RMSE/Cosine while excluding the
+worst-index feature across **all** tokens. In Qwen3-14B, the observed
+`worst_index % 5120` was 731 for all 16 Region-Chunks; this is
+not proof of corrupted weights, and these new metrics help distinguish
+an isolated outlier channel from a widespread computation mismatch.
 
 `status=PASS` only means local HTP compute succeeded and both outputs are
 finite; `parity=MEASURED_ONLY` means no numerical tolerance is being
