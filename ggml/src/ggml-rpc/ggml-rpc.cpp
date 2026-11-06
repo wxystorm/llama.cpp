@@ -8349,12 +8349,30 @@ void rpc_server::phone_auto_compute_loop() {
                     if (phone_chunk_timeline_enabled) {
                         task->npu_exec_begin_us = ggml_time_us();
                     }
-                    if (phone_npu_executor->has_registered_chunk(
-                            req.graph_uid)) {
+                    // Critical A/B invariant: capture the *actual HTP-bound*
+                    // reference Activation during run_registered_chunk(),
+                    // after its OpenCL->HTP copy but BEFORE baseline compute.
+                    // Reading task->input_graph_tensor after compute is unsafe:
+                    // the original Graph can alias/reuse that source buffer
+                    // for its l_out. This previously sent the old output
+                    // into the Phone-local Graph as if it were the input.
+                    const char * local_exec_env =
+                        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
+                    const bool local_ab = local_exec_env != nullptr &&
+                        std::strcmp(local_exec_env, "1") == 0;
+                    const bool fixed_reference =
+                        phone_npu_executor->has_registered_chunk(req.graph_uid);
+                    std::vector<float> pre_compute_activation;
+                    if (local_ab && !fixed_reference) {
+                        why = "PHONE_LOCAL_AB_REQUIRES_FIXED_REFERENCE_GRAPH";
+                        ok = false;
+                    } else if (fixed_reference) {
                         ok = phone_npu_executor->run_registered_chunk(
                             req.graph_uid, it->second.graph, output, why,
                             stage_ms, htp_ms, return_ms,
-                            stage_profile_enabled ? &stage_profile : nullptr);
+                            stage_profile_enabled ? &stage_profile : nullptr,
+                            local_ab ? task->input_graph_tensor : nullptr,
+                            local_ab ? &pre_compute_activation : nullptr);
                     } else {
                         ok = phone_npu_executor->run(
                             it->second.graph, output, why,
@@ -8364,15 +8382,8 @@ void rpc_server::phone_auto_compute_loop() {
                     if (phone_chunk_timeline_enabled) {
                         task->npu_exec_end_us = ggml_time_us();
                     }
-                    // The baseline graph runs first, retaining the only
-                    // canonical KV used for later decode. Local execution
-                    // then replays the very same verified activation into
-                    // independently owned HTP KV. P2C still captures the
-                    // unchanged baseline output for this A/B run.
-                    const char * local_exec_env =
-                        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
-                    const bool local_ab = local_exec_env != nullptr &&
-                        std::strcmp(local_exec_env, "1") == 0;
+                    // Baseline retains canonical KV/P2C ownership; local
+                    // Graph receives the immutable pre-compute HTP snapshot.
                     if (ok && local_ab) {
                         // run_registered_chunk() may enqueue its final
                         // HTP->OpenCL output copy. Establish a reference
@@ -8384,7 +8395,8 @@ void rpc_server::phone_auto_compute_loop() {
                         const bool local_ok =
                             phone_npu_executor->run_owned_htp_chunk(
                                 req.key.run_id, req.key.region,
-                                req.key.chunk, task->input_graph_tensor,
+                                req.key.chunk, pre_compute_activation.data(),
+                                pre_compute_activation.size(),
                                 output, local_reason, local_stats);
                         GGML_LOG_INFO(
                             "[PHONE_QWEN3_LOCAL] event=EXECUTE_AB"
@@ -8396,6 +8408,7 @@ void rpc_server::phone_auto_compute_loop() {
                             " cosine=%.9f ref_rms=%.9g local_rms=%.9g"
                             " nonfinite=%zu worst_index=%zu"
                             " parity=MEASURED_ONLY p2c=LEGACY"
+                            " input_source=BASELINE_HTP_PRE_COMPUTE"
                             " status=%s reason=%s\n",
                             req.key.run_id, req.key.region,
                             local_stats.layer, req.key.chunk,
