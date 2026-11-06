@@ -176,6 +176,7 @@ def probe_tokens(
     env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(pc_layers),
+        "LLAMA_JUPITER_CPU_LAYERS": str(getattr(args, "cpu_layers", 0)),
         "LLAMA_JUPITER_WINDOW": "1",
         "LLAMA_JUPITER_PROFILE_STAGE": "0",
         "LLAMA_JUPITER_TRACE": "1",
