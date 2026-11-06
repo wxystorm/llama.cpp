@@ -61,6 +61,37 @@ class JupiterMemoryPlannerTest(unittest.TestCase):
                               DeviceMemory(250*MIB, 300*MIB), 0, 0,
                               pc_layers_override=3)
 
+    def test_cpu_fallback_auto_split_for_large_model(self):
+        # 64 layers, 256 MiB each = 16 GiB. Local GPU and phone
+        # each have a 4 GiB usable weight budget; CPU must hold the rest.
+        weights = GGUFWeights('qwen2', (256*MIB,)*64, 0, 0)
+        result = plan_memory_split(
+            weights,
+            DeviceMemory(4*GIB, 6*GIB),
+            DeviceMemory(4*GIB, 8*GIB),
+            pc_reserve_mib=0, phone_reserve_mib=0,
+            cpu=DeviceMemory(16*GIB, 24*GIB),
+            cpu_reserve_mib=2048,
+        )
+        self.assertGreater(result.cpu_layers, 0)
+        self.assertEqual(result.cpu_layers+result.pc_gpu_layers +
+                         result.phone_layers, 64)
+        self.assertEqual(result.cpu_weight_bytes +
+                         result.pc_weight_bytes +
+                         result.phone_weight_bytes, 16*GIB)
+        self.assertLessEqual(result.cpu_weight_bytes, result.cpu_budget_bytes)
+        self.assertLessEqual(result.pc_weight_bytes, result.pc_budget_bytes)
+        self.assertLessEqual(result.phone_weight_bytes, result.phone_budget_bytes)
+
+    def test_cpu_is_not_used_if_two_accelerators_suffice(self):
+        weights = GGUFWeights('qwen3', (64*MIB,)*4, 32*MIB, 0)
+        result = plan_memory_split(
+            weights, DeviceMemory(200*MIB, 300*MIB),
+            DeviceMemory(200*MIB, 300*MIB), 0, 0,
+            cpu=DeviceMemory(10*GIB, 12*GIB), cpu_reserve_mib=1024,
+        )
+        self.assertEqual(result.cpu_layers, 0)
+
     def test_pc_free_memory_from_nvidia_smi(self):
         class Result:
             stdout = ' 5000, 6144\n'
