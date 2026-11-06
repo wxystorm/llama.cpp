@@ -364,6 +364,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_WAIT,
     RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
     RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
+    RPC_CMD_PHONE_OWNED_KV_BIND,
     RPC_CMD_COUNT,
 };
 
@@ -402,6 +403,7 @@ static_assert(RPC_CMD_PHONE_AUTO_TASK_REGISTER == 50, "RPC_CMD_PHONE_AUTO_TASK_R
 static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
 static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
+static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -470,6 +472,18 @@ struct rpc_msg_phone_owned_plan_req {
     float rope_attn_factor = 0;
     float rope_beta_fast = 0;
     float rope_beta_slow = 0;
+};
+// One canonical storage binding per Region; no KV payload or host pointer.
+struct rpc_msg_phone_owned_kv_bind_req {
+    uint64_t run_id = 0;
+    uint32_t region = 0;
+    uint32_t layer = 0;
+    uint32_t device = 0;
+    uint32_t total_tokens = 0;
+    uint32_t identity_slots = 0;
+    uint32_t reserved = 0;
+    rpc_tensor canonical_k {};
+    rpc_tensor canonical_v {};
 };
 static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 108,
               "Phone-owned plan wire ABI changed; bump RPC protocol");
@@ -4304,6 +4318,51 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
                &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
 }
 
+static bool ggml_backend_rpc_phone_owned_kv_bind(
+        ggml_backend_t backend, uint64_t run_id, uint32_t region,
+        uint32_t layer, uint32_t total_tokens,
+        const ggml_tensor * canonical_k, const ggml_tensor * canonical_v,
+        bool verified_identity_slots) {
+    if (!backend || !ggml_backend_is_rpc(backend) ||
+            !canonical_k || !canonical_v || !verified_identity_slots ||
+            run_id == 0 || region >= ggml_phone_owned::k_max_regions ||
+            total_tokens == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    for (const ggml_tensor * t : {canonical_k, canonical_v}) {
+        if (!t->buffer || !t->data ||
+                !ggml_backend_buffer_is_rpc(t->buffer) ||
+                t->type != GGML_TYPE_F16 ||
+                t->op != GGML_OP_NONE || !ggml_is_contiguous(t)) {
+            return false;
+        }
+        auto * bc = static_cast<ggml_backend_rpc_buffer_context *>(
+            t->buffer->context);
+        if (!bc || bc->endpoint != ctx->endpoint ||
+                bc->device != ctx->device) {
+            return false;
+        }
+    }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 29) {
+        return false;
+    }
+    rpc_msg_phone_owned_kv_bind_req req {};
+    req.run_id = run_id;
+    req.region = region;
+    req.layer = layer;
+    req.device = ctx->device;
+    req.total_tokens = total_tokens;
+    req.identity_slots = 1;
+    req.canonical_k = serialize_tensor(canonical_k);
+    req.canonical_v = serialize_tensor(canonical_v);
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_KV_BIND,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
+}
+
 static bool ggml_backend_rpc_phone_auto_task_register(
         ggml_backend_t backend, uint64_t run_id, uint32_t region,
         uint32_t chunk, uint64_t graph_uid, size_t expected_input_bytes,
@@ -5893,6 +5952,7 @@ public:
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
+    bool phone_owned_kv_bind(const rpc_msg_phone_owned_kv_bind_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
     bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
     bool phone_auto_wait_capture(
@@ -6053,6 +6113,7 @@ public:
 private:
     struct phone_auto_job {
         rpc_msg_phone_auto_task_req request {};
+        bool graphless_owned = false;
         rpc_tensor input_wire {};
         // Kept alive by the immutable PC-built Graph until this RUN ends.
         // Used only as a read-only source for opt-in Phone-local HTP A/B.
@@ -7466,6 +7527,148 @@ bool rpc_server::phone_owned_plan_register(
                       "SHADOW_PC_BUILT",
                   local_builder_check ? "GRAPH_BUILT" : "OFF",
                   precompile_requested ? "PRECOMPILED" : "OFF");
+    return true;
+}
+
+// Bind the actual Decode K/V storage once per Phone Region and register
+// all Chunk tasks from the immutable Plan. This never deserializes a PC Graph.
+bool rpc_server::phone_owned_kv_bind(
+        const rpc_msg_phone_owned_kv_bind_req & request) {
+    const auto reject = [&](const char * why) {
+        GGML_LOG_ERROR(
+            "[PHONE_OWNED_KV] event=REJECT run=%" PRIu64
+            " region=%u layer=%u reason=%s status=FAIL\n",
+            request.run_id, request.region, request.layer, why);
+        return false;
+    };
+    const auto enabled = [](const char * name) {
+        const char * v = std::getenv(name);
+        return v && std::strcmp(v, "1") == 0;
+    };
+    if (!enabled("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS") ||
+            !enabled("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY") ||
+            !enabled("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT") ||
+            !enabled("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C") ||
+            request.reserved != 0 || request.identity_slots != 1 ||
+            request.device >= backends.size()) {
+        return reject("GRAPHLESS_MODE_OR_REQUEST_INVALID");
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (!phone_input_stream_runs.count(request.run_id) ||
+                std::any_of(phone_input_staged_slots.begin(),
+                    phone_input_staged_slots.end(),
+                    [&](const phone_input_staged & e) {
+                        return e.key.run_id == request.run_id;
+                    })) {
+            return reject("STREAM_NOT_ACTIVE_OR_PUSH_ALREADY_STARTED");
+        }
+    }
+    std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+    std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
+    const auto * plan = phone_owned_plans.find(
+        request.run_id, request.region);
+    if (!plan || plan->layer != request.layer ||
+            plan->total_tokens != request.total_tokens ||
+            !ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, request.region) ||
+            !phone_npu_executor || !phone_npu_executor->has_backend()) {
+        return reject("PHONE_OWNED_PLAN_OR_HTP_MISMATCH");
+    }
+
+    const uint64_t width = uint64_t(plan->n_heads_kv) * plan->head_dim;
+    const uint64_t row_bytes = width * sizeof(uint16_t);
+    const auto valid_wire = [&](const rpc_tensor & t) {
+        if (t.buffer == 0 || t.data == 0 ||
+                t.type != GGML_TYPE_F16 || t.op != GGML_OP_NONE ||
+                t.view_src != 0 || t.ne[0] != width ||
+                t.ne[1] < plan->total_tokens ||
+                t.ne[1] > plan->kv_capacity ||
+                t.ne[2] != 1 || t.ne[3] != 1 ||
+                t.nb[0] != sizeof(uint16_t) ||
+                t.nb[1] != row_bytes ||
+                t.nb[2] != row_bytes * t.ne[1] ||
+                t.nb[3] != t.nb[2]) {
+            return false;
+        }
+        auto * buffer = reinterpret_cast<ggml_backend_buffer_t>(t.buffer);
+        if (buffers.find(buffer) == buffers.end()) { return false; }
+        const uint64_t start =
+            (uint64_t) ggml_backend_buffer_get_base(buffer);
+        const uint64_t size = ggml_backend_buffer_get_size(buffer);
+        const uint64_t bytes = row_bytes * t.ne[1];
+        return bytes != 0 && t.data >= start &&
+               t.data - start <= size && bytes <= size - (t.data - start);
+    };
+    if (!valid_wire(request.canonical_k) ||
+            !valid_wire(request.canonical_v) ||
+            (request.canonical_k.buffer == request.canonical_v.buffer &&
+             request.canonical_k.data == request.canonical_v.data)) {
+        return reject("CANONICAL_KV_F16_WIRE_CONTRACT");
+    }
+    ggml_init_params params {
+        2 * ggml_tensor_overhead() + 4096, nullptr, true
+    };
+    ggml_context_ptr canonical_ctx {ggml_init(params)};
+    if (!canonical_ctx) { return reject("CANONICAL_KV_CONTEXT_ALLOC"); }
+    ggml_tensor * k = deserialize_tensor(
+        canonical_ctx.get(), &request.canonical_k);
+    ggml_tensor * v = deserialize_tensor(
+        canonical_ctx.get(), &request.canonical_v);
+    if (!k || !v || !is_opencl_tensor(k) || !is_opencl_tensor(v) ||
+            !ensure_opencl_tensor_extra(k) ||
+            !ensure_opencl_tensor_extra(v)) {
+        return reject("CANONICAL_KV_NATIVE_TENSOR");
+    }
+    std::string why;
+    if (!phone_npu_executor->bind_owned_decode_kv_storage(
+            request.run_id, request.region, request.layer,
+            std::move(canonical_ctx), k, v, true, why)) {
+        return reject(why.c_str());
+    }
+    // Every task is registered before PC launches PUSH. Per-region FIFO,
+    // 128 MiB host budget and P2C Arena backpressure stay unchanged.
+    size_t added = 0;
+    {
+        std::lock_guard<std::mutex> lock(phone_auto_mutex);
+        const auto region_key =
+            std::make_pair(request.run_id, request.region);
+        if (phone_auto_next_chunk.count(region_key)) {
+            return reject("REGION_TASKS_ALREADY_REGISTERED");
+        }
+        phone_auto_next_chunk.emplace(region_key, 0);
+        for (uint32_t c = 0; c < ggml_phone_owned::chunk_count(*plan); ++c) {
+            const uint64_t begin = uint64_t(c) * plan->chunk_tokens;
+            const uint32_t tokens = std::min<uint64_t>(
+                plan->chunk_tokens, plan->total_tokens - begin);
+            const uint64_t bytes = uint64_t(tokens) * plan->n_embd *
+                                   sizeof(float);
+            rpc_msg_phone_auto_task_req desc {};
+            desc.key = {request.run_id, request.region, c};
+            desc.device = request.device;
+            desc.graph_uid = ggml_phone_owned::owned_task_uid(
+                request.region, c);
+            desc.input_bytes = bytes;
+            desc.p2c_run_id = plan->p2c_run_id;
+            desc.output_bytes = bytes;
+            desc.token_begin = static_cast<uint32_t>(begin);
+            desc.n_tokens = tokens;
+            auto job = std::make_shared<phone_auto_job>();
+            job->request = desc;
+            job->graphless_owned = true;
+            if (!phone_auto_jobs.emplace(auto_key(desc.key), std::move(job)).second) {
+                return reject("DUPLICATE_PHONE_TASK");
+            }
+            ++added;
+        }
+    }
+    phone_auto_cv.notify_all();
+    GGML_LOG_INFO(
+        "[PHONE_OWNED_KV] event=BIND run=%" PRIu64
+        " region=%u layer=%u chunks=%zu"
+        " slots=PC_VERIFIED_IDENTITY graph_register=SKIPPED"
+        " task_register=PHONE_OWNED status=PASS\n",
+        request.run_id, request.region, request.layer, added);
     return true;
 }
 
@@ -14190,6 +14393,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_OWNED_KV_BIND: {
+                rpc_msg_phone_owned_kv_bind_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_owned_kv_bind(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
                 rpc_msg_phone_auto_task_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -14642,6 +14854,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_input_ack response {};
                 response.accepted =
                     server.phone_owned_plan_register(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_OWNED_KV_BIND: {
+                rpc_msg_phone_owned_kv_bind_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_owned_kv_bind(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
@@ -15778,6 +15999,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_plan_register);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_kv_bind);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_task_register);
