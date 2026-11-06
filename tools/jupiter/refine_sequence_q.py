@@ -99,6 +99,7 @@ def targeted_rows(
     sample_csv: Path,
     x: int,
     y: int,
+    require_cpu: bool = False,
 ) -> list[dict[str, str]]:
     raw_rows = read_profile(sample_csv)
     rows = [
@@ -109,9 +110,10 @@ def targeted_rows(
     devices = {row["device"] for row in rows}
     has_phone = any(d.startswith("RPC") for d in devices)
     has_pc = any(not d.startswith("RPC") and not d.startswith("CPU") for d in devices)
-    if not (has_phone and has_pc):
+    has_cpu = any(d.startswith("CPU") for d in devices)
+    if not (has_phone and has_pc and (not require_cpu or has_cpu)):
         raise RuntimeError(
-            f"q({x},{y}) requires both PC accelerator and phone RPC stage "
+            f"q({x},{y}) requires PC accelerator, phone RPC, and optional CPU stage "
             f"samples; found {sorted(devices)} in {sample_csv}"
         )
     return rows
@@ -139,6 +141,7 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--out-dir", default="jupiter-q-refinement")
     p.add_argument("--target-tokens", type=int, default=None)
     p.add_argument("--pc-layers", type=int, default=25)
+    p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--min-chunk", type=int, default=32)
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--max-subsequences", type=int, default=None)
@@ -185,6 +188,7 @@ def build_resume_config(
         "profile_sha256": hashlib.sha256(source_profile.read_bytes()).hexdigest(),
         "total": total, "metric": args.metric,
         "pc_layers": args.pc_layers,
+        "cpu_layers": getattr(args, "cpu_layers", 0),
         "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
         "max_subsequences": args.max_subsequences,
         "repeats": args.repeats,
@@ -197,6 +201,7 @@ def main() -> int:
     args = get_parser().parse_args()
     if (
         args.min_chunk <= 0 or args.max_chunk < args.min_chunk
+        or args.cpu_layers < 0 or args.cpu_layers >= args.pc_layers
         or args.repeats < 1 or args.max_rounds < 1
         or args.batch > args.context or args.max_chunk > args.batch
     ):
@@ -269,6 +274,7 @@ def main() -> int:
     env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(args.pc_layers),
+        "LLAMA_JUPITER_CPU_LAYERS": str(args.cpu_layers),
         "LLAMA_JUPITER_WINDOW": "1",
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_PROFILE_STAGE": "1",
@@ -290,9 +296,11 @@ def main() -> int:
 
     selected_candidate = None
     for iteration in range(1, args.max_rounds + 1):
-        profile = QProfile(all_rows, metric=args.metric)
+        profile = QProfile(all_rows, metric=args.metric,
+                           require_cpu=args.cpu_layers > 0)
         solution = solve_sequence(
-            profile, total, 2, args.min_chunk, args.max_chunk,
+            profile, total, 3 if args.cpu_layers else 2,
+            args.min_chunk, args.max_chunk,
             args.max_subsequences,
         )
         selected_candidate = solution
@@ -326,7 +334,9 @@ def main() -> int:
                     )
                     if actual == chunks:
                         try:
-                            samples = targeted_rows(sample_path, x, y)
+                            samples = targeted_rows(
+                                sample_path, x, y, require_cpu=args.cpu_layers > 0
+                            )
                             reused = True
                         except (RuntimeError, ValueError):
                             reused = False
@@ -361,7 +371,9 @@ def main() -> int:
                         "--metric", "compute_ms",
                         "--min-tokens", str(args.min_chunk),
                     ])
-                    samples = targeted_rows(sample_path, x, y)
+                    samples = targeted_rows(
+                        sample_path, x, y, require_cpu=args.cpu_layers > 0
+                    )
 
                 # Keep incomplete repeat sets in per-repeat CSV files. Do
                 # not mark q(x,y) measured in the merged profile until all
@@ -382,7 +394,8 @@ def main() -> int:
                 flush=True,
             )
 
-    profile = QProfile(all_rows, metric=args.metric)
+    profile = QProfile(all_rows, metric=args.metric,
+                       require_cpu=args.cpu_layers > 0)
     if args.accept_measured_candidate:
         # The selected candidate was measured in the last iteration.
         # Re-solving now can move to new unmeasured coordinates indefinitely.
@@ -398,7 +411,8 @@ def main() -> int:
         )
     else:
         final = solve_sequence(
-            profile, total, 2, args.min_chunk, args.max_chunk,
+            profile, total, 3 if args.cpu_layers else 2,
+            args.min_chunk, args.max_chunk,
             args.max_subsequences,
         )
     missing = sequence_missing_points(profile, final.chunks)
@@ -407,6 +421,7 @@ def main() -> int:
         str(candidate_path),
         {
             "model.pc_layers": str(args.pc_layers),
+            "model.cpu_layers": str(args.cpu_layers),
             f"sequence.{total}": ",".join(map(str, final.chunks)),
         },
     )
@@ -433,6 +448,7 @@ def main() -> int:
         str(plan_output),
         {
             "model.pc_layers": str(args.pc_layers),
+            "model.cpu_layers": str(args.cpu_layers),
             f"sequence.{total}": ",".join(map(str, final.chunks)),
         },
     )
