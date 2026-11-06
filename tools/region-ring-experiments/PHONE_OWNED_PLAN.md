@@ -663,6 +663,52 @@ Priorities also do not increase PCIe or memory bandwidth. Do **not** set
 If only enabled roles improve, keep them optional until repeated parity
 and performance testing confirms the benefit.
 
+## Ordered asynchronous C2P PUSH + Phone receive/verify split (2026-11-06)
+
+This change keeps the exact `RPC_CMD_PHONE_INPUT_STREAM_PUSH` wire layout
+(`cmd:u8 | length:u64 | request metadata | activation`) and the existing
+run-level setup/END RPCs. It changes **Stream mode only**; the legacy
+per-Chunk ACK PUSH path is unchanged.
+
+- **PC:** The READY producer copies immutable Activation into a 64 MiB
+  bounded host queue. A dedicated `PHONE_PUSH` sender drains queued frames
+  in order. The producer can prepare subsequent Chunks while `send()` is
+  blocked; the Phone Worker is **not** told "sent" until the actual frame
+  send has completed. A failed send cancels the ring and wakes waiters.
+  The producer and sender are both joined before the run's END RPC.
+- **One merged frame:** The sender builds one contiguous
+  `header + request + payload` buffer, calls `socket_t::send_data()`
+  once, and keeps it alive until completion. On Windows, the existing
+  `send_data()` wrapper can still perform several blocking native
+  `send()` calls; this is **not IOCP / overlapped `WSASend`**.
+  `pc_header_send_ms` is now 0 for Stream mode, and
+  `pc_payload_send_ms` measures the **entire merged-frame send**.
+- **Phone:** The socket receiver performs budget reservation, framing
+  and full payload reception, then transfers the buffer to a dedicated
+  Verify worker with `std::move`. Hash validation, staging and
+  autonomous VERIFIED notifications happen off the recv thread.
+  The existing 128 MiB reservation covers pending verify items and
+  already-staged/consuming buffers; capacity exhaustion applies natural
+  backpressure rather than allocating without limits.
+- **Shutdown:** Stream END waits until locally enqueued Phone verification
+  tasks for the run finish; server destruction drains verification before
+  stopping the autonomous Phone workers. Both Phone server and PC binary
+  need rebuilding to exercise the changed receive/verify path.
+
+Diagnostics: PC `[PHONE_INPUT_TX_ASYNC]` entries report queue wait,
+merged frame send, peak queued MiB, and budget wait. With
+`GGML_RPC_PHONE_CHUNK_TIMELINE=1` on Phone,
+`[PHONE_INPUT_VERIFY_QUEUE]` reports queue wait and worker time.
+Retain `[PHONE_INPUT_STREAM_SUM]` for 16/16 received/verified frames.
+
+Recommended real-device validation: first run the exact 512-token
+fixed-layout canary with the same model and Phone backend; compare against
+the previous branch, check `status=PASS`, all 16 pushes verified, Phone
+KV correctness, P2C completeness and the decode parity. Repeat 5+ times
+per build to compare prefill median/p95 and `merged_frame_send_ms` tails.
+A non-blocking producer does not increase Wi-Fi or TCP throughput and
+does not eliminate true network backpressure.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
