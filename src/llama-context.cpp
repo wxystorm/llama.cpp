@@ -4380,6 +4380,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::strcmp(phone_copy_trace_setting, "1") == 0;
     const int64_t ring_trace_origin_us =
         ring_trace_enabled ? ggml_time_us() : 0;
+    // PC-clock startup milestones. The first GPU task is READY while PC
+    // builds/prebinds Phone resources; READY->CLAIM therefore includes
+    // bootstrap. These fields separate startup from worker scheduling.
+    int64_t ring_trace_embed_begin_us = 0;
+    int64_t ring_trace_embed_end_us = 0;
+    int64_t ring_trace_owned_plan_begin_us = 0;
+    int64_t ring_trace_owned_plan_end_us = 0;
+    int64_t ring_trace_p2c_subscribe_begin_us = 0;
+    int64_t ring_trace_p2c_subscribe_end_us = 0;
+    int64_t ring_trace_workers_launch_begin_us = 0;
+    int64_t ring_trace_workers_launch_end_us = 0;
+    std::array<int64_t, 3> ring_trace_worker_enter_us {};
     struct ring_chunk_trace_row {
         int64_t ready_us = 0;
         int64_t claim_us = 0;
@@ -4600,6 +4612,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
 
         const int64_t prelude_begin_us = ggml_time_us();
+        if (ring_trace_enabled) {
+            ring_trace_embed_begin_us = prelude_begin_us;
+        }
         LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=BEGIN tokens=%u hidden=%d "
             "backend=CPU_FULL_BATCH status=RUNNING\n",
@@ -4670,8 +4685,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         worker_kv_views[0]->clear_stage_range();
 
         ring_embedding_prelude = true;
-        ring_embedding_prelude_us =
-            ggml_time_us() - prelude_begin_us;
+        const int64_t prelude_end_us = ggml_time_us();
+        if (ring_trace_enabled) {
+            ring_trace_embed_end_us = prelude_end_us;
+        }
+        ring_embedding_prelude_us = prelude_end_us - prelude_begin_us;
         LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=END tokens=%u bytes=%zu "
             "compute_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
@@ -5552,6 +5570,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             return nullptr;
         }
         if (owned_plan_requested && phone_auto_enabled) {
+            if (ring_trace_enabled) {
+                ring_trace_owned_plan_begin_us = ggml_time_us();
+            }
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
             auto * rpc_reg = rpc_dev != nullptr ?
                 ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
@@ -5752,6 +5773,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     " task_registration=PHONE_OWNED status=READY\n",
                     published, phone_auto_templates.size());
             }
+            if (ring_trace_enabled) {
+                ring_trace_owned_plan_end_us = ggml_time_us();
+            }
         }
         ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
         if (phone_auto_enabled) {
@@ -5867,6 +5891,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             phone_stream_session.run_id = phone_stream_run_id;
             phone_stream_session.ready = &ready;
+            if (ring_trace_enabled) {
+                ring_trace_p2c_subscribe_begin_us = ggml_time_us();
+            }
             phone_stream_handle = start(
                 phone_rpc_backend,
                 phone_stream_session.run_id,
@@ -5876,6 +5903,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 llama_region_ring_phone_full_stream_resolve,
                 llama_region_ring_phone_full_stream_complete,
                 &phone_stream_session);
+            if (ring_trace_enabled) {
+                ring_trace_p2c_subscribe_end_us = ggml_time_us();
+            }
             if (phone_stream_handle == nullptr) {
                 LLAMA_LOG_ERROR(
                     "[P2C_STREAM] status=FAIL reason=SUBSCRIBE\n");
@@ -6720,6 +6750,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         };
 
         auto run_worker = [&](size_t dev) {
+            if (ring_trace_enabled && dev < ring_trace_worker_enter_us.size()) {
+                // Each worker writes only its own slot; all rows are read
+                // after the parent joins the worker threads.
+                ring_trace_worker_enter_us[dev] = ggml_time_us();
+            }
             auto & state = worker_states[dev];
             const auto device = devices[dev];
             const char * name = llama_region_ring_device_name(device);
@@ -7917,6 +7952,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         std::vector<std::thread> workers;
         bool launched_all = false;
+        if (ring_trace_enabled) {
+            ring_trace_workers_launch_begin_us = ggml_time_us();
+        }
         try {
             workers.reserve(devices.size());
             for (size_t dev = 0; dev < devices.size(); ++dev) {
@@ -7931,6 +7969,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_WORKERS] event=LAUNCH_FAIL reason=UNKNOWN\n");
             ready.cancel();
+        }
+        if (ring_trace_enabled) {
+            ring_trace_workers_launch_end_us = ggml_time_us();
         }
         const size_t created = workers.size();
         size_t joined = 0;
@@ -8589,8 +8630,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                  << R"(,"ring_wall_ms":)"
                  << experiment_wall_us / 1000.0
                  << R"(,"records":)" << ready.total_tasks()
-                 << R"(,"phone_gpu_kernel_time_included":false)"
-                 << "}\n";
+                 << R"(,"phone_gpu_kernel_time_included":false)";
+            point(meta, "embed_begin_ms", ring_trace_embed_begin_us);
+            point(meta, "embed_end_ms", ring_trace_embed_end_us);
+            point(meta, "owned_plan_begin_ms", ring_trace_owned_plan_begin_us);
+            point(meta, "owned_plan_end_ms", ring_trace_owned_plan_end_us);
+            point(meta, "p2c_subscribe_begin_ms", ring_trace_p2c_subscribe_begin_us);
+            point(meta, "p2c_subscribe_end_ms", ring_trace_p2c_subscribe_end_us);
+            point(meta, "workers_launch_begin_ms", ring_trace_workers_launch_begin_us);
+            point(meta, "workers_launch_end_ms", ring_trace_workers_launch_end_us);
+            point(meta, "cpu_worker_enter_ms", ring_trace_worker_enter_us[0]);
+            point(meta, "gpu_worker_enter_ms", ring_trace_worker_enter_us[1]);
+            point(meta, "phone_worker_enter_ms", ring_trace_worker_enter_us[2]);
+            meta << "}\n";
             region_ring_experiment_records.push_back(meta.str());
 
             for (size_t r = 0; r < stages.size(); ++r) {
@@ -8633,6 +8685,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         point(out, "push_end_ms", t.push_end_us);
                         duration(out, "push_wall_ms", t.push_begin_us, t.push_end_us);
                         const auto & p = t.push_timing;
+                        point(out, "push_header_begin_ms", p.pc_header_begin_us);
+                        point(out, "push_header_end_ms", p.pc_header_end_us);
+                        point(out, "push_payload_begin_ms", p.pc_payload_begin_us);
+                        point(out, "push_payload_end_ms", p.pc_payload_end_us);
                         out << R"(,"push_socket_lock_ms":)" << p.pc_socket_lock_wait_us / 1000.0
                             << R"(,"push_hash_ms":)" << p.pc_hash_us / 1000.0
                             << R"(,"push_pack_ms":)" << p.pc_pack_us / 1000.0
