@@ -20,12 +20,16 @@ int main() {
     CHECK(s.count == 4 && s.nonfinite == 0 && s.max_abs == 0);
     CHECK(std::abs(s.cosine - 1.0) < 1.e-12);
     CHECK(s.rmse == 0.0);
+    CHECK(ggml_phone_qwen3::can_publish_exact(s));
+    ggml_phone_qwen3::parity_stats unmeasured {};
+    CHECK(!ggml_phone_qwen3::can_publish_exact(unmeasured));
 
     float changed[]   = {1.0f, -1.0f, 3.0f, 4.0f};
     CHECK(compare_outputs(reference, changed, 4, s));
     CHECK(s.max_abs == 1.0 && s.max_index == 1);
     CHECK(std::abs(s.rmse - 0.5) < 1.e-12);
     CHECK(std::abs(s.mean_abs - 0.25) < 1.e-12);
+    CHECK(!ggml_phone_qwen3::can_publish_exact(s));
 
     CHECK(!compare_outputs(nullptr, changed, 4, s));
     CHECK(!compare_outputs(reference, changed, 0, s));
@@ -33,6 +37,7 @@ int main() {
     changed[2] = std::numeric_limits<float>::quiet_NaN();
     CHECK(!compare_outputs(reference, changed, 4, s));
     CHECK(s.nonfinite == 1);
+    CHECK(!ggml_phone_qwen3::can_publish_exact(s));
 
     float zeros[] = {0.f,0.f,0.f,0.f};
     CHECK(compare_outputs(zeros, zeros, 4, s));
