@@ -6051,6 +6051,9 @@ private:
     struct phone_auto_job {
         rpc_msg_phone_auto_task_req request {};
         rpc_tensor input_wire {};
+        // Kept alive by the immutable PC-built Graph until this RUN ends.
+        // Used only as a read-only source for opt-in Phone-local HTP A/B.
+        ggml_tensor * input_graph_tensor = nullptr;
         std::shared_ptr<phone_stage_prepare_job> prepared_job;
         std::optional<phone_stage_prepared_input> prepared;
         phone_auto_status state = phone_auto_status::REGISTERED;
@@ -7310,6 +7313,17 @@ bool rpc_server::phone_owned_plan_register(
         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE");
     const bool precompile_requested = precompile_env != nullptr &&
         std::strcmp(precompile_env, "1") == 0;
+    const char * local_exec_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
+    const bool local_exec_requested = local_exec_env != nullptr &&
+        std::strcmp(local_exec_env, "1") == 0;
+    if (local_exec_requested && !precompile_requested) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=EXEC_REQUIRES_HTP_PRECOMPILE\n",
+            plan.run_id, plan.region);
+        return false;
+    }
     if (precompile_requested) {
         ggml_phone_npu_serial::full_region_executor::
             local_htp_prepare_stats stats {};
@@ -7380,12 +7394,22 @@ bool rpc_server::phone_auto_task_register(
             request.input_bytes != request.output_bytes) {
         return reject("INVALID_REQUEST_OR_OUTPUT_SHAPE");
     }
-    // A registered shadow plan constrains legacy graph admission too. This
-    // establishes exact Chunk/KV metadata parity before local construction.
+    // Register the local graph contract before accepting A/B execution.
+    // No best-effort fallback is allowed when the experimental switch is
+    // explicitly enabled: a missing Plan would hide incomplete coverage.
     {
         std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
         const auto * plan = phone_owned_plans.find(
             request.key.run_id, request.key.region);
+        const char * local_exec_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
+        const bool local_exec_requested = local_exec_env != nullptr &&
+            std::strcmp(local_exec_env, "1") == 0 &&
+            ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, request.key.region);
+        if (local_exec_requested && plan == nullptr) {
+            return reject("PHONE_LOCAL_EXEC_PLAN_MISSING");
+        }
         if (plan != nullptr &&
                 !ggml_phone_owned::matches_chunk(
                     *plan, request.key.chunk, request.token_begin,
@@ -7718,6 +7742,7 @@ bool rpc_server::phone_auto_task_register(
         auto job = std::make_shared<phone_auto_job>();
         job->request = request;
         job->input_wire = wire;
+        job->input_graph_tensor = input;
         if (phone_chunk_timeline_enabled) {
             job->register_begin_us = register_begin_us;
             job->register_end_us = ggml_time_us();
@@ -8338,6 +8363,56 @@ void rpc_server::phone_auto_compute_loop() {
                     }
                     if (phone_chunk_timeline_enabled) {
                         task->npu_exec_end_us = ggml_time_us();
+                    }
+                    // The baseline graph runs first, retaining the only
+                    // canonical KV used for later decode. Local execution
+                    // then replays the very same verified activation into
+                    // independently owned HTP KV. P2C still captures the
+                    // unchanged baseline output for this A/B run.
+                    const char * local_exec_env =
+                        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
+                    const bool local_ab = local_exec_env != nullptr &&
+                        std::strcmp(local_exec_env, "1") == 0;
+                    if (ok && local_ab) {
+                        ggml_phone_npu_serial::full_region_executor::
+                            local_exec_profile local_stats {};
+                        std::string local_reason;
+                        const bool local_ok =
+                            phone_npu_executor->run_owned_htp_chunk(
+                                req.key.run_id, req.key.region,
+                                req.key.chunk, task->input_graph_tensor,
+                                output, local_reason, local_stats);
+                        GGML_LOG_INFO(
+                            "[PHONE_QWEN3_LOCAL] event=EXECUTE_AB"
+                            " run=%" PRIu64 " region=%u layer=%u"
+                            " chunk=%u tokens=%u backend=HTP0"
+                            " input_read_ms=%.3f input_upload_ms=%.3f"
+                            " htp_compute_ms=%.3f compare_ms=%.3f"
+                            " max_abs=%.9g mean_abs=%.9g rmse=%.9g"
+                            " cosine=%.9f ref_rms=%.9g local_rms=%.9g"
+                            " nonfinite=%zu worst_index=%zu"
+                            " parity=MEASURED_ONLY p2c=LEGACY"
+                            " status=%s reason=%s\n",
+                            req.key.run_id, req.key.region,
+                            local_stats.layer, req.key.chunk,
+                            local_stats.tokens,
+                            local_stats.input_read_ms,
+                            local_stats.input_upload_ms,
+                            local_stats.compute_ms, local_stats.compare_ms,
+                            local_stats.parity.max_abs,
+                            local_stats.parity.mean_abs,
+                            local_stats.parity.rmse, local_stats.parity.cosine,
+                            local_stats.parity.reference_rms,
+                            local_stats.parity.candidate_rms,
+                            local_stats.parity.nonfinite,
+                            local_stats.parity.max_index,
+                            local_ok ? "PASS" : "FAIL",
+                            local_ok ? "NONE" : local_reason.c_str());
+                        if (!local_ok) {
+                            why = local_reason.empty() ?
+                                "PHONE_LOCAL_EXEC_FAILED" : local_reason;
+                            ok = false;
+                        }
                     }
                 }
                 status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
