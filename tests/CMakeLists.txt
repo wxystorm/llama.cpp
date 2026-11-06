@@ -121,6 +121,19 @@ endfunction()
 add_executable(test-phone-autonomous-policy test-phone-autonomous-policy.cpp)
 llama_test(test-phone-autonomous-policy LABEL region-ring)
 
+# Pure C++ shadow-plan checks; no GGUF, HTP or RPC server required.
+add_executable(test-phone-owned-execution-plan test-phone-owned-execution-plan.cpp)
+llama_test(test-phone-owned-execution-plan LABEL region-ring)
+
+# Local Qwen3 graph construction on GGML metadata; no HTP or model needed.
+add_executable(test-phone-qwen3-local-builder test-phone-qwen3-local-builder.cpp)
+target_link_libraries(test-phone-qwen3-local-builder PRIVATE ggml)
+llama_test(test-phone-qwen3-local-builder LABEL region-ring)
+
+# Pure F32 output parity metrics, including invalid/nonfinite cases.
+add_executable(test-phone-qwen3-local-parity test-phone-qwen3-local-parity.cpp)
+llama_test(test-phone-qwen3-local-parity LABEL region-ring)
+
 # build test-tokenizer-0 target once and add many tests
 llama_build(test-tokenizer-0.cpp)
 

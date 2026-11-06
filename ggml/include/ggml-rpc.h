@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    26
+#define RPC_PROTO_PATCH_VERSION    29
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -205,6 +205,51 @@ using ggml_backend_rpc_phone_auto_wait_capture_t = bool (*)(
     ggml_backend_t backend, uint64_t input_run_id, uint32_t region,
     uint32_t chunk, uint64_t graph_uid, uint64_t p2c_run_id,
     uint32_t token_begin, uint32_t n_tokens, size_t expected_bytes);
+
+// Patch 28: optional shadow registration of an immutable Phone-owned
+// execution plan. This does not switch off the PC-built Graph path; a local
+// Qwen3 Layer Builder and parity validation are required before that cutover.
+struct ggml_backend_rpc_phone_owned_plan {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t run_id;
+    uint64_t p2c_run_id;
+    uint32_t region;
+    uint32_t layer;
+    uint32_t total_tokens;
+    uint32_t chunk_tokens;
+    uint32_t n_embd;
+    uint32_t position_base;
+    uint32_t kv_capacity;
+    uint32_t n_heads;
+    uint32_t n_heads_kv;
+    uint32_t head_dim;
+    uint32_t n_kv;
+    uint32_t rope_type;
+    uint32_t n_ctx_orig;
+    uint32_t kv_type;
+    float rms_norm_eps;
+    float rope_freq_base;
+    float rope_freq_scale;
+    float rope_ext_factor;
+    float rope_attn_factor;
+    float rope_beta_fast;
+    float rope_beta_slow;
+};
+#define GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC \
+    "ggml_backend_rpc_phone_owned_plan_register"
+using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
+    ggml_backend_t backend,
+    const ggml_backend_rpc_phone_owned_plan * plan);
+
+// One-time canonical Decode KV destination binding; no per-Chunk Graph.
+#define GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC \
+    "ggml_backend_rpc_phone_owned_kv_bind"
+using ggml_backend_rpc_phone_owned_kv_bind_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t region,
+    uint32_t layer, uint32_t total_tokens,
+    const ggml_tensor * canonical_k, const ggml_tensor * canonical_v,
+    bool verified_identity_slots);
 
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
@@ -431,6 +476,12 @@ struct ggml_backend_rpc_phone_input_push_timing {
     int64_t pc_pack_us = 0;
     int64_t pc_header_send_us = 0;
     int64_t pc_payload_send_us = 0;
+    // PC-clock absolute boundaries, for TASK_TRACE JSON only. The values
+    // are not sent to the Phone and must never be subtracted from Phone time.
+    int64_t pc_header_begin_us = 0;
+    int64_t pc_header_end_us = 0;
+    int64_t pc_payload_begin_us = 0;
+    int64_t pc_payload_end_us = 0;
     int64_t pc_ack_wait_us = 0;
     int64_t phone_recv_header_us = 0;
     int64_t phone_recv_alloc_us = 0;

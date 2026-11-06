@@ -40,6 +40,13 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 //
 // llama_context
 //
@@ -50,6 +57,31 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+// Opt-in per-role Windows scheduler A/B. Leave the process priority class
+// unchanged so Bank Mover/PUSH can be compared independently. Setting the
+// priority inside each thread guarantees it precedes its first Chunk.
+static void llama_region_ring_maybe_raise_current_thread_priority(
+        const char * env_name, const char * role) {
+#if defined(_WIN32)
+    const char * value = std::getenv(env_name);
+    if (value == nullptr || std::strcmp(value, "1") != 0) {
+        return;
+    }
+    const BOOL ok = SetThreadPriority(
+        GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    const DWORD error = ok ? 0 : GetLastError();
+    LLAMA_LOG_INFO(
+        "[REGION_RING_THREAD_PRIORITY] role=%s tid=%lu"
+        " requested=ABOVE_NORMAL status=%s error=%lu\n",
+        role, static_cast<unsigned long>(GetCurrentThreadId()),
+        ok ? "PASS" : "FAIL",
+        static_cast<unsigned long>(error));
+#else
+    (void) env_name;
+    (void) role;
+#endif
 }
 
 static const char * llama_hybrid_runtime_stage_name(llama_hybrid_runtime_stage_kind kind) {
@@ -4380,6 +4412,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::strcmp(phone_copy_trace_setting, "1") == 0;
     const int64_t ring_trace_origin_us =
         ring_trace_enabled ? ggml_time_us() : 0;
+    // PC-clock startup milestones. The first GPU task is READY while PC
+    // builds/prebinds Phone resources; READY->CLAIM therefore includes
+    // bootstrap. These fields separate startup from worker scheduling.
+    int64_t ring_trace_embed_begin_us = 0;
+    int64_t ring_trace_embed_end_us = 0;
+    int64_t ring_trace_owned_plan_begin_us = 0;
+    int64_t ring_trace_owned_plan_end_us = 0;
+    int64_t ring_trace_p2c_subscribe_begin_us = 0;
+    int64_t ring_trace_p2c_subscribe_end_us = 0;
+    int64_t ring_trace_workers_launch_begin_us = 0;
+    int64_t ring_trace_workers_launch_end_us = 0;
+    std::array<int64_t, 3> ring_trace_worker_enter_us {};
     struct ring_chunk_trace_row {
         int64_t ready_us = 0;
         int64_t claim_us = 0;
@@ -4600,6 +4644,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
 
         const int64_t prelude_begin_us = ggml_time_us();
+        if (ring_trace_enabled) {
+            ring_trace_embed_begin_us = prelude_begin_us;
+        }
         LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=BEGIN tokens=%u hidden=%d "
             "backend=CPU_FULL_BATCH status=RUNNING\n",
@@ -4670,8 +4717,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         worker_kv_views[0]->clear_stage_range();
 
         ring_embedding_prelude = true;
-        ring_embedding_prelude_us =
-            ggml_time_us() - prelude_begin_us;
+        const int64_t prelude_end_us = ggml_time_us();
+        if (ring_trace_enabled) {
+            ring_trace_embed_end_us = prelude_end_us;
+        }
+        ring_embedding_prelude_us = prelude_end_us - prelude_begin_us;
         LLAMA_LOG_INFO(
             "[REGION_RING_EMBED_PRELUDE] phase=END tokens=%u bytes=%zu "
             "compute_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
@@ -4765,6 +4815,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_auto_final_enabled =
         phone_auto_final_requested && phone_auto_eligible &&
         model.arch == LLM_ARCH_QWEN3;
+    // Graphless only changes the full Prefill path; tiny/decode retain
+    // their normal PC graphs. PC must explicitly opt in independently of
+    // the Phone server's matching GRAPHLESS switch.
+    const char * graphless_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_GRAPHLESS");
+    const bool graphless_requested = graphless_env != nullptr &&
+        std::strcmp(graphless_env, "1") == 0;
+    const bool phone_graphless =
+        graphless_requested && ubatch.n_tokens >= 32 &&
+        phone_auto_final_enabled && own_stage_resources;
+    if (graphless_requested && ubatch.n_tokens >= 32 &&
+            !phone_graphless) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_OWNED_KV] side=pc event=REJECT"
+            " reason=GRAPHLESS_REQUIRES_PHONE_AUTONOMOUS_FINAL"
+            "_AND_OWNED_KV status=FAIL\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     // Tiny startup/warmup and one-token decode keep the proven legacy
     // path even while the full-UBatch autonomous experiment is requested.
     // Do not fail the entire test suite before reaching its target prompt.
@@ -4941,7 +5010,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Other modes retain the original eager graph and binding lifecycle.
     const bool phone_async_graph_setup =
         phone_async_graph_requested && phone_auto_eligible &&
-        phone_auto_final_enabled;
+        phone_auto_final_enabled && !phone_graphless;
     std::mutex phone_graph_ready_mutex;
     std::condition_variable phone_graph_ready_cv;
     std::vector<std::vector<uint8_t>> phone_graph_ready(stages.size());
@@ -5260,7 +5329,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return template_index == phone_auto_templates.size();
     };
 
-    if (phone_auto_eligible && !phone_async_graph_setup) {
+    if (phone_auto_eligible && !phone_async_graph_setup &&
+            !phone_graphless) {
         const auto no_binding = [](const phone_auto_template &) { return true; };
         if (!build_phone_auto_graphs(no_binding)) {
             ret = GGML_STATUS_FAILED;
@@ -5506,6 +5576,239 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_stream_requested && has_phone_full_return ?
                 next_phone_stream_run_id.fetch_add(
                     1, std::memory_order_relaxed) : 0;
+        // First migration step: send immutable Region descriptors ahead of
+        // the existing PC-built per-Chunk Graph path. This is intentionally
+        // a SHADOW contract; Phone-local graph building is not enabled yet.
+        const char * owned_plan_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+        const bool owned_plan_requested =
+            owned_plan_env != nullptr &&
+            std::strcmp(owned_plan_env, "1") == 0;
+        if (phone_graphless && !owned_plan_requested) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_OWNED_KV] side=pc event=REJECT"
+                " reason=GRAPHLESS_REQUIRES_REGION_PLAN status=FAIL\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        // Tiny warmup/decode keeps the normal path. A real prefill that
+        // explicitly requests Plan shadow must never silently skip it.
+        if (owned_plan_requested && ubatch.n_tokens >= 32 &&
+                !phone_auto_enabled) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_OWNED_PLAN] side=pc event=REJECT "
+                "reason=PHONE_AUTO_STREAM_REQUIRED status=FAIL\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (owned_plan_requested && phone_auto_enabled) {
+            if (ring_trace_enabled) {
+                ring_trace_owned_plan_begin_us = ggml_time_us();
+            }
+            auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * rpc_reg = rpc_dev != nullptr ?
+                ggml_backend_dev_backend_reg(rpc_dev) : nullptr;
+            const auto register_plan = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_owned_plan_register_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC)) :
+                nullptr;
+            const auto bind_kv = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_owned_kv_bind_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC)) :
+                nullptr;
+            bool valid = register_plan != nullptr &&
+                phone_stream_run_id != 0 &&
+                model.arch == LLM_ARCH_QWEN3 &&
+                ubatch.pos != nullptr && ubatch.pos[0] == 0 &&
+                cparams.n_ctx >= ubatch.n_tokens &&
+                cparams.flash_attn &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+            // The actual KV allocator, not RoPE positions, proves the
+            // fresh physical slot assignment before any remote execution.
+            if (valid && phone_graphless) {
+                valid = bind_kv != nullptr &&
+                    kv_mctx->type_k() == GGML_TYPE_F16 &&
+                    kv_mctx->type_v() == GGML_TYPE_F16 &&
+                    kv_mctx->has_fresh_identity_slots(ubatch.n_tokens);
+                if (!valid) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_OWNED_KV] side=pc event=REJECT"
+                        " reason=NONIDENTITY_KV_SLOTS_OR_F16_BIND"
+                        " status=FAIL\n");
+                }
+            }
+            // v1 permits only a single contiguous sequence beginning at 0.
+            for (uint32_t i = 0; valid && i < ubatch.n_tokens; ++i) {
+                valid = ubatch.pos[i] == (llama_pos) i;
+            }
+            size_t published = 0;
+            for (size_t r = 1; valid && r < stages.size(); ++r) {
+                const auto & stage = stages[r];
+                if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                    continue;
+                }
+                valid = stage.layer_end == stage.layer_begin + 1 &&
+                    stage.layer_begin >= 0 &&
+                    stage.macro_tokens > 0 &&
+                    (uint32_t) stage.layer_begin < model.hparams.n_layer();
+                if (!valid) { break; }
+                const uint32_t layer = (uint32_t) stage.layer_begin;
+                ggml_backend_rpc_phone_owned_plan plan {};
+                plan.version = 2;
+                plan.flags = 1; // Qwen3 Flash Attention with F16 KV
+                plan.run_id = phone_input_push_run_id;
+                plan.p2c_run_id = phone_stream_run_id;
+                plan.region = (uint32_t) r;
+                plan.layer = layer;
+                plan.total_tokens = ubatch.n_tokens;
+                plan.chunk_tokens = (uint32_t) stage.macro_tokens;
+                plan.n_embd = (uint32_t) n_embd;
+                plan.position_base = 0;
+                plan.kv_capacity = cparams.n_ctx;
+                plan.n_heads = model.hparams.n_head(layer);
+                plan.n_heads_kv = model.hparams.n_head_kv(layer);
+                plan.head_dim = model.hparams.n_embd_head_k(layer);
+                // The first Phone-local Builder has an intentionally narrow
+                // contract: fresh single-sequence prefill, full-head RoPE,
+                // flash-attn, F16 KV. A wider KV format needs a new ABI.
+                valid = model.hparams.n_embd_head_v(layer) == plan.head_dim;
+                const uint64_t padded_kv =
+                    (uint64_t(ubatch.n_tokens) + 255) / 256 * 256;
+                plan.n_kv = (uint32_t) std::min<uint64_t>(
+                    cparams.n_ctx, std::max<uint64_t>(256, padded_kv));
+                plan.rope_type = (uint32_t) model.hparams.rope_type;
+                plan.n_ctx_orig = cparams.n_ctx_orig_yarn;
+                plan.kv_type = (uint32_t) GGML_TYPE_F16;
+                plan.rms_norm_eps = model.hparams.f_norm_rms_eps;
+                plan.rope_freq_base = cparams.rope_freq_base;
+                plan.rope_freq_scale = cparams.rope_freq_scale;
+                plan.rope_ext_factor = cparams.yarn_ext_factor;
+                plan.rope_attn_factor = cparams.yarn_attn_factor;
+                plan.rope_beta_fast = cparams.yarn_beta_fast;
+                plan.rope_beta_slow = cparams.yarn_beta_slow;
+                valid = valid && register_plan(phone_rpc_backend, &plan);
+                if (valid && phone_graphless) {
+                    // Cache storage belongs to the *Meta* outer buffer in
+                    // this layout (Meta(CPU,RPC0)). The RPC client cannot
+                    // serialize that outer buffer: it must receive the
+                    // RPC child Tensor, just as PC Graph registration used
+                    // to resolve automatically. Resolve exactly the child
+                    // whose backend is phone_rpc_backend, not a guessed
+                    // child index or a new allocation.
+                    const ggml_tensor * outer_k =
+                        kv_mctx->get_k_storage((int32_t) layer);
+                    const ggml_tensor * outer_v =
+                        kv_mctx->get_v_storage((int32_t) layer);
+                    const ggml_tensor * canonical_k = outer_k;
+                    const ggml_tensor * canonical_v = outer_v;
+                    ggml_backend_t owner_meta = nullptr;
+                    size_t child_index = 0;
+                    for (ggml_backend_t outer : backend_ptrs) {
+                        if (outer == nullptr || !ggml_backend_is_meta(outer)) {
+                            continue;
+                        }
+                        const size_t count =
+                            ggml_backend_meta_n_backends(outer);
+                        for (size_t j = 0; j < count; ++j) {
+                            if (ggml_backend_meta_simple_backend(outer, j) ==
+                                    phone_rpc_backend) {
+                                owner_meta = outer;
+                                child_index = j;
+                                break;
+                            }
+                        }
+                        if (owner_meta != nullptr) { break; }
+                    }
+                    if (owner_meta != nullptr) {
+                        const ggml_tensor * child_k =
+                            ggml_backend_meta_simple_tensor(
+                                outer_k, child_index);
+                        const ggml_tensor * child_v =
+                            ggml_backend_meta_simple_tensor(
+                                outer_v, child_index);
+                        // Meta may not have a mapping for a direct RPC
+                        // allocation. A partially mapped pair must fail;
+                        // silently mixing Meta and RPC buffers is unsafe.
+                        if ((child_k == nullptr) != (child_v == nullptr)) {
+                            valid = false;
+                        } else if (child_k != nullptr) {
+                            canonical_k = child_k;
+                            canonical_v = child_v;
+                        }
+                    }
+                    const auto type_name = [](const ggml_tensor * t) {
+                        return t && t->buffer &&
+                               ggml_backend_buffer_get_type(t->buffer) ?
+                            ggml_backend_buft_name(
+                                ggml_backend_buffer_get_type(t->buffer)) :
+                            "NULL";
+                    };
+                    LLAMA_LOG_INFO(
+                        "[PHONE_OWNED_KV] side=pc event=RESOLVE"
+                        " run=%" PRIu64 " region=%u layer=%u"
+                        " source_k=%s source_v=%s target_k=%s target_v=%s"
+                        " meta_child=%zu has_meta=%d"
+                        " k_ne=[%" PRId64 ",%" PRId64 "]"
+                        " v_ne=[%" PRId64 ",%" PRId64 "]"
+                        " status=%s\n",
+                        plan.run_id, plan.region, plan.layer,
+                        type_name(outer_k), type_name(outer_v),
+                        type_name(canonical_k), type_name(canonical_v),
+                        child_index, owner_meta != nullptr ? 1 : 0,
+                        canonical_k != nullptr ? canonical_k->ne[0] : -1,
+                        canonical_k != nullptr ? canonical_k->ne[1] : -1,
+                        canonical_v != nullptr ? canonical_v->ne[0] : -1,
+                        canonical_v != nullptr ? canonical_v->ne[1] : -1,
+                        valid && canonical_k && canonical_v ?
+                            "READY" : "REJECT");
+                    valid = valid && canonical_k != nullptr &&
+                        canonical_v != nullptr &&
+                        bind_kv(phone_rpc_backend, plan.run_id,
+                                plan.region, plan.layer, plan.total_tokens,
+                                canonical_k, canonical_v, true);
+                    LLAMA_LOG_INFO(
+                        "[PHONE_OWNED_KV] side=pc event=BIND"
+                        " run=%" PRIu64 " region=%u layer=%u"
+                        " slots=PC_VERIFIED_IDENTITY"
+                        " graph_register=SKIPPED status=%s\n",
+                        plan.run_id, plan.region, plan.layer,
+                        valid ? "PASS" : "FAIL");
+                }
+                if (valid) { ++published; }
+            }
+            LLAMA_LOG_INFO(
+                "[PHONE_OWNED_PLAN] side=pc mode=%s"
+                " registered=%zu status=%s\n",
+                phone_graphless ? "PHONE_LOCAL_GRAPHLESS" :
+                                  "SHADOW_PC_BUILT",
+                published, valid ? "PASS" : "FAIL");
+            if (!valid || published == 0) {
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            if (phone_graphless) {
+                // The Phone owns every Chunk task. The PC keeps only
+                // logical descriptors for its FIFO and P2C receiver.
+                for (auto & item : phone_auto_templates) {
+                    item.graph_uid = (UINT64_C(2) << 62) |
+                        (uint64_t(item.region) << 32) |
+                        (uint64_t(item.chunk) + 1);
+                }
+                LLAMA_LOG_INFO(
+                    "[PHONE_AUTO] event=GRAPHLESS_READY"
+                    " regions=%zu chunks=%zu"
+                    " pc_graph_build=SKIPPED pc_graph_register=SKIPPED"
+                    " task_registration=PHONE_OWNED status=READY\n",
+                    published, phone_auto_templates.size());
+            }
+            if (ring_trace_enabled) {
+                ring_trace_owned_plan_end_us = ggml_time_us();
+            }
+        }
         ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
         if (phone_auto_enabled) {
             auto * rpc_dev = ggml_backend_get_device(phone_rpc_backend);
@@ -5519,9 +5822,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // Patch26 registration performs the capability check before any
             // output-bound task is admitted. No runtime WAIT RPC remains.
             phone_auto_register_task = register_task;
-            bool bound = register_task != nullptr &&
+            bool bound = (phone_graphless || register_task != nullptr) &&
                 phone_stream_run_id != 0;
-            if (bound && !phone_async_graph_setup) {
+            if (bound && !phone_async_graph_setup && !phone_graphless) {
                 for (const auto & item : phone_auto_templates) {
                     if (!register_task(
                             phone_rpc_backend, phone_input_push_run_id,
@@ -5620,6 +5923,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             phone_stream_session.run_id = phone_stream_run_id;
             phone_stream_session.ready = &ready;
+            if (ring_trace_enabled) {
+                ring_trace_p2c_subscribe_begin_us = ggml_time_us();
+            }
             phone_stream_handle = start(
                 phone_rpc_backend,
                 phone_stream_session.run_id,
@@ -5629,6 +5935,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 llama_region_ring_phone_full_stream_resolve,
                 llama_region_ring_phone_full_stream_complete,
                 &phone_stream_session);
+            if (ring_trace_enabled) {
+                ring_trace_p2c_subscribe_end_us = ggml_time_us();
+            }
             if (phone_stream_handle == nullptr) {
                 LLAMA_LOG_ERROR(
                     "[P2C_STREAM] status=FAIL reason=SUBSCRIBE\n");
@@ -6124,6 +6433,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             };
 
         auto run_gpu_bank_mover = [&]() {
+            llama_region_ring_maybe_raise_current_thread_priority(
+                "LLAMA_REGION_RING_PRIORITY_BANK_MOVER", "BANK_MOVER");
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_BANK_MOVER] event=START "
                 "role=CPU_SINGLE banks=2 mapping=FIXED_PARITY "
@@ -6391,7 +6702,106 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         size_t phone_push_auto_delegated = 0;
         size_t phone_push_missed = 0;
         uint64_t phone_push_bytes = 0;
+        // Stream input transport: the READY producer never calls send().
+        // A dedicated network worker drains ordered owned buffers. This
+        // overlaps preparing subsequent Chunks with the blocking TCP send
+        // of the current Chunk, without concurrent writes to one TCP stream.
+        struct phone_tx_work_item {
+            llama_region_ring_task task;
+            std::vector<uint8_t> payload;
+            int64_t enqueued_us = 0;
+        };
+        std::mutex phone_tx_mutex;
+        std::condition_variable phone_tx_cv;
+        std::deque<phone_tx_work_item> phone_tx_queue;
+        // Includes the frame currently being sent; bounds owned host memory.
+        static constexpr size_t phone_tx_budget_bytes = 64 * 1024 * 1024;
+        size_t phone_tx_inflight_bytes = 0;
+        size_t phone_tx_peak_bytes = 0;
+        size_t phone_tx_enqueued = 0;
+        int64_t phone_tx_budget_wait_us = 0;
+        bool phone_tx_producer_done = false;
+        bool phone_tx_failed = false;
+
+        // Called only by the sender in Stream mode, or by the original PUSH
+        // worker in legacy mode. Accepted still means locally send() complete,
+        // NEVER merely queued. This preserves the Phone worker's wait gate.
+        auto send_phone_input_chunk = [&](const llama_region_ring_task & job,
+                                          const void * source, size_t bytes,
+                                          int64_t queued_us) -> bool {
+            const int64_t begin_us = ggml_time_us();
+            ggml_backend_rpc_phone_input_push_timing profile {};
+            const bool accepted = phone_input_stream_enabled ?
+                phone_input_stream_push(
+                    phone_rpc_backend, phone_input_push_run_id,
+                    (uint32_t) job.region, (uint32_t) job.chunk,
+                    source, bytes, &profile) :
+                phone_input_push(
+                    phone_rpc_backend, phone_input_push_run_id,
+                    (uint32_t) job.region, (uint32_t) job.chunk,
+                    source, bytes, &profile);
+            const int64_t end_us = ggml_time_us();
+            phone_push_wall_us += end_us - begin_us;
+            const int64_t accounted_pc_us =
+                profile.pc_socket_lock_wait_us + profile.pc_hash_us +
+                profile.pc_pack_us + profile.pc_header_send_us +
+                profile.pc_payload_send_us + profile.pc_ack_wait_us;
+            phone_push_pc_other_us +=
+                std::max<int64_t>(0, end_us - begin_us - accounted_pc_us);
+            phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
+            phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
+            phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
+            phone_push_timing_sum.pc_header_send_us += profile.pc_header_send_us;
+            phone_push_timing_sum.pc_payload_send_us += profile.pc_payload_send_us;
+            phone_push_timing_sum.pc_ack_wait_us += profile.pc_ack_wait_us;
+            phone_push_timing_sum.phone_recv_header_us += profile.phone_recv_header_us;
+            phone_push_timing_sum.phone_recv_alloc_us += profile.phone_recv_alloc_us;
+            phone_push_timing_sum.phone_recv_payload_us += profile.phone_recv_payload_us;
+            phone_push_timing_sum.phone_hash_us += profile.phone_hash_us;
+            phone_push_timing_sum.phone_slot_lock_wait_us += profile.phone_slot_lock_wait_us;
+            phone_push_timing_sum.phone_host_stage_us += profile.phone_host_stage_us;
+            phone_push_timing_sum.phone_handler_us += profile.phone_handler_us;
+            if (auto * row = trace_row(job)) {
+                row->push_begin_us = begin_us;
+                row->push_end_us = end_us;
+                row->push_bytes = bytes;
+                row->push_status = accepted ? 1 : 0;
+                row->push_timing = profile;
+            }
+            if (phone_input_stream_enabled && ring_trace_enabled) {
+                LLAMA_LOG_INFO(
+                    "[PHONE_INPUT_TX_ASYNC] run=%" PRIu64
+                    " region=%zu chunk=%zu bytes=%zu"
+                    " queue_wait_ms=%.3f frame_send_ms=%.3f"
+                    " transport=MERGED_FRAME status=%s\n",
+                    phone_input_push_run_id, job.region, job.chunk, bytes,
+                    (begin_us - queued_us) / 1000.0,
+                    profile.pc_payload_send_us / 1000.0,
+                    accepted ? "PASS" : "FAIL");
+            }
+            {
+                std::lock_guard<std::mutex> lock(phone_push_mutex);
+                phone_push_state[job.region][job.chunk] = accepted ? 1 : 2;
+                if (accepted) {
+                    ++phone_push_accepted;
+                    phone_push_bytes += bytes;
+                }
+            }
+            phone_push_cv.notify_all();
+            if (!accepted) {
+                ready.cancel();
+                phone_push_cv.notify_all();
+            }
+            return accepted;
+        };
+
         auto run_phone_input_pusher = [&]() {
+            // The priority switch controls the socket sender in Stream mode.
+            // Preserve the old single-thread path for legacy ACK PUSH.
+            if (!phone_input_stream_enabled) {
+                llama_region_ring_maybe_raise_current_thread_priority(
+                    "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            }
             try {
                 while (const auto next = ready.wait_take_input_push()) {
                     const auto & job = *next;
@@ -6409,70 +6819,132 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const void * source =
                         outputs[job.region - 1].data() +
                         (size_t) job.token_begin * (size_t) n_embd;
-                    const int64_t begin_us = ggml_time_us();
-                    ggml_backend_rpc_phone_input_push_timing profile {};
-                    // In stream mode this return means only sent to TCP,
-                    // never that the Phone has verified the payload.
-                    const bool accepted = phone_input_stream_enabled ?
-                        phone_input_stream_push(
-                            phone_rpc_backend, phone_input_push_run_id,
-                            (uint32_t) job.region, (uint32_t) job.chunk,
-                            source, bytes, &profile) :
-                        phone_input_push(
-                            phone_rpc_backend, phone_input_push_run_id,
-                            (uint32_t) job.region, (uint32_t) job.chunk,
-                            source, bytes, &profile);
-                    const int64_t end_us = ggml_time_us();
-                    phone_push_wall_us += end_us - begin_us;
-                    const int64_t accounted_pc_us =
-                        profile.pc_socket_lock_wait_us + profile.pc_hash_us +
-                        profile.pc_pack_us + profile.pc_header_send_us +
-                        profile.pc_payload_send_us + profile.pc_ack_wait_us;
-                    phone_push_pc_other_us +=
-                        std::max<int64_t>(0, end_us - begin_us - accounted_pc_us);
-                    phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
-                    phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
-                    phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
-                    phone_push_timing_sum.pc_header_send_us += profile.pc_header_send_us;
-                    phone_push_timing_sum.pc_payload_send_us += profile.pc_payload_send_us;
-                    phone_push_timing_sum.pc_ack_wait_us += profile.pc_ack_wait_us;
-                    phone_push_timing_sum.phone_recv_header_us += profile.phone_recv_header_us;
-                    phone_push_timing_sum.phone_recv_alloc_us += profile.phone_recv_alloc_us;
-                    phone_push_timing_sum.phone_recv_payload_us += profile.phone_recv_payload_us;
-                    phone_push_timing_sum.phone_hash_us += profile.phone_hash_us;
-                    phone_push_timing_sum.phone_slot_lock_wait_us += profile.phone_slot_lock_wait_us;
-                    phone_push_timing_sum.phone_host_stage_us += profile.phone_host_stage_us;
-                    phone_push_timing_sum.phone_handler_us += profile.phone_handler_us;
-                    if (auto * row = trace_row(job)) {
-                        row->push_begin_us = begin_us;
-                        row->push_end_us = end_us;
-                        row->push_bytes = bytes;
-                        row->push_status = accepted ? 1 : 0;
-                        row->push_timing = profile;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(phone_push_mutex);
-                        phone_push_state[job.region][job.chunk] =
-                            accepted ? 1 : 2;
-                        if (accepted) {
-                            ++phone_push_accepted;
-                            phone_push_bytes += bytes;
+                    if (!phone_input_stream_enabled) {
+                        if (!send_phone_input_chunk(job, source, bytes, 0)) {
+                            break;
                         }
+                        continue;
                     }
-                    phone_push_cv.notify_all();
-                    if (!accepted) {
-                        ready.cancel();
-                        phone_push_cv.notify_all();
-                        break;
+                    if (bytes > phone_tx_budget_bytes) {
+                        throw std::runtime_error("Phone async send frame over budget");
                     }
+                    // The upstream output buffer may be reused by the next
+                    // GPU/CPU Chunk. Copy before enqueue, retain until send
+                    // completes, and never pass borrowed activation pointers.
+                    phone_tx_work_item item {};
+                    item.task = job;
+                    item.payload.resize(bytes);
+                    memcpy(item.payload.data(), source, bytes);
+                    const int64_t budget_wait_begin_us = ggml_time_us();
+                    {
+                        std::unique_lock<std::mutex> lock(phone_tx_mutex);
+                        while (!phone_tx_failed && !ready.failed() &&
+                                phone_tx_inflight_bytes >
+                                    phone_tx_budget_bytes - bytes) {
+                            // READY cancellation can be raised by a different
+                            // worker without notifying this queue.
+                            phone_tx_cv.wait_for(
+                                lock, std::chrono::milliseconds(20));
+                        }
+                        phone_tx_budget_wait_us +=
+                            ggml_time_us() - budget_wait_begin_us;
+                        if (phone_tx_failed || ready.failed()) { break; }
+                        item.enqueued_us = ggml_time_us();
+                        phone_tx_inflight_bytes += bytes;
+                        phone_tx_peak_bytes = std::max(
+                            phone_tx_peak_bytes, phone_tx_inflight_bytes);
+                        ++phone_tx_enqueued;
+                        phone_tx_queue.emplace_back(std::move(item));
+                    }
+                    phone_tx_cv.notify_one();
                 }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=PRODUCER_FAIL reason=%s\n",
+                    e.what());
+                ready.cancel();
+                phone_push_cv.notify_all();
             } catch (...) {
                 ready.cancel();
                 phone_push_cv.notify_all();
             }
+            {
+                std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                phone_tx_producer_done = true;
+            }
+            phone_tx_cv.notify_all();
+        };
+
+        auto run_phone_input_sender = [&]() {
+            llama_region_ring_maybe_raise_current_thread_priority(
+                "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            try {
+                while (true) {
+                    phone_tx_work_item item {};
+                    {
+                        std::unique_lock<std::mutex> lock(phone_tx_mutex);
+                        phone_tx_cv.wait(lock, [&]() {
+                            return phone_tx_failed || phone_tx_producer_done ||
+                                   !phone_tx_queue.empty();
+                        });
+                        if (phone_tx_queue.empty()) {
+                            if (phone_tx_failed || phone_tx_producer_done) {
+                                break;
+                            }
+                            continue;
+                        }
+                        item = std::move(phone_tx_queue.front());
+                        phone_tx_queue.pop_front();
+                    }
+                    const size_t bytes = item.payload.size();
+                    const bool accepted = send_phone_input_chunk(
+                        item.task, item.payload.data(), bytes,
+                        item.enqueued_us);
+                    {
+                        std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                        GGML_ASSERT(phone_tx_inflight_bytes >= bytes);
+                        phone_tx_inflight_bytes -= bytes;
+                        if (!accepted) {
+                            phone_tx_failed = true;
+                            phone_tx_queue.clear();
+                            phone_tx_inflight_bytes = 0;
+                        }
+                    }
+                    phone_tx_cv.notify_all();
+                    if (!accepted) { break; }
+                }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=SENDER_FAIL reason=%s\n",
+                    e.what());
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_failed = true;
+                    phone_tx_queue.clear();
+                    phone_tx_inflight_bytes = 0;
+                }
+                ready.cancel();
+                phone_push_cv.notify_all();
+                phone_tx_cv.notify_all();
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_failed = true;
+                    phone_tx_queue.clear();
+                    phone_tx_inflight_bytes = 0;
+                }
+                ready.cancel();
+                phone_push_cv.notify_all();
+                phone_tx_cv.notify_all();
+            }
         };
 
         auto run_worker = [&](size_t dev) {
+            if (ring_trace_enabled && dev < ring_trace_worker_enter_us.size()) {
+                // Each worker writes only its own slot; all rows are read
+                // after the parent joins the worker threads.
+                ring_trace_worker_enter_us[dev] = ggml_time_us();
+            }
             auto & state = worker_states[dev];
             const auto device = devices[dev];
             const char * name = llama_region_ring_device_name(device);
@@ -6588,14 +7060,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                        item.tokens == (uint32_t) task.n_tokens;
                             });
                         if (it == phone_auto_templates.end() ||
-                                it->owned_sched == nullptr ||
-                                it->owned_res == nullptr || it->graph_uid == 0) {
+                                it->graph_uid == 0 ||
+                                (!phone_graphless &&
+                                 (it->owned_sched == nullptr ||
+                                  it->owned_res == nullptr))) {
                             throw std::runtime_error(
-                                "missing exact Phone autonomous Chunk graph");
+                                "missing exact Phone autonomous Chunk binding");
                         }
-                        task_sched = it->owned_sched.get();
-                        task_res = it->owned_res.get();
-                        phone_prebuilt_task = true;
+                        if (!phone_graphless) {
+                            task_sched = it->owned_sched.get();
+                            task_res = it->owned_res.get();
+                            phone_prebuilt_task = true;
+                        } else if (task_res == nullptr || task_sched == nullptr) {
+                            throw std::runtime_error(
+                                "Phone-owned task missing host FIFO context");
+                        }
                         phone_auto_task = true;
                         phone_auto_graph_uid = it->graph_uid;
                     }
@@ -6881,14 +7360,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 dev == (size_t) llama_region_ring_device::PHONE &&
                                 stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
                             if (phone_auto_task) {
-                                // The complete per-Chunk Phone Graph was built
-                                // with Meta and registered before the worker DAG.
-                                // Runtime MUST NOT enter Meta compute: its
-                                // rotating KV View maps may have been cleared.
-                                // Phone is already computing from VERIFIED
-                                // PUSH. Host dispatch just releases the
-                                // logical FIFO and arranges receiver delivery;
-                                // it never waits for Phone compute or P2C.
+                                // No PC Meta compute for autonomous Phone
+                                // work. In graphless mode there is not even
+                                // a PC-built per-Chunk Graph: the Phone has
+                                // the Plan, canonical KV binding and verified
+                                // PUSH payload, and owns compute/P2C.
                                 if (prepare_gate.owns_lock()) {
                                     prepare_gate.unlock();
                                 }
@@ -7651,14 +8127,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
 
+        std::thread phone_send_thread;
+        bool phone_send_thread_started = false;
+        if (phone_input_stream_enabled) {
+            try {
+                phone_send_thread = std::thread(run_phone_input_sender);
+                phone_send_thread_started = true;
+            } catch (...) {
+                ready.cancel();
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=SENDER_LAUNCH_FAIL status=FAIL\n");
+            }
+        }
         std::thread phone_push_thread;
         bool phone_push_thread_started = false;
-        if (phone_input_push_enabled) {
+        if (phone_input_push_enabled &&
+                (!phone_input_stream_enabled || phone_send_thread_started)) {
             try {
                 phone_push_thread = std::thread(run_phone_input_pusher);
                 phone_push_thread_started = true;
             } catch (...) {
                 ready.cancel();
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_producer_done = true;
+                }
+                phone_tx_cv.notify_all();
                 LLAMA_LOG_ERROR(
                     "[PHONE_INPUT_PUSH] event=LAUNCH_FAIL status=FAIL\n");
             }
@@ -7666,6 +8160,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         std::vector<std::thread> workers;
         bool launched_all = false;
+        if (ring_trace_enabled) {
+            ring_trace_workers_launch_begin_us = ggml_time_us();
+        }
         try {
             workers.reserve(devices.size());
             for (size_t dev = 0; dev < devices.size(); ++dev) {
@@ -7681,6 +8178,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[REGION_RING_WORKERS] event=LAUNCH_FAIL reason=UNKNOWN\n");
             ready.cancel();
         }
+        if (ring_trace_enabled) {
+            ring_trace_workers_launch_end_us = ggml_time_us();
+        }
         const size_t created = workers.size();
         size_t joined = 0;
         for (auto & worker : workers) {
@@ -7691,6 +8191,23 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         if (phone_push_thread.joinable()) {
             phone_push_thread.join();
+        }
+        // Flush all locally queued sends before the Stream END control RPC
+        // and before reading push_state or serializing per-Chunk traces.
+        if (phone_send_thread.joinable()) {
+            phone_send_thread.join();
+        }
+        if (phone_input_stream_enabled) {
+            LLAMA_LOG_INFO(
+                "[PHONE_INPUT_TX_ASYNC] event=SUMMARY run=%" PRIu64
+                " enqueued=%zu sent=%zu peak_mib=%.3f"
+                " budget_wait_ms=%.3f sender_started=%d"
+                " transport=MERGED_FRAME status=%s\n",
+                phone_input_push_run_id, phone_tx_enqueued,
+                phone_push_accepted, phone_tx_peak_bytes / 1048576.0,
+                phone_tx_budget_wait_us / 1000.0,
+                phone_send_thread_started ? 1 : 0,
+                phone_tx_failed || ready.failed() ? "FAIL" : "PASS");
         }
         if (phone_graph_thread.worker.joinable()) {
             phone_graph_thread.worker.join();
@@ -7742,7 +8259,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 " phone_recv_payload_ms=%.3f phone_hash_ms=%.3f"
                 " phone_slot_wait_ms=%.3f phone_host_stage_ms=%.3f"
                 " phone_handler_ms=%.3f"
-                " policy=ACCUMULATED_PER_CHUNK status=OK\n",
+                " policy=ACCUMULATED_PER_CHUNK transport=%s status=OK\n",
                 phone_input_push_run_id,
                 phone_push_timing_sum.pc_socket_lock_wait_us / 1000.0,
                 phone_push_timing_sum.pc_hash_us / 1000.0,
@@ -7757,7 +8274,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_push_timing_sum.phone_hash_us / 1000.0,
                 phone_push_timing_sum.phone_slot_lock_wait_us / 1000.0,
                 phone_push_timing_sum.phone_host_stage_us / 1000.0,
-                phone_push_timing_sum.phone_handler_us / 1000.0);
+                phone_push_timing_sum.phone_handler_us / 1000.0,
+                phone_input_stream_enabled ? "MERGED_FRAME" : "HEADER_PAYLOAD");
         }
         if (phone_stream_handle != nullptr) {
             const bool stream_ok = phone_stream_stop(
@@ -8338,8 +8856,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                  << R"(,"ring_wall_ms":)"
                  << experiment_wall_us / 1000.0
                  << R"(,"records":)" << ready.total_tasks()
-                 << R"(,"phone_gpu_kernel_time_included":false)"
-                 << "}\n";
+                 << R"(,"phone_gpu_kernel_time_included":false)";
+            point(meta, "embed_begin_ms", ring_trace_embed_begin_us);
+            point(meta, "embed_end_ms", ring_trace_embed_end_us);
+            point(meta, "owned_plan_begin_ms", ring_trace_owned_plan_begin_us);
+            point(meta, "owned_plan_end_ms", ring_trace_owned_plan_end_us);
+            point(meta, "p2c_subscribe_begin_ms", ring_trace_p2c_subscribe_begin_us);
+            point(meta, "p2c_subscribe_end_ms", ring_trace_p2c_subscribe_end_us);
+            point(meta, "workers_launch_begin_ms", ring_trace_workers_launch_begin_us);
+            point(meta, "workers_launch_end_ms", ring_trace_workers_launch_end_us);
+            point(meta, "cpu_worker_enter_ms", ring_trace_worker_enter_us[0]);
+            point(meta, "gpu_worker_enter_ms", ring_trace_worker_enter_us[1]);
+            point(meta, "phone_worker_enter_ms", ring_trace_worker_enter_us[2]);
+            meta << "}\n";
             region_ring_experiment_records.push_back(meta.str());
 
             for (size_t r = 0; r < stages.size(); ++r) {
@@ -8382,6 +8911,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         point(out, "push_end_ms", t.push_end_us);
                         duration(out, "push_wall_ms", t.push_begin_us, t.push_end_us);
                         const auto & p = t.push_timing;
+                        point(out, "push_header_begin_ms", p.pc_header_begin_us);
+                        point(out, "push_header_end_ms", p.pc_header_end_us);
+                        point(out, "push_payload_begin_ms", p.pc_payload_begin_us);
+                        point(out, "push_payload_end_ms", p.pc_payload_end_us);
                         out << R"(,"push_socket_lock_ms":)" << p.pc_socket_lock_wait_us / 1000.0
                             << R"(,"push_hash_ms":)" << p.pc_hash_us / 1000.0
                             << R"(,"push_pack_ms":)" << p.pc_pack_us / 1000.0

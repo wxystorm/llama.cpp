@@ -45,6 +45,8 @@ public:
                 " bytes=%" PRIu64
                 " frame_wait_begin_us=%" PRId64
                 " frame_header_end_us=%" PRId64
+                " resolve_begin_us=%" PRId64
+                " resolve_end_us=%" PRId64
                 " payload_begin_us=%" PRId64
                 " payload_end_us=%" PRId64
                 " callback_begin_us=%" PRId64
@@ -53,6 +55,7 @@ public:
                 run_id_, t.region, t.chunk, t.token_begin,
                 t.n_tokens, t.seq, t.bytes,
                 t.frame_wait_begin_us, t.frame_header_end_us,
+                t.resolve_begin_us, t.resolve_end_us,
                 t.payload_begin_us, t.payload_end_us,
                 t.callback_begin_us, t.callback_end_us,
                 t.ok ? "PASS" : "FAIL");
@@ -105,7 +108,11 @@ public:
                 frame.payload_bytes > SIZE_MAX) {
                 return false;
             }
+            const int64_t resolve_begin_us =
+                trace_enabled_ ? trace_now_us() : 0;
             void * destination = resolve_(userdata_, &frame);
+            const int64_t resolve_end_us =
+                trace_enabled_ ? trace_now_us() : 0;
             if (destination == nullptr) {
                 complete_(userdata_, &frame, false);
                 return false;
@@ -138,6 +145,8 @@ public:
                 t.bytes = frame.payload_bytes;
                 t.frame_wait_begin_us = header_begin_us;
                 t.frame_header_end_us = header_end_us;
+                t.resolve_begin_us = resolve_begin_us;
+                t.resolve_end_us = resolve_end_us;
                 t.payload_begin_us = payload_begin_us;
                 t.payload_end_us = payload_end_us;
                 t.callback_begin_us = callback_begin_us;
@@ -168,6 +177,8 @@ private:
         uint64_t bytes = 0;
         int64_t frame_wait_begin_us = 0;
         int64_t frame_header_end_us = 0;
+        int64_t resolve_begin_us = 0;
+        int64_t resolve_end_us = 0;
         int64_t payload_begin_us = 0;
         int64_t payload_end_us = 0;
         int64_t callback_begin_us = 0;
