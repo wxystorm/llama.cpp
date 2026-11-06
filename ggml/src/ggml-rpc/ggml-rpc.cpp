@@ -7317,6 +7317,18 @@ bool rpc_server::phone_owned_plan_register(
         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
     const bool local_exec_requested = local_exec_env != nullptr &&
         std::strcmp(local_exec_env, "1") == 0;
+    const char * local_p2c_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_P2C");
+    const bool local_p2c_requested = local_p2c_env != nullptr &&
+        std::strcmp(local_p2c_env, "1") == 0;
+    if (local_p2c_requested &&
+            (!local_exec_requested || !precompile_requested)) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=LOCAL_P2C_REQUIRES_AB_AND_HTP\n",
+            plan.run_id, plan.region);
+        return false;
+    }
     if (local_exec_requested && !precompile_requested) {
         GGML_LOG_ERROR(
             "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
@@ -8360,11 +8372,18 @@ void rpc_server::phone_auto_compute_loop() {
                         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW");
                     const bool local_ab = local_exec_env != nullptr &&
                         std::strcmp(local_exec_env, "1") == 0;
+                    const char * local_p2c_env =
+                        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_P2C");
+                    const bool local_p2c = local_p2c_env != nullptr &&
+                        std::strcmp(local_p2c_env, "1") == 0;
                     const bool fixed_reference =
                         phone_npu_executor->has_registered_chunk(req.graph_uid);
                     std::vector<float> pre_compute_activation;
                     double pre_compute_capture_ms = 0.0;
-                    if (local_ab && !fixed_reference) {
+                    if (local_p2c && !local_ab) {
+                        why = "PHONE_LOCAL_P2C_REQUIRES_AB_EXECUTION";
+                        ok = false;
+                    } else if (local_ab && !fixed_reference) {
                         why = "PHONE_LOCAL_AB_REQUIRES_FIXED_REFERENCE_GRAPH";
                         ok = false;
                     } else if (fixed_reference) {
@@ -8413,7 +8432,7 @@ void rpc_server::phone_auto_compute_loop() {
                             " max_abs=%.9g mean_abs=%.9g rmse=%.9g"
                             " cosine=%.9f ref_rms=%.9g local_rms=%.9g"
                             " nonfinite=%zu worst_index=%zu"
-                            " parity=MEASURED_ONLY p2c=LEGACY"
+                            " parity=MEASURED_ONLY p2c=%s"
                             " input_source=BASELINE_HTP_PRE_COMPUTE"
                             " status=%s reason=%s\n",
                             req.key.run_id, req.key.region,
@@ -8429,6 +8448,7 @@ void rpc_server::phone_auto_compute_loop() {
                             local_stats.parity.candidate_rms,
                             local_stats.parity.nonfinite,
                             local_stats.parity.max_index,
+                            local_p2c ? "LOCAL_CANDIDATE" : "LEGACY",
                             local_ok ? "PASS" : "FAIL",
                             local_ok ? "NONE" : local_reason.c_str());
                         // Optional bounded stage trace, disabled by
@@ -8505,6 +8525,47 @@ void rpc_server::phone_auto_compute_loop() {
                                 feature.dominant_feature_mse_share,
                                 feature.other_rmse, feature.other_cosine,
                                 feature.max_abs_excluding_feature);
+                        }
+                        if (local_ok && local_p2c) {
+                            // The first cutover is deliberately strict:
+                            // local output must be bitwise identical to the
+                            // canonical Reference before replacing the
+                            // OpenCL tensor consumed by existing P2C.
+                            const bool exact = local_stats.parity.count != 0 &&
+                                local_stats.parity.nonfinite == 0 &&
+                                local_stats.parity.max_abs == 0.0;
+                            double copy_ms = 0.0;
+                            std::string publish_reason;
+                            bool published = false;
+                            if (exact) {
+                                published =
+                                    phone_npu_executor->publish_owned_htp_chunk(
+                                        req.key.run_id, req.key.region,
+                                        req.key.chunk, output,
+                                        publish_reason, copy_ms);
+                                if (published) {
+                                    ggml_backend_synchronize(backends[req.device]);
+                                }
+                            } else {
+                                publish_reason = "PHONE_LOCAL_P2C_PARITY_NOT_EXACT";
+                            }
+                            GGML_LOG_INFO(
+                                "[PHONE_QWEN3_LOCAL] event=P2C_SOURCE"
+                                " run=%" PRIu64 " region=%u layer=%u"
+                                " chunk=%u source=PHONE_LOCAL_HTP"
+                                " canonical_kv=LEGACY"
+                                " strict_parity=EXACT max_abs=%.9g"
+                                " copy_ms=%.3f status=%s reason=%s\n",
+                                req.key.run_id, req.key.region,
+                                local_stats.layer, req.key.chunk,
+                                local_stats.parity.max_abs, copy_ms,
+                                published ? "PASS" : "FAIL",
+                                published ? "NONE" : publish_reason.c_str());
+                            if (!published) {
+                                why = publish_reason.empty() ?
+                                    "PHONE_LOCAL_P2C_FAILED" : publish_reason;
+                                ok = false;
+                            }
                         }
                         if (!local_ok) {
                             why = local_reason.empty() ?
