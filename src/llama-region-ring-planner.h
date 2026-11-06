@@ -2559,6 +2559,9 @@ struct dag_search_limits {
     size_t local_max_anchors = 12;
     size_t throughput_per_cycle = 2;
     size_t retain_top = 10;
+    // Offline-only: keep the measured baseline as a full DAG candidate, even
+    // when the constrained first-cycle seed grid has no feasible P depth.
+    bool include_baseline_candidate = false;
 };
 inline bool dag_limits_valid(const dag_search_limits & x) {
     return x.first_cycle_e_pool && x.first_cycle_seeds &&
@@ -3461,6 +3464,14 @@ inline result search_runtime_applicable(
         estimate_region_ring_balance(
             m, baseline_regions, out.baseline) &&
         simulate(m, baseline_regions, out.baseline);
+    if (limits.include_baseline_candidate && out.baseline_valid &&
+            (!m.region_memory_feasible ||
+             m.region_memory_feasible(baseline_regions))) {
+        out.baseline.concrete_regions = baseline_regions;
+        out.top.push_back(out.baseline);
+        ++out.simulated;
+        ++out.shortlisted;
+    }
 
     const std::array<int,4> x_cpu {16,32,64,128};
     const std::array<int,4> x_gpu {16,32,64,128};
