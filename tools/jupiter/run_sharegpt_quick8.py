@@ -17,7 +17,7 @@ import subprocess
 import sys
 
 from jupiter_memory_partition import (
-    DeviceMemory, GIB, MIB, pc_gpu_memory, phone_rpc_memory,
+    DeviceMemory, GIB, MIB, pc_cpu_memory, pc_gpu_memory, phone_rpc_memory,
     plan_memory_split, read_gguf_weights,
 )
 
@@ -65,6 +65,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--pc-layers", type=int, default=None,
                    help="optional fixed PC boundary, still validated against "
                         "GPU+RPC memory; omitted means auto split by free memory")
+    p.add_argument("--cpu-free-mib", type=int, default=None,
+                   help="optional PC free RAM override, MiB")
+    p.add_argument("--cpu-reserve-mib", type=int, default=2048,
+                   help="host RAM reserved for Windows, model cache, etc.")
     p.add_argument("--pc-free-mib", type=int, default=None,
                    help="override free PC GPU memory MiB (normally nvidia-smi)")
     p.add_argument("--phone-free-mib", type=int, default=None,
@@ -107,7 +111,9 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
         "execution": {
             "exe": str(exe), "model": str(model), "rpc": args.rpc,
             "pc_layers": args.pc_layers,
-            "layer_allocation": "FREE_GPU_RPC_MEMORY",
+            "cpu_layers": args.cpu_layers,
+            "layer_allocation": "FREE_CPU_GPU_RPC_MEMORY",
+            "cpu_reserve_mib": args.cpu_reserve_mib,
             "pc_reserve_mib": args.pc_reserve_mib,
             "phone_reserve_mib": args.phone_reserve_mib,
             "rpc_device_index": args.rpc_device_index,
@@ -166,6 +172,8 @@ def choose_layers_by_memory(args: argparse.Namespace):
     weights = read_gguf_weights(Path(args.model).resolve())
     pc = (pc_gpu_memory() if args.pc_free_mib is None else
           DeviceMemory(args.pc_free_mib*MIB, args.pc_free_mib*MIB))
+    cpu = (pc_cpu_memory() if args.cpu_free_mib is None else
+           DeviceMemory(args.cpu_free_mib*MIB, args.cpu_free_mib*MIB))
     phone = (phone_rpc_memory(args.rpc, args.rpc_device_index)
              if args.phone_free_mib is None else
              DeviceMemory(args.phone_free_mib*MIB, args.phone_free_mib*MIB))
@@ -174,15 +182,21 @@ def choose_layers_by_memory(args: argparse.Namespace):
         pc_reserve_mib=args.pc_reserve_mib,
         phone_reserve_mib=args.phone_reserve_mib,
         pc_layers_override=args.pc_layers,
+        cpu=cpu,
+        cpu_reserve_mib=args.cpu_reserve_mib,
     )
     print(
         f"[JUPITER_MEMORY_SPLIT] architecture={weights.architecture} "
-        f"total_layers={weights.n_layers} PC={plan.pc_layers} "
-        f"Phone={plan.phone_layers} "
+        f"total_layers={weights.n_layers} "
+        f"PC_CPU={plan.cpu_layers} PC_GPU={plan.pc_gpu_layers} "
+        f"Phone={plan.phone_layers} pc_boundary={plan.pc_layers} "
         f"pc_free_gib={pc.free_bytes/GIB:.2f} "
         f"phone_free_gib={phone.free_bytes/GIB:.2f} "
+        f"cpu_free_gib={cpu.free_bytes/GIB:.2f} "
+        f"cpu_budget_gib={plan.cpu_budget_bytes/GIB:.2f} "
         f"pc_budget_gib={plan.pc_budget_bytes/GIB:.2f} "
         f"phone_budget_gib={plan.phone_budget_bytes/GIB:.2f} "
+        f"cpu_weights_gib={plan.cpu_weight_bytes/GIB:.2f} "
         f"pc_weights_gib={plan.pc_weight_bytes/GIB:.2f} "
         f"phone_weights_gib={plan.phone_weight_bytes/GIB:.2f} "
         f"mode={'OVERRIDE_CHECKED' if args.pc_layers is not None else 'AUTO_BY_MEMORY'}",
@@ -198,11 +212,18 @@ def save_layer_plan(out: Path, plan) -> None:
         "architecture": plan.model.architecture,
         "total_layers": plan.model.n_layers,
         "pc_layers": plan.pc_layers,
+        "cpu_layers": plan.cpu_layers,
+        "pc_gpu_layers": plan.pc_gpu_layers,
         "phone_layers": plan.phone_layers,
-        "pc_layer_range": [0, plan.pc_layers-1],
+        "cpu_layer_range": [0, plan.cpu_layers-1] if plan.cpu_layers else [],
+        "pc_layer_range": [plan.cpu_layers, plan.pc_layers-1],
         "phone_layer_range": [plan.pc_layers, plan.model.n_layers-1],
         "total_tensor_weights_gib": round(plan.model.total_weights/GIB, 3),
         "nonblock_tensor_weights_gib": round(plan.model.other_bytes/GIB, 3),
+        "cpu_weight_gib": round(plan.cpu_weight_bytes/GIB, 3),
+        "cpu_free_gib": round(plan.cpu_available_bytes/GIB, 3),
+        "cpu_reserve_gib": round(plan.cpu_reserve_bytes/GIB, 3),
+        "cpu_budget_gib": round(plan.cpu_budget_bytes/GIB, 3),
         "pc_weight_gib": round(plan.pc_weight_bytes/GIB, 3),
         "phone_weight_gib": round(plan.phone_weight_bytes/GIB, 3),
         "pc_free_gib": round(plan.pc_available_bytes/GIB, 3),
@@ -229,7 +250,8 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
         "--groups", ",".join(str(g) for g in GROUPS),
         "--exe", str(Path(args.exe).resolve()),
         "--model", str(Path(args.model).resolve()),
-        "--rpc", args.rpc, "--pc-layers", str(args.pc_layers),
+        "--rpc", args.rpc,
+        "--pc-layers", str(args.pc_layers), "--cpu-layers", str(args.cpu_layers),
         "--min-chunk", str(args.min_chunk),
         "--max-chunk", str(args.max_chunk),
         "--ubatch", str(args.ubatch), "--batch", str(args.batch),
@@ -256,8 +278,10 @@ def main() -> int:
     if (min(args.threads, args.window, args.q_repeats, args.refine_repeats,
             args.bench_repeats, args.max_rounds) < 1
             or (args.pc_layers is not None and args.pc_layers < 1)
+            or (args.cpu_free_mib is not None and args.cpu_free_mib < 1)
             or (args.pc_free_mib is not None and args.pc_free_mib < 1)
             or (args.phone_free_mib is not None and args.phone_free_mib < 1)
+            or args.cpu_reserve_mib < 0
             or args.pc_reserve_mib < 0 or args.phone_reserve_mib < 0
             or args.rpc_device_index < 0):
         raise ValueError("invalid layer, memory or repetition parameters")
@@ -286,6 +310,7 @@ def main() -> int:
     # Resolve the memory-dependent boundary before composing case identities.
     # A changed boundary must not silently reuse measurements from old runs.
     args.pc_layers = memory_plan.pc_layers
+    args.cpu_layers = memory_plan.cpu_layers
     prompt_dir = prepare_sample(out, picked, make_identity(args, picked))
     save_layer_plan(out, memory_plan)
     print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} files={len(picked)}", flush=True)
