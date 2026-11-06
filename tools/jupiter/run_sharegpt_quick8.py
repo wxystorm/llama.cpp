@@ -93,6 +93,9 @@ def make_parser() -> argparse.ArgumentParser:
                    help="show selected source prompts without copying or running")
     p.add_argument("--sample-only", action="store_true",
                    help="copy selected prompts and write manifest, then exit")
+    p.add_argument("--memory-check-only", action="store_true",
+                   help="query CUDA/Phone free memory and print the proposed "
+                        "layer split without starting any prompt inference")
     return p
 
 
@@ -276,6 +279,10 @@ def main() -> int:
         if not Path(path).is_file():
             raise ValueError(f"{label} not found: {path}")
     memory_plan = choose_layers_by_memory(args)
+    if args.memory_check_only:
+        print("[JUPITER_MEMORY_CHECK] status=FEASIBLE "
+              "note=WEIGHT_ESTIMATE_NOT_RUNTIME_GUARANTEE", flush=True)
+        return 0
     # Resolve the memory-dependent boundary before composing case identities.
     # A changed boundary must not silently reuse measurements from old runs.
     args.pc_layers = memory_plan.pc_layers
