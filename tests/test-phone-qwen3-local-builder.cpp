@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #define CHECK(expr) do { if (!(expr)) { \
     std::fprintf(stderr, "check failed: %s at %s:%d\n", \
@@ -89,6 +90,23 @@ int main() {
             }
         }
         CHECK(set_rows == 2 && flash == 1 && rope == 2 && glu == 1);
+        // The HTP stage tracer matches these labels against the standard
+        // Qwen3 graph callbacks. Fail model-free tests if a local tensor
+        // is renamed, omitted or duplicated.
+        const char * stages[] = {
+            "attn_norm", "Qcur", "Kcur", "Vcur", "attn_out",
+            "ffn_inp", "ffn_norm", "ffn_up", "ffn_gate",
+            "ffn_swiglu", "ffn_down"
+        };
+        for (const char * stage : stages) {
+            const std::string name = std::string(stage) +
+                "-" + std::to_string(p.layer);
+            int matches = 0;
+            for (int node = 0; node < ggml_graph_n_nodes(g.graph); ++node) {
+                matches += name == ggml_graph_node(g.graph, node)->name;
+            }
+            CHECK(matches == 1);
+        }
         ggml_phone_qwen3::side_inputs side {};
         CHECK(ggml_phone_qwen3::make_side_inputs(p, chunk, side, reason));
         CHECK(side.positions.front() == int32_t(chunk * 128));
