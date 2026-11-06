@@ -49,6 +49,18 @@ int main() {
     CHECK(!matches_chunk(a, 4, 512, 128, 91, 128ULL*5120*4, 128ULL*5120*4));
     CHECK(!matches_chunk(a, 1, 128, 128, 92, 128ULL*5120*4, 128ULL*5120*4));
     CHECK(!matches_chunk(a, 1, 128, 128, 91, 128ULL*5120*4 - 4, 128ULL*5120*4));
+    // Local-only execution may synchronize KV to the main decode cache
+    // only if the physical PC cache slots are 0..N-1 in every Chunk.
+    const int64_t first[] = { 0, 1, 2, 3 };
+    const int64_t next[]  = { 128, 129, 130, 131 };
+    const int64_t reused[] = { 128, 129, 7, 131 };
+    CHECK(identity_kv_slots(first, 4, 0));
+    CHECK(identity_kv_slots(next, 4, 128));
+    CHECK(!identity_kv_slots(next, 4, 127));
+    CHECK(!identity_kv_slots(reused, 4, 128));
+    CHECK(!identity_kv_slots(nullptr, 4, 0));
+    CHECK(!identity_kv_slots(first, 0, 0));
+    CHECK(!identity_kv_slots(first, 4, UINT64_MAX));
     registry plans;
     CHECK(plans.add(a, reason));
     CHECK(plans.add(a, reason)); // idempotent re-registration
