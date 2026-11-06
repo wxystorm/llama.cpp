@@ -4323,31 +4323,41 @@ static bool ggml_backend_rpc_phone_owned_kv_bind(
         uint32_t layer, uint32_t total_tokens,
         const ggml_tensor * canonical_k, const ggml_tensor * canonical_v,
         bool verified_identity_slots) {
+    const auto reject = [&](const char * reason) {
+        GGML_LOG_ERROR(
+            "[PHONE_OWNED_KV] side=rpc_client event=REJECT"
+            " run=%" PRIu64 " region=%u layer=%u reason=%s\n",
+            run_id, region, layer, reason);
+        return false;
+    };
     if (!backend || !ggml_backend_is_rpc(backend) ||
             !canonical_k || !canonical_v || !verified_identity_slots ||
             run_id == 0 || region >= ggml_phone_owned::k_max_regions ||
             total_tokens == 0) {
-        return false;
+        return reject("INVALID_RPC_BACKEND_OR_ARGUMENTS");
     }
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
-    if (!ctx) { return false; }
+    if (!ctx) { return reject("RPC_CONTEXT_MISSING"); }
     for (const ggml_tensor * t : {canonical_k, canonical_v}) {
         if (!t->buffer || !t->data ||
-                !ggml_backend_buffer_is_rpc(t->buffer) ||
-                t->type != GGML_TYPE_F16 ||
+                !ggml_backend_buffer_is_rpc(t->buffer)) {
+            return reject("TENSOR_NOT_RPC_BUFFER");
+        }
+        if (t->type != GGML_TYPE_F16 ||
                 t->op != GGML_OP_NONE || !ggml_is_contiguous(t)) {
-            return false;
+            return reject("TENSOR_F16_LAYOUT_INVALID");
         }
         auto * bc = static_cast<ggml_backend_rpc_buffer_context *>(
             t->buffer->context);
         if (!bc || bc->endpoint != ctx->endpoint ||
                 bc->device != ctx->device) {
-            return false;
+            return reject("RPC_BUFFER_ENDPOINT_OR_DEVICE_MISMATCH");
         }
     }
     auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 29) {
-        return false;
+    if (!sock) { return reject("COMPUTE_SOCKET_UNAVAILABLE"); }
+    if (rpc_get_remote_patch(ctx->endpoint + "_compute") < 29) {
+        return reject("REMOTE_PATCH_BELOW_29");
     }
     rpc_msg_phone_owned_kv_bind_req req {};
     req.run_id = run_id;
@@ -4359,8 +4369,18 @@ static bool ggml_backend_rpc_phone_owned_kv_bind(
     req.canonical_k = serialize_tensor(canonical_k);
     req.canonical_v = serialize_tensor(canonical_v);
     rpc_msg_phone_input_ack rsp {};
-    return send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_KV_BIND,
-               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
+    if (!send_rpc_cmd(sock, RPC_CMD_PHONE_OWNED_KV_BIND,
+            &req, sizeof(req), &rsp, sizeof(rsp))) {
+        return reject("KV_BIND_RPC_TRANSPORT_FAILED");
+    }
+    if (rsp.accepted == 0) {
+        return reject("PHONE_SERVER_REJECTED_BIND_CHECK_PHONE_LOG");
+    }
+    GGML_LOG_INFO(
+        "[PHONE_OWNED_KV] side=rpc_client event=BIND"
+        " run=%" PRIu64 " region=%u layer=%u status=PASS\n",
+        run_id, region, layer);
+    return true;
 }
 
 static bool ggml_backend_rpc_phone_auto_task_register(

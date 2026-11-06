@@ -5637,11 +5637,81 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
                 if (valid && phone_graphless) {
-                    const ggml_tensor * canonical_k =
+                    // Cache storage belongs to the *Meta* outer buffer in
+                    // this layout (Meta(CPU,RPC0)). The RPC client cannot
+                    // serialize that outer buffer: it must receive the
+                    // RPC child Tensor, just as PC Graph registration used
+                    // to resolve automatically. Resolve exactly the child
+                    // whose backend is phone_rpc_backend, not a guessed
+                    // child index or a new allocation.
+                    const ggml_tensor * outer_k =
                         kv_mctx->get_k_storage((int32_t) layer);
-                    const ggml_tensor * canonical_v =
+                    const ggml_tensor * outer_v =
                         kv_mctx->get_v_storage((int32_t) layer);
-                    valid = canonical_k != nullptr && canonical_v != nullptr &&
+                    const ggml_tensor * canonical_k = outer_k;
+                    const ggml_tensor * canonical_v = outer_v;
+                    ggml_backend_t owner_meta = nullptr;
+                    size_t child_index = 0;
+                    for (ggml_backend_t outer : backend_ptrs) {
+                        if (outer == nullptr || !ggml_backend_is_meta(outer)) {
+                            continue;
+                        }
+                        const size_t count =
+                            ggml_backend_meta_n_backends(outer);
+                        for (size_t j = 0; j < count; ++j) {
+                            if (ggml_backend_meta_simple_backend(outer, j) ==
+                                    phone_rpc_backend) {
+                                owner_meta = outer;
+                                child_index = j;
+                                break;
+                            }
+                        }
+                        if (owner_meta != nullptr) { break; }
+                    }
+                    if (owner_meta != nullptr) {
+                        const ggml_tensor * child_k =
+                            ggml_backend_meta_simple_tensor(
+                                outer_k, child_index);
+                        const ggml_tensor * child_v =
+                            ggml_backend_meta_simple_tensor(
+                                outer_v, child_index);
+                        // Meta may not have a mapping for a direct RPC
+                        // allocation. A partially mapped pair must fail;
+                        // silently mixing Meta and RPC buffers is unsafe.
+                        if ((child_k == nullptr) != (child_v == nullptr)) {
+                            valid = false;
+                        } else if (child_k != nullptr) {
+                            canonical_k = child_k;
+                            canonical_v = child_v;
+                        }
+                    }
+                    const auto type_name = [](const ggml_tensor * t) {
+                        return t && t->buffer &&
+                               ggml_backend_buffer_get_type(t->buffer) ?
+                            ggml_backend_buft_name(
+                                ggml_backend_buffer_get_type(t->buffer)) :
+                            "NULL";
+                    };
+                    LLAMA_LOG_INFO(
+                        "[PHONE_OWNED_KV] side=pc event=RESOLVE"
+                        " run=%" PRIu64 " region=%u layer=%u"
+                        " source_k=%s source_v=%s target_k=%s target_v=%s"
+                        " meta_child=%zu has_meta=%d"
+                        " k_ne=[%" PRId64 ",%" PRId64 "]"
+                        " v_ne=[%" PRId64 ",%" PRId64 "]"
+                        " status=%s\n",
+                        plan.run_id, plan.region, plan.layer,
+                        type_name(outer_k), type_name(outer_v),
+                        type_name(canonical_k), type_name(canonical_v),
+                        child_index, owner_meta != nullptr ? 1 : 0,
+                        canonical_k != nullptr ? canonical_k->ne[0] : -1,
+                        canonical_k != nullptr ? canonical_k->ne[1] : -1,
+                        canonical_v != nullptr ? canonical_v->ne[0] : -1,
+                        canonical_v != nullptr ? canonical_v->ne[1] : -1,
+                        valid && canonical_k && canonical_v ?
+                            "READY" : "REJECT");
+                    valid = valid && canonical_k != nullptr &&
+                        canonical_v != nullptr &&
                         bind_kv(phone_rpc_backend, plan.run_id,
                                 plan.region, plan.layer, plan.total_tokens,
                                 canonical_k, canonical_v, true);
