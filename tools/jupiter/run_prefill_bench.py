@@ -333,7 +333,6 @@ def main() -> int:
         "rpc": args.rpc,
         "target_tokens": target,
         "pc_layers": args.pc_layers,
-        "cpu_layers": args.cpu_layers,
         "window": args.window,
         "async_c2p": args.async_c2p,
         "local_graph_reuse": args.local_graph_reuse,
@@ -355,6 +354,8 @@ def main() -> int:
         "dp_chunks": plans.get(target),
         "fixed64_chunks": fixed,
     }
+    if args.cpu_layers:
+        config["cpu_layers"] = args.cpu_layers
     # Keep strict default configs backwards-compatible with earlier runs;
     # an opt-in tolerance must be visible in the experiment identity.
     if args.timing_token_tolerance:
