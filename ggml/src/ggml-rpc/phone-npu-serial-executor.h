@@ -595,6 +595,258 @@ public:
         return true;
     }
 
+
+    // The PC-built Graph remains registered as a metadata carrier in the
+    // first local-only phase. Extract ONLY its canonical OpenCL KV leaves,
+    // so Phone-owned HTP KV can be copied to the original Decode cache when
+    // the input-stream RUN ends. No PC-built Graph executes in this mode.
+    //
+    // Caller holds HTP before graph_compute_mutex; both KV pointers refer
+    // to immutable per-RUN graph metadata while their GPU buffers remain
+    // owned by the RPC server until RUN teardown.
+    bool bind_owned_decode_kv(uint64_t run_id, uint32_t region,
+                              ggml_cgraph * source,
+                              std::string & reason) {
+        reason.clear();
+        auto it = owned_kv_.find(std::make_pair(run_id, region));
+        if (it == owned_kv_.end() || source == nullptr) {
+            reason = "PHONE_LOCAL_KV_PLAN_OR_GRAPH_MISSING";
+            return false;
+        }
+        auto & state = *it->second;
+        const auto & p = state.plan;
+        const std::string kn = "cache_k_l" + std::to_string(p.layer);
+        const std::string vn = "cache_v_l" + std::to_string(p.layer);
+        const auto matches_name = [](const ggml_tensor * t,
+                                     const std::string & name) {
+            if (!t) { return false; }
+            const std::string n(t->name);
+            size_t pos = n.find(name);
+            while (pos != std::string::npos) {
+                const bool left = pos == 0 || n[pos - 1] == '#';
+                const size_t after = pos + name.size();
+                const bool right = after == n.size() || n[after] == '#';
+                if (left && right) { return true; }
+                pos = n.find(name, pos + 1);
+            }
+            return false;
+        };
+        const ggml_tensor * canonical_k = nullptr;
+        const ggml_tensor * canonical_v = nullptr;
+        bool ambiguous = false;
+        std::unordered_set<const ggml_tensor *> visited;
+        std::function<void(const ggml_tensor *)> scan =
+            [&](const ggml_tensor * t) {
+                if (!t || !visited.insert(t).second) { return; }
+                if (t->op == GGML_OP_NONE && t->view_src == nullptr) {
+                    const auto assign = [&](const ggml_tensor * & dst) {
+                        if (dst && (dst->buffer != t->buffer ||
+                                    dst->data != t->data ||
+                                    !ggml_are_same_layout(dst, t))) {
+                            ambiguous = true;
+                        } else {
+                            dst = t;
+                        }
+                    };
+                    if (matches_name(t, kn)) { assign(canonical_k); }
+                    if (matches_name(t, vn)) { assign(canonical_v); }
+                }
+                if (t->view_src) { scan(t->view_src); }
+                for (const ggml_tensor * src : t->src) { scan(src); }
+            };
+        for (int i = 0; i < ggml_graph_n_nodes(source); ++i) {
+            scan(ggml_graph_node(source, i));
+        }
+        const uint64_t width =
+            uint64_t(p.n_heads_kv) * p.head_dim;
+        const uint64_t total_bytes =
+            width * p.total_tokens * sizeof(uint16_t);
+        const auto valid = [&](const ggml_tensor * t) {
+            return t && t->buffer && t->data &&
+                t->type == GGML_TYPE_F16 &&
+                t->ne[0] == static_cast<int64_t>(width) &&
+                t->ne[1] >= static_cast<int64_t>(p.total_tokens) &&
+                t->ne[2] == 1 && t->ne[3] == 1 &&
+                ggml_is_contiguous(t) &&
+                ggml_nbytes(t) >= total_bytes &&
+                ggml_backend_buffer_is_host(t->buffer) == false;
+        };
+        if (ambiguous || !valid(canonical_k) || !valid(canonical_v) ||
+                canonical_k->buffer == canonical_v->buffer &&
+                canonical_k->data == canonical_v->data) {
+            reason = ambiguous ?
+                "PHONE_LOCAL_KV_AMBIGUOUS_CANONICAL" :
+                "PHONE_LOCAL_KV_CANONICAL_LAYOUT_MISMATCH";
+            return false;
+        }
+        const auto same_binding = [](const ggml_tensor * a,
+                                      const ggml_tensor * b) {
+            return !a || (a->buffer == b->buffer && a->data == b->data &&
+                          ggml_are_same_layout(a, b));
+        };
+        if (!same_binding(state.canonical_k, canonical_k) ||
+                !same_binding(state.canonical_v, canonical_v)) {
+            reason = "PHONE_LOCAL_KV_CANONICAL_BINDING_CHANGED";
+            return false;
+        }
+        // Rebind to the most recently registered Chunk's equivalent
+        // metadata; old RPC graph metadata may be recycled earlier.
+        state.canonical_k = canonical_k;
+        state.canonical_v = canonical_v;
+        return true;
+    }
+
+    // Copy every fully-computed Phone-owned local KV prefix to the
+    // authoritative RPC-visible OpenCL cache before decode begins.
+    // This is the ONLY KV handoff required for the fresh, 0-based,
+    // single-sequence prefill plan validated by region_plan v2.
+    bool synchronize_owned_decode_kv(uint64_t run_id,
+                                     std::string & reason,
+                                     size_t & copied_bytes,
+                                     size_t & regions) {
+        reason.clear();
+        copied_bytes = 0;
+        regions = 0;
+        std::vector<uint16_t> scratch;
+        ggml_backend_synchronize(backend_);
+        for (const auto & [key, item] : owned_kv_) {
+            if (key.first != run_id) { continue; }
+            const auto & state = *item;
+            const auto & p = state.plan;
+            if (state.next_chunk != ggml_phone_owned::chunk_count(p) ||
+                    !state.canonical_k || !state.canonical_v ||
+                    !state.k || !state.v) {
+                reason = "PHONE_LOCAL_KV_INCOMPLETE_PREFILL_OR_BINDING";
+                return false;
+            }
+            const uint64_t width =
+                uint64_t(p.n_heads_kv) * p.head_dim;
+            const uint64_t bytes =
+                width * p.total_tokens * sizeof(uint16_t);
+            if (bytes > ggml_phone_owned::k_max_activation_bytes ||
+                    bytes == 0 || bytes > SIZE_MAX ||
+                    ggml_nbytes(state.k) < bytes ||
+                    ggml_nbytes(state.v) < bytes ||
+                    ggml_nbytes(state.canonical_k) < bytes ||
+                    ggml_nbytes(state.canonical_v) < bytes) {
+                reason = "PHONE_LOCAL_KV_SYNC_SIZE_MISMATCH";
+                return false;
+            }
+            scratch.resize(static_cast<size_t>(bytes / sizeof(uint16_t)));
+            for (const auto & pair : {
+                    std::make_pair(state.k, state.canonical_k),
+                    std::make_pair(state.v, state.canonical_v) }) {
+                ggml_backend_tensor_get(
+                    pair.first, scratch.data(), 0, size_t(bytes));
+                ggml_backend_tensor_set(
+                    const_cast<ggml_tensor *>(pair.second),
+                    scratch.data(), 0, size_t(bytes));
+                copied_bytes += size_t(bytes);
+            }
+            ++regions;
+        }
+        if (regions == 0) {
+            reason = "PHONE_LOCAL_KV_NO_REGIONS";
+            return false;
+        }
+        return true;
+    }
+
+    struct local_only_profile {
+        double input_read_ms = 0.0;
+        double input_upload_ms = 0.0;
+        double htp_compute_ms = 0.0;
+        double output_copy_ms = 0.0;
+        uint32_t tokens = 0;
+        uint32_t layer = 0;
+    };
+
+    // Real Phone-local-only execution. The old PC-built Graph supplies
+    // the native OpenCL input/output allocation contract, but NO legacy
+    // HTP Graph is computed, compiled or copied. The Phone-owned HTP
+    // Region KV is the sole prefill cache and is synchronized at RUN END.
+    bool run_owned_only_chunk(uint64_t run_id, uint32_t region,
+                              uint32_t chunk,
+                              const ggml_tensor * input,
+                              ggml_tensor * output,
+                              std::string & reason,
+                              local_only_profile & profile) {
+        reason.clear();
+        profile = {};
+        const auto key = std::make_pair(run_id, region);
+        const auto kit = owned_kv_.find(key);
+        const auto git = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (kit == owned_kv_.end() || git == owned_graphs_.end()) {
+            reason = "PHONE_LOCAL_ONLY_GRAPH_NOT_PREPARED";
+            return false;
+        }
+        auto & state = *kit->second;
+        const auto & p = state.plan;
+        const auto & g = git->second->built;
+        if (state.next_chunk != chunk ||
+                chunk >= ggml_phone_owned::chunk_count(p) ||
+                g.token_begin != uint64_t(chunk) * p.chunk_tokens ||
+                g.tokens == 0 ||
+                g.tokens != std::min<uint32_t>(
+                    p.chunk_tokens, p.total_tokens - g.token_begin) ||
+                g.cache_k != state.k || g.cache_v != state.v ||
+                !state.canonical_k || !state.canonical_v) {
+            reason = "PHONE_LOCAL_ONLY_KV_FIFO_OR_BINDING_MISMATCH";
+            return false;
+        }
+        const size_t bytes =
+            size_t(g.tokens) * p.n_embd * sizeof(float);
+        if (!input || !output || !g.input || !g.output ||
+                !input->buffer || !input->data ||
+                !output->buffer || !output->data ||
+                !g.input->buffer || !g.output->buffer ||
+                input->type != GGML_TYPE_F32 ||
+                output->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(input) ||
+                !ggml_is_contiguous(output) ||
+                !ggml_is_contiguous(g.input) ||
+                !ggml_is_contiguous(g.output) ||
+                ggml_nbytes(input) != bytes ||
+                ggml_nbytes(output) != bytes ||
+                !ggml_are_same_layout(g.input, input) ||
+                !ggml_are_same_layout(g.output, output)) {
+            reason = "PHONE_LOCAL_ONLY_ACTIVATION_CONTRACT";
+            return false;
+        }
+        std::vector<float> activation(bytes / sizeof(float));
+        const int64_t read_begin = ggml_time_us();
+        // The OpenCL input is read BEFORE any Graph compute, avoiding the
+        // aliasing bug found in the initial post-compute A/B experiment.
+        ggml_backend_tensor_get(input, activation.data(), 0, bytes);
+        profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
+
+        const int64_t upload_begin = ggml_time_us();
+        ggml_backend_tensor_set(g.input, activation.data(), 0, bytes);
+        ggml_backend_synchronize(backend_);
+        profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
+        const int64_t compute_begin = ggml_time_us();
+        const ggml_status code =
+            ggml_backend_graph_compute(backend_, g.graph);
+        ggml_backend_synchronize(backend_);
+        profile.htp_compute_ms =
+            (ggml_time_us() - compute_begin) / 1000.0;
+        if (code != GGML_STATUS_SUCCESS) {
+            reason = "PHONE_LOCAL_ONLY_HTP_COMPUTE_FAILED";
+            return false;
+        }
+        double copy_ms = 0.0;
+        if (!publish_owned_htp_chunk(
+                run_id, region, chunk, output, reason, copy_ms)) {
+            return false;
+        }
+        profile.output_copy_ms = copy_ms;
+        profile.tokens = g.tokens;
+        profile.layer = p.layer;
+        ++state.next_chunk;
+        return true;
+    }
+
     struct local_exec_profile {
         double input_read_ms = 0.0;
         double input_upload_ms = 0.0;
@@ -1968,6 +2220,10 @@ private:
         uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
+        // Non-owning RPC-visible OpenCL KV metadata, refreshed for every
+        // registered Chunk. Must be valid until input stream RUN END.
+        const ggml_tensor * canonical_k = nullptr;
+        const ggml_tensor * canonical_v = nullptr;
     };
     struct owned_chunk_graph {
         ggml_context_ptr ctx;
