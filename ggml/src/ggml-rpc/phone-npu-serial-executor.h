@@ -599,7 +599,7 @@ public:
         double input_upload_ms = 0.0;
         double compute_ms = 0.0;
         double compare_ms = 0.0;
-        parity_stats parity {};
+        ggml_phone_qwen3::parity_stats parity {};
         uint32_t tokens = 0;
         uint32_t layer = 0;
     };
@@ -679,7 +679,7 @@ public:
         const int64_t compare_begin = ggml_time_us();
         ggml_backend_tensor_get(reference_output, ref.data(), 0, bytes);
         ggml_backend_tensor_get(g.output, got.data(), 0, bytes);
-        const bool finite = compare_outputs(
+        const bool finite = ggml_phone_qwen3::compare_outputs(
             ref.data(), got.data(), count, profile.parity);
         profile.compare_ms = (ggml_time_us() - compare_begin) / 1000.0;
         profile.tokens = g.tokens;
