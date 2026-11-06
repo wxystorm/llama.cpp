@@ -188,13 +188,14 @@ def benchmark_ready(bench: Path, prompt: Path, plan: Path, actual: int,
             "model": str(Path(args.model).resolve()),
             "target_tokens": actual, "dp_chunks": chunks,
             "pc_layers": args.pc_layers,
-            "cpu_layers": getattr(args, "cpu_layers", 0),
             "modes": ["dp"],
             "repeats": args.bench_repeats, "ubatch": args.ubatch,
             "batch": args.batch, "context": args.context,
             "window": args.window, "graph_prebuild": args.graph_prebuild,
             "rpc": args.rpc, "plan": str(plan.resolve()),
         }
+        if getattr(args, "cpu_layers", 0):
+            required["cpu_layers"] = args.cpu_layers
         if any(stored.get(key) != value for key, value in required.items()):
             return None
         return read_benchmark_results(result_csv, actual, ["dp"], args.bench_repeats)
