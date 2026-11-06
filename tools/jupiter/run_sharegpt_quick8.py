@@ -16,6 +16,11 @@ import shutil
 import subprocess
 import sys
 
+from jupiter_memory_partition import (
+    DeviceMemory, GIB, MIB, pc_gpu_memory, phone_rpc_memory,
+    plan_memory_split, read_gguf_weights,
+)
+
 GROUPS = (128, 256, 512, 1024)
 
 
@@ -57,7 +62,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--exe", default=r".\build-jupiter\bin\Release\llama-cli.exe")
     p.add_argument("--model", default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
     p.add_argument("--rpc", default="10.39.52.114:10139")
-    p.add_argument("--pc-layers", type=int, default=24)
+    p.add_argument("--pc-layers", type=int, default=None,
+                   help="optional fixed PC boundary, still validated against "
+                        "GPU+RPC memory; omitted means auto split by free memory")
+    p.add_argument("--pc-free-mib", type=int, default=None,
+                   help="override free PC GPU memory MiB (normally nvidia-smi)")
+    p.add_argument("--phone-free-mib", type=int, default=None,
+                   help="override free Phone GPU memory MiB (normally queried "
+                        "directly through RPC GET_DEVICE_MEMORY)")
+    p.add_argument("--pc-reserve-mib", type=int, default=512,
+                   help="extra PC GPU buffer reserve beyond model weights")
+    p.add_argument("--phone-reserve-mib", type=int, default=512,
+                   help="extra Phone GPU buffer reserve beyond model weights")
+    p.add_argument("--rpc-device-index", type=int, default=0)
     p.add_argument("--min-chunk", type=int, default=96)
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--ubatch", type=int, default=128)
@@ -87,6 +104,10 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
         "execution": {
             "exe": str(exe), "model": str(model), "rpc": args.rpc,
             "pc_layers": args.pc_layers,
+            "layer_allocation": "FREE_GPU_RPC_MEMORY",
+            "pc_reserve_mib": args.pc_reserve_mib,
+            "phone_reserve_mib": args.phone_reserve_mib,
+            "rpc_device_index": args.rpc_device_index,
             "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
             "ubatch": args.ubatch, "batch": args.batch,
             "context": args.context, "threads": args.threads,
@@ -100,9 +121,10 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
     }
 
 
-def prepare_sample(out: Path, picked: list[dict], identity: dict) -> Path:
+def prepare_sample(out: Path, picked: list[dict],
+                   identity: dict | None) -> Path:
     manifest = out / "quick8-config.json"
-    if manifest.is_file():
+    if identity is not None and manifest.is_file():
         previous = json.loads(manifest.read_text(encoding="utf-8"))
         if previous != identity:
             raise ValueError(
@@ -128,11 +150,69 @@ def prepare_sample(out: Path, picked: list[dict], identity: dict) -> Path:
         ])
         writer.writeheader()
         writer.writerows(picked)
-    manifest.write_text(
-        json.dumps(identity, ensure_ascii=False, indent=2) + "\n",
+    if identity is not None:
+        manifest.write_text(
+            json.dumps(identity, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    return prompt_dir
+
+
+def choose_layers_by_memory(args: argparse.Namespace):
+    """Read free device memory; pick a contiguous boundary before any model run."""
+    weights = read_gguf_weights(Path(args.model).resolve())
+    pc = (pc_gpu_memory() if args.pc_free_mib is None else
+          DeviceMemory(args.pc_free_mib*MIB, args.pc_free_mib*MIB))
+    phone = (phone_rpc_memory(args.rpc, args.rpc_device_index)
+             if args.phone_free_mib is None else
+             DeviceMemory(args.phone_free_mib*MIB, args.phone_free_mib*MIB))
+    plan = plan_memory_split(
+        weights, pc, phone,
+        pc_reserve_mib=args.pc_reserve_mib,
+        phone_reserve_mib=args.phone_reserve_mib,
+        pc_layers_override=args.pc_layers,
+    )
+    print(
+        f"[JUPITER_MEMORY_SPLIT] architecture={weights.architecture} "
+        f"total_layers={weights.n_layers} PC={plan.pc_layers} "
+        f"Phone={plan.phone_layers} "
+        f"pc_free_gib={pc.free_bytes/GIB:.2f} "
+        f"phone_free_gib={phone.free_bytes/GIB:.2f} "
+        f"pc_budget_gib={plan.pc_budget_bytes/GIB:.2f} "
+        f"phone_budget_gib={plan.phone_budget_bytes/GIB:.2f} "
+        f"pc_weights_gib={plan.pc_weight_bytes/GIB:.2f} "
+        f"phone_weights_gib={plan.phone_weight_bytes/GIB:.2f} "
+        f"mode={'OVERRIDE_CHECKED' if args.pc_layers is not None else 'AUTO_BY_MEMORY'}",
+        flush=True,
+    )
+    return plan
+
+
+def save_layer_plan(out: Path, plan) -> None:
+    details = {
+        "method": "MEASURED_FREE_MEMORY_AND_GGUF_WEIGHT_SIZES",
+        "notice": "Weight-capacity preflight, not proof of runtime KV/graph fit.",
+        "architecture": plan.model.architecture,
+        "total_layers": plan.model.n_layers,
+        "pc_layers": plan.pc_layers,
+        "phone_layers": plan.phone_layers,
+        "pc_layer_range": [0, plan.pc_layers-1],
+        "phone_layer_range": [plan.pc_layers, plan.model.n_layers-1],
+        "total_tensor_weights_gib": round(plan.model.total_weights/GIB, 3),
+        "nonblock_tensor_weights_gib": round(plan.model.other_bytes/GIB, 3),
+        "pc_weight_gib": round(plan.pc_weight_bytes/GIB, 3),
+        "phone_weight_gib": round(plan.phone_weight_bytes/GIB, 3),
+        "pc_free_gib": round(plan.pc_available_bytes/GIB, 3),
+        "phone_free_gib": round(plan.phone_available_bytes/GIB, 3),
+        "pc_reserve_gib": round(plan.pc_reserve_bytes/GIB, 3),
+        "phone_reserve_gib": round(plan.phone_reserve_bytes/GIB, 3),
+        "pc_budget_gib": round(plan.pc_budget_bytes/GIB, 3),
+        "phone_budget_gib": round(plan.phone_budget_bytes/GIB, 3),
+    }
+    (out/"memory-plan.json").write_text(
+        json.dumps(details, ensure_ascii=False, indent=2)+"\n",
         encoding="utf-8",
     )
-    return prompt_dir
 
 
 def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list[str]:
@@ -170,9 +250,14 @@ def main() -> int:
     if not (0 < args.min_chunk <= args.max_chunk <= args.ubatch <= args.batch
             <= args.context):
         raise ValueError("require 0 < min-chunk <= max-chunk <= ubatch <= batch <= context")
-    if min(args.pc_layers, args.threads, args.window, args.q_repeats,
-           args.refine_repeats, args.bench_repeats, args.max_rounds) < 1:
-        raise ValueError("pc-layers, threads, window and repeats must be positive")
+    if (min(args.threads, args.window, args.q_repeats, args.refine_repeats,
+            args.bench_repeats, args.max_rounds) < 1
+            or (args.pc_layers is not None and args.pc_layers < 1)
+            or (args.pc_free_mib is not None and args.pc_free_mib < 1)
+            or (args.phone_free_mib is not None and args.phone_free_mib < 1)
+            or args.pc_reserve_mib < 0 or args.phone_reserve_mib < 0
+            or args.rpc_device_index < 0):
+        raise ValueError("invalid layer, memory or repetition parameters")
     source = Path(args.source_dir).resolve()
     picked = select_first(source, args.per_group)
     print(f"[JUPITER_QUICK8_SELECT] groups={GROUPS} per_group={args.per_group} "
@@ -181,14 +266,22 @@ def main() -> int:
         print(f"  {item['prompt']} ({item['bytes']} bytes)", flush=True)
     if args.dry_run:
         return 0
-    for label, path in (("--exe", args.exe), ("--model", args.model)):
-        if not Path(path).is_file() and not args.sample_only:
-            raise ValueError(f"{label} not found: {path}")
     out = Path(args.out_dir).resolve()
-    prompt_dir = prepare_sample(out, picked, make_identity(args, picked))
-    print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} files={len(picked)}", flush=True)
     if args.sample_only:
+        prompt_dir = prepare_sample(out, picked, None)
+        print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} "
+              f"files={len(picked)} mode=SAMPLE_ONLY", flush=True)
         return 0
+    for label, path in (("--exe", args.exe), ("--model", args.model)):
+        if not Path(path).is_file():
+            raise ValueError(f"{label} not found: {path}")
+    memory_plan = choose_layers_by_memory(args)
+    # Resolve the memory-dependent boundary before composing case identities.
+    # A changed boundary must not silently reuse measurements from old runs.
+    args.pc_layers = memory_plan.pc_layers
+    prompt_dir = prepare_sample(out, picked, make_identity(args, picked))
+    save_layer_plan(out, memory_plan)
+    print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} files={len(picked)}", flush=True)
     cmd = build_command(args, prompt_dir, out)
     print("[JUPITER_QUICK8_RUN] " + subprocess.list2cmdline(cmd), flush=True)
     rc = subprocess.run(cmd, check=False).returncode
