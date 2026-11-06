@@ -8,6 +8,7 @@
 #include "phone-qwen3-local-parity.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <limits>
 #include <cinttypes>
@@ -699,6 +700,110 @@ public:
         // It is local-only and never aliases the PC/legacy decode KV.
         ++state.next_chunk;
         return true;
+    }
+
+    struct local_stage_parity {
+        const char * stage = "";
+        const char * state = "NOT_CHECKED";
+        size_t count = 0;
+        ggml_phone_qwen3::parity_stats parity {};
+    };
+
+    // Diagnostic only: compare actual HTP buffers from the PC-derived fixed
+    // graph with the locally built HTP graph. All graph computation has
+    // finished, and the caller still holds phone_npu_backend_mutex.
+    // Unlike comparing P2C, these read intermediate Qwen3 operator outputs
+    // and identify the FIRST point where local computation diverges.
+    std::vector<local_stage_parity> compare_owned_htp_stages(
+            uint64_t source_graph_uid, uint64_t run_id,
+            uint32_t region, uint32_t chunk, uint32_t layer) const {
+        static const std::array<const char *, 11> stages = {{
+            "attn_norm", "Qcur", "Kcur", "Vcur",
+            "attn_out", "ffn_inp", "ffn_norm",
+            "ffn_up", "ffn_gate", "ffn_swiglu", "ffn_down"
+        }};
+        std::vector<local_stage_parity> records;
+        records.reserve(stages.size());
+        const auto reference = registered_graphs_.find(source_graph_uid);
+        const auto local = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (reference == registered_graphs_.end() ||
+                local == owned_graphs_.end() ||
+                reference->second->graph == nullptr ||
+                local->second->built.graph == nullptr) {
+            records.push_back({
+                "all", "REFERENCE_FIXED_GRAPH_NOT_AVAILABLE", 0, {}
+            });
+            return records;
+        }
+        const auto find_named = [&](const ggml_cgraph * graph,
+                                    const char * stage,
+                                    bool & ambiguous) -> const ggml_tensor * {
+            ambiguous = false;
+            const std::string tag = std::string(stage) + "-" +
+                std::to_string(layer);
+            const ggml_tensor * found = nullptr;
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                const ggml_tensor * t = ggml_graph_node(graph, i);
+                if (t == nullptr) { continue; }
+                const std::string name(t->name);
+                const auto pos = name.rfind(tag);
+                if (pos == std::string::npos ||
+                        (pos != 0 && name[pos - 1] != '#') ||
+                        (pos + tag.size() != name.size() &&
+                         name[pos + tag.size()] != '#')) {
+                    continue;
+                }
+                if (found != nullptr && found != t) {
+                    ambiguous = true;
+                    return nullptr;
+                }
+                found = t;
+            }
+            return found;
+        };
+        for (const char * stage : stages) {
+            local_stage_parity row {};
+            row.stage = stage;
+            bool ambiguous_ref = false;
+            bool ambiguous_local = false;
+            const ggml_tensor * a = find_named(
+                reference->second->graph, stage, ambiguous_ref);
+            const ggml_tensor * b = find_named(
+                local->second->built.graph, stage, ambiguous_local);
+            if (ambiguous_ref || ambiguous_local) {
+                row.state = "AMBIGUOUS_STAGE_LABEL";
+            } else if (!a || !b) {
+                row.state = !a ? "MISSING_REFERENCE_STAGE" :
+                    "MISSING_LOCAL_STAGE";
+            } else if (a->type != GGML_TYPE_F32 ||
+                    b->type != GGML_TYPE_F32 ||
+                    !ggml_are_same_shape(a, b) ||
+                    !ggml_is_contiguous(a) ||
+                    !ggml_is_contiguous(b) ||
+                    a->buffer == nullptr || b->buffer == nullptr ||
+                    ggml_nbytes(a) == 0 ||
+                    ggml_nbytes(a) > 128ULL * 1024 * 1024) {
+                row.state = "UNSUPPORTED_STAGE_LAYOUT";
+            } else {
+                const size_t bytes = ggml_nbytes(a);
+                const size_t count = bytes / sizeof(float);
+                std::vector<float> ref_values(count);
+                std::vector<float> local_values(count);
+                ggml_backend_tensor_get(a, ref_values.data(), 0, bytes);
+                ggml_backend_tensor_get(b, local_values.data(), 0, bytes);
+                row.count = count;
+                if (!ggml_phone_qwen3::compare_outputs(
+                        ref_values.data(), local_values.data(),
+                        count, row.parity)) {
+                    row.state = "NONFINITE_STAGE_DATA";
+                } else {
+                    row.state = "MEASURED";
+                }
+            }
+            records.push_back(std::move(row));
+        }
+        return records;
     }
 
     // Called after an input RUN has fully ended while HTP is serialized.
