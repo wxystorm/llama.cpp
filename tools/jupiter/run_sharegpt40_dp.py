@@ -73,6 +73,7 @@ def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
         "exe": input_identity(Path(args.exe)),
         "model": input_identity(Path(args.model)),
         "rpc": args.rpc, "pc_layers": args.pc_layers,
+        "cpu_layers": args.cpu_layers,
         "preferred_min_chunk": args.min_chunk,
         "max_chunk": args.max_chunk, "ubatch": args.ubatch,
         "batch": args.batch, "context": args.context,
@@ -159,6 +160,7 @@ def stage3_ready(stage3: Path, plan: Path, actual: int, b: int,
             )
             and data.get("prompt_tokens") == actual
             and data.get("pc_layers") == args.pc_layers
+            and data.get("cpu_layers", 0) == getattr(args, "cpu_layers", 0)
             and data.get("min_chunk") == b
             and data.get("max_chunk") == args.max_chunk
             and data.get("setup_source") == "FIXED_EXPLICIT"
@@ -182,7 +184,9 @@ def benchmark_ready(bench: Path, prompt: Path, plan: Path, actual: int,
             "exe": str(Path(args.exe).resolve()),
             "model": str(Path(args.model).resolve()),
             "target_tokens": actual, "dp_chunks": chunks,
-            "pc_layers": args.pc_layers, "modes": ["dp"],
+            "pc_layers": args.pc_layers,
+            "cpu_layers": getattr(args, "cpu_layers", 0),
+            "modes": ["dp"],
             "repeats": args.bench_repeats, "ubatch": args.ubatch,
             "batch": args.batch, "context": args.context,
             "window": args.window, "graph_prebuild": args.graph_prebuild,
@@ -244,6 +248,7 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
                 "--model", str(Path(args.model).resolve()),
                 "--rpc", args.rpc, "--prompt-file", str(prompt),
                 "--fixed-stage3", "--pc-layers", str(args.pc_layers),
+                "--cpu-layers", str(args.cpu_layers),
                 "--target-tokens", str(tokens),
                 "--min-chunk", str(minimum), "--max-chunk", str(args.max_chunk),
                 "--q-repeats", str(args.q_repeats),
@@ -281,7 +286,8 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
                 "--model", str(Path(args.model).resolve()),
                 "--rpc", args.rpc, "--prompt-file", str(prompt),
                 "--plan", str(plan), "--target-tokens", str(tokens),
-                "--pc-layers", str(args.pc_layers), "--modes", "dp",
+                "--pc-layers", str(args.pc_layers),
+                "--cpu-layers", str(args.cpu_layers), "--modes", "dp",
                 "--repeats", str(args.bench_repeats),
                 "--batch", str(args.batch), "--context", str(args.context),
                 "--ubatch", str(args.ubatch), "--threads", str(args.threads),
@@ -324,6 +330,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
     p.add_argument("--rpc", default="10.39.52.114:10139")
     p.add_argument("--pc-layers", type=int, default=24)
+    p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--min-chunk", type=int, default=96,
                    help="preferred lower bound b; reduce only if no legal partition")
     p.add_argument("--max-chunk", type=int, default=128)
@@ -356,7 +363,8 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
-    if (args.pc_layers <= 0 or args.min_chunk <= 0 or args.max_chunk <= 0
+    if (args.pc_layers <= 0 or args.cpu_layers < 0
+            or args.cpu_layers >= args.pc_layers or args.min_chunk <= 0 or args.max_chunk <= 0
             or args.min_chunk > args.max_chunk
             or args.max_chunk > args.ubatch or args.ubatch > args.batch
             or args.batch > args.context or args.q_repeats < 1
