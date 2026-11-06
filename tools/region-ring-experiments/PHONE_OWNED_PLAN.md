@@ -451,6 +451,71 @@ do not interpret Phone-side PASS as Decode parity. Set
 `GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=0` and restart Phone RPC to
 return to the original OpenCL input binding.
 
+## Phase 8: one-time Decode KV binding, zero PC Phone-Chunk Graphs (opt-in)
+
+After Phase 7 has passed both Prefill and Decode output/logits parity on the
+same prompt, rebuild **both** the PC and Phone server with RPC patch 29.
+
+Keep these **Phone** server switches (in addition to the existing Phone NPU
+model load/Region configuration):
+
+```sh
+export GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS=1
+```
+
+Set **both** PC switches:
+
+```powershell
+$env:LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW = "1"
+$env:LLAMA_REGION_RING_PHONE_GRAPHLESS = "1"
+```
+
+The PC now calls `llama_kv_cache_context::has_fresh_identity_slots()`
+after the canonical KV allocator's one-time `apply()`, **before** any
+Plan/HTP execution. Only physical slot sequence exactly `0..N-1` for a
+single fresh stream and F16 K/V is accepted. Logical RoPE positions alone
+do not pass the test. Per Phone Region, PC registers one immutable Plan
+and calls `PHONE_OWNED_KV_BIND` with the canonical RPC-backed K/V storage
+Tensor descriptors. The descriptors contain remote backend buffer
+handles and tensor layouts, not a copy of actual K/V data or PC host
+pointers.
+
+Phone validates those backing allocations and creates all synthetic
+Chunk tasks internally. PC skips `build_phone_auto_graphs()`, **all**
+per-Chunk `GRAPH_REGISTER` / `TASK_REGISTER` RPC, per-Chunk Meta
+Scheduler retention and old input/output Graph Tensor allocation.
+Both Host PUSH -> HTP and HTP -> Arena operate directly. The Phone-local
+HTP KV is still synchronized into the canonical OpenCL Decode KV buffer
+at RUN END; normal Decode is unmodified.
+
+Expected for 512 tokens, Chunk=128, 4 single-layer HTP Regions:
+
+- PC: `[PHONE_AUTO] event=GRAPHLESS_READY regions=4 chunks=16
+  pc_graph_build=SKIPPED pc_graph_register=SKIPPED`
+- Phone: 4 `[PHONE_OWNED_KV] event=BIND ... chunks=4 ...
+  graph_register=SKIPPED task_register=PHONE_OWNED status=PASS`
+- Phone: 16 `INPUT_DIRECT`, 16 `EXECUTE_ONLY ... graph_lookup=SKIPPED`,
+  16 `P2C_DIRECT ... graph_lookup=SKIPPED`, all PASS
+- Phone: one `KV_SYNC regions=4 bytes=8388608 status=PASS`
+- PC: Prefill/Decode success and **identical generated tokens or logits**
+  against the last working same-prompt Direct Input baseline
+
+An empty warmup RUN with no owned plan still emits `KV_SYNC status=SKIPPED`.
+The first failure must terminate the run, not silently fall back to old
+Graph compute. For rollback, unset `LLAMA_REGION_RING_PHONE_GRAPHLESS`
+on PC and `GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS` on Phone, then restart
+the Phone server. The old per-Chunk metadata mode remains intact.
+
+Restrictions: tested single-sequence Qwen3 Flash Attention, F16 K/V,
+physical identity slots, a one-layer Phone HTP Region, Phone-resident
+weights and precompiled fixed Chunk Graphs. This does **not** add
+sliding-window, shared-prefix or nonidentity cache-slot support.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
@@ -460,6 +525,7 @@ return to the original OpenCL input binding.
 3. Validate the opt-in Host PUSH -> HTP input path alongside direct
    HTP output -> P2C Arena, then replace PC-registered input task
    metadata with Phone-owned tasks (no PC Graph serialization).
-4. Preserve PC decode compatibility (KV ownership/synchronization) and
-   compare per-Layer activations and final logits against the old path.
-5. Only then make the PC skip building/registering Phone RPC Graphs.
+4. Verify PC Decode KV writeback and final logits against the same-prompt
+   baseline using this new graphless path.
+5. Extend the one-time binding ABI beyond fresh identity slots only after
+   parity, device-memory lifetime, and failure/rollback coverage pass.
