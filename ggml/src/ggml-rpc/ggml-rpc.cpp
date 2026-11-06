@@ -8412,6 +8412,38 @@ void rpc_server::phone_auto_compute_loop() {
                             local_stats.parity.max_index,
                             local_ok ? "PASS" : "FAIL",
                             local_ok ? "NONE" : local_reason.c_str());
+                        // Attribute the worst-index feature across all
+                        // tokens. No extra HTP readback: these metrics use
+                        // the same host arrays already used for RMSE.
+                        if (local_ok) {
+                            const auto & feature = local_stats.feature;
+                            GGML_LOG_INFO(
+                                "[PHONE_QWEN3_LOCAL] event=FEATURE_DIAG"
+                                " run=%" PRIu64 " region=%u layer=%u"
+                                " chunk=%u n_embd=%u"
+                                " worst_feature=%zu worst_token=%zu"
+                                " ref_worst=%.9g local_worst=%.9g"
+                                " feature_rmse=%.9g"
+                                " feature_mse_share=%.9g"
+                                " dominant_feature=%zu"
+                                " dominant_mse_share=%.9g"
+                                " rmse_excl=%.9g cosine_excl=%.9f"
+                                " max_abs_excl=%.9g"
+                                " status=PASS\n",
+                                req.key.run_id, req.key.region,
+                                local_stats.layer, req.key.chunk,
+                                (unsigned) (req.input_bytes /
+                                    ((uint64_t) req.n_tokens * sizeof(float))),
+                                feature.feature, feature.worst_token,
+                                feature.reference_at_worst,
+                                feature.candidate_at_worst,
+                                feature.feature_rmse,
+                                feature.feature_mse_share,
+                                feature.dominant_feature,
+                                feature.dominant_feature_mse_share,
+                                feature.other_rmse, feature.other_cosine,
+                                feature.max_abs_excluding_feature);
+                        }
                         if (!local_ok) {
                             why = local_reason.empty() ?
                                 "PHONE_LOCAL_EXEC_FAILED" : local_reason;
