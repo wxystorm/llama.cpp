@@ -98,6 +98,30 @@ int main() {
 
     model m = mock_profile();
 
+    // Wider offline search is opt-in: default online limits remain identical.
+    {
+        dag_search_limits defaults;
+        REQUIRE(dag_limits_valid(defaults));
+        REQUIRE(defaults.first_cycle_e_pool == 500);
+        REQUIRE(defaults.first_cycle_seeds == 200);
+        REQUIRE(defaults.prefix_beam_per_seed == 16);
+        REQUIRE(defaults.final_beam_per_seed == 24);
+        REQUIRE(!defaults.include_baseline_candidate);
+        dag_search_limits offline = defaults;
+        offline.first_cycle_e_pool = 1500;
+        offline.first_cycle_seeds = 500;
+        offline.prefix_beam_per_seed = 64;
+        offline.final_beam_per_seed = 96;
+        offline.cpu_optional_dag_cap = 256;
+        offline.local_rounds = 4;
+        offline.local_simulations_per_round = 128;
+        offline.retain_top = 100;
+        offline.include_baseline_candidate = true;
+        REQUIRE(dag_limits_valid(offline));
+        offline.first_cycle_seeds = 0;
+        REQUIRE(!dag_limits_valid(offline));
+    }
+
     // First-cycle fine X candidates are available to deterministic A/B
     // runs. A subsequent Cycle must keep this selected X triple unchanged.
     REQUIRE(first_cycle_chunk_candidates.size() == 17);
