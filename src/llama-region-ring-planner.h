@@ -2542,6 +2542,33 @@ inline bool estimate_balance(const model & m, candidate & c) {
            std::isfinite(c.balance);
 }
 
+// Default limits preserve online inference costs. Standalone offline planning
+// can trade longer search time for broader DAG coverage without changing the
+// cost model or relaxing memory correctness.
+struct dag_search_limits {
+    size_t first_cycle_e_pool = 500;
+    size_t first_cycle_seeds = 200;
+    size_t seed_geometry_diversity_per_n = 12;
+    size_t seed_chunk_diversity = 36;
+    size_t prefix_beam_per_seed = 16;
+    size_t final_beam_per_seed = 24;
+    size_t cpu_optional_dag_cap = 64;
+    int cpu_optional_anchors_per_cycles = 4;
+    int local_rounds = 2;
+    size_t local_simulations_per_round = 24;
+    size_t local_max_anchors = 12;
+    size_t throughput_per_cycle = 2;
+    size_t retain_top = 10;
+};
+inline bool dag_limits_valid(const dag_search_limits & x) {
+    return x.first_cycle_e_pool && x.first_cycle_seeds &&
+           x.seed_geometry_diversity_per_n && x.seed_chunk_diversity &&
+           x.prefix_beam_per_seed && x.final_beam_per_seed &&
+           x.cpu_optional_dag_cap && x.cpu_optional_anchors_per_cycles > 0 &&
+           x.local_rounds > 0 && x.local_simulations_per_round &&
+           x.local_max_anchors && x.throughput_per_cycle && x.retain_top;
+}
+
 // Each selected first-Cycle seed is preserved for one-shot experiment
 // diagnostics; only its best completed/simulated continuation is retained.
 struct first_cycle_seed_record {
@@ -2798,10 +2825,11 @@ inline bool first_cycle_chunk_supported(int x) {
 // expensive DAG simulation; there is no additional real inference.
 inline void search_runtime_cpu_optional(
         const model & m, result & out,
-        std::unordered_set<std::string> & scored) {
+        std::unordered_set<std::string> & scored,
+        const dag_search_limits & limits = {}) {
     if (out.top.empty() || !m.memory_feasible) { return; }
-    constexpr size_t k_dag_cap = 64;
-    constexpr int k_anchors_per_cycles = 4;
+    const size_t k_dag_cap = limits.cpu_optional_dag_cap;
+    const int k_anchors_per_cycles = limits.cpu_optional_anchors_per_cycles;
     struct option {
         candidate value;
         double proxy = 0.0;
@@ -3004,12 +3032,13 @@ inline void search_runtime_cpu_optional(
 // E remains diagnostic, never an eligibility threshold in this phase.
 inline void refine_runtime_local_candidates(
         const model & m, result & out,
-        std::unordered_set<std::string> & scored) {
+        std::unordered_set<std::string> & scored,
+        const dag_search_limits & limits = {}) {
     if (out.top.empty()) {
         return;
     }
-    constexpr int k_rounds = 2;
-    constexpr size_t k_simulated_per_round = 24;
+    const int k_rounds = limits.local_rounds;
+    const size_t k_simulated_per_round = limits.local_simulations_per_round;
     const auto key_for = [&](const candidate & c) {
         std::vector<llama_region_ring_region> rs;
         if (!make_regions(c, m.layers, rs)) {
@@ -3084,7 +3113,7 @@ inline void refine_runtime_local_candidates(
                 std::to_string(c.xg) + "/" + std::to_string(c.xp));
         }
         for (size_t idx : order) {
-            if (anchors.size() >= 12) {
+            if (anchors.size() >= limits.local_max_anchors) {
                 break;
             }
             const auto & c = out.top[idx];
@@ -3412,9 +3441,11 @@ inline result search_runtime_applicable(
         int baseline_chunk,
         int max_simulations = 256,
         double e_margin = 0.08,
-        int min_simulations = 32) {
+        int min_simulations = 32,
+        const dag_search_limits & limits = {}) {
     result out;
-    if (m.layers < 6 || m.tokens <= 0 || m.hidden <= 0 ||
+    if (!dag_limits_valid(limits) ||
+        m.layers < 6 || m.tokens <= 0 || m.hidden <= 0 ||
             !m.compute_ms || !m.transfer_ms ||
             baseline_chunk <= 0 || max_simulations <= 0 ||
             min_simulations < 0 || !std::isfinite(e_margin) ||
@@ -3650,7 +3681,7 @@ inline result search_runtime_applicable(
         size_t attempted = 0;
         std::unordered_set<std::string> chosen_chunks;
         for (size_t i : throughput_order) {
-            if (attempted >= 2) {
+            if (attempted >= limits.throughput_per_cycle) {
                 break;
             }
             if (coarse[i].cycles != n_cycles) {
@@ -3827,12 +3858,13 @@ inline result search_runtime_applicable(
     // squared-length term below is a *soft* preference inside that range.
     // A wide E-first pool is ranked again by absolute service demand before
     // entering the nonuniform search. No additional device Profile is run.
-    constexpr size_t k_first_cycle_e_pool_total = 500;
-    constexpr size_t k_first_seeds_total = 200;
-    constexpr size_t k_seed_geometry_diversity_per_n = 12;
-    constexpr size_t k_seed_chunk_diversity = 36;
-    constexpr size_t k_prefix_beam_per_seed = 16;
-    constexpr size_t k_final_beam_per_seed = 24;
+    const size_t k_first_cycle_e_pool_total = limits.first_cycle_e_pool;
+    const size_t k_first_seeds_total = limits.first_cycle_seeds;
+    const size_t k_seed_geometry_diversity_per_n =
+        limits.seed_geometry_diversity_per_n;
+    const size_t k_seed_chunk_diversity = limits.seed_chunk_diversity;
+    const size_t k_prefix_beam_per_seed = limits.prefix_beam_per_seed;
+    const size_t k_final_beam_per_seed = limits.final_beam_per_seed;
 
     const auto first_seed_less = [](const first_cycle_seed & a,
                                     const first_cycle_seed & b) {
@@ -4705,15 +4737,15 @@ inline result search_runtime_applicable(
         }
 
     // Refine only full G/C/P layouts; existing boundary moves use 3*i.
-    refine_runtime_local_candidates(m, out, scored);
+    refine_runtime_local_candidates(m, out, scored, limits);
     // CPU-optional candidates are introduced after that legacy local pass.
-    search_runtime_cpu_optional(m, out, scored);
+    search_runtime_cpu_optional(m, out, scored, limits);
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();
         out.valid = true;
-        if (out.top.size() > 10) {
-            out.top.resize(10);
+        if (out.top.size() > limits.retain_top) {
+            out.top.resize(limits.retain_top);
         }
     }
     return out;
