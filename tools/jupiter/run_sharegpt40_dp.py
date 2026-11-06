@@ -38,7 +38,7 @@ from run_prompt_suite import (
 FIELDS = [
     "group", "prompt", "actual_tokens", "min_chunk", "max_chunk",
     "dp_chunks", "chunk_count", "prefill_ms", "prefill_tok_s",
-    "bench_repeats", "graph_prebuild", "status", "case_dir",
+    "bench_repeats", "graph_prebuild", "refinement_policy", "status", "case_dir",
     "final_plan", "error",
 ]
 NAME_RE = re.compile(r"^prompt_(\d+)_(\d+)\.txt$", re.IGNORECASE)
@@ -81,6 +81,15 @@ def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
         "refine_repeats": args.refine_repeats,
         "graph_prebuild": args.graph_prebuild,
     }
+
+
+def existing_rows(path: Path) -> dict[str, dict[str, str]]:
+    """Read saved results before rewriting the cumulative CSV."""
+    if not path.is_file():
+        return {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return {row["prompt"]: row for row in csv.DictReader(handle)
+                if row.get("prompt")}
 
 
 def save_results(out: Path, rows: list[dict], args: argparse.Namespace) -> None:
@@ -144,7 +153,10 @@ def stage3_ready(stage3: Path, plan: Path, actual: int, b: int,
         data = json.loads(summary_path.read_text(encoding="utf-8"))
         chunks = read_plan(plan).get(actual)
         return bool(
-            data.get("status") == "FULLY_MEASURED_AND_VERIFIED"
+            data.get("status") in (
+                "FULLY_MEASURED_AND_VERIFIED",
+                "BUDGETED_MEASURED_AND_VERIFIED",
+            )
             and data.get("prompt_tokens") == actual
             and data.get("pc_layers") == args.pc_layers
             and data.get("min_chunk") == b
@@ -204,6 +216,7 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
         "group": group, "prompt": prompt.name, "status": "STARTED",
         "graph_prebuild": int(args.graph_prebuild),
         "bench_repeats": args.bench_repeats,
+        "refinement_policy": "PENDING",
         "case_dir": str(case), "final_plan": str(case / "final.plan"),
     }
     try:
@@ -241,9 +254,17 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
                 "--out-dir", str(stage3), "--plan-output", str(plan),
                 "--resume",
             ]
+            if args.budgeted_refine:
+                cmd.append("--accept-measured-candidate")
             launch_logged(cmd, case / "stage3-run.log", "STAGE3")
         if not stage3_ready(stage3, plan, tokens, minimum, args):
             raise RuntimeError(f"Stage3 did not verify a complete DP plan: {stage3}")
+        summary = json.loads(
+            (stage3 / "sequence-summary.json").read_text(encoding="utf-8")
+        )
+        row["refinement_policy"] = summary.get(
+            "refinement_policy", "REOPTIMIZE_UNTIL_EXACT_Q_COVERAGE"
+        )
         chunks = read_plan(plan)[tokens]
         row["dp_chunks"] = ",".join(map(str, chunks))
         row["chunk_count"] = len(chunks)
@@ -314,6 +335,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--q-repeats", type=int, default=1)
     p.add_argument("--refine-repeats", type=int, default=1)
     p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--budgeted-refine", action="store_true",
+                   help="use the last measured DP candidate after the "
+                        "refinement round budget; do not claim fixed-point "
+                        "convergence")
+    p.add_argument("--only-incomplete", action="store_true",
+                   help="skip existing PASS records and preserve them "
+                        "in cumulative CSV")
     p.add_argument("--bench-repeats", type=int, default=1)
     p.add_argument("--graph-prebuild", action="store_true",
                    help="opt in to the existing PC/Phone graph-prebuild path")
@@ -368,8 +396,15 @@ def main() -> int:
             raise ValueError(f"{key} not found: {getattr(args, key)}")
     out = Path(args.out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    old_rows = existing_rows(out / "dp-results.csv") if args.only_incomplete else {}
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
+        previous = old_rows.get(prompt.name)
+        if previous and previous.get("status") == "PASS":
+            rows.append(previous)
+            print(f"[JUPITER_SHAREGPT40_DP_SKIP] {index}/{len(prompts)} "
+                  f"prompt={prompt.name} reason=EXISTING_PASS", flush=True)
+            continue
         print(f"\n[JUPITER_SHAREGPT40_DP_CASE] {index}/{len(prompts)} "
               f"group={group} prompt={prompt.name}", flush=True)
         row = run_case(group, prompt, out, args)
@@ -377,6 +412,7 @@ def main() -> int:
         save_results(out, rows, args)
         if row["status"] != "PASS" and args.fail_fast:
             break
+    save_results(out, rows, args)
     passed = sum(row["status"] == "PASS" for row in rows)
     failed = len(rows) - passed
     print(f"[JUPITER_SHAREGPT40_DP_DONE] passed={passed} failed={failed} "
