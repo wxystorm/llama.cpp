@@ -135,6 +135,24 @@ inline uint32_t chunk_count(const region_plan & p) {
         p.chunk_tokens;
 }
 
+// Guard the fresh 0-based KV cache contract before HTP-only compute.
+// RoPE positions are not sufficient to prove a physical Decode KV slot
+// layout: the PC allocator can recycle cells. Require the actual I64
+// indices supplied to the original SET_ROWS nodes to be contiguous.
+inline bool identity_kv_slots(const int64_t * indices,
+                             size_t count, uint64_t first) {
+    if (indices == nullptr || count == 0 ||
+            first > uint64_t(INT64_MAX) - count) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (indices[i] != static_cast<int64_t>(first + i)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline bool matches_chunk(const region_plan & p, uint32_t chunk,
                           uint32_t begin, uint32_t tokens,
                           uint64_t p2c_run_id,
