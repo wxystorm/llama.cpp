@@ -44,6 +44,12 @@ int main() {
     const region_plan a = make_plan();
     CHECK(validate(a, reason));
     CHECK(chunk_count(a) == 4);
+    CHECK(valid_direct_host_bytes(128ULL*5120*4, 128ULL*5120*4));
+    CHECK(!valid_direct_host_bytes(128ULL*5120*4, 128ULL*5120*4 - 4));
+    CHECK(!valid_direct_host_bytes(0, 0));
+    CHECK(!valid_direct_host_bytes(7, 7));
+    CHECK(!valid_direct_host_bytes(k_max_activation_bytes + 4,
+                                   k_max_activation_bytes + 4));
     CHECK(matches_chunk(a, 0, 0, 128, 91, 128ULL*5120*4, 128ULL*5120*4));
     CHECK(matches_chunk(a, 3, 384, 128, 91, 128ULL*5120*4, 128ULL*5120*4));
     CHECK(!matches_chunk(a, 4, 512, 128, 91, 128ULL*5120*4, 128ULL*5120*4));

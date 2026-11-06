@@ -821,7 +821,9 @@ public:
                               ggml_tensor * output,
                               std::string & reason,
                               local_only_profile & profile,
-                              std::vector<float> * direct_p2c_payload = nullptr) {
+                              std::vector<float> * direct_p2c_payload = nullptr,
+                              const float * direct_input = nullptr,
+                              size_t direct_input_floats = 0) {
         reason.clear();
         profile = {};
         const auto key = std::make_pair(run_id, region);
@@ -871,17 +873,21 @@ public:
         }
         const size_t bytes =
             size_t(g.tokens) * p.n_embd * sizeof(float);
-        if (!input || !g.input || !g.output ||
-                !input->buffer || !input->data ||
+        const bool direct = direct_input != nullptr;
+        if ((direct && direct_input_floats != bytes / sizeof(float)) ||
+                (!direct && direct_input_floats != 0) ||
+                !g.input || !g.output ||
                 !g.input->buffer || !g.output->buffer ||
-                input->type != GGML_TYPE_F32 ||
                 g.output->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(input) ||
                 !ggml_is_contiguous(g.input) ||
                 !ggml_is_contiguous(g.output) ||
-                ggml_nbytes(input) != bytes ||
+                ggml_nbytes(g.input) != bytes ||
                 ggml_nbytes(g.output) != bytes ||
-                !ggml_are_same_layout(g.input, input) ||
+                (!direct && (!input || !input->buffer || !input->data ||
+                    input->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(input) ||
+                    ggml_nbytes(input) != bytes ||
+                    !ggml_are_same_layout(g.input, input))) ||
                 (direct_p2c_payload == nullptr &&
                  (!output || !output->buffer || !output->data ||
                   output->type != GGML_TYPE_F32 ||
@@ -891,21 +897,28 @@ public:
             reason = "PHONE_LOCAL_ONLY_ACTIVATION_CONTRACT";
             return false;
         }
-        std::vector<float> activation(bytes / sizeof(float));
-        const int64_t read_begin = ggml_time_us();
-        // The OpenCL input is read BEFORE any Graph compute, avoiding the
-        // aliasing bug found in the initial post-compute A/B experiment.
-        ggml_backend_tensor_get(input, activation.data(), 0, bytes);
-        profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
-        for (float value : activation) {
-            if (!std::isfinite(value)) {
+        // The verified PUSH buffer already contains the exact precompute
+        // activation. Avoid a host->OpenCL->host roundtrip in direct mode.
+        std::vector<float> activation;
+        const float * source = direct_input;
+        if (!direct) {
+            activation.resize(bytes / sizeof(float));
+            const int64_t read_begin = ggml_time_us();
+            // Always snapshot before Graph compute: the old path can alias
+            // an output allocation with the original input.
+            ggml_backend_tensor_get(input, activation.data(), 0, bytes);
+            profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
+            source = activation.data();
+        }
+        for (size_t i = 0; i < bytes / sizeof(float); ++i) {
+            if (!std::isfinite(source[i])) {
                 reason = "PHONE_LOCAL_ONLY_NONFINITE_INPUT";
                 return false;
             }
         }
 
         const int64_t upload_begin = ggml_time_us();
-        ggml_backend_tensor_set(g.input, activation.data(), 0, bytes);
+        ggml_backend_tensor_set(g.input, source, 0, bytes);
         ggml_backend_synchronize(backend_);
         profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
         const int64_t compute_begin = ggml_time_us();

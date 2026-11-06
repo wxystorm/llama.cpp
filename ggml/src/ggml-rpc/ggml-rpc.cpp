@@ -5916,6 +5916,9 @@ public:
                            rpc_msg_phone_input_ack & response,
                            int64_t * copy_begin_us = nullptr,
                            int64_t * copy_end_us = nullptr);
+    bool phone_input_take_verified_host(const rpc_phone_input_key & key,
+                                        size_t expected_bytes,
+                                        std::vector<float> & dst);
     void phone_input_drop(const rpc_phone_input_key & key,
                           rpc_msg_phone_input_ack & response);
     bool set_tensor(const std::vector<uint8_t> & input, int64_t rx_done_us = 0);
@@ -6057,6 +6060,9 @@ private:
         // Published to P2C from the Phone-owned HTP output, not from a
         // PC-registered Graph's OpenCL output when DIRECT_P2C is enabled.
         std::vector<float> direct_p2c_payload;
+        // Owned verified PUSH bytes, independent of PC Graph OpenCL input
+        // storage. Valid until the HTP upload completes.
+        std::vector<float> direct_input_activation;
         std::shared_ptr<phone_stage_prepare_job> prepared_job;
         std::optional<phone_stage_prepared_input> prepared;
         phone_auto_status state = phone_auto_status::REGISTERED;
@@ -7388,6 +7394,19 @@ bool rpc_server::phone_owned_plan_register(
             plan.run_id, plan.region);
         return false;
     }
+    const char * direct_input_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT");
+    const bool direct_input_requested =
+        direct_input_env != nullptr &&
+        std::strcmp(direct_input_env, "1") == 0;
+    if (direct_input_requested &&
+            (!local_only_requested || !direct_p2c_requested)) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=DIRECT_INPUT_REQUIRES_LOCAL_ONLY_P2C\n",
+            plan.run_id, plan.region);
+        return false;
+    }
     if (local_p2c_requested &&
             (!local_exec_requested || !precompile_requested)) {
         GGML_LOG_ERROR(
@@ -8343,32 +8362,61 @@ void rpc_server::phone_auto_prepare_loop() {
         }
         if (!task) { continue; }
         const auto & req = task->request;
+        const char * direct_input_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT");
+        const bool direct_input =
+            direct_input_env != nullptr &&
+            std::strcmp(direct_input_env, "1") == 0 &&
+            ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, req.key.region);
         bool ok = true;
         if (previous == phone_auto_status::VERIFIED) {
             task->upload_begin_us = ggml_time_us();
-            rpc_msg_phone_input_apply_req apply {};
-            apply.key = req.key;
-            apply.tensor = task->input_wire;
-            apply.size = req.input_bytes;
-            {
-                std::lock_guard<std::mutex> lock(phone_input_mutex);
-                const auto found = std::find_if(
-                    phone_input_staged_slots.begin(),
-                    phone_input_staged_slots.end(), [&](const phone_input_staged & e) {
-                        return auto_key(e.key) == auto_key(req.key);
-                    });
-                ok = found != phone_input_staged_slots.end() &&
-                    found->payload.size() - found->payload_offset ==
-                        req.input_bytes;
-                if (ok) { apply.hash = found->hash; }
-            }
-            if (ok) {
-                rpc_msg_phone_input_ack rsp {};
-                ok = phone_input_apply(apply, rsp,
-                    phone_chunk_timeline_enabled ?
-                        &task->input_copy_begin_us : nullptr,
-                    phone_chunk_timeline_enabled ?
-                        &task->input_copy_end_us : nullptr) && rsp.accepted;
+            if (direct_input) {
+                task->input_copy_begin_us = ggml_time_us();
+                ok = phone_input_take_verified_host(
+                    req.key, static_cast<size_t>(req.input_bytes),
+                    task->direct_input_activation);
+                task->input_copy_end_us = ggml_time_us();
+                GGML_LOG_INFO(
+                    "[PHONE_QWEN3_LOCAL] event=INPUT_DIRECT"
+                    " run=%" PRIu64 " region=%u chunk=%u"
+                    " bytes=%" PRIu64 " source=VERIFIED_PUSH_HOST"
+                    " opencl_apply=SKIPPED copy_ms=%.3f"
+                    " status=%s reason=%s\n",
+                    req.key.run_id, req.key.region, req.key.chunk,
+                    req.input_bytes,
+                    (task->input_copy_end_us -
+                     task->input_copy_begin_us) / 1000.0,
+                    ok ? "PASS" : "FAIL",
+                    ok ? "NONE" : "VERIFIED_INPUT_UNAVAILABLE");
+            } else {
+                rpc_msg_phone_input_apply_req apply {};
+                apply.key = req.key;
+                apply.tensor = task->input_wire;
+                apply.size = req.input_bytes;
+                {
+                    std::lock_guard<std::mutex> lock(phone_input_mutex);
+                    const auto found = std::find_if(
+                        phone_input_staged_slots.begin(),
+                        phone_input_staged_slots.end(),
+                        [&](const phone_input_staged & e) {
+                            return auto_key(e.key) == auto_key(req.key);
+                        });
+                    ok = found != phone_input_staged_slots.end() &&
+                        found->payload.size() - found->payload_offset ==
+                            req.input_bytes;
+                    if (ok) { apply.hash = found->hash; }
+                }
+                if (ok) {
+                    rpc_msg_phone_input_ack rsp {};
+                    ok = phone_input_apply(apply, rsp,
+                        phone_chunk_timeline_enabled ?
+                            &task->input_copy_begin_us : nullptr,
+                        phone_chunk_timeline_enabled ?
+                            &task->input_copy_end_us : nullptr) &&
+                        rsp.accepted;
+                }
             }
             task->upload_done_us = ggml_time_us();
         }
@@ -8505,6 +8553,11 @@ void rpc_server::phone_auto_compute_loop() {
         const bool local_direct_p2c = local_only &&
             local_direct_env != nullptr &&
             std::strcmp(local_direct_env, "1") == 0;
+        const char * direct_input_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT");
+        const bool local_direct_input = local_only &&
+            direct_input_env != nullptr &&
+            std::strcmp(direct_input_env, "1") == 0;
         const bool stage_profile_enabled = npu_task && !local_only &&
             stage_profile_env != nullptr &&
             std::strcmp(stage_profile_env, "1") == 0;
@@ -8594,11 +8647,25 @@ void rpc_server::phone_auto_compute_loop() {
                             // Chunk; it owns the new persistent KV history.
                             ok = phone_npu_executor->run_owned_only_chunk(
                                 req.key.run_id, req.key.region,
-                                req.key.chunk, task->input_graph_tensor,
+                                req.key.chunk,
+                                local_direct_input ?
+                                    nullptr : task->input_graph_tensor,
                                 local_direct_p2c ? nullptr : output,
                                 why, local_stats,
                                 local_direct_p2c ?
-                                    &task->direct_p2c_payload : nullptr);
+                                    &task->direct_p2c_payload : nullptr,
+                                local_direct_input ?
+                                    task->direct_input_activation.data() :
+                                    nullptr,
+                                local_direct_input ?
+                                    task->direct_input_activation.size() : 0);
+                            // The HTP Graph has fully synchronized the input
+                            // upload before this returns: release task Host
+                            // storage early, independent of P2C publication.
+                            if (local_direct_input) {
+                                std::vector<float>().swap(
+                                    task->direct_input_activation);
+                            }
                             if (ok && !local_direct_p2c) {
                                 // Legacy P2C still captures the OpenCL
                                 // output; direct mode already owns F32 host
@@ -8619,7 +8686,7 @@ void rpc_server::phone_auto_compute_loop() {
                             " input_read_ms=%.3f input_upload_ms=%.3f"
                             " htp_compute_ms=%.3f output_copy_ms=%.3f"
                             " legacy_htp_compute=SKIPPED"
-                            " p2c=%s"
+                            " input=%s p2c=%s"
                             " status=%s reason=%s\n",
                             req.key.run_id, req.key.region,
                             local_stats.layer, req.key.chunk,
@@ -8627,6 +8694,8 @@ void rpc_server::phone_auto_compute_loop() {
                             local_stats.input_upload_ms,
                             local_stats.htp_compute_ms,
                             local_stats.output_copy_ms,
+                            local_direct_input ? "VERIFIED_PUSH_HOST" :
+                                                 "PC_GRAPH_OPENCL",
                             local_direct_p2c ? "PHONE_OWNED_HOST" :
                                                "PHONE_AUTONOMOUS",
                             ok ? "PASS" : "FAIL",
@@ -9085,6 +9154,46 @@ void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
             p2c_arena.abort();
         }
     }
+}
+
+// Consume already-verified PUSH bytes from the Phone Host landing queue
+// without materializing an OpenCL input Tensor. The per-task F32 vector
+// owns the payload until the local HTP compute has finished its upload.
+bool rpc_server::phone_input_take_verified_host(
+        const rpc_phone_input_key & key, size_t expected_bytes,
+        std::vector<float> & dst) {
+    dst.clear();
+    if (!ggml_phone_owned::valid_direct_host_bytes(
+            expected_bytes, expected_bytes) ||
+            key.run_id == 0 || key.region >= ggml_phone_owned::k_max_regions) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (phone_input_stream_runs.count(key.run_id) == 0) {
+            return false;
+        }
+        const auto it = std::find_if(phone_input_staged_slots.begin(),
+            phone_input_staged_slots.end(),
+            [&](const phone_input_staged & e) {
+                return auto_key(e.key) == auto_key(key);
+            });
+        if (it == phone_input_staged_slots.end() ||
+                it->reserved_bytes == 0 ||
+                it->payload_offset > it->payload.size() ||
+                it->payload.size() - it->payload_offset != expected_bytes ||
+                phone_input_stream_held_bytes < it->reserved_bytes) {
+            return false;
+        }
+        dst.resize(expected_bytes / sizeof(float));
+        std::memcpy(dst.data(), it->payload.data() + it->payload_offset,
+                    expected_bytes);
+        phone_input_stream_held_bytes -= it->reserved_bytes;
+        phone_input_staged_slots.erase(it);
+        ++phone_input_stream_profiles[key.run_id].applied;
+    }
+    phone_input_stream_cv.notify_all();
+    return true;
 }
 
 bool rpc_server::phone_input_apply(

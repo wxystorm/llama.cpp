@@ -154,6 +154,15 @@ inline bool identity_kv_slots(const int64_t * indices,
     return true;
 }
 
+// The verified PUSH payload is F32 activation data. A host-direct handoff
+// must preserve the byte-exact Chunk contract before HTP upload.
+inline bool valid_direct_host_bytes(uint64_t expected, size_t actual) {
+    return expected != 0 &&
+           expected <= k_max_activation_bytes &&
+           expected % sizeof(float) == 0 &&
+           expected == actual;
+}
+
 inline bool matches_chunk(const region_plan & p, uint32_t chunk,
                           uint32_t begin, uint32_t tokens,
                           uint64_t p2c_run_id,
