@@ -309,7 +309,7 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
     cpu_reserve = cpu_reserve_mib*MIB if cpu is not None else 0
     pc_budget = pc.free_bytes-pc_reserve
     phone_budget = phone.free_bytes-phone_reserve
-    cpu_budget = cpu.free_bytes-cpu_reserve if cpu is not None else 0
+    cpu_budget = max(0, cpu.free_bytes-cpu_reserve) if cpu is not None else 0
     if pc_budget <= 0 or phone_budget <= 0:
         raise ValueError('GPU or Phone memory below the safety reserve')
     required = weights.total_weights
