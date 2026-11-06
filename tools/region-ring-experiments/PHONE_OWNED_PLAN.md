@@ -197,6 +197,49 @@ HTP tensors. Target L39 Chunk 0 first rather than all 16 Chunk graphs.
 Stage data are observational only: the original Graph remains the
 sole P2C publisher.
 
+## A/B input alias regression fix (2026-11-06)
+
+The first targeted L39 Chunk 0 stage trace showed:
+
+- `inp_stage`: cosine 0.867666, RMSE 15.3106513, max abs 6615.25.
+- `attn_norm` and all subsequent observable FFN stages also diverged.
+- `attn_out` read as zero on BOTH sides, which is not trustworthy
+  intermediate parity; zeroed/unmaterialized HTP scratch can look identical.
+
+Root-cause hypothesis, supported by the source: the old A/B path **ran
+the PC-built HTP graph first**, then read `task->input_graph_tensor`
+from OpenCL for the Phone-local HTP graph. That OpenCL storage can be
+reused or aliased by the canonical Graph's output; the local Graph may
+have received a different activation than the baseline.
+
+The A/B harness now does a safer and directly verifiable sequence:
+
+1. After the baseline's input leaf is copied into its **actual HTP
+   target Tensor**, capture the target F32 bytes before executing the
+   baseline HTP graph, with a backend sync.
+2. Execute the baseline graph (unchanged canonical KV + P2C semantics).
+3. Upload the immutable pre-compute snapshot to Phone-local HTP input.
+4. Execute local graph, compare outputs, and (if opted in) inspect stages.
+
+When `GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW=1` is set, a *fixed*
+baseline graph and an exact input leaf match are required. The test
+fails closed with `PHONE_LOCAL_AB_REQUIRES_FIXED_REFERENCE_GRAPH` or
+`HTP_FIXED_AB_STAGE_INPUT_NOT_FOUND_OR_INVALID` if the safe capture
+is unavailable. It does NOT silently fall back to reading the OpenCL
+input after compute.
+
+New `EXECUTE_AB` lines include
+`input_source=BASELINE_HTP_PRE_COMPUTE`. The `input_read_ms` field
+now measures this pre-compute HTP snapshot, not the old post-compute
+OpenCL read.
+
+Re-run the **same 512-token prompt** and first check `STAGE_DIAG
+stage=inp_stage`: its RMSE should approach zero with cosine
+approaching one, provided the backend preserves these input buffers
+for diagnostic readback. If the input matches but output still diverges,
+diagnose Attention/KV/FFN math. Any
+`state=ZERO_INTERMEDIATE_UNVERIFIED` is not a pass.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
