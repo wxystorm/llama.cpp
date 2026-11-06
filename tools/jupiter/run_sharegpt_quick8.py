@@ -299,9 +299,10 @@ def main() -> int:
         print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} "
               f"files={len(picked)} mode=SAMPLE_ONLY", flush=True)
         return 0
-    for label, path in (("--exe", args.exe), ("--model", args.model)):
-        if not Path(path).is_file():
-            raise ValueError(f"{label} not found: {path}")
+    if not Path(args.model).is_file():
+        raise ValueError(f"--model not found: {args.model}")
+    if not args.memory_check_only and not Path(args.exe).is_file():
+        raise ValueError(f"--exe not found: {args.exe}")
     memory_plan = choose_layers_by_memory(args)
     if args.memory_check_only:
         print("[JUPITER_MEMORY_CHECK] status=FEASIBLE "
