@@ -10,7 +10,8 @@ import tempfile
 import unittest
 
 from run_sharegpt40_dp import (
-    benchmark_ready, discover, feasible_min_chunk, parser, stage3_ready,
+    benchmark_ready, discover, existing_rows, feasible_min_chunk,
+    parser, save_results, stage3_ready,
 )
 
 
@@ -52,6 +53,8 @@ class ShareGPT40DPTests(unittest.TestCase):
         self.assertEqual(args.q_repeats, 1)
         self.assertFalse(args.graph_prebuild)
         self.assertEqual(args.groups, "128,256,512,1024")
+        self.assertFalse(args.budgeted_refine)
+        self.assertFalse(args.only_incomplete)
 
     def test_stage3_resume_requires_explicit_fixed_verified_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -74,6 +77,37 @@ class ShareGPT40DPTests(unittest.TestCase):
             summary["setup_source"] = "STAGE2_JSON"
             (stage3 / "sequence-summary.json").write_text(json.dumps(summary))
             self.assertFalse(stage3_ready(stage3, plan, 366, 96, args))
+
+    def test_resume_accepts_budgeted_measured_verified_and_preserves_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stage3 = root / "stage3"
+            stage3.mkdir()
+            plan = root / "final.plan"
+            plan.write_text("model.pc_layers=24\nsequence.1057=" +
+                            ",".join(["117"] * 8 + ["121"]) + "\n")
+            summary = {
+                "status": "BUDGETED_MEASURED_AND_VERIFIED",
+                "prompt_tokens": 1057, "pc_layers": 24,
+                "min_chunk": 96, "max_chunk": 128,
+                "setup_source": "FIXED_EXPLICIT",
+                "chunks": [117] * 8 + [121],
+            }
+            (stage3 / "sequence-summary.json").write_text(json.dumps(summary))
+            args = argparse.Namespace(pc_layers=24, max_chunk=128)
+            self.assertTrue(stage3_ready(stage3, plan, 1057, 96, args))
+            row = {
+                "group": 512, "prompt": "prompt_512_01.txt", "status": "PASS",
+                "actual_tokens": "600", "prefill_ms": "10000",
+                "prefill_tok_s": "60.0", "refinement_policy": "EXACT",
+            }
+            save_args = argparse.Namespace(prompts_dir=str(root),
+                                           bench_repeats=1, graph_prebuild=True)
+            save_results(root, [row], save_args)
+            loaded = existing_rows(root / "dp-results.csv")
+            self.assertEqual(loaded["prompt_512_01.txt"]["prefill_tok_s"], "60.0")
+            save_results(root, [loaded["prompt_512_01.txt"]], save_args)
+            self.assertEqual(existing_rows(root / "dp-results.csv"), loaded)
 
     def test_completed_dp_benchmark_never_accepts_default(self):
         with tempfile.TemporaryDirectory() as tmp:
