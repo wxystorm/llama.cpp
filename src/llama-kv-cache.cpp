@@ -1224,6 +1224,11 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+    return layers[ikv].v;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -2580,6 +2585,31 @@ ggml_type llama_kv_cache_context::type_k() const {
 
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+bool llama_kv_cache_context::has_fresh_identity_slots(
+        uint32_t total_tokens) const {
+    if (!stage_batch_applied || ubatches.empty() ||
+            i_cur >= sinfos.size() || total_tokens == 0) {
+        return false;
+    }
+    const auto & sinfo = sinfos[i_cur];
+    if (sinfo.n_stream() != 1 || sinfo.s0 != 0 || sinfo.s1 != 0 ||
+            sinfo.strm[0] != 0 || sinfo.size() != total_tokens) {
+        return false;
+    }
+    for (uint32_t i = 0; i < total_tokens; ++i) {
+        if (sinfo.idxs[0][i] != i) { return false; }
+    }
+    return true;
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_storage(int32_t il) const {
+    return kv->get_k_storage(il);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_storage(int32_t il) const {
+    return kv->get_v_storage(il);
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {

@@ -164,6 +164,7 @@ public:
 
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     //
     // graph_build API
@@ -367,6 +368,12 @@ public:
 
     ggml_type type_k() const;
     ggml_type type_v() const;
+
+    // Physical slots as allocated by the PC KV allocator, after apply().
+    // The graphless path accepts only a fresh stream with slot[i] == i.
+    bool has_fresh_identity_slots(uint32_t total_tokens) const;
+    ggml_tensor * get_k_storage(int32_t il) const;
+    ggml_tensor * get_v_storage(int32_t il) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;

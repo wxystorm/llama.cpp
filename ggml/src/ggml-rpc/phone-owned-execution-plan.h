@@ -163,6 +163,12 @@ inline bool valid_direct_host_bytes(uint64_t expected, size_t actual) {
            expected == actual;
 }
 
+// Reserved UID namespace: Phone-owned tasks do not represent PC Graphs.
+inline uint64_t owned_task_uid(uint32_t region, uint32_t chunk) {
+    return (uint64_t(2) << 62) |
+           (uint64_t(region) << 32) | (uint64_t(chunk) + 1);
+}
+
 inline bool matches_chunk(const region_plan & p, uint32_t chunk,
                           uint32_t begin, uint32_t tokens,
                           uint64_t p2c_run_id,

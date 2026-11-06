@@ -44,6 +44,9 @@ int main() {
     const region_plan a = make_plan();
     CHECK(validate(a, reason));
     CHECK(chunk_count(a) == 4);
+    CHECK(owned_task_uid(1, 0) != 0);
+    CHECK(owned_task_uid(1, 0) != owned_task_uid(1, 1));
+    CHECK(owned_task_uid(1, 1) != owned_task_uid(3, 1));
     CHECK(valid_direct_host_bytes(128ULL*5120*4, 128ULL*5120*4));
     CHECK(!valid_direct_host_bytes(128ULL*5120*4, 128ULL*5120*4 - 4));
     CHECK(!valid_direct_host_bytes(0, 0));

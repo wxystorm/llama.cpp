@@ -596,6 +596,46 @@ public:
     }
 
 
+    // Bind canonical Decode storage once, independently of any PC Graph.
+    // Caller holds HTP mutex before the Graph mutex.
+    bool bind_owned_decode_kv_storage(
+            uint64_t run_id, uint32_t region, uint32_t layer,
+            ggml_context_ptr canonical_ctx,
+            ggml_tensor * canonical_k, ggml_tensor * canonical_v,
+            bool identity_slots, std::string & reason) {
+        reason.clear();
+        const auto it = owned_kv_.find({run_id, region});
+        if (it == owned_kv_.end() || !canonical_ctx || !identity_slots) {
+            reason = "PHONE_LOCAL_KV_GRAPHLESS_PLAN_OR_SLOTS";
+            return false;
+        }
+        auto & state = *it->second;
+        const auto & p = state.plan;
+        const uint64_t width = uint64_t(p.n_heads_kv) * p.head_dim;
+        const auto valid = [&](const ggml_tensor * t) {
+            return t && t->buffer && t->data &&
+                t->type == GGML_TYPE_F16 && t->op == GGML_OP_NONE &&
+                ggml_is_contiguous(t) && t->ne[0] == int64_t(width) &&
+                t->ne[1] >= p.total_tokens && t->ne[1] <= p.kv_capacity &&
+                t->ne[2] == 1 && t->ne[3] == 1 &&
+                ggml_nbytes(t) >= width * p.total_tokens * sizeof(uint16_t) &&
+                !ggml_backend_buffer_is_host(t->buffer);
+        };
+        if (p.layer != layer || state.next_chunk != 0 ||
+                state.canonical_ctx || state.canonical_k || state.canonical_v ||
+                !valid(canonical_k) || !valid(canonical_v) ||
+                (canonical_k->buffer == canonical_v->buffer &&
+                 canonical_k->data == canonical_v->data)) {
+            reason = "PHONE_LOCAL_KV_GRAPHLESS_DESTINATION_CONTRACT";
+            return false;
+        }
+        state.canonical_ctx = std::move(canonical_ctx);
+        state.canonical_k = canonical_k;
+        state.canonical_v = canonical_v;
+        state.graphless_identity_slots = true;
+        return true;
+    }
+
     // The PC-built Graph remains registered as a metadata carrier in the
     // first local-only phase. Extract ONLY its canonical OpenCL KV leaves,
     // so Phone-owned HTP KV can be copied to the original Decode cache when
@@ -853,22 +893,33 @@ public:
         // The indices are populated dynamically and are not trustworthy
         // until the OpenCL input graph has been prepared and synchronized.
         const auto & chunk_state = *git->second;
-        if (!chunk_state.canonical_k_indices ||
-                !chunk_state.canonical_v_indices) {
-            reason = "PHONE_LOCAL_ONLY_KV_INDICES_NOT_BOUND";
-            return false;
-        }
-        std::vector<int64_t> slot_indices(g.tokens);
-        for (const ggml_tensor * src : {
-                chunk_state.canonical_k_indices,
-                chunk_state.canonical_v_indices }) {
-            ggml_backend_tensor_get(src, slot_indices.data(), 0,
-                                    slot_indices.size() * sizeof(int64_t));
-            if (!ggml_phone_owned::identity_kv_slots(
-                    slot_indices.data(), slot_indices.size(),
-                    g.token_begin)) {
-                reason = "PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS";
+        if (state.graphless_identity_slots) {
+            // The PC allocator validated every physical slot for this
+            // immutable fresh UBatch when it bound Decode K/V storage.
+            if (!state.canonical_ctx) {
+                reason = "PHONE_LOCAL_ONLY_GRAPHLESS_KV_CONTEXT_MISSING";
                 return false;
+            }
+        } else {
+            // Preserve the old per-Chunk I64 index check when PC Graphs
+            // are still registered as metadata carriers.
+            if (!chunk_state.canonical_k_indices ||
+                    !chunk_state.canonical_v_indices) {
+                reason = "PHONE_LOCAL_ONLY_KV_INDICES_NOT_BOUND";
+                return false;
+            }
+            std::vector<int64_t> slot_indices(g.tokens);
+            for (const ggml_tensor * src : {
+                    chunk_state.canonical_k_indices,
+                    chunk_state.canonical_v_indices }) {
+                ggml_backend_tensor_get(src, slot_indices.data(), 0,
+                                        slot_indices.size() * sizeof(int64_t));
+                if (!ggml_phone_owned::identity_kv_slots(
+                        slot_indices.data(), slot_indices.size(),
+                        g.token_begin)) {
+                    reason = "PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS";
+                    return false;
+                }
             }
         }
         const size_t bytes =
@@ -2336,8 +2387,11 @@ private:
         uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
-        // Non-owning RPC-visible OpenCL KV metadata, refreshed for every
-        // registered Chunk. Must be valid until input stream RUN END.
+        // Graphless mode owns the imported canonical OpenCL K/V metadata;
+        // PC still owns the underlying physical buffers until RUN END.
+        ggml_context_ptr canonical_ctx;
+        bool graphless_identity_slots = false;
+        // Legacy mode uses non-owning RPC Graph leaf pointers instead.
         const ggml_tensor * canonical_k = nullptr;
         const ggml_tensor * canonical_v = nullptr;
     };

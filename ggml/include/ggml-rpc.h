@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    28
+#define RPC_PROTO_PATCH_VERSION    29
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -241,6 +241,15 @@ struct ggml_backend_rpc_phone_owned_plan {
 using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
     ggml_backend_t backend,
     const ggml_backend_rpc_phone_owned_plan * plan);
+
+// One-time canonical Decode KV destination binding; no per-Chunk Graph.
+#define GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC \
+    "ggml_backend_rpc_phone_owned_kv_bind"
+using ggml_backend_rpc_phone_owned_kv_bind_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t region,
+    uint32_t layer, uint32_t total_tokens,
+    const ggml_tensor * canonical_k, const ggml_tensor * canonical_v,
+    bool verified_identity_slots);
 
 // Experiment: producer-driven PC->Phone host landing slots. No current Graph
 // tensors are touched until the ordinary Phone Worker enters split_prepare().
