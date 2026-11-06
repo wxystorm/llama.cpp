@@ -6702,9 +6702,106 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         size_t phone_push_auto_delegated = 0;
         size_t phone_push_missed = 0;
         uint64_t phone_push_bytes = 0;
+        // Stream input transport: the READY producer never calls send().
+        // A dedicated network worker drains ordered owned buffers. This
+        // overlaps preparing subsequent Chunks with the blocking TCP send
+        // of the current Chunk, without concurrent writes to one TCP stream.
+        struct phone_tx_work_item {
+            llama_region_ring_task task;
+            std::vector<uint8_t> payload;
+            int64_t enqueued_us = 0;
+        };
+        std::mutex phone_tx_mutex;
+        std::condition_variable phone_tx_cv;
+        std::deque<phone_tx_work_item> phone_tx_queue;
+        // Includes the frame currently being sent; bounds owned host memory.
+        static constexpr size_t phone_tx_budget_bytes = 64 * 1024 * 1024;
+        size_t phone_tx_inflight_bytes = 0;
+        size_t phone_tx_peak_bytes = 0;
+        size_t phone_tx_enqueued = 0;
+        int64_t phone_tx_budget_wait_us = 0;
+        bool phone_tx_producer_done = false;
+        bool phone_tx_failed = false;
+
+        // Called only by the sender in Stream mode, or by the original PUSH
+        // worker in legacy mode. Accepted still means locally send() complete,
+        // NEVER merely queued. This preserves the Phone worker's wait gate.
+        auto send_phone_input_chunk = [&](const llama_region_ring_task & job,
+                                          const void * source, size_t bytes,
+                                          int64_t queued_us) -> bool {
+            const int64_t begin_us = ggml_time_us();
+            ggml_backend_rpc_phone_input_push_timing profile {};
+            const bool accepted = phone_input_stream_enabled ?
+                phone_input_stream_push(
+                    phone_rpc_backend, phone_input_push_run_id,
+                    (uint32_t) job.region, (uint32_t) job.chunk,
+                    source, bytes, &profile) :
+                phone_input_push(
+                    phone_rpc_backend, phone_input_push_run_id,
+                    (uint32_t) job.region, (uint32_t) job.chunk,
+                    source, bytes, &profile);
+            const int64_t end_us = ggml_time_us();
+            phone_push_wall_us += end_us - begin_us;
+            const int64_t accounted_pc_us =
+                profile.pc_socket_lock_wait_us + profile.pc_hash_us +
+                profile.pc_pack_us + profile.pc_header_send_us +
+                profile.pc_payload_send_us + profile.pc_ack_wait_us;
+            phone_push_pc_other_us +=
+                std::max<int64_t>(0, end_us - begin_us - accounted_pc_us);
+            phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
+            phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
+            phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
+            phone_push_timing_sum.pc_header_send_us += profile.pc_header_send_us;
+            phone_push_timing_sum.pc_payload_send_us += profile.pc_payload_send_us;
+            phone_push_timing_sum.pc_ack_wait_us += profile.pc_ack_wait_us;
+            phone_push_timing_sum.phone_recv_header_us += profile.phone_recv_header_us;
+            phone_push_timing_sum.phone_recv_alloc_us += profile.phone_recv_alloc_us;
+            phone_push_timing_sum.phone_recv_payload_us += profile.phone_recv_payload_us;
+            phone_push_timing_sum.phone_hash_us += profile.phone_hash_us;
+            phone_push_timing_sum.phone_slot_lock_wait_us += profile.phone_slot_lock_wait_us;
+            phone_push_timing_sum.phone_host_stage_us += profile.phone_host_stage_us;
+            phone_push_timing_sum.phone_handler_us += profile.phone_handler_us;
+            if (auto * row = trace_row(job)) {
+                row->push_begin_us = begin_us;
+                row->push_end_us = end_us;
+                row->push_bytes = bytes;
+                row->push_status = accepted ? 1 : 0;
+                row->push_timing = profile;
+            }
+            if (phone_input_stream_enabled && ring_trace_enabled) {
+                LLAMA_LOG_INFO(
+                    "[PHONE_INPUT_TX_ASYNC] run=%" PRIu64
+                    " region=%zu chunk=%zu bytes=%zu"
+                    " queue_wait_ms=%.3f frame_send_ms=%.3f"
+                    " transport=MERGED_FRAME status=%s\n",
+                    phone_input_push_run_id, job.region, job.chunk, bytes,
+                    (begin_us - queued_us) / 1000.0,
+                    profile.pc_payload_send_us / 1000.0,
+                    accepted ? "PASS" : "FAIL");
+            }
+            {
+                std::lock_guard<std::mutex> lock(phone_push_mutex);
+                phone_push_state[job.region][job.chunk] = accepted ? 1 : 2;
+                if (accepted) {
+                    ++phone_push_accepted;
+                    phone_push_bytes += bytes;
+                }
+            }
+            phone_push_cv.notify_all();
+            if (!accepted) {
+                ready.cancel();
+                phone_push_cv.notify_all();
+            }
+            return accepted;
+        };
+
         auto run_phone_input_pusher = [&]() {
-            llama_region_ring_maybe_raise_current_thread_priority(
-                "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            // The priority switch controls the socket sender in Stream mode.
+            // Preserve the old single-thread path for legacy ACK PUSH.
+            if (!phone_input_stream_enabled) {
+                llama_region_ring_maybe_raise_current_thread_priority(
+                    "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            }
             try {
                 while (const auto next = ready.wait_take_input_push()) {
                     const auto & job = *next;
@@ -6722,66 +6819,123 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const void * source =
                         outputs[job.region - 1].data() +
                         (size_t) job.token_begin * (size_t) n_embd;
-                    const int64_t begin_us = ggml_time_us();
-                    ggml_backend_rpc_phone_input_push_timing profile {};
-                    // In stream mode this return means only sent to TCP,
-                    // never that the Phone has verified the payload.
-                    const bool accepted = phone_input_stream_enabled ?
-                        phone_input_stream_push(
-                            phone_rpc_backend, phone_input_push_run_id,
-                            (uint32_t) job.region, (uint32_t) job.chunk,
-                            source, bytes, &profile) :
-                        phone_input_push(
-                            phone_rpc_backend, phone_input_push_run_id,
-                            (uint32_t) job.region, (uint32_t) job.chunk,
-                            source, bytes, &profile);
-                    const int64_t end_us = ggml_time_us();
-                    phone_push_wall_us += end_us - begin_us;
-                    const int64_t accounted_pc_us =
-                        profile.pc_socket_lock_wait_us + profile.pc_hash_us +
-                        profile.pc_pack_us + profile.pc_header_send_us +
-                        profile.pc_payload_send_us + profile.pc_ack_wait_us;
-                    phone_push_pc_other_us +=
-                        std::max<int64_t>(0, end_us - begin_us - accounted_pc_us);
-                    phone_push_timing_sum.pc_socket_lock_wait_us += profile.pc_socket_lock_wait_us;
-                    phone_push_timing_sum.pc_hash_us += profile.pc_hash_us;
-                    phone_push_timing_sum.pc_pack_us += profile.pc_pack_us;
-                    phone_push_timing_sum.pc_header_send_us += profile.pc_header_send_us;
-                    phone_push_timing_sum.pc_payload_send_us += profile.pc_payload_send_us;
-                    phone_push_timing_sum.pc_ack_wait_us += profile.pc_ack_wait_us;
-                    phone_push_timing_sum.phone_recv_header_us += profile.phone_recv_header_us;
-                    phone_push_timing_sum.phone_recv_alloc_us += profile.phone_recv_alloc_us;
-                    phone_push_timing_sum.phone_recv_payload_us += profile.phone_recv_payload_us;
-                    phone_push_timing_sum.phone_hash_us += profile.phone_hash_us;
-                    phone_push_timing_sum.phone_slot_lock_wait_us += profile.phone_slot_lock_wait_us;
-                    phone_push_timing_sum.phone_host_stage_us += profile.phone_host_stage_us;
-                    phone_push_timing_sum.phone_handler_us += profile.phone_handler_us;
-                    if (auto * row = trace_row(job)) {
-                        row->push_begin_us = begin_us;
-                        row->push_end_us = end_us;
-                        row->push_bytes = bytes;
-                        row->push_status = accepted ? 1 : 0;
-                        row->push_timing = profile;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(phone_push_mutex);
-                        phone_push_state[job.region][job.chunk] =
-                            accepted ? 1 : 2;
-                        if (accepted) {
-                            ++phone_push_accepted;
-                            phone_push_bytes += bytes;
+                    if (!phone_input_stream_enabled) {
+                        if (!send_phone_input_chunk(job, source, bytes, 0)) {
+                            break;
                         }
+                        continue;
                     }
-                    phone_push_cv.notify_all();
-                    if (!accepted) {
-                        ready.cancel();
-                        phone_push_cv.notify_all();
-                        break;
+                    if (bytes > phone_tx_budget_bytes) {
+                        throw std::runtime_error("Phone async send frame over budget");
                     }
+                    // The upstream output buffer may be reused by the next
+                    // GPU/CPU Chunk. Copy before enqueue, retain until send
+                    // completes, and never pass borrowed activation pointers.
+                    phone_tx_work_item item {};
+                    item.task = job;
+                    item.payload.resize(bytes);
+                    memcpy(item.payload.data(), source, bytes);
+                    const int64_t budget_wait_begin_us = ggml_time_us();
+                    {
+                        std::unique_lock<std::mutex> lock(phone_tx_mutex);
+                        while (!phone_tx_failed && !ready.failed() &&
+                                phone_tx_inflight_bytes >
+                                    phone_tx_budget_bytes - bytes) {
+                            // READY cancellation can be raised by a different
+                            // worker without notifying this queue.
+                            phone_tx_cv.wait_for(
+                                lock, std::chrono::milliseconds(20));
+                        }
+                        phone_tx_budget_wait_us +=
+                            ggml_time_us() - budget_wait_begin_us;
+                        if (phone_tx_failed || ready.failed()) { break; }
+                        item.enqueued_us = ggml_time_us();
+                        phone_tx_inflight_bytes += bytes;
+                        phone_tx_peak_bytes = std::max(
+                            phone_tx_peak_bytes, phone_tx_inflight_bytes);
+                        ++phone_tx_enqueued;
+                        phone_tx_queue.emplace_back(std::move(item));
+                    }
+                    phone_tx_cv.notify_one();
                 }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=PRODUCER_FAIL reason=%s\n",
+                    e.what());
+                ready.cancel();
+                phone_push_cv.notify_all();
             } catch (...) {
                 ready.cancel();
                 phone_push_cv.notify_all();
+            }
+            {
+                std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                phone_tx_producer_done = true;
+            }
+            phone_tx_cv.notify_all();
+        };
+
+        auto run_phone_input_sender = [&]() {
+            llama_region_ring_maybe_raise_current_thread_priority(
+                "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            try {
+                while (true) {
+                    phone_tx_work_item item {};
+                    {
+                        std::unique_lock<std::mutex> lock(phone_tx_mutex);
+                        phone_tx_cv.wait(lock, [&]() {
+                            return phone_tx_failed || phone_tx_producer_done ||
+                                   !phone_tx_queue.empty();
+                        });
+                        if (phone_tx_queue.empty()) {
+                            if (phone_tx_failed || phone_tx_producer_done) {
+                                break;
+                            }
+                            continue;
+                        }
+                        item = std::move(phone_tx_queue.front());
+                        phone_tx_queue.pop_front();
+                    }
+                    const size_t bytes = item.payload.size();
+                    const bool accepted = send_phone_input_chunk(
+                        item.task, item.payload.data(), bytes,
+                        item.enqueued_us);
+                    {
+                        std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                        GGML_ASSERT(phone_tx_inflight_bytes >= bytes);
+                        phone_tx_inflight_bytes -= bytes;
+                        if (!accepted) {
+                            phone_tx_failed = true;
+                            phone_tx_queue.clear();
+                            phone_tx_inflight_bytes = 0;
+                        }
+                    }
+                    phone_tx_cv.notify_all();
+                    if (!accepted) { break; }
+                }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=SENDER_FAIL reason=%s\n",
+                    e.what());
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_failed = true;
+                    phone_tx_queue.clear();
+                    phone_tx_inflight_bytes = 0;
+                }
+                ready.cancel();
+                phone_push_cv.notify_all();
+                phone_tx_cv.notify_all();
+            } catch (...) {
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_failed = true;
+                    phone_tx_queue.clear();
+                    phone_tx_inflight_bytes = 0;
+                }
+                ready.cancel();
+                phone_push_cv.notify_all();
+                phone_tx_cv.notify_all();
             }
         };
 
@@ -7973,14 +8127,32 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
 
+        std::thread phone_send_thread;
+        bool phone_send_thread_started = false;
+        if (phone_input_stream_enabled) {
+            try {
+                phone_send_thread = std::thread(run_phone_input_sender);
+                phone_send_thread_started = true;
+            } catch (...) {
+                ready.cancel();
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_TX_ASYNC] event=SENDER_LAUNCH_FAIL status=FAIL\n");
+            }
+        }
         std::thread phone_push_thread;
         bool phone_push_thread_started = false;
-        if (phone_input_push_enabled) {
+        if (phone_input_push_enabled &&
+                (!phone_input_stream_enabled || phone_send_thread_started)) {
             try {
                 phone_push_thread = std::thread(run_phone_input_pusher);
                 phone_push_thread_started = true;
             } catch (...) {
                 ready.cancel();
+                {
+                    std::lock_guard<std::mutex> lock(phone_tx_mutex);
+                    phone_tx_producer_done = true;
+                }
+                phone_tx_cv.notify_all();
                 LLAMA_LOG_ERROR(
                     "[PHONE_INPUT_PUSH] event=LAUNCH_FAIL status=FAIL\n");
             }
@@ -8019,6 +8191,23 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         if (phone_push_thread.joinable()) {
             phone_push_thread.join();
+        }
+        // Flush all locally queued sends before the Stream END control RPC
+        // and before reading push_state or serializing per-Chunk traces.
+        if (phone_send_thread.joinable()) {
+            phone_send_thread.join();
+        }
+        if (phone_input_stream_enabled) {
+            LLAMA_LOG_INFO(
+                "[PHONE_INPUT_TX_ASYNC] event=SUMMARY run=%" PRIu64
+                " enqueued=%zu sent=%zu peak_mib=%.3f"
+                " budget_wait_ms=%.3f sender_started=%d"
+                " transport=MERGED_FRAME status=%s\n",
+                phone_input_push_run_id, phone_tx_enqueued,
+                phone_push_accepted, phone_tx_peak_bytes / 1048576.0,
+                phone_tx_budget_wait_us / 1000.0,
+                phone_send_thread_started ? 1 : 0,
+                phone_tx_failed || ready.failed() ? "FAIL" : "PASS");
         }
         if (phone_graph_thread.worker.joinable()) {
             phone_graph_thread.worker.join();
@@ -8070,7 +8259,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 " phone_recv_payload_ms=%.3f phone_hash_ms=%.3f"
                 " phone_slot_wait_ms=%.3f phone_host_stage_ms=%.3f"
                 " phone_handler_ms=%.3f"
-                " policy=ACCUMULATED_PER_CHUNK status=OK\n",
+                " policy=ACCUMULATED_PER_CHUNK transport=%s status=OK\n",
                 phone_input_push_run_id,
                 phone_push_timing_sum.pc_socket_lock_wait_us / 1000.0,
                 phone_push_timing_sum.pc_hash_us / 1000.0,
@@ -8085,7 +8274,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_push_timing_sum.phone_hash_us / 1000.0,
                 phone_push_timing_sum.phone_slot_lock_wait_us / 1000.0,
                 phone_push_timing_sum.phone_host_stage_us / 1000.0,
-                phone_push_timing_sum.phone_handler_us / 1000.0);
+                phone_push_timing_sum.phone_handler_us / 1000.0,
+                phone_input_stream_enabled ? "MERGED_FRAME" : "HEADER_PAYLOAD");
         }
         if (phone_stream_handle != nullptr) {
             const bool stream_ok = phone_stream_stop(
