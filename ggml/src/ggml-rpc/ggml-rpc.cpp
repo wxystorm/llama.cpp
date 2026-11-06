@@ -4569,34 +4569,29 @@ static bool ggml_backend_rpc_phone_input_stream_push(
     if (timing != nullptr) {
         timing->pc_hash_us = ggml_time_us() - hash_begin;
     }
+    // Preserve the exact wire format, but issue one framed send_data call.
+    // The backend socket may still need several native send() calls when the
+    // frame is larger than MAX_CHUNK_SIZE. There is no standalone 9-byte send.
     const int64_t pack_begin = ggml_time_us();
-    std::vector<uint8_t> packet(sizeof(req) + bytes);
-    memcpy(packet.data(), &req, sizeof(req));
-    memcpy(packet.data() + sizeof(req), input, bytes);
+    constexpr size_t header_bytes = 1 + sizeof(uint64_t);
+    const uint64_t payload_size = sizeof(req) + bytes;
+    std::vector<uint8_t> frame(header_bytes + (size_t) payload_size);
+    frame[0] = static_cast<uint8_t>(RPC_CMD_PHONE_INPUT_STREAM_PUSH);
+    memcpy(frame.data() + 1, &payload_size, sizeof(payload_size));
+    memcpy(frame.data() + header_bytes, &req, sizeof(req));
+    memcpy(frame.data() + header_bytes + sizeof(req), input, bytes);
     if (timing != nullptr) {
         timing->pc_pack_us = ggml_time_us() - pack_begin;
     }
-    std::array<uint8_t, 1 + sizeof(uint64_t)> header {};
-    header[0] = static_cast<uint8_t>(RPC_CMD_PHONE_INPUT_STREAM_PUSH);
-    const uint64_t size = packet.size();
-    memcpy(header.data() + 1, &size, sizeof(size));
-    const int64_t header_begin = ggml_time_us();
-    bool ok = sock->send_data(header.data(), header.size());
-    const int64_t header_end = ggml_time_us();
+    const int64_t send_begin_us = ggml_time_us();
+    const bool ok = sock->send_data(frame.data(), frame.size());
+    const int64_t send_end_us = ggml_time_us();
     if (timing != nullptr) {
-        timing->pc_header_send_us = header_end - header_begin;
-        timing->pc_header_begin_us = header_begin;
-        timing->pc_header_end_us = header_end;
-    }
-    if (ok) {
-        const int64_t payload_begin = ggml_time_us();
-        ok = sock->send_data(packet.data(), packet.size());
-        const int64_t payload_end = ggml_time_us();
-        if (timing != nullptr) {
-            timing->pc_payload_send_us = payload_end - payload_begin;
-            timing->pc_payload_begin_us = payload_begin;
-            timing->pc_payload_end_us = payload_end;
-        }
+        // Stream mode: pc_payload_send_us is the MERGED FRAME duration.
+        // pc_header_send_us remains zero; there is no separate Header send.
+        timing->pc_payload_send_us = send_end_us - send_begin_us;
+        timing->pc_payload_begin_us = send_begin_us;
+        timing->pc_payload_end_us = send_end_us;
     }
     if (!ok) { sock.reset(); }
     return ok;
@@ -5997,6 +5992,8 @@ public:
             phone_stage_prepare_thread =
                 std::thread([this]() { phone_stage_prepare_loop(); });
         }
+        phone_input_verify_thread =
+            std::thread([this]() { phone_input_verify_loop(); });
     }
     ~rpc_server();
 
@@ -6029,6 +6026,12 @@ public:
     bool phone_chunk_timeline_tracing() const {
         return phone_chunk_timeline_enabled;
     }
+    // Socket dispatcher owns only recv + bounded enqueue. Hash, staging and
+    // autonomous notification run on the separate Phone Verify worker.
+    void phone_input_stream_enqueue(std::vector<uint8_t> && packet,
+                                    int64_t recv_us,
+                                    const phone_chunk_input_timing & timing);
+    void phone_input_verify_loop();
     void phone_input_stream_complete(std::vector<uint8_t> && packet,
                                      int64_t recv_us,
                                      const phone_chunk_input_timing & timing);
@@ -6378,6 +6381,23 @@ private:
         size_t payload_offset = 0;
         size_t reserved_bytes = 0;
     };
+    // One receiver per PUSH socket does only framing and bounded admission.
+    // The queued packet retains the existing 128 MiB reservation until it is
+    // verified, staged, consumed or rejected.
+    struct phone_input_rx_packet {
+        std::vector<uint8_t> packet;
+        int64_t recv_us = 0;
+        phone_chunk_input_timing timing {};
+        uint64_t run_id = 0;
+        int64_t enqueued_us = 0;
+    };
+    std::mutex phone_input_rx_mutex;
+    std::condition_variable phone_input_rx_cv;
+    std::deque<phone_input_rx_packet> phone_input_rx_queue;
+    std::unordered_map<uint64_t, size_t> phone_input_rx_pending;
+    std::thread phone_input_verify_thread;
+    bool phone_input_rx_stop = false;
+
     // Host-only landing: two future chunks per Region. The current GPU
     // activation buffer is changed only by the ordinary Phone Worker.
     std::mutex phone_input_mutex;
@@ -7083,6 +7103,15 @@ bool rpc_server::phone_input_push(
 bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
+    if (!request.active) {
+        // END arrives on the control socket, independently of PUSH. Do not
+        // clear run state while an already received Chunk is being verified.
+        std::unique_lock<std::mutex> lock(phone_input_rx_mutex);
+        phone_input_rx_cv.wait(lock, [&]() {
+            const auto it = phone_input_rx_pending.find(request.run_id);
+            return it == phone_input_rx_pending.end() || it->second == 0;
+        });
+    }
     if (phone_npu_executor != nullptr) {
         // The PC may use the ordinary OpenCL decode Graph after prefill.
         // Without this copy its Phone KV would be stale after HTP execution.
@@ -9399,6 +9428,72 @@ void rpc_server::phone_input_stream_cancel_reserve(size_t bytes) {
         phone_input_stream_held_bytes -= bytes;
     }
     phone_input_stream_cv.notify_all();
+}
+
+void rpc_server::phone_input_stream_enqueue(
+        std::vector<uint8_t> && packet, int64_t recv_us,
+        const phone_chunk_input_timing & timing) {
+    uint64_t run_id = 0;
+    if (packet.size() >= sizeof(rpc_msg_phone_input_push_req)) {
+        rpc_msg_phone_input_push_req request {};
+        memcpy(&request, packet.data(), sizeof(request));
+        run_id = request.key.run_id;
+    }
+    phone_input_rx_packet received {};
+    received.packet = std::move(packet);
+    received.recv_us = recv_us;
+    received.timing = timing;
+    received.run_id = run_id;
+    received.enqueued_us = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> lock(phone_input_rx_mutex);
+        ++phone_input_rx_pending[run_id];
+        phone_input_rx_queue.emplace_back(std::move(received));
+    }
+    phone_input_rx_cv.notify_one();
+}
+
+void rpc_server::phone_input_verify_loop() {
+    for (;;) {
+        phone_input_rx_packet received {};
+        {
+            std::unique_lock<std::mutex> lock(phone_input_rx_mutex);
+            phone_input_rx_cv.wait(lock, [&]() {
+                return phone_input_rx_stop || !phone_input_rx_queue.empty();
+            });
+            if (phone_input_rx_queue.empty()) {
+                if (phone_input_rx_stop) { break; }
+                continue;
+            }
+            received = std::move(phone_input_rx_queue.front());
+            phone_input_rx_queue.pop_front();
+        }
+        const int64_t verify_begin_us = ggml_time_us();
+        const uint64_t run_id = received.run_id;
+        const int64_t queue_wait_us =
+            verify_begin_us - received.enqueued_us;
+        const size_t received_bytes = received.packet.size();
+        phone_input_stream_complete(
+            std::move(received.packet), received.recv_us, received.timing);
+        const int64_t verify_end_us = ggml_time_us();
+        if (phone_chunk_timeline_enabled) {
+            GGML_LOG_INFO(
+                "[PHONE_INPUT_VERIFY_QUEUE] run=%" PRIu64
+                " bytes=%zu queue_wait_ms=%.3f worker_ms=%.3f"
+                " status=PROCESSED\n",
+                run_id, received_bytes, queue_wait_us / 1000.0,
+                (verify_end_us - verify_begin_us) / 1000.0);
+        }
+        {
+            std::lock_guard<std::mutex> lock(phone_input_rx_mutex);
+            auto it = phone_input_rx_pending.find(run_id);
+            GGML_ASSERT(it != phone_input_rx_pending.end() && it->second > 0);
+            if (--it->second == 0) {
+                phone_input_rx_pending.erase(it);
+            }
+        }
+        phone_input_rx_cv.notify_all();
+    }
 }
 
 void rpc_server::phone_input_stream_complete(std::vector<uint8_t> && packet,
@@ -13924,6 +14019,14 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
 
 rpc_server::~rpc_server() {
     {
+        std::lock_guard<std::mutex> lock(phone_input_rx_mutex);
+        phone_input_rx_stop = true;
+    }
+    phone_input_rx_cv.notify_all();
+    if (phone_input_verify_thread.joinable()) {
+        phone_input_verify_thread.join();
+    }
+    {
         std::lock_guard<std::mutex> lock(phone_auto_mutex);
         phone_auto_stop = true;
         for (auto & kv : phone_auto_jobs) {
@@ -14618,9 +14721,12 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     timing.recv_begin_us = recv_begin_us;
                     timing.recv_end_us = recv_end_us;
                 }
-                server.phone_input_stream_complete(
+                if (!received) {
+                    server.phone_input_stream_cancel_reserve((size_t) bytes);
+                    return;
+                }
+                server.phone_input_stream_enqueue(
                     std::move(packet), recv_end_us - recv_begin_us, timing);
-                if (!received) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
@@ -15098,9 +15204,12 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     timing.recv_begin_us = recv_begin_us;
                     timing.recv_end_us = recv_end_us;
                 }
-                server.phone_input_stream_complete(
+                if (!received) {
+                    server.phone_input_stream_cancel_reserve((size_t) bytes);
+                    return;
+                }
+                server.phone_input_stream_enqueue(
                     std::move(packet), recv_end_us - recv_begin_us, timing);
-                if (!received) { return; }
                 break;
             }
             case RPC_CMD_PHONE_INPUT_PUSH: {
