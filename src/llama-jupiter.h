@@ -14,6 +14,7 @@ namespace llama_jupiter {
 
 struct plan_data {
     int pc_layers = -1;
+    int cpu_layers = 0;
     std::unordered_map<uint32_t, std::vector<uint32_t>> sequence;
 };
 
@@ -86,6 +87,10 @@ inline plan_data load_plan_file() {
             result.pc_layers = std::atoi(value.c_str());
             continue;
         }
+        if (key == "model.cpu_layers") {
+            result.cpu_layers = std::atoi(value.c_str());
+            continue;
+        }
 
         static const std::string prefix = "sequence.";
         if (key.rfind(prefix, 0) == 0) {
@@ -104,6 +109,13 @@ inline plan_data load_plan_file() {
     }
 
     return result;
+}
+
+inline int model_cpu_layers() {
+    if (const char * value = std::getenv("LLAMA_JUPITER_CPU_LAYERS")) {
+        return std::atoi(value);
+    }
+    return load_plan_file().cpu_layers;
 }
 
 inline int model_pc_layers(int fallback) {
