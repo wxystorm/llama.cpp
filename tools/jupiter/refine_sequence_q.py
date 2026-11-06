@@ -145,6 +145,13 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--metric", choices=["compute_ms", "wall_ms"], default="compute_ms")
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--max-rounds", type=int, default=3)
+    p.add_argument(
+        "--accept-measured-candidate", action="store_true",
+        help="budgeted DP: after the last refinement round, use its selected "
+             "candidate once all its q(x,y) coordinates were measured, "
+             "instead of re-optimizing and potentially introducing new "
+             "unmeasured coordinates; results must be labeled budgeted",
+    )
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--threads", type=int, default=8)
@@ -281,12 +288,14 @@ def main() -> int:
         flush=True,
     )
 
+    selected_candidate = None
     for iteration in range(1, args.max_rounds + 1):
         profile = QProfile(all_rows, metric=args.metric)
         solution = solve_sequence(
             profile, total, 2, args.min_chunk, args.max_chunk,
             args.max_subsequences,
         )
+        selected_candidate = solution
         missing = sequence_missing_points(profile, solution.chunks)
         print(
             f"[JUPITER_REFINE_CANDIDATE] round={iteration} "
@@ -374,10 +383,24 @@ def main() -> int:
             )
 
     profile = QProfile(all_rows, metric=args.metric)
-    final = solve_sequence(
-        profile, total, 2, args.min_chunk, args.max_chunk,
-        args.max_subsequences,
-    )
+    if args.accept_measured_candidate:
+        # The selected candidate was measured in the last iteration.
+        # Re-solving now can move to new unmeasured coordinates indefinitely.
+        # This is a budgeted (not converged-to-fixed-point) DP candidate.
+        if selected_candidate is None:
+            raise RuntimeError("refinement did not select a DP candidate")
+        final = selected_candidate
+        print(
+            f"[JUPITER_REFINE_BUDGETED] rounds={iteration} "
+            "selection=LAST_MEASURED_CANDIDATE "
+            "not_claimed=FULL_DP_FIXED_POINT",
+            flush=True,
+        )
+    else:
+        final = solve_sequence(
+            profile, total, 2, args.min_chunk, args.max_chunk,
+            args.max_subsequences,
+        )
     missing = sequence_missing_points(profile, final.chunks)
     candidate_path = out / "candidate.plan"
     _write_plan(
@@ -414,7 +437,8 @@ def main() -> int:
         },
     )
     print(
-        f"[JUPITER_REFINE_DONE] status=FULLY_MEASURED "
+        f"[JUPITER_REFINE_DONE] status="
+        f"{'BUDGETED_MEASURED' if args.accept_measured_candidate else 'FULLY_MEASURED'} "
         f"total={total} k={len(final.chunks)} "
         f"predicted_ms={final.predicted_ms:.3f} "
         f"plan={plan_output} profile={merged_profile}",
