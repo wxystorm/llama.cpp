@@ -6054,6 +6054,9 @@ private:
         // Kept alive by the immutable PC-built Graph until this RUN ends.
         // Used only as a read-only source for opt-in Phone-local HTP A/B.
         ggml_tensor * input_graph_tensor = nullptr;
+        // Published to P2C from the Phone-owned HTP output, not from a
+        // PC-registered Graph's OpenCL output when DIRECT_P2C is enabled.
+        std::vector<float> direct_p2c_payload;
         std::shared_ptr<phone_stage_prepare_job> prepared_job;
         std::optional<phone_stage_prepared_input> prepared;
         phone_auto_status state = phone_auto_status::REGISTERED;
@@ -6975,7 +6978,17 @@ bool rpc_server::phone_input_stream_run(
                 std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
             const bool local_only = local_only_env != nullptr &&
                 std::strcmp(local_only_env, "1") == 0;
-            if (local_only) {
+            if (local_only && phone_owned_plans.count_run(request.run_id) == 0) {
+                // A tiny warmup or decode-only stream has no owned Regions.
+                // It must not be misreported as a failed KV handoff. Any
+                // real HTP task without a Plan is rejected at registration.
+                GGML_LOG_INFO(
+                    "[PHONE_QWEN3_LOCAL] event=KV_SYNC"
+                    " run=%" PRIu64 " regions=0 bytes=0"
+                    " from=PHONE_LOCAL_HTP to=OPENCL_DECODE"
+                    " mode=LOCAL_ONLY status=SKIPPED"
+                    " reason=NO_PHONE_LOCAL_PLAN\n", request.run_id);
+            } else if (local_only) {
                 // At this boundary the PC has received every Phone P2C
                 // Chunk and is about to start decode. The baseline HTP
                 // Graph was never run, so *only* local HTP KV is valid.
@@ -7363,6 +7376,18 @@ bool rpc_server::phone_owned_plan_register(
             "_AND_EXCLUDES_SHADOW_AB\n", plan.run_id, plan.region);
         return false;
     }
+    const char * direct_p2c_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C");
+    const bool direct_p2c_requested =
+        direct_p2c_env != nullptr &&
+        std::strcmp(direct_p2c_env, "1") == 0;
+    if (direct_p2c_requested && !local_only_requested) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=DIRECT_P2C_REQUIRES_LOCAL_ONLY\n",
+            plan.run_id, plan.region);
+        return false;
+    }
     if (local_p2c_requested &&
             (!local_exec_requested || !precompile_requested)) {
         GGML_LOG_ERROR(
@@ -7463,7 +7488,14 @@ bool rpc_server::phone_auto_task_register(
             std::strcmp(local_exec_env, "1") == 0 &&
             ggml_phone_npu_serial::htp_region(
                 phone_npu_serial_regions, request.key.region);
-        if (local_exec_requested && plan == nullptr) {
+        const char * local_only_cfg =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+        const bool require_plan = local_exec_requested ||
+            (local_only_cfg != nullptr &&
+             std::strcmp(local_only_cfg, "1") == 0 &&
+             ggml_phone_npu_serial::htp_region(
+                 phone_npu_serial_regions, request.key.region));
+        if (require_plan && plan == nullptr) {
             return reject("PHONE_LOCAL_EXEC_PLAN_MISSING");
         }
         if (plan != nullptr &&
@@ -7969,6 +8001,89 @@ bool rpc_server::phone_auto_wait_capture(
         task->capture_in_progress = true;
     }
 
+    // Optional Phone-owned P2C path. The HTP output has already been
+    // copied into this task's private host payload. Publish directly to
+    // the Arena without looking up stored_graphs or the legacy output
+    // Tensor. The original Graph still supplies input and Decode KV
+    // binding in this intermediate phase.
+    const char * direct_p2c_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C");
+    const bool direct_p2c =
+        direct_p2c_env != nullptr &&
+        std::strcmp(direct_p2c_env, "1") == 0 &&
+        ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region);
+    if (direct_p2c) {
+        bool valid_plan = false;
+        {
+            std::lock_guard<std::recursive_mutex> graph_guard(
+                graph_compute_mutex);
+            const auto * plan = phone_owned_plans.find(
+                request.key.run_id, request.key.region);
+            valid_plan = plan != nullptr &&
+                ggml_phone_owned::matches_chunk(
+                    *plan, request.key.chunk, request.token_begin,
+                    request.n_tokens, request.p2c_run_id,
+                    task->request.input_bytes, request.expected_bytes);
+        }
+        const size_t count = task->direct_p2c_payload.size();
+        const bool valid_payload = valid_plan && count != 0 &&
+            request.expected_bytes <=
+                ggml_phone_owned::k_max_activation_bytes &&
+            request.expected_bytes % sizeof(float) == 0 &&
+            count == request.expected_bytes / sizeof(float);
+        task->capture_begin_us = ggml_time_us();
+        bool captured = false;
+        if (valid_payload) {
+            ggml_backend_rpc_p2c_frame frame {};
+            frame.run_id = request.p2c_run_id;
+            frame.region_id = request.key.region;
+            frame.chunk_id = request.key.chunk;
+            frame.token_begin = request.token_begin;
+            frame.n_tokens = request.n_tokens;
+            frame.kind = GGML_BACKEND_RPC_P2C_FULL;
+            frame.payload_bytes = request.expected_bytes;
+            captured = p2c_arena.capture(
+                frame, [&](uint8_t * destination, size_t bytes) {
+                    if (bytes != request.expected_bytes) { return false; }
+                    std::memcpy(destination,
+                        task->direct_p2c_payload.data(), bytes);
+                    return true;
+                });
+            if (captured) {
+                p2c_capture_bytes.fetch_add(
+                    frame.payload_bytes, std::memory_order_relaxed);
+                p2c_capture_us.fetch_add(
+                    ggml_time_us() - task->capture_begin_us,
+                    std::memory_order_relaxed);
+            } else {
+                p2c_arena.finish();
+            }
+        }
+        task->capture_end_us = ggml_time_us();
+        task->direct_p2c_payload.clear();
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            task->capture_in_progress = false;
+            task->capture_done = captured;
+        }
+        GGML_LOG_INFO(
+            "[PHONE_QWEN3_LOCAL] event=P2C_DIRECT run=%" PRIu64
+            " p2c_run=%" PRIu64 " region=%u chunk=%u"
+            " bytes=%" PRIu64 " source=PHONE_LOCAL_HTP_HOST"
+            " graph_lookup=SKIPPED capture_ms=%.3f"
+            " status=%s reason=%s\n",
+            request.key.run_id, request.p2c_run_id,
+            request.key.region, request.key.chunk,
+            request.expected_bytes,
+            (task->capture_end_us - task->capture_begin_us) / 1000.0,
+            captured ? "PASS" : "FAIL",
+            !valid_plan ? "PLAN_MISMATCH" :
+                !valid_payload ? "PAYLOAD_CONTRACT" :
+                !captured ? "ARENA_CAPTURE_FAILED" : "NONE");
+        return captured;
+    }
+
     rpc_msg_p2c_stream_capture_req capture {};
     capture.device = request.device;
     capture.run_id = request.p2c_run_id;
@@ -8385,6 +8500,11 @@ void rpc_server::phone_auto_compute_loop() {
             std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
         const bool local_only = npu_task && local_only_env != nullptr &&
             std::strcmp(local_only_env, "1") == 0;
+        const char * local_direct_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C");
+        const bool local_direct_p2c = local_only &&
+            local_direct_env != nullptr &&
+            std::strcmp(local_direct_env, "1") == 0;
         const bool stage_profile_enabled = npu_task && !local_only &&
             stage_profile_env != nullptr &&
             std::strcmp(stage_profile_env, "1") == 0;
@@ -8475,10 +8595,14 @@ void rpc_server::phone_auto_compute_loop() {
                             ok = phone_npu_executor->run_owned_only_chunk(
                                 req.key.run_id, req.key.region,
                                 req.key.chunk, task->input_graph_tensor,
-                                output, why, local_stats);
-                            if (ok) {
-                                // P2C capture takes the same OpenCL
-                                // destination as the legacy path.
+                                local_direct_p2c ? nullptr : output,
+                                why, local_stats,
+                                local_direct_p2c ?
+                                    &task->direct_p2c_payload : nullptr);
+                            if (ok && !local_direct_p2c) {
+                                // Legacy P2C still captures the OpenCL
+                                // output; direct mode already owns F32 host
+                                // bytes and requires no extra OpenCL copy.
                                 ggml_backend_synchronize(backends[req.device]);
                             }
                         }
@@ -8495,7 +8619,7 @@ void rpc_server::phone_auto_compute_loop() {
                             " input_read_ms=%.3f input_upload_ms=%.3f"
                             " htp_compute_ms=%.3f output_copy_ms=%.3f"
                             " legacy_htp_compute=SKIPPED"
-                            " p2c=PHONE_AUTONOMOUS"
+                            " p2c=%s"
                             " status=%s reason=%s\n",
                             req.key.run_id, req.key.region,
                             local_stats.layer, req.key.chunk,
@@ -8503,6 +8627,8 @@ void rpc_server::phone_auto_compute_loop() {
                             local_stats.input_upload_ms,
                             local_stats.htp_compute_ms,
                             local_stats.output_copy_ms,
+                            local_direct_p2c ? "PHONE_OWNED_HOST" :
+                                               "PHONE_AUTONOMOUS",
                             ok ? "PASS" : "FAIL",
                             ok ? "NONE" : why.c_str());
                     } else if (local_p2c && !local_ab) {

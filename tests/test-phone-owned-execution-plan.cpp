@@ -74,6 +74,8 @@ int main() {
     b.layer = 19;
     CHECK(plans.add(b, reason));
     CHECK(plans.size() == 2);
+    CHECK(plans.count_run(42) == 2);
+    CHECK(plans.count_run(41) == 0);
 
     auto invalid = a;
     invalid.version = 3;
@@ -105,7 +107,9 @@ int main() {
 
     plans.erase_run(41);
     CHECK(plans.size() == 2);
+    CHECK(plans.count_run(42) == 2);
     plans.erase_run(42);
     CHECK(plans.size() == 0);
+    CHECK(plans.count_run(42) == 0);
     return 0;
 }

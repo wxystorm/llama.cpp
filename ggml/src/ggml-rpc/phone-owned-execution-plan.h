@@ -201,6 +201,14 @@ public:
 
     size_t size() const { return regions_.size(); }
 
+    size_t count_run(uint64_t run_id) const {
+        size_t count = 0;
+        for (const auto & entry : regions_) {
+            if (entry.first.first == run_id) { ++count; }
+        }
+        return count;
+    }
+
 private:
     std::map<std::pair<uint64_t, uint32_t>, region_plan> regions_;
 };

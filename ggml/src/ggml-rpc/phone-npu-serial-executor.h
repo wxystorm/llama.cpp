@@ -820,7 +820,8 @@ public:
                               const ggml_tensor * input,
                               ggml_tensor * output,
                               std::string & reason,
-                              local_only_profile & profile) {
+                              local_only_profile & profile,
+                              std::vector<float> * direct_p2c_payload = nullptr) {
         reason.clear();
         profile = {};
         const auto key = std::make_pair(run_id, region);
@@ -870,20 +871,23 @@ public:
         }
         const size_t bytes =
             size_t(g.tokens) * p.n_embd * sizeof(float);
-        if (!input || !output || !g.input || !g.output ||
+        if (!input || !g.input || !g.output ||
                 !input->buffer || !input->data ||
-                !output->buffer || !output->data ||
                 !g.input->buffer || !g.output->buffer ||
                 input->type != GGML_TYPE_F32 ||
-                output->type != GGML_TYPE_F32 ||
+                g.output->type != GGML_TYPE_F32 ||
                 !ggml_is_contiguous(input) ||
-                !ggml_is_contiguous(output) ||
                 !ggml_is_contiguous(g.input) ||
                 !ggml_is_contiguous(g.output) ||
                 ggml_nbytes(input) != bytes ||
-                ggml_nbytes(output) != bytes ||
+                ggml_nbytes(g.output) != bytes ||
                 !ggml_are_same_layout(g.input, input) ||
-                !ggml_are_same_layout(g.output, output)) {
+                (direct_p2c_payload == nullptr &&
+                 (!output || !output->buffer || !output->data ||
+                  output->type != GGML_TYPE_F32 ||
+                  !ggml_is_contiguous(output) ||
+                  ggml_nbytes(output) != bytes ||
+                  !ggml_are_same_layout(g.output, output)))) {
             reason = "PHONE_LOCAL_ONLY_ACTIVATION_CONTRACT";
             return false;
         }
@@ -914,12 +918,31 @@ public:
             reason = "PHONE_LOCAL_ONLY_HTP_COMPUTE_FAILED";
             return false;
         }
-        double copy_ms = 0.0;
-        if (!publish_owned_htp_chunk(
-                run_id, region, chunk, output, reason, copy_ms)) {
-            return false;
+        if (direct_p2c_payload != nullptr) {
+            // The HTP output is the authoritative payload. Read it once
+            // into owned host storage and hand it directly to the P2C Arena:
+            // no PC Graph output lookup or HTP->OpenCL->Host bounce.
+            const int64_t read_begin = ggml_time_us();
+            direct_p2c_payload->resize(bytes / sizeof(float));
+            ggml_backend_tensor_get(
+                g.output, direct_p2c_payload->data(), 0, bytes);
+            profile.output_copy_ms =
+                (ggml_time_us() - read_begin) / 1000.0;
+            for (float value : *direct_p2c_payload) {
+                if (!std::isfinite(value)) {
+                    direct_p2c_payload->clear();
+                    reason = "PHONE_LOCAL_DIRECT_P2C_NONFINITE_OUTPUT";
+                    return false;
+                }
+            }
+        } else {
+            double copy_ms = 0.0;
+            if (!publish_owned_htp_chunk(
+                    run_id, region, chunk, output, reason, copy_ms)) {
+                return false;
+            }
+            profile.output_copy_ms = copy_ms;
         }
-        profile.output_copy_ms = copy_ms;
         profile.tokens = g.tokens;
         profile.layer = p.layer;
         ++state.next_chunk;

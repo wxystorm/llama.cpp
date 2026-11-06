@@ -385,14 +385,49 @@ Important limitations:
   `PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS`. Do not remove
   that guard just to make the test run.
 
+## Phase 6: direct Phone-owned HTP output to P2C Arena (opt-in)
+
+After the Phase 5 local-only Prefill/Decode comparison passes, keep
+`GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1` and additionally enable:
+
+```sh
+export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C=1
+```
+
+This mode reads each F32 `l_out` from the precompiled Phone-local HTP
+Graph into a private per-task host payload and copies those bytes straight
+into the existing P2C Arena. It **does not** write the PC Graph's OpenCL
+output Tensor, re-run the legacy HTP graph, or use `stored_graphs`
+to locate the P2C output. The existing Arena performs ordered, backpressured
+snapshot publication. The original PC-registered Graph **still** provides
+Activation input storage, physical KV slot indices and canonical OpenCL
+Decode KV destinations. Do not disable that registration yet.
+
+This experiment fails closed when the immutable Region Plan, Chunk shape,
+payload byte count or finite HTP output check fails. Only use it with the
+Phase 5 Qwen3/F16 fresh-sequence restrictions. To revert, set
+`GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C=0` and restart the Phone server.
+
+With four NPU Regions and 512 tokens at Chunk=128, expect **16**
+`event=EXECUTE_ONLY p2c=PHONE_OWNED_HOST status=PASS` and **16**
+`event=P2C_DIRECT source=PHONE_LOCAL_HTP_HOST graph_lookup=SKIPPED
+status=PASS`, followed by one `KV_SYNC regions=4 status=PASS`.
+Empty warmup/decode-only streams with no Phone-owned Plan now log
+`KV_SYNC regions=0 status=SKIPPED reason=NO_PHONE_LOCAL_PLAN`.
+
+Compare PC-side Prefill, Decode and generated tokens or logits against
+the same-prompt Phase 5 baseline before proceeding. **A successful P2C
+capture alone does not validate Decode KV.**
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
    Graph READY barrier, then move compilation off the synchronous RPC path.
 2. Feed verified PC PUSH activations into the fixed Phone-owned input tensors;
    respect the existing per-Layer KV FIFO before executing the HTP Graph.
-3. Publish the Phone-owned Graph output to P2C without looking up the old
-   RPC-registered Graph, and implement safe slot reuse/backpressure.
+3. Validate the opt-in direct Phone-owned HTP output -> P2C Arena path;
+   then replace PC-registered input Tensor lookup with independent
+   Activation/PUSH address binding while retaining Arena backpressure.
 4. Preserve PC decode compatibility (KV ownership/synchronization) and
    compare per-Layer activations and final logits against the old path.
 5. Only then make the PC skip building/registering Phone RPC Graphs.
