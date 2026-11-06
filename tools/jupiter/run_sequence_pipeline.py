@@ -244,6 +244,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--q-repeats", type=int, default=2)
     p.add_argument("--refine-repeats", type=int, default=2)
     p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--accept-measured-candidate", action="store_true",
+                   help="stop after a bounded number of refinement rounds and "
+                        "verify its last measured candidate, rather than require "
+                        "a fully converged DP fixed point")
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--context", type=int, default=512)
     p.add_argument("--ubatch", type=int, default=128)
@@ -409,6 +413,8 @@ def main() -> int:
         "--metric", "compute_ms",
         "--out-dir", str(refine_out), "--plan-output", str(final_plan),
     ]
+    if args.accept_measured_candidate:
+        refine_command.append("--accept-measured-candidate")
     if can_resume:
         refine_command.append("--resume")
     rc = checked(refine_command)
@@ -431,8 +437,19 @@ def main() -> int:
         )
 
     report = {
-        "status": "FULLY_MEASURED_AND_VERIFIED" if not args.skip_runtime_verify
-                  else "FULLY_MEASURED_NOT_RUNTIME_VERIFIED",
+        "status": (
+            ("BUDGETED_MEASURED_AND_VERIFIED"
+             if not args.skip_runtime_verify else
+             "BUDGETED_MEASURED_NOT_RUNTIME_VERIFIED")
+            if args.accept_measured_candidate else
+            ("FULLY_MEASURED_AND_VERIFIED"
+             if not args.skip_runtime_verify else
+             "FULLY_MEASURED_NOT_RUNTIME_VERIFIED")
+        ),
+        "refinement_policy": (
+            "LAST_MEASURED_CANDIDATE" if args.accept_measured_candidate
+            else "REOPTIMIZE_UNTIL_EXACT_Q_COVERAGE"
+        ),
         "pc_layers": pc, "prompt_tokens": total, "min_chunk": b,
         "max_chunk": max_chunk, "min_chunk_status": status,
         "initial_b_from_json": old_b,
