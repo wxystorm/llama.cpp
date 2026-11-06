@@ -4765,6 +4765,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_auto_final_enabled =
         phone_auto_final_requested && phone_auto_eligible &&
         model.arch == LLM_ARCH_QWEN3;
+    // Graphless only changes the full Prefill path; tiny/decode retain
+    // their normal PC graphs. PC must explicitly opt in independently of
+    // the Phone server's matching GRAPHLESS switch.
+    const char * graphless_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_GRAPHLESS");
+    const bool graphless_requested = graphless_env != nullptr &&
+        std::strcmp(graphless_env, "1") == 0;
+    const bool phone_graphless =
+        graphless_requested && ubatch.n_tokens >= 32 &&
+        phone_auto_final_enabled && own_stage_resources;
+    if (graphless_requested && ubatch.n_tokens >= 32 &&
+            !phone_graphless) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_OWNED_KV] side=pc event=REJECT"
+            " reason=GRAPHLESS_REQUIRES_PHONE_AUTONOMOUS_FINAL"
+            "_AND_OWNED_KV status=FAIL\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     // Tiny startup/warmup and one-token decode keep the proven legacy
     // path even while the full-UBatch autonomous experiment is requested.
     // Do not fail the entire test suite before reaching its target prompt.
@@ -4941,7 +4960,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Other modes retain the original eager graph and binding lifecycle.
     const bool phone_async_graph_setup =
         phone_async_graph_requested && phone_auto_eligible &&
-        phone_auto_final_enabled;
+        phone_auto_final_enabled && !phone_graphless;
     std::mutex phone_graph_ready_mutex;
     std::condition_variable phone_graph_ready_cv;
     std::vector<std::vector<uint8_t>> phone_graph_ready(stages.size());
@@ -5260,7 +5279,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return template_index == phone_auto_templates.size();
     };
 
-    if (phone_auto_eligible && !phone_async_graph_setup) {
+    if (phone_auto_eligible && !phone_async_graph_setup &&
+            !phone_graphless) {
         const auto no_binding = [](const phone_auto_template &) { return true; };
         if (!build_phone_auto_graphs(no_binding)) {
             ret = GGML_STATUS_FAILED;
@@ -5514,6 +5534,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool owned_plan_requested =
             owned_plan_env != nullptr &&
             std::strcmp(owned_plan_env, "1") == 0;
+        if (phone_graphless && !owned_plan_requested) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_OWNED_KV] side=pc event=REJECT"
+                " reason=GRAPHLESS_REQUIRES_REGION_PLAN status=FAIL\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
         // Tiny warmup/decode keeps the normal path. A real prefill that
         // explicitly requests Plan shadow must never silently skip it.
         if (owned_plan_requested && ubatch.n_tokens >= 32 &&
@@ -5533,6 +5560,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC)) :
                 nullptr;
+            const auto bind_kv = rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_owned_kv_bind_t>(
+                    ggml_backend_reg_get_proc_address(
+                        rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC)) :
+                nullptr;
             bool valid = register_plan != nullptr &&
                 phone_stream_run_id != 0 &&
                 model.arch == LLM_ARCH_QWEN3 &&
@@ -5540,6 +5572,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 cparams.n_ctx >= ubatch.n_tokens &&
                 cparams.flash_attn &&
                 model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+            // The actual KV allocator, not RoPE positions, proves the
+            // fresh physical slot assignment before any remote execution.
+            if (valid && phone_graphless) {
+                valid = bind_kv != nullptr &&
+                    kv_mctx->type_k() == GGML_TYPE_F16 &&
+                    kv_mctx->type_v() == GGML_TYPE_F16 &&
+                    kv_mctx->has_fresh_identity_slots(ubatch.n_tokens);
+                if (!valid) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_OWNED_KV] side=pc event=REJECT"
+                        " reason=NONIDENTITY_KV_SLOTS_OR_F16_BIND"
+                        " status=FAIL\n");
+                }
+            }
             // v1 permits only a single contiguous sequence beginning at 0.
             for (uint32_t i = 0; valid && i < ubatch.n_tokens; ++i) {
                 valid = ubatch.pos[i] == (llama_pos) i;
@@ -5590,17 +5636,51 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_fast = cparams.yarn_beta_fast;
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
+                if (valid && phone_graphless) {
+                    const ggml_tensor * canonical_k =
+                        kv_mctx->get_k_storage((int32_t) layer);
+                    const ggml_tensor * canonical_v =
+                        kv_mctx->get_v_storage((int32_t) layer);
+                    valid = canonical_k != nullptr && canonical_v != nullptr &&
+                        bind_kv(phone_rpc_backend, plan.run_id,
+                                plan.region, plan.layer, plan.total_tokens,
+                                canonical_k, canonical_v, true);
+                    LLAMA_LOG_INFO(
+                        "[PHONE_OWNED_KV] side=pc event=BIND"
+                        " run=%" PRIu64 " region=%u layer=%u"
+                        " slots=PC_VERIFIED_IDENTITY"
+                        " graph_register=SKIPPED status=%s\n",
+                        plan.run_id, plan.region, plan.layer,
+                        valid ? "PASS" : "FAIL");
+                }
                 if (valid) { ++published; }
             }
             LLAMA_LOG_INFO(
-                "[PHONE_OWNED_PLAN] side=pc mode=SHADOW_PC_BUILT "
-                "registered=%zu status=%s\n",
+                "[PHONE_OWNED_PLAN] side=pc mode=%s"
+                " registered=%zu status=%s\n",
+                phone_graphless ? "PHONE_LOCAL_GRAPHLESS" :
+                                  "SHADOW_PC_BUILT",
                 published, valid ? "PASS" : "FAIL");
             if (!valid || published == 0) {
                 (void) phone_input_stream_run(
                     phone_rpc_backend, phone_input_push_run_id, false);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
+            }
+            if (phone_graphless) {
+                // The Phone owns every Chunk task. The PC keeps only
+                // logical descriptors for its FIFO and P2C receiver.
+                for (auto & item : phone_auto_templates) {
+                    item.graph_uid = (UINT64_C(2) << 62) |
+                        (uint64_t(item.region) << 32) |
+                        (uint64_t(item.chunk) + 1);
+                }
+                LLAMA_LOG_INFO(
+                    "[PHONE_AUTO] event=GRAPHLESS_READY"
+                    " regions=%zu chunks=%zu"
+                    " pc_graph_build=SKIPPED pc_graph_register=SKIPPED"
+                    " task_registration=PHONE_OWNED status=READY\n",
+                    published, phone_auto_templates.size());
             }
         }
         ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
@@ -5616,9 +5696,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // Patch26 registration performs the capability check before any
             // output-bound task is admitted. No runtime WAIT RPC remains.
             phone_auto_register_task = register_task;
-            bool bound = register_task != nullptr &&
+            bool bound = (phone_graphless || register_task != nullptr) &&
                 phone_stream_run_id != 0;
-            if (bound && !phone_async_graph_setup) {
+            if (bound && !phone_async_graph_setup && !phone_graphless) {
                 for (const auto & item : phone_auto_templates) {
                     if (!register_task(
                             phone_rpc_backend, phone_input_push_run_id,
@@ -6685,14 +6765,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                        item.tokens == (uint32_t) task.n_tokens;
                             });
                         if (it == phone_auto_templates.end() ||
-                                it->owned_sched == nullptr ||
-                                it->owned_res == nullptr || it->graph_uid == 0) {
+                                it->graph_uid == 0 ||
+                                (!phone_graphless &&
+                                 (it->owned_sched == nullptr ||
+                                  it->owned_res == nullptr))) {
                             throw std::runtime_error(
-                                "missing exact Phone autonomous Chunk graph");
+                                "missing exact Phone autonomous Chunk binding");
                         }
-                        task_sched = it->owned_sched.get();
-                        task_res = it->owned_res.get();
-                        phone_prebuilt_task = true;
+                        if (!phone_graphless) {
+                            task_sched = it->owned_sched.get();
+                            task_res = it->owned_res.get();
+                            phone_prebuilt_task = true;
+                        } else if (task_res == nullptr || task_sched == nullptr) {
+                            throw std::runtime_error(
+                                "Phone-owned task missing host FIFO context");
+                        }
                         phone_auto_task = true;
                         phone_auto_graph_uid = it->graph_uid;
                     }
@@ -6978,14 +7065,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 dev == (size_t) llama_region_ring_device::PHONE &&
                                 stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
                             if (phone_auto_task) {
-                                // The complete per-Chunk Phone Graph was built
-                                // with Meta and registered before the worker DAG.
-                                // Runtime MUST NOT enter Meta compute: its
-                                // rotating KV View maps may have been cleared.
-                                // Phone is already computing from VERIFIED
-                                // PUSH. Host dispatch just releases the
-                                // logical FIFO and arranges receiver delivery;
-                                // it never waits for Phone compute or P2C.
+                                // No PC Meta compute for autonomous Phone
+                                // work. In graphless mode there is not even
+                                // a PC-built per-Chunk Graph: the Phone has
+                                // the Plan, canonical KV binding and verified
+                                // PUSH payload, and owns compute/P2C.
                                 if (prepare_gate.owns_lock()) {
                                     prepare_gate.unlock();
                                 }
