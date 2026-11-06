@@ -142,6 +142,7 @@ inline uint32_t chunk_count(const region_plan & p) {
 inline bool identity_kv_slots(const int64_t * indices,
                              size_t count, uint64_t first) {
     if (indices == nullptr || count == 0 ||
+            count > uint64_t(INT64_MAX) ||
             first > uint64_t(INT64_MAX) - count) {
         return false;
     }
