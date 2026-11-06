@@ -2594,7 +2594,9 @@ bool llama_kv_cache_context::has_fresh_identity_slots(
         return false;
     }
     const auto & sinfo = sinfos[i_cur];
-    if (sinfo.n_stream() != 1 || sinfo.s0 != 0 || sinfo.s1 != 0 ||
+    if (sinfo.n_stream() != 1 || sinfo.idxs.size() != 1 ||
+            sinfo.idxs[0].empty() ||
+            sinfo.s0 != 0 || sinfo.s1 != 0 ||
             sinfo.strm[0] != 0 || sinfo.size() != total_tokens) {
         return false;
     }
