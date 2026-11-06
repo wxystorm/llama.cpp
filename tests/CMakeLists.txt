@@ -358,6 +358,13 @@ target_include_directories(test-phone-npu-weight-banks PRIVATE
 set_target_properties(test-phone-npu-weight-banks PROPERTIES CXX_STANDARD 17)
 llama_test(test-phone-npu-weight-banks)
 
+# User-facing, inference-free offline Planner (exact same C++ DAG engine).
+add_executable(region-ring-offline-plan
+    ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/offline_plan.cpp)
+target_include_directories(region-ring-offline-plan PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+set_target_properties(region-ring-offline-plan PROPERTIES CXX_STANDARD 17)
+
 add_executable(test-region-ring-planner test-region-ring-planner.cpp)
 set_target_properties(test-region-ring-planner PROPERTIES
     CXX_STANDARD 17
