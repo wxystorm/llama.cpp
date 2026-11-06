@@ -606,14 +606,17 @@ public:
         uint32_t layer = 0;
     };
 
-    // REAL HTP execution of the Phone-constructed graph. The caller has
-    // synchronized the canonical OpenCL input and holds the HTP mutex.
+    // REAL HTP execution of the Phone-constructed graph. The activation
+    // comes from an immutable snapshot captured from the actual baseline
+    // HTP-bound input BEFORE baseline Compute can overwrite its source.
+    // The caller still holds the HTP mutex.
     // This path has its OWN KV and DOES NOT change the canonical OpenCL
     // output or the legacy HTP KV: the old path remains the P2C producer.
     // A/B measurements cover the same input activation and the complete
     // per-region FIFO sequence (including dependencies on earlier KV rows).
     bool run_owned_htp_chunk(uint64_t run_id, uint32_t region, uint32_t chunk,
-                             const ggml_tensor * input,
+                             const float * reference_input_snapshot,
+                             size_t reference_input_count,
                              const ggml_tensor * reference_output,
                              std::string & reason,
                              local_exec_profile & profile) {
@@ -641,15 +644,14 @@ public:
             return false;
         }
         const size_t bytes = uint64_t(g.tokens) * p.n_embd * sizeof(float);
-        if (!input || !reference_output || !g.input || !g.output ||
+        if (!reference_input_snapshot ||
+                reference_input_count != bytes / sizeof(float) ||
+                !reference_output || !g.input || !g.output ||
                 g.input->buffer == nullptr || g.output->buffer == nullptr ||
-                input->type != GGML_TYPE_F32 ||
                 reference_output->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(input) ||
                 !ggml_is_contiguous(reference_output) ||
                 !ggml_is_contiguous(g.input) ||
                 !ggml_is_contiguous(g.output) ||
-                ggml_nbytes(input) != bytes ||
                 ggml_nbytes(g.input) != bytes ||
                 ggml_nbytes(g.output) != bytes ||
                 ggml_nbytes(reference_output) != bytes) {
@@ -657,15 +659,13 @@ public:
             return false;
         }
         const size_t count = bytes / sizeof(float);
-        std::vector<float> src(count);
         std::vector<float> ref(count);
         std::vector<float> got(count);
 
-        const int64_t read_begin = ggml_time_us();
-        ggml_backend_tensor_get(input, src.data(), 0, bytes);
-        profile.input_read_ms = (ggml_time_us() - read_begin) / 1000.0;
+        // Input snapshot read time is accounted at baseline input-copy time,
+        // before baseline compute. Do not read the OpenCL source here.
         const int64_t upload_begin = ggml_time_us();
-        ggml_backend_tensor_set(g.input, src.data(), 0, bytes);
+        ggml_backend_tensor_set(g.input, reference_input_snapshot, 0, bytes);
         ggml_backend_synchronize(backend_);
         profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
 
@@ -1304,10 +1304,19 @@ public:
                               ggml_tensor * output, std::string & reason,
                               double & stage_ms, double & compute_ms,
                               double & output_ms,
-                              stage_profile_stats * profile = nullptr) {
+                              stage_profile_stats * profile = nullptr,
+                              const ggml_tensor * ab_source = nullptr,
+                              std::vector<float> * ab_input_snapshot = nullptr) {
         reason.clear();
         stage_ms = compute_ms = output_ms = 0.0;
         if (profile != nullptr) { *profile = {}; }
+        if ((ab_source == nullptr) != (ab_input_snapshot == nullptr)) {
+            reason = "HTP_FIXED_AB_INCOMPLETE_SNAPSHOT_CONTRACT";
+            return false;
+        }
+        if (ab_input_snapshot != nullptr) {
+            ab_input_snapshot->clear();
+        }
         const auto it = registered_graphs_.find(uid);
         if (it == registered_graphs_.end()) {
             reason = "HTP_FIXED_UID_NOT_FOUND";
@@ -1349,6 +1358,7 @@ public:
             profile->input_tensors = item.inputs.size();
         }
         const int64_t copy_begin = ggml_time_us();
+        const ggml_tensor * htp_snapshot_target = nullptr;
         for (const auto & in : item.inputs) {
             if (in.source->data != in.source_data ||
                     in.source->buffer != in.source_buffer ||
@@ -1357,6 +1367,42 @@ public:
                 return false;
             }
             ggml_backend_tensor_copy(in.source, in.target);
+            if (ab_input_snapshot != nullptr && in.source == ab_source) {
+                if (htp_snapshot_target != nullptr) {
+                    reason = "HTP_FIXED_AB_MULTIPLE_STAGE_INPUTS";
+                    return false;
+                }
+                htp_snapshot_target = in.target;
+            }
+        }
+        if (ab_input_snapshot != nullptr) {
+            // Read exactly what the baseline HTP Graph will consume.
+            // Tensor inputs can be aliased/reused by the legacy Graph,
+            // so this must happen BEFORE the first compute.
+            if (htp_snapshot_target == nullptr ||
+                    ab_source->type != GGML_TYPE_F32 ||
+                    htp_snapshot_target->type != GGML_TYPE_F32 ||
+                    !ggml_is_contiguous(htp_snapshot_target) ||
+                    !ggml_is_contiguous(ab_source) ||
+                    !ggml_are_same_layout(ab_source,
+                                          htp_snapshot_target) ||
+                    ggml_nbytes(htp_snapshot_target) == 0 ||
+                    ggml_nbytes(htp_snapshot_target) >
+                        ggml_phone_owned::k_max_activation_bytes) {
+                reason = "HTP_FIXED_AB_STAGE_INPUT_NOT_FOUND_OR_INVALID";
+                return false;
+            }
+            const size_t bytes = ggml_nbytes(htp_snapshot_target);
+            ab_input_snapshot->resize(bytes / sizeof(float));
+            ggml_backend_synchronize(backend_);
+            ggml_backend_tensor_get(htp_snapshot_target,
+                                    ab_input_snapshot->data(), 0, bytes);
+            for (float x : *ab_input_snapshot) {
+                if (!std::isfinite(x)) {
+                    reason = "HTP_FIXED_AB_NONFINITE_BASELINE_INPUT";
+                    return false;
+                }
+            }
         }
         const int64_t compute_begin = ggml_time_us();
         stage_ms = (compute_begin - start_us) / 1000.0;
