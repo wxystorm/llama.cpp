@@ -204,9 +204,17 @@ inline bool build_graph(ggml_context * ctx,
     ggml_set_input(vi);
     ggml_set_input(mask);
 
+    // Names mirror llama.cpp's cb(stage, layer) labels for optional
+    // HTP-to-HTP stage parity. These do not alter the operator graph.
+    const auto mark = [&](ggml_tensor * t, const char * stage) {
+        std::snprintf(name, sizeof(name), "%s-%u", stage, p.layer);
+        ggml_set_name(t, name);
+    };
+
     // Qwen3: RMSNorm -> QKV matmuls -> per-head Q/K RMSNorm -> NeoX RoPE.
     ggml_tensor * x_norm = ggml_mul(ctx,
         ggml_rms_norm(ctx, input, p.rms_norm_eps), w.attn_norm);
+    mark(x_norm, "attn_norm");
     ggml_tensor * q = ggml_reshape_3d(ctx,
         ggml_mul_mat(ctx, w.wq, x_norm), p.head_dim, p.n_heads, tokens);
     ggml_tensor * k = ggml_reshape_3d(ctx,
@@ -224,6 +232,9 @@ inline bool build_graph(ggml_context * ctx,
                        p.rope_ext_factor, p.rope_attn_factor,
                        p.rope_beta_fast, p.rope_beta_slow);
 
+    mark(q, "Qcur");
+    mark(k, "Kcur");
+    mark(v, "Vcur");
     // Preserve original KV write order. set_rows aliases the persistent
     // KV base; the flash-attn read nodes then see all committed prior chunks.
     ggml_build_forward_expand(graph, q);
@@ -261,15 +272,23 @@ inline bool build_graph(ggml_context * ctx,
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     attn = ggml_reshape_2d(ctx, attn, p.n_embd, tokens);
     ggml_tensor * attn_out = ggml_mul_mat(ctx, w.wo, attn);
+    mark(attn_out, "attn_out");
     ggml_tensor * ffn_inp = ggml_add(ctx, attn_out, input);
+    mark(ffn_inp, "ffn_inp");
 
     ggml_tensor * ffn_norm = ggml_mul(ctx,
         ggml_rms_norm(ctx, ffn_inp, p.rms_norm_eps), w.ffn_norm);
+    mark(ffn_norm, "ffn_norm");
     ggml_tensor * up = ggml_mul_mat(ctx, w.ffn_up, ffn_norm);
+    mark(up, "ffn_up");
     ggml_tensor * gate = ggml_mul_mat(ctx, w.ffn_gate, ffn_norm);
+    mark(gate, "ffn_gate");
     ggml_tensor * glu = ggml_swiglu_split(ctx, gate, up);
+    mark(glu, "ffn_swiglu");
     ggml_tensor * ffn = ggml_mul_mat(ctx, w.ffn_down, glu);
+    mark(ffn, "ffn_down");
     ggml_tensor * result = ggml_add(ctx, ffn, ffn_inp);
+    mark(result, "ffn_out");
     std::snprintf(name, sizeof(name), "l_out-%u", p.layer);
     ggml_set_name(result, name);
     ggml_set_output(result);
