@@ -6,7 +6,7 @@
 #include <vector>
 
 #define CHECK(expr) do { if (!(expr)) { \
-    std::fprintf(stderr, "HTP_TWO_BANK_TEST_FAIL line=%d expr=%s\\n", \
+    std::fprintf(stderr, "HTP_TWO_BANK_TEST_FAIL line=%d expr=%s\n", \
                  __LINE__, #expr); \
     std::abort(); \
 } } while (0)
