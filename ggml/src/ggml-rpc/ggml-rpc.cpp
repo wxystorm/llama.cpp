@@ -8350,7 +8350,11 @@ void rpc_server::phone_auto_compute_loop() {
             phone_npu_serial_regions, req.key.region);
         const char * stage_profile_env =
             std::getenv("GGML_RPC_PHONE_NPU_STAGE_PROFILE");
-        const bool stage_profile_enabled = npu_task &&
+        const char * local_only_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+        const bool local_only = npu_task && local_only_env != nullptr &&
+            std::strcmp(local_only_env, "1") == 0;
+        const bool stage_profile_enabled = npu_task && !local_only &&
             stage_profile_env != nullptr &&
             std::strcmp(stage_profile_env, "1") == 0;
         const int64_t htp_lock_begin_us =
@@ -8427,7 +8431,50 @@ void rpc_server::phone_auto_compute_loop() {
                         phone_npu_executor->has_registered_chunk(req.graph_uid);
                     std::vector<float> pre_compute_activation;
                     double pre_compute_capture_ms = 0.0;
-                    if (local_p2c && !local_ab) {
+                    if (local_only) {
+                        ggml_phone_npu_serial::full_region_executor::
+                            local_only_profile local_stats {};
+                        if (local_ab || local_p2c) {
+                            why = "PHONE_LOCAL_ONLY_CONFLICTING_AB_MODE";
+                            ok = false;
+                        } else {
+                            // The OpenCL input is already fenced above.
+                            // This is now the only HTP compute for this
+                            // Chunk; it owns the new persistent KV history.
+                            ok = phone_npu_executor->run_owned_only_chunk(
+                                req.key.run_id, req.key.region,
+                                req.key.chunk, task->input_graph_tensor,
+                                output, why, local_stats);
+                            if (ok) {
+                                // P2C capture takes the same OpenCL
+                                // destination as the legacy path.
+                                ggml_backend_synchronize(backends[req.device]);
+                            }
+                        }
+                        stage_ms = local_stats.input_read_ms +
+                                   local_stats.input_upload_ms;
+                        htp_ms = local_stats.htp_compute_ms;
+                        return_ms = local_stats.output_copy_ms;
+                        GGML_LOG_INFO(
+                            "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
+                            " run=%" PRIu64 " region=%u layer=%u"
+                            " chunk=%u tokens=%u backend=HTP0"
+                            " source=PHONE_LOCAL_HTP"
+                            " kv_owner=PHONE_LOCAL"
+                            " input_read_ms=%.3f input_upload_ms=%.3f"
+                            " htp_compute_ms=%.3f output_copy_ms=%.3f"
+                            " legacy_htp_compute=SKIPPED"
+                            " p2c=PHONE_AUTONOMOUS"
+                            " status=%s reason=%s\n",
+                            req.key.run_id, req.key.region,
+                            local_stats.layer, req.key.chunk,
+                            local_stats.tokens, local_stats.input_read_ms,
+                            local_stats.input_upload_ms,
+                            local_stats.htp_compute_ms,
+                            local_stats.output_copy_ms,
+                            ok ? "PASS" : "FAIL",
+                            ok ? "NONE" : why.c_str());
+                    } else if (local_p2c && !local_ab) {
                         why = "PHONE_LOCAL_P2C_REQUIRES_AB_EXECUTION";
                         ok = false;
                     } else if (local_ab && !fixed_reference) {
@@ -8450,9 +8497,11 @@ void rpc_server::phone_auto_compute_loop() {
                     if (phone_chunk_timeline_enabled) {
                         task->npu_exec_end_us = ggml_time_us();
                     }
+                    // In A/B, baseline retains canonical KV/P2C ownership;
+                    // local-only mode has already produced the output above.
                     // Baseline retains canonical KV/P2C ownership; local
                     // Graph receives the immutable pre-compute HTP snapshot.
-                    if (ok && local_ab) {
+                    if (ok && local_ab && !local_only) {
                         // run_registered_chunk() may enqueue its final
                         // HTP->OpenCL output copy. Establish a reference
                         // fence before comparing it against the local Graph.
