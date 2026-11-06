@@ -44,6 +44,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+// Windows SDK nb30.h defines REGISTERED as a numeric macro. It collides
+// with phone_auto_status::REGISTERED later in this translation unit.
+#ifdef REGISTERED
+#undef REGISTERED
+#endif
 #endif
 
 // Shared with llama-context.cpp's independent Bank Mover and PUSH switches.
