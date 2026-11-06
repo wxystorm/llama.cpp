@@ -197,6 +197,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--plan", default="jupiter.plan")
     p.add_argument("--target-tokens", type=int)
     p.add_argument("--pc-layers", type=int, default=25)
+    p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument(
         "--timing-token-tolerance", type=int, choices=[0, 1], default=0,
@@ -244,7 +245,9 @@ def main() -> int:
     for path in (exe, model, prompt_path):
         if not path.is_file():
             raise RuntimeError(f"input file not found: {path}")
-    if args.repeats < 1 or args.pc_layers < 1 or args.window < 1:
+    if (args.repeats < 1 or args.pc_layers < 1 or
+            args.cpu_layers < 0 or args.cpu_layers >= args.pc_layers
+            or args.window < 1):
         raise ValueError("repeats, pc-layers and window must be positive")
     if args.verbosity < 2 or args.verbosity > 4:
         raise ValueError("use --verbosity 2, 3 or 4; 3 is recommended")
@@ -281,6 +284,16 @@ def main() -> int:
         for mode in args.modes
     }
     if "dp" in args.modes:
+        cpu_lines = [
+            line.strip() for line in plan_path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip().startswith("model.cpu_layers=")
+        ]
+        plan_cpu = int(cpu_lines[-1].split("=", 1)[1]) if cpu_lines else 0
+        if plan_cpu != args.cpu_layers:
+            raise ValueError(
+                f"DP plan CPU boundary={plan_cpu} differs from "
+                f"--cpu-layers={args.cpu_layers}"
+            )
         if target not in plans:
             raise ValueError(f"{plan_path} has no sequence.{target} entry")
         if max(plans[target]) > args.ubatch:
@@ -296,6 +309,7 @@ def main() -> int:
     base_env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(args.pc_layers),
+        "LLAMA_JUPITER_CPU_LAYERS": str(args.cpu_layers),
         "LLAMA_JUPITER_WINDOW": str(args.window),
         "LLAMA_JUPITER_PROFILE_STAGE": "0",
         "LLAMA_JUPITER_TRACE": "0",
@@ -319,6 +333,7 @@ def main() -> int:
         "rpc": args.rpc,
         "target_tokens": target,
         "pc_layers": args.pc_layers,
+        "cpu_layers": args.cpu_layers,
         "window": args.window,
         "async_c2p": args.async_c2p,
         "local_graph_reuse": args.local_graph_reuse,
