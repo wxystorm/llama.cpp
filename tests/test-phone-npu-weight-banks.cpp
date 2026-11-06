@@ -26,6 +26,7 @@ int main() {
     assert(banks.prime_complete(0) && banks.prime_complete(1));
     assert(!banks.prime_complete(0));
     assert(banks.begin_chunk(0, 0));
+    assert(!banks.begin_chunk(1, 0)); // HTP compute is globally serial
     const auto not_last = banks.finish_chunk(0, 0, false);
     assert(!not_last);
     assert(!banks.begin_chunk(0, 0)); // FIFO: no duplicate chunk
