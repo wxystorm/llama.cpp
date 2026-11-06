@@ -99,7 +99,8 @@ class QProfile:
     before interpreting a DP plan as measured.
     """
 
-    def __init__(self, rows: Sequence[dict], metric: str = "latency_ms"):
+    def __init__(self, rows: Sequence[dict], metric: str = "latency_ms",
+                 require_cpu: bool = False):
         grouped_stage: Dict[Tuple[int, int, str], List[float]] = {}
         for row in rows:
             x = int(row["x"])
@@ -126,6 +127,7 @@ class QProfile:
         # stages are present. CPU-only housekeeping splits can be legitimately
         # absent for some graph shapes, so do not require those everywhere.
         all_stages = {stage for _, _, stage in grouped_stage}
+        self.require_cpu = require_cpu
         self.require_phone = any(s.startswith("RPC") for s in all_stages)
         self.require_pc_accel = any(
             not s.startswith("RPC") and not s.startswith("CPU") for s in all_stages
@@ -147,9 +149,11 @@ class QProfile:
         stages = self.stages_by_xy.get((x, y), set())
         has_phone = any(s.startswith("RPC") for s in stages)
         has_pc = any(not s.startswith("RPC") and not s.startswith("CPU") for s in stages)
+        has_cpu = any(s.startswith("CPU") for s in stages)
         return (
             (not self.require_phone or has_phone)
             and (not self.require_pc_accel or has_pc)
+            and (not self.require_cpu or has_cpu)
         )
 
     def sample_status(self, x: int, y: int) -> str:
@@ -338,7 +342,8 @@ def solve_sequence(
 
 
 def cmd_sequence(args: argparse.Namespace) -> None:
-    profile = QProfile(_read_csv(args.profile), metric=args.metric)
+    profile = QProfile(_read_csv(args.profile), metric=args.metric,
+                       require_cpu=getattr(args, "require_cpu_stage", False))
     lengths: Iterable[int]
     if args.target_length is not None:
         lengths = [args.target_length]
@@ -598,6 +603,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     seq = sub.add_parser("sequence", help="Eq.(2)-(4) sequence partition DP")
     seq.add_argument("--profile", required=True, help="CSV: x,y,latency_ms[,device/stage]")
+    seq.add_argument("--require-cpu-stage", action="store_true",
+                     help="require a measured CPU stage for every DP q point")
     seq.add_argument("--output", required=True, help="runtime plan file")
     seq.add_argument("--devices", type=int, required=True)
     seq.add_argument("--min-chunk", type=int, required=True, dest="min_chunk")
