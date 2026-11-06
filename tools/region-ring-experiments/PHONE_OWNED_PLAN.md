@@ -240,6 +240,66 @@ for diagnostic readback. If the input matches but output still diverges,
 diagnose Attention/KV/FFN math. Any
 `state=ZERO_INTERMEDIATE_UNVERIFIED` is not a pass.
 
+## Phase 4: Phone-local HTP as the actual P2C source (opt-in)
+
+The 2026-11-06 Qwen3-14B, 512-token A/B smoke test produced 16/16
+finite output comparisons with exact `MaxAbs=0, RMSE=0, Cosine=1`
+for Phone Layers 9, 19, 29 and 39 (four 128-token chunks per Region).
+The immutable baseline-HTP input capture is required for this result.
+
+After rebuilding/deploying the latest Phone server, enable **on Phone**:
+
+```sh
+export GGML_RPC_PHONE_NPU_FIXED_CHUNK_GRAPHS=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_P2C=1
+# The expensive intermediate Stage diagnostics are optional:
+export GGML_RPC_PHONE_QWEN3_STAGE_DIAG=0
+```
+
+Run the **same PC** 512-token, Chunk 128, forced 4-Phone-Region
+smoke case. The Phone compute thread now:
+
+1. Runs the reference PC-built Graph to maintain canonical KV for
+   subsequent decode and snapshot the exact HTP input.
+2. Runs the independently built Phone-local HTP Graph, using its own
+   KV and the frozen input snapshot, and computes A/B parity.
+3. Requires **exact F32 parity**, `count > 0`, `nonfinite=0` and
+   `max_abs=0`; any failure **aborts** (no fallback).
+4. Copies the local HTP `l_out` Tensor into the existing per-Chunk
+   OpenCL output buffer and synchronizes the OpenCL backend.
+5. Uses the **unchanged Phone autonomous P2C capture** to deliver that
+   buffer. The output source now comes from Phone-local HTP, while
+   the PC-side graph registration and canonical KV are still used.
+
+Expected per-Chunk log:
+
+```
+[PHONE_QWEN3_LOCAL] event=EXECUTE_AB ... p2c=LOCAL_CANDIDATE max_abs=0 status=PASS
+[PHONE_QWEN3_LOCAL] event=P2C_SOURCE ... source=PHONE_LOCAL_HTP canonical_kv=LEGACY strict_parity=EXACT max_abs=0 copy_ms=... status=PASS reason=NONE
+```
+
+There should be **16 `event=P2C_SOURCE` lines** with `status=PASS` and
+normal PC summary output. Anything else means cutover has not passed.
+These lines are generated before the actual P2C publication call; also
+check the existing `PHONE_AUTO_P2C` log for absence of `ABORT`.
+
+Note that this is a **P2C output-source cutover**, not yet a full Phone-only
+compute cutover. The baseline graph still computes on HTP for each
+Chunk and PC still registers its graphs. This first phase deliberately
+preserves decode and local KV state semantics. It is slower than
+standalone execution because it runs two graphs and compares outputs.
+
+To restore reference-only P2C, set:
+
+```sh
+export GGML_RPC_PHONE_QWEN3_LOCAL_P2C=0
+```
+
+Restart the Phone RPC server after changing any of the switches.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
