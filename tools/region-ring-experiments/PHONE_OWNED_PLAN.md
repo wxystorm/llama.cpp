@@ -300,6 +300,91 @@ export GGML_RPC_PHONE_QWEN3_LOCAL_P2C=0
 
 Restart the Phone RPC server after changing any of the switches.
 
+## Phase 5: one Phone-local HTP compute per Chunk, local KV to Decode KV
+
+After the Phase 4 output-source cutover passes **both prefill and decode**,
+the next experimental switch eliminates the redundant PC-derived HTP
+Graph computation. PC still provides Region Plan and the registered
+OpenCL input/output metadata, so this is *local compute-only*, not
+yet a protocol-level PC Graph-registration removal.
+
+Recompile and redeploy the Phone server, and use this **Phone-only**
+configuration (retain the known-good NPU Region and model GGUF settings):
+
+```sh
+export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7
+export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=9,19,29,39
+export GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS=1
+export GGML_RPC_PHONE_NPU_PRELOAD_ASYNC=1
+
+export GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
+
+# Crucial: no baseline HTP execution, no A/B, no old fixed-graph compile.
+export GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW=0
+export GGML_RPC_PHONE_QWEN3_LOCAL_P2C=0
+export GGML_RPC_PHONE_NPU_FIXED_CHUNK_GRAPHS=0
+export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
+
+export GGML_RPC_PHONE_QWEN3_STAGE_DIAG=0
+```
+
+PC settings and the 512-token fixed-layout test remain unchanged.
+Keep `LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW=1` on the PC:
+it still sends the immutable per-Region Plan.
+
+The new execution is:
+
+1. PC PUSH / verified local OpenCL Activation (unchanged).
+2. Phone validates the original PC Graph's canonical Decode K/V
+   Tensor storage and each Chunk's actual I64 KV slot indices.
+   **Both** physical K and V indices must exactly equal the plan's
+   fresh positions `chunk * 128 + [0..127]`. A different physical slot
+   mapping aborts the run instead of silently corrupting Decode.
+3. Phone reads the input **before any computation**, uploads it to its
+   separately precompiled HTP graph, computes **once**, and writes the
+   local `l_out` into the existing per-Chunk OpenCL output.
+4. The proven autonomous P2C captures that OpenCL output normally.
+5. On end-of-prefill `phone_input_stream_run(active=false)`, the
+   server copies **only the populated F16 KV prefix** from the Phone-local
+   HTP K/V buffers into the authoritative OpenCL Decode K/V tensors,
+   synchronizes OpenCL, then releases the local Graphs/KV.
+   The ordinary PC-controlled decode keeps working without modification.
+
+Expected on the Phone:
+
+```
+[PHONE_QWEN3_LOCAL] event=KV_BIND ... source=PC_GRAPH_METADATA_ONLY status=PASS
+[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY ... legacy_htp_compute=SKIPPED kv_owner=PHONE_LOCAL status=PASS
+[PHONE_NPU_SERIAL] event=EXECUTE ... mode=PHONE_LOCAL_ONLY status=PASS
+[PHONE_QWEN3_LOCAL] event=KV_SYNC ... from=PHONE_LOCAL_HTP to=OPENCL_DECODE mode=LOCAL_ONLY regions=4 status=PASS
+```
+
+For a 512-token, 128-token Chunk, four Region test: **16 KV_BIND,
+16 EXECUTE_ONLY**, one end-of-prefill **KV_SYNC** with four Regions,
+**no ABORT**, and PC `summary.csv` showing successful prefill and
+nonzero, correct decode. The result must be compared with Phase 4 for
+the SAME prompt; especially verify decode output/logits equivalence,
+not only the `status=PASS` and timing fields.
+
+Important limitations:
+- This first local-only experiment is restricted to Qwen3, Flash
+  Attention, F16 KV, single fresh sequence starting at position 0,
+  contiguous identity KV slot assignment, and the tested Region Plan.
+  Prefix reuse, non-identity slots, sliding-window KV, mixed sequences,
+  and noncontiguous K/V storage are rejected.
+- PC still registers its Graph as **metadata** for input/output
+  ownership, canonical KV destination binding and P2C capture. It does
+  not execute a PC-derived HTP Graph. The next phase removes that
+  registration when it has a dedicated Phone-owned output capture path.
+- This mode is opt-in and mutually exclusive with `LOCAL_EXEC_SHADOW=1`
+  and `LOCAL_P2C=1`. Set `LOCAL_ONLY=0` to restore the tested A/B
+  workflow.
+- If physical KV indices are absent or not identity-mapped, the run
+  fails closed with `PHONE_LOCAL_KV_SLOT_INDICES_UNAVAILABLE` or
+  `PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS`. Do not remove
+  that guard just to make the test run.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
