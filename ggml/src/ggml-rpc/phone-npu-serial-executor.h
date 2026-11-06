@@ -702,6 +702,51 @@ public:
         return true;
     }
 
+    // Experimental P2C source cutover, gated by exact A/B parity in the
+    // RPC compute loop. The baseline graph still executes to preserve its
+    // canonical KV for subsequent decode. Only the OpenCL output buffer
+    // (which the existing phone_auto_wait_capture publishes) is replaced.
+    // Caller holds phone_npu_backend_mutex and graph_compute_mutex.
+    bool publish_owned_htp_chunk(uint64_t run_id,
+                                 uint32_t region, uint32_t chunk,
+                                 ggml_tensor * destination,
+                                 std::string & reason,
+                                 double & copy_ms) {
+        reason.clear();
+        copy_ms = 0.0;
+        const auto it = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (it == owned_graphs_.end() || !it->second ||
+                it->second->built.graph == nullptr) {
+            reason = "PHONE_LOCAL_P2C_GRAPH_NOT_PREPARED";
+            return false;
+        }
+        const auto & local = it->second->built;
+        if (local.output == nullptr || destination == nullptr ||
+                local.output->buffer == nullptr ||
+                destination->buffer == nullptr ||
+                local.output->data == nullptr ||
+                destination->data == nullptr ||
+                local.output->type != GGML_TYPE_F32 ||
+                destination->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(local.output) ||
+                !ggml_is_contiguous(destination) ||
+                !ggml_are_same_layout(local.output, destination) ||
+                ggml_nbytes(local.output) == 0 ||
+                ggml_nbytes(local.output) > 
+                    ggml_phone_owned::k_max_activation_bytes) {
+            reason = "PHONE_LOCAL_P2C_OUTPUT_CONTRACT";
+            return false;
+        }
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_synchronize(backend_);
+        // The canonical OpenCL Output buffer is private to this Chunk, and
+        // is still the object consumed by the proven P2C capture path.
+        ggml_backend_tensor_copy(local.output, destination);
+        copy_ms = (ggml_time_us() - t0) / 1000.0;
+        return true;
+    }
+
     struct local_stage_parity {
         const char * stage = "";
         const char * state = "NOT_CHECKED";
