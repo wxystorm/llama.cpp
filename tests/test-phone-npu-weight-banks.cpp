@@ -29,36 +29,37 @@ int main() {
     CHECK(banks.kv_resident_bytes() == 2 * MiB);
     CHECK(banks.bank_capacity(0) == 8 * MiB);
     CHECK(banks.bank_capacity(1) == 7 * MiB);
-    CHECK(!banks.begin_chunk(0, 0)); // no compute before initial load
+    CHECK(!banks.begin_chunk(0, 0, banks.bank(0).generation)); // no compute before initial load
     CHECK(banks.prime_complete(0) && banks.prime_complete(1));
     CHECK(!banks.prime_complete(0));
-    CHECK(banks.begin_chunk(0, 0));
-    CHECK(!banks.begin_chunk(1, 0)); // HTP compute is globally serial
+    CHECK(banks.begin_chunk(0, 0, banks.bank(0).generation));
+    CHECK(!banks.begin_chunk(1, 0, banks.bank(1).generation)); // HTP compute is globally serial
     const auto not_last = banks.finish_chunk(0, 0, false);
     CHECK(!not_last);
-    CHECK(!banks.begin_chunk(0, 0)); // FIFO: no duplicate chunk
-    CHECK(banks.begin_chunk(0, 1));
+    CHECK(!banks.begin_chunk(0, 0, banks.bank(0).generation)); // FIFO: no duplicate chunk
+    CHECK(banks.begin_chunk(0, 1, banks.bank(0).generation));
     const auto a_to2 = banks.finish_chunk(0, 1, true);
     CHECK(a_to2 && a_to2->bank == 0 && a_to2->from_rank == 0 &&
            a_to2->to_rank == 2 && a_to2->to_region == 5);
     CHECK(!banks.begin_refill(*a_to2)); // cached Graph still references A
     CHECK(banks.graphs_retired(0));
     CHECK(banks.begin_refill(*a_to2));
-    CHECK(!banks.begin_chunk(2, 0)); // refill not yet finished
+    CHECK(!banks.begin_chunk(2, 0, banks.bank(0).generation)); // refill not yet finished
     CHECK(banks.refill_complete(2, true));
-    CHECK(banks.begin_chunk(2, 0));
+    CHECK(!banks.begin_chunk(2, 0, banks.bank(0).generation - 1));
+    CHECK(banks.begin_chunk(2, 0, banks.bank(0).generation));
     CHECK(!banks.begin_refill(*a_to2));
     CHECK(banks.finish_chunk(2, 0, true) == std::nullopt);
 
     // Bank B can be independently reused only after rank 1 drains.
-    CHECK(banks.begin_chunk(1, 0));
+    CHECK(banks.begin_chunk(1, 0, banks.bank(1).generation));
     const auto b_to3 = banks.finish_chunk(1, 0, true);
     CHECK(b_to3 && b_to3->bank == 1 && b_to3->to_rank == 3);
     CHECK(!banks.begin_refill(*b_to3));
     CHECK(banks.graphs_retired(1));
     CHECK(banks.begin_refill(*b_to3));
     CHECK(!banks.refill_complete(3, false));
-    CHECK(!banks.begin_chunk(3, 0)); // failure never becomes READY
+    CHECK(!banks.begin_chunk(3, 0, banks.bank(1).generation)); // failure never becomes READY
     CHECK(banks.kv_resident_bytes() == 2 * MiB); // KV never reused/evicted
 
     auto invalid = regions;
