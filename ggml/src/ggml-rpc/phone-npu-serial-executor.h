@@ -717,8 +717,8 @@ public:
     std::vector<local_stage_parity> compare_owned_htp_stages(
             uint64_t source_graph_uid, uint64_t run_id,
             uint32_t region, uint32_t chunk, uint32_t layer) const {
-        static const std::array<const char *, 11> stages = {{
-            "attn_norm", "Qcur", "Kcur", "Vcur",
+        static const std::array<const char *, 12> stages = {{
+            "inp_stage", "attn_norm", "Qcur", "Kcur", "Vcur",
             "attn_out", "ffn_inp", "ffn_norm",
             "ffn_up", "ffn_gate", "ffn_swiglu", "ffn_down"
         }};
@@ -767,10 +767,40 @@ public:
             row.stage = stage;
             bool ambiguous_ref = false;
             bool ambiguous_local = false;
-            const ggml_tensor * a = find_named(
-                reference->second->graph, stage, ambiguous_ref);
-            const ggml_tensor * b = find_named(
-                local->second->built.graph, stage, ambiguous_local);
+            const ggml_tensor * a = nullptr;
+            const ggml_tensor * b = nullptr;
+            if (std::strcmp(stage, "inp_stage") == 0) {
+                // The stage activation is a LEAF, not a graph node.
+                // Compare the baseline's HTP-bound input against the exact
+                // HTP buffer the Phone-local Graph consumed. If this row
+                // already differs, downstream attention is not the cause.
+                for (const auto & in : reference->second->inputs) {
+                    if (in.source == nullptr || in.target == nullptr) {
+                        continue;
+                    }
+                    const std::string input_name(in.source->name);
+                    if (input_name != "inp_stage" &&
+                            input_name.find("#inp_stage#") ==
+                                std::string::npos &&
+                            input_name.rfind("#inp_stage") !=
+                                input_name.size() -
+                                    std::min(input_name.size(),
+                                             std::strlen("#inp_stage"))) {
+                        continue;
+                    }
+                    if (a != nullptr && a != in.target) {
+                        ambiguous_ref = true;
+                        break;
+                    }
+                    a = in.target;
+                }
+                b = local->second->built.input;
+            } else {
+                a = find_named(reference->second->graph,
+                               stage, ambiguous_ref);
+                b = find_named(local->second->built.graph,
+                               stage, ambiguous_local);
+            }
             if (ambiguous_ref || ambiguous_local) {
                 row.state = "AMBIGUOUS_STAGE_LABEL";
             } else if (!a || !b) {
