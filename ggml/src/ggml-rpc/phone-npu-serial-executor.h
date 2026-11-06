@@ -605,11 +605,14 @@ public:
     // to immutable per-RUN graph metadata while their GPU buffers remain
     // owned by the RPC server until RUN teardown.
     bool bind_owned_decode_kv(uint64_t run_id, uint32_t region,
-                              ggml_cgraph * source,
+                              uint32_t chunk, ggml_cgraph * source,
                               std::string & reason) {
         reason.clear();
         auto it = owned_kv_.find(std::make_pair(run_id, region));
-        if (it == owned_kv_.end() || source == nullptr) {
+        auto chunk_it = owned_graphs_.find(
+            std::make_tuple(run_id, region, chunk));
+        if (it == owned_kv_.end() ||
+                chunk_it == owned_graphs_.end() || source == nullptr) {
             reason = "PHONE_LOCAL_KV_PLAN_OR_GRAPH_MISSING";
             return false;
         }
@@ -679,6 +682,47 @@ public:
                 "PHONE_LOCAL_KV_CANONICAL_LAYOUT_MISMATCH";
             return false;
         }
+        // Extract the exact slot indices from the reference PC graph.
+        // The local-only builder assumes KV slot i == absolute position i,
+        // but a KV allocator may reuse a nonzero slot even when RoPE
+        // positions start at zero. We must validate real PC KV indices
+        // per Chunk BEFORE running the local HTP Graph or copying KV back.
+        const ggml_tensor * indices_k = nullptr;
+        const ggml_tensor * indices_v = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(source); ++i) {
+            const ggml_tensor * op = ggml_graph_node(source, i);
+            if (!op || op->op != GGML_OP_SET_ROWS ||
+                    !op->src[1] || !op->src[2]) {
+                continue;
+            }
+            const ggml_tensor * base = op->src[2];
+            // Fresh single-stream Qwen3 cpy_k/cpy_v writes directly
+            // to the backing KV leaf; reject additional transforms.
+            const ggml_tensor ** dst = nullptr;
+            if (base == canonical_k) { dst = &indices_k; }
+            if (base == canonical_v) { dst = &indices_v; }
+            if (!dst) { continue; }
+            if (*dst != nullptr && *dst != op->src[1]) {
+                reason = "PHONE_LOCAL_KV_AMBIGUOUS_SLOT_INDICES";
+                return false;
+            }
+            *dst = op->src[1];
+        }
+        const uint32_t expected_tokens =
+            std::min<uint32_t>(
+                p.chunk_tokens, p.total_tokens - chunk * p.chunk_tokens);
+        const auto valid_indices = [&](const ggml_tensor * t) {
+            return t && t->buffer && t->data &&
+                t->type == GGML_TYPE_I64 &&
+                ggml_is_contiguous(t) &&
+                ggml_nelements(t) == expected_tokens;
+        };
+        if (chunk >= ggml_phone_owned::chunk_count(p) ||
+                !valid_indices(indices_k) ||
+                !valid_indices(indices_v)) {
+            reason = "PHONE_LOCAL_KV_SLOT_INDICES_UNAVAILABLE";
+            return false;
+        }
         const auto same_binding = [](const ggml_tensor * a,
                                       const ggml_tensor * b) {
             return !a || (a->buffer == b->buffer && a->data == b->data &&
@@ -693,6 +737,8 @@ public:
         // metadata; old RPC graph metadata may be recycled earlier.
         state.canonical_k = canonical_k;
         state.canonical_v = canonical_v;
+        chunk_it->second->canonical_k_indices = indices_k;
+        chunk_it->second->canonical_v_indices = indices_v;
         return true;
     }
 
@@ -794,6 +840,30 @@ public:
                 !state.canonical_k || !state.canonical_v) {
             reason = "PHONE_LOCAL_ONLY_KV_FIFO_OR_BINDING_MISMATCH";
             return false;
+        }
+        // Fail closed unless the PC's actual KV cache slot mapping is
+        // exactly the fresh monotonic mapping described by Plan v2.
+        // The indices are populated dynamically and are not trustworthy
+        // until the OpenCL input graph has been prepared and synchronized.
+        const auto & chunk_state = *git->second;
+        if (!chunk_state.canonical_k_indices ||
+                !chunk_state.canonical_v_indices) {
+            reason = "PHONE_LOCAL_ONLY_KV_INDICES_NOT_BOUND";
+            return false;
+        }
+        std::vector<int64_t> slot_indices(g.tokens);
+        for (const ggml_tensor * src : {
+                chunk_state.canonical_k_indices,
+                chunk_state.canonical_v_indices }) {
+            ggml_backend_tensor_get(src, slot_indices.data(), 0,
+                                    slot_indices.size() * sizeof(int64_t));
+            for (uint32_t t = 0; t < g.tokens; ++t) {
+                const int64_t expected = int64_t(g.token_begin) + t;
+                if (slot_indices[t] != expected) {
+                    reason = "PHONE_LOCAL_ONLY_NONCONTIGUOUS_PC_KV_SLOTS";
+                    return false;
+                }
+            }
         }
         const size_t bytes =
             size_t(g.tokens) * p.n_embd * sizeof(float);
@@ -2229,6 +2299,8 @@ private:
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
         ggml_phone_qwen3::graph_result built {};
+        const ggml_tensor * canonical_k_indices = nullptr;
+        const ggml_tensor * canonical_v_indices = nullptr;
     };
     // Declare after model_weights_, and graph after KV, so destruction
     // order is graph -> KV -> model weights.
