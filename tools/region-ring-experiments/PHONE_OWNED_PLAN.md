@@ -92,6 +92,50 @@ Tests cover plan validation/teardown, exact Chunk intervals including the tail,
 per-position F16 causal masks, weight shapes, graph output dimensions and
 presence of two `SET_ROWS`, two RoPE nodes, one Flash Attention and one SwiGLU.
 
+
+## Phase 3: REAL Phone-local HTP A/B execution (opt-in)
+
+After the above GRAPH_BUILD/HTP_PRECOMPILE phases pass, enable one extra
+environment variable on the **Phone** (not on the PC), then restart the RPC
+server:
+
+```sh
+export GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_EXEC_SHADOW=1
+```
+
+Use the *same* PC run command, fixed Region layout, model, and prompt.
+Every verified 128-token Chunk now undergoes **two real HTP computations**:
+1. Baseline PC-built Graph executes first, updating its canonical KV and
+   OpenCL output. This remains the only output published over P2C.
+2. Phone-local Graph reads the same verified OpenCL input into its own
+   pre-bound HTP activation buffer, executes with independent Phone-owned KV
+   (strict Region FIFO), then compares against the baseline OpenCL output.
+
+The new per-Chunk log is:
+
+```
+[PHONE_QWEN3_LOCAL] event=EXECUTE_AB ... htp_compute_ms=... max_abs=... mean_abs=... rmse=... cosine=... nonfinite=0 parity=MEASURED_ONLY p2c=LEGACY status=PASS reason=NONE
+```
+
+`status=PASS` only means local HTP compute succeeded and both outputs are
+finite; `parity=MEASURED_ONLY` means no numerical tolerance is being
+silently asserted. Check all 16 Chunk rows for each metric, especially
+Chunk 0 and Chunk 1 after the KV cache starts accumulating history.
+
+Safety and limitations:
+- A/B is serial, intentionally slower, and does NOT measure the final
+  standalone Phone-owned inference speed.
+- A failure in the opted-in Phone-local Graph aborts the experimental run;
+  leaving the variable unset completely preserves the known-good path.
+- A/B still uses the PC-built Graph to bind the reference activation, hold
+  legacy KV for decode, and expose the P2C output. The next change is to
+  replace these dependencies after parity results are understood.
+- Do not reuse or merge Phone-local KV into canonical KV without a validated
+  ownership and decode transition.
+- This stage does not implement two-slot overlap or local-output P2C.
+
 ## Remaining work before runtime cutover
 
 1. Validate HTP precompilation on the real Phone and establish a
