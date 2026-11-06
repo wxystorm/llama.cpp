@@ -331,6 +331,20 @@ int main(int argc, char ** argv) {
                 !memory_fits(chosen_regions, o)) {
             throw std::runtime_error("selected DAG failed memory recheck");
         }
+        // The current HTP executor still holds all compiled weight pointers.
+        // Capacity modeling alone does not provide physical bank recycling.
+        // Mark plans needing that feature unrunnable until bank cutover.
+        double npu_full_weights_mib = 0.0;
+        double npu_kv_total_mib = 0.0;
+        for (const auto & region : chosen_regions) {
+            if (region.device != device::PHONE) { continue; }
+            const int depth = region.layer_end - region.layer_begin;
+            npu_full_weights_mib += depth * o.npu_weight_layer_mib;
+            npu_kv_total_mib += depth * o.npu_kv_layer_mib;
+        }
+        const bool npu_streaming_required =
+            npu_full_weights_mib + npu_kv_total_mib +
+                o.npu_scratch_mib > o.npu_budget_mib;
         fs::create_directories(o.out);
         const fs::path out(o.out);
         {
@@ -356,6 +370,12 @@ int main(int argc, char ** argv) {
                  << json_quote(npu_regions_csv(chosen_regions)) << ",\n"
                  << "  \"max_npu_region_layers\": "
                  << o.max_npu_region_layers << ",\n"
+                 << "  \"npu_weight_banks\": 2,\n"
+                 << "  \"npu_full_resident_weights_mib\": "
+                 << npu_full_weights_mib << ",\n"
+                 << "  \"npu_streaming_required\": "
+                 << (npu_streaming_required ? "true" : "false") << ",\n"
+                 << "  \"npu_streaming_runtime_ready\": false,\n"
                  << "  \"gpu_budget_mib\": " << o.gpu_budget_mib << ",\n"
                  << "  \"npu_budget_mib\": " << o.npu_budget_mib << ",\n"
                  << "  \"predicted_ms_lower_bound\": " << chosen.wall_ms << ",\n"
@@ -397,6 +417,9 @@ int main(int argc, char ** argv) {
             "[OFFLINE_PLAN] NOTE: predicted_ms excludes NPU weight-refill "
             "critical path until the real two-Bank executor is measured. "
             "Do not use it as a validated prefill forecast.\n";
+        std::cout << "[OFFLINE_PLAN] npu_streaming_required="
+                  << (npu_streaming_required ? 1 : 0)
+                  << " runtime_banked_weights=NOT_YET_INTEGRATED\n";
         std::cout << "[OFFLINE_PLAN] file="
                   << (out / "plan.json").string() << '\n';
         return 0;
