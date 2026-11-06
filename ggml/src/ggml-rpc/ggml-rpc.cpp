@@ -7412,12 +7412,14 @@ bool rpc_server::phone_owned_plan_register(
                   " p2c_run=%" PRIu64
                   " region=%u layer=%u chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
-                  " graph_mode=SHADOW_PC_BUILT local_builder=%s"
+                  " graph_mode=%s local_builder=%s"
                   " local_htp=%s status=READY\n",
                   plan.run_id, plan.p2c_run_id, plan.region,
                   plan.layer, ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
                   plan.position_base, plan.kv_capacity,
+                  local_only_requested ? "PHONE_LOCAL_HTP_PC_METADATA" :
+                      "SHADOW_PC_BUILT",
                   local_builder_check ? "GRAPH_BUILT" : "OFF",
                   precompile_requested ? "PRECOMPILED" : "OFF");
     return true;
@@ -8754,7 +8756,8 @@ void rpc_server::phone_auto_compute_loop() {
                         phone_npu_region_layer.at(req.key.region) : -1,
                     req.key.chunk, req.n_tokens, req.graph_uid,
                     stage_ms, htp_ms, return_ms,
-                    phone_npu_executor != nullptr &&
+                    local_only ? "PHONE_LOCAL_ONLY" :
+                        phone_npu_executor != nullptr &&
                         phone_npu_executor->has_registered_chunk(
                             req.graph_uid) ? "FIXED_GRAPH" : "LEGACY",
                     ok ? "PASS" : "FAIL",
