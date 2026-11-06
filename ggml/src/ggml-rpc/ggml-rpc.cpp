@@ -7321,6 +7321,19 @@ bool rpc_server::phone_owned_plan_register(
         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_P2C");
     const bool local_p2c_requested = local_p2c_env != nullptr &&
         std::strcmp(local_p2c_env, "1") == 0;
+    const char * local_only_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+    const bool local_only_requested = local_only_env != nullptr &&
+        std::strcmp(local_only_env, "1") == 0;
+    if (local_only_requested &&
+            (!precompile_requested || local_exec_requested ||
+             local_p2c_requested)) {
+        GGML_LOG_ERROR(
+            "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+            " region=%u reason=LOCAL_ONLY_REQUIRES_PRECOMPILE"
+            "_AND_EXCLUDES_SHADOW_AB\n", plan.run_id, plan.region);
+        return false;
+    }
     if (local_p2c_requested &&
             (!local_exec_requested || !precompile_requested)) {
         GGML_LOG_ERROR(
@@ -7444,13 +7457,22 @@ bool rpc_server::phone_auto_task_register(
     // graph must not race its shared scratch arena or weight preload.
     const char * fixed_env =
         std::getenv("GGML_RPC_PHONE_NPU_FIXED_CHUNK_GRAPHS");
+    const char * local_only_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+    const bool local_only_requested = local_only_env != nullptr &&
+        std::strcmp(local_only_env, "1") == 0 &&
+        ggml_phone_npu_serial::htp_region(
+            phone_npu_serial_regions, request.key.region);
     const bool fixed_npu_requested =
+        !local_only_requested &&
         fixed_env != nullptr && std::strcmp(fixed_env, "1") == 0 &&
         ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, request.key.region);
     std::unique_lock<std::mutex> fixed_htp_guard(
         phone_npu_backend_mutex, std::defer_lock);
-    if (fixed_npu_requested) { fixed_htp_guard.lock(); }
+    if (fixed_npu_requested || local_only_requested) {
+        fixed_htp_guard.lock();
+    }
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     auto it = stored_graphs[request.device].find(request.graph_uid);
     if (it == stored_graphs[request.device].end()) {
@@ -7585,7 +7607,28 @@ bool rpc_server::phone_auto_task_register(
         return reject("INPUT_ADDRESS_INVALID");
     }
 
-    const bool npu_async_task = phone_npu_async_preload &&
+    if (local_only_requested) {
+        std::string bind_reason;
+        const bool bound = phone_npu_executor != nullptr &&
+            phone_npu_executor->bind_owned_decode_kv(
+                request.key.run_id, request.key.region,
+                it->second.graph, bind_reason);
+        GGML_LOG_INFO(
+            "[PHONE_QWEN3_LOCAL] event=KV_BIND run=%" PRIu64
+            " region=%u chunk=%u layer=%d"
+            " source=PC_GRAPH_METADATA_ONLY status=%s reason=%s\n",
+            request.key.run_id, request.key.region,
+            request.key.chunk, phone_npu_region_layer.at(
+                request.key.region),
+            bound ? "PASS" : "FAIL",
+            bound ? "NONE" : bind_reason.c_str());
+        if (!bound) {
+            return reject("PHONE_LOCAL_CANONICAL_KV_BIND_FAILED");
+        }
+    }
+
+    const bool npu_async_task = !local_only_requested &&
+        phone_npu_async_preload &&
         ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, request.key.region);
     std::vector<ggml_tensor> async_weight_sources;
@@ -7973,7 +8016,11 @@ bool rpc_server::phone_auto_wait_capture(
 // COMPUTING until that Region's HTP weight transfer has completed.
 bool rpc_server::phone_npu_preload_ready_locked(
         const phone_auto_job & job) const {
-    if (!phone_npu_async_preload ||
+    const char * local_only_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
+    if ((local_only_env != nullptr &&
+            std::strcmp(local_only_env, "1") == 0) ||
+            !phone_npu_async_preload ||
             !ggml_phone_npu_serial::htp_region(
                 phone_npu_serial_regions, job.request.key.region)) {
         return true;
