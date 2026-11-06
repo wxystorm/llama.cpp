@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""Memory-based two-device Jupiter split preflight (GGUF + CUDA + phone RPC).
+"""Memory-based Jupiter split preflight (GGUF + PC RAM/CUDA + Phone RPC).
 
-Estimate weight placement from GGUF tensor offsets, read free memory from
-nvidia-smi and llama.cpp RPC GET_DEVICE_MEMORY, then choose the memory-feasible
-PC/Phone contiguous layer boundary. Never infer CPU spill: Jupiter's GPU+RPC
-layer path requires all repeating layers offloaded (-ngl all).
-
-This is a conservative weight-budget check, not proof that runtime allocations
-or per-buffer max allocation limits will fit on either device.
+Read GGUF per-layer tensor offsets and *current* available device memory.
+Choose three contiguous regions: PC CPU prefix, PC GPU middle, Phone RPC suffix.
+The 2-device mode remains valid when no CPU layers are required. These are
+weight capacity estimates, not guarantees of runtime KV, graph or buffer fit.
 """
 from __future__ import annotations
 
@@ -17,6 +14,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -64,6 +62,15 @@ class MemoryPlan:
     pc_reserve_bytes: int
     phone_reserve_bytes: int
     model: GGUFWeights
+    cpu_layers: int = 0
+    cpu_weight_bytes: int = 0
+    cpu_available_bytes: int = 0
+    cpu_budget_bytes: int = 0
+    cpu_reserve_bytes: int = 0
+
+    @property
+    def pc_gpu_layers(self) -> int:
+        return self.pc_layers - self.cpu_layers
 
 
 def _read_exact(f, n: int) -> bytes:
@@ -199,6 +206,41 @@ def pc_gpu_memory() -> DeviceMemory:
     return DeviceMemory(free*MIB, total*MIB)
 
 
+def pc_cpu_memory() -> DeviceMemory:
+    """Get available host RAM; never mistake total RAM for allocatable RAM."""
+    if sys.platform == 'win32':
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                ('ullTotalPhys', ctypes.c_ulonglong),
+                ('ullAvailPhys', ctypes.c_ulonglong),
+                ('ullTotalPageFile', ctypes.c_ulonglong),
+                ('ullAvailPageFile', ctypes.c_ulonglong),
+                ('ullTotalVirtual', ctypes.c_ulonglong),
+                ('ullAvailVirtual', ctypes.c_ulonglong),
+                ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+            ]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(stat)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            raise ValueError('Windows GlobalMemoryStatusEx failed')
+        memory = DeviceMemory(int(stat.ullAvailPhys), int(stat.ullTotalPhys))
+    elif sys.platform.startswith('linux'):
+        fields = {}
+        for line in Path('/proc/meminfo').read_text().splitlines():
+            if ':' in line:
+                key, value = line.split(':', 1)
+                fields[key] = int(value.strip().split()[0]) * 1024
+        memory = DeviceMemory(fields['MemAvailable'], fields['MemTotal'])
+    else:
+        raise ValueError('host RAM query unavailable; pass --cpu-free-mib')
+    if not 0 < memory.free_bytes <= memory.total_bytes:
+        raise ValueError('invalid available PC RAM')
+    return memory
+
+
 def _recv_exact(sock: socket.socket, length: int) -> bytes:
     chunks = bytearray()
     while len(chunks) < length:
@@ -253,40 +295,67 @@ def phone_rpc_memory(endpoint: str, device: int = 0) -> DeviceMemory:
 def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
                       phone: DeviceMemory, pc_reserve_mib: int = 512,
                       phone_reserve_mib: int = 512,
-                      pc_layers_override: int | None = None) -> MemoryPlan:
-    if pc_reserve_mib < 0 or phone_reserve_mib < 0:
+                      pc_layers_override: int | None = None,
+                      cpu: DeviceMemory | None = None,
+                      cpu_reserve_mib: int = 2048) -> MemoryPlan:
+    """Minimize CPU layers, then balance PC GPU and Phone memory pressure.
+
+    Output and other non-repeating GGUF tensors count against the Phone budget.
+    Actual tensor placement depends on llama.cpp and will be verified by load.
+    """
+    if min(pc_reserve_mib, phone_reserve_mib, cpu_reserve_mib) < 0:
         raise ValueError('memory reserves must be nonnegative')
     pc_reserve, phone_reserve = pc_reserve_mib*MIB, phone_reserve_mib*MIB
+    cpu_reserve = cpu_reserve_mib*MIB if cpu is not None else 0
     pc_budget = pc.free_bytes-pc_reserve
     phone_budget = phone.free_bytes-phone_reserve
+    cpu_budget = cpu.free_bytes-cpu_reserve if cpu is not None else 0
     if pc_budget <= 0 or phone_budget <= 0:
-        raise ValueError('device free memory smaller than the safety reserve')
-    # Non-block tensor bytes conservatively belong to Phone (output is there).
+        raise ValueError('GPU or Phone memory below the safety reserve')
     required = weights.total_weights
-    if required > pc_budget+phone_budget:
+    if required > pc_budget+phone_budget+cpu_budget:
         raise ValueError(
             f'INFEASIBLE: GGUF tensor payload ~{required/GIB:.2f} GiB exceeds '
-            f'combined usable GPU+RPC memory {(pc_budget+phone_budget)/GIB:.2f} GiB '
-            f'(PC {pc_budget/GIB:.2f}, Phone {phone_budget/GIB:.2f}); '
-            'Jupiter does not automatically spill repeating layers to PC CPU')
-    pc_prefix = 0
-    choices = []
-    for index in range(1, weights.n_layers):
-        pc_prefix += weights.layers[index-1]
-        phone_weight = required-pc_prefix
-        if pc_prefix <= pc_budget and phone_weight <= phone_budget:
-            if pc_layers_override is None or index == pc_layers_override:
-                score = abs(pc_prefix/pc_budget-phone_weight/phone_budget)
-                choices.append((score, index, pc_prefix, phone_weight))
-    if not choices:
+            f'combined usable memory '
+            f'{(pc_budget+phone_budget+cpu_budget)/GIB:.2f} GiB '
+            f'(CPU {cpu_budget/GIB:.2f}, GPU {pc_budget/GIB:.2f}, '
+            f'Phone {phone_budget/GIB:.2f})'
+        )
+
+    prefix = [0]
+    for size in weights.layers:
+        prefix.append(prefix[-1]+size)
+    candidates = []
+    for cpu_layers in range(weights.n_layers-1):
+        cpu_weight = prefix[cpu_layers]
+        if cpu_weight > cpu_budget:
+            break
+        for pc_layers in range(cpu_layers+1, weights.n_layers):
+            if pc_layers_override is not None and pc_layers != pc_layers_override:
+                continue
+            gpu_weight = prefix[pc_layers]-cpu_weight
+            phone_weight = required-prefix[pc_layers]
+            if gpu_weight > pc_budget or phone_weight > phone_budget:
+                continue
+            score = (
+                cpu_layers,
+                abs(gpu_weight/pc_budget-phone_weight/phone_budget),
+                pc_layers,
+            )
+            candidates.append((score, cpu_layers, pc_layers,
+                               cpu_weight, gpu_weight, phone_weight))
+        if candidates:
+            break  # Fewer CPU layers is the primary memory-only objective.
+    if not candidates:
         note = (f' for --pc-layers={pc_layers_override}'
                 if pc_layers_override is not None else '')
         raise ValueError(
-            f'INFEASIBLE: no contiguous memory split{note} fits '
-            f'PC usable={pc_budget/GIB:.2f} GiB and '
-            f'Phone usable={phone_budget/GIB:.2f} GiB; '
-            f'nonlayer weights={weights.other_bytes/GIB:.2f} GiB')
-    _, pc_layers, pc_weight, phone_weight = min(choices)
+            f'INFEASIBLE: no contiguous CPU/GPU/Phone split{note} fits '
+            f'CPU {cpu_budget/GIB:.2f} GiB, PC GPU {pc_budget/GIB:.2f} GiB, '
+            f'Phone {phone_budget/GIB:.2f} GiB. '
+            'Non-layer tensors are conservatively charged to Phone.'
+        )
+    _, cpu_layers, pc_layers, cpu_weight, pc_weight, phone_weight = min(candidates)
     return MemoryPlan(
         pc_layers=pc_layers, phone_layers=weights.n_layers-pc_layers,
         pc_weight_bytes=pc_weight, phone_weight_bytes=phone_weight,
@@ -294,4 +363,7 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
         pc_budget_bytes=pc_budget, phone_budget_bytes=phone_budget,
         pc_reserve_bytes=pc_reserve, phone_reserve_bytes=phone_reserve,
         model=weights,
+        cpu_layers=cpu_layers, cpu_weight_bytes=cpu_weight,
+        cpu_available_bytes=cpu.free_bytes if cpu is not None else 0,
+        cpu_budget_bytes=cpu_budget, cpu_reserve_bytes=cpu_reserve,
     )
