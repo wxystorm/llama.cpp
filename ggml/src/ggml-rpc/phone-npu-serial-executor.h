@@ -345,8 +345,8 @@ public:
             size_t flash = 0;
             size_t rope = 0;
             size_t glu = 0;
-            for (int i = 0; i < built.graph->n_nodes; ++i) {
-                const auto * op = built.graph->nodes[i];
+            for (int i = 0; i < ggml_graph_n_nodes(built.graph); ++i) {
+                const auto * op = ggml_graph_node(built.graph, i);
                 set_rows += op->op == GGML_OP_SET_ROWS ? 1 : 0;
                 flash += op->op == GGML_OP_FLASH_ATTN_EXT ? 1 : 0;
                 rope += op->op == GGML_OP_ROPE ? 1 : 0;
@@ -362,7 +362,7 @@ public:
                 return false;
             }
             ++stats.chunks;
-            stats.total_nodes += built.graph->n_nodes;
+            stats.total_nodes += ggml_graph_n_nodes(built.graph);
             stats.kv_writes += set_rows;
             stats.flash_nodes += flash;
             stats.rope_nodes += rope;
@@ -542,12 +542,12 @@ public:
             // compile-time specialization before registering this graph.
             ggml_backend_synchronize(backend_);
             bool supported = true;
-            for (int i = 0; i < item->built.graph->n_nodes; ++i) {
+            for (int i = 0; i < ggml_graph_n_nodes(item->built.graph); ++i) {
                 if (!ggml_backend_supports_op(
-                        backend_, item->built.graph->nodes[i])) {
+                        backend_, ggml_graph_node(item->built.graph, i))) {
                     supported = false;
                     reason = std::string("PHONE_OWNED_HTP_UNSUPPORTED_OP:") +
-                        item->built.graph->nodes[i]->name;
+                        ggml_graph_node(item->built.graph, i)->name;
                     break;
                 }
             }
@@ -567,7 +567,7 @@ public:
                 break;
             }
             ++stats.chunks;
-            stats.graph_nodes += item->built.graph->n_nodes;
+            stats.graph_nodes += ggml_graph_n_nodes(item->built.graph);
             stats.graph_storage_bytes +=
                 ggml_backend_buffer_get_size(item->buffer.get());
             pending.push_back(std::move(item));
