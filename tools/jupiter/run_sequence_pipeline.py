@@ -93,21 +93,28 @@ def first_chunk_candidates(total: int, minimum: int, maximum: int,
 
 def read_complete_plan(path: Path, total: int, pc_layers: int,
                        minimum: int, maximum: int,
-                       measured_profile: Path) -> list[int]:
+                       measured_profile: Path,
+                       cpu_layers: int = 0) -> list[int]:
     if not path.is_file() or not measured_profile.is_file():
         raise ValueError("final plan or refined q-profile is missing")
     model_value = None
+    cpu_value = 0
     for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.split("#", 1)[0].strip()
         if line.startswith("model.pc_layers="):
             model_value = int(line.split("=", 1)[1])
+        if line.startswith("model.cpu_layers="):
+            cpu_value = int(line.split("=", 1)[1])
+    if cpu_value != cpu_layers:
+        raise ValueError("final plan CPU boundary does not match profiling")
     if model_value != pc_layers:
         raise ValueError("final plan model boundary does not match profiling")
     chunks = read_plan(path).get(total)
     if (not chunks or sum(chunks) != total or
             any(not minimum <= x <= maximum for x in chunks)):
         raise ValueError("final plan has an invalid or missing sequence partition")
-    profile = QProfile(_read_csv(str(measured_profile)), metric="compute_ms")
+    profile = QProfile(_read_csv(str(measured_profile)), metric="compute_ms",
+                       require_cpu=cpu_layers > 0)
     missing = sequence_missing_points(profile, chunks)
     if missing:
         raise ValueError(f"final plan contains unmeasured q(x,y) points: {missing}")
@@ -184,6 +191,7 @@ def verify_runtime(args: argparse.Namespace, plan: Path, chunks: list[int],
     env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(pc_layers),
+        "LLAMA_JUPITER_CPU_LAYERS": str(getattr(args, "cpu_layers", 0)),
         "LLAMA_JUPITER_PLAN_FILE": str(plan),
         "LLAMA_JUPITER_TRACE": "1",
         "LLAMA_JUPITER_PROFILE_STAGE": "0",
@@ -228,6 +236,8 @@ def parser() -> argparse.ArgumentParser:
                    help="maximum sequence chunk for --fixed-stage3")
     p.add_argument("--pc-layers", type=int, default=None,
                    help="override only when it equals stage-2 PC layer count")
+    p.add_argument("--cpu-layers", type=int, default=0,
+                   help="PC CPU prefix layers; remainder of PC stage runs on GPU")
     p.add_argument("--target-tokens", type=int, default=None)
     p.add_argument(
         "--reuse-b-profile-for-new-length", action="store_true",
@@ -319,7 +329,8 @@ def main() -> int:
                 f"actual_prompt_tokens={total} status=REUSE_HARDWARE_CURVE",
                 flush=True,
             )
-    if (args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 1 or
+    if (args.cpu_layers < 0 or args.cpu_layers >= pc or
+            args.q_repeats < 1 or args.refine_repeats < 1 or args.max_rounds < 1 or
             args.ubatch < max_chunk or args.batch < args.ubatch or
             args.context < args.batch):
         raise ValueError("invalid repeat count, max-rounds or context/batch bounds")
@@ -357,6 +368,7 @@ def main() -> int:
         "--rpc", args.rpc,
         "--prompt-file", str(Path(args.prompt_file).resolve()),
         "--pc-layers", str(pc),
+        "--cpu-layers", str(args.cpu_layers),
         "--batch", str(args.batch),
         "--context", str(args.context),
         "--threads", str(args.threads),
@@ -385,6 +397,7 @@ def main() -> int:
     refine_args = argparse.Namespace(
         rpc=args.rpc,
         metric="compute_ms", pc_layers=pc,
+        cpu_layers=args.cpu_layers,
         min_chunk=b, max_chunk=max_chunk,
         max_subsequences=None, repeats=args.refine_repeats,
         batch=args.batch, context=args.context,
@@ -428,7 +441,8 @@ def main() -> int:
 
     chunks = read_complete_plan(
         final_plan, total, pc, b, max_chunk,
-        refine_out / "q-profile-refined.csv"
+        refine_out / "q-profile-refined.csv",
+        cpu_layers=args.cpu_layers,
     )
     runtime_latency_ms = None
     if not args.skip_runtime_verify:
@@ -450,7 +464,9 @@ def main() -> int:
             "LAST_MEASURED_CANDIDATE" if args.accept_measured_candidate
             else "REOPTIMIZE_UNTIL_EXACT_Q_COVERAGE"
         ),
-        "pc_layers": pc, "prompt_tokens": total, "min_chunk": b,
+        "pc_layers": pc, "cpu_layers": args.cpu_layers,
+        "pipeline_stages": 3 if args.cpu_layers else 2,
+        "prompt_tokens": total, "min_chunk": b,
         "max_chunk": max_chunk, "min_chunk_status": status,
         "initial_b_from_json": old_b,
         "b_profile_prompt_tokens": measured_prompt_tokens,
