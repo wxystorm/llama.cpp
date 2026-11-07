@@ -365,6 +365,11 @@ target_include_directories(test-phone-mixed-region-selector PRIVATE
 set_target_properties(test-phone-mixed-region-selector PROPERTIES CXX_STANDARD 17)
 llama_test(test-phone-mixed-region-selector)
 
+# Host-only mixed HTP/OpenCL two-worker scheduling and overlap policy.
+add_executable(test-phone-mixed-pipeline test-phone-mixed-pipeline.cpp)
+set_target_properties(test-phone-mixed-pipeline PROPERTIES CXX_STANDARD 17)
+llama_test(test-phone-mixed-pipeline)
+
 # User-facing, inference-free offline Planner (exact same C++ DAG engine).
 add_executable(region-ring-offline-plan
     ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/offline_plan.cpp)
