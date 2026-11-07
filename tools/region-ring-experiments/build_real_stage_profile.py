@@ -142,14 +142,15 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
                     else:
                         diag["backend_missing"] += 1
                         continue
-                if q is None and not (mixed and backend == "HTP0"):
+                # Graphless HTP has a native Plan/HTP graph, not a
+                # PC-owned RPC Graph registration or OpenCL Slot Prepare.
+                # This applies to both historical HTP-only and mixed probes.
+                if q is None and backend != "HTP0":
                     diag["setup_missing"] += 1
                     continue
                 val = [number(p.get(k)) for k in
                        ("upload_ms", "prepare_ms", "compute_ms")]
-                # Graphless HTP has no OpenCL Slot Prepare: -1 is a log
-                # sentinel, not a negative service time.
-                if mixed and backend == "HTP0" and p.get("prepare_ms") == "-1.000":
+                if backend == "HTP0" and p.get("prepare_ms") in ("-1.000", "-1"):
                     val[1] = 0.0
                 registration = number(q.get("setup_ms")) if q else 0.0
                 if registration is None or any(v is None for v in val):
