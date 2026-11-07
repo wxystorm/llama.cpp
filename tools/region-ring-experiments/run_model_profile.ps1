@@ -70,6 +70,8 @@ $runs = Join-Path $folder "runs"
 if ((Test-Path -LiteralPath $runs) -and @(Get-ChildItem $runs -Recurse -File -ErrorAction SilentlyContinue).Count -gt 0) {
     if (!$UpdateProfile) { throw "Existing probes in $runs. Pass -UpdateProfile or use -Finalize." }
     Remove-Item -LiteralPath $runs -Force -Recurse
+    $manifest = Join-Path $folder "model_profile.json"
+    if (Test-Path -LiteralPath $manifest) { Remove-Item -LiteralPath $manifest -Force }
 }
 $inputFolder = Join-Path $folder "input"
 New-Item -ItemType Directory -Path $inputFolder -Force | Out-Null
