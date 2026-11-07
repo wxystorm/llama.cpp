@@ -484,6 +484,21 @@ def planner_backend_mapping(cycles):
     return htp, opencl
 
 
+def runtime_compatible_cycles(cycles):
+    """Conservative executable APPLY_WIDE + Phone-local NPU->Adreno subset."""
+    if not 2 <= len(cycles) <= 4:
+        return False
+    if any(c.g < 1 or c.phone < 1 or c.n > 1 for c in cycles):
+        return False
+    stages, edges = execution_stage_graph(cycles)
+    if not stages or stages[-1]["backend"] not in ("N", "A"):
+        return False
+    htp = sum(s["backend"] == "N" for s in stages)
+    adreno = sum(s["backend"] == "A" for s in stages)
+    return (htp >= 2 and adreno >= 1 and
+            any(e["handoff"] == "HTP_TO_ADRENO" for e in edges))
+
+
 def plan(model, profiles, base, mix, max_npu=1, max_cycles=4):
     if not {"CPU", "GPU", "PHONE", "PHONE_GPU"}.issubset(profiles.devices):
         raise ValueError("MIXED_PROFILE_NEEDS_CPU_GPU_PHONE_HTP_AND_PHONE_GPU_SAMPLES")
@@ -527,6 +542,8 @@ def run_cli(argv=None):
     ap.add_argument("--tokenizer", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--max-npu-region-layers", type=int, default=1)
+    ap.add_argument("--runtime-compatible", action="store_true",
+                    help="select only experimental adjacent HTP-to-Adreno executable plans")
     args = ap.parse_args(argv)
     from model_profile import gguf_info, tokenize
     model_path = args.model.resolve(strict=True)
@@ -563,6 +580,10 @@ def run_cli(argv=None):
     options, diag = plan({"layers":info["layers"],"tokens":token_count,
                           "hidden":info["hidden"]}, profiles, b, m,
                          max_npu=args.max_npu_region_layers)
+    if args.runtime_compatible:
+        options = [row for row in options if runtime_compatible_cycles(row[3])]
+        if not options:
+            raise ValueError("NO_RUNTIME_COMPATIBLE_FOUR_BACKEND_CANDIDATE")
     args.out.mkdir(parents=True,exist_ok=True)
     w, la, x, cycles, mem, dag = options[0]
     htp_map, opencl_map = planner_backend_mapping(cycles)
@@ -592,9 +613,11 @@ def run_cli(argv=None):
         "dag":{"predicted_wall_ms":w,**dag},"search":diag,
         "phone_gpu_depth_cost":"measured_depth_or_linear_sum_of_measured_P1_services",
         "prediction_scope":"offline_measured_stage_plus_bank_transfer_model_no_runtime_validation",
-        "runtime_missing":"PHONE_LOCAL_HTP_TO_OPENCL_HANDOFF_AND_MULTI_PHONE_STAGE_SCHEDULER",
-        "runtime_compatible":False,
-        "execution_blocker":"Runtime cannot execute an intra-cycle HTP->OpenCL contiguous mixed Phone stage; plan only",
+        "runtime_compatible":runtime_compatible_cycles(cycles),
+        "runtime_experimental":True,
+        "runtime_requirements":"RPC_PATCH_31_DUAL_LANE_PLAN_CONTROLLED_TWO_NPU_BANKS_LOCAL_HANDOFF",
+        "execution_blocker":None if runtime_compatible_cycles(cycles) else
+            "Requires GPU-first Phone-final cycles, at least two HTP Regions and an adjacent HTP->Adreno edge",
     }
     (args.out/"plan.json").write_text(json.dumps(record,indent=2),encoding="utf-8")
     with (args.out/"candidates.csv").open("w",newline="",encoding="utf-8") as f:
@@ -612,7 +635,7 @@ def run_cli(argv=None):
                              round(dd["npu_bank_repack_ms"],3)])
     print(f"[PHONE_MIXED_DAG] layout={la} X={x} predicted_ms={w:.3f} "
           f"candidates={len(options)} spill_geometries={diag['npu_spill_geometries']} "
-          f"status=PLAN_ONLY_RUNTIME_NOT_COMPATIBLE file={args.out/'plan.json'}")
+          f"status={ 'RUNTIME_EXPERIMENTAL' if runtime_compatible_cycles(cycles) else 'PLAN_ONLY' } file={args.out/'plan.json'}")
 
 
 if __name__ == "__main__":
