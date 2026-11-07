@@ -140,6 +140,11 @@ $opt = @(
 & .\build-tensor-v2\bin\Release\region-ring-offline-plan.exe @opt
 ~~~
 
+If the selected plan requires HTP weight eviction, add
+`--npu-banked-runtime-confirmed 1` to the offline Planner options ONLY after
+the matching Phone Hexagon binary has actually passed the double-Bank test.
+The saved runner also requires `-ConfirmBankedPhoneReady` for these plans.
+
 The zero-valued example measurements are **placeholders** and will
 intentionally be rejected. After replacing them with measured values,
 the program saves plan.json and up to 100 ranked candidates.
@@ -148,7 +153,7 @@ For the same model and token-length prompt set, execute the saved layout
 without repeating any Planner search:
 
 ~~~powershell
-.\tools\region-ring-experiments\run_saved_plan.ps1 -Plan .\offline-plan-512\plan.json -Model E:\llama\models\Qwen3-14B-Q4_K_M.gguf -Rpc 10.39.52.114:50052 -PromptDir D:\prima.cpp\prompts512 -Out .\offline-plan-512-runs -NoMmap
+.\tools\region-ring-experiments\run_saved_plan.ps1 -Plan .\offline-plan-512\plan.json -Model E:\llama\models\Qwen3-14B-Q4_K_M.gguf -Rpc 10.39.52.114:50052 -PromptDir D:\prima.cpp\prompts512 -Out .\offline-plan-512-runs -NoMmap -ConfirmBankedPhoneReady
 ~~~
 
 The Phone RPC server must already have the NPU Region list from the
