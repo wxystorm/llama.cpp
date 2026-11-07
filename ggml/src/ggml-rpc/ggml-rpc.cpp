@@ -7575,6 +7575,15 @@ bool rpc_server::phone_stage_profile_pull(
         }
     }
     std::lock_guard<std::mutex> lock(phone_auto_mutex);
+    // Bounded long-lived Phone server history: keep at most the latest 8
+    // completed Runs, not 8192 samples for every previous Profile forever.
+    while (phone_stage_profile_finished.size() > 8) {
+        const uint64_t oldest = phone_stage_profile_finished.begin()->first;
+        if (oldest == request.run_id) { break; }
+        phone_stage_profile_finished.erase(phone_stage_profile_finished.begin());
+        phone_stage_profile_overflow.erase(oldest);
+        phone_stage_profile_banks.erase(oldest);
+    }
     const auto stats = phone_stage_profile_banks.find(request.run_id);
     if (stats != phone_stage_profile_banks.end()) {
         response.npu_host_stage_bytes = stats->second.staged_bytes;
