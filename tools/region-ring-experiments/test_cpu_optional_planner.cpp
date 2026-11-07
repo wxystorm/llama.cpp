@@ -44,6 +44,21 @@ static void test_layouts() {
     assert(rejects("G12,P0,G12,P2,G12,P2"));
     assert(rejects("C2,G10,P2,G10,P2,G14"));
     assert(rejects("G12,P2,G11,P2,G11,P1"));
+
+    // The final physical Transformer Stage can be the PC GPU or CPU.
+    // Unlike an ordinary G/C/P ring, these layouts have no final Phone
+    // Region and must still cover the original 40 layers exactly.
+    const auto gpu_final = llama_region_ring_parse_apply_wide_layout(
+        "G12,C1,P1,P1,G12,C1,P1,P1,G10", 40);
+    assert(llama_region_ring_apply_topology_compatible(gpu_final, 40));
+    assert(gpu_final.back().device == device::GPU);
+    assert(gpu_final.back().layer_end == 40);
+    const auto cpu_final = llama_region_ring_parse_apply_wide_layout(
+        "G12,C1,P1,P1,G12,C1,P1,P1,G8,C2", 40);
+    assert(llama_region_ring_apply_topology_compatible(cpu_final, 40));
+    assert(cpu_final.back().device == device::CPU);
+    assert(cpu_final.back().layer_end == 40);
+    assert(rejects("G12,C1,P1,P1,G25")); // <2 Phone cycles
 }
 
 static model make_test_model() {
