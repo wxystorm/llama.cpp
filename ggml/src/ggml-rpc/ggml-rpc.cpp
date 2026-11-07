@@ -10305,16 +10305,37 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
                 (task->compute_end_us - task->compute_begin_us) / 1000.0,
                 status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
         }
-        if (status == GGML_STATUS_SUCCESS && npu_task &&
-                task->graphless_owned &&
+        // The Plan, not a per-Chunk RPC command, decides whether this HTP
+        // output remains entirely on the Phone. The PC has already handed
+        // off the intermediate Stage to the Phone-owned N->Adreno pipeline.
+        // In that case there is NO P2C full frame and NO completion frame.
+        bool local_successor = false;
+        if (npu_task && task->graphless_owned) {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            local_successor =
+                phone_npu_plan_configured_run == req.key.run_id &&
+                phone_npu_local_successors.count(req.key.region) != 0;
+        }
+        if (status == GGML_STATUS_SUCCESS && local_successor &&
                 !phone_local_handoff_publish(*task)) {
             status = GGML_STATUS_FAILED;
         }
-        if (status == GGML_STATUS_SUCCESS) {
-            // This is the Phone-owned publication event: no PC per-Chunk
-            // WAIT_CAPTURE command, and no PC Meta graph rebuild. The
-            // original output lives in a private per-Chunk OpenCL buffer,
-            // so publishing the Arena snapshot is safe after Slot release.
+        if (status == GGML_STATUS_SUCCESS && local_successor) {
+            task->capture_begin_us = ggml_time_us();
+            task->capture_end_us = task->capture_begin_us;
+            // All downstream bytes are now owned by the Adreno input queue.
+            // The upstream payload vector was moved, not copied or sent.
+            task->capture_done = false; // No P2C frame was published.
+            GGML_LOG_INFO(
+                "[PHONE_LOCAL_HANDOFF] event=NO_INTERMEDIATE_P2C "
+                "run=%" PRIu64 " src=%u dst=%u chunk=%u "
+                "payload_bytes=0 completion_frame=SKIPPED "
+                "control=PHONE_OWNED status=PASS\n",
+                req.key.run_id, req.key.region,
+                req.key.region + 1, req.key.chunk);
+        } else if (status == GGML_STATUS_SUCCESS) {
+            // Crossing Phone->PC or final Head: the existing subscriber
+            // still requires a real full result frame. No fake completion.
             {
                 std::lock_guard<std::mutex> lock(phone_auto_mutex);
                 task->state = phone_auto_status::CAPTURING;
