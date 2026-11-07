@@ -58,7 +58,10 @@ def port(src: str) -> str:
     src = src[:end] + qwen3_map + src[end:]
 
     # Dense Qwen3 GGUF: 0.6B/1.7B/4B/8B/14B/32B sizes. No MoE or VL.
-    src = replace_once(src,
+    src = modify_section(src,
+        "static void llm_load_hparams(",
+        "static void llm_load_vocab(",
+        lambda block: replace_once(block,
         "        case LLM_ARCH_QWEN2MOE:\n            {",
         "        case LLM_ARCH_QWEN3:\n"
         "            {\n"
@@ -72,7 +75,7 @@ def port(src: str) -> str:
         "                }\n"
         "            } break;\n"
         "        case LLM_ARCH_QWEN2MOE:\n            {",
-        "Qwen3 hyperparameters")
+        "Qwen3 hyperparameters"))
 
     def patch_loader(block: str) -> str:
         block = replace_once(block,
