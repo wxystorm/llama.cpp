@@ -15,6 +15,7 @@
 #include "phone-npu-serial-policy.h"
 #include "phone-mixed-pipeline-policy.h"
 #include "phone-plan-region-map.h"
+#include "phone-local-host-handoff.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-execution-plan.h"
 
@@ -9372,12 +9373,11 @@ void rpc_server::phone_npu_preload_loop() {
     }
 }
 
-// A genuine Phone-local HTP -> Adreno activation edge. Only an exact,
-// PC-configured adjacent Region may consume this payload. The source's HTP
-// output remains private until it is copied into the destination's owned
-// input slot; the producer never borrows a live NPU/Slot0 tensor pointer.
-// The old P2C frame remains for the PC Region DAG completion handshake,
-// but there is NO PC->Phone PUSH of this intermediate activation.
+// A Phone-local HTP -> Adreno edge. A validated PC-selected adjacent
+// Adreno task takes ownership of the SAME F32 Host allocation. There is no
+// secondary Host copy, no extra intermediate P2C and no completion RPC.
+// HTP and OpenCL keep independent workers/KV, and the GPU still uploads
+// the Host bytes into its own device buffer before execution.
 bool rpc_server::phone_local_handoff_publish(phone_auto_job & source) {
     const auto & src = source.request;
     uint32_t dst_region = 0;
@@ -9451,9 +9451,11 @@ bool rpc_server::phone_local_handoff_publish(phone_auto_job & source) {
                     [&](const phone_input_staged & e) {
                         return auto_key(e.key) == auto_key(key);
                     })) {
-            staged.local_f32 = std::move(source.direct_p2c_payload);
-            phone_input_staged_slots.emplace_back(std::move(staged));
-            accepted = true;
+            if (ggml_phone_local_host::move_f32(
+                    source.direct_p2c_payload, staged.local_f32, bytes)) {
+                phone_input_staged_slots.emplace_back(std::move(staged));
+                accepted = true;
+            }
         }
     } catch (const std::bad_alloc &) {
         allocation_failed = true;
