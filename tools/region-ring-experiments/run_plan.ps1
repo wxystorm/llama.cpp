@@ -36,7 +36,7 @@ if (!$Tokenizer) { $Tokenizer = Join-Path $repo "build-tensor-v2\bin\Release\lla
 $py = (Get-Command python -ErrorAction Stop).Source
 if ($PhoneMixed) {
     if ($BankedRuntimeConfirmed) {
-        throw "-BankedRuntimeConfirmed applies only to the existing 3-backend executor. Four-backend mixed plans are offline-only until runtime cutover."
+        throw "-BankedRuntimeConfirmed is legacy three-backend only. For the experimental Patch32 four-backend Runtime, use -PhoneMixed -RuntimeCompatible after completing GCNA measurements."
     }
     $argsMixed = @(
         (Join-Path $PSScriptRoot "mixed_phone_dag_plan.py"),
