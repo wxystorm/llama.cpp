@@ -7827,6 +7827,19 @@ bool rpc_server::phone_owned_plan_register(
                        plan.run_id, plan.region, reason);
         return false;
     }
+    if (phone_npu_plan_controlled) {
+        const auto assignment = phone_npu_region_layer.find(plan.region);
+        if (phone_npu_plan_configured_run != plan.run_id ||
+                assignment == phone_npu_region_layer.end() ||
+                assignment->second != (int) plan.layer) {
+            GGML_LOG_ERROR(
+                "[PHONE_OWNED_PLAN] event=REJECT "
+                "run=%" PRIu64 " region=%u layer=%u "
+                "reason=PLAN_NOT_INSTALLED_OR_LAYER_MISMATCH\n",
+                plan.run_id, plan.region, plan.layer);
+            return false;
+        }
+    }
     if (!ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, plan.region) ||
             phone_npu_executor == nullptr ||
