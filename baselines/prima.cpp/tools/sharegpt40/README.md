@@ -55,6 +55,10 @@ time for this restart.
       --ctx 4096 --predict 32 --delay 5 \
       -- -b 512 -ub 512 -t 8
 
+For the **first real run**, add `--max-new 1` (before `--`) to run only
+`prompt_128_01.txt`. Once it passes, remove `--max-new 1` and rerun the
+same command; it will resume from `prompt_128_02.txt`.
+
 The 40 file names MUST be prompt_{128,256,512,1024}_{01..10}.txt. The
 script checks they exist. Change the IPs, model paths, context and batch sizes
 to suit your experiment. Do not add an extra -f/-p after the separator.
