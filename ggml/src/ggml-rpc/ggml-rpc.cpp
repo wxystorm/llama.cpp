@@ -14,6 +14,7 @@
 #include "phone-autonomous-policy.h"
 #include "phone-npu-serial-policy.h"
 #include "phone-mixed-pipeline-policy.h"
+#include "phone-plan-region-map.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-execution-plan.h"
 
@@ -4374,15 +4375,15 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
             run_id == 0 || count < 2 || count > 64) {
         return false;
     }
+    std::vector<ggml_phone_plan::region_layer> ordered;
+    ordered.reserve(count);
     for (size_t i = 0; i < count; ++i) {
-        if (entries[i].region >= 64 ||
-                (i > 0 && (entries[i-1].region >= entries[i].region ||
-                           entries[i-1].layer >= entries[i].layer))) {
-            GGML_LOG_ERROR(
-                "[PHONE_NPU_PLAN] side=pc reason=INVALID_ORDER_OR_DUPLICATE "
-                "index=%zu status=REJECT\n", i);
-            return false;
-        }
+        ordered.emplace_back(entries[i].region, entries[i].layer);
+    }
+    if (!ggml_phone_plan::valid_htp_map(ordered)) {
+        GGML_LOG_ERROR("[PHONE_NPU_PLAN] side=pc "
+                       "reason=INVALID_ORDERED_HTP_MAP status=REJECT\n");
+        return false;
     }
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (!ctx) { return false; }
@@ -8043,6 +8044,9 @@ bool rpc_server::phone_npu_plan_configure(
             return reject("HTP_REGIONS_OR_LAYERS_NOT_STRICTLY_ORDERED");
         }
         ordered.emplace_back(region, layer);
+    }
+    if (!ggml_phone_plan::valid_htp_map(ordered)) {
+        return reject("INVALID_ORDERED_HTP_MAP");
     }
     for (size_t i = request.count; i < 64; ++i) {
         if (request.regions[i] != 0 || request.layers[i] != 0) {
