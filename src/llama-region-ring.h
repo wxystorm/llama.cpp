@@ -14,10 +14,37 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+// Explicit whole-layer Phone backend selector for mixed OpenCL/HTP mode.
+// No hidden fallback: malformed or duplicate Region IDs reject the run.
+inline bool llama_region_ring_parse_region_ids(
+        const char * spec, std::set<uint32_t> & result) {
+    result.clear();
+    if (spec == nullptr || *spec == '\0') { return true; }
+    const char * at = spec;
+    while (*at != '\0') {
+        if (*at < '0' || *at > '9') { result.clear(); return false; }
+        char * end = nullptr;
+        const unsigned long id = std::strtoul(at, &end, 10);
+        if (end == at || id > 63 ||
+                !result.insert((uint32_t) id).second) {
+            result.clear();
+            return false;
+        }
+        if (*end == '\0') { break; }
+        if (*end != ',' || end[1] == '\0') {
+            result.clear();
+            return false;
+        }
+        at = end + 1;
+    }
+    return true;
+}
 
 enum class llama_region_ring_device : uint8_t {
     CPU = 0,
