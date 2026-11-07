@@ -77,7 +77,35 @@ try {
     if ($NoMmap) { $opts.NoMmap = $true }
     if ($DryRun) { $opts.DryRun = $true }
     & (Join-Path $PSScriptRoot "run_prompt_sweep.ps1") @opts
-    if ($LASTEXITCODE -ne 0) { throw "Whole-layer HTP/OpenCL smoke failed; inspect the run's engine.stderr.log and Phone log." }
+    $runExitCode = $LASTEXITCODE
+    if ($runExitCode -ne 0) {
+        # Report the real engine errors rather than only a generic wrapper
+        # failure. The Python sweep keeps stdout/stderr in the run folder.
+        $result = Get-ChildItem -LiteralPath $Out -Recurse -Filter "result.json" -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($null -ne $result) {
+            try {
+                $record = Get-Content -LiteralPath $result.FullName -Raw | ConvertFrom-Json
+                Write-Host "[PHONE_MIXED_BACKENDS] result_status=$($record.status) engine_exit=$($record.exit_code) runtime_layout=$($record.runtime_layout)"
+            } catch {
+                Write-Warning "Unable to parse $($result.FullName): $_"
+            }
+            $engineLog = Join-Path $result.DirectoryName "engine.stderr.log"
+            Write-Host "[PHONE_MIXED_BACKENDS] engine_log=$engineLog"
+            if (Test-Path -LiteralPath $engineLog) {
+                $bad = @(Select-String -LiteralPath $engineLog -Pattern "REJECT|FAIL|ERROR|ABORT|exception|PHONE_MIXED|PHONE_OWNED|NPU_BANK|HTP_PRECOMPILE|GRAPHLESS" -ErrorAction SilentlyContinue |
+                    Select-Object -Last 50)
+                foreach ($line in $bad) { Write-Host $line.Line }
+                if ($bad.Count -eq 0) {
+                    Write-Host "[PHONE_MIXED_BACKENDS] No tagged errors; last 50 engine lines:"
+                    Get-Content -LiteralPath $engineLog -Tail 50
+                }
+            }
+        } else {
+            Write-Warning "No result.json found beneath $Out. Check for a Python launcher error."
+        }
+        throw "Whole-layer HTP/OpenCL smoke failed (runner exit $runExitCode); the exact error lines are printed above. Check Phone log for matching Region/Chunk failures."
+    }
 }
 finally {
     foreach ($name in $vars.Keys) {
