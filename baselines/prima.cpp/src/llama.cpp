@@ -20774,7 +20774,7 @@ int llama_rebuild_topo(llama_context * ctx,
     // The original STOP handshake still ends this single prompt session.
     if (n_world == 2 && n_layer_window[0] > 0 && n_layer_window[1] == 0) {
         topo_helper[1].is_forwarder = 1;
-        LLAMA_LOG_INFO("[PRIMA_IDLE_RANK] rank=1 assigned_layers=0 role=FORWARDER status=KEEP_CONNECTED\\n");
+        LLAMA_LOG_INFO("[PRIMA_IDLE_RANK] rank=1 assigned_layers=0 role=FORWARDER status=KEEP_CONNECTED\n");
     }
 
     auto next_rank = (my_rank + 1) % n_world;
