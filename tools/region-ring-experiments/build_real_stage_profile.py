@@ -155,8 +155,8 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
                 if registration is None or any(v is None for v in val):
                     continue
                 try:
-                    kv = int(q.get("kv_tokens", begin + tokens))
-                    terminal = int(q.get("terminal", int(region == final_region)))
+                    kv = int(q.get("kv_tokens", begin + tokens)) if q else begin + tokens
+                    terminal = int(q.get("terminal", int(region == final_region))) if q else int(region == final_region)
                 except ValueError:
                     continue
                 s.update(upload_ms=val[0], prepare_ms=val[1],
