@@ -5843,6 +5843,30 @@ public:
                 "GGML_RPC_PHONE_NPU_SERIAL_REGIONS expects distinct comma-separated "
                 "Region indices in [0,63]");
         }
+        const char * npu_banked_env =
+            std::getenv("GGML_RPC_PHONE_NPU_WEIGHT_BANKS");
+        phone_npu_banked_enabled = npu_banked_env != nullptr &&
+            std::strcmp(npu_banked_env, "2") == 0;
+        if (npu_banked_env != nullptr && *npu_banked_env &&
+                !phone_npu_banked_enabled) {
+            throw std::runtime_error(
+                "GGML_RPC_PHONE_NPU_WEIGHT_BANKS supports only 2");
+        }
+        if (phone_npu_banked_enabled) {
+            const auto require_env = [](const char * name) {
+                const char * v = std::getenv(name);
+                return v != nullptr && std::strcmp(v, "1") == 0;
+            };
+            if (!require_env("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY") ||
+                    !require_env("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C") ||
+                    !require_env("GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT") ||
+                    !require_env("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS") ||
+                    !require_env("GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE")) {
+                throw std::runtime_error(
+                    "NPU weight Banks require Qwen3 LOCAL_ONLY + "
+                    "DIRECT_P2C + DIRECT_INPUT + GRAPHLESS + HTP_PRECOMPILE");
+            }
+        }
         if (!phone_npu_serial_regions.empty()) {
             if (backends.size() != 1) {
                 throw std::runtime_error(
@@ -5915,6 +5939,61 @@ public:
                         "GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS expects "
                         "distinct layer IDs (e.g. 19,39)");
                 }
+                if (phone_npu_banked_enabled) {
+                    if (model_layers.size() != phone_npu_serial_regions.size()) {
+                        throw std::runtime_error(
+                            "Banked NPU requires one distinct model Layer per "
+                            "ordered GGML_RPC_PHONE_NPU_SERIAL_REGIONS");
+                    }
+                    std::vector<std::pair<uint32_t, uint32_t>> order;
+                    auto regions = phone_npu_serial_regions.begin();
+                    auto layers = model_layers.begin();
+                    for (; regions != phone_npu_serial_regions.end();
+                            ++regions, ++layers) {
+                        order.emplace_back(*regions, *layers);
+                    }
+                    // Optional user-supplied cap. Without one, try the
+                    // actual TWO allocations and fail on rpcmem/map error;
+                    // Hexagon device_get_memory() currently returns zero.
+                    size_t limit = std::numeric_limits<size_t>::max();
+                    const char * budget_env = std::getenv(
+                        "GGML_RPC_PHONE_NPU_BANK_BUDGET_MIB");
+                    if (budget_env != nullptr && *budget_env) {
+                        char * end = nullptr;
+                        const unsigned long long mib =
+                            std::strtoull(budget_env, &end, 10);
+                        if (end == budget_env || *end != '\0' || mib == 0 ||
+                                mib > (unsigned long long)
+                                    (SIZE_MAX / (1024 * 1024))) {
+                            throw std::runtime_error(
+                                "invalid GGML_RPC_PHONE_NPU_BANK_BUDGET_MIB");
+                        }
+                        limit = static_cast<size_t>(mib) * 1024 * 1024;
+                    }
+                    std::string why;
+                    std::array<size_t, 2> caps {};
+                    if (!phone_npu_executor->configure_banked_model(
+                            local_tensor_source, order, limit, why, caps)) {
+                        throw std::runtime_error(
+                            "HTP dual Bank init failed: " + why);
+                    }
+                    phone_npu_banked_ready_regions.insert(order[0].first);
+                    phone_npu_banked_ready_regions.insert(order[1].first);
+                    GGML_LOG_INFO(
+                        "[NPU_BANK_MEMORY] event=ALLOCATED banks=2 "
+                        "a_bytes=%zu b_bytes=%zu mapped_bytes=%zu "
+                        "kv=INDEPENDENT buffer=HTP_REPACK "
+                        "budget_bytes=%zu allocator=RPCMEM "
+                        "status=PASS\n",
+                        caps[0], caps[1], caps[0] + caps[1], limit);
+                    for (size_t rank = 0; rank < order.size(); ++rank) {
+                        GGML_LOG_INFO(
+                            "[NPU_BANK_PLAN] rank=%zu bank=%zu region=%u"
+                            " layer=%u initial_resident=%d\n",
+                            rank, rank % 2, order[rank].first,
+                            order[rank].second, rank < 2 ? 1 : 0);
+                    }
+                } else {
                 GGML_LOG_INFO(
                     "[PHONE_NPU_SERIAL] event=MODEL_LOAD_START "
                     "layers=%zu source=%s model_equivalence=UNVERIFIED "
@@ -5960,7 +6039,15 @@ public:
                     (ggml_time_us() - model_begin_us) / 1000.0,
                     layers_ok == model_layers.size() ?
                         "PASS" : "PARTIAL_FALLBACK");
+                } // legacy permanently resident model load
+            } else if (phone_npu_banked_enabled) {
+                throw std::runtime_error(
+                    "GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS must list every "
+                    "banked NPU Region's Layer in ascending order");
             }
+        } else if (phone_npu_banked_enabled) {
+            throw std::runtime_error(
+                "NPU weight Banks require nonempty SERIAL_REGIONS");
         }
         phone_region_main_thread =
             std::thread([this]() { phone_region_main_loop(); });
@@ -5980,6 +6067,15 @@ public:
             preload_env != nullptr && async_env != nullptr &&
             std::strcmp(preload_env, "1") == 0 &&
             std::strcmp(async_env, "1") == 0;
+        if (phone_npu_banked_enabled && phone_npu_async_preload) {
+            throw std::runtime_error(
+                "banked NPU weight worker conflicts with legacy async "
+                "HTP preload; disable PRELOAD_ASYNC");
+        }
+        if (phone_npu_banked_enabled) {
+            phone_npu_bank_thread = std::thread(
+                [this]() { phone_npu_bank_refill_loop(); });
+        }
         if (phone_npu_async_preload) {
             phone_npu_preload_thread =
                 std::thread([this]() { phone_npu_preload_loop(); });
@@ -6020,6 +6116,7 @@ public:
         const phone_chunk_input_timing & timing);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop();
+    void phone_npu_bank_refill_loop();
     void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
     void phone_input_stream_cancel_reserve(size_t bytes);
@@ -6312,6 +6409,11 @@ private:
     std::unique_ptr<ggml_phone_npu_serial::full_region_executor>
         phone_npu_executor;
     bool phone_npu_async_preload = false;
+    bool phone_npu_banked_enabled = false;
+    std::set<uint32_t> phone_npu_banked_ready_regions;
+    std::deque<std::pair<uint64_t, ggml_phone_npu_serial::weight_bank_refill>>
+        phone_npu_bank_refill_jobs; // guarded by phone_auto_mutex
+    std::thread phone_npu_bank_thread;
     // The async preloader never takes graph_compute_mutex during REPACK,
     // so PC graph/task registration cannot be serialized behind ~2s of
     // HTP weight copies. Backend operations and source-buffer lifetime are
