@@ -5882,19 +5882,21 @@ public:
             };
             if (!phone_npu_banked_enabled ||
                     phone_npu_serial_regions.size() != 2 ||
+                    !enabled("GGML_RPC_PHONE_BINDING_PREFLIGHT") ||
                     !enabled("GGML_RPC_PHONE_STAGE_SLOT0_EXEC") ||
                     !enabled("GGML_RPC_PHONE_STAGE_DUAL_SLOT") ||
                     !enabled("GGML_RPC_PHONE_PERSISTENT_POOL_PREP")) {
                 throw std::runtime_error(
                     "Mixed Phone OpenCL+HTP requires exactly two banked "
-                    "NPU Regions and GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1, "
+                    "NPU Regions and GGML_RPC_PHONE_BINDING_PREFLIGHT=1, "
+                    "GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1, "
                     "GGML_RPC_PHONE_STAGE_DUAL_SLOT=1, "
                     "GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1");
             }
             GGML_LOG_INFO(
                 "[PHONE_MIXED_BACKENDS] event=SERVER_INIT "
                 "htp_regions=%zu rpc_gpu=GPUOpenCL "
-                "slot0=REQUIRED dual_slot=ON pool_prep=ON "
+                "binding_preflight=ON slot0=REQUIRED dual_slot=ON pool_prep=ON "
                 "status=READY\n", phone_npu_serial_regions.size());
         }
         if (!phone_npu_serial_regions.empty()) {
