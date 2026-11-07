@@ -8016,18 +8016,12 @@ bool rpc_server::phone_auto_task_register(
     }
     const char * graphless_env =
         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
-    // Experimental mixed whole-layer mode: ordinary Phone Regions still
-    // execute their PC-built RPC GPUOpenCL graphs. HTP P1 Regions also keep
-    // their PC graph as *metadata* while local-only HTP owns the actual
-    // computation and KV. Do not relax this contract in the default mode.
-    const char * mixed_env =
-        std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL");
-    const bool mixed_phone = mixed_env != nullptr &&
-        std::strcmp(mixed_env, "1") == 0 && phone_npu_banked_enabled;
+    // HTP Regions must use the immutable PHONE_OWNED_KV Graphless path.
+    // Only GPUOpenCL Regions may register a PC-built RPC Chunk Graph.
+    // Mixed mode does not weaken HTP's native KV and output contracts.
     if (graphless_env && std::strcmp(graphless_env, "1") == 0 &&
             ggml_phone_npu_serial::htp_region(
-                phone_npu_serial_regions, request.key.region) &&
-            !mixed_phone) {
+                phone_npu_serial_regions, request.key.region)) {
         return reject("GRAPHLESS_REJECTS_PC_TASK_REGISTER");
     }
     // Register the local graph contract before accepting A/B execution.
