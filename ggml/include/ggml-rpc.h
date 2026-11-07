@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    30
+#define RPC_PROTO_PATCH_VERSION    31
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -245,10 +245,14 @@ using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
 // Planner-driven Phone HTP Region/Layer mapping. No per-layout HTP
 // environment variables are required on the Phone; PC passes all selected
 // P1 Region/Layer pairs before registering any Phone-owned Graph/KV.
-// Version 1 requires at least two HTP Regions for physical two-Bank mode.
+// Version 2 also describes a same-Phone successor when HTP output flows
+// directly to an adjacent Adreno Region. A zero successor means normal P2C.
+// The PC retains the original P2C completion frame for its Region DAG;
+// only the intermediate activation is no longer pushed back to the Phone.
 struct ggml_backend_rpc_phone_npu_region_layer {
     uint32_t region;
     uint32_t layer;
+    uint32_t next_phone_gpu_region = 0;
 };
 #define GGML_BACKEND_RPC_PHONE_NPU_PLAN_CONFIGURE_PROC \
     "ggml_backend_rpc_phone_npu_plan_configure"
