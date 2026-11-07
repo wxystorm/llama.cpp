@@ -757,8 +757,8 @@ inline bool llama_region_ring_single_cycle_force_compatible(
     return active_devices >= 2;
 }
 
-// The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
-// Ordinary fixed/legacy parsing stays strict and unchanged.
+// APPLY_WIDE accepts G,[C],P and G,[C],P(HTP),P(Adreno) cycles;
+// zero-count CPU stages may be omitted. Fixed/legacy parsing stays strict.
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer);
@@ -849,14 +849,15 @@ llama_region_ring_parse_apply_wide_layout(
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
-    if (regions.size() < 4 || regions.size() > 14 ||
+    if (regions.size() < 4 || regions.size() > 16 ||
             n_layer <= 0 || regions.front().layer_begin != 0 ||
             regions.back().layer_end != n_layer) {
         return false;
     }
-    // Each complete Cycle is GPU -> [CPU] -> Phone. A zero-layer CPU is
-    // absent from this list: it is NEVER an executable Region. Preserve
-    // legacy trailing GPU or GPU+CPU after at least two complete Cycles.
+    // Each complete Cycle is GPU -> [CPU] -> Phone [-> Phone]. The
+    // adjacent two Phone Regions are distinct physical HTP and Adreno
+    // stages chosen by PC NPU Plan RPC, not a synthetic tensor-copy layer.
+    // A zero CPU is absent; legacy PC tails remain accepted.
     size_t i = 0;
     int layer = 0;
     int cycles = 0;
@@ -884,6 +885,13 @@ inline bool llama_region_ring_apply_topology_compatible(
             return cycles >= 2 && cycles <= 4 && layer == n_layer;
         }
         if (!take(llama_region_ring_device::PHONE)) {
+            return false;
+        }
+        // A second contiguous Phone stage is legal only in APPLY_WIDE.
+        // Its exact NPU->Adreno ownership is validated at Plan RPC setup.
+        if (i < regions.size() &&
+                regions[i].device == llama_region_ring_device::PHONE &&
+                !take(llama_region_ring_device::PHONE)) {
             return false;
         }
         if (++cycles > 4) {
