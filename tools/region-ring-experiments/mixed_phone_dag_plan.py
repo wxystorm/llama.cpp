@@ -371,6 +371,35 @@ def layout(cycles):
     return ",".join(f"G{c.g},C{c.c},N{c.n},A{c.a}" for c in cycles)
 
 
+def planner_backend_mapping(cycles):
+    """The Plan owns physical Phone Region/Layer pairs, never Phone env.
+
+    Region indices are assigned after omitting zero-width Regions, matching
+    the full-stage runtime's contiguous stage indexing convention. These
+    are plan metadata until the runtime supports N->A sub-stages.
+    """
+    region = 0
+    first = 0
+    htp = []
+    opencl = []
+    for c in cycles:
+        for name, width in (("G",c.g),("C",c.c),("N",c.n),("A",c.a)):
+            if width < 0:
+                raise ValueError("NEGATIVE_PHYSICAL_BACKEND_DEPTH")
+            if width == 0:
+                continue
+            if name == "N":
+                if width != 1:
+                    raise ValueError("HTP_RUNTIME_P1_ONLY")
+                htp.append({"region":region,"layer":first})
+            elif name == "A":
+                opencl.append({"region":region,"first_layer":first,
+                               "last_layer_exclusive":first+width})
+            first += width
+            region += 1
+    return htp, opencl
+
+
 def plan(model, profiles, base, mix, max_npu=1, max_cycles=4):
     if not {"CPU", "GPU", "PHONE", "PHONE_GPU"}.issubset(profiles.devices):
         raise ValueError("MIXED_PROFILE_NEEDS_CPU_GPU_PHONE_HTP_AND_PHONE_GPU_SAMPLES")
@@ -449,12 +478,16 @@ def run_cli(argv=None):
                          max_npu=args.max_npu_region_layers)
     args.out.mkdir(parents=True,exist_ok=True)
     w, la, x, cycles, mem, dag = options[0]
+    htp_map, opencl_map = planner_backend_mapping(cycles)
     record = {
         "schema": 2, "planner": "phone-four-backend-dual-bank-exact-dag-v1",
         "model_id": info["file"], "model_fingerprint":info["fingerprint"],
         "source_profile":str(stage_file), "source_mixed_calibration": str(folder/"phone_mixed_calibration.json"),
         "tokens":token_count, "layers":info["layers"], "chunk_tokens":x,
         "mixed_layout":la,
+        "phone_npu_mapping":htp_map,
+        "phone_gpu_mapping":opencl_map,
+        "mapping_authority":"PC_PLANNER_RPC_NOT_PHONE_ENV",
         "cycles":[{"pc_gpu":c.g,"pc_cpu":c.c,"phone_npu":c.n,"phone_gpu":c.a} for c in cycles],
         "bank_model":{"pc_cuda":"two_bank_rank_k_minus_2_release_and_separate_h2d_lane",
                       "phone_npu":"two_bank_host_stage_plus_htp_repack_after_rank_k_minus_2",
