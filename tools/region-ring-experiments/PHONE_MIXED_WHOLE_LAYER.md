@@ -35,6 +35,7 @@ Preserve your existing working LD_LIBRARY_PATH/OCL_ICD_VENDORS settings.
     export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=9,19
     export GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2
     export GGML_RPC_PHONE_NPU_MIXED_OPENCL=1
+    export GGML_RPC_PHONE_BINDING_PREFLIGHT=1
     export GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1
     export GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1
     export GGML_RPC_PHONE_STAGE_DUAL_SLOT=1
@@ -84,7 +85,13 @@ writeback and OpenCL KV. Both Phone OpenCL Regions are P1. Earlier
 P5 terminal graphs produced unsupported 2-way Phone backend splits.
 HTP no longer needs OpenCL Slot0 at all: its Plan/KV-bound Graphless
 jobs are native HTP. GPUOpenCL still requires OpenCL Slot0 and its
-persistent pool; missing Slot0/pool options fail at Phone RPC startup.
+persistent pool. OpenCL Slot0 is initialized only inside
+`phone_stage_binding_preflight()` and requires
+`GGML_RPC_PHONE_BINDING_PREFLIGHT=1` in addition to the Slot0/pool flags.
+Missing required options fail at Phone RPC startup. Even with these flags,
+per-Graph preflight may still reject a graph on its actual output, input,
+address, and memory contracts; check Phone `REGISTER_REJECT` and
+`PHONE_STAGE_SLOT0` log entries before attempting further fixes.
 Tiny warmup/decode can legally have two splits on the last Phone Stage:
 Phone Meta last layer followed by PC CPU output Head; the mixed guard
 allows only this exact two-backend split.
