@@ -89,6 +89,20 @@ class MixedPlanTests(unittest.TestCase):
         self.assertIn("HTP_TO_ADRENO", r["handoffs"])
         self.assertIn("P2C", r["handoffs"])
         self.assertIn("C2P", r["handoffs"])
+        self.assertNotIn("N_CONTROL_P2C", r["handoffs"])
+
+    def test_no_intermediate_htp_frame_for_local_phone_island(self):
+        # Two local N->A handoffs, but only a real Adreno->PC crossing and
+        # the final Phone->PC Head output consume P2C bandwidth.
+        cs = [Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1)]
+        result = dag_for(cs, 64, 128, 5120, FakeProfile(),
+                         dict(BASE, npu_budget_mib=100), MIX, 2.)
+        self.assertIsNotNone(result)
+        self.assertNotIn("N_CONTROL_P2C", result["handoffs"])
+        self.assertIn("HTP_TO_ADRENO", result["handoffs"])
+        self.assertGreater(result["busy_ms"]["phone_to_pc"], 0)
+        self.assertFalse(any("N_CONTROL" in node
+                             for node in result["bank_nodes"]))
 
     def test_terminal_cuda_requires_measured_d2h(self):
         cycles = [Cycle(5, 0, 0, 0), Cycle(5, 0, 0, 0)]
