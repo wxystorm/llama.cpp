@@ -9,12 +9,12 @@ single compute worker, so OpenCL/HTP execution is **serial**, not concurrent.
 
 The 40-layer layout is:
 
-    G7,C1,P1, G7,C1,P1, G7,C1,P1, G7,C1,P5
+    G8,C1,P1, G8,C1,P1, G8,C1,P1, G7,C2,P1
 
-PC CPU: 4 layers (C1 x4)
-PC CUDA: 28 layers (G7 x4)
-Phone NPU HTP0: region 2/layer 8 and region 5/layer 17
-Phone Adreno OpenCL: region 8/layer 26 and region 11/layers 35..39
+PC CPU: 5 layers (C1 x3, C2 x1)
+PC CUDA: 31 layers (G8 x3, G7 x1)
+Phone NPU HTP0: region 2/layer 9 and region 5/layer 19
+Phone Adreno OpenCL: region 8/layer 29 and region 11/layer 39
 
 The two NPU ranks occupy separate physical HTP Banks (A,B). This
 first smoke deliberately uses **two** NPU regions, both primed at startup.
@@ -32,9 +32,12 @@ Use the SAME model (Qwen3-14B-Q4_K_M.gguf) already on the Phone.
 Preserve your existing working LD_LIBRARY_PATH/OCL_ICD_VENDORS settings.
 
     export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=2,5
-    export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=8,17
+    export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=9,19
     export GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2
     export GGML_RPC_PHONE_NPU_MIXED_OPENCL=1
+    export GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1
+    export GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1
+    export GGML_RPC_PHONE_STAGE_DUAL_SLOT=1
     export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
     export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
     export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=1
@@ -75,7 +78,11 @@ values on exit, including GRAPHLESS=0. It forces the internal smoke
 layout and all three Chunk widths to 64. These are A/B TEST settings
 only; the ordinary Planner will eventually determine layer/Chunk choices.
 The smoke uses one generated token and preserves full HTP local-KV
-writeback and OpenCL KV.
+writeback and OpenCL KV. Both Phone OpenCL Regions are P1. Earlier
+P5 terminal graphs produced unsupported 2-way Phone backend splits.
+Slot0 readiness is required for PC-registered HTP metadata graphs even
+when actual HTP execution is Phone-local. Missing Slot0/pool options
+now fail at Phone RPC startup, not at first HTP Chunk registration.
 
 ## What proves a real mixed run
 
