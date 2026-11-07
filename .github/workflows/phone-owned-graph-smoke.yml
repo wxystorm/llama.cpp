@@ -6,6 +6,7 @@ on:
       - feat/phone-owned-plan-bootstrap-20261106
       - feat/phone-npu-dual-bank-offline-plan-20261107
       - feat/phone-npu-adreno-no-mid-p2c-host-move-20261107
+      - feat/four-backend-profile-rpc-gcna-20261107
   workflow_dispatch:
 
 jobs:
@@ -22,3 +23,5 @@ jobs:
         run: ctest --test-dir build-phone-owned -R 'test-phone-(owned-execution-plan|qwen3-local-builder|qwen3-local-parity|npu-weight-banks|plan-region-map|local-host-handoff)|test-region-ring(-planner)?' --output-on-failure
       - name: Test four-backend Python DAG and saved-plan schema
         run: python3 -m unittest discover -s tools/region-ring-experiments -p 'test_mixed_phone*.py' -v
+      - name: Test G/C/N/A compact probe and Patch32 RPC extraction
+        run: python3 -m unittest discover -s tools/region-ring-experiments -p 'test_gcna_*.py' -v
