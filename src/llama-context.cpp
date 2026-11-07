@@ -5617,6 +5617,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // and retains its original KV order and Meta scheduler.
         ggml_backend_rpc_phone_input_push_t phone_input_push = nullptr;
         ggml_backend_rpc_phone_input_stream_run_t phone_input_stream_run = nullptr;
+        ggml_backend_rpc_phone_stage_profile_pull_t phone_stage_profile_pull = nullptr;
+        const char * phone_profile_rpc_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_PROFILE_RPC");
+        const bool phone_profile_rpc_enabled = phone_profile_rpc_env != nullptr &&
+            std::strcmp(phone_profile_rpc_env, "1") == 0;
         ggml_backend_rpc_phone_input_stream_push_t phone_input_stream_push = nullptr;
         ggml_backend_rpc_phone_input_consume_begin_t phone_input_consume_begin = nullptr;
         ggml_backend_rpc_phone_input_consume_end_t phone_input_consume_end = nullptr;
@@ -5634,6 +5639,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         reinterpret_cast<ggml_backend_rpc_phone_input_stream_run_t>(
                             ggml_backend_reg_get_proc_address(
                                 rpc_reg, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC));
+                    if (phone_profile_rpc_enabled) {
+                        phone_stage_profile_pull =
+                            reinterpret_cast<ggml_backend_rpc_phone_stage_profile_pull_t>(
+                                ggml_backend_reg_get_proc_address(
+                                    rpc_reg, GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_PULL_PROC));
+                    }
                     phone_input_stream_push =
                         reinterpret_cast<ggml_backend_rpc_phone_input_stream_push_t>(
                             ggml_backend_reg_get_proc_address(
@@ -5669,6 +5680,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             phone_input_consume_end != nullptr &&
             phone_input_drop != nullptr &&
             phone_input_stream_run(phone_rpc_backend, phone_input_push_run_id, true);
+        if (phone_profile_rpc_enabled &&
+                (!phone_input_stream_enabled || !phone_stage_profile_pull)) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_STAGE_PROFILE_RPC] event=INIT status=FAIL "
+                "reason=PHONE_INPUT_STREAM_OR_PATCH32_REQUIRED\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
         // An explicit stream request must never silently run the legacy
         // two-slot ACK transport: the scheduler has different admission limits.
         if (phone_input_stream_requested && !phone_input_stream_enabled) {
@@ -8470,6 +8489,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                         phone_input_push_run_id, false)) {
             LLAMA_LOG_ERROR("[PHONE_INPUT_STREAM] event=END status=FAIL\n");
             ready.cancel();
+        } else if (phone_profile_rpc_enabled && phone_input_stream_enabled &&
+                   !phone_stage_profile_pull(
+                        phone_rpc_backend, phone_input_push_run_id)) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_STAGE_PROFILE_RPC] event=PULL status=FAIL "
+                "reason=INCOMPLETE_OR_MISSING_PHONE_SAMPLES\n");
+            ready.cancel();
+            ret = GGML_STATUS_FAILED;
         }
         // Recover abandoned host landing buffers if execution was cancelled
         // while a future Chunk was already staged on Phone.
