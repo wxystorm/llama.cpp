@@ -27,7 +27,7 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
         throw "The selected G/C/N/A plan is still offline-only. Re-run run_plan.ps1 -PhoneMixed -RuntimeCompatible."
     }
     if (!$ConfirmBankedPhoneReady) {
-        throw "Patch31 Android Phone with Plan-controlled two HTP Banks, MIXED_OPENCL=1 and NPU_GPU_PIPELINE=1 must be built and checked. Pass -ConfirmBankedPhoneReady only after checking those conditions."
+        throw "Patch32 Android Phone with Plan-controlled two HTP Banks, MIXED_OPENCL=1 and NPU_GPU_PIPELINE=1 must be built and checked. Pass -ConfirmBankedPhoneReady only after checking those conditions."
     }
     if ([IO.Path]::GetFileName($Model) -ine [IO.Path]::GetFileName([string]$p.model_id)) {
         throw "Saved plan/model mismatch. Re-plan for this GGUF."
@@ -118,7 +118,7 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
     if ($x -notin @(16,32,64,128)) { throw "Unsupported shared Chunk width." }
     Write-Host "[PHONE_LOCAL_HANDOFF] phase=APPLY layout=$layout npu_regions=$npuRegions local_links=$($localEdges.Count) chunk=$x status=EXPERIMENTAL"
     # These PC settings are model/runtime capabilities. The actual Phone NPU
-    # layer mapping travels in the Patch31 Plan RPC, not in Phone exports.
+    # layer mapping travels in the Patch32 Plan RPC, not in Phone exports.
     $capabilities = @{
         "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP" = "1"
         "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS" = $npuRegions
