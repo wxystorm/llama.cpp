@@ -349,78 +349,171 @@ def phone_rpc_memory(endpoint: str, device: int = 0) -> DeviceMemory:
     return DeviceMemory(free, total)
 
 
+def estimate_workspaces(weights: GGUFWeights, ubatch: int, window: int,
+                        graph_prebuild: bool,
+                        cpu_workspace_mib: int, pc_workspace_mib: int,
+                        phone_workspace_mib: int) -> tuple[int, int, int]:
+    """Workspace budget: configured floor + activation slots + graph prebuild.
+
+    These are adjustable allowances, NOT a claim to predict ggml allocator
+    high-water marks. Actual buffer requirements are architecture-dependent.
+    """
+    if ubatch < 1 or window < 1 or min(
+        cpu_workspace_mib, pc_workspace_mib, phone_workspace_mib
+    ) < 0:
+        raise ValueError("invalid graph workspace or ubatch/window settings")
+    embd = weights.embedding_length or 4096
+    # Number of live activation copies in the pipeline. Conservatively assume
+    # FP32 intermediates and 12 reusable residual/attention working tensors.
+    activation_bytes = ubatch * embd * 4 * 12 * window
+    graph_bytes = 128*MIB if graph_prebuild else 0
+    return (
+        cpu_workspace_mib*MIB + activation_bytes//2,
+        pc_workspace_mib*MIB + activation_bytes + graph_bytes,
+        phone_workspace_mib*MIB + activation_bytes + graph_bytes,
+    )
+
+
 def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
                       phone: DeviceMemory, pc_reserve_mib: int = 512,
                       phone_reserve_mib: int = 512,
                       pc_layers_override: int | None = None,
                       cpu: DeviceMemory | None = None,
-                      cpu_reserve_mib: int = 2048) -> MemoryPlan:
-    """Minimize CPU layers, then balance PC GPU and Phone memory pressure.
+                      cpu_reserve_mib: int = 2048,
+                      *,
+                      context: int = 0,
+                      ubatch: int = 128,
+                      window: int = 2,
+                      graph_prebuild: bool = False,
+                      kv_dtype_bytes: float = 2.0,
+                      kv_per_layer_mib: float | None = None,
+                      cpu_workspace_mib: int = 0,
+                      pc_workspace_mib: int = 0,
+                      phone_workspace_mib: int = 0,
+                      safety_percent: float = 0.0) -> MemoryPlan:
+    """Allocate contiguous CPU->CUDA->Phone layers with KV/graph headroom.
 
-    Output and other non-repeating GGUF tensors count against the Phone budget.
-    Actual tensor placement depends on llama.cpp and will be verified by load.
+    1. Budget fixed system/device reserves and safety margins.
+    2. Budget per-device graph workspace (ubatch/window/prebuild-dependent).
+    3. Account for per-layer KV cache at the configured context length.
+    4. Fit weight + KV per layer; first minimize CPU layers, then balance
+       accelerator utilization, never silently overcommitting memory.
+
+    Exact backend allocation is architecture/runtime-specific; this remains
+    a preflight estimate and the actual model load must still be validated.
     """
     if min(pc_reserve_mib, phone_reserve_mib, cpu_reserve_mib) < 0:
-        raise ValueError('memory reserves must be nonnegative')
+        raise ValueError("fixed memory reserves must be nonnegative")
+    if (not math.isfinite(safety_percent) or not 0 <= safety_percent <= 50
+            or not 0 < kv_dtype_bytes <= 8 or context < 0):
+        raise ValueError("invalid KV dtype, context length, or safety percentage")
+    if kv_per_layer_mib is not None and (
+        not math.isfinite(kv_per_layer_mib) or kv_per_layer_mib < 0
+    ):
+        raise ValueError("invalid --kv-per-layer-mib override")
+    if context:
+        kv_per_layer = (
+            math.ceil(kv_per_layer_mib*MIB)
+            if kv_per_layer_mib is not None
+            else weights.kv_bytes_per_layer(context, kv_dtype_bytes)
+        )
+    else:
+        kv_per_layer = 0
+    cpu_workspace, pc_workspace, phone_workspace = estimate_workspaces(
+        weights, ubatch, window, graph_prebuild,
+        cpu_workspace_mib, pc_workspace_mib, phone_workspace_mib,
+    )
     pc_reserve, phone_reserve = pc_reserve_mib*MIB, phone_reserve_mib*MIB
     cpu_reserve = cpu_reserve_mib*MIB if cpu is not None else 0
-    pc_budget = pc.free_bytes-pc_reserve
-    phone_budget = phone.free_bytes-phone_reserve
-    cpu_budget = max(0, cpu.free_bytes-cpu_reserve) if cpu is not None else 0
+    pc_safety = math.ceil(pc.free_bytes*safety_percent/100)
+    phone_safety = math.ceil(phone.free_bytes*safety_percent/100)
+    cpu_safety = (
+        math.ceil(cpu.free_bytes*safety_percent/100)
+        if cpu is not None else 0
+    )
+    pc_budget = pc.free_bytes-pc_reserve-pc_workspace-pc_safety
+    phone_budget = phone.free_bytes-phone_reserve-phone_workspace-phone_safety
+    cpu_budget = (max(0, cpu.free_bytes-cpu_reserve-cpu_workspace-cpu_safety)
+                  if cpu is not None else 0)
     if pc_budget <= 0 or phone_budget <= 0:
-        raise ValueError('GPU or Phone memory below the safety reserve')
-    required = weights.total_weights
-    if required > pc_budget+phone_budget+cpu_budget:
         raise ValueError(
-            f'INFEASIBLE: GGUF tensor payload ~{required/GIB:.2f} GiB exceeds '
-            f'combined usable memory '
-            f'{(pc_budget+phone_budget+cpu_budget)/GIB:.2f} GiB '
-            f'(CPU {cpu_budget/GIB:.2f}, GPU {pc_budget/GIB:.2f}, '
-            f'Phone {phone_budget/GIB:.2f})'
+            "INFEASIBLE: GPU or Phone memory smaller than reserve + "
+            "KV/graph workspace + safety allowance; "
+            f"PC weight+KV budget={pc_budget/GIB:.2f} GiB, "
+            f"Phone weight+KV budget={phone_budget/GIB:.2f} GiB"
         )
 
+    required = weights.total_weights + weights.n_layers*kv_per_layer
+    if required > pc_budget+phone_budget+cpu_budget:
+        raise ValueError(
+            f"INFEASIBLE: GGUF weights {weights.total_weights/GIB:.2f} GiB "
+            f"+ total KV {weights.n_layers*kv_per_layer/GIB:.2f} GiB "
+            f"exceed combined memory after reserves/graph/safety "
+            f"{(pc_budget+phone_budget+cpu_budget)/GIB:.2f} GiB "
+            f"(CPU {cpu_budget/GIB:.2f}, PC GPU {pc_budget/GIB:.2f}, "
+            f"Phone {phone_budget/GIB:.2f})"
+        )
+    # Repeating layers own KV on their assigned execution backend.
     prefix = [0]
     for size in weights.layers:
-        prefix.append(prefix[-1]+size)
-    candidates = []
+        prefix.append(prefix[-1]+size+kv_per_layer)
+
+    choices = []
     for cpu_layers in range(weights.n_layers-1):
-        cpu_weight = prefix[cpu_layers]
-        if cpu_weight > cpu_budget:
+        cpu_used = prefix[cpu_layers]
+        if cpu_used > cpu_budget:
             break
         for pc_layers in range(cpu_layers+1, weights.n_layers):
             if pc_layers_override is not None and pc_layers != pc_layers_override:
                 continue
-            gpu_weight = prefix[pc_layers]-cpu_weight
-            phone_weight = required-prefix[pc_layers]
-            if gpu_weight > pc_budget or phone_weight > phone_budget:
+            gpu_used = prefix[pc_layers]-cpu_used
+            # Output head and all other non-block tensors are placed on Phone
+            # in the Jupiter model loader. Conservatively charge all there.
+            phone_used = required-prefix[pc_layers]
+            if gpu_used > pc_budget or phone_used > phone_budget:
                 continue
             score = (
                 cpu_layers,
-                abs(gpu_weight/pc_budget-phone_weight/phone_budget),
+                abs(gpu_used/pc_budget-phone_used/phone_budget),
                 pc_layers,
             )
-            candidates.append((score, cpu_layers, pc_layers,
-                               cpu_weight, gpu_weight, phone_weight))
-        if candidates:
-            break  # Fewer CPU layers is the primary memory-only objective.
-    if not candidates:
-        note = (f' for --pc-layers={pc_layers_override}'
-                if pc_layers_override is not None else '')
+            choices.append((score, cpu_layers, pc_layers))
+        if choices:
+            break  # Keep as many layers as possible off the PC CPU.
+
+    if not choices:
+        boundary = (f" for --pc-layers={pc_layers_override}"
+                    if pc_layers_override is not None else "")
         raise ValueError(
-            f'INFEASIBLE: no contiguous CPU/GPU/Phone split{note} fits '
-            f'CPU {cpu_budget/GIB:.2f} GiB, PC GPU {pc_budget/GIB:.2f} GiB, '
-            f'Phone {phone_budget/GIB:.2f} GiB. '
-            'Non-layer tensors are conservatively charged to Phone.'
+            f"INFEASIBLE: no contiguous CPU/CUDA/Phone split{boundary}; "
+            f"usable weight+KV budgets: CPU {cpu_budget/GIB:.2f} GiB, "
+            f"GPU {pc_budget/GIB:.2f} GiB, Phone {phone_budget/GIB:.2f} GiB "
+            f"(KV={kv_per_layer/MIB:.1f} MiB per layer)."
         )
-    _, cpu_layers, pc_layers, cpu_weight, pc_weight, phone_weight = min(candidates)
+    _, cpu_layers, pc_layers = min(choices)
+    pc_weights = sum(weights.layers[cpu_layers:pc_layers])
+    cpu_weights = sum(weights.layers[:cpu_layers])
+    phone_weights = weights.total_weights-sum(weights.layers[:pc_layers])
     return MemoryPlan(
         pc_layers=pc_layers, phone_layers=weights.n_layers-pc_layers,
-        pc_weight_bytes=pc_weight, phone_weight_bytes=phone_weight,
+        pc_weight_bytes=pc_weights, phone_weight_bytes=phone_weights,
         pc_available_bytes=pc.free_bytes, phone_available_bytes=phone.free_bytes,
         pc_budget_bytes=pc_budget, phone_budget_bytes=phone_budget,
         pc_reserve_bytes=pc_reserve, phone_reserve_bytes=phone_reserve,
         model=weights,
-        cpu_layers=cpu_layers, cpu_weight_bytes=cpu_weight,
+        cpu_layers=cpu_layers, cpu_weight_bytes=cpu_weights,
         cpu_available_bytes=cpu.free_bytes if cpu is not None else 0,
         cpu_budget_bytes=cpu_budget, cpu_reserve_bytes=cpu_reserve,
+        kv_per_layer_bytes=kv_per_layer,
+        cpu_kv_bytes=cpu_layers*kv_per_layer,
+        pc_kv_bytes=(pc_layers-cpu_layers)*kv_per_layer,
+        phone_kv_bytes=(weights.n_layers-pc_layers)*kv_per_layer,
+        cpu_workspace_bytes=cpu_workspace if cpu is not None else 0,
+        pc_workspace_bytes=pc_workspace,
+        phone_workspace_bytes=phone_workspace,
+        cpu_safety_bytes=cpu_safety,
+        pc_safety_bytes=pc_safety,
+        phone_safety_bytes=phone_safety,
+        context_tokens=context,
+        kv_dtype_bytes=kv_dtype_bytes,
     )
