@@ -209,6 +209,10 @@ def calibration(stage_csv, pc_text, phone_text):
             "gpu_h2d_mibps": throughput(pc_text, "gpu_weight_h2d"),
             "c2p_mibps": throughput(pc_text, "pc_to_phone"),
             "p2c_mibps": throughput(pc_text, "phone_to_pc"),
+            # The existing HYBRID_PROFILE GPU->PC copy is a measured CUDA
+            # readback. Expose the direction explicitly for a PC CUDA final
+            # Transformer Stage, before the CPU-owned LM Head.
+            "gpu_d2h_mibps": throughput(pc_text, "gpu_to_pc"),
             "local_mibps": throughput(pc_text, "gpu_to_pc")}
 
 
