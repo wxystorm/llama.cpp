@@ -170,7 +170,7 @@ def create_probe(source: Path, dest: Path, spec: dict) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--pattern", default="G2,C1,N1,A1")
+    ap.add_argument("--pattern", default="G7,C1,N1,A1")
     ap.add_argument("--cycles", type=int, default=3)
     ap.add_argument("--describe", action="store_true")
     ap.add_argument("--model", type=Path)
