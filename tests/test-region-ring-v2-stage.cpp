@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Release-safe checks: CI builds with NDEBUG, so do not use assert().
