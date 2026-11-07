@@ -8692,13 +8692,41 @@ void rpc_server::phone_npu_bank_refill_loop() {
         ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats
             compiled {};
         bool ok = false;
-        int64_t lock_acquired_us = wait_begin_us;
-        {
+        // Stage raw GGUF on the host while the other Bank may still be
+        // computing on HTP. This is the GPU Bank Mover's simplified
+        // host-stage -> device-repack -> READY order.
+        std::vector<std::vector<uint8_t>> staged;
+        double host_stage_ms = 0.0;
+        std::string stage_reason;
+        const bool prefetched = phone_npu_executor != nullptr &&
+            phone_npu_executor->stage_banked_rank(
+                job.second.to_rank, staged, host_stage_ms, stage_reason);
+        const bool stage_fallback = stage_reason ==
+                "NPU_BANK_HOST_STAGE_BUDGET_EXCEEDED" ||
+            stage_reason == "NPU_BANK_HOST_STAGE_OOM";
+        size_t host_staged_bytes = 0;
+        for (const auto & tensor : staged) {
+            host_staged_bytes += tensor.size();
+        }
+        if (prefetched || stage_fallback) {
+            if (stage_fallback) {
+                GGML_LOG_WARN(
+                    "[NPU_BANK] event=STAGE_FALLBACK run=%" PRIu64
+                    " to_rank=%zu reason=%s mode=SERIAL_GGUF_READ\n",
+                    job.first, job.second.to_rank, stage_reason.c_str());
+            }
+        } else {
+            reason = stage_reason.empty() ?
+                "NPU_BANK_HOST_STAGE_FAILED" : stage_reason;
+        }
+        int64_t lock_acquired_us = ggml_time_us();
+        const int64_t lock_begin_us = lock_acquired_us;
+        if (prefetched || stage_fallback) {
             std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
             lock_acquired_us = ggml_time_us();
-            ok = phone_npu_executor != nullptr &&
-                phone_npu_executor->refill_banked_rank(
-                    job.first, job.second, reason, load, compiled);
+            ok = phone_npu_executor->refill_banked_rank(
+                job.first, job.second, reason, load, compiled,
+                prefetched ? &staged : nullptr);
         }
         const int64_t finish_us = ggml_time_us();
         bool active = false;
@@ -8726,15 +8754,18 @@ void rpc_server::phone_npu_bank_refill_loop() {
             "[NPU_BANK] event=REFILL run=%" PRIu64
             " bank=%zu from_rank=%zu to_rank=%zu region=%u"
             " source_bytes=%zu weights=%zu read_ms=%.3f"
+            " host_stage_ms=%.3f host_stage_bytes=%zu"
             " repack_ms=%.3f compile_ms=%.3f"
             " htp_lock_wait_ms=%.3f wall_ms=%.3f"
-            " physical_banks=2 status=%s reason=%s\n",
+            " stage_mode=%s physical_banks=2 status=%s reason=%s\n",
             job.first, job.second.bank, job.second.from_rank,
             job.second.to_rank, job.second.to_region,
             load.new_bytes, load.new_weights, load.file_read_ms,
+            host_stage_ms, host_staged_bytes,
             load.htp_repack_ms, compiled.precompile_ms,
-            (lock_acquired_us - wait_begin_us) / 1000.0,
+            (lock_acquired_us - lock_begin_us) / 1000.0,
             (finish_us - wait_begin_us) / 1000.0,
+            prefetched ? "PREFETCH" : "SERIAL_FALLBACK",
             ok ? "PASS" : "FAIL",
             ok ? "NONE" : reason.c_str());
         phone_auto_cv.notify_all();
