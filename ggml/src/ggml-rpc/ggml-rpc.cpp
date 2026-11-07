@@ -499,6 +499,17 @@ struct rpc_msg_phone_stage_profile_rsp {
     uint32_t total = 0;
     uint32_t count = 0;
     uint32_t overflow = 0;
+    // Repeated on every page so a lost/invalid page cannot result in a
+    // silent partial memory/bandwidth calibration.
+    uint64_t phone_gpu_free_bytes = 0;
+    uint64_t phone_gpu_total_bytes = 0;
+    uint64_t phone_host_available_bytes = 0;
+    uint64_t phone_gpu_stage_arena_bytes = 0;
+    uint64_t npu_host_stage_budget_bytes = 0;
+    uint64_t npu_host_stage_bytes = 0;
+    double npu_host_stage_ms = 0;
+    uint64_t npu_bank_repack_bytes = 0;
+    double npu_bank_repack_ms = 0;
     rpc_msg_phone_stage_profile_sample samples[RPC_PHONE_STAGE_PROFILE_PAGE] = {};
 };
 struct rpc_msg_phone_auto_task_req {
@@ -6812,6 +6823,13 @@ private:
     std::map<uint64_t, std::vector<rpc_msg_phone_stage_profile_sample>>
         phone_stage_profile_finished;
     std::set<uint64_t> phone_stage_profile_overflow;
+    struct phone_profile_bank_stats {
+        uint64_t staged_bytes = 0;
+        double staged_ms = 0;
+        uint64_t repack_bytes = 0;
+        double repack_ms = 0;
+    };
+    std::map<uint64_t, phone_profile_bank_stats> phone_stage_profile_banks;
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
@@ -9381,6 +9399,17 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 if (ok) {
                     phone_npu_banked_ready_regions.insert(
                         job.second.to_region);
+                    if (prefetched && host_stage_ms > 0.0 &&
+                            host_staged_bytes > 0 &&
+                            load.htp_repack_ms > 0.0 && load.new_bytes > 0) {
+                        // Measured on the real Bank refill; never infer rates
+                        // from generic Host/GPU copy or dummy tensor sizes.
+                        auto & sample = phone_stage_profile_banks[job.first];
+                        sample.staged_bytes += host_staged_bytes;
+                        sample.staged_ms += host_stage_ms;
+                        sample.repack_bytes += load.new_bytes;
+                        sample.repack_ms += load.htp_repack_ms;
+                    }
                 } else {
                     for (auto & entry : phone_auto_jobs) {
                         auto & pending = *entry.second;
