@@ -27,6 +27,7 @@ REQUIRED_MIXED = (
     "phone_gpu_scratch_mib",
     "phone_shared_budget_mib", "phone_local_mibps",
     "npu_host_stage_mibps", "npu_bank_repack_mibps",
+    "npu_host_stage_budget_mib",
 )
 REQUIRED_BASE = (
     "gpu_budget_mib", "npu_budget_mib", "gpu_weight_layer_mib",
@@ -155,6 +156,7 @@ class MemoryResult:
     npu_used_mib: float
     phone_gpu_used_mib: float
     phone_shared_used_mib: float
+    npu_host_stage_peak_mib: float
 
 
 def memory(cycles, b, m):
@@ -171,15 +173,20 @@ def memory(cycles, b, m):
             n_rank += 1
             nn += c.n
         na += c.a
+    # Host-staged GGUF weights are additional temporary Phone RAM, not
+    # NPU device Bank allocations. Rank 0/1 are already primed before RUN.
+    n_weight_regions = [c.n * b["npu_weight_layer_mib"] for c in cycles if c.n]
+    host_stage_peak = max(n_weight_regions[2:], default=0.)
     pg = sum(g_banks) + ng*b["gpu_kv_layer_mib"] + b["gpu_scratch_mib"]
     np = sum(n_banks) + nn*b["npu_kv_layer_mib"] + b["npu_scratch_mib"]
     ap = na*m["phone_gpu_weight_layer_mib"] + na*m["phone_gpu_kv_layer_mib"] + m["phone_gpu_scratch_mib"]
-    shared = np + ap
+    shared = np + ap + host_stage_peak
     fits = (pg <= b["gpu_budget_mib"] + 1e-9 and
             np <= b["npu_budget_mib"] + 1e-9 and
             ap <= m["phone_gpu_budget_mib"] + 1e-9 and
+            host_stage_peak <= m["npu_host_stage_budget_mib"] + 1e-9 and
             shared <= m["phone_shared_budget_mib"] + 1e-9)
-    return MemoryResult(fits, tuple(g_banks), tuple(n_banks), pg, np, ap, shared)
+    return MemoryResult(fits, tuple(g_banks), tuple(n_banks), pg, np, ap, shared, host_stage_peak)
 
 
 def split_phone(gcp, base, mix, max_npu):
@@ -457,7 +464,8 @@ def run_cli(argv=None):
                   "pc_gpu_used_mib":mem.gpu_pc_used_mib,
                   "npu_used_mib":mem.npu_used_mib,
                   "phone_gpu_used_mib":mem.phone_gpu_used_mib,
-                  "phone_shared_used_mib":mem.phone_shared_used_mib},
+                  "phone_shared_used_mib":mem.phone_shared_used_mib,
+                  "npu_host_stage_peak_mib":mem.npu_host_stage_peak_mib},
         "dag":{"predicted_wall_ms":w,**dag},"search":diag,
         "phone_gpu_depth_cost":"measured_depth_or_linear_sum_of_measured_P1_services",
         "prediction_scope":"offline_measured_stage_plus_bank_transfer_model_no_runtime_validation",
