@@ -280,6 +280,47 @@ static void test_adjacent_phone_mixed_topology() {
           "APPLY_WIDE must reject a mixed layout ending on PC");
 }
 
+static void test_phone_local_delegation_without_intermediate_p2c() {
+    // The PC grants authority for the HTP->Adreno edge at delegation time.
+    // Real HTP computation stays on the Phone; no PC P2C frame exists for
+    // HTP. Only Adreno's actual returned bytes release the next PC GPU.
+    const auto regions = llama_region_ring_parse_apply_wide_layout(
+        "G2,P1,P1,G2,P1", 7);
+    llama_region_ring_ready ready(regions, 64, 64);
+
+    const auto g0 = ready.try_take(llama_region_ring_device::GPU);
+    check(g0 && g0->region == 0, "missing first PC GPU stage");
+    ready.complete(*g0);
+
+    const auto n = ready.try_take(llama_region_ring_device::PHONE);
+    check(n && n->region == 1, "missing delegated HTP stage");
+    // No receiver frame, wait or callback for the internal HTP stage.
+    ready.complete(*n);
+
+    const auto a = ready.try_take(llama_region_ring_device::PHONE);
+    check(a && a->region == 2,
+          "Phone-owned Adreno was not released by HTP delegation");
+    // Adreno has only been delegated, not finished. Its P2C is in flight.
+    ready.defer(*a);
+    check(!ready.try_take(llama_region_ring_device::GPU).has_value(),
+          "next PC GPU ran before real Adreno P2C data arrived");
+    check(!ready.all_done(), "delegation masqueraded as full completion");
+
+    // The sole cross-device return of this island releases PC.
+    ready.complete_deferred(*a);
+    const auto g1 = ready.try_take(llama_region_ring_device::GPU);
+    check(g1 && g1->region == 3, "Adreno P2C did not wake PC continuation");
+    ready.complete(*g1);
+    const auto final_phone = ready.try_take(llama_region_ring_device::PHONE);
+    check(final_phone && final_phone->region == 4,
+          "final Phone stage missing after PC continuation");
+    ready.defer(*final_phone);
+    check(!ready.all_done(), "terminal Phone output not yet returned");
+    ready.complete_deferred(*final_phone);
+    check(ready.all_done() && ready.finished() == 5 && !ready.failed(),
+          "Phone-owned island did not drain cleanly");
+}
+
 static void test_general_topology() {
     const auto two_cycle_tail = llama_region_ring_parse(
         "G4,C6,P8,G4,C6,P8,G4,C8",48,true);
@@ -1464,6 +1505,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
         test_adjacent_phone_mixed_topology();
         std::fprintf(stderr, "[REGION_RING_TEST] adjacent_phone_mixed=PASS\n");
+        test_phone_local_delegation_without_intermediate_p2c();
+        std::fprintf(stderr, "[REGION_RING_TEST] local_no_p2c=PASS\n");
         test_apply_safe_compatibility();
         std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
