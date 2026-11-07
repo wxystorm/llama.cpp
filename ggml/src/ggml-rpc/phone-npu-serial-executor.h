@@ -799,6 +799,16 @@ public:
             }
             item->built.graph->uid = (UINT64_C(3) << 62) |
                 next_owned_uid_++;
+            if (banked_mode_) {
+                const int rank = rank_for_region(
+                    plan.region, plan.layer);
+                if (rank < 0 || !rank_banked_ready(plan.region)) {
+                    reason = "NPU_BANK_PRECOMPILE_BEFORE_WEIGHT_READY";
+                    break;
+                }
+                item->bank_generation =
+                    weight_banks_.bank(size_t(rank) % 2).generation;
+            }
             const int64_t t0 = ggml_time_us();
             const bool compiled = compile(backend_, item->built.graph);
             stats.precompile_ms += (ggml_time_us() - t0) / 1000.0;
@@ -1206,6 +1216,18 @@ public:
             }
         }
 
+        // The Graph was compiled against THIS Bank generation, not merely
+        // a compatible weight address or model-shape. A stale graph cannot
+        // be run after another layer replaces its Bank.
+        if (banked_mode_) {
+            const int rank = rank_for_region(region, p.layer);
+            if (rank < 0 || !weight_banks_.begin_chunk(
+                    static_cast<size_t>(rank), chunk,
+                    chunk_state.bank_generation)) {
+                reason = "NPU_BANK_STALE_GRAPH_OR_NOT_READY";
+                return false;
+            }
+        }
         const int64_t upload_begin = ggml_time_us();
         ggml_backend_tensor_set(g.input, source, 0, bytes);
         ggml_backend_synchronize(backend_);
@@ -2763,6 +2785,7 @@ private:
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
         ggml_phone_qwen3::graph_result built {};
+        uint64_t bank_generation = 0;
         const ggml_tensor * canonical_k_indices = nullptr;
         const ggml_tensor * canonical_v_indices = nullptr;
     };
