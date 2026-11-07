@@ -8952,7 +8952,13 @@ void rpc_server::phone_auto_compute_loop() {
                             ggml_phone_auto::can_compute(
                                 next->second, job.request.key.chunk) &&
                             job.state == phone_auto_status::PREPARED &&
-                            phone_npu_preload_ready_locked(job)) {
+                            phone_npu_preload_ready_locked(job) &&
+                            (!phone_npu_banked_enabled ||
+                             !ggml_phone_npu_serial::htp_region(
+                                 phone_npu_serial_regions,
+                                 job.request.key.region) ||
+                             phone_npu_banked_ready_regions.count(
+                                 job.request.key.region) != 0)) {
                         return true;
                     }
                 }
@@ -8967,7 +8973,13 @@ void rpc_server::phone_auto_compute_loop() {
                         ggml_phone_auto::can_compute(
                                 next->second, job.request.key.chunk) &&
                         job.state == phone_auto_status::PREPARED &&
-                            phone_npu_preload_ready_locked(job)) {
+                            phone_npu_preload_ready_locked(job) &&
+                            (!phone_npu_banked_enabled ||
+                             !ggml_phone_npu_serial::htp_region(
+                                 phone_npu_serial_regions,
+                                 job.request.key.region) ||
+                             phone_npu_banked_ready_regions.count(
+                                 job.request.key.region) != 0)) {
                     task = item.second;
                     job.state = phone_auto_status::COMPUTING;
                     break;
@@ -9482,6 +9494,22 @@ void rpc_server::phone_auto_compute_loop() {
                 status = GGML_STATUS_FAILED;
             }
         }
+        std::optional<ggml_phone_npu_serial::weight_bank_refill>
+            bank_refill;
+        if (status == GGML_STATUS_SUCCESS && npu_task &&
+                task->graphless_owned && phone_npu_banked_enabled) {
+            std::string bank_reason;
+            if (!phone_npu_executor->finish_banked_chunk(
+                    req.key.run_id, req.key.region, req.key.chunk,
+                    bank_refill, bank_reason)) {
+                GGML_LOG_ERROR(
+                    "[NPU_BANK] event=COMPLETE_REJECT run=%" PRIu64
+                    " region=%u chunk=%u reason=%s\n",
+                    req.key.run_id, req.key.region, req.key.chunk,
+                    bank_reason.c_str());
+                status = GGML_STATUS_FAILED;
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
             task->state = status == GGML_STATUS_SUCCESS ?
@@ -9489,6 +9517,10 @@ void rpc_server::phone_auto_compute_loop() {
             if (status == GGML_STATUS_SUCCESS) {
                 ++phone_auto_next_chunk[
                     { req.key.run_id, req.key.region }];
+                if (bank_refill.has_value()) {
+                    phone_npu_bank_refill_jobs.emplace_back(
+                        req.key.run_id, *bank_refill);
+                }
             }
         }
         phone_auto_cv.notify_all();
