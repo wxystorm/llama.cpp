@@ -6,7 +6,7 @@ param(
     [Parameter(Mandatory=$true)][string]$Model,
     [Parameter(Mandatory=$true)][string]$Rpc,
     [Parameter(Mandatory=$true)][string]$PromptFile,
-    [string]$Pattern = "G2,C1,N1,A1",
+    [string]$Pattern = "G7,C1,N1,A1",
     [ValidateRange(2,4)][int]$Cycles = 3,
     [ValidateSet("16,32,64,128", "16,32,64", "32,64,128", "64")][string]$Chunks = "16,32,64,128",
     [string]$ProfileRoot = "",
