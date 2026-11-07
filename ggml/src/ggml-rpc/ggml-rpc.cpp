@@ -8012,6 +8012,125 @@ bool rpc_server::phone_owned_plan_register(
     return true;
 }
 
+// Install the Planner's immutable NPU whole-layer assignment for this RUN.
+// The model's GGUF source is already loaded by -m; only HTP weights are
+// populated here. GPUOpenCL keeps the complement of these Phone Regions.
+bool rpc_server::phone_npu_plan_configure(
+        const rpc_msg_phone_npu_plan_configure_req & request) {
+    const auto reject = [&](const std::string & reason) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_PLAN] side=phone event=CONFIGURE "
+            "run=%" PRIu64 " regions=%u reason=%s status=REJECT\n",
+            request.run_id, request.count, reason.c_str());
+        return false;
+    };
+    if (!phone_npu_plan_controlled || !phone_npu_banked_enabled ||
+            !phone_npu_executor || !phone_npu_executor->has_backend()) {
+        return reject("PLAN_CONTROLLED_BANKED_HTP_NOT_ENABLED");
+    }
+    if (request.version != 1 || request.run_id == 0 ||
+            request.count < 2 || request.count > 64) {
+        return reject("INVALID_PLAN_VERSION_RUN_OR_REGION_COUNT");
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> ordered;
+    ordered.reserve(request.count);
+    for (uint32_t i = 0; i < request.count; ++i) {
+        const uint32_t region = request.regions[i];
+        const uint32_t layer = request.layers[i];
+        if (region >= 64 || layer >= 256 ||
+                (i != 0 && (ordered.back().first >= region ||
+                            ordered.back().second >= layer))) {
+            return reject("HTP_REGIONS_OR_LAYERS_NOT_STRICTLY_ORDERED");
+        }
+        ordered.emplace_back(region, layer);
+    }
+    for (size_t i = request.count; i < 64; ++i) {
+        if (request.regions[i] != 0 || request.layers[i] != 0) {
+            return reject("NONZERO_UNUSED_WIRE_ENTRIES");
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(phone_input_mutex);
+        if (!phone_input_stream_runs.count(request.run_id) ||
+                !phone_input_staged_slots.empty()) {
+            return reject("NO_ACTIVE_INPUT_RUN_OR_INPUT_ALREADY_STAGED");
+        }
+    }
+    // Single global lock ordering: HTP before Graph before auto jobs.
+    // Never configure a model while any of its immutable Chunk Graphs or
+    // workers could still reference the existing Bank tensor addresses.
+    std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+    std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
+    std::lock_guard<std::mutex> jobs_guard(phone_auto_mutex);
+    if (phone_npu_banked_run_id != request.run_id ||
+            phone_owned_plans.count_run(request.run_id) != 0) {
+        return reject("RUN_ID_OR_GRAPH_REGISTRATION_ALREADY_STARTED");
+    }
+    for (const auto & entry : phone_auto_jobs) {
+        if (entry.second->request.key.run_id == request.run_id) {
+            return reject("RUN_ALREADY_HAS_PHONE_COMPUTE_JOBS");
+        }
+    }
+    if (!phone_npu_plan_mapping.empty() &&
+            phone_npu_plan_mapping != ordered) {
+        // Rebuilding HTP arenas while an old fixed-UID graph may still live
+        // in the Hexagon driver is unsafe. Require a new Phone server for a
+        // changed per-model Plan until targeted all-graph teardown exists.
+        return reject("PLAN_MAPPING_CHANGED_RESTART_PHONE_RPC_REQUIRED");
+    }
+    if (phone_npu_plan_mapping.empty()) {
+        size_t limit = std::numeric_limits<size_t>::max();
+        const char * cap = std::getenv("GGML_RPC_PHONE_NPU_BANK_BUDGET_MIB");
+        if (cap && *cap) {
+            char * end = nullptr;
+            const unsigned long long mib = std::strtoull(cap, &end, 10);
+            if (end == cap || *end != '\0' || mib == 0 ||
+                    mib > (unsigned long long) (SIZE_MAX / (1024 * 1024))) {
+                return reject("INVALID_PHYSICAL_BANK_BUDGET");
+            }
+            limit = (size_t) mib * 1024 * 1024;
+        }
+        std::string why;
+        std::array<size_t, 2> caps {};
+        if (!phone_npu_executor->configure_banked_model(
+                local_tensor_source, ordered, limit, why, caps)) {
+            return reject("TWO_BANK_CONFIG:" + why);
+        }
+        phone_npu_plan_mapping = ordered;
+        phone_npu_serial_regions.clear();
+        phone_npu_region_layer.clear();
+        for (const auto & [region, layer] : ordered) {
+            phone_npu_serial_regions.insert(region);
+            phone_npu_region_layer[region] = (int) layer;
+        }
+        GGML_LOG_INFO(
+            "[NPU_BANK_MEMORY] event=ALLOCATED banks=2 "
+            "a_bytes=%zu b_bytes=%zu mapped_bytes=%zu "
+            "kv=INDEPENDENT buffer=HTP_REPACK "
+            "budget_bytes=%zu allocator=RPCMEM "
+            "origin=PC_PLAN status=PASS\n",
+            caps[0], caps[1], caps[0] + caps[1], limit);
+        for (size_t rank = 0; rank < ordered.size(); ++rank) {
+            GGML_LOG_INFO(
+                "[NPU_BANK_PLAN] rank=%zu bank=%zu region=%u "
+                "layer=%u initial_resident=%d origin=PC_PLAN\n",
+                rank, rank % 2, ordered[rank].first,
+                ordered[rank].second, rank < 2 ? 1 : 0);
+        }
+    }
+    phone_npu_plan_configured_run = request.run_id;
+    phone_npu_banked_ready_regions.clear();
+    phone_npu_banked_ready_regions.insert(ordered[0].first);
+    phone_npu_banked_ready_regions.insert(ordered[1].first);
+    GGML_LOG_INFO(
+        "[PHONE_NPU_PLAN] side=phone event=CONFIGURE "
+        "run=%" PRIu64 " regions=%zu banks=2 "
+        "authority=PC_PLANNER status=PASS\n",
+        request.run_id, ordered.size());
+    phone_auto_cv.notify_all();
+    return true;
+}
+
 // Bind the actual Decode K/V storage once per Phone Region and register
 // all Chunk tasks from the immutable Plan. This never deserializes a PC Graph.
 bool rpc_server::phone_owned_kv_bind(
