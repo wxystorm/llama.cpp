@@ -402,6 +402,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
     RPC_CMD_PHONE_OWNED_KV_BIND,
     RPC_CMD_PHONE_NPU_PLAN_CONFIGURE,
+    RPC_CMD_PHONE_STAGE_PROFILE_PULL,
     RPC_CMD_COUNT,
 };
 
@@ -442,6 +443,7 @@ static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CA
 static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
 static_assert(RPC_CMD_PHONE_NPU_PLAN_CONFIGURE == 55, "Plan-driven Phone HTP config index");
+static_assert(RPC_CMD_PHONE_STAGE_PROFILE_PULL == 56, "Structured Phone Stage Profile RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -470,6 +472,34 @@ struct rpc_msg_phone_input_ack {
 struct rpc_msg_phone_input_stream_run_req {
     uint64_t run_id = 0;
     uint8_t active = 0;
+};
+
+// Small bounded pages: never transfer arbitrary log strings or unbounded
+// server-side buffers. All values are measured in the Phone's time domain.
+static constexpr uint32_t RPC_PHONE_STAGE_PROFILE_PAGE = 32;
+static constexpr size_t RPC_PHONE_STAGE_PROFILE_RUN_LIMIT = 8192;
+struct rpc_msg_phone_stage_profile_sample {
+    uint64_t run_id = 0;
+    uint32_t region = 0;
+    uint32_t chunk = 0;
+    uint32_t tokens = 0;
+    uint32_t token_begin = 0;
+    uint32_t backend = 0; // 1=HTP0, 2=GPUOpenCL
+    uint32_t status = 0;  // 1=PASS
+    double upload_ms = 0;
+    double prepare_ms = 0;
+    double compute_ms = 0;
+};
+struct rpc_msg_phone_stage_profile_req {
+    uint64_t run_id = 0;
+    uint32_t offset = 0;
+};
+struct rpc_msg_phone_stage_profile_rsp {
+    uint32_t valid = 0;
+    uint32_t total = 0;
+    uint32_t count = 0;
+    uint32_t overflow = 0;
+    rpc_msg_phone_stage_profile_sample samples[RPC_PHONE_STAGE_PROFILE_PAGE] = {};
 };
 struct rpc_msg_phone_auto_task_req {
     rpc_phone_input_key key {};
