@@ -8738,11 +8738,13 @@ void rpc_server::phone_npu_bank_refill_loop() {
         int64_t lock_acquired_us = ggml_time_us();
         const int64_t lock_begin_us = lock_acquired_us;
         bool stale_run = false;
-        if (prefetched || stage_fallback) {
+        {
+            // Every job, including host-stage failures, checks the current
+            // RUN before it can abort a different experiment.
             std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
             lock_acquired_us = ggml_time_us();
             stale_run = job.first != phone_npu_banked_run_id;
-            if (!stale_run) {
+            if (!stale_run && (prefetched || stage_fallback)) {
                 ok = phone_npu_executor->refill_banked_rank(
                     job.first, job.second, reason, load, compiled,
                     prefetched ? &staged : nullptr);
