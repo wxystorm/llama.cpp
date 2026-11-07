@@ -15,14 +15,22 @@
   strict Graph-retirement-before-refill, shared-KV residency and a single
   global HTP compute lane. There is a standalone deterministic test.
 
-**Important runtime limit:** the NPU policy is a lifecycle and memory
-module, NOT yet the real HTP weight-transfer engine. The current HTP
-executor still precompiles Graphs referencing its own permanently allocated
-weight tensors. Until those Graph references and physical weight buffers can
-be safely recycled, a plan that requires evictions is marked
-npu_streaming_required=true / npu_streaming_runtime_ready=false, and the
-saved-plan runner deliberately refuses to run it. Do not claim an
-out-of-memory model can already run on two device weight banks.
+**Experimental physical HTP dual-Bank runtime is now integrated**, opt-in only via
+`GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2`. The Phone server allocates exactly two
+mapped HTP repack-weight arenas, pre-primes the first two Regions, reserves
+all NPU KV separately, and defers later Graph compilation. When all Chunks
+from rank k have published their P2C output, the Bank Mover selectively
+retires old Graph UIDs, stages/loads rank k+2 into the same physical arena,
+recompiles its Chunk Graphs, and publishes READY. A generation counter blocks
+stale Graph reuse. Host GGUF staging may overlap other-Bank HTP compute;
+repack and Graph compilation remain serialized.
+
+**Not yet Android device-verified.** The saved-plan runner still refuses
+NPU oversubscription by default. After compiling and actually testing the
+Phone runtime, operators may explicitly set
+`--npu-banked-runtime-confirmed 1` in the offline Planner and
+`-ConfirmBankedPhoneReady` when running the saved plan. Do not claim hardware
+PASS solely because this source code is merged.
 
 ## GPU Bank Mover behavior to preserve exactly
 
@@ -43,6 +51,44 @@ out-of-memory model can already run on two device weight banks.
    Hexagon backend supports it; the present HTP compute mutex is necessary.
 6. Per-layer HTP KV stays independent and resident throughout prefill.
    Weight refill never resets or reallocates KV.
+
+## Opt-in Phone environment
+
+For the Qwen3-14B layout G9,P1,G9,P1,G9,P1,G9,P1, launch the existing
+Android Phone RPC server with these environment variables, using a locally
+available matching GGUF:
+
+~~~sh
+export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7
+export GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=9,19,29,39
+export GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2
+export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=1
+export GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS=1
+export GGML_RPC_PHONE_NPU_HOST_STAGE_MIB=512
+# Optional limit on two weight arenas only, in MiB (does NOT include KV):
+# export GGML_RPC_PHONE_NPU_BANK_BUDGET_MIB=1536
+~~~
+
+The two ordered lists MUST have the same number of entries. Each Phone
+Region is exactly one Qwen3 layer. The GGUF loader callbacks must remain
+alive across refills. Do not combine this mode with legacy
+`GGML_RPC_PHONE_NPU_PRELOAD_ASYNC=1` and
+`GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS=1`.
+
+Expect `[NPU_BANK_MEMORY] event=ALLOCATED/KV_BOUND` and
+`[NPU_BANK] event=REFILL ... status=PASS`. Logs include the **real** HTP
+Bank/Graph/KV allocation bytes, host-stage time, repack time, compile
+time, and HTP lock wait. Hexagon's device memory query remains 0; the
+two physical Bank allocations are verified by real rpcmem + FastRPC
+allocation/mapping at startup, and later KV allocation must also succeed.
+
+Host GGUF staging is bounded (default 512 MiB). Too large a Region or
+host staging OOM triggers an explicitly logged serial-read fallback,
+rather than silently caching a third Region's weights. HTP weights are
+still repacked under the single HTP mutex.
 
 ## Build and unit test
 
@@ -110,17 +156,24 @@ plan.json property phone_npu_regions. The runner checks the model filename,
 prompt token-size hints, one-Layer-per-HTP-Region support and bank runtime
 readiness. Its planning mode is fixed apply-wide plus SkipProfile.
 
-## Accuracy and remaining physical integration
+## Accuracy and remaining verification
 
-The saved predicted_ms_lower_bound includes the existing computation,
-GPU Bank streaming and C2P/P2C DAG model. **It does not yet simulate the
-NPU weight refill critical path.** Its purpose is candidate ranking, not
-a validated oversubscribed NPU latency forecast.
+The saved `predicted_ms_lower_bound` currently excludes the real HTP
+refill critical path. It ranks candidates but is NOT a validated speed
+prediction for oversubscribed NPU execution.
 
-Next implement the physical HTP A/B arenas, host-stage queue and
-repack/upload worker, rank-k drain and P2C completion barrier, Hexagon
-fixed-Graph invalidation/rebind, and true READY publication. Test HTP
-weight residency under memory pressure before enabling runtime streaming.
-Then measure refill queue wait, CPU-stage, HTP-upload, graph compilation
-and exposed/hidden refill time, and incorporate those measurements into
-the offline DAG simulator.
+Device QA needed before enabling saved plans for large models:
+1. Cross-compile Phone Hexagon + PC from this branch; run HTP double-Bank
+   with 4+ NPU Regions, inspect `REFILL` and `NPU_BANK_MEMORY`.
+2. Compare logits with the non-banked Qwen3 reference and confirm one
+   compute per Chunk, complete P2C, KV sync and Decode correctness.
+3. Run twice in the SAME Phone server to verify re-prime, old UID removal
+   and stale refill cancellation. Deliberately request a too-small Bank
+   budget and confirm startup fails without launching inference.
+4. Compare 128/256/512/1024 prompts. Measure `host_stage_ms`,
+   `repack_ms`, `compile_ms`, `htp_lock_wait_ms` and exposed Bank wait.
+5. Ensure unbanked Phone mode remains unchanged with the opt-in disabled.
+
+Only after collecting these timings should the offline DAG simulator
+model HTP bank refill overlap and bottlenecks; it currently models the
+two-Bank *capacity*, not the transfer schedule.
