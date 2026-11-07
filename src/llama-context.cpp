@@ -6909,6 +6909,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         size_t phone_push_accepted = 0;
         size_t phone_push_applied = 0;
         size_t phone_push_auto_delegated = 0;
+        size_t phone_push_local_skipped = 0;
         size_t phone_push_missed = 0;
         uint64_t phone_push_bytes = 0;
         // Stream input transport: the READY producer never calls send().
@@ -7031,7 +7032,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         {
                             std::lock_guard<std::mutex> lock(phone_push_mutex);
                             phone_push_state[job.region][job.chunk] = 1;
-                            ++phone_push_auto_delegated;
+                            ++phone_push_local_skipped;
                         }
                         phone_push_cv.notify_all();
                         LLAMA_LOG_INFO(
@@ -8486,13 +8487,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             LLAMA_LOG_INFO(
                 "[PHONE_INPUT_PUSH] event=SUMMARY run=%" PRIu64
-                " accepted=%zu applied=%zu delegated=%zu fallback=%zu abandoned=%zu"
+                " accepted=%zu applied=%zu delegated=%zu local_skipped=%zu"
+                " fallback=%zu abandoned=%zu"
                 " upload_mib=%.3f push_wall_ms=%.3f worker_wait_ms=%.3f"
                 " thread_started=%d status=%s\n",
                 phone_input_push_run_id,
                 phone_push_accepted, phone_push_applied,
-                phone_push_auto_delegated, phone_push_missed,
-                abandoned, phone_push_bytes / 1048576.0,
+                phone_push_auto_delegated, phone_push_local_skipped,
+                phone_push_missed, abandoned, phone_push_bytes / 1048576.0,
                 phone_push_wall_us / 1000.0, phone_push_wait_us / 1000.0,
                 phone_push_thread_started ? 1 : 0,
                 ready.failed() ? "FAIL" : "PASS");
@@ -8818,6 +8820,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << (phone_input_push_enabled ? "true" : "false")
                             << ",\"phone_input_push_accepted\":" << phone_push_accepted
                             << ",\"phone_input_push_applied\":" << phone_push_applied
+                            << ",\"phone_input_push_local_skipped\":" << phone_push_local_skipped
                             << ",\"phone_input_push_fallback\":" << phone_push_missed
                             << ",\"phone_input_push_mib\":" << phone_push_bytes / 1048576.0
                             << ",\"phone_input_push_wall_ms\":" << phone_push_wall_us / 1000.0
