@@ -4839,12 +4839,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS");
         if (!llama_region_ring_parse_region_ids(
                 region_spec, phone_mixed_htp_regions) ||
-                phone_mixed_htp_regions.size() < 2 ||
+                phone_mixed_htp_regions.size() != 2 ||
                 graphless_requested || !phone_auto_final_enabled) {
             LLAMA_LOG_ERROR(
                 "[PHONE_MIXED_BACKENDS] status=REJECT "
                 "reason=INVALID_HTP_REGION_LIST_OR_GRAPHLESS_CONFIG "
-                "required=PHONE_AUTO_FINAL_PC_BUILT_NPU_REGIONS_AT_LEAST_2\n");
+                "required=PHONE_AUTO_FINAL_PC_BUILT_EXACTLY_2_HTP_REGIONS\n");
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
