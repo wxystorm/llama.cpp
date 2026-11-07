@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Profile-only four-backend whole-layer Ring planner (offline, not executable).
 
-Cycle: PC_CUDA -> PC_CPU(optional) -> Phone_HTP -> Phone_OpenCL.
+Cycle: PC_CUDA(optional) -> PC_CPU(optional) -> Phone_HTP(optional) -> Phone_OpenCL(optional).
 NPU overflow spills a contiguous suffix into Phone OpenCL; do not reject
 until both Phone memory budgets and the shared physical budget are checked.
 Exact event DAG models per-device compute lanes, boundary copies, PC CUDA
@@ -135,7 +135,7 @@ class Cycle:
     a: int
 
     def __post_init__(self):
-        if min(self.g, self.c, self.n, self.a) < 0 or self.g == 0:
+        if min(self.g, self.c, self.n, self.a) < 0 or self.layers == 0:
             raise ValueError("INVALID_CYCLE")
 
     @property
@@ -165,9 +165,10 @@ def memory(cycles, b, m):
     g_rank = n_rank = 0
     ng = nn = na = 0
     for c in cycles:
-        g_banks[g_rank % 2] = max(g_banks[g_rank % 2], c.g * b["gpu_weight_layer_mib"])
-        g_rank += 1
-        ng += c.g
+        if c.g:
+            g_banks[g_rank % 2] = max(g_banks[g_rank % 2], c.g * b["gpu_weight_layer_mib"])
+            g_rank += 1
+            ng += c.g
         if c.n:
             n_banks[n_rank % 2] = max(n_banks[n_rank % 2], c.n * b["npu_weight_layer_mib"])
             n_rank += 1
@@ -177,9 +178,9 @@ def memory(cycles, b, m):
     # NPU device Bank allocations. Rank 0/1 are already primed before RUN.
     n_weight_regions = [c.n * b["npu_weight_layer_mib"] for c in cycles if c.n]
     host_stage_peak = max(n_weight_regions[2:], default=0.)
-    pg = sum(g_banks) + ng*b["gpu_kv_layer_mib"] + b["gpu_scratch_mib"]
-    np = sum(n_banks) + nn*b["npu_kv_layer_mib"] + b["npu_scratch_mib"]
-    ap = na*m["phone_gpu_weight_layer_mib"] + na*m["phone_gpu_kv_layer_mib"] + m["phone_gpu_scratch_mib"]
+    pg = sum(g_banks) + ng*b["gpu_kv_layer_mib"] + (b["gpu_scratch_mib"] if ng else 0.)
+    np = sum(n_banks) + nn*b["npu_kv_layer_mib"] + (b["npu_scratch_mib"] if nn else 0.)
+    ap = na*m["phone_gpu_weight_layer_mib"] + na*m["phone_gpu_kv_layer_mib"] + (m["phone_gpu_scratch_mib"] if na else 0.)
     shared = np + ap + host_stage_peak
     fits = (pg <= b["gpu_budget_mib"] + 1e-9 and
             np <= b["npu_budget_mib"] + 1e-9 and
@@ -190,17 +191,75 @@ def memory(cycles, b, m):
 
 
 def split_phone(gcp, base, mix, max_npu):
-    """Enumerate feasible NPU -> Phone GPU suffix spill, do not pre-reject."""
+    """Enumerate HTP prefixes and Adreno suffixes before memory pruning.
+
+    No physical compute engine is required in every Cycle. N=0 and A=0
+    are legitimate choices.
+    """
+    if max_npu < 0 or not gcp or any(
+            min(g, cpu, phone) < 0 or g + cpu + phone == 0
+            for g, cpu, phone in gcp):
+        raise ValueError("INVALID_PHONE_SPLIT_GEOMETRY")
     ranges = [range(min(max_npu, p) + 1) for g,c,p in gcp]
     for ranks in itertools.product(*ranges):
-        if not any(ranks):
-            continue
         cycles = [Cycle(g, cpu, n, p-n) for (g,cpu,p), n in zip(gcp, ranks)]
-        if not any(x.a for x in cycles):
-            continue
         mem = memory(cycles, base, mix)
         if mem.fits:
             yield cycles, mem
+
+
+def handoff_route(src: str, dst: str):
+    """Conservative activation route across the next actual nonzero stage."""
+    pc = ("G", "C")
+    phone = ("N", "A")
+    if src not in pc + phone or dst not in pc + phone:
+        raise ValueError("INVALID_HANDOFF_BACKEND")
+    if src == dst and src in pc:
+        return "SAME_PC_BACKEND", None
+    if src in pc and dst in pc:
+        return ("PC_CPU_TO_CUDA", "pc_h2d") if src == "C" and dst == "G" else ("PC_LOCAL", "pc_local")
+    if src in pc:
+        return "C2P", "pc_to_phone"
+    if dst in pc:
+        return "P2C", "phone_to_pc"
+    if src == "N" and dst == "A":
+        return "HTP_TO_ADRENO", "phone_gpu"
+    # Separate Phone Graphs cannot assume zero-copy, even on the same engine.
+    return "PHONE_LOCAL", "phone_local"
+
+
+def execution_stage_graph(cycles):
+    """Ordered physical Regions/edges, without zero-depth phantom Regions.
+
+    A schema=2 metadata contract, NOT an implemented N->A RPC runtime.
+    """
+    stages = []
+    next_layer = 0
+    for cycle_index, cycle in enumerate(cycles):
+        for backend, depth in (("G", cycle.g), ("C", cycle.c),
+                               ("N", cycle.n), ("A", cycle.a)):
+            if depth == 0:
+                continue
+            if backend == "N" and depth != 1:
+                raise ValueError("HTP_RUNTIME_P1_ONLY")
+            stages.append({
+                "region": len(stages),
+                "cycle": cycle_index,
+                "backend": backend,
+                "first_layer": next_layer,
+                "last_layer_exclusive": next_layer + depth,
+            })
+            next_layer += depth
+    edges = []
+    for source, target in zip(stages, stages[1:]):
+        kind, lane = handoff_route(source["backend"], target["backend"])
+        edges.append({
+            "from_region": source["region"],
+            "to_region": target["region"],
+            "handoff": kind,
+            "resource_lane": lane,
+        })
+    return stages, edges
 
 
 @dataclass
