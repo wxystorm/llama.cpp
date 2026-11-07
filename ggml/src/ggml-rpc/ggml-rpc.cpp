@@ -13,6 +13,7 @@
 #include "phone-stage-binding-map.h"
 #include "phone-autonomous-policy.h"
 #include "phone-npu-serial-policy.h"
+#include "phone-mixed-pipeline-policy.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-execution-plan.h"
 
@@ -5875,6 +5876,23 @@ public:
             std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL");
         const bool mixed_opencl_enabled = mixed_opencl_env != nullptr &&
             std::strcmp(mixed_opencl_env, "1") == 0;
+        // Two independent compute lanes are opt-in. Refuse unsupported
+        // configurations before any worker thread becomes joinable.
+        const char * pipeline_env =
+            std::getenv("GGML_RPC_PHONE_NPU_GPU_PIPELINE");
+        if (pipeline_env != nullptr && *pipeline_env &&
+                std::strcmp(pipeline_env, "0") != 0 &&
+                std::strcmp(pipeline_env, "1") != 0) {
+            throw std::runtime_error(
+                "GGML_RPC_PHONE_NPU_GPU_PIPELINE expects 0 or 1");
+        }
+        phone_auto_dual_lane_enabled = pipeline_env != nullptr &&
+            std::strcmp(pipeline_env, "1") == 0;
+        if (phone_auto_dual_lane_enabled && !mixed_opencl_enabled) {
+            throw std::runtime_error(
+                "Phone NPU/GPU pipeline requires "
+                "GGML_RPC_PHONE_NPU_MIXED_OPENCL=1");
+        }
         if (mixed_opencl_enabled) {
             const auto enabled = [](const char * name) {
                 const char * value = std::getenv(name);
@@ -6101,7 +6119,16 @@ public:
         phone_auto_prepare_thread =
             std::thread([this]() { phone_auto_prepare_loop(); });
         phone_auto_compute_thread =
-            std::thread([this]() { phone_auto_compute_loop(); });
+            std::thread([this]() { phone_auto_compute_loop(false); });
+        if (phone_auto_dual_lane_enabled) {
+            phone_auto_compute_htp_thread =
+                std::thread([this]() { phone_auto_compute_loop(true); });
+            GGML_LOG_INFO(
+                "[PHONE_MIXED_PIPELINE] event=START "
+                "mode=DUAL_COMPUTE_LANES htp_workers=1 gpu_workers=1 "
+                "prepare_workers=1 dependency=PER_REGION_CHUNK_FIFO "
+                "input=VERIFIED_PUSH p2c=ARENA status=READY\n");
+        }
         if (phone_npu_banked_enabled) {
             phone_npu_bank_thread = std::thread(
                 [this]() { phone_npu_bank_refill_loop(); });
@@ -6145,7 +6172,7 @@ public:
         const rpc_phone_input_key & key,
         const phone_chunk_input_timing & timing);
     void phone_auto_prepare_loop();
-    void phone_auto_compute_loop();
+    void phone_auto_compute_loop(bool htp_lane_only);
     void phone_npu_bank_refill_loop();
     void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
@@ -6429,8 +6456,9 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
 
-    // One private HTP backend and one phone-owned compute thread. Explicit
-    // regions are evaluated on HTP instead of GPU, never concurrently.
+    // One private HTP backend plus an optional dedicated HTP compute lane.
+    // GPUOpenCL and HTP use distinct device/graph locks, allowing different
+    // verified Chunks to execute concurrently. Per-Region KV FIFO is shared.
     std::set<uint32_t> phone_npu_serial_regions;
     std::unordered_map<uint32_t, int> phone_npu_region_layer;
     // Immutable shadow plans, guarded by graph_compute_mutex.
@@ -6440,6 +6468,7 @@ private:
         phone_npu_executor;
     bool phone_npu_async_preload = false;
     bool phone_npu_banked_enabled = false;
+    bool phone_auto_dual_lane_enabled = false;
     // Owned by HTP mutex: stale dequeued refills from an earlier RUN may
     // never write into a freshly re-primed Bank.
     uint64_t phone_npu_banked_run_id = 0;
@@ -6565,6 +6594,7 @@ private:
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
+    std::thread phone_auto_compute_htp_thread;
     std::thread phone_npu_preload_thread;
     std::map<std::pair<uint64_t, uint32_t>, phone_npu_preload_job>
         phone_npu_preload_jobs; // guarded by phone_auto_mutex
@@ -9171,7 +9201,7 @@ void rpc_server::phone_auto_prepare_loop() {
     }
 }
 
-void rpc_server::phone_auto_compute_loop() {
+void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
     for (;;) {
         std::shared_ptr<phone_auto_job> task;
         {
@@ -9180,6 +9210,13 @@ void rpc_server::phone_auto_compute_loop() {
                 if (phone_auto_stop) { return true; }
                 for (const auto & item : phone_auto_jobs) {
                     const auto & job = *item.second;
+                    if (!ggml_phone_mixed_pipeline::lane_accepts(
+                            phone_auto_dual_lane_enabled, htp_lane_only,
+                            ggml_phone_npu_serial::htp_region(
+                                phone_npu_serial_regions,
+                                job.request.key.region))) {
+                        continue;
+                    }
                     const auto next = phone_auto_next_chunk.find(
                         { job.request.key.run_id, job.request.key.region });
                     if (next != phone_auto_next_chunk.end() &&
@@ -9201,6 +9238,13 @@ void rpc_server::phone_auto_compute_loop() {
             if (phone_auto_stop) { return; }
             for (const auto & item : phone_auto_jobs) {
                 auto & job = *item.second;
+                if (!ggml_phone_mixed_pipeline::lane_accepts(
+                        phone_auto_dual_lane_enabled, htp_lane_only,
+                        ggml_phone_npu_serial::htp_region(
+                            phone_npu_serial_regions,
+                            job.request.key.region))) {
+                    continue;
+                }
                 const auto next = phone_auto_next_chunk.find(
                     { job.request.key.run_id, job.request.key.region });
                 if (next != phone_auto_next_chunk.end() &&
@@ -9228,6 +9272,15 @@ void rpc_server::phone_auto_compute_loop() {
         // L39. Wait for HTP without retaining the Graph registry lock.
         const bool npu_task = ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, req.key.region);
+        if (phone_auto_dual_lane_enabled) {
+            GGML_LOG_INFO(
+                "[PHONE_MIXED_PIPELINE] event=COMPUTE_BEGIN "
+                "run=%" PRIu64 " region=%u chunk=%u backend=%s "
+                "phone_us=%" PRId64 " worker=%s status=ACTIVE\n",
+                req.key.run_id, req.key.region, req.key.chunk,
+                npu_task ? "HTP0" : "GPUOpenCL", task->compute_begin_us,
+                htp_lane_only ? "HTP" : "OPENCL");
+        }
         const char * stage_profile_env =
             std::getenv("GGML_RPC_PHONE_NPU_STAGE_PROFILE");
         const char * local_only_env =
@@ -9717,6 +9770,16 @@ void rpc_server::phone_auto_compute_loop() {
         }
         } // legacy PC-registered Graph path
         task->compute_end_us = ggml_time_us();
+        if (phone_auto_dual_lane_enabled) {
+            GGML_LOG_INFO(
+                "[PHONE_MIXED_PIPELINE] event=COMPUTE_END "
+                "run=%" PRIu64 " region=%u chunk=%u backend=%s "
+                "phone_us=%" PRId64 " compute_ms=%.3f status=%s\n",
+                req.key.run_id, req.key.region, req.key.chunk,
+                npu_task ? "HTP0" : "GPUOpenCL", task->compute_end_us,
+                (task->compute_end_us - task->compute_begin_us) / 1000.0,
+                status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        }
         if (status == GGML_STATUS_SUCCESS) {
             // This is the Phone-owned publication event: no PC per-Chunk
             // WAIT_CAPTURE command, and no PC Meta graph rebuild. The
@@ -14436,6 +14499,9 @@ rpc_server::~rpc_server() {
     }
     if (phone_auto_compute_thread.joinable()) {
         phone_auto_compute_thread.join();
+    }
+    if (phone_auto_compute_htp_thread.joinable()) {
+        phone_auto_compute_htp_thread.join();
     }
     if (phone_npu_preload_thread.joinable()) {
         phone_npu_preload_thread.join();
