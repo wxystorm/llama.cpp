@@ -2088,7 +2088,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  bool                     embedding_only,
                                                  bool                     preserve_weight_cache_on_reset,
                                                  bool *                   graph_reused_out,
-                                                 llama_hybrid_stage_timing * stage_timing_out) {
+                                                 llama_hybrid_stage_timing * stage_timing_out,
+                                                 bool                     defer_output_head) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -2139,7 +2140,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         gparams.hybrid_hidden_input  =
             stage->layer_begin > 0 || force_hidden_input;
         gparams.hybrid_output_head   =
-            !embedding_only && stage->layer_end == n_layer;
+            !embedding_only && !defer_output_head &&
+            stage->layer_end == n_layer;
         gparams.hybrid_wave_probe    = stage->wave_probe;
         gparams.hybrid_embedding_only = embedding_only;
     }
@@ -2632,7 +2634,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_cuda_wait_us,
         bool                               preserve_weight_cache_on_graph_reset,
         bool                               phone_prebuilt_graph,
-        bool                               phone_auto_wait) {
+        bool                               phone_auto_wait,
+        bool                               defer_output_head) {
     llama_region_ring_tls_p2c_deferred = {};
     GGML_ASSERT(!phone_auto_wait || (ring_lane == 2 && phone_prebuilt_graph));
     // Scoped to a single synchronous Scheduler prepare_split call. Other
@@ -2762,7 +2765,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             stage_input != nullptr, false,
             preserve_weight_cache_on_graph_reset,
             timing != nullptr ? &timing->graph_reused : nullptr,
-            timing);
+            timing, defer_output_head);
     }
     if (timing != nullptr) {
         const int64_t prepare_end_us = ggml_time_us();
@@ -3997,7 +4000,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // the final output into the canonical graph result/scheduler.
         if (!device_fifo_simulation || sched_use != sched.get() ||
             res_use != gf_res_prev.get() ||
-            regions.back().device != llama_region_ring_device::PHONE) {
+            (regions.back().device != llama_region_ring_device::PHONE &&
+             !(std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL") &&
+               std::strcmp(std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL"), "1") == 0))) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_RESOURCE] status=REJECT reason=UNSAFE_FINAL_OUTPUT_OWNER\n");
             ret = GGML_STATUS_FAILED;
@@ -4804,7 +4809,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         threaded_execution && pc_phone_overlap && own_stage_resources &&
         task_local_graph_outputs && !directional_runtime &&
         !stages.empty() &&
-        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE &&
+        (stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE ||
+         (std::count_if(stages.begin(), stages.end(), [](const auto & stage) {
+             return stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
+         }) >= 2 &&
+          (stages.back().kind == llama_hybrid_runtime_stage_kind::GPU ||
+           stages.back().kind == llama_hybrid_runtime_stage_kind::CPU))) &&
         ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
         !ubatch.equal_seqs() && ubatch.output != nullptr &&
         worker_kv_views[2] != nullptr && backend_ptrs.size() == 3 &&
@@ -7236,6 +7246,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const bool first = task.region == 0;
                     const bool last = task.region + 1 == stages.size();
                     const auto & stage = stages[task.region];
+                    // A PC terminal publishes its hidden vector into the
+                    // existing host buffer. The separate PC CPU Head follows
+                    // once every Chunk and Phone P2C frame has completed.
+                    if (last && phone_auto_final_enabled &&
+                            stage.kind != llama_hybrid_runtime_stage_kind::PHONE &&
+                            task_trace != nullptr) {
+                        task_trace->output_kind = 1;
+                    }
                     if (slot_pool_size > 0 &&
                         ((!first && task.input_slot < 0) ||
                          (!last && task.output_slot < 0))) {
@@ -7698,7 +7716,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     pc_phone_overlap ? &state.cuda_wait_us : nullptr,
                                     dev == 1 && gpu_weight_streaming &&
                                         gpu_bank_resident,
-                                    phone_prebuilt_task, false);
+                                    phone_prebuilt_task, false,
+                                    last && phone_auto_final_enabled &&
+                                    stage.kind != llama_hybrid_runtime_stage_kind::PHONE);
                             }
                             const int64_t compute_end_us = ggml_time_us();
                             if (task_trace != nullptr) {
