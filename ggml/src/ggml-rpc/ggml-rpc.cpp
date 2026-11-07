@@ -7450,6 +7450,7 @@ bool rpc_server::phone_input_stream_run(
                             "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK "
                             "run=%" PRIu64 " region=%u chunk=%u "
                             "tokens=%u token_begin=%u "
+                            "backend=%s "
                             "verified_to_upload_ms=%.3f upload_ms=%.3f "
                             "prepare_ms=%.3f prepare_queue_ms=%.3f "
                             "compute_queue_ms=%.3f compute_ms=%.3f "
@@ -7457,6 +7458,9 @@ bool rpc_server::phone_input_stream_run(
                             request.run_id, job.request.key.region,
                             job.request.key.chunk, job.request.n_tokens,
                             job.request.token_begin,
+                            ggml_phone_npu_serial::htp_region(
+                                phone_npu_serial_regions,
+                                job.request.key.region) ? "HTP0" : "GPUOpenCL",
                             millis(job.verified_us, job.upload_begin_us),
                             millis(job.upload_begin_us, job.upload_done_us),
                             prep_service,
@@ -7982,9 +7986,18 @@ bool rpc_server::phone_auto_task_register(
     }
     const char * graphless_env =
         std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
+    // Experimental mixed whole-layer mode: ordinary Phone Regions still
+    // execute their PC-built RPC GPUOpenCL graphs. HTP P1 Regions also keep
+    // their PC graph as *metadata* while local-only HTP owns the actual
+    // computation and KV. Do not relax this contract in the default mode.
+    const char * mixed_env =
+        std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL");
+    const bool mixed_phone = mixed_env != nullptr &&
+        std::strcmp(mixed_env, "1") == 0 && phone_npu_banked_enabled;
     if (graphless_env && std::strcmp(graphless_env, "1") == 0 &&
             ggml_phone_npu_serial::htp_region(
-                phone_npu_serial_regions, request.key.region)) {
+                phone_npu_serial_regions, request.key.region) &&
+            !mixed_phone) {
         return reject("GRAPHLESS_REJECTS_PC_TASK_REGISTER");
     }
     // Register the local graph contract before accepting A/B execution.
@@ -9645,6 +9658,16 @@ void rpc_server::phone_auto_compute_loop() {
                     it->second, &*task->prepared);
                 if (computed.has_value()) {
                     status = *computed;
+                    if (std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL") != nullptr &&
+                            std::strcmp(std::getenv(
+                                "GGML_RPC_PHONE_NPU_MIXED_OPENCL"), "1") == 0) {
+                        GGML_LOG_INFO(
+                            "[PHONE_MIXED_BACKENDS] event=EXECUTE "
+                            "region=%u chunk=%u tokens=%u backend=GPUOpenCL "
+                            "status=%s\n",
+                            req.key.region, req.key.chunk, req.n_tokens,
+                            status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+                    }
                 } else {
                     // Fail closed, do not recompute on an unbound graph.
                     std::lock_guard<std::mutex> slot_guard(
@@ -9682,7 +9705,12 @@ void rpc_server::phone_auto_compute_loop() {
         std::optional<ggml_phone_npu_serial::weight_bank_refill>
             bank_refill;
         if (status == GGML_STATUS_SUCCESS && npu_task &&
-                task->graphless_owned && phone_npu_banked_enabled) {
+                (task->graphless_owned ||
+                 (phone_npu_banked_enabled &&
+                  std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL") != nullptr &&
+                  std::strcmp(std::getenv(
+                      "GGML_RPC_PHONE_NPU_MIXED_OPENCL"), "1") == 0 &&
+                  local_only)) && phone_npu_banked_enabled) {
             std::string bank_reason;
             if (!phone_npu_executor->finish_banked_chunk(
                     req.key.run_id, req.key.region, req.key.chunk,
