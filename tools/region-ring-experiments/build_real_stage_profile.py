@@ -49,7 +49,13 @@ def profile_lines(path: Path, substring: str) -> list[dict[str, str]]:
             if substring in line]
 
 
-def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tuple[list[dict], dict]:
+def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False,
+            target_only: bool = False) -> tuple[list[dict], dict]:
+    """target_only: extract the measured backend/depth from each matrix probe.
+
+    The running topology still contains the minimum G/C/N/A feeder stages.
+    This selector does NOT claim that other devices were idle.
+    """
     # Legacy manual Phone-log input remains supported. Patch32 automatically
     # writes Phone measurements into each PC case's engine.stderr.log, so
     # --rpc-log is optional and never needs to be copied from Android.
@@ -67,6 +73,16 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
                 phone_missing=0, setup_missing=0, trace_missing=0,
                 backend_missing=0)
     for case in cases:
+        target_device = None
+        target_layers = None
+        if target_only:
+            match = re.search(r"backend-([GCNA])-L([1-9][0-9]*)",
+                              str(case).replace("\\", "/"))
+            if not match:
+                raise ValueError("MATRIX_PROBE_TARGET_NOT_FOUND:" + str(case))
+            target_device = {"G": "GPU", "C": "CPU",
+                             "N": "PHONE", "A": "PHONE_GPU"}[match[1]]
+            target_layers = int(match[2])
         # Only finished PASS probes are valid anchors for ranking. A failed
         # run can contain plausible-looking partial Chunk timing records.
         result_file = case / "result.json"
@@ -195,6 +211,10 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
                 s.update(upload_ms=val[0], prepare_ms=val[1],
                          compute_ms=val[2], setup_ms=registration,
                          kv_tokens=kv, terminal=terminal)
+            if target_only and (
+                    s["device"] != target_device or
+                    s["layers"] != target_layers):
+                continue
             diag[s["device"].lower()] += 1
             samples.append(s)
     return samples, diag
@@ -223,9 +243,12 @@ def main() -> int:
                         help="legacy optional Phone log; Patch32 pulls samples into PC logs automatically")
     parser.add_argument("--mixed", action="store_true",
                         help="Require HTP0/GPUOpenCL labels and keep PHONE_GPU distinct")
+    parser.add_argument("--target-only", action="store_true",
+                        help="For backend-G/C/N/A-L# matrix probes, discard feeder Stage rows")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    raw, diag = extract(case_dirs(args.run), args.rpc_log, mixed=args.mixed)
+    raw, diag = extract(case_dirs(args.run), args.rpc_log,
+                        mixed=args.mixed, target_only=args.target_only)
     points = aggregate(raw)
     if not points:
         parser.error("no real Stage rows; enable task trace and Stage logging")
