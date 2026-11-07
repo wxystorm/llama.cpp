@@ -6268,7 +6268,6 @@ public:
         const phone_chunk_input_timing & timing);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop(bool htp_lane_only);
-    bool phone_local_handoff_publish(const phone_auto_job & source);
     void phone_npu_bank_refill_loop();
     void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
@@ -6471,6 +6470,7 @@ private:
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
     };
+    bool phone_local_handoff_publish(const phone_auto_job & source);
     enum class phone_npu_preload_status : uint8_t {
         QUEUED, RUNNING, READY, FAILED,
     };
