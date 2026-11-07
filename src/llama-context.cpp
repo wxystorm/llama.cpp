@@ -4865,12 +4865,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS");
         if (!llama_region_ring_parse_region_ids(
                 region_spec, phone_mixed_htp_regions) ||
-                phone_mixed_htp_regions.size() != 2 ||
+                phone_mixed_htp_regions.size() < 2 ||
                 graphless_requested || !phone_auto_final_enabled) {
             LLAMA_LOG_ERROR(
                 "[PHONE_MIXED_BACKENDS] status=REJECT "
                 "reason=INVALID_HTP_REGION_LIST_OR_GRAPHLESS_CONFIG "
-                "required=PHONE_AUTO_FINAL_PC_BUILT_EXACTLY_2_HTP_REGIONS\n");
+                "required=PHONE_AUTO_FINAL_PC_BUILT_AT_LEAST_2_HTP_REGIONS\n");
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
@@ -5673,6 +5673,53 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR("[PHONE_INPUT_STREAM] event=INIT status=FAIL reason=UNSUPPORTED_OR_INELIGIBLE\n");
             ret = GGML_STATUS_FAILED;
             return nullptr;
+        }
+        // The *runtime's selected Plan* is the sole authority for HTP
+        // Region/Layer assignment. This RPC runs after the Phone input
+        // session START, but before any Phone-owned Graph/KV/Chunk is bound.
+        // There is no user-maintained Region/Layer list on the Phone.
+        if (phone_mixed_requested && ubatch.n_tokens >= 32) {
+            auto * plan_rpc_dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * plan_rpc_reg = plan_rpc_dev != nullptr ?
+                ggml_backend_dev_backend_reg(plan_rpc_dev) : nullptr;
+            const auto configure = plan_rpc_reg != nullptr ?
+                reinterpret_cast<ggml_backend_rpc_phone_npu_plan_configure_t>(
+                    ggml_backend_reg_get_proc_address(
+                        plan_rpc_reg,
+                        GGML_BACKEND_RPC_PHONE_NPU_PLAN_CONFIGURE_PROC)) :
+                nullptr;
+            std::vector<ggml_backend_rpc_phone_npu_region_layer> mapping;
+            mapping.reserve(phone_mixed_htp_regions.size());
+            for (uint32_t region : phone_mixed_htp_regions) {
+                if (region >= stages.size() ||
+                        stages[region].kind !=
+                            llama_hybrid_runtime_stage_kind::PHONE ||
+                        stages[region].layer_begin < 0 ||
+                        stages[region].layer_end !=
+                            stages[region].layer_begin + 1) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_NPU_PLAN] side=pc status=REJECT "
+                        "region=%u reason=INVALID_HTP_P1_LAYER\n", region);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                mapping.push_back({region,
+                    (uint32_t) stages[region].layer_begin});
+            }
+            const bool installed = phone_input_stream_enabled &&
+                configure != nullptr && !mapping.empty() &&
+                configure(phone_rpc_backend, phone_input_push_run_id,
+                          mapping.data(), mapping.size());
+            LLAMA_LOG_INFO(
+                "[PHONE_NPU_PLAN] side=pc event=INSTALL "
+                "run=%" PRIu64 " htp_regions=%zu "
+                "source=RUNTIME_SELECTED_REGION_MAP status=%s\n",
+                phone_input_push_run_id, mapping.size(),
+                installed ? "PASS" : "FAIL");
+            if (!installed) {
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
         }
         const bool phone_input_push_enabled =
             phone_input_stream_enabled ||
