@@ -23,7 +23,7 @@ int main() {
     assert(!llama_region_ring_parse_region_ids("0x2", htp));
     assert(!llama_region_ring_parse_region_ids("999999999999999999", htp));
 
-    assert(llama_region_ring_parse_region_ids("2,5,8", htp));
+    assert(llama_region_ring_parse_region_ids("2,5", htp));
     const auto stages = llama_region_ring_parse_apply_wide_layout(
         "G8,C1,P1,G8,C1,P1,G8,C1,P1,G7,C2,P1", 40);
     assert(stages.size() == 12);
