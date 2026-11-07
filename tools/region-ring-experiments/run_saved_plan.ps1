@@ -40,12 +40,15 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
             $stages.Count -gt 16) {
         throw "Invalid schema-2 Cycle or Region count."
     }
-    foreach ($cy in $cycles) {
+    for ($cyIndex=0; $cyIndex -lt $cycles.Count; $cyIndex++) {
+        $cy=$cycles[$cyIndex]
+        $phoneDepth=[int]$cy.phone_npu + [int]$cy.phone_gpu
+        $pcTail=($cyIndex -eq $cycles.Count - 1 -and $phoneDepth -eq 0)
         if ([int]$cy.pc_gpu -lt 1 -or [int]$cy.pc_cpu -lt 0 -or
                 [int]$cy.phone_npu -lt 0 -or [int]$cy.phone_npu -gt 1 -or
                 [int]$cy.phone_gpu -lt 0 -or
-                [int]$cy.phone_npu + [int]$cy.phone_gpu -lt 1) {
-            throw "Unsupported schema-2 Runtime Cycle; each Cycle requires GPU-first and Phone-final, optional CPU, HTP P1."
+                ($phoneDepth -lt 1 -and !$pcTail)) {
+            throw "Unsupported schema-2 Runtime Cycle: G-first, optional CPU, HTP P1, optional last PC tail."
         }
     }
     $currentLayer = 0
@@ -78,8 +81,8 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
     if ($currentLayer -ne [int]$p.layers -or
             $htp.Count -lt 2 -or $adreno.Count -lt 1 -or
             $stages[0].backend -ne 'G' -or
-            @('N','A') -notcontains [string]$stages[-1].backend) {
-        throw "Schema-2 model coverage, two-Bank HTP or final Phone owner not satisfied."
+            @('G','C','N','A') -notcontains [string]$stages[-1].backend) {
+        throw "Schema-2 model coverage, two-Bank HTP or final backend invalid."
     }
     $localEdges = @($edges | Where-Object { $_.handoff -eq 'HTP_TO_ADRENO' })
     if ($localEdges.Count -lt 1) {
@@ -116,7 +119,7 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
     $npuRegions = (@($htp | ForEach-Object { [string]$_.region })) -join ','
     $x = [int]$p.chunk_tokens
     if ($x -notin @(16,32,64,128)) { throw "Unsupported shared Chunk width." }
-    Write-Host "[PHONE_LOCAL_HANDOFF] phase=APPLY layout=$layout npu_regions=$npuRegions local_links=$($localEdges.Count) chunk=$x status=EXPERIMENTAL"
+    Write-Host "[PHONE_LOCAL_HANDOFF] phase=APPLY layout=$layout terminal=$($stages[-1].backend) npu_regions=$npuRegions local_links=$($localEdges.Count) chunk=$x status=EXPERIMENTAL"
     # These PC settings are model/runtime capabilities. The actual Phone NPU
     # layer mapping travels in the Patch32 Plan RPC, not in Phone exports.
     $capabilities = @{
@@ -165,7 +168,7 @@ if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-
         if ($DryRun) { $params.DryRun = $true }
         & (Join-Path $PSScriptRoot "run_prompt_sweep.ps1") @params
         if ($LASTEXITCODE -ne 0) {
-            throw "Four-backend Phone HTP->Adreno execution failed. Inspect PC result.json and Phone LOCAL_HANDOFF logs."
+            throw "Four-backend execution failed; check final-owner/PC_HEAD and Phone LOCAL_HANDOFF logs."
         }
     }
     finally {
