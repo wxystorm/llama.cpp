@@ -7707,18 +7707,30 @@ bool rpc_server::phone_owned_plan_register(
         std::string why;
         const int64_t begin_us = ggml_time_us();
         std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
-        const bool precompiled = phone_npu_executor->prepare_owned_htp_graphs(
-            plan, why, stats);
+        const int bank_rank = phone_npu_banked_enabled ?
+            phone_npu_executor->rank_for_region(
+                plan.region, plan.layer) : -1;
+        if (phone_npu_banked_enabled && bank_rank < 0) {
+            return reject("NPU_BANK_REGION_OR_LAYER_NOT_IN_LOAD_PLAN");
+        }
+        // All Region KV must exist before PC binds Decode storage.
+        // For rank 2+ weights and Graphs are deliberately absent until
+        // the old parity Bank has drained and the refill worker runs.
+        const bool deferred = phone_npu_banked_enabled && bank_rank >= 2;
+        const bool precompiled = deferred ?
+            phone_npu_executor->reserve_owned_htp_kv(plan, why) :
+            phone_npu_executor->prepare_owned_htp_graphs(plan, why, stats);
         GGML_LOG_INFO(
             "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
             " region=%u layer=%u chunks=%u graph_nodes=%zu"
             " kv_bytes=%zu graph_storage_bytes=%zu"
             " compile_ms=%.3f wall_ms=%.3f"
-            " mode=SHADOW_FIXED_STORAGE status=%s reason=%s\n",
+            " bank_rank=%d mode=%s status=%s reason=%s\n",
             plan.run_id, plan.region, plan.layer, stats.chunks,
             stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
             stats.precompile_ms,
-            (ggml_time_us() - begin_us) / 1000.0,
+            (ggml_time_us() - begin_us) / 1000.0, bank_rank,
+            deferred ? "DEFERRED_KV_ONLY" : "SHADOW_FIXED_STORAGE",
             precompiled ? "PASS" : "FAIL",
             precompiled ? "NONE" : why.c_str());
         if (!precompiled) { return false; }
