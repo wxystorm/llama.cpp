@@ -9435,27 +9435,35 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
     header.hash = fnv_hash(
         reinterpret_cast<const uint8_t *>(source.direct_p2c_payload.data()),
         bytes);
-    phone_input_staged staged {};
-    staged.key = header.key;
-    staged.hash = header.hash;
-    staged.payload_offset = sizeof(header);
-    staged.reserved_bytes = reserved;
-    staged.payload.resize(reserved);
-    memcpy(staged.payload.data(), &header, sizeof(header));
-    memcpy(staged.payload.data() + sizeof(header),
-           source.direct_p2c_payload.data(), bytes);
     bool accepted = false;
-    {
-        std::lock_guard<std::mutex> guard(phone_input_mutex);
-        if (phone_input_stream_runs.count(src.key.run_id) != 0 &&
-                std::none_of(phone_input_staged_slots.begin(),
-                    phone_input_staged_slots.end(),
-                    [&](const phone_input_staged & e) {
-                        return auto_key(e.key) == auto_key(header.key);
-                    })) {
-            phone_input_staged_slots.emplace_back(std::move(staged));
-            accepted = true;
+    try {
+        phone_input_staged staged {};
+        staged.key = header.key;
+        staged.hash = header.hash;
+        staged.payload_offset = sizeof(header);
+        staged.reserved_bytes = reserved;
+        staged.payload.resize(reserved);
+        memcpy(staged.payload.data(), &header, sizeof(header));
+        memcpy(staged.payload.data() + sizeof(header),
+               source.direct_p2c_payload.data(), bytes);
+        {
+            std::lock_guard<std::mutex> guard(phone_input_mutex);
+            if (phone_input_stream_runs.count(src.key.run_id) != 0 &&
+                    std::none_of(phone_input_staged_slots.begin(),
+                        phone_input_staged_slots.end(),
+                        [&](const phone_input_staged & e) {
+                            return auto_key(e.key) == auto_key(header.key);
+                        })) {
+                phone_input_staged_slots.emplace_back(std::move(staged));
+                accepted = true;
+            }
         }
+    } catch (const std::bad_alloc &) {
+        GGML_LOG_ERROR(
+            "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
+            " src=%u dst=%u chunk=%u reason=HOST_ALLOC_FAILED\\n",
+            src.key.run_id, src.key.region, dst_region, src.key.chunk);
+        // The host admission reservation is released below on failure.
     }
     if (!accepted) {
         phone_input_stream_cancel_reserve(reserved);
