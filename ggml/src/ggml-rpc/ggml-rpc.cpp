@@ -4610,6 +4610,74 @@ static bool ggml_backend_rpc_phone_auto_wait_capture(
 }
 
 // Stream session has one setup/teardown RPC, never a per-Chunk ACK.
+// Once-per-run telemetry pull, invoked AFTER Phone Input Stream END.
+// Each page is tied to an exact Run ID and contains only bounded measured
+// data. The PC writes Phone samples alongside its own Stage trace. Neither
+// manual log copying nor remote filesystem access is necessary.
+static bool ggml_backend_rpc_phone_stage_profile_pull(
+        ggml_backend_t backend, uint64_t run_id) {
+    if (backend == nullptr || !ggml_backend_is_rpc(backend) || run_id == 0) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    const auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 32) {
+        GGML_LOG_ERROR("[PHONE_STAGE_PROFILE_RPC] event=REJECT reason=PATCH32_REQUIRED\n");
+        return false;
+    }
+    GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=BEGIN run=%" PRIu64 "\n", run_id);
+    uint32_t offset = 0;
+    uint32_t total = 0;
+    do {
+        rpc_msg_phone_stage_profile_req request {};
+        request.run_id = run_id;
+        request.offset = offset;
+        rpc_msg_phone_stage_profile_rsp response {};
+        if (!send_rpc_cmd(sock, RPC_CMD_PHONE_STAGE_PROFILE_PULL,
+                &request, sizeof(request), &response, sizeof(response)) ||
+                response.valid != 1 || response.overflow != 0 ||
+                response.total > RPC_PHONE_STAGE_PROFILE_RUN_LIMIT ||
+                response.count > RPC_PHONE_STAGE_PROFILE_PAGE ||
+                response.count > response.total - offset ||
+                (offset == 0 && response.total == 0) ||
+                (offset < response.total && response.count == 0) ||
+                (offset != 0 && response.total != total)) {
+            GGML_LOG_ERROR("[PHONE_STAGE_PROFILE_RPC] event=REJECT "
+                           "run=%" PRIu64 " offset=%u status=FAIL\n",
+                           run_id, offset);
+            return false;
+        }
+        total = response.total;
+        for (uint32_t i = 0; i < response.count; ++i) {
+            const auto & p = response.samples[i];
+            if (p.run_id != run_id || p.region >= 64 ||
+                    p.tokens == 0 || p.backend < 1 || p.backend > 2 ||
+                    !std::isfinite(p.upload_ms) ||
+                    !std::isfinite(p.prepare_ms) ||
+                    !std::isfinite(p.compute_ms)) {
+                GGML_LOG_ERROR("[PHONE_STAGE_PROFILE_RPC] event=REJECT "
+                               "run=%" PRIu64 " reason=INVALID_SAMPLE\n", run_id);
+                return false;
+            }
+            GGML_LOG_INFO(
+                "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK source=RPC "
+                "run=%" PRIu64 " region=%u chunk=%u tokens=%u token_begin=%u "
+                "backend=%s upload_ms=%.3f prepare_ms=%.3f "
+                "compute_ms=%.3f status=%s\n",
+                p.run_id, p.region, p.chunk, p.tokens, p.token_begin,
+                p.backend == 1 ? "HTP0" : "GPUOpenCL",
+                p.upload_ms, p.prepare_ms, p.compute_ms,
+                p.status == 1 ? "PASS" : "FAIL");
+        }
+        offset += response.count;
+    } while (offset < total);
+    GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=COMPLETE "
+                  "run=%" PRIu64 " samples=%u status=PASS\n",
+                  run_id, total);
+    return true;
+}
+
 static bool ggml_backend_rpc_phone_input_stream_run(
         ggml_backend_t backend, uint64_t run_id, bool active) {
     if (backend == nullptr || !ggml_backend_is_rpc(backend) ||
@@ -17468,6 +17536,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_WAIT_CAPTURE_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_wait_capture);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_PULL_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_stage_profile_pull);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_input_stream_run);
