@@ -7391,6 +7391,10 @@ bool rpc_server::phone_input_stream_run(
     int64_t auto_capture_us = 0;
     size_t auto_published = 0;
     int64_t auto_overlap_us = 0;
+    std::vector<ggml_phone_mixed_pipeline::interval> mixed_htp_windows;
+    std::vector<ggml_phone_mixed_pipeline::interval> mixed_opencl_windows;
+    uint64_t mixed_htp_compute_us = 0;
+    uint64_t mixed_opencl_compute_us = 0;
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (request.active) {
@@ -7551,6 +7555,22 @@ bool rpc_server::phone_input_stream_run(
                     if (job.compute_begin_us > 0 &&
                             job.compute_end_us >= job.compute_begin_us) {
                         auto_compute_us += job.compute_end_us - job.compute_begin_us;
+                        if (phone_auto_dual_lane_enabled &&
+                                job.compute_end_us > job.compute_begin_us) {
+                            const ggml_phone_mixed_pipeline::interval window {
+                                job.compute_begin_us, job.compute_end_us };
+                            const uint64_t elapsed = static_cast<uint64_t>(
+                                job.compute_end_us - job.compute_begin_us);
+                            if (ggml_phone_npu_serial::htp_region(
+                                    phone_npu_serial_regions,
+                                    job.request.key.region)) {
+                                mixed_htp_windows.push_back(window);
+                                mixed_htp_compute_us += elapsed;
+                            } else {
+                                mixed_opencl_windows.push_back(window);
+                                mixed_opencl_compute_us += elapsed;
+                            }
+                        }
                     }
                     if (job.capture_begin_us > 0 &&
                             job.capture_end_us >= job.capture_begin_us) {
@@ -7611,6 +7631,24 @@ bool rpc_server::phone_input_stream_run(
             phone_owned_plans.erase_run(request.run_id);
         }
         phone_auto_cv.notify_all();
+        if (phone_auto_dual_lane_enabled && auto_jobs_total > 0) {
+            const uint64_t overlap = ggml_phone_mixed_pipeline::overlap_us(
+                mixed_htp_windows, mixed_opencl_windows);
+            GGML_LOG_INFO(
+                "[PHONE_MIXED_PIPELINE] event=SUMMARY "
+                "run=%" PRIu64 " htp_jobs=%zu gpu_jobs=%zu "
+                "htp_compute_ms=%.3f gpu_compute_ms=%.3f "
+                "htp_gpu_overlap_ms=%.3f "
+                "policy=SEPARATE_PHYSICAL_LANES "
+                "status=%s\n",
+                request.run_id, mixed_htp_windows.size(),
+                mixed_opencl_windows.size(),
+                mixed_htp_compute_us / 1000.0,
+                mixed_opencl_compute_us / 1000.0,
+                overlap / 1000.0,
+                auto_jobs_failed != 0 ? "FAILED" :
+                overlap != 0 ? "OVERLAP_MEASURED" : "NO_OVERLAP_MEASURED");
+        }
         if (auto_jobs_total > 0) {
             GGML_LOG_INFO(
                 "[PHONE_AUTO_SUM] run=%" PRIu64
