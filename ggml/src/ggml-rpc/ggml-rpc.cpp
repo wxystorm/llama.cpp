@@ -7418,6 +7418,31 @@ bool rpc_server::phone_input_push(
 }
 
 
+bool rpc_server::phone_stage_profile_pull(
+        const rpc_msg_phone_stage_profile_req & request,
+        rpc_msg_phone_stage_profile_rsp & response) {
+    response = {};
+    if (request.run_id == 0) { return true; }
+    std::lock_guard<std::mutex> lock(phone_auto_mutex);
+    const auto it = phone_stage_profile_finished.find(request.run_id);
+    if (it == phone_stage_profile_finished.end() ||
+            it->second.size() > RPC_PHONE_STAGE_PROFILE_RUN_LIMIT ||
+            request.offset > it->second.size()) {
+        return true; // valid==0; never serve another Run's records.
+    }
+    const auto & saved = it->second;
+    response.total = static_cast<uint32_t>(saved.size());
+    response.overflow = phone_stage_profile_overflow.count(request.run_id) ? 1 : 0;
+    response.count = static_cast<uint32_t>(
+        std::min<size_t>(RPC_PHONE_STAGE_PROFILE_PAGE,
+                         saved.size() - request.offset));
+    for (size_t i = 0; i < response.count; ++i) {
+        response.samples[i] = saved[request.offset + i];
+    }
+    response.valid = 1;
+    return true;
+}
+
 bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
@@ -15755,6 +15780,16 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_STAGE_PROFILE_PULL: {
+                rpc_msg_phone_stage_profile_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_stage_profile_rsp response {};
+                if (!server.phone_stage_profile_pull(request, response) ||
+                        !send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
             case RPC_CMD_PHONE_NPU_PLAN_CONFIGURE: {
                 rpc_msg_phone_npu_plan_configure_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -16245,6 +16280,16 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 response.accepted =
                     server.phone_owned_kv_bind(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_STAGE_PROFILE_PULL: {
+                rpc_msg_phone_stage_profile_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_stage_profile_rsp response {};
+                if (!server.phone_stage_profile_pull(request, response) ||
+                        !send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
                 break;
             }
             case RPC_CMD_PHONE_NPU_PLAN_CONFIGURE: {
