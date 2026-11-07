@@ -49,7 +49,7 @@ def profile_lines(path: Path, substring: str) -> list[dict[str, str]]:
             if substring in line]
 
 
-def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
+def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tuple[list[dict], dict]:
     phone = {}
     if rpc_log is not None:
         for x in profile_lines(rpc_log, "[REAL_STAGE_PROFILE]"):
@@ -60,8 +60,9 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                     except (KeyError, ValueError):
                         pass
     samples = []
-    diag = dict(cases=0, cpu=0, gpu=0, phone=0,
-                phone_missing=0, setup_missing=0, trace_missing=0)
+    diag = dict(cases=0, cpu=0, gpu=0, phone=0, phone_gpu=0,
+                phone_missing=0, setup_missing=0, trace_missing=0,
+                backend_missing=0)
     for case in cases:
         # Only finished PASS probes are valid anchors for ranking. A failed
         # run can contain plausible-looking partial Chunk timing records.
@@ -129,12 +130,28 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                 if p is None:
                     diag["phone_missing"] += 1
                     continue
-                if q is None:
+                backend = p.get("backend")
+                if mixed:
+                    # Preserve distinct Phone HTP and Adreno GPU cost
+                    # classes: otherwise the four-backend Planner would
+                    # interpolate NPU compute times for GPU candidates.
+                    if backend == "HTP0":
+                        s["device"] = "PHONE"
+                    elif backend == "GPUOpenCL":
+                        s["device"] = "PHONE_GPU"
+                    else:
+                        diag["backend_missing"] += 1
+                        continue
+                if q is None and not (mixed and backend == "HTP0"):
                     diag["setup_missing"] += 1
                     continue
                 val = [number(p.get(k)) for k in
                        ("upload_ms", "prepare_ms", "compute_ms")]
-                registration = number(q.get("setup_ms"))
+                # Graphless HTP has no OpenCL Slot Prepare: -1 is a log
+                # sentinel, not a negative service time.
+                if mixed and backend == "HTP0" and p.get("prepare_ms") == "-1.000":
+                    val[1] = 0.0
+                registration = number(q.get("setup_ms")) if q else 0.0
                 if registration is None or any(v is None for v in val):
                     continue
                 try:
@@ -145,7 +162,7 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                 s.update(upload_ms=val[0], prepare_ms=val[1],
                          compute_ms=val[2], setup_ms=registration,
                          kv_tokens=kv, terminal=terminal)
-            diag[d.lower()] += 1
+            diag[s["device"].lower()] += 1
             samples.append(s)
     return samples, diag
 
@@ -170,9 +187,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, action="append", required=True)
     parser.add_argument("--rpc-log", type=Path)
+    parser.add_argument("--mixed", action="store_true",
+                        help="Require HTP0/GPUOpenCL labels and keep PHONE_GPU distinct")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    raw, diag = extract(case_dirs(args.run), args.rpc_log)
+    raw, diag = extract(case_dirs(args.run), args.rpc_log, mixed=args.mixed)
     points = aggregate(raw)
     if not points:
         parser.error("no real Stage rows; enable task trace and Stage logging")
@@ -182,14 +201,20 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(points)
     shapes = {d: len({(p["layers"], p["tokens"]) for p in points
-                      if p["device"] == d}) for d in ("CPU", "GPU", "PHONE")}
+                      if p["device"] == d}) for d in
+              (("CPU", "GPU", "PHONE", "PHONE_GPU") if args.mixed else
+               ("CPU", "GPU", "PHONE"))}
     print(f"[REAL_STAGE_PROFILE] points={len(points)} shapes={shapes} "
           f"raw={len(raw)} diagnostic={diag} file={args.output}")
-    if diag["phone_missing"] or diag["setup_missing"]:
+    if diag["phone_missing"] or diag["setup_missing"] or diag["backend_missing"]:
         print("[REAL_STAGE_PROFILE] WARNING: incomplete Phone records; "
               "Planner will fall back for unsupported shapes")
-    print('$env:LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV = '
-          f'"{args.output.resolve()}"')
+    if not args.mixed:
+        print('$env:LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV = '
+              f'"{args.output.resolve()}"')
+    else:
+        print("[REAL_STAGE_PROFILE] mode=MIXED_OFFLINE_ONLY; do not pass the "
+              "PHONE_GPU CSV to the legacy three-device runtime")
     return 0
 
 
