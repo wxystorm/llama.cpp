@@ -168,11 +168,36 @@ def create_probe(source: Path, dest: Path, spec: dict) -> dict:
         "model_equivalence": "NOT_EQUIVALENT_FOR_OUTPUTS_TIMING_ONLY",
     }
 
+def verify_probe(source: Path, dest: Path, manifest: Path,
+                 spec: dict) -> None:
+    """Reject stale cached compact GGUF, including original source replacement."""
+    gguf = _gguf()
+    if not dest.is_file() or not manifest.is_file():
+        raise ValueError("COMPACT_PROFILE_CACHE_FILE_MISSING")
+    record = json.loads(manifest.read_text(encoding="utf-8"))
+    if record.get("source_model_fingerprint") != fingerprint(source) or \
+            record.get("probe_model_fingerprint") != fingerprint(dest) or \
+            record.get("pattern") != spec["pattern"] or \
+            record.get("cycles") != spec["cycles"] or \
+            record.get("layers") != spec["layers"]:
+        raise ValueError("COMPACT_PROFILE_CACHE_FINGERPRINT_MISMATCH")
+    reader = gguf.GGUFReader(dest)
+    count = reader.get_field("qwen3.block_count")
+    if count is None or int(count.contents()) != spec["layers"]:
+        raise ValueError("COMPACT_PROFILE_CACHE_LAYER_MISMATCH")
+    if any(int(m[1]) >= spec["layers"]
+           for tensor in reader.tensors
+           if (m := BLOCK.match(tensor.name))):
+        raise ValueError("COMPACT_PROFILE_CACHE_CONTAINS_UNSAMPLED_BLOCKS")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pattern", default="G7,C1,N1,A1")
     ap.add_argument("--cycles", type=int, default=3)
     ap.add_argument("--describe", action="store_true")
+    ap.add_argument("--verify", action="store_true",
+                    help="reject stale compact GGUF or original source fingerprint")
     ap.add_argument("--model", type=Path)
     ap.add_argument("--output", type=Path)
     ap.add_argument("--manifest", type=Path)
@@ -183,9 +208,14 @@ def main() -> None:
         return
     if not args.model or not args.output:
         ap.error("A compact real model probe needs --model and --output")
+    manifest = args.manifest or args.output.with_suffix(".probe.json")
+    if args.verify:
+        verify_probe(args.model.resolve(strict=True), args.output, manifest,
+                     spec)
+        print(f"[GCNA_PROFILE] status=CACHE_VERIFIED file={args.output}")
+        return
     args.output.parent.mkdir(parents=True, exist_ok=True)
     result = create_probe(args.model.resolve(strict=True), args.output, spec)
-    manifest = args.manifest or args.output.with_suffix(".probe.json")
     manifest.write_text(json.dumps(result, ensure_ascii=False, indent=2),
                         encoding="utf-8")
     print(f"[GCNA_PROFILE] original={result['source_model']} "
