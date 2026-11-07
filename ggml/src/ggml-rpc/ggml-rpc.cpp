@@ -7935,6 +7935,18 @@ bool rpc_server::phone_owned_kv_bind(
         " slots=PC_VERIFIED_IDENTITY graph_register=SKIPPED"
         " task_register=PHONE_OWNED status=PASS\n",
         request.run_id, request.region, request.layer, added);
+    if (phone_npu_banked_enabled) {
+        const auto mem =
+            phone_npu_executor->banked_memory_for_run(request.run_id);
+        GGML_LOG_INFO(
+            "[NPU_BANK_MEMORY] event=KV_BOUND run=%" PRIu64
+            " region=%u bank_a_bytes=%zu bank_b_bytes=%zu"
+            " kv_bytes=%zu graph_bytes=%zu weight_tensors=%zu"
+            " compiled_graphs=%zu status=PASS\n",
+            request.run_id, request.region, mem.a_bytes, mem.b_bytes,
+            mem.kv_bytes, mem.graph_bytes, mem.weight_tensor_count,
+            mem.compiled_chunk_graphs);
+    }
     return true;
 }
 
@@ -8694,6 +8706,8 @@ void rpc_server::phone_npu_bank_refill_loop() {
         ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats
             compiled {};
         bool ok = false;
+        ggml_phone_npu_serial::full_region_executor::banked_memory_snapshot
+            memory_after {};
         // Stage raw GGUF on the host while the other Bank may still be
         // computing on HTP. This is the GPU Bank Mover's simplified
         // host-stage -> device-repack -> READY order.
@@ -8732,6 +8746,10 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 ok = phone_npu_executor->refill_banked_rank(
                     job.first, job.second, reason, load, compiled,
                     prefetched ? &staged : nullptr);
+                if (ok) {
+                    memory_after =
+                        phone_npu_executor->banked_memory_for_run(job.first);
+                }
             }
         }
         if (stale_run) {
@@ -8770,7 +8788,9 @@ void rpc_server::phone_npu_bank_refill_loop() {
             " host_stage_ms=%.3f host_stage_bytes=%zu"
             " repack_ms=%.3f compile_ms=%.3f"
             " htp_lock_wait_ms=%.3f wall_ms=%.3f"
-            " stage_mode=%s physical_banks=2 status=%s reason=%s\n",
+            " stage_mode=%s physical_banks=2"
+            " bank_a_bytes=%zu bank_b_bytes=%zu kv_bytes=%zu"
+            " graph_bytes=%zu status=%s reason=%s\n",
             job.first, job.second.bank, job.second.from_rank,
             job.second.to_rank, job.second.to_region,
             load.new_bytes, load.new_weights, load.file_read_ms,
@@ -8779,6 +8799,8 @@ void rpc_server::phone_npu_bank_refill_loop() {
             (lock_acquired_us - lock_begin_us) / 1000.0,
             (finish_us - wait_begin_us) / 1000.0,
             prefetched ? "PREFETCH" : "SERIAL_FALLBACK",
+            memory_after.a_bytes, memory_after.b_bytes,
+            memory_after.kv_bytes, memory_after.graph_bytes,
             ok ? "PASS" : "FAIL",
             ok ? "NONE" : reason.c_str());
         phone_auto_cv.notify_all();
