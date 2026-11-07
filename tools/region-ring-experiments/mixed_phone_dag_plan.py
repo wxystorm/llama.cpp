@@ -526,15 +526,15 @@ def runtime_compatible_cycles(cycles):
     htp = sum(s["backend"] == "N" for s in stages)
     adreno = sum(s["backend"] == "A" for s in stages)
     phone_cycles = sum(c.phone > 0 for c in cycles)
-    # Mixed HTP requires at least two banked HTP Regions, one N->A
-    # handoff and two complete Phone cycles. PC-tail is structurally
-    # representable in the offline DAG, but the current autonomous
-    # runtime's canonical final result/Head is Phone-owned. Do not label
-    # PC-tail as executable until that ownership has been implemented
-    # and validated on device.
+    # Every active Phone Cycle is G-first, followed by N->A locally.
+    # The last Cycle may instead be a real PC G[,C] tail, and uses
+    # a deferred canonical CPU Head after the worker DAG completes.
+    phone_tail = stages[-1]["backend"] in ("N", "A")
+    pc_tail = (stages[-1]["backend"] in ("G", "C") and
+               cycles[-1].phone == 0 and
+               all(c.phone > 0 for c in cycles[:-1]))
     return (phone_cycles >= 2 and htp >= 2 and adreno >= 1 and
-            all(c.phone > 0 for c in cycles) and
-            stages[-1]["backend"] in ("N", "A") and
+            (phone_tail or pc_tail) and
             any(e["handoff"] == "HTP_TO_ADRENO" for e in edges))
 
 
@@ -664,7 +664,7 @@ def run_cli(argv=None):
         "terminal_ranking_policy":"MIN_PREDICTED_DAG_WALL_OVER_G_C_N_A",
         "runtime_requirements":"RPC_PATCH_31_DUAL_LANE_PLAN_CONTROLLED_TWO_NPU_BANKS_LOCAL_HANDOFF",
         "execution_blocker":None if runtime_compatible_cycles(cycles) else
-            "Runtime not verified for this topology. PC-terminal DAG candidates remain available for offline performance ranking, but current autonomous output ownership is Phone-final.",
+            "Requires G-first cycles, at least two HTP P1 regions, an adjacent HTP->Adreno edge, and a supported Phone-final or final PC G[,C] tail",
     }
     (args.out/"plan.json").write_text(json.dumps(record,indent=2),encoding="utf-8")
     with (args.out/"candidates.csv").open("w",newline="",encoding="utf-8") as f:
