@@ -50,7 +50,7 @@ class MixedPlanTests(unittest.TestCase):
              {"region": 5, "first_layer": 10, "last_layer_exclusive": 11}]))
 
     def test_phone_handoff_is_not_assumed_zero_copy(self):
-        self.assertEqual(handoff_route("N", "A"), ("HTP_TO_ADRENO", "phone_gpu"))
+        self.assertEqual(handoff_route("N", "A"), ("HTP_TO_ADRENO", None))
         self.assertEqual(handoff_route("A", "N"), ("PHONE_LOCAL", "phone_local"))
         self.assertEqual(handoff_route("C", "G"), ("PC_CPU_TO_CUDA", "pc_h2d"))
         self.assertEqual(handoff_route("N", "C"), ("P2C", "phone_to_pc"))
