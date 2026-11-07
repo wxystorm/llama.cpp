@@ -154,13 +154,14 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="rerun even PASS with matching config")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max-new", type=int, default=0, help="limit new attempts (0 = all); for smoke tests")
     args, extra = parser.parse_known_args()
     if extra and extra[0] == "--":
         extra = extra[1:]
     if any(x in extra for x in ("-m", "--model", "-f", "--file", "--world", "--rank", "--master", "--next")):
         parser.error("Do not override model/prompt/world/rank/network in extra args")
     args.extra = extra
-    if args.ctx < 8 or args.predict < 1 or args.timeout < 0 or args.delay < 0:
+    if args.ctx < 8 or args.predict < 1 or args.timeout < 0 or args.delay < 0 or args.max_new < 0:
         parser.error("Invalid ctx/predict/timeout/delay")
     return args
 
@@ -203,7 +204,7 @@ def main() -> int:
         write_summary(output)
     print(f"[PRIMA_SWEEP] prompts=40 signature={signature} output={output}", flush=True)
 
-    completed, failed = 0, 0
+    completed, failed, attempted = 0, 0, 0
     for index, (length, case_id, prompt_path) in enumerate(expected, start=1):
         result_path = output / "cases" / f"{case_id}.json"
         old = None
@@ -217,6 +218,10 @@ def main() -> int:
             print(f"[{index:02d}/40] SKIP {case_id} (PASS)", flush=True)
             continue
 
+        if args.max_new and attempted >= args.max_new:
+            print(f"[PRIMA_SWEEP] max-new={args.max_new} reached; resume with the same command.", flush=True)
+            break
+        attempted += 1
         log_path = output / "logs" / f"{case_id}.log"
         command = [
             str(binary), "-m", str(model), "-f", str(prompt_path),
