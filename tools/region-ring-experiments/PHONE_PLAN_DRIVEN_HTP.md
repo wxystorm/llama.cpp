@@ -91,10 +91,14 @@ Region Ring runtime change. This branch delivers the mapping protocol
 and verified fixed-topology experiment; it does NOT yet execute arbitrary
 G/C/N/A plans. Do not pass schema=2 into run_saved_plan.ps1.
 
-Different HTP mappings in the SAME Phone process currently reject
-with PLAN_MAPPING_CHANGED_RESTART_PHONE_RPC_REQUIRED. Restarting
-the same generic Phone RPC command requires zero layout edits. Safe
-dynamic graph/Bank teardown and reconfigure remains future work.
+Different HTP mappings in the SAME Phone process are now accepted
+at a fresh RUN boundary after all previous Chunk jobs finish. Phone
+clears fixed Hexagon UID Graphs/KV, tears down the previous two Bank
+allocations, recreates physical A/B capacity for the new ordered Plan,
+and primes the new rank 0/1 weights. Reconfiguration before the previous
+RUN drains is explicitly rejected. A repeat Plan keeps the Bank arenas
+and only re-primes their initial weight ranks. No layout edits or Phone
+restarts are needed for a correctly sequenced new RUN.
 
 The first Plan configuration moves HTP weight priming into startup of
 the first Prefill run: benchmark setup separately from steady-state
