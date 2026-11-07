@@ -24,7 +24,11 @@ PC GPU memory = max(even G weights) + max(odd G weights) +
 HTP NPU memory = max(even actual N weights) + max(odd actual N weights) +
                  ALL N KV + NPU graph/scratch
 Phone GPU memory = ALL A weights (resident) + ALL A KV + OpenCL scratch
-Phone shared memory = HTP NPU memory + Phone GPU memory
+Phone shared memory = HTP NPU memory + Phone GPU memory +
+                      temporary Bank host-staging peak (rank k>=2)
+
+The host-staging peak must also fit the measured
+npu_host_stage_budget_mib (e.g. the configured Phone Host Stage cap).
 
 Reject only when PC GPU, NPU, Phone GPU, or the shared Phone RAM budget
 cannot accommodate the resulting split. Missing NPU Regions do not consume
@@ -86,6 +90,7 @@ all of these measured positive numeric fields:
     phone_shared_budget_mib
     phone_local_mibps
     npu_host_stage_mibps
+    npu_host_stage_budget_mib
     npu_bank_repack_mibps
     pc_head_ms (optional, >=0)
 
