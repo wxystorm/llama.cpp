@@ -45,6 +45,17 @@ class MixedPlanTests(unittest.TestCase):
         self.assertEqual(m.npu_bank_mib, (10, 10))
         self.assertEqual(m.npu_used_mib, 29)
 
+    def test_htp_host_staging_budget_is_not_free(self):
+        cs = [Cycle(7, 1, 1, 1)] * 4
+        base = dict(BASE, npu_budget_mib=100)
+        allowed = memory(cs, base, MIX)
+        denied = memory(cs, base, dict(MIX, npu_host_stage_budget_mib=9))
+        self.assertEqual(allowed.npu_host_stage_peak_mib, 10)
+        self.assertTrue(allowed.fits)
+        self.assertFalse(denied.fits)
+        self.assertGreater(allowed.phone_shared_used_mib,
+                           allowed.npu_used_mib + allowed.phone_gpu_used_mib)
+
     def test_dag_refill_dependencies_and_cost(self):
         cs = [Cycle(7, 1, 1, 1)] * 4
         r = dag_for(cs, 64, 256, 5120, FakeProfile(), BASE, MIX, 2.)
