@@ -288,6 +288,63 @@ public:
         return true;
     }
 
+    // Host-only GGUF prefetch; no HTP mutex, no Bank mutation.
+    // Bounded because staging a complete large layer can exhaust phone RAM.
+    bool stage_banked_rank(size_t rank,
+                           std::vector<std::vector<uint8_t>> & raw,
+                           double & read_ms, std::string & reason) const {
+        read_ms = 0;
+        raw.clear();
+        reason.clear();
+        if (!banked_mode_ || rank >= banked_layers_.size() ||
+                !bank_local_source_.read) {
+            reason = "NPU_BANK_HOST_STAGE_INVALID_RANK";
+            return false;
+        }
+        size_t cap_mib = 512;
+        if (const char * budget =
+                std::getenv("GGML_RPC_PHONE_NPU_HOST_STAGE_MIB")) {
+            char * end = nullptr;
+            const unsigned long long n = std::strtoull(budget, &end, 10);
+            if (end == budget || *end != '\0' || n == 0 ||
+                    n > SIZE_MAX / (1024 * 1024)) {
+                reason = "NPU_BANK_HOST_STAGE_INVALID_BUDGET";
+                return false;
+            }
+            cap_mib = static_cast<size_t>(n);
+        }
+        size_t total = 0;
+        for (const auto & t : banked_layers_[rank].tensors) {
+            const size_t bytes = static_cast<size_t>(t.info.nbytes);
+            if (bytes > cap_mib * 1024 * 1024 - total) {
+                reason = "NPU_BANK_HOST_STAGE_BUDGET_EXCEEDED";
+                return false;
+            }
+            total += bytes;
+        }
+        const int64_t t0 = ggml_time_us();
+        try {
+            raw.reserve(banked_layers_[rank].tensors.size());
+            for (const auto & tensor : banked_layers_[rank].tensors) {
+                auto & data = raw.emplace_back();
+                data.resize(static_cast<size_t>(tensor.info.nbytes));
+                if (!bank_local_source_.read(
+                        bank_local_source_.user_data, tensor.name.c_str(),
+                        0, data.data(), data.size())) {
+                    raw.clear();
+                    reason = "NPU_BANK_HOST_STAGE_GGUF_READ:" + tensor.name;
+                    return false;
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            raw.clear();
+            reason = "NPU_BANK_HOST_STAGE_OOM";
+            return false;
+        }
+        read_ms = (ggml_time_us() - t0) / 1000.0;
+        return true;
+    }
+
     bool has_weight_banks() const { return banked_mode_; }
     int rank_for_region(uint32_t region, uint32_t layer) const {
         if (!banked_mode_) { return -1; }
@@ -887,7 +944,8 @@ public:
     bool refill_banked_rank(
             uint64_t run_id, const weight_bank_refill & job,
             std::string & reason, model_load_stats & load_stats,
-            local_htp_prepare_stats & compile_stats) {
+            local_htp_prepare_stats & compile_stats,
+            const std::vector<std::vector<uint8_t>> * staged = nullptr) {
         reason.clear();
         load_stats = {};
         compile_stats = {};
@@ -959,7 +1017,7 @@ public:
             }
         }
         banked_layers_[job.from_rank].keys.clear();
-        if (!load_banked_rank(job.to_rank, reason, load_stats)) {
+        if (!load_banked_rank(job.to_rank, reason, load_stats, staged)) {
             return false;
         }
         if (!weight_banks_.refill_complete(job.to_rank, true)) {
@@ -2674,7 +2732,8 @@ private:
     // Address offsets into the two backing arenas never change. Only the
     // bytes and metadata for the current Region are resident per Bank.
     bool load_banked_rank(size_t rank, std::string & reason,
-                          model_load_stats & stats) {
+                          model_load_stats & stats,
+                          const std::vector<std::vector<uint8_t>> * staged = nullptr) {
         reason.clear();
         stats = {};
         if (!banked_mode_ || rank >= banked_layers_.size() ||
@@ -2683,6 +2742,10 @@ private:
             return false;
         }
         auto & layer = banked_layers_[rank];
+        if (staged != nullptr && staged->size() != layer.tensors.size()) {
+            reason = "NPU_BANK_STAGE_COUNT_MISMATCH";
+            return false;
+        }
         ggml_backend_buffer_t bank =
             bank_weight_arenas_[rank % 2].get();
         if (!bank) {
@@ -2694,7 +2757,9 @@ private:
             pending;
         std::vector<std::string> keys;
         keys.reserve(layer.tensors.size());
-        for (const auto & spec : layer.tensors) {
+        for (size_t tensor_index = 0;
+                tensor_index < layer.tensors.size(); ++tensor_index) {
+            const auto & spec = layer.tensors[tensor_index];
             ggml_init_params params {
                 ggml_tensor_overhead() * 4 + 4096, nullptr, true
             };
@@ -2740,23 +2805,34 @@ private:
                 reason = "NPU_BANK_LOAD_DUPLICATE_WEIGHT:" + spec.name;
                 return false;
             }
-            std::vector<uint8_t> raw;
-            try {
-                raw.resize(static_cast<size_t>(spec.info.nbytes));
-            } catch (const std::bad_alloc &) {
-                reason = "NPU_BANK_LOAD_HOST_STAGING_OOM";
-                return false;
+            std::vector<uint8_t> direct;
+            const std::vector<uint8_t> * raw = nullptr;
+            if (staged != nullptr) {
+                raw = &(*staged)[tensor_index];
+                if (raw->size() != static_cast<size_t>(spec.info.nbytes)) {
+                    reason = "NPU_BANK_STAGE_LAYOUT_MISMATCH:" + spec.name;
+                    return false;
+                }
+            } else {
+                try {
+                    direct.resize(static_cast<size_t>(spec.info.nbytes));
+                } catch (const std::bad_alloc &) {
+                    reason = "NPU_BANK_LOAD_HOST_STAGING_OOM";
+                    return false;
+                }
+                const int64_t read_us = ggml_time_us();
+                if (!bank_local_source_.read(bank_local_source_.user_data,
+                        spec.name.c_str(), 0, direct.data(), direct.size())) {
+                    reason = "NPU_BANK_LOAD_GGUF_READ:" + spec.name;
+                    return false;
+                }
+                stats.file_read_ms +=
+                    (ggml_time_us() - read_us) / 1000.0;
+                raw = &direct;
             }
-            const int64_t read_us = ggml_time_us();
-            if (!bank_local_source_.read(bank_local_source_.user_data,
-                    spec.name.c_str(), 0, raw.data(), raw.size())) {
-                reason = "NPU_BANK_LOAD_GGUF_READ:" + spec.name;
-                return false;
-            }
-            stats.file_read_ms += (ggml_time_us() - read_us) / 1000.0;
             const int64_t repack_us = ggml_time_us();
             ggml_backend_tensor_set(
-                entry->tensor, raw.data(), 0, raw.size());
+                entry->tensor, raw->data(), 0, raw->size());
             stats.htp_repack_ms +=
                 (ggml_time_us() - repack_us) / 1000.0;
             entry->kv = false;
@@ -2764,7 +2840,7 @@ private:
             pending.emplace(key, std::move(entry));
             keys.push_back(key);
             ++stats.new_weights;
-            stats.new_bytes += raw.size();
+            stats.new_bytes += raw->size();
         }
         ggml_backend_synchronize(backend_);
         for (auto & p : pending) {
