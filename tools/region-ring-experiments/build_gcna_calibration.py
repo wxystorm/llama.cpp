@@ -78,6 +78,16 @@ def assemble(model: Path, profile_dir: Path, runs: Path,
             successful.append((case, report))
     if not successful:
         raise ValueError("NO_PHONE_RESOURCE_RPC_SAMPLES")
+    # The separate PC CPU Head is measured on Phone-final runs.
+    # It is also required when an offline candidate ends on PC C/G:
+    # never silently score that final normalization/projection as zero.
+    head_samples = []
+    for case, _ in successful:
+        for line in profile_lines(case / "engine.stderr.log",
+                                  "[PHONE_AUTO_FINAL_HEAD] event=PC_EXEC"):
+            ms = number(line.get("head_ms"))
+            if line.get("status") == "PASS" and ms is not None and ms > 0:
+                head_samples.append(ms)
     measures = {k: [positive(r,k,case) for case,r in successful]
                 for k in NEEDED}
     # The Phone's reported free bytes and MemAvailable are observed AFTER
@@ -127,6 +137,13 @@ def assemble(model: Path, profile_dir: Path, runs: Path,
             "npu_bank_transfer": "REAL_THIRD_BANK_REFILL_ONLY",
         },
     }
+    if head_samples:
+        result["calibration"]["pc_head_ms"] = round(
+            statistics.median(head_samples), 6)
+        result["origin"]["pc_head_ms_source"] = (
+            "MEASURED_PHONE_AUTO_FINAL_HEAD_PC_EXEC")
+    else:
+        result["origin"]["pc_head_ms_source"] = "NOT_MEASURED_PC_TAIL_UNSCORABLE"
     return result
 
 def main() -> None:
