@@ -291,6 +291,23 @@ def save_layer_plan(out: Path, plan) -> None:
         "cpu_safety_gib": round(plan.cpu_safety_bytes/GIB, 3),
         "pc_safety_gib": round(plan.pc_safety_bytes/GIB, 3),
         "phone_safety_gib": round(plan.phone_safety_bytes/GIB, 3),
+        "estimated_remaining_gib": {
+            "cpu": round((
+                plan.cpu_available_bytes-plan.cpu_weight_bytes
+                -plan.cpu_kv_bytes-plan.cpu_workspace_bytes
+                -plan.cpu_reserve_bytes-plan.cpu_safety_bytes
+            )/GIB, 3),
+            "pc_gpu": round((
+                plan.pc_available_bytes-plan.pc_weight_bytes
+                -plan.pc_kv_bytes-plan.pc_workspace_bytes
+                -plan.pc_reserve_bytes-plan.pc_safety_bytes
+            )/GIB, 3),
+            "phone": round((
+                plan.phone_available_bytes-plan.phone_weight_bytes
+                -plan.phone_kv_bytes-plan.phone_workspace_bytes
+                -plan.phone_reserve_bytes-plan.phone_safety_bytes
+            )/GIB, 3),
+        },
         "architecture": plan.model.architecture,
         "total_layers": plan.model.n_layers,
         "pc_layers": plan.pc_layers,
