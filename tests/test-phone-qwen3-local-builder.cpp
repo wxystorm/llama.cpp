@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #define CHECK(expr) do { if (!(expr)) { \
     std::fprintf(stderr, "check failed: %s at %s:%d\n", \
@@ -54,6 +55,69 @@ static ggml_phone_qwen3::layer_weights weights(ggml_context * ctx) {
     w.q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
     w.k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
     return w;
+}
+
+static void test_multi_layer_graphs() {
+    // Metadata-only graph construction; no Phone/HTP device or GGUF needed.
+    ggml_init_params mp = {
+        ggml_tensor_overhead() * 8192 +
+        ggml_graph_overhead_custom(2048, false) + 65536,
+        nullptr, true
+    };
+    ggml_context * ctx = ggml_init(mp);
+    CHECK(ctx != nullptr);
+    const auto first = plan();
+    for (std::size_t depth : {std::size_t(2), std::size_t(4)}) {
+        std::vector<ggml_phone_qwen3::layer_weights> all;
+        for (std::size_t i = 0; i < depth; ++i) {
+            all.push_back(weights(ctx));
+        }
+        const char * reason = "NONE";
+        ggml_phone_qwen3::multi_graph_result chain {};
+        CHECK(ggml_phone_qwen3::build_graph_layers(
+            ctx, first, 0, all, chain, reason));
+        CHECK(chain.graph != nullptr);
+        CHECK(chain.layers.size() == depth);
+        CHECK(chain.input == chain.layers.front().input);
+        CHECK(chain.output == chain.layers.back().output);
+        CHECK(chain.layers.front().tokens == first.chunk_tokens);
+        CHECK(chain.layers.front().token_begin == 0);
+        for (std::size_t i = 0; i < depth; ++i) {
+            const auto & layer = chain.layers[i];
+            CHECK(layer.graph == chain.graph);
+            CHECK(layer.cache_k != nullptr && layer.cache_v != nullptr);
+            if (i > 0) {
+                CHECK(layer.input == chain.layers[i-1].output);
+                CHECK(layer.cache_k != chain.layers[i-1].cache_k);
+                CHECK(layer.cache_v != chain.layers[i-1].cache_v);
+            }
+            const auto name = std::string("l_out-") +
+                              std::to_string(first.layer + i);
+            CHECK(name == layer.output->name);
+        }
+        int set_rows = 0, flash = 0, rope = 0, glu = 0;
+        for (int node = 0; node < ggml_graph_n_nodes(chain.graph); ++node) {
+            switch (ggml_graph_node(chain.graph, node)->op) {
+                case GGML_OP_SET_ROWS: ++set_rows; break;
+                case GGML_OP_FLASH_ATTN_EXT: ++flash; break;
+                case GGML_OP_ROPE: ++rope; break;
+                case GGML_OP_GLU: ++glu; break;
+                default: break;
+            }
+        }
+        CHECK(set_rows == 2 * int(depth));
+        CHECK(flash == int(depth));
+        CHECK(rope == 2 * int(depth));
+        CHECK(glu == int(depth));
+    }
+    // Reject malformed multi-layer requests rather than silently using P1.
+    const char * why = "NONE";
+    ggml_phone_qwen3::multi_graph_result invalid {};
+    std::vector<ggml_phone_qwen3::layer_weights> none {};
+    CHECK(!ggml_phone_qwen3::build_graph_layers(
+        ctx, first, 0, none, invalid, why));
+    CHECK(std::string(why) == "INVALID_MULTI_LAYER_STAGE");
+    ggml_free(ctx);
 }
 
 int main() {
@@ -129,6 +193,7 @@ int main() {
     bad.ffn_up = w.wq;
     CHECK(!ggml_phone_qwen3::validate_weights(p, bad, reason));
     ggml_free(ctx);
+    test_multi_layer_graphs();
     std::puts("test-phone-qwen3-local-builder PASS");
     return 0;
 }
