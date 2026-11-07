@@ -24,15 +24,15 @@ MIB = 1024 * 1024
 CLASSES = {"GPU", "CPU", "PHONE", "PHONE_GPU"}
 REQUIRED_MIXED = (
     "phone_gpu_budget_mib", "phone_gpu_weight_layer_mib",
-    "phone_gpu_kv_layer_mib", "phone_gpu_scratch_mib",
+    "phone_gpu_scratch_mib",
     "phone_shared_budget_mib", "phone_local_mibps",
     "npu_host_stage_mibps", "npu_bank_repack_mibps",
 )
 REQUIRED_BASE = (
     "gpu_budget_mib", "npu_budget_mib", "gpu_weight_layer_mib",
     "npu_weight_layer_mib", "gpu_h2d_mibps", "c2p_mibps",
-    "p2c_mibps", "local_mibps", "gpu_kv_layer_mib",
-    "npu_kv_layer_mib", "gpu_scratch_mib", "npu_scratch_mib",
+    "p2c_mibps", "local_mibps", "gpu_scratch_mib",
+    "npu_scratch_mib",
 )
 
 
@@ -424,6 +424,12 @@ def run_cli(argv=None):
     if "pc_head_ms" in extra["calibration"]:
         m.update(calibration(extra["calibration"], ("pc_head_ms",), ("pc_head_ms",)))
     token_count = tokenize(args.tokenizer.resolve(strict=True), model_path, prompt)
+    # KV footprint is determined by model metadata and *this Prompt*, not
+    # by the fixed-length Prompt that happened to collect the Profile.
+    kv_mib = info["kv_bytes_per_token_per_layer"] * token_count / MIB
+    b["gpu_kv_layer_mib"] = kv_mib
+    b["npu_kv_layer_mib"] = kv_mib
+    m["phone_gpu_kv_layer_mib"] = kv_mib
     # Mixed Stage samples live alongside the original HTP-only Profile;
     # never overwrite the production three-device CSV with PHONE_GPU rows.
     stage_name = extra.get("stage_csv", "real-stage-mixed.csv")
