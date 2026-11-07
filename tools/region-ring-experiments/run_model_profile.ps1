@@ -16,10 +16,11 @@ param(
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
-# Mixed HTP/OpenCL cost classes are not yet modeled by the offline DAG.
-# Reject instead of silently applying the old aggregate PHONE profile.
+# The legacy base Profile remains a separate 3-backend calibration. Do not
+# mix active GCNA profiling flags into it. Use run_gcna_profile.ps1 for the
+# compact real four-backend Stage and automatic Phone RPC sample collection.
 if ($env:LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP -eq "1") {
-    throw "Four-backend Phone mixed Profile/Planner is not implemented yet. Use the dedicated run_phone_mixed_smoke.ps1 A/B test; do not use the HTP-only Profile as mixed data."
+    throw "This is the original-model base Profile (three-backend). Run it without mixed flags; for a compact G/C/N/A Profile and automatic Phone telemetry use run_gcna_profile.ps1."
 }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $py = (Get-Command python -ErrorAction Stop).Source
