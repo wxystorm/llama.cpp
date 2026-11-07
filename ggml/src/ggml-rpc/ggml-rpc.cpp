@@ -4640,6 +4640,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
     GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=BEGIN run=%" PRIu64 "\n", run_id);
     uint32_t offset = 0;
     uint32_t total = 0;
+    rpc_msg_phone_stage_profile_rsp resources {};
     do {
         rpc_msg_phone_stage_profile_req request {};
         request.run_id = run_id;
@@ -4660,6 +4661,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
             return false;
         }
         total = response.total;
+        if (offset == 0) { resources = response; }
         for (uint32_t i = 0; i < response.count; ++i) {
             const auto & p = response.samples[i];
             if (p.run_id != run_id || p.region >= 64 ||
@@ -4683,6 +4685,22 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         }
         offset += response.count;
     } while (offset < total);
+    GGML_LOG_INFO(
+        "[PHONE_PROFILE_RESOURCES] side=PHONE source=RPC run=%" PRIu64
+        " gpu_free_bytes=%" PRIu64 " gpu_total_bytes=%" PRIu64
+        " host_available_bytes=%" PRIu64 " gpu_stage_arena_bytes=%" PRIu64
+        " host_stage_budget_bytes=%" PRIu64 " host_stage_bytes=%" PRIu64
+        " host_stage_ms=%.3f repack_bytes=%" PRIu64
+        " repack_ms=%.3f status=PASS\n",
+        run_id, resources.phone_gpu_free_bytes,
+        resources.phone_gpu_total_bytes,
+        resources.phone_host_available_bytes,
+        resources.phone_gpu_stage_arena_bytes,
+        resources.npu_host_stage_budget_bytes,
+        resources.npu_host_stage_bytes,
+        resources.npu_host_stage_ms,
+        resources.npu_bank_repack_bytes,
+        resources.npu_bank_repack_ms);
     GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=COMPLETE "
                   "run=%" PRIu64 " samples=%u status=PASS\n",
                   run_id, total);
@@ -7509,7 +7527,57 @@ bool rpc_server::phone_stage_profile_pull(
         rpc_msg_phone_stage_profile_rsp & response) {
     response = {};
     if (request.run_id == 0) { return true; }
+    // Read memory only *after* the Stage session has completed. Device free
+    // memory is a conservative remaining budget, not an assumed total RAM.
+    if (!backends.empty() && backends.front() != nullptr) {
+        auto * dev = ggml_backend_get_device(backends.front());
+        if (dev) {
+            size_t mem_free = 0, mem_total = 0;
+            ggml_backend_dev_memory(dev, &mem_free, &mem_total);
+            response.phone_gpu_free_bytes = mem_free;
+            response.phone_gpu_total_bytes = mem_total;
+        }
+    }
+#if defined(__linux__) || defined(__ANDROID__)
+    {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string label, unit;
+        uint64_t kb = 0;
+        while (meminfo >> label >> kb >> unit) {
+            if (label == "MemAvailable:") {
+                response.phone_host_available_bytes = kb * 1024;
+                break;
+            }
+        }
+    }
+#endif
+    {
+        std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
+        for (const auto & arena : phone_stage_device_arenas) {
+            response.phone_gpu_stage_arena_bytes = std::max<uint64_t>(
+                response.phone_gpu_stage_arena_bytes, arena.capacity);
+        }
+    }
+    const char * host_stage_limit =
+        std::getenv("GGML_RPC_PHONE_NPU_HOST_STAGE_MIB");
+    if (host_stage_limit && *host_stage_limit) {
+        char * end = nullptr;
+        const unsigned long long mib =
+            std::strtoull(host_stage_limit, &end, 10);
+        if (end && *end == '\0' && mib > 0 &&
+                mib < (UINT64_MAX / (1024 * 1024))) {
+            response.npu_host_stage_budget_bytes =
+                static_cast<uint64_t>(mib) * 1024 * 1024;
+        }
+    }
     std::lock_guard<std::mutex> lock(phone_auto_mutex);
+    const auto stats = phone_stage_profile_banks.find(request.run_id);
+    if (stats != phone_stage_profile_banks.end()) {
+        response.npu_host_stage_bytes = stats->second.staged_bytes;
+        response.npu_host_stage_ms = stats->second.staged_ms;
+        response.npu_bank_repack_bytes = stats->second.repack_bytes;
+        response.npu_bank_repack_ms = stats->second.repack_ms;
+    }
     const auto it = phone_stage_profile_finished.find(request.run_id);
     if (it == phone_stage_profile_finished.end() ||
             it->second.size() > RPC_PHONE_STAGE_PROFILE_RUN_LIMIT ||
