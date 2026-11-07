@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory=$true)][string]$PromptFile,
     [string]$Out = ".\phone-opencl-htp-mixed-smoke",
     [int]$Threads = 8,
+    [ValidateRange(1,256)][int]$NPredict = 1,
     [switch]$NoMmap,
     [switch]$DryRun
 )
@@ -29,6 +30,7 @@ Write-Host "  GGML_RPC_PHONE_NPU_SERIAL_REGIONS=$regions"
 Write-Host "  GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=$layers"
 Write-Host "  GGML_RPC_PHONE_NPU_MIXED_OPENCL=1"
 Write-Host "  GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2"
+Write-Host "  GGML_RPC_PHONE_NPU_GPU_PIPELINE=1    # optional dual HTP/GPU compute lanes"
 Write-Host "  GGML_RPC_PHONE_BINDING_PREFLIGHT=1"
 Write-Host "  GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1"
 Write-Host "  GGML_RPC_PHONE_STAGE_DUAL_SLOT=1"
@@ -74,7 +76,7 @@ try {
         ForceXP = 64
         Batch = 512
         UBatch = 512
-        NPredict = 1
+        NPredict = $NPredict
         Threads = $Threads
         LogVerbosity = 4
     }
