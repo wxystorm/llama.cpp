@@ -348,6 +348,7 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
     last_by_stage = {}
     last_gpu_region = []
     last_npu_region = []
+    side_p2c_done = []  # Keep PC DAG completion frames for local HTP->Adreno.
     handoffs = set()
     prev_boundary = [None] * len(chunks)
     speed_by_lane = {
@@ -409,10 +410,21 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
         else:
             prev_boundary = new_boundary
         if letter == "N":
-            # Bank k+2 cannot reuse Bank k until its last output handoff
-            # has completed, not merely its last compute call. The terminal
-            # Phone->PC frame is added below and is handled separately.
-            if not last:
+            # The current RPC still publishes a P2C control/completion frame
+            # for this HTP Region, even when actual activations go directly
+            # to the next Phone Adreno Region. Model that side branch on the
+            # shared phone-to-PC lane and fence subsequent Bank repacking
+            # until the last frame is captured. It does not gate Adreno input.
+            if not last and active[index+1][1] == "A":
+                controls = [
+                    dag.add(f"N_CONTROL_P2C:{ci}:{k}", "phone_to_pc",
+                            length*bytes_per_token/MIB/base["p2c_mibps"]*1000,
+                            prev_boundary[k])
+                    for k, (_, length) in enumerate(chunks)]
+                side_p2c_done.extend(controls)
+                last_npu_region.append(controls[-1])
+                handoffs.add("N_CONTROL_P2C")
+            elif not last:
                 last_npu_region.append(prev_boundary[-1])
     final_backend = active[-1][1]
     if final_backend in ("N", "A"):
@@ -435,7 +447,7 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
                     prev_boundary[k])
             for k, (_, length) in enumerate(chunks)]
         handoffs.add("FINAL_GPU_TO_CPU")
-    dag.add("PC_HEAD", "cpu", head_ms, *prev_boundary)
+    dag.add("PC_HEAD", "cpu", head_ms, *prev_boundary, *side_p2c_done)
     wall, busy, start, end = dag.run()
     return {
         "wall_ms": wall, "nodes": len(dag.nodes), "busy_ms": busy,
