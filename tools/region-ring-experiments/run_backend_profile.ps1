@@ -81,6 +81,12 @@ if ($LASTEXITCODE -ne 0) { throw "Tokenizer failed" }
 $match=[regex]::Match(($tok -join [Environment]::NewLine),'Total number of tokens:\s*(\d+)')
 if (!$match.Success) { throw "Tokenizer did not report token count." }
 $ntokens=[int]$match.Groups[1].Value
+$promptHash=(Get-FileHash -LiteralPath $prompt -Algorithm SHA256).Hash.ToLowerInvariant()
+$currentCommit=((& git -C $repo rev-parse HEAD) | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($currentCommit)) {
+    throw "Git working-tree HEAD is required for safe resume matching."
+}
+$currentCommit=$currentCommit.Trim()
 New-Item -ItemType Directory -Force -Path $matrix | Out-Null
 $vars=@{
     "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP"="1"
@@ -122,7 +128,17 @@ try {
             foreach ($x in $widths) {
                 $out=Join-Path $runs "repeat$repeat-x$x"
                 $pass=@(Get-ChildItem -LiteralPath $out -Filter result.json -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-                    try { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).status -eq "PASS" } catch { $false }
+                    try {
+                        $prev=Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json
+                        $prev.status -eq "PASS" -and
+                        $prev.model -eq $probe -and
+                        $prev.prompt_sha256 -eq $promptHash -and
+                        $prev.runtime_layout -eq [string]$p.spec.runtime_layout -and
+                        [int]$prev.xc -eq $x -and
+                        [int]$prev.xg -eq $x -and
+                        [int]$prev.xp -eq $x -and
+                        $prev.commit -eq $currentCommit
+                    } catch { $false }
                 })
                 if ($pass.Count -gt 0) {
                     Write-Host "[BACKEND_PROFILE] skip=PASS backend=$($p.backend) layers=$($p.layers) X=$x repeat=$repeat"
