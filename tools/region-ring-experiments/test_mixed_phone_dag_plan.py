@@ -2,7 +2,8 @@
 import unittest
 from mixed_phone_dag_plan import (Cycle, memory, split_phone, plan, dag_for,
                                   planner_backend_mapping, execution_stage_graph,
-                                  handoff_route, geometry)
+                                  handoff_route, geometry,
+                                  runtime_compatible_cycles)
 
 BASE = dict(gpu_budget_mib=500, npu_budget_mib=25,
             gpu_weight_layer_mib=8, npu_weight_layer_mib=10,
@@ -97,6 +98,17 @@ class MixedPlanTests(unittest.TestCase):
         result = dag_for(cycles, 64, 128, 5120,
                          FakeProfile(), measured, MIX, 2.)
         self.assertIn("FINAL_GPU_TO_CPU", result["handoffs"])
+
+    def test_runtime_candidate_requires_real_adjacent_phone_link(self):
+        self.assertTrue(runtime_compatible_cycles([
+            Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1),
+            Cycle(8, 1, 0, 1), Cycle(7, 2, 0, 1)]))
+        self.assertFalse(runtime_compatible_cycles([
+            Cycle(8, 1, 1, 0), Cycle(8, 1, 1, 0)]))
+        self.assertFalse(runtime_compatible_cycles([
+            Cycle(0, 1, 1, 1), Cycle(7, 1, 1, 1)]))
+        self.assertFalse(runtime_compatible_cycles([
+            Cycle(7, 1, 0, 1), Cycle(7, 1, 0, 1)]))
 
     def test_plan_owns_region_layer_mapping_with_omitted_zero_width(self):
         cycles = [Cycle(7, 1, 1, 1), Cycle(8, 0, 1, 0)]
