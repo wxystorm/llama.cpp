@@ -1,6 +1,6 @@
 """Offline test: NPU->PhoneGPU spill, memory reject, bank-mover DAG."""
 import unittest
-from mixed_phone_dag_plan import Cycle, memory, split_phone, plan, dag_for
+from mixed_phone_dag_plan import Cycle, memory, split_phone, plan, dag_for, planner_backend_mapping
 
 BASE = dict(gpu_budget_mib=500, npu_budget_mib=25,
             gpu_weight_layer_mib=8, npu_weight_layer_mib=10,
@@ -24,6 +24,18 @@ class FakeProfile:
 
 
 class MixedPlanTests(unittest.TestCase):
+    def test_plan_owns_region_layer_mapping_with_omitted_zero_width(self):
+        cycles = [Cycle(7, 1, 1, 1), Cycle(8, 0, 1, 0)]
+        npu, phone_gpu = planner_backend_mapping(cycles)
+        self.assertEqual(npu, [
+            {"region": 2, "layer": 8},
+            {"region": 5, "layer": 18},
+        ])
+        self.assertEqual(phone_gpu, [{
+            "region": 3, "first_layer": 9,
+            "last_layer_exclusive": 10,
+        }])
+
     def test_spill_instead_of_early_reject(self):
         gcp = [(7, 1, 2)] * 4
         before = [Cycle(g, c, 1, 1) for g, c, _ in gcp]
