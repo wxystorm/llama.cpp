@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import re
 import socket
 import struct
@@ -33,6 +34,36 @@ class GGUFWeights:
     layers: tuple[int, ...]
     other_bytes: int
     file_bytes: int
+    embedding_length: int = 0
+    attention_head_count: int = 0
+    attention_head_count_kv: int = 0
+    attention_key_length: int = 0
+    attention_value_length: int = 0
+
+    def kv_bytes_per_layer(self, context: int, dtype_bytes: float = 2.0) -> int:
+        """Estimate per-layer K+V allocation for a full context in this model."""
+        if context < 1 or not 0 < dtype_bytes <= 8:
+            raise ValueError("invalid KV context length or bytes per element")
+        if self.attention_head_count_kv <= 0:
+            raise ValueError(
+                "GGUF attention.head_count_kv is absent; unable to size "
+                "the KV cache safely. Supply --kv-per-layer-mib override."
+            )
+        head_dim = (self.embedding_length // self.attention_head_count
+                    if self.attention_head_count > 0
+                    and self.embedding_length % self.attention_head_count == 0
+                    else 0)
+        key_dim = self.attention_key_length or head_dim
+        value_dim = self.attention_value_length or head_dim
+        if key_dim < 1 or value_dim < 1:
+            raise ValueError(
+                "GGUF key/value head dimensions missing; supply "
+                "--kv-per-layer-mib override."
+            )
+        return math.ceil(
+            context * self.attention_head_count_kv *
+            (key_dim + value_dim) * dtype_bytes
+        )
 
     @property
     def n_layers(self) -> int:
@@ -67,6 +98,18 @@ class MemoryPlan:
     cpu_available_bytes: int = 0
     cpu_budget_bytes: int = 0
     cpu_reserve_bytes: int = 0
+    kv_per_layer_bytes: int = 0
+    cpu_kv_bytes: int = 0
+    pc_kv_bytes: int = 0
+    phone_kv_bytes: int = 0
+    cpu_workspace_bytes: int = 0
+    pc_workspace_bytes: int = 0
+    phone_workspace_bytes: int = 0
+    cpu_safety_bytes: int = 0
+    pc_safety_bytes: int = 0
+    phone_safety_bytes: int = 0
+    context_tokens: int = 0
+    kv_dtype_bytes: float = 2.0
 
     @property
     def pc_gpu_layers(self) -> int:
@@ -138,7 +181,14 @@ def read_gguf_weights(path: Path) -> GGUFWeights:
             value_type = _read_num(f, 'I')
             keep = (key == 'general.architecture' or key == 'general.alignment'
                     or key.endswith('.block_count') or key == 'split.count'
-                    or key == 'general.split.count')
+                    or key == 'general.split.count'
+                    or key.endswith((
+                        '.embedding_length',
+                        '.attention.head_count',
+                        '.attention.head_count_kv',
+                        '.attention.key_length',
+                        '.attention.value_length',
+                    )))
             value = _metadata_value(f, value_type, keep)
             if keep:
                 metadata[key] = value
@@ -186,7 +236,14 @@ def read_gguf_weights(path: Path) -> GGUFWeights:
             other_size += size
     if any(size <= 0 for size in layer_sizes):
         raise ValueError('GGUF is missing at least one complete repeating layer')
-    return GGUFWeights(arch, tuple(layer_sizes), other_size, file_bytes)
+    return GGUFWeights(
+        arch, tuple(layer_sizes), other_size, file_bytes,
+        embedding_length=int(metadata.get(arch + '.embedding_length') or 0),
+        attention_head_count=int(metadata.get(arch + '.attention.head_count') or 0),
+        attention_head_count_kv=int(metadata.get(arch + '.attention.head_count_kv') or 0),
+        attention_key_length=int(metadata.get(arch + '.attention.key_length') or 0),
+        attention_value_length=int(metadata.get(arch + '.attention.value_length') or 0),
+    )
 
 
 def pc_gpu_memory() -> DeviceMemory:
