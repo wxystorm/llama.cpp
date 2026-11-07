@@ -1,0 +1,98 @@
+name: Bootstrap pinned PRIMA Qwen3 Dense baseline
+on:
+  push:
+    branches:
+      - baseline/prima-qwen3-dense-20261107
+    paths:
+      - '.github/workflows/prima-qwen3-bootstrap.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.repository == 'wxystorm/llama.cpp'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout isolated working branch
+        uses: actions/checkout@v4
+        with:
+          ref: baseline/prima-qwen3-dense-20261107
+          persist-credentials: true
+      - name: Import PRIMA under its own folder (preserve upstream LICENSE)
+        shell: bash
+        run: |
+          set -euo pipefail
+          upstream_sha=288df6a2cc2120387e12d6f40798f30cc525c9ea
+          dest=baselines/prima.cpp
+          if test -e "$dest/src/llama.cpp"; then
+            echo "Import already present, skipping"
+            exit 0
+          fi
+          git clone --depth 1 --branch main https://github.com/OpenCPIL/prima.cpp.git /tmp/prima-pinned
+          actual=$(git -C /tmp/prima-pinned rev-parse HEAD)
+          test "$actual" = "$upstream_sha" || {
+            echo "::error::Upstream moved: expected $upstream_sha, got $actual"
+            exit 1
+          }
+          mkdir -p "$dest"
+          tar -C /tmp/prima-pinned --exclude='.git' -cf - . | tar -C "$dest" -xf -
+          test -f "$dest/LICENSE"
+      - name: Add Qwen3 Dense compatibility without changing HALDA scheduling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile baselines/_prima_bootstrap/port_qwen3_dense.py
+          if grep -q 'LLM_ARCH_QWEN3' baselines/prima.cpp/src/llama.cpp; then
+            echo "Already patched"
+          else
+            python3 baselines/_prima_bootstrap/port_qwen3_dense.py baselines/prima.cpp/src/llama.cpp
+          fi
+          grep -q 'LLM_ARCH_QWEN3' baselines/prima.cpp/src/llama.cpp
+      - name: Record provenance and remaining validations
+        shell: bash
+        run: |
+          cat > baselines/prima.cpp/PRIMA_QWEN3_PORT.md <<'EOF'
+          # PRIMA Qwen3 Dense (experimental)
+
+          Upstream: https://github.com/OpenCPIL/prima.cpp
+          Upstream main commit: `288df6a2cc2120387e12d6f40798f30cc525c9ea`
+          Original license: MIT; see [LICENSE](LICENSE). Keep upstream authorship and notices.
+
+          ## Scope
+          This copy is modified locally for **Qwen3 Dense** models (not Qwen3 MoE / VL).
+          It extends the distributed Qwen2 loader and graph to recognize qwen3,
+          load per-head Q/K RMSNorm weights, use the Qwen3 bias-free Q/K/V
+          projections, and apply Q/K RMSNorm before RoPE. The HALDA
+          profiling-side model loader and norm FLOP accounting are extended.
+          Communication, pipeline scheduling, and HALDA optimization policy are
+          intentionally unchanged.
+
+          ## Status
+          **Experimental / unverified.** The bootstrap workflow performs textual
+          integrity checks only; it does not compile or run a Qwen3 model.
+          Build the PC and Android implementations and validate logits against
+          official llama.cpp in 1-rank and 2-rank configurations before using
+          performance numbers. Older GGUF metadata or tokenizer handling may need
+          further compatibility work.
+
+          ## PC / Termux
+          Build commands remain the same as upstream (see README.md).
+          On the rank-0 PC, use the existing `make USE_HIGHS=1` setup.
+          On the phone, use the normal Termux build. Both nodes need the
+          matching Qwen3 Dense GGUF file.
+          EOF
+      - name: Commit isolated imported copy and patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add baselines/prima.cpp
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m 'baseline(prima): import upstream and port Qwen3 Dense graph'
+          git push origin HEAD:baseline/prima-qwen3-dense-20261107
