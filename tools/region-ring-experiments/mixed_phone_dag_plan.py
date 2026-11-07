@@ -410,8 +410,10 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
             prev_boundary = new_boundary
         if letter == "N":
             # Bank k+2 cannot reuse Bank k until its last output handoff
-            # has completed, not merely its last compute call.
-            last_npu_region.append(prev_boundary[-1])
+            # has completed, not merely its last compute call. The terminal
+            # Phone->PC frame is added below and is handled separately.
+            if not last:
+                last_npu_region.append(prev_boundary[-1])
     final_backend = active[-1][1]
     if final_backend in ("N", "A"):
         prev_boundary = [
@@ -420,6 +422,8 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
                     prev_boundary[k])
             for k, (_, length) in enumerate(chunks)]
         handoffs.add("FINAL_P2C")
+        if final_backend == "N":
+            last_npu_region.append(prev_boundary[-1])
     elif final_backend == "G":
         # CUDA-to-CPU readback must be measured for the final CPU Head.
         rate = base.get("gpu_d2h_mibps", 0.)
