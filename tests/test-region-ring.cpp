@@ -239,6 +239,44 @@ static void test_directional_layout() {
 
 
 
+static void test_adjacent_phone_mixed_topology() {
+    // Both Phone Regions are real (whole-layer) Stage boundaries. The PC
+    // chooses which one is HTP and which one is Adreno through its map RPC.
+    // No zero-length Region or implied Tensor layer is inserted.
+    const char * selected =
+        "G7,C1,P1,P1,G7,C1,P1,P1,G8,C1,P1,G7,C2,P1";
+    const auto regions = llama_region_ring_parse_apply_wide_layout(selected, 40);
+    check(regions.size() == 14, "adjacent Phone Regions were merged");
+    check(llama_region_ring_apply_topology_compatible(regions, 40),
+          "HTP->Adreno mixed Cycle rejected by APPLY_WIDE");
+    check(llama_region_ring_layout_string(regions) == selected,
+          "mixed Phone Regions changed layer allocation after parse");
+    check(regions[2].device == llama_region_ring_device::PHONE &&
+          regions[3].device == llama_region_ring_device::PHONE &&
+          regions[2].layer_end == regions[3].layer_begin,
+          "HTP->Adreno whole-layer boundary is not contiguous");
+    check(regions[6].device == llama_region_ring_device::PHONE &&
+          regions[7].device == llama_region_ring_device::PHONE,
+          "second Cycle Phone-local boundary missing");
+    const auto totals = llama_region_ring_layer_counts(regions);
+    check(totals[0] + totals[1] + totals[2] == 40,
+          "mixed Phone region coverage mismatch");
+    bool legacy_rejected = false;
+    try {
+        (void) llama_region_ring_parse(selected, 40);
+    } catch (const std::exception &) {
+        legacy_rejected = true;
+    }
+    check(legacy_rejected, "strict legacy parser must reject adjacent Phone Regions");
+
+    const auto without_cpu = llama_region_ring_parse_apply_wide_layout(
+        "G8,P1,P1,G8,P1,P1,G9,P1,G10", 40);
+    // The last cycle is PC-only and must never masquerade as a valid
+    // Phone-final four-backend topology.
+    check(without_cpu.back().device == llama_region_ring_device::GPU,
+          "PC-only tail should retain GPU ownership");
+}
+
 static void test_general_topology() {
     const auto two_cycle_tail = llama_region_ring_parse(
         "G4,C6,P8,G4,C6,P8,G4,C8",48,true);
