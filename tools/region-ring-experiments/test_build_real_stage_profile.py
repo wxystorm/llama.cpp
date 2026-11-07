@@ -49,6 +49,48 @@ class RealStageProfileTests(unittest.TestCase):
             self.assertEqual(phone["compute_ms"], 128.25)
             self.assertEqual(phone["terminal"], 1)
 
+    def test_mixed_htp_graphless_and_opencl_costs_are_distinct(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            case = root / "mixed" / "prompt_512"
+            case.mkdir(parents=True)
+            traces = [
+                dict(type="region_ring_chunk_trace", device="PHONE",
+                     region=2, chunk=0, layer_begin=9, layer_end=10,
+                     tokens=64, token_begin=0),
+                dict(type="region_ring_chunk_trace", device="PHONE",
+                     region=8, chunk=0, layer_begin=29, layer_end=30,
+                     tokens=64, token_begin=0),
+            ]
+            (case / "metrics.jsonl").write_text(
+                "\n".join(json.dumps(t) for t in traces), encoding="utf-8")
+            (case / "engine.stderr.log").write_text(
+                "[PHONE_AUTO] event=SESSION_READY run=246 status=READY\n"
+                "[REAL_STAGE_PROFILE] side=PC phase=GRAPH_SETUP "
+                "region=8 chunk=0 kv_tokens=64 terminal=1 setup_ms=5.0\n",
+                encoding="utf-8")
+            rpc = root / "rpc.log"
+            rpc.write_text(
+                "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK run=246 "
+                "region=2 chunk=0 backend=HTP0 upload_ms=0.5 "
+                "prepare_ms=-1.000 compute_ms=12.0 status=PASS\n"
+                "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK run=246 "
+                "region=8 chunk=0 backend=GPUOpenCL upload_ms=1.0 "
+                "prepare_ms=2.0 compute_ms=43.0 status=PASS\n",
+                encoding="utf-8")
+            raw, diag = extract([case], rpc, mixed=True)
+            rows = aggregate(raw)
+            self.assertEqual(diag["phone"], 1)
+            self.assertEqual(diag["phone_gpu"], 1)
+            self.assertEqual(len(rows), 2)
+            npu = next(x for x in rows if x["device"] == "PHONE")
+            gpu = next(x for x in rows if x["device"] == "PHONE_GPU")
+            self.assertEqual(npu["compute_ms"], 12.)
+            self.assertEqual(npu["prepare_ms"], 0.)
+            self.assertEqual(gpu["compute_ms"], 43.)
+            self.assertEqual(gpu["prepare_ms"], 2.)
+            self.assertEqual(gpu["setup_ms"], 5.)
+
     def test_no_remote_data_means_no_fabricated_phone_cost(self):
         with TemporaryDirectory() as temp:
             case = Path(temp)
