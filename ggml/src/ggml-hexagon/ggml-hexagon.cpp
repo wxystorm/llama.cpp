@@ -5463,7 +5463,23 @@ static void ggml_backend_hexagon_clear_fixed_graph_cache(
     sess->cached_graph.htp_nodes.clear();
 }
 
+// Selective fixed-Graph retirement for two physical NPU weight Banks.
+// The RPC owner must synchronize the HTP compute lane before invoking this;
+// an in-flight DSP op may still reference tensor metadata after a CPU erase.
+static bool ggml_backend_hexagon_evict_fixed_graph_uid(
+        ggml_backend_t backend, uint64_t uid) {
+    if (backend == nullptr || (uid & (UINT64_C(1) << 63)) == 0) {
+        return false;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    return sess != nullptr && sess->fixed_graph_cache.erase(uid) == 1;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_hexagon_evict_fixed_graph_uid") == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_hexagon_evict_fixed_graph_uid);
+    }
     if (strcmp(name, "ggml_backend_hexagon_clear_fixed_graph_cache") == 0) {
         return reinterpret_cast<void *>(
             ggml_backend_hexagon_clear_fixed_graph_cache);
