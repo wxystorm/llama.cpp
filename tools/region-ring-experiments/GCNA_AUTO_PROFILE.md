@@ -87,6 +87,41 @@ warns that final Plan requires the original-model model_profile.json.
 The automated mixed calibration requires measured third-bank refill;
 otherwise it refuses to invent NPU Host stage/repack bandwidth.
 
+
+## Device-selected final Stage (offline planner, current limitation)
+
+The four-backend **offline** DAG now compares final-transformer ownership
+for Phone HTP (N), Phone OpenCL (A), PC CPU (C) and PC CUDA (G), rather
+than assuming the last physical Stage must be Phone.
+
+For an eligible PC-final candidate, the last Cycle has no Phone Region;
+all its original Transformer layers are instead explicitly assigned to
+PC GPU or PC CPU. The preceding Cycles can still use the HTP->Adreno
+pipeline. The DAG includes the final CPU RMSNorm/LM Head and, for a
+CUDA-terminal candidate, a measured CUDA->CPU D2H transfer. Both are
+required measured costs: no zero-cost hidden transfer and no implicit
+CPU fallback. The ranked `candidates.csv` exposes `final_backend` and
+`runtime_compatible`.
+
+**Important:** This does not yet make PC-last plans executable.
+`-PhoneMixed -RuntimeCompatible` retains the proven Phone-last
+autonomous prefill subset. The PC runtime still guards its canonical
+output result and scheduler ownership around a terminal Phone Region
+(see `llama-context.cpp`); simply relaxing `APPLY_WIDE` topology
+checks would create an invalid execution contract. PC-last plans have
+`runtime_compatible=false` and `run_saved_plan.ps1` rejects them.
+
+To finish runtime support, terminal G/C must publish final hidden states
+and synchronize the correct CPU/CUDA stage before a CPU-owned Head is
+built on the canonical scheduler. The last Phone Region may now be
+*intermediate*, requiring its actual P2C activation to reach the
+downstream PC worker. Validation must include tiny/warmup, full prefill
+and decode transitions, plus PC logits parity.
+
+Phone NPU still supports one physical Transformer layer per HTP Region;
+the offline planner never interprets a measured N1 point as a real N2
+Stage.
+
 ## Offline Plan on the ORIGINAL full model
 
     .\tools\region-ring-experiments\run_plan.ps1 -PhoneMixed -RuntimeCompatible -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_512.txt" -Out ".\offline-plans\gcna-512"
