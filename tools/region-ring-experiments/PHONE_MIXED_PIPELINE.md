@@ -34,12 +34,11 @@ This is **different-Chunk overlap**, not simultaneous GPU+NPU within a
 single Transformer Layer and not a direct NPU->GPU activation transfer.
 The actual layer order for one Chunk is:
 
-    PC G0..8 -> Phone HTP L9
-      -> PC G/C L10..18 -> Phone HTP L19
-      -> PC G/C L20..28 -> Phone GPU L29
-      -> PC G/C L30..38 -> Phone GPU L39 -> PC Head
-
-The existing PC CPU layers are included in those PC G/C intervals.
+    PC CUDA L0..7 -> PC CPU L8 -> Phone HTP L9
+      -> PC CUDA L10..17 -> PC CPU L18 -> Phone HTP L19
+      -> PC CUDA L20..27 -> PC CPU L28 -> Phone GPU L29
+      -> PC CUDA L30..36 -> PC CPU L37..38 -> Phone GPU L39
+      -> PC Head
 
 ## Phone Termux setup
 
@@ -100,23 +99,28 @@ On Phone:
 
     grep -E '\[PHONE_MIXED_PIPELINE\]|\[PHONE_AUTO_SUM\]|\[PHONE_QWEN3_LOCAL\]|\[PHONE_STAGE_SLOT0\]' phone-pipeline.log | tail -n 120
 
-For each accepted compute task:
+For each accepted compute task, `CLAIM` is recorded before device lock
+acquisition. Only `DEVICE_BEGIN`/`DEVICE_END` are used for overlap:
 
-    [PHONE_MIXED_PIPELINE] event=COMPUTE_BEGIN run=... region=2 chunk=... backend=HTP0 phone_us=...
-    [PHONE_MIXED_PIPELINE] event=COMPUTE_BEGIN run=... region=8 chunk=... backend=GPUOpenCL phone_us=...
-    [PHONE_MIXED_PIPELINE] event=COMPUTE_END   run=... region=2 chunk=... backend=HTP0 phone_us=...
-    [PHONE_MIXED_PIPELINE] event=COMPUTE_END   run=... region=8 chunk=... backend=GPUOpenCL phone_us=...
+    [PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN run=... region=2 chunk=... backend=HTP0 phone_us=...
+    [PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN run=... region=8 chunk=... backend=GPUOpenCL phone_us=...
+    [PHONE_MIXED_PIPELINE] event=DEVICE_END   run=... region=2 chunk=... backend=HTP0 phone_us=...
+    [PHONE_MIXED_PIPELINE] event=DEVICE_END   run=... region=8 chunk=... backend=GPUOpenCL phone_us=...
 
 At RUN teardown:
 
     [PHONE_MIXED_PIPELINE] event=SUMMARY run=...
       htp_jobs=... gpu_jobs=...
-      htp_compute_ms=... gpu_compute_ms=...
-      htp_gpu_overlap_ms=... status=OVERLAP_MEASURED
+      htp_device_service_ms=... gpu_device_service_ms=...
+      htp_gpu_service_overlap_ms=... status=OVERLAP_MEASURED
 
-The measured overlap uses **only Phone monotonic timestamps**.
-`htp_gpu_overlap_ms > 0` is actual overlapping compute intervals
-from two different worker threads. `NO_OVERLAP_MEASURED` is not
+The measured overlap uses **only Phone monotonic timestamps** and
+excludes queue admission and waiting for the two device mutexes.
+`htp_gpu_service_overlap_ms > 0` demonstrates simultaneous backend
+*service calls* on two workers. Those calls include input/output transfers,
+so this is **not proof that both GPU and HTP arithmetic kernels executed
+at the same instant**. A kernel-level overlap claim needs separate
+hardware-event profiling. `NO_OVERLAP_MEASURED` is not
 automatically a correctness failure: causal readiness, short Chunks,
 CPU/CUDA time, or lock contention may leave no simultaneous jobs.
 
