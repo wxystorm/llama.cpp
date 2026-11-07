@@ -269,12 +269,15 @@ static void test_adjacent_phone_mixed_topology() {
     }
     check(legacy_rejected, "strict legacy parser must reject adjacent Phone Regions");
 
-    const auto without_cpu = llama_region_ring_parse_apply_wide_layout(
-        "G8,P1,P1,G8,P1,P1,G9,P1,G10", 40);
-    // The last cycle is PC-only and must never masquerade as a valid
-    // Phone-final four-backend topology.
-    check(without_cpu.back().device == llama_region_ring_device::GPU,
-          "PC-only tail should retain GPU ownership");
+    bool rejected_pc_tail = false;
+    try {
+        (void) llama_region_ring_parse_apply_wide_layout(
+            "G8,P1,P1,G8,P1,P1,G9,P1,G10", 40);
+    } catch (const std::exception &) {
+        rejected_pc_tail = true;
+    }
+    check(rejected_pc_tail,
+          "APPLY_WIDE must reject a mixed layout ending on PC");
 }
 
 static void test_general_topology() {
@@ -1459,6 +1462,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] directional_layout=PASS\n");
         test_general_topology();
         std::fprintf(stderr, "[REGION_RING_TEST] general_topology=PASS\n");
+        test_adjacent_phone_mixed_topology();
+        std::fprintf(stderr, "[REGION_RING_TEST] adjacent_phone_mixed=PASS\n");
         test_apply_safe_compatibility();
         std::fprintf(stderr, "[REGION_RING_TEST] apply_safe_compatibility=PASS\n");
         test_dependencies();
