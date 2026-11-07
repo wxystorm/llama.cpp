@@ -9465,6 +9465,9 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
             src.key.run_id, src.key.region, dst_region, src.key.chunk);
         return false;
     }
+    // Wake both the stream staging waiter and the autonomous Adreno worker.
+    // No socket receive or network checksum path participates here.
+    phone_input_stream_cv.notify_all();
     // Only after the payload owns its bytes may the independent Adreno
     // upload worker accept the destination job. Never reuse a raw pointer
     // into HTP repack storage or the source vector.
