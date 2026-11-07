@@ -375,6 +375,12 @@ add_executable(test-phone-plan-region-map test-phone-plan-region-map.cpp)
 set_target_properties(test-phone-plan-region-map PROPERTIES CXX_STANDARD 17)
 llama_test(test-phone-plan-region-map)
 
+# Host-only HTP->Adreno F32 handoff: prove the same vector allocation is
+# transferred without a second memcpy or device-dependent runtime.
+add_executable(test-phone-local-host-handoff test-phone-local-host-handoff.cpp)
+set_target_properties(test-phone-local-host-handoff PROPERTIES CXX_STANDARD 17)
+llama_test(test-phone-local-host-handoff)
+
 # User-facing, inference-free offline Planner (exact same C++ DAG engine).
 add_executable(region-ring-offline-plan
     ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/offline_plan.cpp)
