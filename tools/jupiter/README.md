@@ -1172,3 +1172,37 @@ uses a 3-stage DP cost whenever CPU layers are nonzero. Existing 2-stage
 runs remain unchanged when cpu_layers=0. The 3-device path has not been
 validated on the user's actual PC+Phone rig; verify model load and correct
 plan application before relying on performance results.
+
+### Memory-aware automatic split (KV, workspace and safety)
+
+The quick8 sampler now sizes more than GGUF weights. For each model layer it
+estimates full-context K+V bytes from the GGUF attention KV-head count and
+key/value head widths (default f16, 2 bytes per element); it also budgets
+host/GPU/Phone graph workspace, extra in-flight chunk activation buffers,
+Graph Prebuild buffer overhead, fixed reserves and a per-device free-memory
+safety percentage. All terms are accounted for BEFORE choosing layer cuts.
+
+Quick8 default settings for the CPU/GPU/Phone split:
+
+- Fixed reserves: CPU 2048 MiB, GPU 512 MiB, Phone 512 MiB.
+- Workspace floors: CPU 512 MiB, GPU 1024 MiB, Phone 1536 MiB.
+- Extra safety: 10% of currently free memory on each device.
+- Context length: --context, KV type: f16 (2 bytes/element),
+  activation sizing: --ubatch and --window, plus --graph-prebuild.
+- Missing GGUF KV dimensions cause an explicit error, not a silent zero-KV
+  estimate. The override --kv-per-layer-mib is available for unusual models.
+
+Use the following to inspect the split without launching the model:
+
+```powershell
+python .\tools\jupiter\run_sharegpt_quick8.py `
+    --model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+    --memory-check-only
+```
+
+Log records JUPITER_MEMORY_BUDGET include device, free, weights, KV, workspace,
+fixed reserve, safety, and estimated remaining GiB. The JSON memory-plan.json
+contains the same breakdown for actual runs. This is NOT an exact ggml
+allocator forecast. If Phone RPC says failed to load tensor from local RPC
+model file, inspect the Phone RPC server's local model source, tensor names,
+and file integrity; adding memory margin does not fix a missing source tensor.
