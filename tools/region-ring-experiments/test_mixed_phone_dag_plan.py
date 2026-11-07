@@ -72,23 +72,30 @@ class MixedPlanTests(unittest.TestCase):
         self.assertTrue(all(sum(sum(c) for c in xs) == 40 for xs in seeds))
         self.assertEqual(len(seeds), len({tuple(xs) for xs in seeds}))
 
-    def test_pc_terminal_is_offline_only_until_runtime_owns_final_head(self):
+    def test_pc_terminal_requires_real_deferred_head_and_p2c(self):
         cpu_tail = [Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1),
                     Cycle(6, 4, 0, 0)]
         gpu_tail = [Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1),
                     Cycle(10, 0, 0, 0)]
         for cs in (cpu_tail, gpu_tail):
-            self.assertFalse(runtime_compatible_cycles(cs))
+            self.assertTrue(runtime_compatible_cycles(cs))
             result = dag_for(cs, 64, 256, 5120, FakeProfile(),
                              dict(BASE, gpu_d2h_mibps=200), MIX, 2.)
             self.assertIsNotNone(result)
             self.assertIn("P2C", result["handoffs"])
+            # No zero-cost CPU Head is permitted for PC terminal layouts.
+            self.assertIsNone(dag_for(
+                cs, 64, 256, 5120, FakeProfile(),
+                dict(BASE, gpu_d2h_mibps=200), MIX, 0.))
         self.assertIn("FINAL_GPU_TO_CPU",
                       dag_for(gpu_tail, 64, 256, 5120, FakeProfile(),
                               dict(BASE, gpu_d2h_mibps=200), MIX, 2.)["handoffs"])
         self.assertNotIn("FINAL_GPU_TO_CPU",
                          dag_for(cpu_tail, 64, 256, 5120, FakeProfile(),
                                  BASE, MIX, 2.)["handoffs"])
+        self.assertFalse(runtime_compatible_cycles([
+            Cycle(7, 1, 0, 0), Cycle(7, 1, 1, 1),
+            Cycle(7, 1, 1, 1)]))
 
     def test_no_npu_and_no_adreno_both_allowed(self):
         base = dict(BASE, npu_budget_mib=100)
