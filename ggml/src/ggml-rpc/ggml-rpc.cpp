@@ -7223,7 +7223,41 @@ bool rpc_server::phone_input_stream_run(
         std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
         std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
         if (request.active) {
+            // New RUN begins only after the previous compute/Bank Mover
+            // HTP critical section is drained. Discard pending old-run
+            // refill jobs, invalidate every old Graph, and prime A/B again.
+            if (phone_npu_banked_enabled) {
+                std::lock_guard<std::mutex> lock(phone_auto_mutex);
+                phone_npu_bank_refill_jobs.clear();
+                phone_npu_banked_ready_regions.clear();
+            }
             phone_npu_executor->reset_kv();
+            if (phone_npu_banked_enabled) {
+                std::string why;
+                ggml_phone_npu_serial::full_region_executor::model_load_stats
+                    stats {};
+                const int64_t t0 = ggml_time_us();
+                if (!phone_npu_executor->reset_banked_initial_weights(
+                        why, stats)) {
+                    GGML_LOG_ERROR(
+                        "[NPU_BANK] event=REPRIME status=FAIL reason=%s\n",
+                        why.c_str());
+                    return false;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(phone_auto_mutex);
+                    auto it = phone_npu_serial_regions.begin();
+                    phone_npu_banked_ready_regions.insert(*it++);
+                    phone_npu_banked_ready_regions.insert(*it);
+                }
+                GGML_LOG_INFO(
+                    "[NPU_BANK] event=REPRIME read_ms=%.3f"
+                    " repack_ms=%.3f source_bytes=%zu wall_ms=%.3f"
+                    " status=PASS\n",
+                    stats.file_read_ms, stats.htp_repack_ms, stats.new_bytes,
+                    (ggml_time_us() - t0) / 1000.0);
+                phone_auto_cv.notify_all();
+            }
         } else {
             std::string reason;
             size_t kv_bytes = 0;
