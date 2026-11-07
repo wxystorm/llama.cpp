@@ -370,6 +370,11 @@ add_executable(test-phone-mixed-pipeline test-phone-mixed-pipeline.cpp)
 set_target_properties(test-phone-mixed-pipeline PROPERTIES CXX_STANDARD 17)
 llama_test(test-phone-mixed-pipeline)
 
+# Pure policy: immutable PC-selected Phone HTP Region/Layer assignments.
+add_executable(test-phone-plan-region-map test-phone-plan-region-map.cpp)
+set_target_properties(test-phone-plan-region-map PROPERTIES CXX_STANDARD 17)
+llama_test(test-phone-plan-region-map)
+
 # User-facing, inference-free offline Planner (exact same C++ DAG engine).
 add_executable(region-ring-offline-plan
     ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/offline_plan.cpp)
