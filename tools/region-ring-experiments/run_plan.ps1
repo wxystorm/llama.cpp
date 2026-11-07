@@ -9,6 +9,7 @@ param(
     [string]$Tokenizer = "",
     [switch]$BankedRuntimeConfirmed,
     [switch]$PhoneMixed,
+    [switch]$RuntimeCompatible,
     [ValidateRange(0,1)][int]$MaxNpuRegionLayers = 1
 )
 $ErrorActionPreference = "Stop"
@@ -17,6 +18,9 @@ $ErrorActionPreference = "Stop"
 # to use the separate measured four-resource DAG and Bank memory model.
 if (!$PhoneMixed -and $env:LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP -eq "1") {
     throw "Mixed Phone mode requires -PhoneMixed (and the separate PHONE_GPU Profile); do not use the old 3-device DAG."
+}
+if ($RuntimeCompatible -and !$PhoneMixed) {
+    throw "-RuntimeCompatible is only supported with -PhoneMixed."
 }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $modelFile = (Resolve-Path -LiteralPath $Model).Path
@@ -40,6 +44,7 @@ if ($PhoneMixed) {
         "--profile-dir", $ProfileDir, "--tokenizer", $Tokenizer,
         "--max-npu-region-layers", "$MaxNpuRegionLayers", "--out", $Out
     )
+    if ($RuntimeCompatible) { $argsMixed += "--runtime-compatible" }
     & $py @argsMixed
     if ($LASTEXITCODE -ne 0) { throw "Profile-only four-backend DAG planning failed. No profiling or inference was launched." }
     return
