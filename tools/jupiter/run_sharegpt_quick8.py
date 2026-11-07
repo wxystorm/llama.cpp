@@ -59,6 +59,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-dir", default=r"E:\llama\datasets\sharegpt\sharegpt40")
     p.add_argument("--out-dir", default="jupiter-sharegpt-quick8-dp")
     p.add_argument("--per-group", type=int, default=2)
+    p.add_argument("--limit", type=int, default=None,
+                   help="limit total DP experiments after sampling (1 for smoke test)")
+    p.add_argument("--fail-fast", action="store_true",
+                   help="stop after the first failed prompt rather than retrying all 8")
     p.add_argument("--exe", default=r".\build-jupiter\bin\Release\llama-cli.exe")
     p.add_argument("--model", default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
     p.add_argument("--rpc", default="10.39.52.114:10139")
@@ -265,6 +269,10 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
     ]
     if args.graph_prebuild:
         cmd.append("--graph-prebuild")
+    if args.limit is not None:
+        cmd.extend(["--limit", str(args.limit)])
+    if args.fail_fast:
+        cmd.append("--fail-fast")
     if not args.strict_refine:
         cmd.append("--budgeted-refine")
     return cmd
@@ -277,6 +285,7 @@ def main() -> int:
         raise ValueError("require 0 < min-chunk <= max-chunk <= ubatch <= batch <= context")
     if (min(args.threads, args.window, args.q_repeats, args.refine_repeats,
             args.bench_repeats, args.max_rounds) < 1
+            or (args.limit is not None and args.limit < 1)
             or (args.pc_layers is not None and args.pc_layers < 1)
             or (args.cpu_free_mib is not None and args.cpu_free_mib < 1)
             or (args.pc_free_mib is not None and args.pc_free_mib < 1)
