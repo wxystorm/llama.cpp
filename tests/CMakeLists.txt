@@ -116,6 +116,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+# V2 descriptor tests are independent of ggml/model/RPC/HTP and run in Release.
+add_executable(test-region-ring-v2-stage test-region-ring-v2-stage.cpp)
+set_target_properties(test-region-ring-v2-stage PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+llama_test(test-region-ring-v2-stage LABEL region-ring)
+
 # Standalone Region Ring Phone KV FIFO/two-slot policy test. No model or RPC
 # server is needed; usable on Windows and Linux in Release builds.
 add_executable(test-phone-autonomous-policy test-phone-autonomous-policy.cpp)
