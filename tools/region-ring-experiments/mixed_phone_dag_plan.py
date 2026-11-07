@@ -424,7 +424,12 @@ def run_cli(argv=None):
     if "pc_head_ms" in extra["calibration"]:
         m.update(calibration(extra["calibration"], ("pc_head_ms",), ("pc_head_ms",)))
     token_count = tokenize(args.tokenizer.resolve(strict=True), model_path, prompt)
-    stage_file = (folder/manifest["stage_csv"]).resolve(strict=True)
+    # Mixed Stage samples live alongside the original HTP-only Profile;
+    # never overwrite the production three-device CSV with PHONE_GPU rows.
+    stage_name = extra.get("stage_csv", "real-stage-mixed.csv")
+    if Path(stage_name).is_absolute() or ".." in Path(stage_name).parts:
+        raise ValueError("INVALID_MIXED_STAGE_PROFILE_PATH")
+    stage_file = (folder/stage_name).resolve(strict=True)
     profiles = StageProfile(stage_file)
     options, diag = plan({"layers":info["layers"],"tokens":token_count,
                           "hidden":info["hidden"]}, profiles, b, m,
