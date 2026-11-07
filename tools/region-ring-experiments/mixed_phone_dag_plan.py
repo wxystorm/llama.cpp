@@ -348,7 +348,6 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
     last_by_stage = {}
     last_gpu_region = []
     last_npu_region = []
-    side_p2c_done = []  # Keep PC DAG completion frames for local HTP->Adreno.
     handoffs = set()
     prev_boundary = [None] * len(chunks)
     speed_by_lane = {
@@ -409,23 +408,11 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
                     for k, (_, length) in enumerate(chunks)]
         else:
             prev_boundary = new_boundary
-        if letter == "N":
-            # The current RPC still publishes a P2C control/completion frame
-            # for this HTP Region, even when actual activations go directly
-            # to the next Phone Adreno Region. Model that side branch on the
-            # shared phone-to-PC lane and fence subsequent Bank repacking
-            # until the last frame is captured. It does not gate Adreno input.
-            if not last and active[index+1][1] == "A":
-                controls = [
-                    dag.add(f"N_CONTROL_P2C:{ci}:{k}", "phone_to_pc",
-                            length*bytes_per_token/MIB/base["p2c_mibps"]*1000,
-                            prev_boundary[k])
-                    for k, (_, length) in enumerate(chunks)]
-                side_p2c_done.extend(controls)
-                last_npu_region.append(controls[-1])
-                handoffs.add("N_CONTROL_P2C")
-            elif not last:
-                last_npu_region.append(prev_boundary[-1])
+        if letter == "N" and not last:
+            # The last HTP input/output must be fully handed to the next
+            # local Adreno Host queue (or actually returned to PC). The
+            # internal N->A boundary has no P2C data or completion frame.
+            last_npu_region.append(prev_boundary[-1])
     final_backend = active[-1][1]
     if final_backend in ("N", "A"):
         prev_boundary = [
@@ -447,7 +434,7 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
                     prev_boundary[k])
             for k, (_, length) in enumerate(chunks)]
         handoffs.add("FINAL_GPU_TO_CPU")
-    dag.add("PC_HEAD", "cpu", head_ms, *prev_boundary, *side_p2c_done)
+    dag.add("PC_HEAD", "cpu", head_ms, *prev_boundary)
     wall, busy, start, end = dag.run()
     return {
         "wall_ms": wall, "nodes": len(dag.nodes), "busy_ms": busy,
