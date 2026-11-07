@@ -6688,6 +6688,9 @@ private:
         uint64_t frames = 0;
         uint64_t verified = 0;
         uint64_t applied = 0;
+        uint64_t local_published = 0;
+        uint64_t local_applied = 0;
+        uint64_t local_bytes = 0;
         uint64_t payload_bytes = 0;
         uint64_t errors = 0;
         int64_t recv_us = 0;
@@ -7801,13 +7804,17 @@ bool rpc_server::phone_input_stream_run(
             " frames=%" PRIu64 " verified=%" PRIu64
             " applied=%" PRIu64 " errors=%" PRIu64
             " payload_mib=%.3f recv_ms=%.3f hash_ms=%.3f"
-            " apply_wait_ms=%.3f status=END\n",
+            " apply_wait_ms=%.3f local_published=%" PRIu64
+            " local_applied=%" PRIu64 " local_mib=%.3f"
+            " local_host_copy_bytes=0 status=END\n",
             request.run_id, report.frames, report.verified,
             report.applied, report.errors,
             report.payload_bytes / 1048576.0,
             report.recv_us / 1000.0,
             report.hash_us / 1000.0,
-            report.apply_wait_us / 1000.0);
+            report.apply_wait_us / 1000.0,
+            report.local_published, report.local_applied,
+            report.local_bytes / 1048576.0);
     }
     return true;
 }
@@ -9454,6 +9461,9 @@ bool rpc_server::phone_local_handoff_publish(phone_auto_job & source) {
             if (ggml_phone_local_host::move_f32(
                     source.direct_p2c_payload, staged.local_f32, bytes)) {
                 phone_input_staged_slots.emplace_back(std::move(staged));
+                auto & profile = phone_input_stream_profiles[src.key.run_id];
+                ++profile.local_published;
+                profile.local_bytes += bytes;
                 accepted = true;
             }
         }
@@ -10714,7 +10724,12 @@ bool rpc_server::phone_input_apply(
         {
             std::lock_guard<std::mutex> lock(phone_input_mutex);
             if (response.accepted) {
-                ++phone_input_stream_profiles[request.key.run_id].applied;
+                auto & p = phone_input_stream_profiles[request.key.run_id];
+                if (staged.local_f32.empty()) {
+                    ++p.applied; // Only network PUSH is counted as applied.
+                } else {
+                    ++p.local_applied;
+                }
             }
         }
         {
