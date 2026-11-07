@@ -11,8 +11,8 @@ int main() {
     std::set<uint32_t> htp;
     assert(llama_region_ring_parse_region_ids(nullptr, htp) && htp.empty());
     assert(llama_region_ring_parse_region_ids("", htp) && htp.empty());
-    assert(llama_region_ring_parse_region_ids("2,5,8", htp));
-    assert((htp == std::set<uint32_t>{2,5,8}));
+    assert(llama_region_ring_parse_region_ids("2,5", htp));
+    assert((htp == std::set<uint32_t>{2,5}));
     assert(!llama_region_ring_parse_region_ids("2,2", htp));
     assert(!llama_region_ring_parse_region_ids("-1", htp));
     assert(!llama_region_ring_parse_region_ids("64", htp));
@@ -37,16 +37,17 @@ int main() {
             pc_layers += n;
         } else if (htp.count((uint32_t) i)) {
             assert(n == 1);
-            const int expected = i == 2 ? 8 : i == 5 ? 17 : 26;
+            const int expected = i == 2 ? 8 : 17;
             assert(stage.layer_begin == expected);
             ++htp_layers;
         } else {
-            assert(i == 11 && stage.layer_begin == 35 && n == 5);
+            assert((i == 8 && stage.layer_begin == 26 && n == 1) ||
+                   (i == 11 && stage.layer_begin == 35 && n == 5));
             opencl_layers += n;
         }
     }
     assert(pc_layers == 32);
-    assert(htp_layers == 3);
-    assert(opencl_layers == 5);
+    assert(htp_layers == 2);
+    assert(opencl_layers == 6);
     assert(pc_layers + htp_layers + opencl_layers == 40);
 }
