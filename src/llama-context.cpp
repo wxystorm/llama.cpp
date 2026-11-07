@@ -2936,14 +2936,40 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
                 return nullptr;
             }
         } else if (ring_lane == 2) {
-            if (n_splits != 1) {
+            const char * mixed_env =
+                std::getenv("LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP");
+            const bool mixed_enabled = mixed_env != nullptr &&
+                std::strcmp(mixed_env, "1") == 0;
+            // The tiny/warmup/decode Graph may contain two legal splits:
+            // Phone Meta computes the last Transformer layer, then PC CPU
+            // applies RMSNorm/LM Head. Full Prefill uses the independent
+            // phone-auto-final Head path instead. Do not accept any other
+            // multi-split topology or turn off backend ownership checks.
+            const bool tiny_phone_pc_head = mixed_enabled &&
+                block_tokens < 32 &&
+                stage.kind == llama_hybrid_runtime_stage_kind::PHONE &&
+                stage.layer_end == (int) model.hparams.n_layer() &&
+                n_splits == 2 && split_backend_count == 3 &&
+                ggml_backend_sched_get_split_backend(sched_use, 0) ==
+                    ggml_backend_sched_get_backend(sched_use, 0) &&
+                ggml_backend_is_meta(
+                    ggml_backend_sched_get_split_backend(sched_use, 0)) &&
+                ggml_backend_sched_get_split_backend(sched_use, 1) == local_cpu;
+            if (n_splits != 1 && !tiny_phone_pc_head) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PC_PHONE] stage=%zu block=%zu "
                     "event=REJECT reason=UNSUPPORTED_PHONE_SPLIT "
-                    "splits=%d\n",
-                    stage_index, block_index, n_splits);
+                    "splits=%d tiny_pc_head=%d\n",
+                    stage_index, block_index, n_splits,
+                    tiny_phone_pc_head ? 1 : 0);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
+            }
+            if (tiny_phone_pc_head) {
+                LLAMA_LOG_INFO(
+                    "[PHONE_MIXED_BACKENDS] event=TINY_FINAL_HEAD "
+                    "region=%zu splits=2 order=PHONE_META_THEN_PC_CPU "
+                    "status=ALLOWED\n", stage_index);
             }
             ggml_backend_t target =
                 ggml_backend_sched_get_split_backend(sched_use, 0);
