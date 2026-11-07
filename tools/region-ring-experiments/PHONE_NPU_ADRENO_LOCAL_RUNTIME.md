@@ -1,4 +1,8 @@
-# Experimental Phone HTP -> Adreno contiguous Stage runtime (RPC Patch 31)
+# Experimental Phone HTP -> Adreno contiguous Stage runtime (original RPC Patch 31)
+
+> On branch feat/four-backend-profile-rpc-gcna-20261107, the current RPC
+> protocol is Patch32 and automatic compact G/C/N/A Profile is documented in
+> GCNA_AUTO_PROFILE.md. Rebuild both PC and Phone from the same commit.
 
 Branch: `feat/phone-npu-adreno-no-mid-p2c-host-move-20261107`
 Status: source integration only. **Not yet compiled on Windows/Android or verified on a Snapdragon phone.** Do not report a device PASS without logs and logits comparison.
