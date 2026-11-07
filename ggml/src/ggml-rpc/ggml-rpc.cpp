@@ -4651,6 +4651,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
                 response.valid != 1 || response.overflow != 0 ||
                 response.total > RPC_PHONE_STAGE_PROFILE_RUN_LIMIT ||
                 response.count > RPC_PHONE_STAGE_PROFILE_PAGE ||
+                response.total < offset ||
                 response.count > response.total - offset ||
                 (offset == 0 && response.total == 0) ||
                 (offset < response.total && response.count == 0) ||
