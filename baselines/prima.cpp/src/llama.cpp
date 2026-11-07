@@ -20768,6 +20768,15 @@ int llama_rebuild_topo(llama_context * ctx,
 
     GGML_ASSERT(ctx != nullptr && ctx->send_socket != nullptr);
 
+    // Keep a connected two-node ring even if HALDA selects no compute
+    // layers for the phone. Rank 1 becomes a zero-compute network forwarder,
+    // instead of receiving NODE_TYPE_EXIT and closing the session early.
+    // The original STOP handshake still ends this single prompt session.
+    if (n_world == 2 && n_layer_window[0] > 0 && n_layer_window[1] == 0) {
+        topo_helper[1].is_forwarder = 1;
+        LLAMA_LOG_INFO("[PRIMA_IDLE_RANK] rank=1 assigned_layers=0 role=FORWARDER status=KEEP_CONNECTED\\n");
+    }
+
     auto next_rank = (my_rank + 1) % n_world;
     auto next_connect_rank = (my_rank + 1) % n_world;
     zmq::socket_t * socket_to_close = nullptr;
@@ -20781,7 +20790,7 @@ int llama_rebuild_topo(llama_context * ctx,
 
         while (next_rank_ != my_rank) {
             nodes.push_back(next_rank_);
-            if (n_layer_window[next_rank_] > 0) {
+            if (n_layer_window[next_rank_] > 0 || topo_helper[next_rank_].is_forwarder != 0) {
                 break;
             }
             next_rank_   = (next_rank_   + 1) % n_world;
