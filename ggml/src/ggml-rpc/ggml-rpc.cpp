@@ -6470,7 +6470,7 @@ private:
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
     };
-    bool phone_local_handoff_publish(const phone_auto_job & source);
+    bool phone_local_handoff_publish(phone_auto_job & source);
     enum class phone_npu_preload_status : uint8_t {
         QUEUED, RUNNING, READY, FAILED,
     };
@@ -6649,6 +6649,10 @@ private:
         phone_chunk_input_timing timing {};
         uint64_t hash = 0;
         std::vector<uint8_t> payload;
+        // Direct HTP->Adreno handoff owns this one F32 Host buffer, moved
+        // from the source HTP job. No second Host->Host activation copy or
+        // synthetic wire-frame allocation is needed.
+        std::vector<float> local_f32;
         size_t payload_offset = 0;
         size_t reserved_bytes = 0;
     };
@@ -9374,7 +9378,7 @@ void rpc_server::phone_npu_preload_loop() {
 // input slot; the producer never borrows a live NPU/Slot0 tensor pointer.
 // The old P2C frame remains for the PC Region DAG completion handshake,
 // but there is NO PC->Phone PUSH of this intermediate activation.
-bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
+bool rpc_server::phone_local_handoff_publish(phone_auto_job & source) {
     const auto & src = source.request;
     uint32_t dst_region = 0;
     rpc_msg_phone_auto_task_req dst {};
@@ -9429,35 +9433,27 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
         return false;
     }
     const int64_t begin_us = ggml_time_us();
-    rpc_msg_phone_input_push_req header {};
-    header.key = {src.key.run_id, dst_region, src.key.chunk};
-    header.size = bytes;
-    header.hash = fnv_hash(
-        reinterpret_cast<const uint8_t *>(source.direct_p2c_payload.data()),
-        bytes);
+    const rpc_phone_input_key key {
+        src.key.run_id, dst_region, src.key.chunk };
     bool accepted = false;
     bool allocation_failed = false;
     try {
         phone_input_staged staged {};
-        staged.key = header.key;
-        staged.hash = header.hash;
-        staged.payload_offset = sizeof(header);
+        staged.key = key;
+        // This payload is local trusted output, not a network message:
+        // no checksum, packet header, second activation buffer, or memcpy.
+        staged.hash = 0;
         staged.reserved_bytes = reserved;
-        staged.payload.resize(reserved);
-        memcpy(staged.payload.data(), &header, sizeof(header));
-        memcpy(staged.payload.data() + sizeof(header),
-               source.direct_p2c_payload.data(), bytes);
-        {
-            std::lock_guard<std::mutex> guard(phone_input_mutex);
-            if (phone_input_stream_runs.count(src.key.run_id) != 0 &&
-                    std::none_of(phone_input_staged_slots.begin(),
-                        phone_input_staged_slots.end(),
-                        [&](const phone_input_staged & e) {
-                            return auto_key(e.key) == auto_key(header.key);
-                        })) {
-                phone_input_staged_slots.emplace_back(std::move(staged));
-                accepted = true;
-            }
+        std::lock_guard<std::mutex> guard(phone_input_mutex);
+        if (phone_input_stream_runs.count(src.key.run_id) != 0 &&
+                std::none_of(phone_input_staged_slots.begin(),
+                    phone_input_staged_slots.end(),
+                    [&](const phone_input_staged & e) {
+                        return auto_key(e.key) == auto_key(key);
+                    })) {
+            staged.local_f32 = std::move(source.direct_p2c_payload);
+            phone_input_staged_slots.emplace_back(std::move(staged));
+            accepted = true;
         }
     } catch (const std::bad_alloc &) {
         allocation_failed = true;
@@ -9472,18 +9468,16 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
                                 "RUN_ENDED_OR_DUPLICATE");
         return false;
     }
-    // Wake both the stream staging waiter and the autonomous Adreno worker.
-    // No socket receive or network checksum path participates here.
+    // The same vector allocation now belongs to Adreno's input stage.
+    // The existing prepared-input worker owns the eventual Host->OpenCL
+    // upload; it frees the buffer and releases the budget afterward.
     phone_input_stream_cv.notify_all();
-    // Only after the payload owns its bytes may the independent Adreno
-    // upload worker accept the destination job. Never reuse a raw pointer
-    // into HTP repack storage or the source vector.
-    phone_auto_input_verified(header.key, {});
+    phone_auto_input_verified(key, {});
     GGML_LOG_INFO(
         "[PHONE_LOCAL_HANDOFF] event=PUBLISH run=%" PRIu64
         " src=%u dst=%u chunk=%u tokens=%u bytes=%zu"
-        " storage=PHONE_HOST_F32 source=HTP destination=GPUOpenCL"
-        " copy_ms=%.3f pc_push=SKIPPED status=PASS\n",
+        " storage=PHONE_HOST_F32_MOVE source=HTP destination=GPUOpenCL"
+        " host_copy_bytes=0 move_ms=%.3f pc_push=SKIPPED status=PASS\n",
         src.key.run_id, src.key.region, dst_region,
         src.key.chunk, src.n_tokens, bytes,
         (ggml_time_us() - begin_us) / 1000.0);
@@ -9581,8 +9575,13 @@ void rpc_server::phone_auto_prepare_loop() {
                             return auto_key(e.key) == auto_key(req.key);
                         });
                     ok = found != phone_input_staged_slots.end() &&
-                        found->payload.size() - found->payload_offset ==
-                            req.input_bytes;
+                        (found->local_f32.empty() ?
+                            found->payload_offset <= found->payload.size() &&
+                            found->payload.size() - found->payload_offset ==
+                                req.input_bytes :
+                            found->local_f32.size() ==
+                                req.input_bytes / sizeof(float) &&
+                            req.input_bytes % sizeof(float) == 0);
                     if (ok) { apply.hash = found->hash; }
                 }
                 if (ok) {
@@ -10666,18 +10665,27 @@ bool rpc_server::phone_input_apply(
         auto it = matching();
         if (it == phone_input_staged_slots.end() ||
                 it->hash != request.hash ||
-                it->payload.size() - it->payload_offset != request.size) {
-            return true; // Legacy SET_TENSOR fallback if no matching bytes.
+                (it->local_f32.empty() ?
+                    it->payload_offset > it->payload.size() ||
+                    it->payload.size() - it->payload_offset != request.size :
+                    request.size % sizeof(float) != 0 ||
+                    it->local_f32.size() != request.size / sizeof(float))) {
+            return true; // No matching bytes; never alias an invalid buffer.
         }
         staged = std::move(*it);
         phone_input_staged_slots.erase(it);
     }
     // Keep the host bytes charged during device upload.
     if (copy_begin_us != nullptr) { *copy_begin_us = ggml_time_us(); }
+    const void * input_host = staged.local_f32.empty() ?
+        static_cast<const void *>(staged.payload.data() + staged.payload_offset) :
+        static_cast<const void *>(staged.local_f32.data());
+    const size_t input_bytes = staged.local_f32.empty() ?
+        staged.payload.size() - staged.payload_offset :
+        staged.local_f32.size() * sizeof(float);
     response.accepted = set_tensor_direct(
         request.tensor, request.offset,
-        staged.payload.data() + staged.payload_offset,
-        staged.payload.size() - staged.payload_offset) ? 1 : 0;
+        input_host, input_bytes) ? 1 : 0;
     if (copy_end_us != nullptr) { *copy_end_us = ggml_time_us(); }
     if (staged.reserved_bytes != 0) {
         {
