@@ -1,4 +1,11 @@
-# Planner-driven Phone HTP assignment (RPC patch 30)
+# Planner-driven Phone HTP assignment (original RPC patch 30)
+
+> This document records the Patch30 mapping baseline. On
+> `feat/phone-npu-adreno-local-handoff-runtime-20261107`, the integrated
+> HTP -> Adreno local handoff uses **RPC Patch31**, an extended mapping wire
+> format and an experimental schema2 executable subset. Follow
+> [PHONE_NPU_ADRENO_LOCAL_RUNTIME.md](PHONE_NPU_ADRENO_LOCAL_RUNTIME.md)
+> for the latest build and run instructions instead of the Patch30 smoke.
 
 Branch: feat/phone-plan-driven-htp-map-20261107
 Status: experimental; rebuild PC and Phone from the same commit.
