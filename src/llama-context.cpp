@@ -4860,6 +4860,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_mixed_requested = phone_mixed_env != nullptr &&
         std::strcmp(phone_mixed_env, "1") == 0;
     std::set<uint32_t> phone_mixed_htp_regions;
+    std::set<uint32_t> phone_local_handoff_dest_regions;
     if (phone_mixed_requested && ubatch.n_tokens >= 32) {
         const char * region_spec = std::getenv(
             "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS");
@@ -5703,8 +5704,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
+                uint32_t local_successor = 0;
+                if (region + 1 < stages.size() &&
+                        stages[region + 1].kind ==
+                            llama_hybrid_runtime_stage_kind::PHONE &&
+                        phone_mixed_htp_regions.count(region + 1) == 0) {
+                    // N->A: keep source P2C for the PC DAG's completion
+                    // event, but stage its payload locally for Adreno.
+                    local_successor = region + 1;
+                    phone_local_handoff_dest_regions.insert(local_successor);
+                }
                 mapping.push_back({region,
-                    (uint32_t) stages[region].layer_begin});
+                    (uint32_t) stages[region].layer_begin,
+                    local_successor});
             }
             const bool installed = phone_input_stream_enabled &&
                 configure != nullptr && !mapping.empty() &&
@@ -5713,8 +5725,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_INFO(
                 "[PHONE_NPU_PLAN] side=pc event=INSTALL "
                 "run=%" PRIu64 " htp_regions=%zu "
-                "source=RUNTIME_SELECTED_REGION_MAP status=%s\n",
+                "local_handoffs=%zu source=RUNTIME_SELECTED_REGION_MAP status=%s\n",
                 phone_input_push_run_id, mapping.size(),
+                phone_local_handoff_dest_regions.size(),
                 installed ? "PASS" : "FAIL");
             if (!installed) {
                 ret = GGML_STATUS_FAILED;
@@ -7000,6 +7013,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             !wait_phone_graph_bound(job.region, job.chunk, "PUSH")) {
                         throw std::runtime_error(
                             "Phone graph not bound before input PUSH");
+                    }
+                    if (phone_local_handoff_dest_regions.count(
+                            (uint32_t) job.region) != 0) {
+                        // The upstream HTP worker already handed this
+                        // verified Chunk to Adreno on the Phone. Do not send
+                        // its P2C mirror back to the Phone over C2P.
+                        {
+                            std::lock_guard<std::mutex> lock(phone_push_mutex);
+                            phone_push_state[job.region][job.chunk] = 1;
+                            ++phone_push_auto_delegated;
+                        }
+                        phone_push_cv.notify_all();
+                        LLAMA_LOG_INFO(
+                            "[PHONE_LOCAL_HANDOFF] side=pc event=SKIP_PUSH "
+                            "run=%" PRIu64 " region=%zu chunk=%zu "
+                            "source=ADJACENT_HTP_PHONE_HOST status=PASS\n",
+                            phone_input_push_run_id, job.region, job.chunk);
+                        continue;
                     }
                     const size_t bytes = (size_t) job.n_tokens *
                         (size_t) n_embd * sizeof(float);
