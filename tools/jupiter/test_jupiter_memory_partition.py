@@ -135,6 +135,16 @@ class JupiterMemoryPlannerTest(unittest.TestCase):
         self.assertGreater(plan.phone_workspace_bytes, 1536*MIB)
         self.assertGreater(plan.pc_safety_bytes, 0)
 
+    def test_qwen3_rope_head_dimension_fallback(self):
+        model = GGUFWeights(
+            'qwen3', (288*MIB,)*64, 0, 0,
+            embedding_length=5120, attention_head_count=64,
+            attention_head_count_kv=8, rope_dimension_count=128,
+        )
+        # The naive embedding/head_count value is 80, but K/V
+        # use head dimension 128 on this Qwen3 layout.
+        self.assertEqual(model.kv_bytes_per_layer(2048), 8*MIB)
+
     def test_missing_metadata_requires_explicit_kv_override(self):
         weights = GGUFWeights('other', (64*MIB,)*4, 0, 0)
         with self.assertRaisesRegex(ValueError, 'head_count_kv'):
