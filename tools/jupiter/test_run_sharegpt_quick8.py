@@ -46,6 +46,11 @@ class JupiterQuickCPUStageTests(unittest.TestCase):
                              str(plan.pc_layers))
             self.assertIn("--budgeted-refine", command)
             self.assertIn("--graph-prebuild", command)
+            args.limit = 1
+            args.fail_fast = True
+            smoke = build_command(args, Path(temp), Path(temp))
+            self.assertEqual(smoke[smoke.index("--limit") + 1], "1")
+            self.assertIn("--fail-fast", smoke)
 
 
 if __name__ == "__main__":
