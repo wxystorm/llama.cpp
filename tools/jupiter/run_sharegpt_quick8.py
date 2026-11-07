@@ -269,9 +269,9 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
     ]
     if args.graph_prebuild:
         cmd.append("--graph-prebuild")
-    if args.limit is not None:
+    if getattr(args, "limit", None) is not None:
         cmd.extend(["--limit", str(args.limit)])
-    if args.fail_fast:
+    if getattr(args, "fail_fast", False):
         cmd.append("--fail-fast")
     if not args.strict_refine:
         cmd.append("--budgeted-refine")
