@@ -62,6 +62,34 @@ class MixedPlanTests(unittest.TestCase):
         self.assertTrue(any(all(c == 0 for _,c,_ in xs) for xs in seeds))
         self.assertTrue(any(all(p == 0 for _,_,p in xs) for xs in seeds))
 
+    def test_geometry_ranks_pc_terminal_alternatives(self):
+        seeds = list(geometry(40, max_cycles=4, max_c=4, max_phone=8))
+        self.assertTrue(any(xs[-1][2] > 0 for xs in seeds))
+        self.assertTrue(any(xs[-1][2] == 0 and xs[-1][1] == 0
+                            for xs in seeds))
+        self.assertTrue(any(xs[-1][2] == 0 and xs[-1][1] > 0
+                            for xs in seeds))
+        self.assertTrue(all(sum(sum(c) for c in xs) == 40 for xs in seeds))
+        self.assertEqual(len(seeds), len({tuple(xs) for xs in seeds}))
+
+    def test_pc_terminal_is_offline_only_until_runtime_owns_final_head(self):
+        cpu_tail = [Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1),
+                    Cycle(6, 4, 0, 0)]
+        gpu_tail = [Cycle(7, 1, 1, 1), Cycle(7, 1, 1, 1),
+                    Cycle(10, 0, 0, 0)]
+        for cs in (cpu_tail, gpu_tail):
+            self.assertFalse(runtime_compatible_cycles(cs))
+            result = dag_for(cs, 64, 256, 5120, FakeProfile(),
+                             dict(BASE, gpu_d2h_mibps=200), MIX, 2.)
+            self.assertIsNotNone(result)
+            self.assertIn("P2C", result["handoffs"])
+        self.assertIn("FINAL_GPU_TO_CPU",
+                      dag_for(gpu_tail, 64, 256, 5120, FakeProfile(),
+                              dict(BASE, gpu_d2h_mibps=200), MIX, 2.)["handoffs"])
+        self.assertNotIn("FINAL_GPU_TO_CPU",
+                         dag_for(cpu_tail, 64, 256, 5120, FakeProfile(),
+                                 BASE, MIX, 2.)["handoffs"])
+
     def test_no_npu_and_no_adreno_both_allowed(self):
         base = dict(BASE, npu_budget_mib=100)
         no_npu = list(split_phone([(5, 1, 1), (5, 1, 1)],
