@@ -96,9 +96,17 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
         session_lines = profile_lines(local_log,
                                       "[PHONE_AUTO] event=SESSION_READY")
         session = session_lines[0].get("run") if session_lines else None
-        pulled = profile_lines(local_log, "[PHONE_STAGE_PROFILE_RPC] event=COMPLETE")
-        if not session and pulled:
-            session = pulled[0].get("run")
+        pulled = [r for r in profile_lines(local_log,
+                    "[PHONE_STAGE_PROFILE_RPC] event=COMPLETE")
+                  if r.get("status") == "PASS"]
+        # A successful Patch32 RPC return is the authoritative session ID.
+        # The older Phone AUTO readiness diagnostic may refer to a setup
+        # session, and should not override actual fetched sample provenance.
+        if pulled:
+            run_ids = {row.get("run") for row in pulled}
+            if len(run_ids) != 1 or None in run_ids:
+                raise ValueError("AMBIGUOUS_PHONE_PROFILE_RPC_RUN_IDS")
+            session = pulled[0]["run"]
         phone = dict(legacy_phone)
         for x in profile_lines(local_log, "[REAL_STAGE_PROFILE]"):
             if x.get("side") == "PHONE" and x.get("phase") == "CHUNK" and \
@@ -162,13 +170,20 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
                 # Graphless HTP has a native Plan/HTP graph, not a
                 # PC-owned RPC Graph registration or OpenCL Slot Prepare.
                 # This applies to both historical HTP-only and mixed probes.
-                if q is None and backend != "HTP0":
+                if q is None and backend != "HTP0" and \
+                        p.get("source") != "RPC":
                     diag["setup_missing"] += 1
                     continue
+                # Patch32 service-only samples need not include a duplicate
+                # per-Chunk PC Graph registration line (prebuilt/Slot0).
+                # Setup is amortized outside the measured device service.
                 val = [number(p.get(k)) for k in
                        ("upload_ms", "prepare_ms", "compute_ms")]
-                if backend == "HTP0" and p.get("prepare_ms") in ("-1.000", "-1"):
-                    val[1] = 0.0
+                if backend == "HTP0":
+                    if p.get("upload_ms") in ("-1.000", "-1"):
+                        val[0] = 0.0
+                    if p.get("prepare_ms") in ("-1.000", "-1"):
+                        val[1] = 0.0
                 registration = number(q.get("setup_ms")) if q else 0.0
                 if registration is None or any(v is None for v in val):
                     continue
