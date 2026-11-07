@@ -347,6 +347,41 @@ public:
         return true;
     }
 
+    // Actual backend buffer sizes, not raw GGUF file sizes or Hexagon's
+    // unavailable free-memory query. Call under the HTP mutex.
+    struct banked_memory_snapshot {
+        size_t a_bytes = 0;
+        size_t b_bytes = 0;
+        size_t kv_bytes = 0;
+        size_t graph_bytes = 0;
+        size_t weight_tensor_count = 0;
+        size_t compiled_chunk_graphs = 0;
+    };
+    banked_memory_snapshot banked_memory_for_run(uint64_t run_id) const {
+        banked_memory_snapshot result {};
+        if (!banked_mode_) { return result; }
+        result.a_bytes = ggml_backend_buffer_get_size(
+            bank_weight_arenas_[0].get());
+        result.b_bytes = ggml_backend_buffer_get_size(
+            bank_weight_arenas_[1].get());
+        result.weight_tensor_count = model_weights_.size();
+        for (const auto & item : owned_kv_) {
+            if (item.first.first == run_id && item.second->buffer) {
+                result.kv_bytes += ggml_backend_buffer_get_size(
+                    item.second->buffer.get());
+            }
+        }
+        for (const auto & item : owned_graphs_) {
+            if (std::get<0>(item.first) == run_id &&
+                    item.second->buffer) {
+                result.graph_bytes += ggml_backend_buffer_get_size(
+                    item.second->buffer.get());
+                ++result.compiled_chunk_graphs;
+            }
+        }
+        return result;
+    }
+
     bool has_weight_banks() const { return banked_mode_; }
     int rank_for_region(uint32_t region, uint32_t layer) const {
         if (!banked_mode_) { return -1; }
