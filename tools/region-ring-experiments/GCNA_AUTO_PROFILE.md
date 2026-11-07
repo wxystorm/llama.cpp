@@ -88,39 +88,59 @@ The automated mixed calibration requires measured third-bank refill;
 otherwise it refuses to invent NPU Host stage/repack bandwidth.
 
 
-## Device-selected final Stage (offline planner, current limitation)
+## Backend-specific Stage depth matrix (experimental)
 
-The four-backend **offline** DAG now compares final-transformer ownership
-for Phone HTP (N), Phone OpenCL (A), PC CPU (C) and PC CUDA (G), rather
-than assuming the last physical Stage must be Phone.
+Run on Windows after rebuilding Patch32 on PC and phone:
 
-For an eligible PC-final candidate, the last Cycle has no Phone Region;
-all its original Transformer layers are instead explicitly assigned to
-PC GPU or PC CPU. The preceding Cycles can still use the HTP->Adreno
-pipeline. The DAG includes the final CPU RMSNorm/LM Head and, for a
-CUDA-terminal candidate, a measured CUDA->CPU D2H transfer. Both are
-required measured costs: no zero-cost hidden transfer and no implicit
-CPU fallback. The ranked `candidates.csv` exposes `final_backend` and
+    .\tools\region-ring-experiments\run_backend_profile.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_512.txt" -G "1,2,4,6,8" -C "1,2,3,4" -N "1,2,3" -A "1,2,4,6" -Chunks "16,32,64,128" -Repeats 2 -NoMmap
+
+For each depth/Chunk combination, the script executes the original
+weights of a compact GGUF. It keeps minimum feeder G/C/N/A Stages to satisfy
+the current hardware runtime, and extracts **only the named backend**
+service timings. Thus curves are independent of a chosen full-model Plan
+but measurements are **not standalone single-device microbenchmarks**.
+The source manifest records `standalone_compute=false`. Phone N2/N3
+are explicitly listed as unsupported; no fake linear NPU measurement.
+An interrupted sweep resumes previously successful cases.
+
+Output: `backend-matrix/backend-<G/C/N/A>-L<depth>/...`,
+`backend-matrix/matrix_manifest.json`, and
+`real-stage-mixed.csv` with independently selected target rows.
+An existing original-model `model_profile.json` supplies measured
+network/H2D/D2H rates. The legacy base Profile captures these from
+real `HYBRID_PROFILE` tensor transfer probes; separate dedicated
+communication and bank-only benchmark executables are still future work.
+
+## Device-selected terminal Stage (experimental PC runtime)
+
+The four-backend offline DAG now compares final Transformer ownership
+on HTP (N), Phone OpenCL (A), PC CPU (C), or PC CUDA (G) and ranks
+candidates by predicted critical-path latency instead of forcing Phone
+at the end. After at least two full Phone Cycles it may assign the
+remaining layers to a final G or G,C PC tail. It models the real
+intermediate P2C transfer, PC CPU Head after final hidden-state
+publication, and an additional measured CUDA->CPU readback for G-last.
+Unknown Head/D2H costs **reject** PC-final candidates; they are not
+assumed zero. `candidates.csv` includes `final_backend` and
 `runtime_compatible`.
 
-**Important:** This does not yet make PC-last plans executable.
-`-PhoneMixed -RuntimeCompatible` retains the proven Phone-last
-autonomous prefill subset. The PC runtime still guards its canonical
-output result and scheduler ownership around a terminal Phone Region
-(see `llama-context.cpp`); simply relaxing `APPLY_WIDE` topology
-checks would create an invalid execution contract. PC-last plans have
-`runtime_compatible=false` and `run_saved_plan.ps1` rejects them.
+The experimental C++ runtime now accepts PC-terminal APPLY_WIDE layouts,
+keeps Phone autonomous for intermediate Regions, and defers the
+last G/C Stage's output Head into the shared canonical CPU Head. A
+tiny (<32-token) PC-final run uses the serial staged fallback;
+normal full prefill uses the worker DAG with an explicit terminal
+hidden-state Host buffer. Saved schema-2 Plans can be applied after
+`-ConfirmBankedPhoneReady` with an appropriately rebuilt server.
 
-To finish runtime support, terminal G/C must publish final hidden states
-and synchronize the correct CPU/CUDA stage before a CPU-owned Head is
-built on the canonical scheduler. The last Phone Region may now be
-*intermediate*, requiring its actual P2C activation to reach the
-downstream PC worker. Validation must include tiny/warmup, full prefill
-and decode transitions, plus PC logits parity.
+**Status: code committed; NOT built or proven on Windows/Android.**
+The PC-final execution path is *experimental* and still requires
+physical integration tests, full prefill/decode parity, GPU final D2H
+validation, and phone-native two-bank synchronization checks. The
+`runtime_compatible` flag is a topology/feature contract, **not PASS**.
 
-Phone NPU still supports one physical Transformer layer per HTP Region;
-the offline planner never interprets a measured N1 point as a real N2
-Stage.
+The HTP executor remains restricted to one physical Transformer layer
+per Region. An independent NPU multi-layer executor and the dedicated
+communication-only sweep remain unfinished.
 
 ## Offline Plan on the ORIGINAL full model
 
