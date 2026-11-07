@@ -843,6 +843,185 @@ public:
     }
 
 
+    // Called AFTER the corresponding output frame is safely published to
+    // P2C. The caller holds HTP mutex, and all Graph compute is serialized.
+    // The old Bank cannot be reused while any Chunk is in flight.
+    bool finish_banked_chunk(uint64_t run_id, uint32_t region,
+                             uint32_t chunk,
+                             std::optional<weight_bank_refill> & refill,
+                             std::string & reason) {
+        refill.reset();
+        reason.clear();
+        if (!banked_mode_) { return true; }
+        const auto it = owned_kv_.find({run_id, region});
+        if (it == owned_kv_.end()) {
+            reason = "NPU_BANK_KV_REGION_NOT_REGISTERED";
+            return false;
+        }
+        const int rank = rank_for_region(region, it->second->plan.layer);
+        if (rank < 0) {
+            reason = "NPU_BANK_REGION_LAYER_MISMATCH";
+            return false;
+        }
+        const size_t r = static_cast<size_t>(rank);
+        const auto & b = weight_banks_.bank(r % 2);
+        if (b.state != two_weight_banks::phase::COMPUTING ||
+                b.rank != r || b.next_chunk != chunk ||
+                it->second->next_chunk != chunk + 1) {
+            reason = "NPU_BANK_CHUNK_NOT_COMPUTED_OR_UNPUBLISHED";
+            return false;
+        }
+        const bool last =
+            chunk + 1 == ggml_phone_owned::chunk_count(it->second->plan);
+        refill = weight_banks_.finish_chunk(r, chunk, last);
+        if (weight_banks_.bank(r % 2).next_chunk != chunk + 1) {
+            reason = "NPU_BANK_FINISH_STATE_INVALID";
+            return false;
+        }
+        return true;
+    }
+
+    // Serialized HTP critical section, called by the independent Bank Mover
+    // after rank k has fully drained and published P2C. Only cache entries
+    // for k are removed; Bank B's graph metadata and KV remain valid.
+    bool refill_banked_rank(
+            uint64_t run_id, const weight_bank_refill & job,
+            std::string & reason, model_load_stats & load_stats,
+            local_htp_prepare_stats & compile_stats) {
+        reason.clear();
+        load_stats = {};
+        compile_stats = {};
+        if (!banked_mode_ ||
+                job.from_rank >= banked_layers_.size() ||
+                job.to_rank >= banked_layers_.size() ||
+                job.bank >= 2 ||
+                job.bank != job.from_rank % 2 ||
+                job.bank != job.to_rank % 2) {
+            reason = "NPU_BANK_INVALID_REFILL_JOB";
+            return false;
+        }
+        const auto old_region = banked_layers_[job.from_rank].region;
+        const auto next_region = banked_layers_[job.to_rank].region;
+        const auto old_it = owned_kv_.find({run_id, old_region});
+        const auto next_it = owned_kv_.find({run_id, next_region});
+        if (old_it == owned_kv_.end() || next_it == owned_kv_.end() ||
+                old_it->second->next_chunk !=
+                    ggml_phone_owned::chunk_count(old_it->second->plan) ||
+                old_it->second->plan.layer !=
+                    banked_layers_[job.from_rank].layer ||
+                next_it->second->plan.layer !=
+                    banked_layers_[job.to_rank].layer ||
+                next_it->second->next_chunk != 0) {
+            reason = "NPU_BANK_REFILL_PLAN_OR_KV_NOT_READY";
+            return false;
+        }
+        ggml_backend_synchronize(backend_);
+        const auto reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_));
+        using evict_fn = bool (*)(ggml_backend_t, uint64_t);
+        const auto evict = reg == nullptr ? nullptr :
+            reinterpret_cast<evict_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_evict_fixed_graph_uid"));
+        if (!evict) {
+            reason = "NPU_BANK_NO_TARGETED_GRAPH_EVICTION";
+            return false;
+        }
+        size_t retired = 0;
+        for (auto it = owned_graphs_.begin();
+                it != owned_graphs_.end();) {
+            if (std::get<0>(it->first) != run_id ||
+                    std::get<1>(it->first) != old_region) {
+                ++it;
+                continue;
+            }
+            const auto * g = it->second->built.graph;
+            if (!g || !evict(backend_, g->uid)) {
+                reason = "NPU_BANK_GRAPH_RETIRE_FAILED";
+                return false;
+            }
+            it = owned_graphs_.erase(it);
+            ++retired;
+        }
+        if (retired !=
+                ggml_phone_owned::chunk_count(old_it->second->plan) ||
+                !weight_banks_.graphs_retired(job.from_rank) ||
+                !weight_banks_.begin_refill(job)) {
+            reason = "NPU_BANK_DRAIN_OR_REFILL_TRANSITION";
+            return false;
+        }
+        // Invalidate Tensor metadata only AFTER no compiled Graph references
+        // its addresses. The physical A/B mapping is not freed or remapped.
+        for (const auto & key : banked_layers_[job.from_rank].keys) {
+            if (model_weights_.erase(key) != 1) {
+                reason = "NPU_BANK_OLD_WEIGHT_NOT_RESIDENT";
+                return false;
+            }
+        }
+        banked_layers_[job.from_rank].keys.clear();
+        if (!load_banked_rank(job.to_rank, reason, load_stats)) {
+            return false;
+        }
+        if (!weight_banks_.refill_complete(job.to_rank, true)) {
+            reason = "NPU_BANK_REFILL_READY_TRANSITION_FAILED";
+            return false;
+        }
+        // All precompiled Graphs point into the freshly repacked Bank, with
+        // this generation's UID and the unchanged per-layer KV storage.
+        if (!prepare_owned_htp_graphs(
+                next_it->second->plan, reason, compile_stats)) {
+            return false;
+        }
+        return true;
+    }
+
+    // New RUN reset: after all prior HTP users have left, restore the first
+    // two resident Regions (A=rank0, B=rank1) for repeat experiments. The
+    // fixed arenas are not freed. Must follow reset_kv() under HTP lock.
+    bool reset_banked_initial_weights(std::string & reason,
+                                      model_load_stats & stats) {
+        reason.clear();
+        stats = {};
+        if (!banked_mode_) { return true; }
+        if (banked_layers_.size() < 2 ||
+                !owned_graphs_.empty() || !owned_kv_.empty()) {
+            reason = "NPU_BANK_RESET_REQUIRES_NO_RUNNING_GRAPH_OR_KV";
+            return false;
+        }
+        if (rank_banked_ready(banked_layers_[0].region) &&
+                rank_banked_ready(banked_layers_[1].region)) {
+            return true;
+        }
+        ggml_backend_synchronize(backend_);
+        model_weights_.clear();
+        for (auto & item : banked_layers_) { item.keys.clear(); }
+        std::vector<weight_bank_region> regions;
+        for (const auto & item : banked_layers_) {
+            regions.push_back({item.region, static_cast<int>(item.layer),
+                static_cast<int>(item.layer + 1), item.bytes});
+        }
+        weight_banks_.reset();
+        if (!weight_banks_.configure(regions, 0, 0,
+                std::numeric_limits<size_t>::max(), reason)) {
+            return false;
+        }
+        for (size_t rank = 0; rank < 2; ++rank) {
+            model_load_stats delta {};
+            if (!load_banked_rank(rank, reason, delta) ||
+                    !weight_banks_.prime_complete(rank)) {
+                if (reason.empty()) {
+                    reason = "NPU_BANK_REPRIME_FAILED";
+                }
+                return false;
+            }
+            stats.new_weights += delta.new_weights;
+            stats.new_bytes += delta.new_bytes;
+            stats.file_read_ms += delta.file_read_ms;
+            stats.htp_repack_ms += delta.htp_repack_ms;
+        }
+        return true;
+    }
+
     // Bind canonical Decode storage once, independently of any PC Graph.
     // Caller holds HTP mutex before the Graph mutex.
     bool bind_owned_decode_kv_storage(
