@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/phone-owned-plan-bootstrap-20261106
+      - feat/phone-npu-dual-bank-offline-plan-20261107
   workflow_dispatch:
 
 jobs:
@@ -15,6 +16,6 @@ jobs:
       - name: Configure
         run: cmake -S . -B build-phone-owned -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
       - name: Compile local graph, RPC and context
-        run: cmake --build build-phone-owned --target llama-cli test-phone-owned-execution-plan test-phone-qwen3-local-builder test-phone-qwen3-local-parity --parallel 4
+        run: cmake --build build-phone-owned --target llama-cli test-phone-owned-execution-plan test-phone-qwen3-local-builder test-phone-qwen3-local-parity test-phone-npu-weight-banks test-region-ring-planner region-ring-offline-plan --parallel 4
       - name: Test local graph and plan
-        run: ctest --test-dir build-phone-owned -R 'test-phone-(owned-execution-plan|qwen3-local-builder|qwen3-local-parity)' --output-on-failure
+        run: ctest --test-dir build-phone-owned -R 'test-phone-(owned-execution-plan|qwen3-local-builder|qwen3-local-parity|npu-weight-banks)|test-region-ring-planner' --output-on-failure
