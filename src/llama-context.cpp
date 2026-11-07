@@ -4825,6 +4825,73 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_graphless =
         graphless_requested && ubatch.n_tokens >= 32 &&
         phone_auto_final_enabled && own_stage_resources;
+    // Distinct whole-layer Phone backends share the existing Phone FIFO:
+    // selected P1 Regions run on private HTP0; remaining P Regions retain
+    // their normal RPC GPUOpenCL graphs. Graphless is currently all-or-none,
+    // so the mixed opt-in deliberately keeps PC-built OpenCL metadata graphs.
+    const char * phone_mixed_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP");
+    const bool phone_mixed_requested = phone_mixed_env != nullptr &&
+        std::strcmp(phone_mixed_env, "1") == 0;
+    std::set<uint32_t> phone_mixed_htp_regions;
+    if (phone_mixed_requested && ubatch.n_tokens >= 32) {
+        const char * region_spec = std::getenv(
+            "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS");
+        if (!llama_region_ring_parse_region_ids(
+                region_spec, phone_mixed_htp_regions) ||
+                phone_mixed_htp_regions.size() < 2 ||
+                graphless_requested || !phone_auto_final_enabled) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] status=REJECT "
+                "reason=INVALID_HTP_REGION_LIST_OR_GRAPHLESS_CONFIG "
+                "required=PHONE_AUTO_FINAL_PC_BUILT_NPU_REGIONS_AT_LEAST_2\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        size_t opencl_regions = 0;
+        for (size_t r = 0; r < stages.size(); ++r) {
+            if (stages[r].kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                if (phone_mixed_htp_regions.count((uint32_t) r)) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_MIXED_BACKENDS] status=REJECT region=%zu "
+                        "reason=HTP_REGION_NOT_PHONE\n", r);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                continue;
+            }
+            const bool htp = phone_mixed_htp_regions.count((uint32_t) r) != 0;
+            if (htp && stages[r].layer_end - stages[r].layer_begin != 1) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_MIXED_BACKENDS] status=REJECT region=%zu "
+                    "reason=HTP_REQUIRES_P1\n", r);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            opencl_regions += !htp;
+            LLAMA_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] region=%zu layers=[%d,%d) "
+                "backend=%s policy=WHOLE_TRANSFORMER_LAYER\n",
+                r, stages[r].layer_begin, stages[r].layer_end,
+                htp ? "HTP0" : "GPUOpenCL");
+        }
+        if (opencl_regions == 0) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] status=REJECT "
+                "reason=NO_PHONE_OPENCL_REGION\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        for (uint32_t region : phone_mixed_htp_regions) {
+            if (region >= stages.size()) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_MIXED_BACKENDS] status=REJECT region=%u "
+                    "reason=HTP_REGION_OUT_OF_RANGE\n", region);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+        }
+    }
     if (graphless_requested && ubatch.n_tokens >= 32 &&
             !phone_graphless) {
         LLAMA_LOG_ERROR(
@@ -5584,6 +5651,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const bool owned_plan_requested =
             owned_plan_env != nullptr &&
             std::strcmp(owned_plan_env, "1") == 0;
+        if (phone_mixed_requested && ubatch.n_tokens >= 32 &&
+                !owned_plan_requested) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] status=REJECT "
+                "reason=PHONE_OWNED_PLAN_REQUIRED_FOR_HTP\n");
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
         if (phone_graphless && !owned_plan_requested) {
             LLAMA_LOG_ERROR(
                 "[PHONE_OWNED_KV] side=pc event=REJECT"
@@ -5646,7 +5721,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             size_t published = 0;
             for (size_t r = 1; valid && r < stages.size(); ++r) {
                 const auto & stage = stages[r];
-                if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
+                if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE ||
+                        (phone_mixed_requested &&
+                         phone_mixed_htp_regions.count((uint32_t) r) == 0)) {
+                    // GPUOpenCL Regions are registered as PC-built RPC graphs.
+                    // Never attempt to register them with the HTP-only ABI.
                     continue;
                 }
                 valid = stage.layer_end == stage.layer_begin + 1 &&
@@ -5784,7 +5863,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_graphless ? "PHONE_LOCAL_GRAPHLESS" :
                                   "SHADOW_PC_BUILT",
                 published, valid ? "PASS" : "FAIL");
-            if (!valid || published == 0) {
+            if (!valid || published == 0 ||
+                    (phone_mixed_requested &&
+                     published != phone_mixed_htp_regions.size())) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_MIXED_BACKENDS] status=REJECT "
+                    "reason=HTP_PLAN_REGION_COUNT_MISMATCH "
+                    "registered=%zu expected=%zu\n",
+                    published, phone_mixed_htp_regions.size());
                 (void) phone_input_stream_run(
                     phone_rpc_backend, phone_input_push_run_id, false);
                 ret = GGML_STATUS_FAILED;
