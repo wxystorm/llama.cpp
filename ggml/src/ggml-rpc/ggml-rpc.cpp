@@ -6367,6 +6367,9 @@ public:
     bool get_graph_profile(
         const rpc_msg_get_graph_profile_req & request,
         rpc_msg_get_graph_profile_rsp & response);
+    bool phone_stage_profile_pull(
+        const rpc_msg_phone_stage_profile_req & request,
+        rpc_msg_phone_stage_profile_rsp & response);
     bool graph_recompute_snapshot(const rpc_msg_graph_recompute_snapshot_req & request);
     bool synchronize(uint32_t device);
     bool snapshot_tensor(const rpc_msg_snapshot_tensor_req & request);
@@ -6736,6 +6739,11 @@ private:
     std::mutex phone_auto_mutex;
     std::condition_variable phone_auto_cv;
     std::map<phone_auto_key, std::shared_ptr<phone_auto_job>> phone_auto_jobs;
+    // Completed sample pages are stable after Input Stream END, owned by the
+    // Phone server until fetched by PC. All access holds phone_auto_mutex.
+    std::map<uint64_t, std::vector<rpc_msg_phone_stage_profile_sample>>
+        phone_stage_profile_finished;
+    std::set<uint64_t> phone_stage_profile_overflow;
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
@@ -7694,6 +7702,39 @@ bool rpc_server::phone_input_stream_run(
                             millis(job.capture_begin_us, job.capture_end_us),
                             job.state == phone_auto_status::COMPLETE ?
                                 "PASS" : "FAIL");
+                    }
+                    if (stage_env != nullptr &&
+                            std::strcmp(stage_env, "1") == 0) {
+                        // Persist a *structured* sample after the Phone has
+                        // finished the job. The PC may retrieve it later over
+                        // RPC; do not require copying Android's log file.
+                        auto & samples = phone_stage_profile_finished[request.run_id];
+                        if (samples.size() < RPC_PHONE_STAGE_PROFILE_RUN_LIMIT) {
+                            const auto millis = [](int64_t begin, int64_t end) {
+                                return begin > 0 && end >= begin ?
+                                    (end - begin) / 1000.0 : -1.0;
+                            };
+                            rpc_msg_phone_stage_profile_sample measured {};
+                            measured.run_id = request.run_id;
+                            measured.region = job.request.key.region;
+                            measured.chunk = job.request.key.chunk;
+                            measured.tokens = job.request.n_tokens;
+                            measured.token_begin = job.request.token_begin;
+                            measured.backend = ggml_phone_npu_serial::htp_region(
+                                phone_npu_serial_regions, job.request.key.region) ? 1 : 2;
+                            measured.status = job.state == phone_auto_status::COMPLETE ? 1 : 0;
+                            measured.upload_ms = millis(
+                                job.upload_begin_us, job.upload_done_us);
+                            measured.prepare_ms = job.prepared.has_value() ?
+                                millis(job.prepared->prepare_begin_us,
+                                       job.prepared->prepare_end_us) :
+                                (measured.backend == 1 ? 0.0 : -1.0);
+                            measured.compute_ms = millis(
+                                job.compute_begin_us, job.compute_end_us);
+                            samples.push_back(measured);
+                        } else {
+                            phone_stage_profile_overflow.insert(request.run_id);
+                        }
                     }
                     if (job.state == phone_auto_status::COMPLETE) {
                         ++auto_jobs_complete;
