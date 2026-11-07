@@ -1693,11 +1693,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 forced_regions, hparams.n_layer()) ||
             llama_region_ring_single_cycle_force_compatible(
                 forced_regions, hparams.n_layer());
-        if (!topology_ok || forced_regions.empty() ||
-                forced_regions.back().device !=
-                    llama_region_ring_device::PHONE) {
+        if (!topology_ok || forced_regions.empty()) {
             throw std::runtime_error(
-                "SKIP_PROFILE forced layout is not a supported Phone-final topology");
+                "SKIP_PROFILE forced layout is not a supported G/C/P topology");
         }
         llama_hybrid_runtime_plan_clear();
         hybrid_ring_plan_layout =
@@ -1864,8 +1862,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 ((apply_wide || ring_regions.size() == 9) &&
                  selected_topology_ok &&
                  !ring_regions.empty() &&
-                 ring_regions.back().device ==
-                     llama_region_ring_device::PHONE) :
+                 (apply_wide ||
+                  ring_regions.back().device ==
+                      llama_region_ring_device::PHONE)) :
                 (llama_region_ring_apply_safe_phone_shape(original) &&
                  llama_region_ring_apply_safe_compatible(
                      original, ring_regions));
@@ -2347,7 +2346,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         llama_region_ring_enabled() &&
         arch == LLM_ARCH_QWEN3 &&
         !hybrid_layer_modes.empty() &&
-        hybrid_layer_modes.back() == llama_hybrid_layer_mode::PHONE_ONLY &&
         phone_final_output_env != nullptr &&
         std::strcmp(phone_final_output_env, "1") == 0;
     if (phone_final_pc_head) {
