@@ -11,7 +11,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <new>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
