@@ -5867,6 +5867,36 @@ public:
                     "DIRECT_P2C + DIRECT_INPUT + GRAPHLESS + HTP_PRECOMPILE");
             }
         }
+        // The mixed PC-Graph path requires the pre-existing OpenCL Slot0
+        // ABI even for HTP-bound P1 metadata graphs. Without the pool and
+        // Slot0 capture, auto-task registration fails at SLOT0_NOT_READY.
+        // Reject at server start, not 30 seconds into a Prompt run.
+        const char * mixed_opencl_env =
+            std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL");
+        const bool mixed_opencl_enabled = mixed_opencl_env != nullptr &&
+            std::strcmp(mixed_opencl_env, "1") == 0;
+        if (mixed_opencl_enabled) {
+            const auto enabled = [](const char * name) {
+                const char * value = std::getenv(name);
+                return value != nullptr && std::strcmp(value, "1") == 0;
+            };
+            if (!phone_npu_banked_enabled ||
+                    phone_npu_serial_regions.size() != 2 ||
+                    !enabled("GGML_RPC_PHONE_STAGE_SLOT0_EXEC") ||
+                    !enabled("GGML_RPC_PHONE_STAGE_DUAL_SLOT") ||
+                    !enabled("GGML_RPC_PHONE_PERSISTENT_POOL_PREP")) {
+                throw std::runtime_error(
+                    "Mixed Phone OpenCL+HTP requires exactly two banked "
+                    "NPU Regions and GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1, "
+                    "GGML_RPC_PHONE_STAGE_DUAL_SLOT=1, "
+                    "GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1");
+            }
+            GGML_LOG_INFO(
+                "[PHONE_MIXED_BACKENDS] event=SERVER_INIT "
+                "htp_regions=%zu rpc_gpu=GPUOpenCL "
+                "slot0=REQUIRED dual_slot=ON pool_prep=ON "
+                "status=READY\n", phone_npu_serial_regions.size());
+        }
         if (!phone_npu_serial_regions.empty()) {
             if (backends.size() != 1) {
                 throw std::runtime_error(
@@ -8070,6 +8100,16 @@ bool rpc_server::phone_auto_task_register(
         return reject("GRAPH_EMPTY");
     }
     if (!it->second.slot0.ready) {
+        const char * mixed =
+            std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL");
+        if (mixed != nullptr && std::strcmp(mixed, "1") == 0) {
+            GGML_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] event=SLOT0_DIAG "
+                "region=%u chunk=%u uid=%" PRIu64
+                " reason=SLOT0_NOT_READY "
+                "check=PHONE_STAGE_SLOT0_REGISTER_AND_POOL_STATUS\n",
+                request.key.region, request.key.chunk, request.graph_uid);
+        }
         return reject("SLOT0_NOT_READY");
     }
     if (it->second.slot0.kv_only_output) {
