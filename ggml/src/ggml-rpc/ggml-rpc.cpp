@@ -5894,8 +5894,17 @@ public:
         if (tensor_source != nullptr) {
             local_tensor_source = *tensor_source;
         }
+        const char * plan_mode_env =
+            std::getenv("GGML_RPC_PHONE_NPU_PLAN_CONTROLLED");
+        phone_npu_plan_controlled = plan_mode_env != nullptr &&
+            std::strcmp(plan_mode_env, "1") == 0;
         const char * serial_spec =
             std::getenv("GGML_RPC_PHONE_NPU_SERIAL_REGIONS");
+        if (phone_npu_plan_controlled && serial_spec && *serial_spec) {
+            throw std::runtime_error(
+                "Plan-controlled HTP forbids manual SERIAL_REGIONS; "
+                "the PC Planner must send the mapping over RPC");
+        }
         if (!ggml_phone_npu_serial::parse_regions(
                 serial_spec, phone_npu_serial_regions)) {
             throw std::runtime_error(
@@ -5951,19 +5960,30 @@ public:
                 "Phone NPU/GPU pipeline requires "
                 "GGML_RPC_PHONE_NPU_MIXED_OPENCL=1");
         }
+        if (phone_npu_plan_controlled &&
+                (!mixed_opencl_enabled || !phone_npu_banked_enabled)) {
+            throw std::runtime_error(
+                "Plan-controlled HTP requires MIXED_OPENCL=1 "
+                "and NPU_WEIGHT_BANKS=2");
+        }
         if (mixed_opencl_enabled) {
             const auto enabled = [](const char * name) {
                 const char * value = std::getenv(name);
                 return value != nullptr && std::strcmp(value, "1") == 0;
             };
             if (!phone_npu_banked_enabled ||
-                    phone_npu_serial_regions.size() != 2 ||
+                    (!phone_npu_plan_controlled &&
+                     phone_npu_serial_regions.size() != 2) ||
+                    (phone_npu_plan_controlled &&
+                     !phone_npu_serial_regions.empty()) ||
                     !enabled("GGML_RPC_PHONE_BINDING_PREFLIGHT") ||
                     !enabled("GGML_RPC_PHONE_STAGE_SLOT0_EXEC") ||
                     !enabled("GGML_RPC_PHONE_STAGE_DUAL_SLOT") ||
                     !enabled("GGML_RPC_PHONE_PERSISTENT_POOL_PREP")) {
                 throw std::runtime_error(
                     "Mixed Phone OpenCL+HTP requires exactly two banked "
+                    "HTP Regions in legacy mode, or a PC Plan in "
+                    "GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1 mode, and "
                     "NPU Regions and GGML_RPC_PHONE_BINDING_PREFLIGHT=1, "
                     "GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1, "
                     "GGML_RPC_PHONE_STAGE_DUAL_SLOT=1, "
@@ -5971,11 +5991,13 @@ public:
             }
             GGML_LOG_INFO(
                 "[PHONE_MIXED_BACKENDS] event=SERVER_INIT "
-                "htp_regions=%zu rpc_gpu=GPUOpenCL "
+                "htp_regions=%zu rpc_gpu=GPUOpenCL plan_controlled=%d "
                 "binding_preflight=ON slot0=REQUIRED dual_slot=ON pool_prep=ON "
-                "status=READY\n", phone_npu_serial_regions.size());
+                "status=READY\n", phone_npu_serial_regions.size(),
+                phone_npu_plan_controlled ? 1 : 0);
         }
-        if (!phone_npu_serial_regions.empty()) {
+        if (!phone_npu_serial_regions.empty() ||
+                phone_npu_plan_controlled) {
             if (backends.size() != 1) {
                 throw std::runtime_error(
                     "Serial NPU requires one RPC-visible GPUOpenCL device");
@@ -6038,7 +6060,13 @@ public:
             // Graph preload path; no RPC protocol or PC model loader change.
             const char * model_layers_env =
                 std::getenv("GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS");
-            if (model_layers_env != nullptr && model_layers_env[0] != '\0') {
+            if (phone_npu_plan_controlled && model_layers_env &&
+                    *model_layers_env) {
+                throw std::runtime_error(
+                    "Plan-controlled HTP forbids manual MODEL_LOAD_LAYERS");
+            }
+            if (!phone_npu_plan_controlled && model_layers_env != nullptr &&
+                    model_layers_env[0] != '\0') {
                 std::set<uint32_t> model_layers;
                 if (!ggml_phone_npu_serial::parse_regions(
                         model_layers_env, model_layers) ||
@@ -6148,7 +6176,8 @@ public:
                     layers_ok == model_layers.size() ?
                         "PASS" : "PARTIAL_FALLBACK");
                 } // legacy permanently resident model load
-            } else if (phone_npu_banked_enabled) {
+            } else if (phone_npu_banked_enabled &&
+                    !phone_npu_plan_controlled) {
                 throw std::runtime_error(
                     "GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS must list every "
                     "banked NPU Region's Layer in ascending order");
@@ -7364,7 +7393,8 @@ bool rpc_server::phone_input_stream_run(
                 phone_npu_banked_ready_regions.clear();
             }
             phone_npu_executor->reset_kv();
-            if (phone_npu_banked_enabled) {
+            if (phone_npu_banked_enabled &&
+                    !phone_npu_serial_regions.empty()) {
                 std::string why;
                 ggml_phone_npu_serial::full_region_executor::model_load_stats
                     stats {};
