@@ -20,6 +20,9 @@ param(
 $ErrorActionPreference = "Stop"
 $planFile = (Resolve-Path $Plan).Path
 $p = Get-Content -LiteralPath $planFile -Raw | ConvertFrom-Json
+if ($p.schema -eq 2 -and $p.planner -eq 'phone-four-backend-dual-bank-exact-dag-v1') {
+    throw "Four-backend G/C/N/A schema=2 plan is NOT runtime-compatible. Missing HTP->Adreno intra-Cycle handoff and N/A Region executor. Refusing legacy P reinterpretation or silent OpenCL fallback."
+}
 if ($p.schema -ne 1 -or $p.planner -ne 'offline-exact-dag') {
     throw "Invalid plan file schema or planner type: $planFile"
 }
