@@ -24,11 +24,20 @@ def fake_gguf(path: Path) -> None:
         data = text.encode('utf-8')
         return struct.pack('<Q', len(data))+data
     with path.open('wb') as f:
-        f.write(b'GGUF'+struct.pack('<IQQ', 3, len(infos), 3))
+        scalar_meta = [
+            ('qwen3.block_count', 4),
+            ('general.alignment', 32),
+            ('qwen3.embedding_length', 5120),
+            ('qwen3.attention.head_count', 64),
+            ('qwen3.attention.head_count_kv', 8),
+            ('qwen3.attention.key_length', 128),
+            ('qwen3.attention.value_length', 128),
+        ]
+        f.write(b'GGUF'+struct.pack('<IQQ', 3, len(infos), len(scalar_meta)+1))
         f.write(gguf_string('general.architecture') +
                 struct.pack('<I', 8)+gguf_string('qwen3'))
-        f.write(gguf_string('qwen3.block_count')+struct.pack('<II', 4, 4))
-        f.write(gguf_string('general.alignment')+struct.pack('<II', 4, 32))
+        for key, value in scalar_meta:
+            f.write(gguf_string(key)+struct.pack('<II', 4, value))
         for name, offset in infos:
             f.write(gguf_string(name)+struct.pack('<I', 1) +
                     struct.pack('<Q', 1)+struct.pack('<IQ', 0, offset))
@@ -47,6 +56,10 @@ class JupiterMemoryPlannerTest(unittest.TestCase):
             self.assertEqual(model.layers, (64*MIB,)*4)
             self.assertEqual(model.other_bytes, 32*MIB)
             self.assertEqual(model.total_weights, 288*MIB)
+            self.assertEqual(model.embedding_length, 5120)
+            self.assertEqual(model.attention_head_count_kv, 8)
+            self.assertEqual(model.kv_bytes_per_layer(2048), 8*MIB)
+            self.assertEqual(model.kv_bytes_per_layer(4096), 16*MIB)
 
     def test_memory_balance_override_and_insufficient_total(self):
         model = GGUFWeights('qwen3', (64*MIB,)*4, 32*MIB, 0)
@@ -91,6 +104,51 @@ class JupiterMemoryPlannerTest(unittest.TestCase):
             cpu=DeviceMemory(10*GIB, 12*GIB), cpu_reserve_mib=1024,
         )
         self.assertEqual(result.cpu_layers, 0)
+
+    def test_headroom_forces_cpu_layers_and_accounts_for_kv(self):
+        weights = GGUFWeights(
+            'qwen3', (288*MIB,)*64, 0, 0,
+            embedding_length=5120, attention_head_count=64,
+            attention_head_count_kv=8,
+            attention_key_length=128, attention_value_length=128,
+        )
+        gpu = DeviceMemory(int(5.36*GIB), 6*GIB)
+        phone = DeviceMemory(int(14.76*GIB), 16*GIB)
+        cpu = DeviceMemory(int(17.90*GIB), 24*GIB)
+        plan = plan_memory_split(
+            weights, gpu, phone, 512, 512,
+            cpu=cpu, cpu_reserve_mib=2048,
+            context=2048, ubatch=128, window=2, graph_prebuild=True,
+            cpu_workspace_mib=512, pc_workspace_mib=1024,
+            phone_workspace_mib=1536, safety_percent=10,
+        )
+        self.assertGreater(plan.cpu_layers, 0)
+        self.assertEqual(plan.kv_per_layer_bytes, 8*MIB)
+        self.assertEqual(plan.cpu_kv_bytes+plan.pc_kv_bytes+plan.phone_kv_bytes,
+                         64*8*MIB)
+        for weight, kv, budget in (
+            (plan.cpu_weight_bytes, plan.cpu_kv_bytes, plan.cpu_budget_bytes),
+            (plan.pc_weight_bytes, plan.pc_kv_bytes, plan.pc_budget_bytes),
+            (plan.phone_weight_bytes, plan.phone_kv_bytes, plan.phone_budget_bytes),
+        ):
+            self.assertLessEqual(weight+kv, budget)
+        self.assertGreater(plan.phone_workspace_bytes, 1536*MIB)
+        self.assertGreater(plan.pc_safety_bytes, 0)
+
+    def test_missing_metadata_requires_explicit_kv_override(self):
+        weights = GGUFWeights('other', (64*MIB,)*4, 0, 0)
+        with self.assertRaisesRegex(ValueError, 'head_count_kv'):
+            plan_memory_split(
+                weights, DeviceMemory(4*GIB, 4*GIB),
+                DeviceMemory(4*GIB, 4*GIB),
+                context=2048,
+            )
+        plan = plan_memory_split(
+            weights, DeviceMemory(4*GIB, 4*GIB),
+            DeviceMemory(4*GIB, 4*GIB),
+            context=2048, kv_per_layer_mib=8,
+        )
+        self.assertEqual(plan.kv_per_layer_bytes, 8*MIB)
 
     def test_pc_free_memory_from_nvidia_smi(self):
         class Result:
