@@ -9436,6 +9436,7 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
         reinterpret_cast<const uint8_t *>(source.direct_p2c_payload.data()),
         bytes);
     bool accepted = false;
+    bool allocation_failed = false;
     try {
         phone_input_staged staged {};
         staged.key = header.key;
@@ -9459,18 +9460,16 @@ bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
             }
         }
     } catch (const std::bad_alloc &) {
-        GGML_LOG_ERROR(
-            "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
-            " src=%u dst=%u chunk=%u reason=HOST_ALLOC_FAILED\\n",
-            src.key.run_id, src.key.region, dst_region, src.key.chunk);
-        // The host admission reservation is released below on failure.
+        allocation_failed = true;
     }
     if (!accepted) {
         phone_input_stream_cancel_reserve(reserved);
         GGML_LOG_ERROR(
             "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
-            " src=%u dst=%u chunk=%u reason=RUN_ENDED_OR_DUPLICATE\n",
-            src.key.run_id, src.key.region, dst_region, src.key.chunk);
+            " src=%u dst=%u chunk=%u reason=%s\n",
+            src.key.run_id, src.key.region, dst_region, src.key.chunk,
+            allocation_failed ? "HOST_ALLOC_FAILED" :
+                                "RUN_ENDED_OR_DUPLICATE");
         return false;
     }
     // Wake both the stream staging waiter and the autonomous Adreno worker.
