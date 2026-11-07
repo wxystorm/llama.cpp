@@ -223,7 +223,10 @@ def handoff_route(src: str, dst: str):
     if dst in pc:
         return "P2C", "phone_to_pc"
     if src == "N" and dst == "A":
-        return "HTP_TO_ADRENO", "phone_gpu"
+        # The F32 Host vector ownership moves without a second Host copy.
+        # Adreno's measured PHONE_GPU upload_ms is already included in its
+        # prepare cost; charging another transfer here double-counts upload.
+        return "HTP_TO_ADRENO", None
     # Separate Phone Graphs cannot assume zero-copy, even on the same engine.
     return "PHONE_LOCAL", "phone_local"
 
@@ -356,7 +359,6 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
         "pc_to_phone": base["c2p_mibps"],
         "phone_to_pc": base["p2c_mibps"],
         "phone_local": mix["phone_local_mibps"],
-        "phone_gpu": mix["phone_local_mibps"],
     }
     for index, (ci, letter, depth, backend, lane) in enumerate(active):
         rank = (len(last_gpu_region) if letter == "G"
@@ -409,9 +411,10 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
         else:
             prev_boundary = new_boundary
         if letter == "N" and not last:
-            # The last HTP input/output must be fully handed to the next
-            # local Adreno Host queue (or actually returned to PC). The
-            # internal N->A boundary has no P2C data or completion frame.
+            # HTP keeps its Bank until the last local Host output exists.
+            # The vector move to Adreno does not re-copy bytes, and GPU
+            # upload is accounted for in PHONE_GPU stage prepare. No P2C
+            # data or completion frame exists for this internal boundary.
             last_npu_region.append(prev_boundary[-1])
     final_backend = active[-1][1]
     if final_backend in ("N", "A"):
