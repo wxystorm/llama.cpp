@@ -3793,6 +3793,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         return nullptr;
     }
 
+    // Tiny warmup/decode stays on the canonical scheduler. For PC-tail
+    // layouts the fast path uses a deferred Head after the asynchronous
+    // workers finish; tiny inputs safely use the existing serial stage
+    // executor, which already owns the final CPU/GPU projection graph.
+    if (ubatch.n_tokens < 32 &&
+            (stages.back().kind == llama_hybrid_runtime_stage_kind::CPU ||
+             stages.back().kind == llama_hybrid_runtime_stage_kind::GPU)) {
+        LLAMA_LOG_INFO(
+            "[REGION_RING_FINAL_OWNER] event=TINY_FALLBACK "
+            "owner=PC mode=SERIAL_STAGED tokens=%u status=READY\n",
+            ubatch.n_tokens);
+        return process_ubatch_staged(
+            ubatch, gtype, mctx, sched_use, res_use,
+            stages, ubatch_id, ret);
+    }
+
     const bool directional_runtime =
         std::any_of(
             stages.begin(), stages.end(),
@@ -10672,8 +10688,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ((apply_wide || ring_runtime_regions.size() == 9) &&
              selected_topology_ok &&
              !ring_runtime_regions.empty() &&
-             ring_runtime_regions.back().device ==
-                 llama_region_ring_device::PHONE) :
+             (apply_wide ||
+              ring_runtime_regions.back().device ==
+                  llama_region_ring_device::PHONE)) :
             llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
         const bool chunk_shape_ok = apply_wide ?
             (region_ring_xc > 0 && region_ring_xg > 0 &&
