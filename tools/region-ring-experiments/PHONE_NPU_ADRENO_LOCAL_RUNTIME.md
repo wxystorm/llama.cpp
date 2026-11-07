@@ -21,8 +21,8 @@ On Windows PowerShell, from the repo root:
 git fetch origin
 git switch feat/phone-npu-adreno-no-mid-p2c-host-move-20261107
 git pull --ff-only
-cmake --build build-tensor-v2 --config Release --target llama-completion test-region-ring test-phone-plan-region-map -j 8
-ctest --test-dir build-tensor-v2 -C Release -R "test-region-ring|test-phone-plan-region-map" --output-on-failure
+cmake --build build-tensor-v2 --config Release --target llama-completion test-region-ring test-phone-plan-region-map test-phone-local-host-handoff -j 8
+ctest --test-dir build-tensor-v2 -C Release -R "test-region-ring|test-phone-plan-region-map|test-phone-local-host-handoff" --output-on-failure
 python -m unittest discover -s tools/region-ring-experiments -p "test_mixed_phone*.py" -v
 ```
 
@@ -87,6 +87,7 @@ Start by validating `-NPredict 1` Prefill and parity against a nonmixed referenc
 - Phone: `[PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN/DEVICE_END ... backend=HTP0/GPUOpenCL` for both physical engines
 - PC: `[PHONE_LOCAL_HANDOFF] side=pc event=DELEGATE` for internal HTP and `[PHONE_INPUT_PUSH] event=SUMMARY ... local_skipped=N` (this field is separate from successful network PUSHs)
 - Phone: `[PHONE_LOCAL_HANDOFF] event=NO_INTERMEDIATE_P2C ... payload_bytes=0 completion_frame=SKIPPED`, with **no P2C frame for those HTP Region/Chunk IDs**
+- Phone: `[PHONE_INPUT_STREAM_SUM] ... local_published=N local_applied=N local_host_copy_bytes=0`; its `frames/verified/applied` counts refer only to network input, not internal HTP handoffs
 - Both Phone and PC: complete P2C for every **cross-device** Adreno-to-PC or terminal Phone Region, `[PHONE_AUTO_SUM] ... failed=0` and no `REGISTER_REJECT`, Bank/Graph/KV mismatch or silent backend fallback
 - End-to-end: Prefill PASS, correct logits, and (for Decode tests) successful KV synchronization
 
