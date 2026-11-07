@@ -51,10 +51,12 @@ Preserve your existing working LD_LIBRARY_PATH/OCL_ICD_VENDORS settings.
       2>&1 | tee phone-mixed.log
 
 Note: the Phone-side GRAPHLESS=1 is required by HTP two-Bank setup.
-The PC-side GRAPHLESS must be **0**, because this first mixed version
-retains PC-built RPC Graph metadata for HTP and fully executes the OpenCL
-graphs for GPU Phone Regions. The new Phone opt-in permits PC task
-registration on HTP Regions only after its immutable HTP Plan exists.
+The PC-side global GRAPHLESS must be **0** because the GPUOpenCL Regions
+still need PC-registered RPC Graphs. The mixed dispatcher nevertheless
+selects **Phone-owned GRAPHLESS for the two HTP P1 Regions only**:
+PC registers Plan + canonical KV, then skips PC HTP Chunk Graphs and
+HTP auto-task registration. GPUOpenCL Regions retain PC Graphs and
+OpenCL Slot0. The Phone server forbids PC HTP task registration.
 
 Check the Phone boot log for HTP Region count=2 and both physical Banks.
 
@@ -80,9 +82,12 @@ only; the ordinary Planner will eventually determine layer/Chunk choices.
 The smoke uses one generated token and preserves full HTP local-KV
 writeback and OpenCL KV. Both Phone OpenCL Regions are P1. Earlier
 P5 terminal graphs produced unsupported 2-way Phone backend splits.
-Slot0 readiness is required for PC-registered HTP metadata graphs even
-when actual HTP execution is Phone-local. Missing Slot0/pool options
-now fail at Phone RPC startup, not at first HTP Chunk registration.
+HTP no longer needs OpenCL Slot0 at all: its Plan/KV-bound Graphless
+jobs are native HTP. GPUOpenCL still requires OpenCL Slot0 and its
+persistent pool; missing Slot0/pool options fail at Phone RPC startup.
+Tiny warmup/decode can legally have two splits on the last Phone Stage:
+Phone Meta last layer followed by PC CPU output Head; the mixed guard
+allows only this exact two-backend split.
 
 ## What proves a real mixed run
 
@@ -90,6 +95,8 @@ Look for ALL of:
 
 - PC `[PHONE_MIXED_BACKENDS] region=2/5 ... backend=HTP0`.
 - PC `[PHONE_MIXED_BACKENDS] region=8/11 ... backend=GPUOpenCL`.
+- PC `[PHONE_OWNED_KV] side=pc event=BIND ... status=PASS` for regions 2/5.
+- PC `[PHONE_MIXED_BACKENDS] event=GRAPHLESS_READY ... backend=HTP0`.
 - Phone `[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY ... backend=HTP0 ... status=PASS`.
 - Phone `[PHONE_MIXED_BACKENDS] event=EXECUTE ... backend=GPUOpenCL ... status=PASS`.
 - Phone `[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK ... backend=HTP0/GPUOpenCL`.
