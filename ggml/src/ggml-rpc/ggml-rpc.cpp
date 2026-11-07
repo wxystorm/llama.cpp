@@ -6410,6 +6410,9 @@ private:
         phone_npu_executor;
     bool phone_npu_async_preload = false;
     bool phone_npu_banked_enabled = false;
+    // Owned by HTP mutex: stale dequeued refills from an earlier RUN may
+    // never write into a freshly re-primed Bank.
+    uint64_t phone_npu_banked_run_id = 0;
     std::set<uint32_t> phone_npu_banked_ready_regions;
     std::deque<std::pair<uint64_t, ggml_phone_npu_serial::weight_bank_refill>>
         phone_npu_bank_refill_jobs; // guarded by phone_auto_mutex
@@ -7227,6 +7230,7 @@ bool rpc_server::phone_input_stream_run(
             // HTP critical section is drained. Discard pending old-run
             // refill jobs, invalidate every old Graph, and prime A/B again.
             if (phone_npu_banked_enabled) {
+                phone_npu_banked_run_id = request.run_id;
                 std::lock_guard<std::mutex> lock(phone_auto_mutex);
                 phone_npu_bank_refill_jobs.clear();
                 phone_npu_banked_ready_regions.clear();
@@ -8721,12 +8725,23 @@ void rpc_server::phone_npu_bank_refill_loop() {
         }
         int64_t lock_acquired_us = ggml_time_us();
         const int64_t lock_begin_us = lock_acquired_us;
+        bool stale_run = false;
         if (prefetched || stage_fallback) {
             std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
             lock_acquired_us = ggml_time_us();
-            ok = phone_npu_executor->refill_banked_rank(
-                job.first, job.second, reason, load, compiled,
-                prefetched ? &staged : nullptr);
+            stale_run = job.first != phone_npu_banked_run_id;
+            if (!stale_run) {
+                ok = phone_npu_executor->refill_banked_rank(
+                    job.first, job.second, reason, load, compiled,
+                    prefetched ? &staged : nullptr);
+            }
+        }
+        if (stale_run) {
+            GGML_LOG_INFO(
+                "[NPU_BANK] event=STALE_REFILL_DROPPED"
+                " run=%" PRIu64 " to_rank=%zu status=SKIPPED\n",
+                job.first, job.second.to_rank);
+            continue;
         }
         const int64_t finish_us = ggml_time_us();
         bool active = false;
