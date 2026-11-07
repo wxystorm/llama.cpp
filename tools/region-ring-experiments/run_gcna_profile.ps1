@@ -12,6 +12,7 @@ param(
     [string]$ProfileRoot = "",
     [int]$Threads = 8,
     [switch]$NoMmap,
+    [switch]$UpdateCalibration,
     [switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -130,5 +131,27 @@ $outCsv = Join-Path $folder "real-stage-mixed.csv"
 if ($LASTEXITCODE -ne 0) {
     throw "Could not assemble four-backend Profile from PC logs/RPC samples."
 }
+$baseManifest = Join-Path $folder "model_profile.json"
+$calibration = Join-Path $folder "phone_mixed_calibration.json"
+if (Test-Path -LiteralPath $baseManifest) {
+    if ((Test-Path -LiteralPath $calibration) -and !$UpdateCalibration) {
+        Write-Warning "Existing phone_mixed_calibration.json preserved. Pass -UpdateCalibration to refresh from measured Patch32 RPC data."
+    } else {
+        $calibrationArgs = @(
+            (Join-Path $PSScriptRoot "build_gcna_calibration.py"),
+            "--model", $source, "--profile-dir", $folder,
+            "--run", $runs, "--probe-manifest", $manifestPath,
+            "--stage-csv", $outCsv, "--output", $calibration
+        )
+        if ($UpdateCalibration) { $calibrationArgs += "--update" }
+        & $python @calibrationArgs
+        if ($LASTEXITCODE -ne 0) {
+            throw "Measured Phone calibration generation failed; check RPC Bank REFILL and device memory samples."
+        }
+    }
+} else {
+    Write-Warning "model_profile.json (full Qwen3 base Profile) is absent. Four-backend Stage CSV is ready, but final mixed calibration/Plan requires this original-model base Profile; no synthetic base was created."
+}
 Write-Host "[GCNA_PROFILE] status=COMPLETE csv=$outCsv manifest=$manifestPath"
+Write-Host "[GCNA_PROFILE] phone_calibration=$calibration"
 Write-Host "[GCNA_PROFILE] No Android phone log was copied."
