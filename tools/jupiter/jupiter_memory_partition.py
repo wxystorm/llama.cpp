@@ -39,6 +39,7 @@ class GGUFWeights:
     attention_head_count_kv: int = 0
     attention_key_length: int = 0
     attention_value_length: int = 0
+    rope_dimension_count: int = 0
 
     def kv_bytes_per_layer(self, context: int, dtype_bytes: float = 2.0) -> int:
         """Estimate per-layer K+V allocation for a full context in this model."""
@@ -53,8 +54,12 @@ class GGUFWeights:
                     if self.attention_head_count > 0
                     and self.embedding_length % self.attention_head_count == 0
                     else 0)
-        key_dim = self.attention_key_length or head_dim
-        value_dim = self.attention_value_length or head_dim
+        # Qwen3 uses a 128-dim attention head even when n_embd/n_heads
+        # suggests 80; GGUF rope.dimension_count captures that wider head
+        # when explicit attention.key_length is not present.
+        fallback_dim = max(head_dim, self.rope_dimension_count)
+        key_dim = self.attention_key_length or fallback_dim
+        value_dim = self.attention_value_length or fallback_dim
         if key_dim < 1 or value_dim < 1:
             raise ValueError(
                 "GGUF key/value head dimensions missing; supply "
@@ -188,6 +193,7 @@ def read_gguf_weights(path: Path) -> GGUFWeights:
                         '.attention.head_count_kv',
                         '.attention.key_length',
                         '.attention.value_length',
+                        '.rope.dimension_count',
                     )))
             value = _metadata_value(f, value_type, keep)
             if keep:
@@ -243,6 +249,7 @@ def read_gguf_weights(path: Path) -> GGUFWeights:
         attention_head_count_kv=int(metadata.get(arch + '.attention.head_count_kv') or 0),
         attention_key_length=int(metadata.get(arch + '.attention.key_length') or 0),
         attention_value_length=int(metadata.get(arch + '.attention.value_length') or 0),
+        rope_dimension_count=int(metadata.get(arch + '.rope.dimension_count') or 0),
     )
 
 
