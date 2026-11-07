@@ -1,9 +1,12 @@
 # Four-backend whole-layer Cycle Plan with HTP two-Bank spill
 
 Branch: feat/phone-four-backend-spill-dag-20261107.
-Status: OFFLINE PLAN ONLY. No inference, model-load profiling or RPC during
-formal Plan. New schema=2 plans cannot be applied with run_saved_plan.ps1
-until the runtime learns intra-Cycle NPU -> Phone GPU contiguous stages.
+Status: Plan itself remains offline (no inference, model-load profiling or
+RPC). The opt-in Patch31 experimental runtime now supports a validated
+GPU-first/Phone-final subset with adjacent HTP -> Adreno activation handoff;
+untested model/hardware combinations remain experimental. See
+PHONE_NPU_ADRENO_LOCAL_RUNTIME.md for the exact requirements and smoke.
+Do not treat a schema=2 Plan as proof of an Android PASS.
 
 ## Geometry and memory
 
@@ -108,12 +111,15 @@ base-calibration gpu_d2h_mibps for the final CPU Head.
 
     .\tools\region-ring-experiments\run_plan.ps1 -PhoneMixed -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_512.txt"
 
-Outputs plan.json (schema=2, mixed_layout=G/C/N/A, runtime_compatible=false)
+Outputs plan.json (schema=2, mixed_layout=G/C/N/A, runtime_compatible
+flag determined by the current experimental runtime constraints)
 and candidates.csv. The file now includes execution_stages (absolute layer
 ranges, Region indices and backend) and execution_edges (handoff type and
 resource lane). Zero-width stages are omitted before IDs are assigned.
-HTP_TO_ADRENO is an explicit planned Phone-local activation handoff, NOT
-yet an implemented Phone execution RPC. No silent OpenCL fallback is allowed.
+HTP_TO_ADRENO now has an experimental Patch31 Phone host-F32 staging
+implementation. PC still receives HTP P2C completion frames, and the DAG
+models those side returns as a real transfer cost; NPU Bank reuse waits for
+that final capture. No silent OpenCL fallback is allowed.
 The old 3-device Profile/Plan flow stays unchanged.
 
 To disable HTP search candidates, pass -MaxNpuRegionLayers 0. Depths greater
@@ -121,8 +127,11 @@ than 1 remain unsupported until measured HTP multi-layer timings and runtime
 exist. The search is still based on balanced 2-4 Cycle seeds and one shared
 Chunk width; full per-Cycle beam search remains future work.
 
-run_saved_plan.ps1 now explicitly rejects schema=2 before interpreting
-any N/A Region as a legacy P Region.
+run_saved_plan.ps1 only executes a schema=2 plan when its
+runtime_compatible flag is true and -ConfirmBankedPhoneReady was explicitly
+passed. It converts N/A to separate contiguous P Regions, never merging
+or silently reassigning the physical backend; NPU assignments travel in the
+Patch31 Plan RPC. Unsupported candidates fail before execution.
 
 Test offline policy after syncing the branch:
 
