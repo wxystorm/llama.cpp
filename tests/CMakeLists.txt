@@ -358,6 +358,13 @@ target_include_directories(test-phone-npu-weight-banks PRIVATE
 set_target_properties(test-phone-npu-weight-banks PROPERTIES CXX_STANDARD 17)
 llama_test(test-phone-npu-weight-banks)
 
+# Host-only whole-layer HTP/OpenCL region selector validation.
+add_executable(test-phone-mixed-region-selector test-phone-mixed-region-selector.cpp)
+target_include_directories(test-phone-mixed-region-selector PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+set_target_properties(test-phone-mixed-region-selector PROPERTIES CXX_STANDARD 17)
+llama_test(test-phone-mixed-region-selector)
+
 # User-facing, inference-free offline Planner (exact same C++ DAG engine).
 add_executable(region-ring-offline-plan
     ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/offline_plan.cpp)
