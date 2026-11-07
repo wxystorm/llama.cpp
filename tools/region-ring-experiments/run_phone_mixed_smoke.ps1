@@ -8,6 +8,7 @@ param(
     [string]$Out = ".\phone-opencl-htp-mixed-smoke",
     [int]$Threads = 8,
     [ValidateRange(1,256)][int]$NPredict = 1,
+    [ValidateSet(16,32,64,128)][int]$Chunk = 64,
     [switch]$NoMmap,
     [switch]$DryRun
 )
@@ -24,7 +25,7 @@ if ([IO.Path]::GetFileName($prompt) -notmatch '^prompt_[0-9]+\.txt$') {
 $layout = "G8,C1,P1,G8,C1,P1,G8,C1,P1,G7,C2,P1"
 $regions = "2,5"
 $layers = "9,19"
-Write-Host "[PHONE_MIXED_BACKENDS] expected_model=40-layer-Qwen3 backend_map=HTP0:$regions GPUOpenCL:8,11"
+Write-Host "[PHONE_MIXED_BACKENDS] expected_model=40-layer-Qwen3 backend_map=HTP0:$regions GPUOpenCL:8,11 chunk=$Chunk"
 Write-Host "[PHONE_MIXED_BACKENDS] phone_server_requires:"
 Write-Host "  GGML_RPC_PHONE_NPU_SERIAL_REGIONS=$regions"
 Write-Host "  GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=$layers"
@@ -71,9 +72,9 @@ try {
         Planner = "apply-wide"
         SkipProfile = $true
         ForceLayout = $layout
-        ForceXC = 64
-        ForceXG = 64
-        ForceXP = 64
+        ForceXC = $Chunk
+        ForceXG = $Chunk
+        ForceXP = $Chunk
         Batch = 512
         UBatch = 512
         NPredict = $NPredict
