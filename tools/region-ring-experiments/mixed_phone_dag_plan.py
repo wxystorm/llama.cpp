@@ -25,7 +25,7 @@ CLASSES = {"GPU", "CPU", "PHONE", "PHONE_GPU"}
 REQUIRED_MIXED = (
     "phone_gpu_budget_mib", "phone_gpu_weight_layer_mib",
     "phone_gpu_scratch_mib",
-    "phone_shared_budget_mib", "phone_local_mibps",
+    "phone_shared_budget_mib",
     "npu_host_stage_mibps", "npu_bank_repack_mibps",
     "npu_host_stage_budget_mib",
 )
@@ -358,7 +358,7 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
         "pc_local": base["local_mibps"],
         "pc_to_phone": base["c2p_mibps"],
         "phone_to_pc": base["p2c_mibps"],
-        "phone_local": mix["phone_local_mibps"],
+        "phone_local": mix.get("phone_local_mibps", 0.0),
     }
     for index, (ci, letter, depth, backend, lane) in enumerate(active):
         rank = (len(last_gpu_region) if letter == "G"
@@ -403,6 +403,10 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
                 prev_boundary = new_boundary
             else:
                 rate = speed_by_lane[transfer_lane]
+                if rate <= 0.0:
+                    # Unmeasured A->N Host copy cannot be priced as zero;
+                    # the executable G-first N->A path is a vector move.
+                    return None
                 prev_boundary = [
                     dag.add(f"{letter}->{next_letter}:{ci}:{k}",
                             transfer_lane, length*bytes_per_token/MIB/rate*1000,
@@ -563,6 +567,11 @@ def run_cli(argv=None):
     if "gpu_d2h_mibps" in manifest["calibration"]:
         b.update(calibration(manifest["calibration"], ("gpu_d2h_mibps",)))
     m = calibration(extra["calibration"], REQUIRED_MIXED)
+    # Not required for adjacent HTP->Adreno: the F32 Host vector moves and
+    # the OpenCL upload is charged once by the GPU stage Profile. Only
+    # non-executable A->N topologies need an actual measured Host-copy rate.
+    if "phone_local_mibps" in extra["calibration"]:
+        m.update(calibration(extra["calibration"], ("phone_local_mibps",)))
     if "pc_head_ms" in extra["calibration"]:
         m.update(calibration(extra["calibration"], ("pc_head_ms",), ("pc_head_ms",)))
     token_count = tokenize(args.tokenizer.resolve(strict=True), model_path, prompt)
