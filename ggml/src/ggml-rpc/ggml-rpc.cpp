@@ -6049,16 +6049,8 @@ public:
             throw std::runtime_error(
                 "NPU weight Banks require nonempty SERIAL_REGIONS");
         }
-        phone_region_main_thread =
-            std::thread([this]() { phone_region_main_loop(); });
-        // Server-side autonomous queue is dormant until patch24 task
-        // registration; it never intercepts the legacy RPC compute path.
-        phone_auto_prepare_thread =
-            std::thread([this]() { phone_auto_prepare_loop(); });
-        phone_auto_compute_thread =
-            std::thread([this]() { phone_auto_compute_loop(); });
-        // Async mode is an explicit extension of the existing opt-in
-        // weight preload. Leave the synchronous A/B baseline unchanged.
+        // Fail fast before any std::thread becomes joinable. A throwing
+        // constructor with live worker threads would call std::terminate.
         const char * preload_env =
             std::getenv("GGML_RPC_PHONE_NPU_PRELOAD_WEIGHTS");
         const char * async_env =
@@ -6072,6 +6064,12 @@ public:
                 "banked NPU weight worker conflicts with legacy async "
                 "HTP preload; disable PRELOAD_ASYNC");
         }
+        phone_region_main_thread =
+            std::thread([this]() { phone_region_main_loop(); });
+        phone_auto_prepare_thread =
+            std::thread([this]() { phone_auto_prepare_loop(); });
+        phone_auto_compute_thread =
+            std::thread([this]() { phone_auto_compute_loop(); });
         if (phone_npu_banked_enabled) {
             phone_npu_bank_thread = std::thread(
                 [this]() { phone_npu_bank_refill_loop(); });
