@@ -1,6 +1,6 @@
 # Whole-layer Phone Adreno OpenCL + HTP0 mixed execution (experimental)
 
-This branch is built on \`feat/phone-npu-dual-bank-offline-plan-20261107\`.
+This branch is built on `feat/phone-npu-dual-bank-offline-plan-20261107`.
 It adds an opt-in **execution smoke**, not yet a four-backend automatic
 Planner. Only whole Transformer layers are assigned. The Phone has a
 single compute worker, so OpenCL/HTP execution is **serial**, not concurrent.
@@ -65,9 +65,9 @@ Compile the new PC branch and the matching Android RPC server first:
 Run one prompt_N.txt without exposing any layer/Chunk allocations as
 command parameters:
 
-    .\tools\region-ring-experiments\run_phone_mixed_smoke.ps1 \
-      -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" \
-      -PromptFile "D:\prima.cpp\prompts\prompt_512.txt" \
+    .\tools\region-ring-experiments\run_phone_mixed_smoke.ps1 `
+      -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+      -PromptFile "D:\prima.cpp\prompts\prompt_512.txt" `
       -Rpc "10.39.52.114:50052" -NoMmap
 
 The script sets the **PC-side** mapping and restores previous environment
@@ -81,11 +81,11 @@ writeback and OpenCL KV.
 
 Look for ALL of:
 
-- PC \`[PHONE_MIXED_BACKENDS] region=2/5 ... backend=HTP0\`.
-- PC \`[PHONE_MIXED_BACKENDS] region=8/11 ... backend=GPUOpenCL\`.
-- Phone \`[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY ... backend=HTP0 ... status=PASS\`.
-- Phone \`[PHONE_MIXED_BACKENDS] event=EXECUTE ... backend=GPUOpenCL ... status=PASS\`.
-- Phone \`[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK ... backend=HTP0/GPUOpenCL\`.
+- PC `[PHONE_MIXED_BACKENDS] region=2/5 ... backend=HTP0`.
+- PC `[PHONE_MIXED_BACKENDS] region=8/11 ... backend=GPUOpenCL`.
+- Phone `[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY ... backend=HTP0 ... status=PASS`.
+- Phone `[PHONE_MIXED_BACKENDS] event=EXECUTE ... backend=GPUOpenCL ... status=PASS`.
+- Phone `[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK ... backend=HTP0/GPUOpenCL`.
 - Complete P2C, prefill and KV synchronization without fallback.
 
 Note that one Phone GPUOpenCL RPC-visible device still exists even when
@@ -100,7 +100,7 @@ verified** in the development environment.
 
 The existing offline DAG Planner still models three device types:
 PC CPU, PC CUDA, and aggregate PHONE. The current real Stage CSV has a
-single \`PHONE\` cost class and cannot safely compare HTP with OpenCL
+single `PHONE` cost class and cannot safely compare HTP with OpenCL
 separately. Do not treat its automatic result as a four-backend decision.
 
 To reach the requested automatic model-specific Profile -> Plan process:
@@ -119,5 +119,5 @@ To reach the requested automatic model-specific Profile -> Plan process:
    for Phone setup. Fail closed if server mapping and chosen Plan differ.
 
 Separate Profile is a mandatory precondition for formal Plan. The
-\`run_phone_mixed_smoke.ps1\` command performs no model-load profiling
-(\`-SkipProfile\`); it is a fixed A/B hardware correctness experiment.
+`run_phone_mixed_smoke.ps1` command performs no model-load profiling
+(`-SkipProfile`); it is a fixed A/B hardware correctness experiment.
