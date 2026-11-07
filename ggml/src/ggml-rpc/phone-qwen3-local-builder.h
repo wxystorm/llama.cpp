@@ -8,9 +8,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
-// Phone-local, metadata-only Qwen3 single-Layer graph builder. This copies
+// Phone-local Qwen3 Stage graph builder. The same single-layer operator chain
+// is used for one Layer or a contiguous multi-Layer Stage. This copies
 // the operator order from src/models/qwen3.cpp and the standard flash-attn
 // KV path in src/llama-graph.cpp and src/llama-kv-cache.cpp.
 // The Graph has no input/storage bindings until a separate HTP allocation
@@ -43,6 +45,13 @@ struct graph_result {
     ggml_tensor * output = nullptr;
     uint32_t tokens = 0;
     uint32_t token_begin = 0;
+};
+
+struct multi_graph_result {
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<graph_result> layers;
 };
 
 struct side_inputs {
@@ -127,7 +136,10 @@ inline bool build_graph(ggml_context * ctx,
                         graph_result & out,
                         const char * & reason,
                         ggml_tensor * persistent_k = nullptr,
-                        ggml_tensor * persistent_v = nullptr) {
+                        ggml_tensor * persistent_v = nullptr,
+                        ggml_tensor * upstream_input = nullptr,
+                        ggml_cgraph * shared_graph = nullptr,
+                        bool publish_output = true) {
     out = {};
     if (!ctx || !ggml_phone_owned::validate(p, reason) ||
             chunk >= ggml_phone_owned::chunk_count(p) ||
@@ -177,10 +189,19 @@ inline bool build_graph(ggml_context * ctx,
     std::snprintf(name, sizeof(name), "cache_v_l%u", p.layer);
     ggml_set_name(cache_v, name);
 
-    ggml_cgraph * graph = ggml_new_graph_custom(ctx, 512, false);
+    if (upstream_input &&
+            (!shared_graph || upstream_input->type != GGML_TYPE_F32 ||
+             upstream_input->ne[0] != p.n_embd ||
+             upstream_input->ne[1] != tokens)) {
+        reason = "INVALID_MULTI_LAYER_STAGE_INPUT";
+        return false;
+    }
+    ggml_cgraph * graph = shared_graph ?
+        shared_graph : ggml_new_graph_custom(ctx, 512, false);
     if (!graph) { reason = "LOCAL_GRAPH_ALLOC"; return false; }
-    ggml_tensor * input = ggml_new_tensor_2d(
-        ctx, GGML_TYPE_F32, p.n_embd, tokens);
+    ggml_tensor * input = upstream_input ?
+        upstream_input : ggml_new_tensor_2d(
+            ctx, GGML_TYPE_F32, p.n_embd, tokens);
     ggml_tensor * pos = ggml_new_tensor_1d(
         ctx, GGML_TYPE_I32, tokens);
     ggml_tensor * ki = ggml_new_tensor_1d(
@@ -193,12 +214,28 @@ inline bool build_graph(ggml_context * ctx,
         reason = "LOCAL_GRAPH_INPUT_ALLOC";
         return false;
     }
-    ggml_set_name(input, "inp_stage");
-    ggml_set_name(pos, "inp_pos");
-    ggml_set_name(ki, "kv_k_indices");
-    ggml_set_name(vi, "kv_v_indices");
-    ggml_set_name(mask, "attn_inp_kq_mask");
-    ggml_set_input(input);
+    if (!upstream_input) {
+        ggml_set_name(input, "inp_stage");
+        ggml_set_input(input);
+    }
+    if (shared_graph) {
+        // Side inputs are distinct Tensors per physical Transformer Layer
+        // even though Position and Mask values are identical across layers.
+        char side_name[GGML_MAX_NAME];
+        std::snprintf(side_name, sizeof(side_name), "inp_pos_l%u", p.layer);
+        ggml_set_name(pos, side_name);
+        std::snprintf(side_name, sizeof(side_name), "kv_k_indices_l%u", p.layer);
+        ggml_set_name(ki, side_name);
+        std::snprintf(side_name, sizeof(side_name), "kv_v_indices_l%u", p.layer);
+        ggml_set_name(vi, side_name);
+        std::snprintf(side_name, sizeof(side_name), "attn_mask_l%u", p.layer);
+        ggml_set_name(mask, side_name);
+    } else {
+        ggml_set_name(pos, "inp_pos");
+        ggml_set_name(ki, "kv_k_indices");
+        ggml_set_name(vi, "kv_v_indices");
+        ggml_set_name(mask, "attn_inp_kq_mask");
+    }
     ggml_set_input(pos);
     ggml_set_input(ki);
     ggml_set_input(vi);
@@ -291,7 +328,9 @@ inline bool build_graph(ggml_context * ctx,
     mark(result, "ffn_out");
     std::snprintf(name, sizeof(name), "l_out-%u", p.layer);
     ggml_set_name(result, name);
-    ggml_set_output(result);
+    if (publish_output) {
+        ggml_set_output(result);
+    }
     ggml_build_forward_expand(graph, result);
 
     if (ggml_graph_n_nodes(graph) < 10) {
@@ -309,6 +348,58 @@ inline bool build_graph(ggml_context * ctx,
     out.output = result;
     out.tokens = tokens;
     out.token_begin = begin;
+    reason = "NONE";
+    return true;
+}
+
+// Compile a real continuous [first_layer, first_layer + weights.size())
+// Qwen3 Stage into ONE GGML graph. Its output from Layer i is directly
+// consumed by Layer i+1, with independently owned per-layer K/V tensors.
+// This constructs metadata only; the caller is responsible for HTP weight
+// residence, KV initialization, input binding, compilation, and execution.
+// It does not silently fall back to an OpenCL or PC executor.
+inline bool build_graph_layers(
+        ggml_context * ctx,
+        const ggml_phone_owned::region_plan & first_layer_plan,
+        uint32_t chunk,
+        const std::vector<layer_weights> & weights,
+        multi_graph_result & out,
+        const char * & reason,
+        const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & kv = {}) {
+    out = {};
+    if (!ctx || weights.empty() || weights.size() > 32 ||
+            first_layer_plan.layer + weights.size() > 256 ||
+            (!kv.empty() && kv.size() != weights.size())) {
+        reason = "INVALID_MULTI_LAYER_STAGE";
+        return false;
+    }
+    ggml_cgraph * graph = ggml_new_graph_custom(
+        ctx, 512 * weights.size(), false);
+    if (!graph) {
+        reason = "MULTI_LAYER_GRAPH_ALLOC";
+        return false;
+    }
+    out.graph = graph;
+    out.layers.reserve(weights.size());
+    for (std::size_t i = 0; i < weights.size(); ++i) {
+        ggml_phone_owned::region_plan p = first_layer_plan;
+        p.layer += static_cast<uint32_t>(i);
+        const auto k = kv.empty() ? nullptr : kv[i].first;
+        const auto v = kv.empty() ? nullptr : kv[i].second;
+        const auto input = out.layers.empty() ?
+            nullptr : out.layers.back().output;
+        graph_result layer {};
+        if (!build_graph(ctx, p, chunk, weights[i], layer, reason,
+                         k, v, input, graph, i + 1 == weights.size())) {
+            out = {};
+            return false;
+        }
+        if (i == 0) {
+            out.input = layer.input;
+        }
+        out.output = layer.output;
+        out.layers.push_back(layer);
+    }
     reason = "NONE";
     return true;
 }
