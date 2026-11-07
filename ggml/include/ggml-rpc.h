@@ -156,6 +156,15 @@ using ggml_backend_rpc_profile_duplex_t = bool (*)(
 #define GGML_BACKEND_RPC_PHONE_RING_AUTO_WAIT_PROC \
     "ggml_backend_rpc_phone_ring_auto_wait"
 
+// Patch32: pull *structured* per-Chunk Phone timings once after Run END.
+// The PC logs the received records into its own engine.stderr.log;
+// model-bound Profile extraction no longer requires copying Phone logs.
+// No on-device log scraping, no per-Chunk RPC traffic.
+#define GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_PULL_PROC \
+    "ggml_backend_rpc_phone_stage_profile_pull"
+using ggml_backend_rpc_phone_stage_profile_pull_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id);
+
 // Experimental ACK-free Phone input stream (RPC patch 23).
 #define GGML_BACKEND_RPC_PHONE_INPUT_STREAM_RUN_PROC \
     "ggml_backend_rpc_phone_input_stream_run"
@@ -247,8 +256,8 @@ using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
 // P1 Region/Layer pairs before registering any Phone-owned Graph/KV.
 // Version 2 also describes a same-Phone successor when HTP output flows
 // directly to an adjacent Adreno Region. A zero successor means normal P2C.
-// The PC retains the original P2C completion frame for its Region DAG;
-// only the intermediate activation is no longer pushed back to the Phone.
+// Internal NPU->Adreno stages are autonomously executed on Phone without
+// an intermediate P2C frame or per-Chunk completion notification.
 struct ggml_backend_rpc_phone_npu_region_layer {
     uint32_t region;
     uint32_t layer;
