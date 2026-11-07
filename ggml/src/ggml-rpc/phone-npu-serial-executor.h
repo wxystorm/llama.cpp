@@ -6,6 +6,7 @@
 #include "ggml-rpc.h"
 #include "phone-qwen3-local-builder.h"
 #include "phone-qwen3-local-parity.h"
+#include "phone-npu-weight-banks.h"
 
 #include <algorithm>
 #include <array>
@@ -381,6 +382,60 @@ public:
         double precompile_ms = 0.0;
     };
 
+    // KV is allocated once for ALL selected NPU Regions, including those
+    // whose weight Bank is not ready yet. It survives Region graph retirement.
+    bool reserve_owned_htp_kv(const ggml_phone_owned::region_plan & plan,
+                              std::string & reason) {
+        const char * why = "NONE";
+        if (!ggml_phone_owned::validate(plan, why)) {
+            reason = why;
+            return false;
+        }
+        const auto key = std::make_pair(plan.run_id, plan.region);
+        const auto existing = owned_kv_.find(key);
+        if (existing != owned_kv_.end()) {
+            if (!ggml_phone_owned::equal(existing->second->plan, plan)) {
+                reason = "PHONE_OWNED_HTP_PLAN_CONFLICT";
+                return false;
+            }
+            reason.clear();
+            return true;
+        }
+        auto kv = std::make_unique<owned_layer_kv>();
+        kv->plan = plan;
+        const size_t kv_ctx_bytes = ggml_tensor_overhead() * 8 + 4096;
+        ggml_init_params kv_params = {kv_ctx_bytes, nullptr, true};
+        kv->ctx.reset(ggml_init(kv_params));
+        if (!kv->ctx) {
+            reason = "PHONE_OWNED_HTP_KV_CONTEXT";
+            return false;
+        }
+        const int64_t width = int64_t(plan.n_heads_kv) * plan.head_dim;
+        kv->k = ggml_new_tensor_2d(
+            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+        kv->v = ggml_new_tensor_2d(
+            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+        if (!kv->k || !kv->v) {
+            reason = "PHONE_OWNED_HTP_KV_METADATA";
+            return false;
+        }
+        char name[GGML_MAX_NAME] = {};
+        std::snprintf(name, sizeof(name), "cache_k_l%u", plan.layer);
+        ggml_set_name(kv->k, name);
+        std::snprintf(name, sizeof(name), "cache_v_l%u", plan.layer);
+        ggml_set_name(kv->v, name);
+        kv->buffer.reset(ggml_backend_alloc_ctx_tensors(
+            kv->ctx.get(), backend_));
+        if (!kv->buffer) {
+            reason = "PHONE_OWNED_HTP_KV_ALLOC";
+            return false;
+        }
+        ggml_backend_buffer_clear(kv->buffer.get(), 0);
+        owned_kv_.emplace(key, std::move(kv));
+        reason.clear();
+        return true;
+    }
+
     // Opt-in precompile stage. The Phone allocates KV once per assigned Layer,
     // fixes every Chunk's input/side-input/output Tensor storage, then invokes
     // the same HTP fixed-graph precompiler used by PC-built Graphs. No PC
@@ -410,16 +465,22 @@ public:
                 reason = "PHONE_OWNED_HTP_PLAN_CONFLICT";
                 return false;
             }
+            size_t compiled = 0;
             for (uint32_t chunk = 0;
                     chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
-                if (owned_graphs_.count(
-                        std::make_tuple(plan.run_id, plan.region, chunk)) == 0) {
-                    reason = "PHONE_OWNED_HTP_PARTIAL_REGISTRATION";
-                    return false;
-                }
+                compiled += owned_graphs_.count(
+                    std::make_tuple(plan.run_id, plan.region, chunk));
             }
-            stats.chunks = ggml_phone_owned::chunk_count(plan);
-            return true;
+            if (compiled == ggml_phone_owned::chunk_count(plan)) {
+                stats.chunks = static_cast<uint32_t>(compiled);
+                return true;
+            }
+            if (compiled != 0) {
+                reason = "PHONE_OWNED_HTP_PARTIAL_REGISTRATION";
+                return false;
+            }
+            // Deferred Bank: its KV already exists, but no Graph is built
+            // until the previous rank-k Region drains and rank-k+2 refills.
         }
 
         ggml_phone_qwen3::layer_weights w {};
@@ -451,36 +512,10 @@ public:
             return false;
         }
 
-        auto kv = std::make_unique<owned_layer_kv>();
-        kv->plan = plan;
-        const size_t kv_ctx_bytes = ggml_tensor_overhead() * 8 + 4096;
-        ggml_init_params kv_params = {kv_ctx_bytes, nullptr, true};
-        kv->ctx.reset(ggml_init(kv_params));
-        if (!kv->ctx) {
-            reason = "PHONE_OWNED_HTP_KV_CONTEXT";
+        if (!reserve_owned_htp_kv(plan, reason)) {
             return false;
         }
-        const int64_t width = int64_t(plan.n_heads_kv) * plan.head_dim;
-        kv->k = ggml_new_tensor_2d(
-            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
-        kv->v = ggml_new_tensor_2d(
-            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
-        if (!kv->k || !kv->v) {
-            reason = "PHONE_OWNED_HTP_KV_METADATA";
-            return false;
-        }
-        char name[GGML_MAX_NAME] = {};
-        std::snprintf(name, sizeof(name), "cache_k_l%u", plan.layer);
-        ggml_set_name(kv->k, name);
-        std::snprintf(name, sizeof(name), "cache_v_l%u", plan.layer);
-        ggml_set_name(kv->v, name);
-        kv->buffer.reset(ggml_backend_alloc_ctx_tensors(
-            kv->ctx.get(), backend_));
-        if (!kv->buffer) {
-            reason = "PHONE_OWNED_HTP_KV_ALLOC";
-            return false;
-        }
-        ggml_backend_buffer_clear(kv->buffer.get(), 0);
+        auto * kv = owned_kv_.at(key).get();
         stats.kv_bytes = ggml_backend_buffer_get_size(kv->buffer.get());
 
         const auto reg = ggml_backend_dev_backend_reg(
@@ -585,7 +620,6 @@ public:
             if (reason.empty()) { reason = "PHONE_OWNED_HTP_PARTIAL"; }
             return false;
         }
-        owned_kv_.emplace(key, std::move(kv));
         for (uint32_t chunk = 0; chunk < pending.size(); ++chunk) {
             owned_graphs_.emplace(
                 std::make_tuple(plan.run_id, plan.region, chunk),
