@@ -8636,6 +8636,84 @@ bool rpc_server::phone_npu_preload_ready_locked(
         it->second.state == phone_npu_preload_status::READY;
 }
 
+// Two-Bank HTP weight mover: same parity/rank-k+2 policy as the PC GPU
+// Bank Mover. It operates separately from the Phone compute scheduler and
+// never holds phone_auto_mutex during file I/O, repack or HTP Graph compile.
+// The only HTP compute lane remains serialized by phone_npu_backend_mutex.
+void rpc_server::phone_npu_bank_refill_loop() {
+    for (;;) {
+        std::pair<uint64_t, ggml_phone_npu_serial::weight_bank_refill> job;
+        {
+            std::unique_lock<std::mutex> lock(phone_auto_mutex);
+            phone_auto_cv.wait(lock, [&]() {
+                return phone_auto_stop || !phone_npu_bank_refill_jobs.empty();
+            });
+            if (phone_auto_stop) { return; }
+            job = phone_npu_bank_refill_jobs.front();
+            phone_npu_bank_refill_jobs.pop_front();
+        }
+        const int64_t wait_begin_us = ggml_time_us();
+        std::string reason;
+        ggml_phone_npu_serial::full_region_executor::model_load_stats load {};
+        ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats
+            compiled {};
+        bool ok = false;
+        int64_t lock_acquired_us = wait_begin_us;
+        {
+            std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+            lock_acquired_us = ggml_time_us();
+            ok = phone_npu_executor != nullptr &&
+                phone_npu_executor->refill_banked_rank(
+                    job.first, job.second, reason, load, compiled);
+        }
+        const int64_t finish_us = ggml_time_us();
+        bool active = false;
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            if (!phone_auto_stop) {
+                active = true;
+                if (ok) {
+                    phone_npu_banked_ready_regions.insert(
+                        job.second.to_region);
+                } else {
+                    for (auto & entry : phone_auto_jobs) {
+                        auto & pending = *entry.second;
+                        if (pending.request.key.run_id == job.first &&
+                                pending.request.key.region ==
+                                    job.second.to_region &&
+                                pending.state != phone_auto_status::COMPLETE) {
+                            pending.state = phone_auto_status::FAILED;
+                        }
+                    }
+                }
+            }
+        }
+        GGML_LOG_INFO(
+            "[NPU_BANK] event=REFILL run=%" PRIu64
+            " bank=%zu from_rank=%zu to_rank=%zu region=%u"
+            " source_bytes=%zu weights=%zu read_ms=%.3f"
+            " repack_ms=%.3f compile_ms=%.3f"
+            " htp_lock_wait_ms=%.3f wall_ms=%.3f"
+            " physical_banks=2 status=%s reason=%s\n",
+            job.first, job.second.bank, job.second.from_rank,
+            job.second.to_rank, job.second.to_region,
+            load.new_bytes, load.new_weights, load.file_read_ms,
+            load.htp_repack_ms, compiled.precompile_ms,
+            (lock_acquired_us - wait_begin_us) / 1000.0,
+            (finish_us - wait_begin_us) / 1000.0,
+            ok ? "PASS" : "FAIL",
+            ok ? "NONE" : reason.c_str());
+        phone_auto_cv.notify_all();
+        if (!ok && active) {
+            GGML_LOG_ERROR(
+                "[PHONE_AUTO_P2C] event=ABORT run=%" PRIu64
+                " region=%u reason=NPU_BANK_REFILL_FAILED:%s\n",
+                job.first, job.second.to_region, reason.c_str());
+            p2c_arena.abort();
+        }
+    }
+}
+
 // Dedicated HTP weight worker. It never touches the original RPC Graph:
 // only detached ggml_tensor metadata and live, immutable OpenCL buffers.
 // Backend operations are serialized with HTP run()/KV_SYNC separately from
@@ -14190,6 +14268,9 @@ rpc_server::~rpc_server() {
     }
     if (phone_npu_preload_thread.joinable()) {
         phone_npu_preload_thread.join();
+    }
+    if (phone_npu_bank_thread.joinable()) {
+        phone_npu_bank_thread.join();
     }
     {
         std::lock_guard<std::mutex> lock(phone_region_main_mutex);
