@@ -116,10 +116,14 @@ flag determined by the current experimental runtime constraints)
 and candidates.csv. The file now includes execution_stages (absolute layer
 ranges, Region indices and backend) and execution_edges (handoff type and
 resource lane). Zero-width stages are omitted before IDs are assigned.
-HTP_TO_ADRENO now has an experimental Patch31 Phone host-F32 staging
-implementation. PC still receives HTP P2C completion frames, and the DAG
-models those side returns as a real transfer cost; NPU Bank reuse waits for
-that final capture. No silent OpenCL fallback is allowed.
+HTP_TO_ADRENO now has an experimental Patch31 Phone-local Host F32
+ownership-transfer implementation: the NPU output vector is moved into the
+Adreno input queue without a second Host memcpy, but OpenCL still uploads
+the bytes to GPU device memory. No intermediate NPU P2C bytes or completion
+notifications go to PC. PC marks the N Region logically delegated, then
+waits for the **real** Adreno-to-PC return before scheduling any next PC
+stage. The DAG charges the measured Adreno Stage upload but no duplicate
+Host copy and no fake NPU P2C frame. No silent OpenCL fallback is allowed.
 The old 3-device Profile/Plan flow stays unchanged.
 
 To disable HTP search candidates, pass -MaxNpuRegionLayers 0. Depths greater
