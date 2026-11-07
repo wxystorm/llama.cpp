@@ -7747,7 +7747,12 @@ bool rpc_server::phone_owned_plan_register(
             phone_npu_executor->rank_for_region(
                 plan.region, plan.layer) : -1;
         if (phone_npu_banked_enabled && bank_rank < 0) {
-            return reject("NPU_BANK_REGION_OR_LAYER_NOT_IN_LOAD_PLAN");
+            GGML_LOG_ERROR(
+                "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
+                " region=%u layer=%u"
+                " reason=NPU_BANK_REGION_OR_LAYER_NOT_IN_LOAD_PLAN\n",
+                plan.run_id, plan.region, plan.layer);
+            return false;
         }
         // All Region KV must exist before PC binds Decode storage.
         // For rank 2+ weights and Graphs are deliberately absent until
