@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile-only four-backend whole-layer Ring planner (offline, not executable).
+"""Profile-only four-backend whole-layer Ring planner (offline planning; experimental Runtime subset).
 
 Cycle: PC_CUDA(optional) -> PC_CPU(optional) -> Phone_HTP(optional) -> Phone_OpenCL(optional).
 NPU overflow spills a contiguous suffix into Phone OpenCL; do not reject
