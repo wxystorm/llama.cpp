@@ -4852,9 +4852,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         graphless_requested && ubatch.n_tokens >= 32 &&
         phone_auto_final_enabled && own_stage_resources;
     // Distinct whole-layer Phone backends share the existing Phone FIFO:
-    // selected P1 Regions run on private HTP0; remaining P Regions retain
-    // their normal RPC GPUOpenCL graphs. Graphless is currently all-or-none,
-    // so the mixed opt-in deliberately keeps PC-built OpenCL metadata graphs.
+    // selected P1 Regions use the existing Phone-owned Graphless HTP ABI;
+    // other P1 Regions keep PC-built GPUOpenCL graphs and Slot0 contracts.
+    // This avoids requiring a fake OpenCL Graph/Slot0 for private HTP work.
     const char * phone_mixed_env =
         std::getenv("LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP");
     const bool phone_mixed_requested = phone_mixed_env != nullptr &&
@@ -5103,7 +5103,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Other modes retain the original eager graph and binding lifecycle.
     const bool phone_async_graph_setup =
         phone_async_graph_requested && phone_auto_eligible &&
-        phone_auto_final_enabled && !phone_graphless;
+        phone_auto_final_enabled && !phone_graphless &&
+        !phone_mixed_requested;
     std::mutex phone_graph_ready_mutex;
     std::condition_variable phone_graph_ready_cv;
     std::vector<std::vector<uint8_t>> phone_graph_ready(stages.size());
@@ -5238,6 +5239,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         item.tokens != std::min<uint32_t>(
                             size, ubatch.n_tokens - begin)) {
                     return false;
+                }
+                if (phone_mixed_requested &&
+                        phone_mixed_htp_regions.count((uint32_t) r)) {
+                    // KV + immutable Chunk descriptors were bound using
+                    // PHONE_OWNED_KV; no PC graph, RPC slot, OpenCL input
+                    // upload or legacy NPU task registration is necessary.
+                    item.graph_uid = (UINT64_C(2) << 62) |
+                        (uint64_t(item.region) << 32) |
+                        (uint64_t(item.chunk) + 1);
+                    if (!registered_uids.insert(item.graph_uid).second) {
+                        return false;
+                    }
+                    LLAMA_LOG_INFO(
+                        "[PHONE_MIXED_BACKENDS] event=GRAPHLESS_READY "
+                        "region=%zu chunk=%u uid=%" PRIu64
+                        " backend=HTP0 pc_graph=SKIPPED status=READY\n",
+                        r, chunk, item.graph_uid);
+                    if (!on_built(item)) { return false; }
+                    continue;
                 }
                 item.owned_sched.reset(ggml_backend_sched_new(
                     backend_ptrs.data(), backend_buft.data(),
@@ -5728,7 +5748,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
             // The actual KV allocator, not RoPE positions, proves the
             // fresh physical slot assignment before any remote execution.
-            if (valid && phone_graphless) {
+            if (valid && (phone_graphless || phone_mixed_requested)) {
                 valid = bind_kv != nullptr &&
                     kv_mctx->type_k() == GGML_TYPE_F16 &&
                     kv_mctx->type_v() == GGML_TYPE_F16 &&
@@ -5794,7 +5814,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_fast = cparams.yarn_beta_fast;
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
-                if (valid && phone_graphless) {
+                if (valid && (phone_graphless || phone_mixed_requested)) {
                     // Cache storage belongs to the *Meta* outer buffer in
                     // this layout (Meta(CPU,RPC0)). The RPC client cannot
                     // serialize that outer buffer: it must receive the
@@ -5886,8 +5906,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_INFO(
                 "[PHONE_OWNED_PLAN] side=pc mode=%s"
                 " registered=%zu status=%s\n",
-                phone_graphless ? "PHONE_LOCAL_GRAPHLESS" :
-                                  "SHADOW_PC_BUILT",
+                phone_mixed_requested ? "HTP_GRAPHLESS_GPU_OPENCL" :
+                    phone_graphless ? "PHONE_LOCAL_GRAPHLESS" :
+                                      "SHADOW_PC_BUILT",
                 published, valid ? "PASS" : "FAIL");
             if (!valid || published == 0 ||
                     (phone_mixed_requested &&
@@ -5938,6 +5959,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 phone_stream_run_id != 0;
             if (bound && !phone_async_graph_setup && !phone_graphless) {
                 for (const auto & item : phone_auto_templates) {
+                    if (phone_mixed_requested &&
+                            phone_mixed_htp_regions.count(
+                                (uint32_t) item.region)) {
+                        // Phone-owned KV_BIND has already created this
+                        // Graphless HTP Chunk; never register an OpenCL UID.
+                        continue;
+                    }
                     if (!register_task(
                             phone_rpc_backend, phone_input_push_run_id,
                             (uint32_t) item.region, (uint32_t) item.chunk,
@@ -7171,15 +7199,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                        item.token_begin == (uint32_t) task.token_begin &&
                                        item.tokens == (uint32_t) task.n_tokens;
                             });
+                        const bool region_graphless = phone_graphless ||
+                            (phone_mixed_requested &&
+                             phone_mixed_htp_regions.count(
+                                 (uint32_t) task.region) != 0);
                         if (it == phone_auto_templates.end() ||
                                 it->graph_uid == 0 ||
-                                (!phone_graphless &&
+                                (!region_graphless &&
                                  (it->owned_sched == nullptr ||
                                   it->owned_res == nullptr))) {
                             throw std::runtime_error(
                                 "missing exact Phone autonomous Chunk binding");
                         }
-                        if (!phone_graphless) {
+                        if (!region_graphless) {
                             task_sched = it->owned_sched.get();
                             task_res = it->owned_res.get();
                             phone_prebuilt_task = true;
