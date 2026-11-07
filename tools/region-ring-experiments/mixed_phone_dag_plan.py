@@ -421,6 +421,11 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
             # data or completion frame exists for this internal boundary.
             last_npu_region.append(prev_boundary[-1])
     final_backend = active[-1][1]
+    # A PC terminal must still execute the CPU RMSNorm/LM Head.
+    # Never give a PC tail a free Head just because an older Phone
+    # calibration did not include pc_head_ms.
+    if final_backend in ("G", "C") and head_ms <= 0.0:
+        return None
     if final_backend in ("N", "A"):
         prev_boundary = [
             dag.add(f"FINAL_P2C:{k}", "phone_to_pc",
@@ -664,12 +669,14 @@ def run_cli(argv=None):
     (args.out/"plan.json").write_text(json.dumps(record,indent=2),encoding="utf-8")
     with (args.out/"candidates.csv").open("w",newline="",encoding="utf-8") as f:
         writer=csv.writer(f)
-        writer.writerow(["rank","mixed_layout","chunk_tokens","predicted_wall_ms",
+        writer.writerow(["rank","mixed_layout","final_backend","runtime_compatible","chunk_tokens","predicted_wall_ms",
                          "pc_gpu_used_mib","npu_used_mib","phone_gpu_used_mib",
                          "phone_shared_used_mib","gpu_bank_h2d_ms",
                          "npu_bank_stage_ms","npu_bank_repack_ms"])
         for j,(ww,ll,xx,_,mm,dd) in enumerate(options[:100],start=1):
-            writer.writerow([j,ll,xx,round(ww,3),round(mm.gpu_pc_used_mib,3),
+            writer.writerow([j,ll,execution_stage_graph(_)[0][-1]["backend"],
+                             int(runtime_compatible_cycles(_)),xx,round(ww,3),
+                             round(mm.gpu_pc_used_mib,3),
                              round(mm.npu_used_mib,3),round(mm.phone_gpu_used_mib,3),
                              round(mm.phone_shared_used_mib,3),
                              round(dd["gpu_bank_h2d_ms"],3),
