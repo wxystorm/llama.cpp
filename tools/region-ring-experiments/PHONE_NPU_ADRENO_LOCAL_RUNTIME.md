@@ -1,6 +1,6 @@
 # Experimental Phone HTP -> Adreno contiguous Stage runtime (RPC Patch 31)
 
-Branch: `feat/phone-npu-adreno-local-handoff-runtime-20261107`
+Branch: `feat/phone-npu-adreno-no-mid-p2c-host-move-20261107`
 Status: source integration only. **Not yet compiled on Windows/Android or verified on a Snapdragon phone.** Do not report a device PASS without logs and logits comparison.
 
 ## Contract
@@ -9,9 +9,9 @@ The PC four-backend Planner selects `G -> C? -> N? -> A?` per Cycle. The first r
 
 Patch31 PC plan configure sends `(HTP region, absolute layer, next Adreno region or zero)` after input-stream START and before owned Graph/KV registration. Phone accepts the HTP map only with two real weight Banks and validates that any local successor is exactly the next Region and is not HTP. Failure is fatal; no implicit OpenCL fallback.
 
-HTP Graphless compute creates an F32 Host output. When its Plan contains an adjacent Adreno successor, the Phone **copies** that output into a bounded, owned and hashed destination Host input slot, signals the existing GPU preparation Worker and runs the registered GPUOpenCL Graph/Slot0 on the verified payload. No PC->Phone PUSH occurs for this particular edge. It is *not* a zero-copy shared NPU/Adreno device buffer and KV never travels with activations.
+HTP Graphless compute creates one F32 Host output vector. When its Plan contains an adjacent Adreno successor, the Phone **moves ownership of that same vector** to the bounded destination Host landing queue (`std::move`), wakes the OpenCL preparation Worker, and uploads from the owned vector directly into GPUOpenCL Graph/Slot0. There is no second Host memcpy, no pseudo-network packet or per-Chunk hash for these locally trusted bytes, and no PC->Phone Activation PUSH for this edge. This is **not** device-level shared-memory zero-copy: the necessary Host->OpenCL device upload remains. KV never travels with activations.
 
-For this first cut, Phone still sends the HTP Region's **normal P2C frame** so the existing PC Ring can mark upstream completion. This means local activation delivery can overlap that control return; the offline DAG includes both this side P2C and the local Phone copy. The HTP Bank may not be refilled before the Region's final P2C is captured. There is no claim that all network traffic has been eliminated.
+The internal HTP->Adreno edge sends **neither a full intermediate P2C frame nor a per-Chunk completion notification**. At PC dispatch time, Region Ring logically completes the N stage only to transfer ownership to the adjacent Phone A stage; this is **not** an assertion that HTP computation has finished. The Phone's own FIFO, output publication and KV rules gate Adreno. Actual **Adreno->PC** and final **Phone->PC Head** boundaries still return full, validated data, so the next PC GPU/CPU stage cannot advance until the real data arrives. NPU two-Bank reuse waits for the last local Host handoff (or actual P2C if N is terminal), not for any fictitious intermediate frame. The offline DAG now models this ownership boundary without inventing P2C bandwidth.
 
 ## Build on both sides
 
@@ -19,7 +19,7 @@ On Windows PowerShell, from the repo root:
 
 ```powershell
 git fetch origin
-git switch feat/phone-npu-adreno-local-handoff-runtime-20261107
+git switch feat/phone-npu-adreno-no-mid-p2c-host-move-20261107
 git pull --ff-only
 cmake --build build-tensor-v2 --config Release --target llama-completion test-region-ring test-phone-plan-region-map -j 8
 ctest --test-dir build-tensor-v2 -C Release -R "test-region-ring|test-phone-plan-region-map" --output-on-failure
@@ -85,7 +85,9 @@ Start by validating `-NPredict 1` Prefill and parity against a nonmixed referenc
 - PC: `[PHONE_NPU_PLAN] side=pc event=CONFIGURE/INSTALL ... status=PASS` and `[PHONE_LOCAL_HANDOFF] side=pc event=SKIP_PUSH ... status=PASS`
 - Phone: `[PHONE_NPU_PLAN] side=phone event=CONFIGURE ... local_links=... status=PASS`, `[PHONE_LOCAL_HANDOFF] event=PUBLISH ... status=PASS`
 - Phone: `[PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN/DEVICE_END ... backend=HTP0/GPUOpenCL` for both physical engines
-- Both Phone and PC: complete P2C for the source HTP and destination Adreno Regions, `[PHONE_AUTO_SUM] ... failed=0` and no `REGISTER_REJECT`, Bank/Graph/KV mismatch or silent backend fallback
+- PC: `[PHONE_LOCAL_HANDOFF] side=pc event=DELEGATE` for internal HTP and `[PHONE_INPUT_PUSH] event=SUMMARY ... local_skipped=N` (this field is separate from successful network PUSHs)
+- Phone: `[PHONE_LOCAL_HANDOFF] event=NO_INTERMEDIATE_P2C ... payload_bytes=0 completion_frame=SKIPPED`, with **no P2C frame for those HTP Region/Chunk IDs**
+- Both Phone and PC: complete P2C for every **cross-device** Adreno-to-PC or terminal Phone Region, `[PHONE_AUTO_SUM] ... failed=0` and no `REGISTER_REJECT`, Bank/Graph/KV mismatch or silent backend fallback
 - End-to-end: Prefill PASS, correct logits, and (for Decode tests) successful KV synchronization
 
 A nonzero `htp_gpu_service_overlap_ms` shows overlap between service intervals (including copies); kernel-level parallelism still needs separate hardware profiling. Under short Chunks, zero measured overlap need not mean a correctness failure.
