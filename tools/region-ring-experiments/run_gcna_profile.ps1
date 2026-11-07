@@ -52,11 +52,12 @@ if (!(Test-Path -LiteralPath $probeModel)) {
     if (!(Test-Path -LiteralPath $manifestPath)) {
         throw "Compact model exists without a fingerprint manifest; refuse reuse."
     }
-    $existing = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($existing.pattern -ne $spec.pattern -or
-            [int]$existing.cycles -ne $Cycles -or
-            $existing.source_model -ne [IO.Path]::GetFileName($source)) {
-        throw "Compact GGUF manifest mismatch; use a separate ProfileRoot."
+    $verifyArgs = @($builder, "--model", $source, "--output", $probeModel,
+                    "--pattern", $Pattern, "--cycles", "$Cycles",
+                    "--manifest", $manifestPath, "--verify")
+    & $python @verifyArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Existing compact GGUF fingerprint mismatch; refuse stale model cache."
     }
 }
 $tokenizer = Join-Path $repo "build-tensor-v2\bin\Release\llama-tokenize.exe"
