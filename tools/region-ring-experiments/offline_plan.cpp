@@ -28,6 +28,7 @@ struct offline_config {
     std::string baseline;
     int layers = 0, tokens = 0, hidden = 0, kv_start = 0;
     int max_npu_region_layers = 1; // current local-only HTP supports one Layer
+    bool banked_runtime_confirmed = false; // explicit opt-in, not inferred
     double gpu_budget_mib = 0.0, npu_budget_mib = 0.0;
     double gpu_weight_layer_mib = 0.0, npu_weight_layer_mib = 0.0;
     double gpu_kv_layer_mib = 0.0, npu_kv_layer_mib = 0.0;
@@ -92,6 +93,7 @@ static offline_config parse_args(int argc, char ** argv) {
                 "  --first-pool 1500 --first-seeds 500 --beam 64\n"
                 "  --final-beam 96 --cpu-dag 256 --local-dag 128\n"
                 "  --local-rounds 4 --top 100 --max-npu-region-layers 1\n"
+                "  --npu-banked-runtime-confirmed 0|1 (default 0)\n"
                 "  --gpu-scratch-mib 0 --npu-scratch-mib 0\n"
                 "  --latency-ms 0.0 --phone-head-ms 0.0 --kv-start 0\n";
             std::exit(0);
@@ -121,6 +123,13 @@ static offline_config parse_args(int argc, char ** argv) {
     o.hidden = read_int(args, "--hidden", 0);
     o.kv_start = read_int(args, "--kv-start", 0);
     o.max_npu_region_layers = read_int(args, "--max-npu-region-layers", 1);
+    const int banked_confirmed =
+        read_int(args, "--npu-banked-runtime-confirmed", 0);
+    if (banked_confirmed != 0 && banked_confirmed != 1) {
+        throw std::runtime_error(
+            "npu-banked-runtime-confirmed must be 0 or 1");
+    }
+    o.banked_runtime_confirmed = banked_confirmed == 1;
     o.gpu_budget_mib = read_double(args, "--gpu-budget-mib", 0);
     o.npu_budget_mib = read_double(args, "--npu-budget-mib", 0);
     o.gpu_weight_layer_mib = read_double(args, "--gpu-weight-layer-mib", 0);
@@ -375,7 +384,9 @@ int main(int argc, char ** argv) {
                  << npu_full_weights_mib << ",\n"
                  << "  \"npu_streaming_required\": "
                  << (npu_streaming_required ? "true" : "false") << ",\n"
-                 << "  \"npu_streaming_runtime_ready\": false,\n"
+                 << "  \"npu_streaming_runtime_ready\": "
+                 << (o.banked_runtime_confirmed ? "true" : "false")
+                 << ",\n"
                  << "  \"gpu_budget_mib\": " << o.gpu_budget_mib << ",\n"
                  << "  \"npu_budget_mib\": " << o.npu_budget_mib << ",\n"
                  << "  \"predicted_ms_lower_bound\": " << chosen.wall_ms << ",\n"
@@ -419,7 +430,9 @@ int main(int argc, char ** argv) {
             "Do not use it as a validated prefill forecast.\n";
         std::cout << "[OFFLINE_PLAN] npu_streaming_required="
                   << (npu_streaming_required ? 1 : 0)
-                  << " runtime_banked_weights=NOT_YET_INTEGRATED\n";
+                  << " runtime_banked_confirmed="
+                  << (o.banked_runtime_confirmed ? 1 : 0)
+                  << " prediction_includes_refill=0\n";
         std::cout << "[OFFLINE_PLAN] file="
                   << (out / "plan.json").string() << '\n';
         return 0;
