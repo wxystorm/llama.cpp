@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    29
+#define RPC_PROTO_PATCH_VERSION    30
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -241,6 +241,21 @@ struct ggml_backend_rpc_phone_owned_plan {
 using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
     ggml_backend_t backend,
     const ggml_backend_rpc_phone_owned_plan * plan);
+
+// Planner-driven Phone HTP Region/Layer mapping. No per-layout HTP
+// environment variables are required on the Phone; PC passes all selected
+// P1 Region/Layer pairs before registering any Phone-owned Graph/KV.
+// Version 1 requires at least two HTP Regions for physical two-Bank mode.
+struct ggml_backend_rpc_phone_npu_region_layer {
+    uint32_t region;
+    uint32_t layer;
+};
+#define GGML_BACKEND_RPC_PHONE_NPU_PLAN_CONFIGURE_PROC \
+    "ggml_backend_rpc_phone_npu_plan_configure"
+using ggml_backend_rpc_phone_npu_plan_configure_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id,
+    const ggml_backend_rpc_phone_npu_region_layer * entries,
+    size_t count);
 
 // One-time canonical Decode KV destination binding; no per-Chunk Graph.
 #define GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC \
