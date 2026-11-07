@@ -25,11 +25,10 @@ class RPCProfileExtractorTests(unittest.TestCase):
             (case/"engine.stderr.log").write_text(
                 "[PHONE_STAGE_PROFILE_RPC] event=COMPLETE run=4242 "
                 "samples=2 status=PASS\n"
-                "[REAL_STAGE_PROFILE] side=PC phase=GRAPH_SETUP "
-                "region=3 chunk=0 setup_ms=0.2 kv_tokens=64 terminal=1\n"
+                # Adreno Graph is prebuilt; no per-Chunk setup record.
                 "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK source=RPC "
                 "run=4242 region=2 chunk=0 tokens=64 token_begin=0 "
-                "backend=HTP0 upload_ms=0.1 prepare_ms=0 compute_ms=3 "
+                "backend=HTP0 upload_ms=-1.000 prepare_ms=-1.000 compute_ms=3 "
                 "status=PASS\n"
                 "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK source=RPC "
                 "run=4242 region=3 chunk=0 tokens=64 token_begin=0 "
@@ -48,7 +47,9 @@ class RPCProfileExtractorTests(unittest.TestCase):
             htp = next(x for x in samples if x["device"]=="PHONE")
             self.assertEqual(htp["compute_ms"], 3)
             self.assertEqual(htp["prepare_ms"], 0)
+            self.assertEqual(htp["upload_ms"], 0)
             self.assertEqual(diag["phone_missing"], 0)
+            self.assertEqual(diag["setup_missing"], 0)
 
 if __name__ == "__main__":
     unittest.main()
