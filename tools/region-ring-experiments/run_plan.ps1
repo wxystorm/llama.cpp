@@ -8,7 +8,8 @@ param(
     [string]$PlannerExe = "",
     [string]$Tokenizer = "",
     [switch]$BankedRuntimeConfirmed,
-    [switch]$PhoneMixed
+    [switch]$PhoneMixed,
+    [ValidateRange(0,1)][int]$MaxNpuRegionLayers = 1
 )
 $ErrorActionPreference = "Stop"
 # Keep the old three-device offline Planner from mistaking a mixed Phone
@@ -37,7 +38,7 @@ if ($PhoneMixed) {
         (Join-Path $PSScriptRoot "mixed_phone_dag_plan.py"),
         "--model", $modelFile, "--prompt", $prompt,
         "--profile-dir", $ProfileDir, "--tokenizer", $Tokenizer,
-        "--out", $Out
+        "--max-npu-region-layers", "$MaxNpuRegionLayers", "--out", $Out
     )
     & $py @argsMixed
     if ($LASTEXITCODE -ne 0) { throw "Profile-only four-backend DAG planning failed. No profiling or inference was launched." }
