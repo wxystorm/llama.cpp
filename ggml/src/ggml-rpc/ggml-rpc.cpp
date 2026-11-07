@@ -6268,6 +6268,7 @@ public:
         const phone_chunk_input_timing & timing);
     void phone_auto_prepare_loop();
     void phone_auto_compute_loop(bool htp_lane_only);
+    bool phone_local_handoff_publish(const phone_auto_job & source);
     void phone_npu_bank_refill_loop();
     void phone_npu_preload_loop();
     bool phone_input_stream_reserve(size_t bytes);
@@ -7730,6 +7731,9 @@ bool rpc_server::phone_input_stream_run(
                     it = phone_auto_jobs.erase(it);
                 } else { ++it; }
             }
+            if (phone_npu_plan_configured_run == request.run_id) {
+                phone_npu_local_successors.clear();
+            }
             for (auto it = phone_auto_next_chunk.begin();
                     it != phone_auto_next_chunk.end();) {
                 if (it->first.first == request.run_id) {
@@ -8057,10 +8061,12 @@ bool rpc_server::phone_npu_plan_configure(
             !phone_npu_executor || !phone_npu_executor->has_backend()) {
         return reject("PLAN_CONTROLLED_BANKED_HTP_NOT_ENABLED");
     }
-    if (request.version != 1 || request.run_id == 0 ||
+    if (request.version != 2 || request.run_id == 0 ||
             request.count < 2 || request.count > 64) {
         return reject("INVALID_PLAN_VERSION_RUN_OR_REGION_COUNT");
     }
+    std::vector<uint32_t> successors;
+    successors.reserve(request.count);
     std::vector<std::pair<uint32_t, uint32_t>> ordered;
     ordered.reserve(request.count);
     for (uint32_t i = 0; i < request.count; ++i) {
@@ -8072,12 +8078,19 @@ bool rpc_server::phone_npu_plan_configure(
             return reject("HTP_REGIONS_OR_LAYERS_NOT_STRICTLY_ORDERED");
         }
         ordered.emplace_back(region, layer);
+        successors.push_back(request.local_successors[i]);
     }
-    if (!ggml_phone_plan::valid_htp_map(ordered)) {
-        return reject("INVALID_ORDERED_HTP_MAP");
+    if (!ggml_phone_plan::valid_local_successors(ordered, successors)) {
+        return reject("INVALID_ORDERED_HTP_OR_LOCAL_SUCCESSOR_MAP");
+    }
+    if (!phone_auto_dual_lane_enabled &&
+            std::any_of(successors.begin(), successors.end(),
+                        [](uint32_t dst) { return dst != 0; })) {
+        return reject("LOCAL_HANDOFF_REQUIRES_DUAL_LANE_PIPELINE");
     }
     for (size_t i = request.count; i < 64; ++i) {
-        if (request.regions[i] != 0 || request.layers[i] != 0) {
+        if (request.regions[i] != 0 || request.layers[i] != 0 ||
+                request.local_successors[i] != 0) {
             return reject("NONZERO_UNUSED_WIRE_ENTRIES");
         }
     }
@@ -8186,14 +8199,21 @@ bool rpc_server::phone_npu_plan_configure(
             stats.new_bytes);
     }
     phone_npu_plan_configured_run = request.run_id;
+    phone_npu_local_successors.clear();
+    for (size_t i = 0; i < successors.size(); ++i) {
+        if (successors[i] != 0) {
+            phone_npu_local_successors.emplace(ordered[i].first,
+                                               successors[i]);
+        }
+    }
     phone_npu_banked_ready_regions.clear();
     phone_npu_banked_ready_regions.insert(ordered[0].first);
     phone_npu_banked_ready_regions.insert(ordered[1].first);
     GGML_LOG_INFO(
         "[PHONE_NPU_PLAN] side=phone event=CONFIGURE "
-        "run=%" PRIu64 " regions=%zu banks=2 "
+        "run=%" PRIu64 " regions=%zu banks=2 local_links=%zu "
         "authority=PC_PLANNER status=PASS\n",
-        request.run_id, ordered.size());
+        request.run_id, ordered.size(), phone_npu_local_successors.size());
     phone_auto_cv.notify_all();
     return true;
 }
@@ -9348,6 +9368,118 @@ void rpc_server::phone_npu_preload_loop() {
     }
 }
 
+// A genuine Phone-local HTP -> Adreno activation edge. Only an exact,
+// PC-configured adjacent Region may consume this payload. The source's HTP
+// output remains private until it is copied into the destination's owned
+// input slot; the producer never borrows a live NPU/Slot0 tensor pointer.
+// The old P2C frame remains for the PC Region DAG completion handshake,
+// but there is NO PC->Phone PUSH of this intermediate activation.
+bool rpc_server::phone_local_handoff_publish(const phone_auto_job & source) {
+    const auto & src = source.request;
+    uint32_t dst_region = 0;
+    rpc_msg_phone_auto_task_req dst {};
+    {
+        std::lock_guard<std::mutex> guard(phone_auto_mutex);
+        if (phone_npu_plan_configured_run != src.key.run_id) {
+            return false;
+        }
+        auto link = phone_npu_local_successors.find(src.key.region);
+        if (link == phone_npu_local_successors.end()) {
+            return true; // Normal remote-return HTP Region.
+        }
+        dst_region = link->second;
+        const rpc_phone_input_key key {
+            src.key.run_id, dst_region, src.key.chunk };
+        const auto item = phone_auto_jobs.find(auto_key(key));
+        if (item == phone_auto_jobs.end() ||
+                item->second->state != phone_auto_status::REGISTERED ||
+                item->second->graphless_owned ||
+                ggml_phone_npu_serial::htp_region(
+                    phone_npu_serial_regions, dst_region)) {
+            GGML_LOG_ERROR(
+                "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
+                " src=%u dst=%u chunk=%u reason=DEST_TASK_NOT_REGISTERED_OR_NOT_OPENCL\n",
+                src.key.run_id, src.key.region, dst_region, src.key.chunk);
+            return false;
+        }
+        dst = item->second->request;
+    }
+    const size_t bytes = static_cast<size_t>(src.output_bytes);
+    if (dst_region != src.key.region + 1 ||
+            src.output_bytes == 0 ||
+            src.output_bytes > RPC_PHONE_INPUT_MAX_BYTES ||
+            src.output_bytes != dst.input_bytes ||
+            src.token_begin != dst.token_begin ||
+            src.n_tokens != dst.n_tokens ||
+            bytes % sizeof(float) != 0 ||
+            source.direct_p2c_payload.size() != bytes/sizeof(float) ||
+            bytes > SIZE_MAX - sizeof(rpc_msg_phone_input_push_req)) {
+        GGML_LOG_ERROR(
+            "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
+            " src=%u dst=%u chunk=%u reason=TOKEN_OR_BYTE_CONTRACT\n",
+            src.key.run_id, src.key.region, dst_region, src.key.chunk);
+        return false;
+    }
+    const size_t reserved = sizeof(rpc_msg_phone_input_push_req) + bytes;
+    if (!phone_input_stream_reserve(reserved)) {
+        GGML_LOG_ERROR(
+            "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
+            " src=%u dst=%u chunk=%u reason=HOST_LANDING_BUDGET\n",
+            src.key.run_id, src.key.region, dst_region, src.key.chunk);
+        return false;
+    }
+    const int64_t begin_us = ggml_time_us();
+    rpc_msg_phone_input_push_req header {};
+    header.key = {src.key.run_id, dst_region, src.key.chunk};
+    header.size = bytes;
+    header.hash = fnv_hash(
+        reinterpret_cast<const uint8_t *>(source.direct_p2c_payload.data()),
+        bytes);
+    phone_input_staged staged {};
+    staged.key = header.key;
+    staged.hash = header.hash;
+    staged.payload_offset = sizeof(header);
+    staged.reserved_bytes = reserved;
+    staged.payload.resize(reserved);
+    memcpy(staged.payload.data(), &header, sizeof(header));
+    memcpy(staged.payload.data() + sizeof(header),
+           source.direct_p2c_payload.data(), bytes);
+    bool accepted = false;
+    {
+        std::lock_guard<std::mutex> guard(phone_input_mutex);
+        if (phone_input_stream_runs.count(src.key.run_id) != 0 &&
+                std::none_of(phone_input_staged_slots.begin(),
+                    phone_input_staged_slots.end(),
+                    [&](const phone_input_staged & e) {
+                        return auto_key(e.key) == auto_key(header.key);
+                    })) {
+            phone_input_staged_slots.emplace_back(std::move(staged));
+            accepted = true;
+        }
+    }
+    if (!accepted) {
+        phone_input_stream_cancel_reserve(reserved);
+        GGML_LOG_ERROR(
+            "[PHONE_LOCAL_HANDOFF] event=REJECT run=%" PRIu64
+            " src=%u dst=%u chunk=%u reason=RUN_ENDED_OR_DUPLICATE\n",
+            src.key.run_id, src.key.region, dst_region, src.key.chunk);
+        return false;
+    }
+    // Only after the payload owns its bytes may the independent Adreno
+    // upload worker accept the destination job. Never reuse a raw pointer
+    // into HTP repack storage or the source vector.
+    phone_auto_input_verified(header.key, {});
+    GGML_LOG_INFO(
+        "[PHONE_LOCAL_HANDOFF] event=PUBLISH run=%" PRIu64
+        " src=%u dst=%u chunk=%u tokens=%u bytes=%zu"
+        " storage=PHONE_HOST_F32 source=HTP destination=GPUOpenCL"
+        " copy_ms=%.3f pc_push=SKIPPED status=PASS\n",
+        src.key.run_id, src.key.region, dst_region,
+        src.key.chunk, src.n_tokens, bytes,
+        (ggml_time_us() - begin_us) / 1000.0);
+    return true;
+}
+
 // A verified input may upload to the next local Slot while Phone is still
 // running the preceding Chunk. The original remote input tensors are private
 // per Chunk. Slot admission uses the existing two_slot_pool state machine.
@@ -10163,6 +10295,11 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
                 npu_task ? "HTP0" : "GPUOpenCL", task->compute_end_us,
                 (task->compute_end_us - task->compute_begin_us) / 1000.0,
                 status == GGML_STATUS_SUCCESS ? "PASS" : "FAIL");
+        }
+        if (status == GGML_STATUS_SUCCESS && npu_task &&
+                task->graphless_owned &&
+                !phone_local_handoff_publish(*task)) {
+            status = GGML_STATUS_FAILED;
         }
         if (status == GGML_STATUS_SUCCESS) {
             // This is the Phone-owned publication event: no PC per-Chunk
