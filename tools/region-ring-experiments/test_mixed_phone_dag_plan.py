@@ -1,6 +1,8 @@
 """Offline test: NPU->PhoneGPU spill, memory reject, bank-mover DAG."""
 import unittest
-from mixed_phone_dag_plan import Cycle, memory, split_phone, plan, dag_for, planner_backend_mapping
+from mixed_phone_dag_plan import (Cycle, memory, split_phone, plan, dag_for,
+                                  planner_backend_mapping, execution_stage_graph,
+                                  handoff_route, geometry)
 
 BASE = dict(gpu_budget_mib=500, npu_budget_mib=25,
             gpu_weight_layer_mib=8, npu_weight_layer_mib=10,
@@ -24,6 +26,78 @@ class FakeProfile:
 
 
 class MixedPlanTests(unittest.TestCase):
+
+    def test_optional_backends_and_all_zero_rejected(self):
+        with self.assertRaisesRegex(ValueError, "INVALID_CYCLE"):
+            Cycle(0, 0, 0, 0)
+        for cycle in (Cycle(0, 1, 1, 0), Cycle(0, 0, 1, 2),
+                      Cycle(2, 0, 0, 0), Cycle(0, 2, 0, 0),
+                      Cycle(0, 0, 0, 2)):
+            self.assertGreater(cycle.layers, 0)
+
+    def test_omitted_regions_have_no_phantom_ids(self):
+        cycles = [Cycle(0, 1, 1, 2), Cycle(5, 0, 0, 0), Cycle(0, 1, 0, 1)]
+        stages, edges = execution_stage_graph(cycles)
+        self.assertEqual([s["backend"] for s in stages], ["C", "N", "A", "G", "C", "A"])
+        self.assertEqual([s["region"] for s in stages], list(range(6)))
+        self.assertEqual(stages[-1]["last_layer_exclusive"], 11)
+        self.assertEqual([e["handoff"] for e in edges],
+                         ["C2P", "HTP_TO_ADRENO", "P2C", "PC_LOCAL", "C2P"])
+        self.assertEqual(planner_backend_mapping(cycles), (
+            [{"region": 1, "layer": 1}],
+            [{"region": 2, "first_layer": 2, "last_layer_exclusive": 4},
+             {"region": 5, "first_layer": 10, "last_layer_exclusive": 11}]))
+
+    def test_phone_handoff_is_not_assumed_zero_copy(self):
+        self.assertEqual(handoff_route("N", "A"), ("HTP_TO_ADRENO", "phone_gpu"))
+        self.assertEqual(handoff_route("A", "N"), ("PHONE_LOCAL", "phone_local"))
+        self.assertEqual(handoff_route("C", "G"), ("PC_CPU_TO_CUDA", "pc_h2d"))
+        self.assertEqual(handoff_route("N", "C"), ("P2C", "phone_to_pc"))
+        self.assertEqual(handoff_route("G", "G"), ("SAME_PC_BACKEND", None))
+
+    def test_geometry_includes_zero_gpu_cpu_and_phone(self):
+        seeds = list(geometry(12, max_cycles=2, max_c=2, max_phone=6))
+        self.assertTrue(any(all(g == 0 for g,_,_ in xs) for xs in seeds))
+        self.assertTrue(any(all(c == 0 for _,c,_ in xs) for xs in seeds))
+        self.assertTrue(any(all(p == 0 for _,_,p in xs) for xs in seeds))
+
+    def test_no_npu_and_no_adreno_both_allowed(self):
+        base = dict(BASE, npu_budget_mib=100)
+        no_npu = list(split_phone([(5, 1, 1), (5, 1, 1)],
+                                  base, MIX, max_npu=0))
+        self.assertTrue(no_npu)
+        self.assertTrue(all(c.n == 0 for cs,_ in no_npu for c in cs))
+        no_adreno = list(split_phone([(5, 1, 1), (5, 1, 1)],
+                                     base, MIX, max_npu=1))
+        self.assertTrue(any(all(c.a == 0 for c in cs) for cs,_ in no_adreno))
+
+    def test_no_unused_bank_or_scratch_for_absent_engines(self):
+        cycles = [Cycle(0, 2, 0, 3), Cycle(0, 2, 0, 3)]
+        result = memory(cycles, BASE, MIX)
+        self.assertEqual(result.gpu_bank_mib, (0., 0.))
+        self.assertEqual(result.npu_bank_mib, (0., 0.))
+        self.assertEqual(result.gpu_pc_used_mib, 0.)
+        self.assertEqual(result.npu_used_mib, 0.)
+
+    def test_cross_cycle_handoff_uses_next_nonzero_stage(self):
+        cycles = [Cycle(7, 1, 1, 1), Cycle(0, 2, 0, 8),
+                  Cycle(7, 0, 0, 3)]
+        r = dag_for(cycles, 64, 128, 5120, FakeProfile(),
+                    dict(BASE, npu_budget_mib=100), MIX, 2.)
+        self.assertIsNotNone(r)
+        self.assertIn("HTP_TO_ADRENO", r["handoffs"])
+        self.assertIn("P2C", r["handoffs"])
+        self.assertIn("C2P", r["handoffs"])
+
+    def test_terminal_cuda_requires_measured_d2h(self):
+        cycles = [Cycle(5, 0, 0, 0), Cycle(5, 0, 0, 0)]
+        self.assertIsNone(dag_for(cycles, 64, 128, 5120,
+                                  FakeProfile(), BASE, MIX, 2.))
+        measured = dict(BASE, gpu_d2h_mibps=200)
+        result = dag_for(cycles, 64, 128, 5120,
+                         FakeProfile(), measured, MIX, 2.)
+        self.assertIn("FINAL_GPU_TO_CPU", result["handoffs"])
+
     def test_plan_owns_region_layer_mapping_with_omitted_zero_width(self):
         cycles = [Cycle(7, 1, 1, 1), Cycle(8, 0, 1, 0)]
         npu, phone_gpu = planner_backend_mapping(cycles)
