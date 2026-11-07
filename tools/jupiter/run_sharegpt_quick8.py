@@ -81,7 +81,21 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--pc-reserve-mib", type=int, default=512,
                    help="extra PC GPU buffer reserve beyond model weights")
     p.add_argument("--phone-reserve-mib", type=int, default=512,
-                   help="extra Phone GPU buffer reserve beyond model weights")
+                   help="fixed Phone memory reserve beyond all other allowances")
+    p.add_argument("--cpu-workspace-mib", type=int, default=512,
+                   help="minimum CPU graph/activation workspace estimate")
+    p.add_argument("--gpu-workspace-mib", type=int, default=1024,
+                   help="minimum PC GPU graph/activation workspace estimate")
+    p.add_argument("--phone-workspace-mib", type=int, default=1536,
+                   help="minimum remote graph/activation workspace estimate")
+    p.add_argument("--memory-safety-percent", type=float, default=10.0,
+                   help="additional percentage of each device's free memory "
+                        "held back for allocator fragmentation and uncertainty")
+    p.add_argument("--kv-bytes-per-element", type=float, default=2.0,
+                   help="KV tensor element bytes, 2=f16 (default, matching CLI)")
+    p.add_argument("--kv-per-layer-mib", type=float, default=None,
+                   help="explicit KV cache MiB per layer if GGUF attention "
+                        "metadata is absent or different from runtime")
     p.add_argument("--rpc-device-index", type=int, default=0)
     p.add_argument("--min-chunk", type=int, default=96)
     p.add_argument("--max-chunk", type=int, default=128)
@@ -120,6 +134,12 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
             "cpu_reserve_mib": args.cpu_reserve_mib,
             "pc_reserve_mib": args.pc_reserve_mib,
             "phone_reserve_mib": args.phone_reserve_mib,
+            "cpu_workspace_mib": args.cpu_workspace_mib,
+            "gpu_workspace_mib": args.gpu_workspace_mib,
+            "phone_workspace_mib": args.phone_workspace_mib,
+            "memory_safety_percent": args.memory_safety_percent,
+            "kv_bytes_per_element": args.kv_bytes_per_element,
+            "kv_per_layer_mib": args.kv_per_layer_mib,
             "rpc_device_index": args.rpc_device_index,
             "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
             "ubatch": args.ubatch, "batch": args.batch,
@@ -188,7 +208,24 @@ def choose_layers_by_memory(args: argparse.Namespace):
         pc_layers_override=args.pc_layers,
         cpu=cpu,
         cpu_reserve_mib=args.cpu_reserve_mib,
+        context=args.context,
+        ubatch=args.ubatch,
+        window=args.window,
+        graph_prebuild=args.graph_prebuild,
+        kv_dtype_bytes=args.kv_bytes_per_element,
+        kv_per_layer_mib=args.kv_per_layer_mib,
+        cpu_workspace_mib=args.cpu_workspace_mib,
+        pc_workspace_mib=args.gpu_workspace_mib,
+        phone_workspace_mib=args.phone_workspace_mib,
+        safety_percent=args.memory_safety_percent,
     )
+    if phone.free_bytes > 12*GIB:
+        print(
+            "[JUPITER_MEMORY_WARNING] Phone RPC reports over 12 GiB free. "
+            "Confirm the selected RPC device is the intended accelerator "
+            "and the reported memory is actually allocatable by that backend.",
+            flush=True,
+        )
     print(
         f"[JUPITER_MEMORY_SPLIT] architecture={weights.architecture} "
         f"total_layers={weights.n_layers} "
@@ -203,16 +240,57 @@ def choose_layers_by_memory(args: argparse.Namespace):
         f"cpu_weights_gib={plan.cpu_weight_bytes/GIB:.2f} "
         f"pc_weights_gib={plan.pc_weight_bytes/GIB:.2f} "
         f"phone_weights_gib={plan.phone_weight_bytes/GIB:.2f} "
+        f"kv_layer_mib={plan.kv_per_layer_bytes/MIB:.1f} "
+        f"pc_kv_mib={plan.pc_kv_bytes/MIB:.1f} "
+        f"phone_kv_mib={plan.phone_kv_bytes/MIB:.1f} "
+        f"gpu_workspace_mib={plan.pc_workspace_bytes/MIB:.0f} "
+        f"phone_workspace_mib={plan.phone_workspace_bytes/MIB:.0f} "
+        f"safety_percent={args.memory_safety_percent:.1f} "
         f"mode={'OVERRIDE_CHECKED' if args.pc_layers is not None else 'AUTO_BY_MEMORY'}",
         flush=True,
     )
+    for name, free, weights_size, kv, workspace, reserve, safety in (
+        ("PC_CPU", cpu.free_bytes, plan.cpu_weight_bytes,
+         plan.cpu_kv_bytes, plan.cpu_workspace_bytes,
+         plan.cpu_reserve_bytes, plan.cpu_safety_bytes),
+        ("PC_GPU", pc.free_bytes, plan.pc_weight_bytes,
+         plan.pc_kv_bytes, plan.pc_workspace_bytes,
+         plan.pc_reserve_bytes, plan.pc_safety_bytes),
+        ("PHONE", phone.free_bytes, plan.phone_weight_bytes,
+         plan.phone_kv_bytes, plan.phone_workspace_bytes,
+         plan.phone_reserve_bytes, plan.phone_safety_bytes),
+    ):
+        remaining = free-weights_size-kv-workspace-reserve-safety
+        print(
+            f"[JUPITER_MEMORY_BUDGET] device={name} "
+            f"free_gib={free/GIB:.2f} weights_gib={weights_size/GIB:.2f} "
+            f"kv_gib={kv/GIB:.2f} workspace_gib={workspace/GIB:.2f} "
+            f"fixed_reserve_gib={reserve/GIB:.2f} "
+            f"safety_gib={safety/GIB:.2f} "
+            f"remaining_gib={remaining/GIB:.2f} status="
+            f"{'FITS_ESTIMATE' if remaining >= 0 else 'OVERCOMMITTED'}",
+            flush=True,
+        )
     return plan
 
 
 def save_layer_plan(out: Path, plan) -> None:
     details = {
-        "method": "MEASURED_FREE_MEMORY_AND_GGUF_WEIGHT_SIZES",
-        "notice": "Weight-capacity preflight, not proof of runtime KV/graph fit.",
+        "method": "GGUF_WEIGHTS_KV_CONTEXT_GRAPH_WORKSPACE_SAFETY",
+        "notice": "Estimate only; backend max allocation, local RPC source "
+                  "and actual graph buffers require runtime validation.",
+        "context_tokens": plan.context_tokens,
+        "kv_dtype_bytes": plan.kv_dtype_bytes,
+        "kv_per_layer_mib": round(plan.kv_per_layer_bytes/MIB, 3),
+        "cpu_kv_gib": round(plan.cpu_kv_bytes/GIB, 3),
+        "pc_kv_gib": round(plan.pc_kv_bytes/GIB, 3),
+        "phone_kv_gib": round(plan.phone_kv_bytes/GIB, 3),
+        "cpu_workspace_gib": round(plan.cpu_workspace_bytes/GIB, 3),
+        "pc_workspace_gib": round(plan.pc_workspace_bytes/GIB, 3),
+        "phone_workspace_gib": round(plan.phone_workspace_bytes/GIB, 3),
+        "cpu_safety_gib": round(plan.cpu_safety_bytes/GIB, 3),
+        "pc_safety_gib": round(plan.pc_safety_bytes/GIB, 3),
+        "phone_safety_gib": round(plan.phone_safety_bytes/GIB, 3),
         "architecture": plan.model.architecture,
         "total_layers": plan.model.n_layers,
         "pc_layers": plan.pc_layers,
@@ -292,6 +370,12 @@ def main() -> int:
             or (args.phone_free_mib is not None and args.phone_free_mib < 1)
             or args.cpu_reserve_mib < 0
             or args.pc_reserve_mib < 0 or args.phone_reserve_mib < 0
+            or min(args.cpu_workspace_mib, args.gpu_workspace_mib,
+                   args.phone_workspace_mib) < 0
+            or not (0 <= args.memory_safety_percent <= 50)
+            or not (0 < args.kv_bytes_per_element <= 8)
+            or (args.kv_per_layer_mib is not None
+                and args.kv_per_layer_mib < 0)
             or args.rpc_device_index < 0):
         raise ValueError("invalid layer, memory or repetition parameters")
     source = Path(args.source_dir).resolve()
