@@ -6367,6 +6367,11 @@ private:
         int64_t npu_exec_begin_us = 0;
         int64_t npu_exec_end_us = 0;
         int64_t compute_end_us = 0;
+        // Measured only after the lane's device lock is acquired; excludes
+        // worker admission and HTP/Graph lock waits. Includes the backend
+        // service call (HTP upload/compute/read or OpenCL slot compute).
+        int64_t device_service_begin_us = 0;
+        int64_t device_service_end_us = 0;
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
     };
@@ -7470,6 +7475,8 @@ bool rpc_server::phone_input_stream_run(
                             " htp_exec_begin_us=%" PRId64
                             " htp_exec_end_us=%" PRId64
                             " compute_end_us=%" PRId64
+                            " device_service_begin_us=%" PRId64
+                            " device_service_end_us=%" PRId64
                             " capture_begin_us=%" PRId64
                             " capture_end_us=%" PRId64
                             " status=%s\n",
@@ -7491,8 +7498,10 @@ bool rpc_server::phone_input_stream_run(
                             job.input_copy_end_us, job.upload_done_us,
                             job.prepare_done_us, job.compute_begin_us,
                             job.npu_exec_begin_us, job.npu_exec_end_us,
-                            job.compute_end_us, job.capture_begin_us,
-                            job.capture_end_us,
+                            job.compute_end_us,
+                            job.device_service_begin_us,
+                            job.device_service_end_us,
+                            job.capture_begin_us, job.capture_end_us,
                             job.state == phone_auto_status::COMPLETE ?
                                 "PASS" : "FAIL");
                     }
@@ -7556,11 +7565,16 @@ bool rpc_server::phone_input_stream_run(
                             job.compute_end_us >= job.compute_begin_us) {
                         auto_compute_us += job.compute_end_us - job.compute_begin_us;
                         if (phone_auto_dual_lane_enabled &&
-                                job.compute_end_us > job.compute_begin_us) {
+                                job.state == phone_auto_status::COMPLETE &&
+                                job.device_service_begin_us > 0 &&
+                                job.device_service_end_us >
+                                    job.device_service_begin_us) {
                             const ggml_phone_mixed_pipeline::interval window {
-                                job.compute_begin_us, job.compute_end_us };
+                                job.device_service_begin_us,
+                                job.device_service_end_us };
                             const uint64_t elapsed = static_cast<uint64_t>(
-                                job.compute_end_us - job.compute_begin_us);
+                                job.device_service_end_us -
+                                job.device_service_begin_us);
                             if (ggml_phone_npu_serial::htp_region(
                                     phone_npu_serial_regions,
                                     job.request.key.region)) {
@@ -7637,8 +7651,8 @@ bool rpc_server::phone_input_stream_run(
             GGML_LOG_INFO(
                 "[PHONE_MIXED_PIPELINE] event=SUMMARY "
                 "run=%" PRIu64 " htp_jobs=%zu gpu_jobs=%zu "
-                "htp_compute_ms=%.3f gpu_compute_ms=%.3f "
-                "htp_gpu_overlap_ms=%.3f "
+                "htp_device_service_ms=%.3f gpu_device_service_ms=%.3f "
+                "htp_gpu_service_overlap_ms=%.3f "
                 "policy=SEPARATE_PHYSICAL_LANES "
                 "status=%s\n",
                 request.run_id, mixed_htp_windows.size(),
@@ -9312,7 +9326,7 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
             phone_npu_serial_regions, req.key.region);
         if (phone_auto_dual_lane_enabled) {
             GGML_LOG_INFO(
-                "[PHONE_MIXED_PIPELINE] event=COMPUTE_BEGIN "
+                "[PHONE_MIXED_PIPELINE] event=CLAIM "
                 "run=%" PRIu64 " region=%u chunk=%u backend=%s "
                 "phone_us=%" PRId64 " worker=%s status=ACTIVE\n",
                 req.key.run_id, req.key.region, req.key.chunk,
@@ -9360,6 +9374,19 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
             ggml_phone_npu_serial::full_region_executor::
                 local_only_profile profile {};
             std::string why;
+            const bool measure_device = valid_input &&
+                (phone_chunk_timeline_enabled ||
+                 phone_auto_dual_lane_enabled);
+            const int64_t owned_begin_us = measure_device ?
+                ggml_time_us() : 0;
+            if (phone_auto_dual_lane_enabled && measure_device) {
+                GGML_LOG_INFO(
+                    "[PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN "
+                    "run=%" PRIu64 " region=%u chunk=%u "
+                    "backend=HTP0 phone_us=%" PRId64 "\n",
+                    req.key.run_id, req.key.region, req.key.chunk,
+                    owned_begin_us);
+            }
             const bool ok = valid_input &&
                 phone_npu_executor->run_owned_only_chunk(
                     req.key.run_id, req.key.region, req.key.chunk,
@@ -9367,11 +9394,26 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
                     &task->direct_p2c_payload,
                     task->direct_input_activation.data(),
                     task->direct_input_activation.size());
-            std::vector<float>().swap(task->direct_input_activation);
-            if (phone_chunk_timeline_enabled) {
-                task->npu_exec_begin_us = task->compute_begin_us;
-                task->npu_exec_end_us = ggml_time_us();
+            const int64_t owned_end_us = measure_device ?
+                ggml_time_us() : 0;
+            if (measure_device) {
+                task->npu_exec_begin_us = owned_begin_us;
+                task->npu_exec_end_us = owned_end_us;
+                task->device_service_begin_us = owned_begin_us;
+                task->device_service_end_us = owned_end_us;
+                if (phone_auto_dual_lane_enabled) {
+                    GGML_LOG_INFO(
+                        "[PHONE_MIXED_PIPELINE] event=DEVICE_END "
+                        "run=%" PRIu64 " region=%u chunk=%u "
+                        "backend=HTP0 phone_us=%" PRId64
+                        " service_ms=%.3f status=%s\n",
+                        req.key.run_id, req.key.region, req.key.chunk,
+                        owned_end_us,
+                        (owned_end_us - owned_begin_us) / 1000.0,
+                        ok ? "PASS" : "FAIL");
+                }
             }
+            std::vector<float>().swap(task->direct_input_activation);
             status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
             GGML_LOG_INFO(
                 "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
@@ -9780,9 +9822,34 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
             } else if (it != stored_graphs[req.device].end() &&
                     it->second.graph != nullptr &&
                     task->prepared.has_value()) {
+                const int64_t opencl_begin_us = phone_auto_dual_lane_enabled ?
+                    ggml_time_us() : 0;
+                if (phone_auto_dual_lane_enabled) {
+                    GGML_LOG_INFO(
+                        "[PHONE_MIXED_PIPELINE] event=DEVICE_BEGIN "
+                        "run=%" PRIu64 " region=%u chunk=%u "
+                        "backend=GPUOpenCL phone_us=%" PRId64 "\n",
+                        req.key.run_id, req.key.region, req.key.chunk,
+                        opencl_begin_us);
+                }
                 const auto computed = phone_stage_slot0_compute(
                     req.device, req.graph_uid, it->second.graph,
                     it->second, &*task->prepared);
+                if (phone_auto_dual_lane_enabled) {
+                    task->device_service_begin_us = opencl_begin_us;
+                    task->device_service_end_us = ggml_time_us();
+                    GGML_LOG_INFO(
+                        "[PHONE_MIXED_PIPELINE] event=DEVICE_END "
+                        "run=%" PRIu64 " region=%u chunk=%u "
+                        "backend=GPUOpenCL phone_us=%" PRId64
+                        " service_ms=%.3f status=%s\n",
+                        req.key.run_id, req.key.region, req.key.chunk,
+                        task->device_service_end_us,
+                        (task->device_service_end_us - opencl_begin_us) / 1000.0,
+                        computed.has_value() &&
+                            *computed == GGML_STATUS_SUCCESS ?
+                                "PASS" : "FAIL");
+                }
                 if (computed.has_value()) {
                     status = *computed;
                     if (std::getenv("GGML_RPC_PHONE_NPU_MIXED_OPENCL") != nullptr &&
@@ -9810,7 +9877,7 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
         task->compute_end_us = ggml_time_us();
         if (phone_auto_dual_lane_enabled) {
             GGML_LOG_INFO(
-                "[PHONE_MIXED_PIPELINE] event=COMPUTE_END "
+                "[PHONE_MIXED_PIPELINE] event=SERVICE_END "
                 "run=%" PRIu64 " region=%u chunk=%u backend=%s "
                 "phone_us=%" PRId64 " compute_ms=%.3f status=%s\n",
                 req.key.run_id, req.key.region, req.key.chunk,
