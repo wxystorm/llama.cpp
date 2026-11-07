@@ -7394,7 +7394,14 @@ bool rpc_server::phone_input_stream_run(
                 phone_npu_banked_ready_regions.clear();
             }
             phone_npu_executor->reset_kv();
+            if (phone_npu_plan_controlled) {
+                // The Plan may choose different NPU Layers for each RUN.
+                // No Bank is declared ready until that RUN installs its
+                // own ordered immutable mapping and the two Banks are primed.
+                phone_npu_plan_configured_run = 0;
+            }
             if (phone_npu_banked_enabled &&
+                    !phone_npu_plan_controlled &&
                     !phone_npu_serial_regions.empty()) {
                 std::string why;
                 ggml_phone_npu_serial::full_region_executor::model_load_stats
@@ -8069,8 +8076,9 @@ bool rpc_server::phone_npu_plan_configure(
     {
         std::lock_guard<std::mutex> lock(phone_input_mutex);
         if (!phone_input_stream_runs.count(request.run_id) ||
+                phone_input_stream_runs.size() != 1 ||
                 !phone_input_staged_slots.empty()) {
-            return reject("NO_ACTIVE_INPUT_RUN_OR_INPUT_ALREADY_STAGED");
+            return reject("NO_EXCLUSIVE_INPUT_RUN_OR_INPUT_ALREADY_STAGED");
         }
     }
     // Single global lock ordering: HTP before Graph before auto jobs.
@@ -8090,10 +8098,29 @@ bool rpc_server::phone_npu_plan_configure(
     }
     if (!phone_npu_plan_mapping.empty() &&
             phone_npu_plan_mapping != ordered) {
-        // Rebuilding HTP arenas while an old fixed-UID graph may still live
-        // in the Hexagon driver is unsafe. Require a new Phone server for a
-        // changed per-model Plan until targeted all-graph teardown exists.
-        return reject("PLAN_MAPPING_CHANGED_RESTART_PHONE_RPC_REQUIRED");
+        // The new RUN has not registered any Graphs or Chunks. BEGIN has
+        // drained old HTP execution, cleared the Hexagon UID cache and
+        // reset old owned KVs. No Bank tensor pointer can still be live.
+        // Drop both physical arenas and allocate new maxima for this Plan.
+        for (const auto & entry : phone_auto_jobs) {
+            if (entry.second->state != phone_auto_status::COMPLETE &&
+                    entry.second->state != phone_auto_status::FAILED) {
+                return reject("PREVIOUS_RUN_COMPUTE_NOT_DRAINED");
+            }
+        }
+        phone_npu_executor->reset_kv();
+        phone_npu_executor.reset();
+        phone_npu_executor = std::make_unique<
+            ggml_phone_npu_serial::full_region_executor>(
+                phone_npu_backend.get());
+        phone_npu_plan_mapping.clear();
+        phone_npu_serial_regions.clear();
+        phone_npu_region_layer.clear();
+        phone_npu_banked_ready_regions.clear();
+        GGML_LOG_INFO(
+            "[PHONE_NPU_PLAN] side=phone event=RECONFIGURE "
+            "run=%" PRIu64 " action=DROP_OLD_BANKS_AND_REBUILD "
+            "status=READY\n", request.run_id);
     }
     if (phone_npu_plan_mapping.empty()) {
         size_t limit = std::numeric_limits<size_t>::max();
@@ -8134,6 +8161,21 @@ bool rpc_server::phone_npu_plan_configure(
                 rank, rank % 2, ordered[rank].first,
                 ordered[rank].second, rank < 2 ? 1 : 0);
         }
+    } else {
+        // Same mapping across runs: old KV/Graph metadata is gone after
+        // RUN BEGIN, but a Bank may still contain rank>=2 weights from the
+        // previous run. Re-prime ranks 0/1 under the HTP mutex.
+        std::string why;
+        ggml_phone_npu_serial::full_region_executor::model_load_stats stats {};
+        if (!phone_npu_executor->reset_banked_initial_weights(why, stats)) {
+            return reject("TWO_BANK_REPRIME:" + why);
+        }
+        GGML_LOG_INFO(
+            "[PHONE_NPU_PLAN] side=phone event=REPRIME "
+            "run=%" PRIu64 " read_ms=%.3f repack_ms=%.3f "
+            "bytes=%zu status=PASS\n",
+            request.run_id, stats.file_read_ms, stats.htp_repack_ms,
+            stats.new_bytes);
     }
     phone_npu_plan_configured_run = request.run_id;
     phone_npu_banked_ready_regions.clear();
