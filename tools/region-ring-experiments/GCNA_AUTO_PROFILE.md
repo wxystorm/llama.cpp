@@ -108,8 +108,19 @@ Output: `backend-matrix/backend-<G/C/N/A>-L<depth>/...`,
 `real-stage-mixed.csv` with independently selected target rows.
 An existing original-model `model_profile.json` supplies measured
 network/H2D/D2H rates. The legacy base Profile captures these from
-real `HYBRID_PROFILE` tensor transfer probes; separate dedicated
-communication and bank-only benchmark executables are still future work.
+real `HYBRID_PROFILE` transfer-only tensor-copy probes.
+
+To export a separate per-transfer-size communication CSV from those
+recorded real PC/RPC transfer probes:
+
+    .\tools\region-ring-experiments\run_communication_profile.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf"
+
+This produces `communication-profile.csv` with direction, payload bytes,
+median service and wall time, sample count and effective MiB/s. It will
+fail if a required direction was not actually measured. It is an
+**exporter of existing transfer-only probes**, not a new standalone
+network test. The Phone NPU->Adreno Host ownership/Upload and independent
+Bank-only benchmark executables remain future work.
 
 ## Device-selected terminal Stage (experimental PC runtime)
 
