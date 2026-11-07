@@ -7,15 +7,16 @@ until the runtime learns intra-Cycle NPU -> Phone GPU contiguous stages.
 
 ## Geometry and memory
 
-Candidate Cycle is G -> C(optional) -> N -> A:
+Candidate Cycle is G(optional) -> C(optional) -> N(optional) -> A(optional):
 
-- G: PC CUDA, rolling two weight Banks
-- C: PC CPU, may have zero layers
-- N: Phone HTP NPU, current executor limits each Region to 1 layer
-- A: Phone GPU Adreno OpenCL, whole Transformer layers
+- G: PC CUDA, rolling two weight Banks (may be zero)
+- C: PC CPU (may be zero)
+- N: Phone HTP NPU, current executor limits each Region to 1 layer (may be zero)
+- A: Phone GPU Adreno OpenCL, whole Transformer layers (may be zero)
 
-Create G,C,P_total candidates, then search N in [0,max_supported]
-and A=P_total-N for each Cycle. Even when the initial NPU allocation
+Create bounded balanced G,C,P_total Cycle seeds, including zero-depth
+backend choices; then search N in [0,max_supported] and A=P_total-N per
+Cycle. Even when the initial NPU allocation
 overflows NPU memory, DO NOT reject the whole geometry: enumerate
 spill into Phone GPU before applying memory pruning.
 
@@ -98,14 +99,30 @@ No guessed budget or copy bandwidth is silently substituted. The
 two-region NPU smoke does NOT measure rank>=2 Bank host-stage/repack
 throughput; those rates require an additional standalone calibration.
 Actual Prompt KV memory is derived from the GGUF metadata and true
-tokenizer count, not from a fixed Profile Prompt length.
+tokenizer count, not from a fixed Profile Prompt length. Absent CUDA,
+HTP, or Adreno engines reserve no unnecessary scratch or weight Banks.
+A CUDA-terminal candidate is scored only with an optional measured
+base-calibration gpu_d2h_mibps for the final CPU Head.
 
 ## Formal Plan (never profiles)
 
     .\tools\region-ring-experiments\run_plan.ps1 -PhoneMixed -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -PromptFile "D:\prima.cpp\prompts\prompt_512.txt"
 
 Outputs plan.json (schema=2, mixed_layout=G/C/N/A, runtime_compatible=false)
-and candidates.csv. The old 3-device Profile/Plan flow stays unchanged.
+and candidates.csv. The file now includes execution_stages (absolute layer
+ranges, Region indices and backend) and execution_edges (handoff type and
+resource lane). Zero-width stages are omitted before IDs are assigned.
+HTP_TO_ADRENO is an explicit planned Phone-local activation handoff, NOT
+yet an implemented Phone execution RPC. No silent OpenCL fallback is allowed.
+The old 3-device Profile/Plan flow stays unchanged.
+
+To disable HTP search candidates, pass -MaxNpuRegionLayers 0. Depths greater
+than 1 remain unsupported until measured HTP multi-layer timings and runtime
+exist. The search is still based on balanced 2-4 Cycle seeds and one shared
+Chunk width; full per-Cycle beam search remains future work.
+
+run_saved_plan.ps1 now explicitly rejects schema=2 before interpreting
+any N/A Region as a legacy P Region.
 
 Test offline policy after syncing the branch:
 
