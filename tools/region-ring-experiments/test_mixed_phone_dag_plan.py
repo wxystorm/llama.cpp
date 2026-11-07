@@ -100,7 +100,11 @@ class MixedPlanTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertNotIn("N_CONTROL_P2C", result["handoffs"])
         self.assertIn("HTP_TO_ADRENO", result["handoffs"])
-        self.assertGreater(result["busy_ms"]["phone_to_pc"], 0)
+        # A of cycle 0 -> next PC, plus final A -> PC Head. No HTP P2C.
+        expected_p2c_ms = 2 * (128 * 5120 * 4 / (1024*1024) /
+                                BASE["p2c_mibps"] * 1000)
+        self.assertAlmostEqual(result["busy_ms"]["phone_to_pc"],
+                               expected_p2c_ms, places=5)
         self.assertFalse(any("N_CONTROL" in node
                              for node in result["bank_nodes"]))
 
