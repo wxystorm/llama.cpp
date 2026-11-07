@@ -21,9 +21,9 @@ if ([IO.Path]::GetFileName($prompt) -notmatch '^prompt_[0-9]+\.txt$') {
     throw "Smoke requires a prompt_N.txt filename for the existing sweep runner."
 }
 $layout = "G7,C1,P1,G7,C1,P1,G7,C1,P1,G7,C1,P5"
-$regions = "2,5,8"
-$layers = "8,17,26"
-Write-Host "[PHONE_MIXED_BACKENDS] expected_model=40-layer-Qwen3 backend_map=HTP0:$regions GPUOpenCL:11"
+$regions = "2,5"
+$layers = "8,17"
+Write-Host "[PHONE_MIXED_BACKENDS] expected_model=40-layer-Qwen3 backend_map=HTP0:$regions GPUOpenCL:8,11"
 Write-Host "[PHONE_MIXED_BACKENDS] phone_server_requires:"
 Write-Host "  GGML_RPC_PHONE_NPU_SERIAL_REGIONS=$regions"
 Write-Host "  GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=$layers"
