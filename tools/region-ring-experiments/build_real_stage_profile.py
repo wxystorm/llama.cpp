@@ -50,15 +50,18 @@ def profile_lines(path: Path, substring: str) -> list[dict[str, str]]:
 
 
 def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tuple[list[dict], dict]:
-    phone = {}
+    # Legacy manual Phone-log input remains supported. Patch32 automatically
+    # writes Phone measurements into each PC case's engine.stderr.log, so
+    # --rpc-log is optional and never needs to be copied from Android.
+    legacy_phone = {}
     if rpc_log is not None:
         for x in profile_lines(rpc_log, "[REAL_STAGE_PROFILE]"):
-            if x.get("side") == "PHONE" and x.get("phase") == "CHUNK":
-                if x.get("status") == "PASS":
-                    try:
-                        phone[(x["run"], int(x["region"]), int(x["chunk"]))] = x
-                    except (KeyError, ValueError):
-                        pass
+            if x.get("side") == "PHONE" and x.get("phase") == "CHUNK" and \
+                    x.get("status") == "PASS":
+                try:
+                    legacy_phone[(x["run"], int(x["region"]), int(x["chunk"]))] = x
+                except (KeyError, ValueError):
+                    pass
     samples = []
     diag = dict(cases=0, cpu=0, gpu=0, phone=0, phone_gpu=0,
                 phone_missing=0, setup_missing=0, trace_missing=0,
@@ -89,9 +92,23 @@ def extract(cases: list[Path], rpc_log: Path | None, mixed: bool = False) -> tup
         diag["cases"] += 1
         # Match the PC-run session ID to the Phone autonomous job table;
         # otherwise a stale Phone log could contaminate the Profile.
-        session_lines = profile_lines(case / "engine.stderr.log",
+        local_log = case / "engine.stderr.log"
+        session_lines = profile_lines(local_log,
                                       "[PHONE_AUTO] event=SESSION_READY")
         session = session_lines[0].get("run") if session_lines else None
+        pulled = profile_lines(local_log, "[PHONE_STAGE_PROFILE_RPC] event=COMPLETE")
+        if not session and pulled:
+            session = pulled[0].get("run")
+        phone = dict(legacy_phone)
+        for x in profile_lines(local_log, "[REAL_STAGE_PROFILE]"):
+            if x.get("side") == "PHONE" and x.get("phase") == "CHUNK" and \
+                    x.get("status") == "PASS" and x.get("source") == "RPC":
+                try:
+                    k = (x["run"], int(x["region"]), int(x["chunk"]))
+                    if session is not None and x["run"] == session:
+                        phone[k] = x
+                except (KeyError, ValueError):
+                    pass
         setup = {}
         for p in profile_lines(case / "engine.stderr.log",
                                "[REAL_STAGE_PROFILE]"):
@@ -187,7 +204,8 @@ def aggregate(samples: list[dict]) -> list[dict]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, action="append", required=True)
-    parser.add_argument("--rpc-log", type=Path)
+    parser.add_argument("--rpc-log", type=Path,
+                        help="legacy optional Phone log; Patch32 pulls samples into PC logs automatically")
     parser.add_argument("--mixed", action="store_true",
                         help="Require HTP0/GPUOpenCL labels and keep PHONE_GPU distinct")
     parser.add_argument("--output", type=Path, required=True)
@@ -196,6 +214,12 @@ def main() -> int:
     points = aggregate(raw)
     if not points:
         parser.error("no real Stage rows; enable task trace and Stage logging")
+    if args.mixed:
+        missing = {"CPU", "GPU", "PHONE", "PHONE_GPU"} - {p["device"] for p in points}
+        if missing:
+            parser.error("incomplete four-backend Stage Profile: "
+                         + ",".join(sorted(missing))
+                         + "; run Patch32 profile probes with Phone RPC telemetry")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=SCHEMA)
