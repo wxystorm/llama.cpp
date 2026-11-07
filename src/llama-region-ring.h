@@ -757,8 +757,9 @@ inline bool llama_region_ring_single_cycle_force_compatible(
     return active_devices >= 2;
 }
 
-// APPLY_WIDE accepts G,[C],P and G,[C],P(HTP),P(Adreno) cycles;
-// zero-count CPU stages may be omitted. Fixed/legacy parsing stays strict.
+// APPLY_WIDE accepts G,[C],P and G,[C],P(HTP),P(Adreno) cycles,
+// optionally followed by a final PC G[,C] tail.
+// Zero-count CPU stages may be omitted. Fixed/legacy parsing stays strict.
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer);
@@ -816,9 +817,8 @@ llama_region_ring_parse_optional_cpu_cycles(
         }
     }
     if (layer != n_layer ||
-            !llama_region_ring_apply_topology_compatible(regions, n_layer) ||
-            regions.back().device != llama_region_ring_device::PHONE) {
-        throw std::runtime_error("invalid optional-CPU G,C?,P cycle topology");
+            !llama_region_ring_apply_topology_compatible(regions, n_layer)) {
+        throw std::runtime_error("invalid optional-CPU G/C/P topology or PC tail");
     }
     return regions;
 }
@@ -876,12 +876,16 @@ inline bool llama_region_ring_apply_topology_compatible(
         if (!take(llama_region_ring_device::GPU)) {
             return false;
         }
+        // Optional GPU-only tail after >=2 complete Phone Cycles.
+        if (i == regions.size()) {
+            return cycles >= 2 && cycles <= 4 && layer == n_layer;
+        }
         if (i < regions.size() &&
                 regions[i].device == llama_region_ring_device::CPU &&
                 !take(llama_region_ring_device::CPU)) {
             return false;
         }
-        if (i == regions.size()) { // Legacy PC tail (never final Phone).
+        if (i == regions.size()) { // Optional final PC G,C tail.
             return cycles >= 2 && cycles <= 4 && layer == n_layer;
         }
         if (!take(llama_region_ring_device::PHONE)) {
