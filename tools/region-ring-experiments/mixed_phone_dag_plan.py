@@ -529,7 +529,8 @@ def runtime_compatible_cycles(cycles):
     # Every active Phone Cycle is G-first, followed by N->A locally.
     # The last Cycle may instead be a real PC G[,C] tail, and uses
     # a deferred canonical CPU Head after the worker DAG completes.
-    phone_tail = stages[-1]["backend"] in ("N", "A")
+    phone_tail = (stages[-1]["backend"] in ("N", "A") and
+                  all(c.phone > 0 for c in cycles))
     pc_tail = (stages[-1]["backend"] in ("G", "C") and
                cycles[-1].phone == 0 and
                all(c.phone > 0 for c in cycles[:-1]))
@@ -673,9 +674,10 @@ def run_cli(argv=None):
                          "pc_gpu_used_mib","npu_used_mib","phone_gpu_used_mib",
                          "phone_shared_used_mib","gpu_bank_h2d_ms",
                          "npu_bank_stage_ms","npu_bank_repack_ms"])
-        for j,(ww,ll,xx,_,mm,dd) in enumerate(options[:100],start=1):
-            writer.writerow([j,ll,execution_stage_graph(_)[0][-1]["backend"],
-                             int(runtime_compatible_cycles(_)),xx,round(ww,3),
+        for j,(ww,ll,xx,selected_cycles,mm,dd) in enumerate(options[:100],start=1):
+            writer.writerow([j,ll,execution_stage_graph(selected_cycles)[0][-1]["backend"],
+                             int(runtime_compatible_cycles(selected_cycles)),
+                             xx,round(ww,3),
                              round(mm.gpu_pc_used_mib,3),
                              round(mm.npu_used_mib,3),round(mm.phone_gpu_used_mib,3),
                              round(mm.phone_shared_used_mib,3),
