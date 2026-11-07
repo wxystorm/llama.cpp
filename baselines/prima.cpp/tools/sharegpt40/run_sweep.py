@@ -57,7 +57,7 @@ def parse_perf(log: str) -> dict:
         is_decode = re.search(r"\beval time\s*=", line) and not is_prompt
         if not is_prompt and not is_decode:
             continue
-        m = re.search(r"eval time\s*=\s*([\d,.]+)\s*ms\s*/\s*(\d+)\s*tokens?", line)
+        m = re.search(r"eval time\s*=\s*([\d,.]+)\s*ms\s*/\s*(\d+)\s*(?:tokens?|runs?)", line)
         t = re.search(r"([\d,.]+)\s*tokens?\s+per\s+second", line)
         if not m:
             continue
