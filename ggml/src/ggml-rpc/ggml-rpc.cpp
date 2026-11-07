@@ -513,13 +513,14 @@ struct rpc_msg_phone_owned_plan_req {
 // Fixed-size versioned request. Avoid dynamic wire sizes and reject unknown
 // Region indices, duplicate layers and invalid physical Bank assignments.
 struct rpc_msg_phone_npu_plan_configure_req {
-    uint32_t version = 1;
+    uint32_t version = 2;
     uint32_t count = 0;
     uint64_t run_id = 0;
     uint32_t regions[64] = {};
     uint32_t layers[64] = {};
+    uint32_t local_successors[64] = {};
 };
-static_assert(sizeof(rpc_msg_phone_npu_plan_configure_req) == 528,
+static_assert(sizeof(rpc_msg_phone_npu_plan_configure_req) == 784,
               "Plan-driven HTP wire ABI changed; bump RPC protocol");
 // One canonical storage binding per Region; no KV payload or host pointer.
 struct rpc_msg_phone_owned_kv_bind_req {
@@ -4376,11 +4377,14 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
         return false;
     }
     std::vector<ggml_phone_plan::region_layer> ordered;
+    std::vector<uint32_t> successors;
     ordered.reserve(count);
+    successors.reserve(count);
     for (size_t i = 0; i < count; ++i) {
         ordered.emplace_back(entries[i].region, entries[i].layer);
+        successors.push_back(entries[i].next_phone_gpu_region);
     }
-    if (!ggml_phone_plan::valid_htp_map(ordered)) {
+    if (!ggml_phone_plan::valid_local_successors(ordered, successors)) {
         GGML_LOG_ERROR("[PHONE_NPU_PLAN] side=pc "
                        "reason=INVALID_ORDERED_HTP_MAP status=REJECT\n");
         return false;
@@ -4388,9 +4392,9 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (!ctx) { return false; }
     auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 30) {
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 31) {
         GGML_LOG_ERROR(
-            "[PHONE_NPU_PLAN] side=pc reason=PHONE_PATCH_BELOW_30 "
+            "[PHONE_NPU_PLAN] side=pc reason=PHONE_PATCH_BELOW_31 "
             "status=REJECT\n");
         return false;
     }
@@ -4400,6 +4404,7 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
     for (size_t i = 0; i < count; ++i) {
         req.regions[i] = entries[i].region;
         req.layers[i] = entries[i].layer;
+        req.local_successors[i] = entries[i].next_phone_gpu_region;
     }
     rpc_msg_phone_input_ack rsp {};
     const bool accepted = send_rpc_cmd(
@@ -6566,6 +6571,9 @@ private:
     bool phone_npu_plan_controlled = false;
     uint64_t phone_npu_plan_configured_run = 0;
     std::vector<std::pair<uint32_t, uint32_t>> phone_npu_plan_mapping;
+    // Source HTP Region -> immediately adjacent Adreno Region. Guarded by
+    // phone_auto_mutex and scoped to phone_npu_plan_configured_run.
+    std::map<uint32_t, uint32_t> phone_npu_local_successors;
     bool phone_auto_dual_lane_enabled = false;
     // Owned by HTP mutex: stale dequeued refills from an earlier RUN may
     // never write into a freshly re-primed Bank.
