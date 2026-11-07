@@ -12,7 +12,7 @@ MIX = dict(phone_gpu_budget_mib=300, phone_gpu_weight_layer_mib=5,
            phone_gpu_kv_layer_mib=1, phone_gpu_scratch_mib=1,
            phone_shared_budget_mib=300, phone_local_mibps=500,
            npu_host_stage_mibps=200, npu_bank_repack_mibps=400,
-           pc_head_ms=2)
+           npu_host_stage_budget_mib=200, pc_head_ms=2)
 
 
 class FakeProfile:
