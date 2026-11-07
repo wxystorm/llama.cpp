@@ -399,6 +399,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
     RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
     RPC_CMD_PHONE_OWNED_KV_BIND,
+    RPC_CMD_PHONE_NPU_PLAN_CONFIGURE,
     RPC_CMD_COUNT,
 };
 
@@ -438,6 +439,7 @@ static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
 static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
+static_assert(RPC_CMD_PHONE_NPU_PLAN_CONFIGURE == 55, "Plan-driven Phone HTP config index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -507,6 +509,17 @@ struct rpc_msg_phone_owned_plan_req {
     float rope_beta_fast = 0;
     float rope_beta_slow = 0;
 };
+// Fixed-size versioned request. Avoid dynamic wire sizes and reject unknown
+// Region indices, duplicate layers and invalid physical Bank assignments.
+struct rpc_msg_phone_npu_plan_configure_req {
+    uint32_t version = 1;
+    uint32_t count = 0;
+    uint64_t run_id = 0;
+    uint32_t regions[64] = {};
+    uint32_t layers[64] = {};
+};
+static_assert(sizeof(rpc_msg_phone_npu_plan_configure_req) == 528,
+              "Plan-driven HTP wire ABI changed; bump RPC protocol");
 // One canonical storage binding per Region; no KV payload or host pointer.
 struct rpc_msg_phone_owned_kv_bind_req {
     uint64_t run_id = 0;
@@ -4353,6 +4366,51 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
                &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
 }
 
+static bool ggml_backend_rpc_phone_npu_plan_configure(
+        ggml_backend_t backend, uint64_t run_id,
+        const ggml_backend_rpc_phone_npu_region_layer * entries,
+        size_t count) {
+    if (!backend || !ggml_backend_is_rpc(backend) || !entries ||
+            run_id == 0 || count < 2 || count > 64) {
+        return false;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (entries[i].region >= 64 ||
+                (i > 0 && (entries[i-1].region >= entries[i].region ||
+                           entries[i-1].layer >= entries[i].layer))) {
+            GGML_LOG_ERROR(
+                "[PHONE_NPU_PLAN] side=pc reason=INVALID_ORDER_OR_DUPLICATE "
+                "index=%zu status=REJECT\n", i);
+            return false;
+        }
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 30) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_PLAN] side=pc reason=PHONE_PATCH_BELOW_30 "
+            "status=REJECT\n");
+        return false;
+    }
+    rpc_msg_phone_npu_plan_configure_req req {};
+    req.run_id = run_id;
+    req.count = static_cast<uint32_t>(count);
+    for (size_t i = 0; i < count; ++i) {
+        req.regions[i] = entries[i].region;
+        req.layers[i] = entries[i].layer;
+    }
+    rpc_msg_phone_input_ack rsp {};
+    const bool accepted = send_rpc_cmd(
+        sock, RPC_CMD_PHONE_NPU_PLAN_CONFIGURE, &req, sizeof(req),
+        &rsp, sizeof(rsp)) && rsp.accepted != 0;
+    GGML_LOG_INFO(
+        "[PHONE_NPU_PLAN] side=pc event=CONFIGURE "
+        "run=%" PRIu64 " htp_regions=%zu physical_banks=2 status=%s\n",
+        run_id, count, accepted ? "PASS" : "REJECT");
+    return accepted;
+}
+
 static bool ggml_backend_rpc_phone_owned_kv_bind(
         ggml_backend_t backend, uint64_t run_id, uint32_t region,
         uint32_t layer, uint32_t total_tokens,
@@ -6162,6 +6220,8 @@ public:
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
+    bool phone_npu_plan_configure(
+        const rpc_msg_phone_npu_plan_configure_req & request);
     bool phone_owned_kv_bind(const rpc_msg_phone_owned_kv_bind_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
     bool phone_auto_wait(const rpc_msg_phone_auto_wait_req & request);
@@ -6473,6 +6533,9 @@ private:
         phone_npu_executor;
     bool phone_npu_async_preload = false;
     bool phone_npu_banked_enabled = false;
+    bool phone_npu_plan_controlled = false;
+    uint64_t phone_npu_plan_configured_run = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> phone_npu_plan_mapping;
     bool phone_auto_dual_lane_enabled = false;
     // Owned by HTP mutex: stale dequeued refills from an earlier RUN may
     // never write into a freshly re-primed Bank.
@@ -15212,6 +15275,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_NPU_PLAN_CONFIGURE: {
+                rpc_msg_phone_npu_plan_configure_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_npu_plan_configure(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_AUTO_TASK_REGISTER: {
                 rpc_msg_phone_auto_task_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -15692,6 +15764,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_input_ack response {};
                 response.accepted =
                     server.phone_owned_kv_bind(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_NPU_PLAN_CONFIGURE: {
+                rpc_msg_phone_npu_plan_configure_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_npu_plan_configure(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
@@ -16850,6 +16931,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_kv_bind);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_NPU_PLAN_CONFIGURE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_npu_plan_configure);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_TASK_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_task_register);
