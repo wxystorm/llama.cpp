@@ -459,13 +459,32 @@ def dag_for(cycles, x, token_count, hidden, profiles, base, mix, head_ms):
 
 def geometry(layers, max_cycles=4, max_c=4, max_phone=8):
     """Bounded balanced Cycle seeds, allowing G/C/N/A to be absent."""
+    seen = set()
     for nc in range(2, min(layers, max_cycles) + 1):
         widths = [layers//nc + (i < layers%nc) for i in range(nc)]
         for phone in range(0, min(max_phone, min(widths))+1):
             for cpu in range(0, min(max_c, min(widths)-phone)+1):
-                out = [(w-phone-cpu, cpu, phone) for w in widths]
-                if min(g for g,_,_ in out) >= 0:
-                    yield out
+                out = tuple((w-phone-cpu, cpu, phone) for w in widths)
+                if min(g for g,_,_ in out) < 0:
+                    continue
+                # The last physical Stage is a search variable, not always
+                # Phone. A PC-tail Cycle retains the earlier Phone pipeline
+                # and ends in G or C. It does NOT move its missing Phone
+                # layers to a hidden device: the last G/C absorbs them.
+                tails = [out]
+                if phone and nc >= 3:
+                    last_width = widths[-1]
+                    # Tail G: no CPU or Phone in the last Cycle.
+                    tails.append(out[:-1] + ((last_width, 0, 0),))
+                    # Tail C: last Cycle is G,C with no Phone.
+                    for tail_cpu in sorted({cpu, min(max_c, last_width - 1)}):
+                        if 1 <= tail_cpu < last_width:
+                            tails.append(out[:-1] +
+                                         ((last_width-tail_cpu, tail_cpu, 0),))
+                for candidate in tails:
+                    if candidate not in seen:
+                        seen.add(candidate)
+                        yield list(candidate)
 
 
 def layout(cycles):
@@ -494,14 +513,23 @@ def runtime_compatible_cycles(cycles):
     """Conservative executable APPLY_WIDE + Phone-local NPU->Adreno subset."""
     if not 2 <= len(cycles) <= 4:
         return False
-    if any(c.g < 1 or c.phone < 1 or c.n > 1 for c in cycles):
+    if any(c.g < 1 or c.n > 1 for c in cycles):
         return False
     stages, edges = execution_stage_graph(cycles)
-    if not stages or stages[-1]["backend"] not in ("N", "A"):
+    if not stages:
         return False
     htp = sum(s["backend"] == "N" for s in stages)
     adreno = sum(s["backend"] == "A" for s in stages)
-    return (htp >= 2 and adreno >= 1 and
+    phone_cycles = sum(c.phone > 0 for c in cycles)
+    # Mixed HTP requires at least two banked HTP Regions, one N->A
+    # handoff and two complete Phone cycles. PC-tail is structurally
+    # representable in the offline DAG, but the current autonomous
+    # runtime's canonical final result/Head is Phone-owned. Do not label
+    # PC-tail as executable until that ownership has been implemented
+    # and validated on device.
+    return (phone_cycles >= 2 and htp >= 2 and adreno >= 1 and
+            all(c.phone > 0 for c in cycles) and
+            stages[-1]["backend"] in ("N", "A") and
             any(e["handoff"] == "HTP_TO_ADRENO" for e in edges))
 
 
@@ -626,9 +654,12 @@ def run_cli(argv=None):
         "prediction_scope":"offline_measured_stage_plus_bank_transfer_model_no_runtime_validation",
         "runtime_compatible":runtime_compatible_cycles(cycles),
         "runtime_experimental":True,
+        "final_backend":execution_stages[-1]["backend"],
+        "head_owner":"PC_CPU",
+        "terminal_ranking_policy":"MIN_PREDICTED_DAG_WALL_OVER_G_C_N_A",
         "runtime_requirements":"RPC_PATCH_31_DUAL_LANE_PLAN_CONTROLLED_TWO_NPU_BANKS_LOCAL_HANDOFF",
         "execution_blocker":None if runtime_compatible_cycles(cycles) else
-            "Requires GPU-first Phone-final cycles, at least two HTP Regions and an adjacent HTP->Adreno edge",
+            "Runtime not verified for this topology. PC-terminal DAG candidates remain available for offline performance ranking, but current autonomous output ownership is Phone-final.",
     }
     (args.out/"plan.json").write_text(json.dumps(record,indent=2),encoding="utf-8")
     with (args.out/"candidates.csv").open("w",newline="",encoding="utf-8") as f:
