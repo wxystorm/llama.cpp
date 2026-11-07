@@ -4860,6 +4860,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_mixed_requested = phone_mixed_env != nullptr &&
         std::strcmp(phone_mixed_env, "1") == 0;
     std::set<uint32_t> phone_mixed_htp_regions;
+    std::set<uint32_t> phone_local_handoff_source_regions;
     std::set<uint32_t> phone_local_handoff_dest_regions;
     if (phone_mixed_requested && ubatch.n_tokens >= 32) {
         const char * region_spec = std::getenv(
@@ -5709,9 +5710,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         stages[region + 1].kind ==
                             llama_hybrid_runtime_stage_kind::PHONE &&
                         phone_mixed_htp_regions.count(region + 1) == 0) {
-                    // N->A: keep source P2C for the PC DAG's completion
-                    // event, but stage its payload locally for Adreno.
+                    // This is a Phone-owned island, not a PC-visible result.
+                    // No intermediate HTP frame will be sent to the PC;
+                    // a real Adreno return gates the next PC stage.
                     local_successor = region + 1;
+                    phone_local_handoff_source_regions.insert(region);
                     phone_local_handoff_dest_regions.insert(local_successor);
                 }
                 mapping.push_back({region,
@@ -6161,6 +6164,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // yet claimed its logical task. Register every receiver target
             // BEFORE starting the PUSH producer or any Ring worker.
             for (const auto & item : phone_auto_templates) {
+                if (phone_local_handoff_source_regions.count(
+                        (uint32_t) item.region) != 0) {
+                    // No P2C frame exists for this internal N->A edge.
+                    // Subscribing a fake receiver would stall run teardown.
+                    continue;
+                }
                 // The terminal Phone Region is a valid return producer
                 // with a separate PC Head. Never index its host output
                 // buffer before validating the region index.
@@ -7515,7 +7524,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                         llama_region_ring_device::PHONE &&
                                     stage.kind ==
                                         llama_hybrid_runtime_stage_kind::PHONE &&
-                                    (!last || phone_auto_final_enabled)) {
+                                    (!last || phone_auto_final_enabled) &&
+                                    phone_local_handoff_source_regions.count(
+                                        (uint32_t) task.region) == 0) {
                                 if (output == nullptr) {
                                     throw std::runtime_error(
                                         "missing Phone stream output buffer");
@@ -7582,11 +7593,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 dev == (size_t) llama_region_ring_device::PHONE &&
                                 stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
                             if (phone_auto_task) {
-                                // No PC Meta compute for autonomous Phone
-                                // work. In graphless mode there is not even
-                                // a PC-built per-Chunk Graph: the Phone has
-                                // the Plan, canonical KV binding and verified
-                                // PUSH payload, and owns compute/P2C.
+                                // The PC owns only the orchestration. On a
+                                // local N->A edge, it releases the logical
+                                // edge without awaiting HTP's P2C; actual
+                                // HTP->Adreno readiness is Phone-owned.
+                                const bool local_handoff =
+                                    phone_local_handoff_source_regions.count(
+                                        (uint32_t) task.region) != 0;
                                 if (prepare_gate.owns_lock()) {
                                     prepare_gate.unlock();
                                 }
@@ -7595,15 +7608,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     phone_auto_graph_uid != 0 &&
                                     task_res != nullptr &&
                                     output != nullptr &&
-                                    llama_region_ring_tls_phone_full_stream.enabled;
+                                    (local_handoff ||
+                                     llama_region_ring_tls_phone_full_stream.enabled);
                                 task_status = delegated ? GGML_STATUS_SUCCESS :
                                     GGML_STATUS_FAILED;
                                 task_result = delegated ? task_res : nullptr;
-                                if (delegated) {
-                                    // A prebound Receiver will publish
-                                    // downstream READY only after its entire
-                                    // P2C frame is in the host output buffer.
+                                if (delegated && !local_handoff) {
+                                    // Cross-device completion still waits for
+                                    // the full return frame in PC Host memory.
                                     llama_region_ring_tls_phone_full_stream.deferred = true;
+                                } else if (delegated) {
+                                    LLAMA_LOG_INFO(
+                                        "[PHONE_LOCAL_HANDOFF] side=pc event=DELEGATE "
+                                        "region=%zu chunk=%zu "
+                                        "completion=PHONE_OWNED "
+                                        "intermediate_p2c=SKIPPED status=PASS\n",
+                                        task.region, task.chunk);
                                 }
                                 if (task_timing.capture_timeline) {
                                     task_timing.output_kind = 2;
@@ -8226,6 +8246,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         continue;
                     }
 
+                    // For N->A, this marks ownership transfer rather than
+                    // the device finishing its compute. Only another Phone
+                    // stage becomes ready; downstream PC work still waits
+                    // for Adreno's actual full output frame.
                     ready.complete(task);
                     if (dev == (size_t) llama_region_ring_device::PHONE) {
                         previous_phone_region = task.region;
