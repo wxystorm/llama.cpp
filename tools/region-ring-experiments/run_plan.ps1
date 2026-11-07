@@ -10,6 +10,11 @@ param(
     [switch]$BankedRuntimeConfirmed
 )
 $ErrorActionPreference = "Stop"
+# Mixed HTP/OpenCL cost classes are not yet modeled by the offline DAG.
+# Reject instead of silently applying the old aggregate PHONE profile.
+if ($env:LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP -eq "1") {
+    throw "Four-backend Phone mixed Profile/Planner is not implemented yet. Use the dedicated run_phone_mixed_smoke.ps1 A/B test; do not use the HTP-only Profile as mixed data."
+}
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $modelFile = (Resolve-Path -LiteralPath $Model).Path
 $prompt = (Resolve-Path -LiteralPath $PromptFile).Path
