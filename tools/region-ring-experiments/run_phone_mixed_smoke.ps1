@@ -20,15 +20,18 @@ if ([IO.Path]::GetFileNameWithoutExtension($modelFile) -ne "Qwen3-14B-Q4_K_M") {
 if ([IO.Path]::GetFileName($prompt) -notmatch '^prompt_[0-9]+\.txt$') {
     throw "Smoke requires a prompt_N.txt filename for the existing sweep runner."
 }
-$layout = "G7,C1,P1,G7,C1,P1,G7,C1,P1,G7,C1,P5"
+$layout = "G8,C1,P1,G8,C1,P1,G8,C1,P1,G7,C2,P1"
 $regions = "2,5"
-$layers = "8,17"
+$layers = "9,19"
 Write-Host "[PHONE_MIXED_BACKENDS] expected_model=40-layer-Qwen3 backend_map=HTP0:$regions GPUOpenCL:8,11"
 Write-Host "[PHONE_MIXED_BACKENDS] phone_server_requires:"
 Write-Host "  GGML_RPC_PHONE_NPU_SERIAL_REGIONS=$regions"
 Write-Host "  GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS=$layers"
 Write-Host "  GGML_RPC_PHONE_NPU_MIXED_OPENCL=1"
 Write-Host "  GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2"
+Write-Host "  GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1"
+Write-Host "  GGML_RPC_PHONE_STAGE_DUAL_SLOT=1"
+Write-Host "  GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1"
 $vars = @{
     "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP" = "1"
     "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS" = $regions
