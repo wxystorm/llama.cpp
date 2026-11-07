@@ -131,6 +131,14 @@ public:
             reason = "NPU_BANK_CONFIG_OR_LOCAL_GGUF_UNAVAILABLE";
             return false;
         }
+        const auto dev_reg = ggml_backend_dev_backend_reg(
+            ggml_backend_get_device(backend_));
+        if (dev_reg == nullptr ||
+                ggml_backend_reg_get_proc_address(dev_reg,
+                    "ggml_backend_hexagon_evict_fixed_graph_uid") == nullptr) {
+            reason = "NPU_BANK_REQUIRES_SELECTIVE_GRAPH_EVICTION";
+            return false;
+        }
         const size_t alignment = ggml_backend_buft_get_alignment(repack_buft_);
         if (!alignment || alignment > 65536) {
             reason = "NPU_BANK_BAD_ALIGNMENT";
@@ -317,6 +325,10 @@ public:
                           model_load_stats & stats) {
         reason.clear();
         stats = {};
+        if (banked_mode_) {
+            reason = "HTP_MODEL_LOAD_PROHIBITED_WHILE_BANKED";
+            return false;
+        }
         if (backend_ == nullptr || local.get_info == nullptr ||
                 local.read == nullptr) {
             reason = "HTP_MODEL_LOAD_NO_LOCAL_GGUF";
@@ -2456,6 +2468,110 @@ private:
         const ggml_tensor * original = nullptr;
         bool kv = false;
     };
+
+    // The HTP repack Tensor descriptors are recreated at every refill.
+    // Address offsets into the two backing arenas never change. Only the
+    // bytes and metadata for the current Region are resident per Bank.
+    bool load_banked_rank(size_t rank, std::string & reason,
+                          model_load_stats & stats) {
+        reason.clear();
+        stats = {};
+        if (!banked_mode_ || rank >= banked_layers_.size() ||
+                !bank_local_source_.get_info || !bank_local_source_.read) {
+            reason = "NPU_BANK_LOAD_INVALID_RANK_OR_SOURCE";
+            return false;
+        }
+        auto & layer = banked_layers_[rank];
+        ggml_backend_buffer_t bank =
+            bank_weight_arenas_[rank % 2].get();
+        if (!bank) {
+            reason = "NPU_BANK_ARENA_NOT_MAPPED";
+            return false;
+        }
+        // Do not publish a partially repacked Region into model_weights_.
+        std::unordered_map<std::string, std::unique_ptr<persistent_tensor>>
+            pending;
+        std::vector<std::string> keys;
+        keys.reserve(layer.tensors.size());
+        for (const auto & spec : layer.tensors) {
+            ggml_init_params params {
+                ggml_tensor_overhead() * 4 + 4096, nullptr, true
+            };
+            auto entry = std::make_unique<persistent_tensor>();
+            entry->ctx.reset(ggml_init(params));
+            if (!entry->ctx) {
+                reason = "NPU_BANK_LOAD_CONTEXT";
+                return false;
+            }
+            int64_t shape[GGML_MAX_DIMS] = {1, 1, 1, 1};
+            for (uint32_t d = 0; d < spec.info.n_dims; ++d) {
+                shape[d] = static_cast<int64_t>(spec.info.ne[d]);
+            }
+            entry->tensor = ggml_new_tensor(
+                entry->ctx.get(), static_cast<ggml_type>(spec.info.type),
+                GGML_MAX_DIMS, shape);
+            if (!entry->tensor ||
+                    ggml_nbytes(entry->tensor) !=
+                        static_cast<size_t>(spec.info.nbytes)) {
+                reason = "NPU_BANK_LOAD_LAYOUT_DRIFT:" + spec.name;
+                return false;
+            }
+            ggml_set_name(entry->tensor, spec.name.c_str());
+            const size_t actual_size =
+                ggml_backend_buft_get_alloc_size(repack_buft_, entry->tensor);
+            const size_t bank_size = ggml_backend_buffer_get_size(bank);
+            if (actual_size != spec.alloc_bytes ||
+                    spec.offset > bank_size ||
+                    actual_size > bank_size - spec.offset) {
+                reason = "NPU_BANK_LOAD_SIZE_DRIFT:" + spec.name;
+                return false;
+            }
+            void * const at =
+                static_cast<uint8_t *>(ggml_backend_buffer_get_base(bank)) +
+                spec.offset;
+            if (ggml_backend_tensor_alloc(
+                    bank, entry->tensor, at) != GGML_STATUS_SUCCESS) {
+                reason = "NPU_BANK_LOAD_TENSOR_BIND:" + spec.name;
+                return false;
+            }
+            const std::string key = model_weight_key(entry->tensor);
+            if (model_weights_.count(key) || pending.count(key)) {
+                reason = "NPU_BANK_LOAD_DUPLICATE_WEIGHT:" + spec.name;
+                return false;
+            }
+            std::vector<uint8_t> raw;
+            try {
+                raw.resize(static_cast<size_t>(spec.info.nbytes));
+            } catch (const std::bad_alloc &) {
+                reason = "NPU_BANK_LOAD_HOST_STAGING_OOM";
+                return false;
+            }
+            const int64_t read_us = ggml_time_us();
+            if (!bank_local_source_.read(bank_local_source_.user_data,
+                    spec.name.c_str(), 0, raw.data(), raw.size())) {
+                reason = "NPU_BANK_LOAD_GGUF_READ:" + spec.name;
+                return false;
+            }
+            stats.file_read_ms += (ggml_time_us() - read_us) / 1000.0;
+            const int64_t repack_us = ggml_time_us();
+            ggml_backend_tensor_set(
+                entry->tensor, raw.data(), 0, raw.size());
+            stats.htp_repack_ms +=
+                (ggml_time_us() - repack_us) / 1000.0;
+            entry->kv = false;
+            entry->original = nullptr;
+            pending.emplace(key, std::move(entry));
+            keys.push_back(key);
+            ++stats.new_weights;
+            stats.new_bytes += raw.size();
+        }
+        ggml_backend_synchronize(backend_);
+        for (auto & p : pending) {
+            model_weights_.emplace(p.first, std::move(p.second));
+        }
+        layer.keys = std::move(keys);
+        return true;
+    }
 
     static bool is_weight(const ggml_tensor * t) {
         if (t == nullptr) { return false; }
