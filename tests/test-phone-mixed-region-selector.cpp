@@ -25,7 +25,7 @@ int main() {
 
     assert(llama_region_ring_parse_region_ids("2,5,8", htp));
     const auto stages = llama_region_ring_parse_apply_wide_layout(
-        "G7,C1,P1,G7,C1,P1,G7,C1,P1,G7,C1,P5", 40);
+        "G8,C1,P1,G8,C1,P1,G8,C1,P1,G7,C2,P1", 40);
     assert(stages.size() == 12);
     assert(llama_region_ring_apply_topology_compatible(stages, 40));
     int htp_layers = 0, opencl_layers = 0, pc_layers = 0;
@@ -37,17 +37,17 @@ int main() {
             pc_layers += n;
         } else if (htp.count((uint32_t) i)) {
             assert(n == 1);
-            const int expected = i == 2 ? 8 : 17;
+            const int expected = i == 2 ? 9 : 19;
             assert(stage.layer_begin == expected);
             ++htp_layers;
         } else {
-            assert((i == 8 && stage.layer_begin == 26 && n == 1) ||
-                   (i == 11 && stage.layer_begin == 35 && n == 5));
+            assert((i == 8 && stage.layer_begin == 29 && n == 1) ||
+                   (i == 11 && stage.layer_begin == 39 && n == 1));
             opencl_layers += n;
         }
     }
-    assert(pc_layers == 32);
+    assert(pc_layers == 36);
     assert(htp_layers == 2);
-    assert(opencl_layers == 6);
+    assert(opencl_layers == 2);
     assert(pc_layers + htp_layers + opencl_layers == 40);
 }
