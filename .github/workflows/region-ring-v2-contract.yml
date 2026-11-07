@@ -1,0 +1,35 @@
+name: Region Ring V2 contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'feat/region-ring-v2-*'
+    paths:
+      - '.github/workflows/region-ring-v2-contract.yml'
+      - 'src/llama-region-ring-v2.h'
+      - 'ggml/src/ggml-rpc/phone-qwen3-local-builder.h'
+      - 'ggml/src/ggml-rpc/phone-plan-region-map.h'
+      - 'tests/test-region-ring-v2-stage.cpp'
+      - 'tests/test-phone-qwen3-local-builder.cpp'
+      - 'tests/test-phone-plan-region-map.cpp'
+      - 'tests/CMakeLists.txt'
+
+jobs:
+  host-contract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and run standalone Stage contract in Release mode
+        run: |
+          g++ -std=c++17 -DNDEBUG -O2 -Wall -Wextra -Werror \
+            tests/test-region-ring-v2-stage.cpp -o /tmp/test-region-ring-v2-stage
+          /tmp/test-region-ring-v2-stage
+      - name: Compile and run Phone multi-layer metadata / Region map tests
+        run: |
+          cmake -S . -B build -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON \
+            -DGGML_NATIVE=OFF
+          cmake --build build --config Release --parallel 4 \
+            --target test-phone-qwen3-local-builder test-phone-plan-region-map test-region-ring-v2-stage
+          ctest --test-dir build --output-on-failure \
+            -R '^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage)$'
