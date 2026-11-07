@@ -20,6 +20,9 @@
 #include "phone-owned-execution-plan.h"
 
 #include <array>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
 #include <chrono>
 #include <deque>
 #include <atomic>
