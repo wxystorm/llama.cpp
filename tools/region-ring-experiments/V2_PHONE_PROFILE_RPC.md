@@ -139,7 +139,17 @@ Set the identical V2_PROFILE_TOKEN on the PC and pass
 a trusted/private network only. For untrusted networks, prefer USB
 adb forward rather than exposing a Profile service.
 
-## 5. Scope limitations
+## 5. Production runtime Bank/Handoff telemetry
+
+The separate native profiling sidecar does not measure two-Bank
+overlap. For this, the production ggml-rpc Phone server now has
+Patch33 structured Bank-Mover and zero-copy HTP->Adreno transition
+timing returned automatically to PC. See V2_RUNTIME_BANK_PROFILE.md.
+Both PC and Phone inference RPC binaries must use Patch33. This
+production extension is awaiting real Windows/Android verification,
+and its data is not fabricated from raw-TCP sidecar timing.
+
+## 6. Scope limitations
 
 - The Profile server is a separate long-lived Python process and
   launches the native executable for each N/A sample. Graph build,
@@ -155,9 +165,10 @@ adb forward rather than exposing a Profile service.
   failed cases are quarantined. Planner must eventually consider
   only correctness-qualified profiles, plus separately measured
   Bank refill/transfer costs and memory feasibility.
-- A raw-TCP link Profile is now available, but production ggml-rpc
-  Activation transfer, PC GPU H2D bank mover and physical HTP two-Bank
-  overlap still require separate runtime-equivalent measurement.
+- A raw-TCP link Profile is available, while RPC Patch33 has opt-in
+  native two-Bank/Handoff timeline instrumentation. The new Bank
+  measurement requires production hardware validation; complete RPC
+  Activation transfer and PC GPU H2D mover remain separately scoped.
 - The experimental Profile sidecar is not yet integrated into
   production ggml-rpc command handling, real two-Bank scheduling or
   the new Planner.
