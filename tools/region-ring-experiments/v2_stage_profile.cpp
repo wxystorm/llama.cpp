@@ -48,6 +48,9 @@ struct parameters {
     int warmups = 2;
     int repeats = 8;
     int threads = 8;
+    bool verify_cpu = false;
+    double max_relative_rmse = 0.02;
+    double max_abs_error = 0.5;
 };
 
 int parse_int(const char * value, const char * label) {
@@ -65,17 +68,22 @@ parameters parse(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         if (key == "--help" || key == "-h") {
-            std::cout << "v2-stage-profile --model FILE --backend G|C "
+            std::cout << "v2-stage-profile --model FILE --backend G|C|N|A "
                          "--layers N --chunk X --kv K [--warmups N] "
-                         "[--repeats N] [--threads N]\n";
+                         "[--repeats N] [--threads N] [--verify-cpu] "
+                         "[--relative-rmse F] [--max-abs-error F]\n";
             std::exit(0);
+        }
+        if (key == "--verify-cpu") {
+            p.verify_cpu = true;
+            continue;
         }
         if (i + 1 >= argc) { throw std::runtime_error("MISSING_ARGUMENT:" + key); }
         const char * value = argv[++i];
         if (key == "--model") { p.model = value; }
         else if (key == "--backend") {
             if (std::strlen(value) != 1) {
-                throw std::runtime_error("BACKEND_MUST_BE_G_OR_C");
+                throw std::runtime_error("BACKEND_MUST_BE_G_C_N_OR_A");
             }
             p.backend = value[0];
         } else if (key == "--layers") { p.layers = parse_int(value, "LAYERS"); }
@@ -84,12 +92,23 @@ parameters parse(int argc, char ** argv) {
         else if (key == "--warmups") { p.warmups = parse_int(value, "WARMUPS"); }
         else if (key == "--repeats") { p.repeats = parse_int(value, "REPEATS"); }
         else if (key == "--threads") { p.threads = parse_int(value, "THREADS"); }
-        else { throw std::runtime_error("UNKNOWN_ARGUMENT:" + key); }
+        else if (key == "--relative-rmse") {
+            p.max_relative_rmse = std::stod(value);
+        } else if (key == "--max-abs-error") {
+            p.max_abs_error = std::stod(value);
+        } else { throw std::runtime_error("UNKNOWN_ARGUMENT:" + key); }
     }
-    if (p.model.empty() || (p.backend != 'G' && p.backend != 'C') ||
+    if (p.model.empty() ||
+            (p.backend != 'G' && p.backend != 'C' &&
+             p.backend != 'N' && p.backend != 'A') ||
             p.layers < 1 || p.chunk < 1 || p.kv < p.chunk ||
-            p.kv % p.chunk != 0 || p.repeats < 1 || p.threads < 1) {
-        throw std::runtime_error("INVALID_PC_STAGE_PROFILE_SHAPE");
+            p.kv % p.chunk != 0 || p.repeats < 1 || p.threads < 1 ||
+            !std::isfinite(p.max_relative_rmse) ||
+            !std::isfinite(p.max_abs_error) ||
+            p.max_relative_rmse < 0 || p.max_abs_error < 0 ||
+            (p.backend == 'N' && !p.verify_cpu)) {
+        throw std::runtime_error(
+            "INVALID_STAGE_PROFILE_SHAPE_OR_NPU_CPU_PARITY_REQUIRED");
     }
     return p;
 }
@@ -131,7 +150,8 @@ struct to_load {
 };
 
 ggml_phone_qwen3::layer_weights load_layer(
-        ggml_context * weight_ctx, const ggml_context * model_ctx,
+        ggml_context * plain_ctx, ggml_context * quant_ctx,
+        const ggml_context * model_ctx,
         const gguf_context * gguf, uint32_t layer,
         std::vector<to_load> & todo) {
     ggml_phone_qwen3::layer_weights w {};
@@ -143,7 +163,9 @@ ggml_phone_qwen3::layer_weights load_layer(
             throw std::runtime_error("MISSING_REAL_GGUF_WEIGHT:" + name);
         }
         auto * target = ggml_new_tensor(
-            weight_ctx, source->type, GGML_MAX_DIMS, source->ne);
+            quant_ctx && ggml_is_quantized(source->type) ?
+                quant_ctx : plain_ctx,
+            source->type, GGML_MAX_DIMS, source->ne);
         if (!target || ggml_nbytes(target) != gguf_get_tensor_size(gguf,id)) {
             throw std::runtime_error("INVALID_GGUF_WEIGHT:" + name);
         }
@@ -234,16 +256,61 @@ ggml_phone_owned::region_plan model_plan(
     return p;
 }
 
-int run(const parameters & args) {
+struct sample_result {
+    double graph_build_ms = 0;
+    double weight_upload_ms = 0;
+    double prepare_ms = 0;
+    double compute_ms = 0;
+    double htp_precompile_ms = 0;
+    size_t weight_bytes = 0;
+    size_t kv_bytes = 0;
+    size_t graph_workspace_bytes = 0;
+    std::vector<float> output;
+};
+
+sample_result run(const parameters & args) {
     ggml_backend_load_all();
-    const auto type = args.backend == 'G' ?
-        GGML_BACKEND_DEVICE_TYPE_GPU : GGML_BACKEND_DEVICE_TYPE_CPU;
-    auto dev = ggml_backend_dev_by_type(type);
+    ggml_backend_dev_t dev = nullptr;
+    if (args.backend == 'N') {
+        dev = ggml_backend_dev_by_name("HTP0");
+    } else {
+        const auto type = args.backend == 'C' ?
+            GGML_BACKEND_DEVICE_TYPE_CPU : GGML_BACKEND_DEVICE_TYPE_GPU;
+        dev = ggml_backend_dev_by_type(type);
+        if (dev && args.backend == 'G' &&
+                std::string(ggml_backend_dev_name(dev)).find("CUDA") == std::string::npos) {
+            throw std::runtime_error("G_REQUIRES_CUDA_DEVICE");
+        }
+        if (dev && args.backend == 'A' &&
+                std::string(ggml_backend_dev_name(dev)).find("OpenCL") == std::string::npos) {
+            throw std::runtime_error("A_REQUIRES_OPENCL_DEVICE");
+        }
+    }
     if (!dev) { throw std::runtime_error("REQUESTED_BACKEND_NOT_AVAILABLE"); }
     backend_ptr backend(ggml_backend_dev_init(dev, nullptr), ggml_backend_free);
     if (!backend) { throw std::runtime_error("BACKEND_INIT_FAILED"); }
-    if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+    if (args.backend == 'C') {
         ggml_backend_cpu_set_n_threads(backend.get(), args.threads);
+    }
+    const bool htp = args.backend == 'N';
+    ggml_backend_buffer_type_t repack = nullptr;
+    using precompile_fn = bool (*)(ggml_backend_t, ggml_cgraph *);
+    precompile_fn precompile = nullptr;
+    if (htp) {
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        const auto extra = reg == nullptr ? nullptr :
+            reinterpret_cast<ggml_backend_dev_get_extra_bufts_t>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_dev_get_extra_bufts"));
+        auto * bufts = extra == nullptr ? nullptr : extra(dev);
+        if (bufts != nullptr) { repack = bufts[0]; }
+        precompile = reg == nullptr ? nullptr :
+            reinterpret_cast<precompile_fn>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_precompile_fixed_graph"));
+        if (!repack || !precompile) {
+            throw std::runtime_error("HTP_REPACK_OR_PRECOMPILER_NOT_AVAILABLE");
+        }
     }
     ggml_context * raw_model_ctx = nullptr;
     gguf_ptr gguf(gguf_init_from_file(
@@ -254,8 +321,10 @@ int run(const parameters & args) {
     }
     auto p = model_plan(gguf.get(), args);
     llama_ring_v2::profile_request request {};
-    request.device = args.backend == 'G' ?
-        llama_ring_v2::backend::G : llama_ring_v2::backend::C;
+    request.device = args.backend == 'G' ? llama_ring_v2::backend::G :
+                     args.backend == 'C' ? llama_ring_v2::backend::C :
+                     args.backend == 'N' ? llama_ring_v2::backend::N :
+                                           llama_ring_v2::backend::A;
     request.model_layers = static_cast<int>(field_u32(gguf.get(),"qwen3.block_count"));
     request.layers = args.layers;
     request.chunk_tokens = static_cast<uint32_t>(args.chunk);
@@ -269,19 +338,32 @@ int run(const parameters & args) {
     const size_t weight_meta = ggml_tensor_overhead() *
         (static_cast<size_t>(args.layers) * 32 + 128) + 65536;
     ggml_ptr weight_ctx(ggml_init({weight_meta, nullptr, true}), ggml_free);
-    if (!weight_ctx) { throw std::runtime_error("WEIGHT_CONTEXT_ALLOC_FAILED"); }
+    ggml_ptr quant_ctx(htp ?
+        ggml_init({weight_meta, nullptr, true}) : nullptr, ggml_free);
+    if (!weight_ctx || (htp && !quant_ctx)) {
+        throw std::runtime_error("WEIGHT_CONTEXT_ALLOC_FAILED");
+    }
     std::vector<to_load> todo;
     std::vector<ggml_phone_qwen3::layer_weights> weights;
     for (int layer = 0; layer < args.layers; ++layer) {
-        weights.push_back(load_layer(weight_ctx.get(), model_ctx.get(),
-                                     gguf.get(), layer, todo));
+        weights.push_back(load_layer(weight_ctx.get(), quant_ctx.get(),
+                                     model_ctx.get(), gguf.get(), layer, todo));
     }
     buffer_ptr weight_buffer(
         ggml_backend_alloc_ctx_tensors(weight_ctx.get(), backend.get()),
         ggml_backend_buffer_free);
-    if (!weight_buffer) { throw std::runtime_error("PREFIX_WEIGHTS_EXCEED_BACKEND_MEMORY"); }
+    buffer_ptr repack_buffer(htp ?
+        ggml_backend_alloc_ctx_tensors_from_buft(quant_ctx.get(), repack) :
+        nullptr, ggml_backend_buffer_free);
+    if (!weight_buffer || (htp && !repack_buffer)) {
+        throw std::runtime_error("PREFIX_WEIGHTS_EXCEED_BACKEND_MEMORY");
+    }
     ggml_backend_buffer_set_usage(
         weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    if (repack_buffer) {
+        ggml_backend_buffer_set_usage(
+            repack_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     const auto upload_begin = clock_t::now();
     upload_weights(args.model, todo);
     ggml_backend_synchronize(backend.get());
@@ -374,6 +456,18 @@ int run(const parameters & args) {
         }
         ggml_backend_synchronize(backend.get());
     };
+    double precompile_ms = 0.0;
+    if (htp) {
+        // HTP specializes opnodes after all repacked weights, KV and
+        // fixed per-Chunk input addresses exist. No PC/Adreno fallback.
+        prepare();
+        const auto start = clock_t::now();
+        if (!precompile(backend.get(), graph.graph)) {
+            throw std::runtime_error("HTP_MULTI_LAYER_PRECOMPILE_FAILED");
+        }
+        ggml_backend_synchronize(backend.get());
+        precompile_ms = elapsed_ms(start);
+    }
     std::vector<double> prepare_ms, compute_ms;
     for (int repeat = -args.warmups; repeat < args.repeats; ++repeat) {
         const auto preparation = clock_t::now();
@@ -391,32 +485,82 @@ int run(const parameters & args) {
             compute_ms.push_back(elapsed_ms(computing));
         }
     }
-    std::vector<float> output(activation.size());
-    ggml_backend_tensor_get(graph.output, output.data(), 0,
-                            output.size() * sizeof(float));
-    for (float x : output) {
+    sample_result result {};
+    result.output.resize(activation.size());
+    ggml_backend_tensor_get(graph.output, result.output.data(), 0,
+                            result.output.size() * sizeof(float));
+    for (float x : result.output) {
         if (!std::isfinite(x)) {
             throw std::runtime_error("NONFINITE_NATIVE_STAGE_OUTPUT");
         }
     }
-    std::cout << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
-                 "weight_upload_ms,prepare_median_ms,compute_median_ms,"
-                 "weight_bytes,kv_bytes,graph_workspace_bytes,source\n";
-    std::cout << args.backend << ',' << args.layers << ',' << args.chunk
-              << ',' << args.kv << ',' << args.repeats << ','
-              << graph_build_ms << ',' << weight_upload_ms << ','
-              << median(prepare_ms) << ',' << median(compute_ms) << ','
-              << ggml_backend_buffer_get_size(weight_buffer.get()) << ','
-              << ggml_backend_buffer_get_size(kv_buffer.get()) << ','
-              << ggml_gallocr_get_buffer_size(allocator.get(), 0)
-              << ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n";
-    return 0;
+    result.graph_build_ms = graph_build_ms;
+    result.weight_upload_ms = weight_upload_ms;
+    result.prepare_ms = median(prepare_ms);
+    result.compute_ms = median(compute_ms);
+    result.htp_precompile_ms = precompile_ms;
+    result.weight_bytes = ggml_backend_buffer_get_size(weight_buffer.get()) +
+        (repack_buffer ? ggml_backend_buffer_get_size(repack_buffer.get()) : 0);
+    result.kv_bytes = ggml_backend_buffer_get_size(kv_buffer.get());
+    result.graph_workspace_bytes =
+        ggml_gallocr_get_buffer_size(allocator.get(), 0);
+    return result;
 }
 } // namespace
 
 int main(int argc, char ** argv) {
     try {
-        return run(parse(argc, argv));
+        const parameters args = parse(argc, argv);
+        const sample_result measured = run(args);
+        double max_abs = 0.0;
+        double relative_rmse = 0.0;
+        const char * parity = "NOT_REQUESTED";
+        if (args.verify_cpu) {
+            parameters cpu = args;
+            cpu.backend = 'C';
+            cpu.verify_cpu = false;
+            cpu.warmups = 0;
+            cpu.repeats = 1;
+            const sample_result reference = run(cpu);
+            if (reference.output.size() != measured.output.size()) {
+                throw std::runtime_error("CPU_REFERENCE_OUTPUT_SHAPE_MISMATCH");
+            }
+            double squared = 0.0, reference_squared = 0.0;
+            for (size_t i = 0; i < reference.output.size(); ++i) {
+                const double difference = double(measured.output[i]) -
+                                          double(reference.output[i]);
+                max_abs = std::max(max_abs, std::abs(difference));
+                squared += difference * difference;
+                reference_squared += double(reference.output[i]) *
+                                     double(reference.output[i]);
+            }
+            relative_rmse = std::sqrt(
+                squared / std::max(reference_squared, 1e-20));
+            if (!std::isfinite(relative_rmse) ||
+                    relative_rmse > args.max_relative_rmse ||
+                    max_abs > args.max_abs_error) {
+                throw std::runtime_error(
+                    "HTP_OR_CUDA_CPU_PARITY_FAILED rel_rmse=" +
+                    std::to_string(relative_rmse) +
+                    " max_abs=" + std::to_string(max_abs));
+            }
+            parity = "PASS";
+        }
+        std::cout << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
+                     "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
+                     "compute_median_ms,weight_bytes,kv_bytes,"
+                     "graph_workspace_bytes,relative_rmse,max_abs,parity,source\n";
+        std::cout << args.backend << ',' << args.layers << ',' << args.chunk
+                  << ',' << args.kv << ',' << args.repeats << ','
+                  << measured.graph_build_ms << ','
+                  << measured.weight_upload_ms << ','
+                  << measured.htp_precompile_ms << ','
+                  << measured.prepare_ms << ',' << measured.compute_ms << ','
+                  << measured.weight_bytes << ',' << measured.kv_bytes << ','
+                  << measured.graph_workspace_bytes << ','
+                  << relative_rmse << ',' << max_abs << ',' << parity
+                  << ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n";
+        return 0;
     } catch (const std::exception & ex) {
         std::cerr << "[V2_STAGE_PROFILE] status=FAIL reason="
                   << ex.what() << '\n';
