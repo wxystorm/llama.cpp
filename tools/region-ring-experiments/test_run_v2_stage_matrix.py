@@ -7,10 +7,38 @@ import tempfile
 import unittest
 from unittest import mock
 
-from run_v2_stage_matrix import cases, csv_positive, run_matrix
+from run_v2_stage_matrix import cases, csv_positive, run_matrix, npu_refill_curve
 
 
 class MatrixTests(unittest.TestCase):
+    def test_htp_refill_curve_is_real_independent_pass_only(self):
+        def sample(layers, chunk, ms, status="PASS", repeats=3):
+            return {
+                "status": status,
+                "key": {"backend": "N", "layers": layers,
+                        "chunk": chunk, "bank_repeats": repeats},
+                "sample": {"parity": "PASS" if status == "PASS" else "FAIL",
+                           "weight_bytes": "2500",
+                           "raw_weight_bytes": "2100",
+                           "same_bank_refill_median_ms": str(ms)},
+            }
+        approved = [
+            sample(2, 32, 11.0),
+            sample(2, 64, 13.0),
+            sample(4, 128, 99.0, status="PARITY_FAIL"),
+            sample(2, 96, 15.0, repeats=0),
+            {"status": "PASS", "key": {"backend": "A", "layers": 2,
+              "bank_repeats": 3}, "sample": {"parity": "NOT_REQUESTED"}},
+        ]
+        curve = npu_refill_curve(approved)
+        self.assertEqual(len(curve), 1)
+        self.assertEqual(curve[0]["layers"], 2)
+        self.assertEqual(curve[0]["raw_weight_bytes"], 2100)
+        self.assertEqual(curve[0]["bank_weight_allocation_bytes"], 2500)
+        self.assertEqual(curve[0]["refill_median_ms"], 12.0)
+        self.assertEqual(curve[0]["samples"], 2)
+        self.assertFalse(curve[0]["overlap_measured"])
+
     def test_omits_invalid_chunk_kv_shapes_without_faking_rows(self):
         self.assertEqual(cases("GC", [1], [32, 64], [32, 48]),
                          [("G", 1, 32, 32), ("G", 1, 32, 48),
