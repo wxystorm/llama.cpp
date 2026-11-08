@@ -157,6 +157,59 @@ int main() {
         REQUIRE(four_banks.npu_weight_refill_busy_ms == 20000.0);
     }
 
+    // NPU-first placement only spills a contiguous suffix to Adreno,
+    // and it must obey both CPU-parity qualification and the joint Phone
+    // memory guard. A capacity failure cannot silently discard layers.
+    {
+        const auto logical = llama_region_ring_parse(
+            "G4,C1,P3,G4,C1,P3", 16);
+        phone_npu_spill_result spill;
+        const auto npu_valid = [](int begin, int end) {
+            return begin >= 0 && end - begin <= 2;
+        };
+        const auto adreno_valid = [](int begin, int end) {
+            return begin >= 0 && end > begin && end - begin <= 3;
+        };
+        const auto phone_memory = [](
+                const std::vector<llama_region_ring_region> & rs,
+                const std::vector<size_t> & npu) {
+            if (npu.size() < 2) { return false; }
+            for (size_t index : npu) {
+                if (index >= rs.size() ||
+                        rs[index].layer_end - rs[index].layer_begin > 1) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        REQUIRE(choose_phone_npu_preferred_spill(
+            logical, 3, npu_valid, adreno_valid, phone_memory, spill));
+        REQUIRE(spill.npu_layers == 2);
+        REQUIRE(spill.adreno_layers == 4);
+        REQUIRE(spill.npu_region_indices.size() == 2);
+        REQUIRE(spill.regions.size() == 8);
+        REQUIRE(spill.regions[spill.npu_region_indices[0]].layer_begin == 5);
+        REQUIRE(spill.regions[spill.npu_region_indices[0]].layer_end == 6);
+        REQUIRE(spill.regions[spill.npu_region_indices[1]].layer_begin == 13);
+        REQUIRE(spill.regions[spill.npu_region_indices[1]].layer_end == 14);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            spill.regions, 16));
+
+        // A failed HTP numeric shape cannot be treated as a cheap NPU
+        // alternative. The only verified profile is N1 in this fixture.
+        const auto npu_one_only = [](int begin, int end) {
+            return begin >= 0 && end - begin == 1;
+        };
+        REQUIRE(choose_phone_npu_preferred_spill(
+            logical, 4, npu_one_only, adreno_valid,
+            phone_memory, spill));
+        REQUIRE(spill.npu_layers == 2);
+        const auto no_adreno = [](int, int) { return false; };
+        REQUIRE(!choose_phone_npu_preferred_spill(
+            logical, 1, npu_one_only, no_adreno,
+            phone_memory, spill));
+    }
+
     // Wider offline search is opt-in: default online limits remain identical.
     {
         dag_search_limits defaults;
