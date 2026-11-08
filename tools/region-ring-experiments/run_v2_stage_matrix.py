@@ -18,6 +18,7 @@ import json
 import math
 import os
 from pathlib import Path
+import platform
 import subprocess
 import sys
 from typing import Any
@@ -34,6 +35,27 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: inp.read(4 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def host_device_id() -> str:
+    # Include physical hardware, OS and driver in the local G/C cache
+    # identity. A different PC (or GPU driver) must not reuse measurements.
+    pieces = [
+        platform.system(), platform.release(), platform.machine(),
+        platform.node(), platform.processor(),
+        os.environ.get("PROCESSOR_IDENTIFIER", ""),
+        os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+    ]
+    try:
+        info = subprocess.run([
+            "nvidia-smi", "--query-gpu=name,uuid,driver_version",
+            "--format=csv,noheader"], capture_output=True, text=True,
+            timeout=5, check=False)
+        if info.returncode == 0:
+            pieces.append(info.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return hashlib.sha256("\n".join(pieces).encode("utf-8")).hexdigest()
 
 
 def csv_positive(spec: str, name: str) -> list[int]:
@@ -224,6 +246,7 @@ def run_matrix(args: argparse.Namespace) -> int:
     out.mkdir(parents=True, exist_ok=True)
     model_sha = sha256(model)
     native_sha = sha256(exe) if exe else None
+    local_device = host_device_id() if local_needed else None
     phone = None
     token = getattr(args, "phone_token", "") or \
         os.environ.get("V2_PROFILE_TOKEN", "")
@@ -251,7 +274,7 @@ def run_matrix(args: argparse.Namespace) -> int:
         identity = {
             "model_sha256": model_sha,
             "exe_sha256": phone["exe_sha256"] if remote else native_sha,
-            "device_id": phone["device_id"] if remote else "LOCAL_HOST",
+            "device_id": phone["device_id"] if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
         }
         key = {**identity, **shape}
