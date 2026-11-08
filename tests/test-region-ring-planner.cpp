@@ -117,6 +117,28 @@ int main() {
 
         model htp = plain;
         htp.phone_npu_weight_streaming = true;
+        htp.phone_npu_compute_ms = [](
+                int layers, int tokens, int kv, double & ms) {
+            ms = layers * (0.6 + 0.033 * tokens) +
+                0.00001 * tokens * kv;
+            return true;
+        };
+        htp.phone_adreno_compute_ms = [](
+                int layers, int tokens, int kv, double & ms) {
+            ms = layers * (0.5 + 0.045 * tokens) +
+                0.00002 * tokens * kv;
+            return true;
+        };
+        htp.phone_npu_prepare_ms = [](
+                int, int, int, double & ms) {
+            ms = 0.2;
+            return true;
+        };
+        htp.phone_adreno_prepare_ms = [](
+                int, int, int, double & ms) {
+            ms = 0.3;
+            return true;
+        };
         htp.phone_npu_region_enabled = [](int begin, int end) {
             return begin >= 0 && end - begin == 1;
         };
@@ -155,6 +177,22 @@ int main() {
         REQUIRE(simulate(htp, four, four_banks));
         REQUIRE(four_banks.npu_weight_refills == 2);
         REQUIRE(four_banks.npu_weight_refill_busy_ms == 20000.0);
+
+        // Two separate Phone physical Stage costs are required. A missing
+        // Adreno compute profile cannot be replaced with aggregate PHONE.
+        const auto mixed = llama_region_ring_parse_apply_wide_layout(
+            "G4,C1,P1,P2,G4,C1,P1,P2", 16);
+        model mixed_model = htp;
+        mixed_model.layers = 16;
+        candidate mixed_ok;
+        mixed_ok.xc = mixed_ok.xg = mixed_ok.xp = 64;
+        REQUIRE(simulate(mixed_model, mixed, mixed_ok));
+        REQUIRE(mixed_ok.npu_weight_refills == 0);
+        mixed_model.phone_adreno_compute_ms = {};
+        candidate mixed_invalid;
+        mixed_invalid.xc = mixed_invalid.xg = mixed_invalid.xp = 64;
+        REQUIRE(!simulate(mixed_model, mixed, mixed_invalid, &reason));
+        REQUIRE(reason == "COMPUTE_PROFILE_MISSING");
     }
 
     // NPU-first placement only spills a contiguous suffix to Adreno,
