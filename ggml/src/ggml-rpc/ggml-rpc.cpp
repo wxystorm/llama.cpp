@@ -4660,8 +4660,8 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (!ctx) { return false; }
     const auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 32) {
-        GGML_LOG_ERROR("[PHONE_STAGE_PROFILE_RPC] event=REJECT reason=PATCH32_REQUIRED\n");
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 33) {
+        GGML_LOG_ERROR("[PHONE_STAGE_PROFILE_RPC] event=REJECT reason=PATCH33_REQUIRED\n");
         return false;
     }
     GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=BEGIN run=%" PRIu64 "\n", run_id);
@@ -4729,6 +4729,56 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         resources.npu_host_stage_ms,
         resources.npu_bank_repack_bytes,
         resources.npu_bank_repack_ms);
+    const char * bank_status =
+        resources.bank_refill_count == 0 ? "NOT_EXERCISED" :
+        (resources.bank_refill_failed != 0 ||
+         resources.bank_refill_inflight != 0 ||
+         resources.bank_timeline_overflow != 0 ? "INCOMPLETE" : "PASS");
+    GGML_LOG_INFO(
+        "[PHONE_BANK_RUNTIME_PROFILE] source=RPC_PATCH33"
+        " run=%" PRIu64 " refills=%u failed=%u inflight=%u"
+        " unstaged=%u overflow=%u device_windows=%u"
+        " queue_ms=%.3f host_stage_wall_ms=%.3f"
+        " htp_lock_wait_ms=%.3f htp_critical_wall_ms=%.3f"
+        " precompile_ms=%.3f host_stage_htp_overlap_ms=%.3f"
+        " host_stage_adreno_overlap_ms=%.3f"
+        " htp_critical_adreno_overlap_ms=%.3f"
+        " source=RPC status=%s overlap_state=%s\n",
+        run_id,
+        resources.bank_refill_count,
+        resources.bank_refill_failed,
+        resources.bank_refill_inflight,
+        resources.bank_refill_unstaged,
+        resources.bank_timeline_overflow,
+        resources.bank_device_service_windows,
+        resources.bank_queue_ms,
+        resources.bank_host_stage_wall_ms,
+        resources.bank_htp_lock_wait_ms,
+        resources.bank_htp_critical_wall_ms,
+        resources.bank_precompile_ms,
+        resources.bank_host_stage_htp_overlap_ms,
+        resources.bank_host_stage_adreno_overlap_ms,
+        resources.bank_htp_critical_adreno_overlap_ms,
+        bank_status,
+        resources.bank_device_service_windows > 0 ?
+            "MEASURED" : "NO_DEVICE_SERVICE_WINDOWS");
+    GGML_LOG_INFO(
+        "[PHONE_LOCAL_HANDOFF_RUNTIME_PROFILE] source=RPC_PATCH33"
+        " run=%" PRIu64 " edges=%u incomplete=%u bytes=%" PRIu64
+        " host_move_ms=%.3f ready_to_upload_ms=%.3f"
+        " upload_ms=%.3f ready_to_device_ms=%.3f"
+        " host_copy_bytes=0 intermediate_p2c_bytes=0"
+        " status=%s\n",
+        run_id,
+        resources.local_handoff_edges,
+        resources.local_handoff_incomplete,
+        resources.local_handoff_bytes,
+        resources.local_handoff_move_ms,
+        resources.local_handoff_to_upload_ms,
+        resources.local_handoff_upload_ms,
+        resources.local_handoff_to_device_ms,
+        resources.local_handoff_edges == 0 ? "NOT_EXERCISED" :
+            resources.local_handoff_incomplete > 0 ? "INCOMPLETE" : "PASS");
     GGML_LOG_INFO("[PHONE_STAGE_PROFILE_RPC] event=COMPLETE "
                   "run=%" PRIu64 " samples=%u status=PASS\n",
                   run_id, total);
