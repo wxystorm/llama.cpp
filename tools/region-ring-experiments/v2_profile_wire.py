@@ -127,8 +127,7 @@ def validate_shape(value: dict[str, Any]) -> dict[str, Any]:
         "max_abs_error": finite_threshold(
             value.get("max_abs_error"), "MAX_ABS"),
     }
-    if result["kv_tokens"] < result["chunk"] or \
-            result["kv_tokens"] % result["chunk"] != 0:
+    if result["kv_tokens"] < result["chunk"]:
         raise ProfileProtocolError("INVALID_CHUNK_KV_GEOMETRY")
     return result
 
