@@ -134,6 +134,10 @@ if (LLAMA_BUILD_TOOLS)
             NAME test-region-ring-v2-matrix-cache
             LABEL region-ring
             ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_run_v2_stage_matrix.py)
+        llama_test_cmd(${Python3_EXECUTABLE}
+            NAME test-region-ring-v2-phone-profile-wire
+            LABEL region-ring
+            ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_v2_phone_profile_rpc.py)
     endif()
 endif()
 
