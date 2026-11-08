@@ -35,9 +35,10 @@ jobs:
             -DGGML_NATIVE=OFF
           cmake --build build --config Release --parallel 4 \
             --target test-phone-qwen3-local-builder test-phone-plan-region-map \
-                     test-region-ring-v2-stage region-ring-v2-stage-profile
+                     test-phone-mixed-pipeline test-region-ring-v2-stage \
+                     region-ring-v2-stage-profile
           ctest --test-dir build --output-on-failure \
-            -R "^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage|test-region-ring-v2-profile-help)$"
+            -R "^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-phone-mixed-pipeline|test-region-ring-v2-stage|test-region-ring-v2-profile-help)$"
       - name: Test native CPU N1-N4 prefix, resumable matrix and Phone RPC
         run: |
           PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
