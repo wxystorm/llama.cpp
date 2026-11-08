@@ -91,6 +91,8 @@ def collect(log: Path) -> list[dict[str, Any]]:
             "overflow": number(bank_raw, "overflow", integer=True),
             "device_windows": number(bank_raw, "device_windows",
                                      integer=True),
+            "htp_windows": number(bank_raw, "htp_windows", integer=True),
+            "adreno_windows": number(bank_raw, "adreno_windows", integer=True),
         }
         for field in (
             "queue_ms", "host_stage_wall_ms", "htp_lock_wait_ms",
@@ -99,6 +101,9 @@ def collect(log: Path) -> list[dict[str, Any]]:
             "htp_critical_adreno_overlap_ms",
         ):
             bank[field] = number(bank_raw, field)
+        if (bank["device_windows"] !=
+                bank["htp_windows"] + bank["adreno_windows"]):
+            raise ValueError("BANK_DEVICE_WINDOW_TOTAL_MISMATCH")
         if (bank["host_stage_htp_overlap_ms"] >
                 bank["host_stage_wall_ms"] + 0.02 or
                 bank["host_stage_adreno_overlap_ms"] >
@@ -114,11 +119,13 @@ def collect(log: Path) -> list[dict[str, Any]]:
             bank["htp_critical_adreno_overlap_ms"] /
             bank["htp_critical_wall_ms"]
             if bank["htp_critical_wall_ms"] > 0 else None)
+        bank["htp_overlap_verified"] = bank["htp_windows"] > 0
+        bank["adreno_overlap_verified"] = bank["adreno_windows"] > 0
         bank["usable_as_runtime_calibration"] = bool(
             bank["status"] == "PASS" and bank["refills"] >= 1 and
             bank["failed"] == 0 and bank["inflight"] == 0 and
             bank["overflow"] == 0 and bank["unstaged"] == 0 and
-            bank["device_windows"] > 0 and
+            bank["htp_windows"] > 0 and
             bank["overlap_state"] == "MEASURED")
 
         handoff = {
