@@ -138,6 +138,10 @@ if (LLAMA_BUILD_TOOLS)
             NAME test-region-ring-v2-phone-profile-wire
             LABEL region-ring
             ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_v2_phone_profile_rpc.py)
+        llama_test_cmd(${Python3_EXECUTABLE}
+            NAME test-region-ring-v2-runtime-profile-import
+            LABEL region-ring
+            ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_merge_v2_runtime_profile.py)
     endif()
 endif()
 
