@@ -102,6 +102,24 @@ def read_native(text: str) -> dict[str, str]:
     return rows[0]
 
 
+def strict_parity(row: dict[str, str],
+                  shape: dict[str, Any]) -> None:
+    if not shape["verify_cpu"]:
+        if row.get("parity") == "FAIL":
+            raise ProfileProtocolError("NATIVE_PARITY_FAILED_WITHOUT_REFERENCE")
+        return
+    if row.get("parity") not in ("PASS", "FAIL"):
+        raise ProfileProtocolError("MISSING_MANDATORY_CPU_PARITY")
+    try:
+        numeric_pass = (
+            float(row["relative_rmse"]) <= shape["max_relative_rmse"] and
+            float(row["max_abs"]) <= shape["max_abs_error"])
+    except (KeyError, ValueError) as exc:
+        raise ProfileProtocolError("MISSING_PARITY_ERROR_METRICS") from exc
+    if (row["parity"] == "PASS") != numeric_pass:
+        raise ProfileProtocolError("PARITY_LABEL_CONTRADICTS_NUMERICAL_ERRORS")
+
+
 def native_local(exe: Path, model: Path, shape: dict[str, Any],
                  timeout: int) -> tuple[str, dict[str, str], str]:
     argv = [
@@ -146,6 +164,7 @@ def native_local(exe: Path, model: Path, shape: dict[str, Any],
                 raise ProfileProtocolError("LOCAL_PROFILE_ZERO_COMPUTE")
         except (KeyError, ValueError) as exc:
             raise ProfileProtocolError("LOCAL_PROFILE_INVALID_ROW") from exc
+    strict_parity(row, shape)
     if proc.returncode == 0 and (
             row.get("parity") != "FAIL" and
             (not shape["verify_cpu"] or row.get("parity") == "PASS")):
@@ -187,6 +206,7 @@ def phone_remote(endpoint: str, token: str, timeout: int,
     if state not in ("PASS", "PARITY_FAIL"):
         raise ProfileProtocolError("PHONE_PROFILE_INVALID_RESPONSE_STATUS")
     row = validate_sample(response.get("sample"), shape)
+    strict_parity(row, shape)
     if state == "PASS" and (
             row["parity"] == "FAIL" or
             (shape["verify_cpu"] and row["parity"] != "PASS")):
