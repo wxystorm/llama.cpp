@@ -43,7 +43,7 @@ jobs:
 
       - name: Validate native PC real-weight prefix CPU N1/N2 and resumable profile
         run: |
-          python3 -m pip install --user numpy ./gguf-py
+          PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
           ctest --test-dir build --output-on-failure \
             -R '^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache)
 
