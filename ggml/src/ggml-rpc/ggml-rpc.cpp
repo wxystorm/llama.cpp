@@ -7647,6 +7647,9 @@ bool rpc_server::phone_stage_profile_pull(
         phone_stage_profile_finished.erase(phone_stage_profile_finished.begin());
         phone_stage_profile_overflow.erase(oldest);
         phone_stage_profile_banks.erase(oldest);
+        phone_stage_profile_bank_timeline.erase(oldest);
+        phone_stage_profile_device_windows.erase(oldest);
+        phone_stage_profile_local_handoff.erase(oldest);
     }
     const auto stats = phone_stage_profile_banks.find(request.run_id);
     if (stats != phone_stage_profile_banks.end()) {
@@ -7851,6 +7854,47 @@ bool rpc_server::phone_input_stream_run(
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
+                    if (job.state == phone_auto_status::COMPLETE &&
+                            job.device_service_begin_us > 0 &&
+                            job.device_service_end_us > job.device_service_begin_us) {
+                        const size_t lane = ggml_phone_npu_serial::htp_region(
+                            phone_npu_serial_regions,
+                            job.request.key.region) ? 0 : 1;
+                        phone_stage_profile_device_windows[request.run_id][lane]
+                            .push_back({job.device_service_begin_us,
+                                        job.device_service_end_us});
+                    }
+                    if (job.local_handoff_published_us > 0) {
+                        auto & h = phone_stage_profile_local_handoff[request.run_id];
+                        ++h.edges;
+                        h.bytes += job.local_handoff_bytes;
+                        if (job.local_handoff_move_begin_us > 0 &&
+                                job.local_handoff_published_us >=
+                                    job.local_handoff_move_begin_us) {
+                            h.move_ms += (job.local_handoff_published_us -
+                                          job.local_handoff_move_begin_us) / 1000.0;
+                        }
+                        if (job.upload_begin_us >= job.local_handoff_published_us) {
+                            h.to_upload_ms += (job.upload_begin_us -
+                                               job.local_handoff_published_us) / 1000.0;
+                        } else {
+                            ++h.incomplete;
+                        }
+                        if (job.upload_done_us >= job.upload_begin_us &&
+                                job.upload_begin_us > 0) {
+                            h.upload_ms += (job.upload_done_us -
+                                            job.upload_begin_us) / 1000.0;
+                        } else {
+                            ++h.incomplete;
+                        }
+                        if (job.device_service_begin_us >=
+                                job.local_handoff_published_us) {
+                            h.to_device_ms += (job.device_service_begin_us -
+                                               job.local_handoff_published_us) / 1000.0;
+                        } else {
+                            ++h.incomplete;
+                        }
+                    }
                     // Opt-in exact phone monotonic timestamps. Emit only
                     // at stream teardown, never in the hot Chunk path.
                     // P2C socket times are separately emitted by the sender
@@ -9851,6 +9895,19 @@ bool rpc_server::phone_local_handoff_publish(phone_auto_job & source) {
         return false;
     }
     // The same vector allocation now belongs to Adreno's input stage.
+    // Keep the destination's actual Phone clock boundary for the later
+    // upload/compute accounting. No extra Host copy is performed here.
+    const int64_t publish_us = ggml_time_us();
+    {
+        std::lock_guard<std::mutex> guard(phone_auto_mutex);
+        const auto dst_task = phone_auto_jobs.find(auto_key(key));
+        if (dst_task != phone_auto_jobs.end() &&
+                dst_task->second->state == phone_auto_status::REGISTERED) {
+            dst_task->second->local_handoff_move_begin_us = begin_us;
+            dst_task->second->local_handoff_published_us = publish_us;
+            dst_task->second->local_handoff_bytes = bytes;
+        }
+    }
     // The existing prepared-input worker owns the eventual Host->OpenCL
     // upload; it frees the buffer and releases the budget afterward.
     phone_input_stream_cv.notify_all();
