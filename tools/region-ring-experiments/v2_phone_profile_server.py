@@ -27,6 +27,7 @@ from v2_profile_wire import (
     DEFAULT_PORT, MAX_FRAME, ProfileProtocolError, SOURCE, WIRE_VERSION,
     decode, encode, validate_sample, validate_shape,
 )
+from v2_profile_transfer import phone_serve_transfer, validate_transfer
 
 
 def sha256(path: Path) -> str:
@@ -78,13 +79,22 @@ class Service:
                 "backends": ["N", "A"],
                 "transport": "V2_PHONE_PROFILE_SIDECAR"}
 
+    def authenticate(self, request: dict[str, Any]) -> None:
+        if self.token:
+            supplied = request.get("token")
+            if not isinstance(supplied, str) or not secrets.compare_digest(
+                    supplied, self.token):
+                raise ProfileProtocolError("UNAUTHORIZED_PROFILE_REQUEST")
+
+    def authorize_transfer(self, request: dict[str, Any]) -> None:
+        self.authenticate(request)
+        if request.get("model_sha256") != self.model_sha256:
+            raise ProfileProtocolError("PHONE_PC_GGUF_SHA256_MISMATCH")
+        validate_transfer(request)
+
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         try:
-            if self.token:
-                supplied = request.get("token")
-                if not isinstance(supplied, str) or not secrets.compare_digest(
-                        supplied, self.token):
-                    raise ProfileProtocolError("UNAUTHORIZED_PROFILE_REQUEST")
+            self.authenticate(request)
             action = request.get("action")
             if action == "hello":
                 return self.hello()
@@ -166,6 +176,10 @@ class Handler(socketserver.StreamRequestHandler):
         try:
             raw = self.rfile.readline(MAX_FRAME + 1)
             request = decode(raw)
+            if request.get("action") == "transfer":
+                self.server.service.authorize_transfer(request)
+                phone_serve_transfer(request, self.rfile, self.connection)
+                return
             response = self.server.service.dispatch(request)
         except (ProfileProtocolError, ValueError, OSError) as exc:
             response = {"version": WIRE_VERSION, "status": "ERROR",
