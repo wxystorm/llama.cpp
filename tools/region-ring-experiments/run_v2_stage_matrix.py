@@ -395,7 +395,9 @@ def run_matrix(args: argparse.Namespace) -> int:
     # receiver times only, NOT production ggml-rpc Tensor transfer costs.
     transfer_records: list[dict[str, Any]] = []
     transfer_failed: list[dict[str, Any]] = []
-    sizes_spec = getattr(args, "tcp_transfer_sizes_kib", "")
+    sizes_spec = (
+        "" if getattr(args, "skip_tcp_transfer", False) else
+        getattr(args, "tcp_transfer_sizes_kib", ""))
     if use_phone and phone and sizes_spec:
         sizes = csv_positive(sizes_spec, "TRANSFER_SIZES_KIB")
         if max(sizes) > 32768:
@@ -594,6 +596,8 @@ def main() -> int:
     parser.add_argument("--host-stage-cap-mib", type=int, default=1024)
     parser.add_argument("--tcp-transfer-sizes-kib", default="256,1024,2048,4096",
                         help="Phone TCP unidirectional binary payload sizes in KiB; empty disables")
+    parser.add_argument("--skip-tcp-transfer", action="store_true",
+                        help="Run only independent Compute/Activation/Bank profiles")
     parser.add_argument("--tcp-transfer-warmups", type=int, default=1)
     parser.add_argument("--tcp-transfer-repeats", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=0)
