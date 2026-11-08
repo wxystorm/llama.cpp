@@ -14,15 +14,7 @@ on:
       - 'tests/test-phone-qwen3-local-builder.cpp'
       - 'tests/test-phone-plan-region-map.cpp'
       - 'tests/CMakeLists.txt'
-      - 'tools/region-ring-experiments/CMakeLists.txt'
-      - 'tools/region-ring-experiments/v2_stage_profile.cpp'
-      - 'tools/region-ring-experiments/run_v2_stage_matrix.py'
-      - 'tools/region-ring-experiments/v2_phone_profile_server.py'
-      - 'tools/region-ring-experiments/v2_profile_wire.py'
-      - 'tools/region-ring-experiments/test_v2_phone_profile_rpc.py'
-      - 'tools/region-ring-experiments/V2_PHONE_PROFILE_RPC.md'
-      - 'tools/region-ring-experiments/test_run_v2_stage_matrix.py'
-      - 'tools/region-ring-experiments/test_v2_native_stage_profile.py'
+      - 'tools/region-ring-experiments/**'
       - 'tools/CMakeLists.txt'
 
 jobs:
@@ -30,12 +22,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Compile and run standalone Stage contract in Release mode
+      - name: Compile standalone V2 Stage contract in Release mode
         run: |
           g++ -std=c++17 -DNDEBUG -O2 -Wall -Wextra -Werror \
             tests/test-region-ring-v2-stage.cpp -o /tmp/test-region-ring-v2-stage
           /tmp/test-region-ring-v2-stage
-      - name: Compile and run Phone multi-layer metadata / Region map tests
+      - name: Build GGML Phone metadata tests and native prefix profiler
         run: |
           cmake -S . -B build -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON \
             -DGGML_NATIVE=OFF
@@ -43,29 +35,9 @@ jobs:
             --target test-phone-qwen3-local-builder test-phone-plan-region-map \
                      test-region-ring-v2-stage region-ring-v2-stage-profile
           ctest --test-dir build --output-on-failure \
-            -R '^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage|test-region-ring-v2-profile-help)
-
-      - name: Validate native PC CPU prefix, resumable matrix and Phone protocol
+            -R "^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage|test-region-ring-v2-profile-help)$"
+      - name: Test native CPU N1-N4 prefix, resumable matrix and Phone RPC
         run: |
           PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
           ctest --test-dir build --output-on-failure \
-            -R '^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache|test-region-ring-v2-phone-profile-wire)
-
-
-
-      - name: Validate native PC real-weight prefix CPU N1/N2 and resumable profile
-        run: |
-          PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
-          ctest --test-dir build --output-on-failure \
-            -R '^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache)
-
-
-
-
-
-      - name: Validate native PC real-weight prefix CPU N1/N2 and resumable profile
-        run: |
-          PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
-          ctest --test-dir build --output-on-failure \
-            -R '^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache)
-
+            -R "^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache|test-region-ring-v2-phone-profile-wire)$"
