@@ -36,8 +36,13 @@ class MatrixTests(unittest.TestCase):
                 repeats = command[command.index("--repeats") + 1]
                 return mock.Mock(
                     returncode=0, stderr="", stdout=(
-                        "backend,layers,chunk,kv_tokens,repeats,parity,source\n"
-                        f"{backend},2,64,512,{repeats},NOT_REQUESTED,"
+                        "backend,layers,chunk,kv_tokens,repeats,"
+                        "graph_build_ms,weight_upload_ms,htp_precompile_ms,"
+                        "prepare_median_ms,compute_median_ms,weight_bytes,"
+                        "kv_bytes,graph_workspace_bytes,relative_rmse,"
+                        "max_abs,parity,source\n"
+                        f"{backend},2,64,512,{repeats},1.0,2.0,0,0.1,3.0,"
+                        "100,100,100,0,0,NOT_REQUESTED,"
                         "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
             with mock.patch("subprocess.run", side_effect=completed) as run:
                 self.assertEqual(run_matrix(args), 0)
@@ -74,6 +79,91 @@ class MatrixTests(unittest.TestCase):
                     (args.out / "N-L2-X64-KV512.json").read_text("utf-8")
                 )["status"], "FAIL")
             self.assertTrue((args.out / "N-L2-X64-KV512.failed.json").exists())
+
+    def test_pc_and_phone_gcna_dispatch_and_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            model = base / "m.gguf"
+            model.write_bytes(b"qwen3 fake for matching digest")
+            args = argparse.Namespace(
+                exe=Path(sys.executable), model=model, out=base / "profile",
+                phone="127.0.0.1:50177", phone_token="", phone_timeout=10,
+                backends="GCNA", layers="2", chunks="64", kvs="512",
+                warmups=1, repeats=3, threads=4, timeout=2,
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                update=False, dry_run=False)
+            info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "device_id": "d" * 64}
+            def local_response(command, **_):
+                backend = command[command.index("--backend") + 1]
+                return mock.Mock(returncode=0, stderr="", stdout=(
+                    "backend,layers,chunk,kv_tokens,repeats,"
+                    "graph_build_ms,weight_upload_ms,htp_precompile_ms,"
+                    "prepare_median_ms,compute_median_ms,weight_bytes,"
+                    "kv_bytes,graph_workspace_bytes,relative_rmse,"
+                    "max_abs,parity,source\n"
+                    f"{backend},2,64,512,3,1,2,0,0.1,3,100,100,100,0,0,"
+                    "NOT_REQUESTED,NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
+            def remote_response(endpoint, token, timeout, sha, phone, shape):
+                row = {"backend": shape["backend"], "layers": "2",
+                       "chunk": "64", "kv_tokens": "512", "repeats": "3",
+                       "graph_build_ms": "1", "weight_upload_ms": "1",
+                       "htp_precompile_ms": "0.04",
+                       "prepare_median_ms": "0.1",
+                       "compute_median_ms": "2.0", "weight_bytes": "100",
+                       "kv_bytes": "100", "graph_workspace_bytes": "100",
+                       "relative_rmse": "0.01", "max_abs": "0.1",
+                       "parity": ("PASS" if shape["backend"] == "N"
+                                  else "NOT_REQUESTED"),
+                       "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
+                return "PASS", row, ""
+            with mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
+                 mock.patch("run_v2_stage_matrix.phone_remote",
+                            side_effect=remote_response) as remote, \
+                 mock.patch("subprocess.run", side_effect=local_response) as local:
+                self.assertEqual(run_matrix(args), 0)
+                self.assertEqual(remote.call_count, 2)
+                self.assertEqual(local.call_count, 2)
+                self.assertEqual(run_matrix(args), 0)
+                self.assertEqual(remote.call_count, 2)
+                self.assertEqual(local.call_count, 2)
+            import csv
+            with (args.out / "stage-profile-v2.csv").open(newline="") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual({r["backend"] for r in rows}, set("GCNA"))
+            self.assertEqual(len(rows), 4)
+
+    def test_remote_n4_parity_fail_never_enters_pass_csv(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            model = base / "m.gguf"
+            model.write_bytes(b"qwen3 fake")
+            args = argparse.Namespace(
+                exe=None, model=model, out=base / "out",
+                phone="127.0.0.1:50177", phone_token="", phone_timeout=10,
+                backends="N", layers="4", chunks="64", kvs="512",
+                warmups=1, repeats=3, threads=4, timeout=2,
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                update=False, dry_run=False)
+            info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "device_id": "d" * 64}
+            sample = {"backend": "N", "layers": "4", "chunk": "64",
+                      "kv_tokens": "512", "repeats": "3",
+                      "relative_rmse": "0.071", "max_abs": "2.289",
+                      "compute_median_ms": "41.2",
+                      "parity": "FAIL",
+                      "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
+            with mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
+                 mock.patch("run_v2_stage_matrix.phone_remote",
+                            return_value=("PARITY_FAIL", sample, "")):
+                self.assertEqual(run_matrix(args), 1)
+            self.assertFalse((args.out / "stage-profile-v2.csv").exists())
+            self.assertTrue(
+                (args.out / "stage-profile-v2-parity-fail.csv").exists())
+            import json
+            record = json.loads((args.out / "N-L4-X64-KV512.json").read_text())
+            self.assertEqual(record["status"], "PARITY_FAIL")
+            self.assertEqual(record["sample"]["compute_median_ms"], "41.2")
 
 
 if __name__ == "__main__":
