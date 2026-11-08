@@ -456,9 +456,41 @@ def run_matrix(args: argparse.Namespace) -> int:
                           f"size_kib={size_kib}: {exc}",
                           file=sys.stderr, flush=True)
     save_rows(out / "tcp-link-v2.csv", transfer_records)
+    # These are measured GGML backend Buffer allocations, NOT actual
+    # peak resident device memory; HTP dev_get_memory currently reports
+    # (0,0) and cannot substantiate free capacity. The 2-weight-bank
+    # number is a lower-bound allocation estimate, NOT a successful
+    # second-bank allocation or overlap test.
+    stage_allocations = []
+    for record in complete + parity_fails:
+        sample = record["sample"]
+        try:
+            weights = int(sample["weight_bytes"])
+            kv_bytes = int(sample["kv_bytes"])
+            workspace = int(sample["graph_workspace_bytes"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("STAGE_ALLOCATION_METRICS_MISSING") from exc
+        if min(weights, kv_bytes, workspace) < 0:
+            raise ValueError("STAGE_ALLOCATION_METRICS_NEGATIVE")
+        backend = record["key"]["backend"]
+        stage_allocations.append({
+            "backend": backend,
+            "layers": record["key"]["layers"],
+            "chunk": record["key"]["chunk"],
+            "kv_tokens": record["key"]["kv_tokens"],
+            "numeric_status": record["status"],
+            "weight_buffer_bytes": weights,
+            "kv_buffer_bytes": kv_bytes,
+            "graph_workspace_buffer_bytes": workspace,
+            "single_stage_allocation_sum_bytes": weights + kv_bytes + workspace,
+            "two_weight_banks_allocation_sum_bytes": (
+                2 * weights + kv_bytes + workspace if backend == "N" else None),
+            "physical_free_memory_verified": False,
+            "two_bank_allocated_and_tested": False,
+        })
     # Unified structured model-specific Profile cache for the future V2
-    # Planner. Never claim Planner readiness before transfer/Bank profiles
-    # and all required numerical/compute backend samples are complete.
+    # Planner. Never claim Planner readiness before production transfer/Bank
+    # probes and all required numerical/compute samples are complete.
     aggregate = {
         "schema": 2,
         "model_sha256": model_sha,
@@ -490,6 +522,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                    "parity_fail": len(parity_fails),
                    "failed": len(failed_records)},
         "compute_complete": len(complete) == len(combinations),
+        "stage_memory_allocations": stage_allocations,
         "tcp_transfer_samples": [
             {"key": record["key"], "sample": record["sample"],
              "source": record["origin"], "planner_eligible": False}
