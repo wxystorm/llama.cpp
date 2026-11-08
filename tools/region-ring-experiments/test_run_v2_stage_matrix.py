@@ -107,6 +107,7 @@ class MatrixTests(unittest.TestCase):
                 verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
                 update=False, dry_run=False)
             info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "runtime_sha256": "r" * 64,
                     "device_id": "d" * 64}
             def local_response(command, **_):
                 backend = command[command.index("--backend") + 1]
@@ -173,6 +174,7 @@ class MatrixTests(unittest.TestCase):
                 tcp_transfer_warmups=1, tcp_transfer_repeats=3,
                 update=False, dry_run=False)
             info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "runtime_sha256": "r" * 64,
                     "device_id": "d" * 64}
             native = {"backend": "N", "layers": "2", "chunk": "64",
                       "kv_tokens": "512", "repeats": "3",
@@ -267,6 +269,7 @@ class MatrixTests(unittest.TestCase):
                 verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
                 update=False, dry_run=False)
             info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "runtime_sha256": "r" * 64,
                     "device_id": "d" * 64}
             sample = {"backend": "N", "layers": "4", "chunk": "64",
                       "kv_tokens": "512", "repeats": "3",
