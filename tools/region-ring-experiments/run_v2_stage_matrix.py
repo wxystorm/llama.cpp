@@ -74,7 +74,7 @@ def cases(backends: str, layers: list[int], chunks: list[int],
         raise ValueError("INVALID_BACKENDS:expected a subset of GCNA")
     return [(backend, n, x, kv) for backend, n, x, kv in
             itertools.product(dict.fromkeys(backends), layers, chunks, kvs)
-            if kv >= x and kv % x == 0]
+            if kv >= x]
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
