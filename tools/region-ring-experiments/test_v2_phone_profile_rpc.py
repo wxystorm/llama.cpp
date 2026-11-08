@@ -32,6 +32,8 @@ def native_response(backend: str = "N", n: int = 2,
                     status: str = "PASS"):
     parity = status if status == "FAIL" else (
         "PASS" if backend == "N" else "NOT_REQUESTED")
+    relative_rmse = 0.071 if status == "FAIL" else 0.010
+    max_abs = 2.289 if status == "FAIL" else 0.140
     return SimpleNamespace(
         returncode=2 if status == "FAIL" else 0,
         stderr="HTP test diagnostics",
@@ -40,7 +42,7 @@ def native_response(backend: str = "N", n: int = 2,
                 "compute_median_ms,weight_bytes,kv_bytes,"
                 "graph_workspace_bytes,relative_rmse,max_abs,parity,source\n"
                 f"{backend},{n},64,512,3,13.0,32.0,0.04,0.11,20.5,"
-                f"4096,512,512,0.071,2.289,{parity},"
+                f"4096,512,512,{relative_rmse},{max_abs},{parity},"
                 "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
 
 
