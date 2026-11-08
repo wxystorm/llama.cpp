@@ -14,6 +14,12 @@ on:
       - 'tests/test-phone-qwen3-local-builder.cpp'
       - 'tests/test-phone-plan-region-map.cpp'
       - 'tests/CMakeLists.txt'
+      - 'tools/region-ring-experiments/CMakeLists.txt'
+      - 'tools/region-ring-experiments/v2_stage_profile.cpp'
+      - 'tools/region-ring-experiments/run_v2_stage_matrix.py'
+      - 'tools/region-ring-experiments/test_run_v2_stage_matrix.py'
+      - 'tools/region-ring-experiments/test_v2_native_stage_profile.py'
+      - 'tools/CMakeLists.txt'
 
 jobs:
   host-contract:
@@ -30,6 +36,14 @@ jobs:
           cmake -S . -B build -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON \
             -DGGML_NATIVE=OFF
           cmake --build build --config Release --parallel 4 \
-            --target test-phone-qwen3-local-builder test-phone-plan-region-map test-region-ring-v2-stage
+            --target test-phone-qwen3-local-builder test-phone-plan-region-map \
+                     test-region-ring-v2-stage region-ring-v2-stage-profile
           ctest --test-dir build --output-on-failure \
-            -R '^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage)$'
+            -R '^(test-phone-qwen3-local-builder|test-phone-plan-region-map|test-region-ring-v2-stage|test-region-ring-v2-profile-help)
+
+      - name: Validate native PC real-weight prefix CPU N1/N2 and resumable profile
+        run: |
+          python3 -m pip install --user numpy ./gguf-py
+          ctest --test-dir build --output-on-failure \
+            -R '^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache)
+
