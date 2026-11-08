@@ -273,11 +273,20 @@ def run_matrix(args: argparse.Namespace) -> int:
     phone_timeout = int(getattr(args, "phone_timeout", 360))
     if phone_timeout <= 0:
         raise ValueError("INVALID_PHONE_TIMEOUT")
+    phone_error = ""
     if use_phone:
-        phone = hello_phone(endpoint, token, phone_timeout, model_sha)
-        print("[V2_PROFILE_MATRIX] PHONE_CONNECTED device_id=" +
-              phone["device_id"][:16] + " exe_sha256=" +
-              phone["exe_sha256"][:16], flush=True)
+        try:
+            phone = hello_phone(endpoint, token, phone_timeout, model_sha)
+            print("[V2_PROFILE_MATRIX] PHONE_CONNECTED device_id=" +
+                  phone["device_id"][:16] + " exe_sha256=" +
+                  phone["exe_sha256"][:16], flush=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Do not abandon PC G/C measurements if Phone is offline or
+            # carries a different original GGUF; each N/A case will fail
+            # explicitly and remain eligible for later resume.
+            phone_error = str(exc)
+            print("[V2_PROFILE_MATRIX] PHONE_UNAVAILABLE reason=" +
+                  phone_error, file=sys.stderr, flush=True)
     complete: list[dict[str, Any]] = []
     parity_fails: list[dict[str, Any]] = []
     failures = 0
@@ -293,8 +302,10 @@ def run_matrix(args: argparse.Namespace) -> int:
         }
         identity = {
             "model_sha256": model_sha,
-            "exe_sha256": phone["exe_sha256"] if remote else native_sha,
-            "device_id": phone["device_id"] if remote else local_device,
+            "exe_sha256": (phone["exe_sha256"] if phone else None)
+                if remote else native_sha,
+            "device_id": (phone["device_id"] if phone else "PHONE_UNAVAILABLE")
+                if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
         }
         key = {**identity, **shape}
@@ -309,6 +320,9 @@ def run_matrix(args: argparse.Namespace) -> int:
               f"device={'PHONE' if remote else 'PC'}", flush=True)
         try:
             if remote:
+                if phone is None:
+                    raise ProfileProtocolError(
+                        "PHONE_PROFILE_NOT_CONNECTED:" + phone_error)
                 state, sample, diag = phone_remote(
                     endpoint, token, phone_timeout, model_sha, phone, shape)
             else:
