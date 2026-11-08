@@ -65,7 +65,9 @@ class ProfileWireTests(unittest.TestCase):
         with self.assertRaises(ProfileProtocolError):
             validate_shape(p)
         p = shape()
-        p["chunk"] = 100
+        p["chunk"] = 96
+        self.assertEqual(validate_shape(p)["chunk"], 96)
+        p["chunk"] = 1024
         with self.assertRaises(ProfileProtocolError):
             validate_shape(p)
         p = shape()
