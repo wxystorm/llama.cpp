@@ -513,6 +513,28 @@ struct rpc_msg_phone_stage_profile_rsp {
     double npu_host_stage_ms = 0;
     uint64_t npu_bank_repack_bytes = 0;
     double npu_bank_repack_ms = 0;
+    // Patch33: same-Phone monotonic clock boundaries. Values are actual
+    // production Region Bank-Mover and local N->OpenCL handoff timings,
+    // not extrapolated from independent Stage Profile/TCP probes.
+    uint32_t bank_refill_count = 0;
+    uint32_t bank_refill_failed = 0;
+    uint32_t bank_refill_inflight = 0;
+    uint32_t bank_refill_unstaged = 0;
+    double bank_queue_ms = 0;
+    double bank_host_stage_wall_ms = 0;
+    double bank_htp_lock_wait_ms = 0;
+    double bank_htp_critical_wall_ms = 0;
+    double bank_precompile_ms = 0;
+    double bank_host_stage_htp_overlap_ms = 0;
+    double bank_host_stage_adreno_overlap_ms = 0;
+    double bank_htp_critical_adreno_overlap_ms = 0;
+    uint32_t local_handoff_edges = 0;
+    uint32_t local_handoff_incomplete = 0;
+    uint64_t local_handoff_bytes = 0;
+    double local_handoff_move_ms = 0;
+    double local_handoff_to_upload_ms = 0;
+    double local_handoff_upload_ms = 0;
+    double local_handoff_to_device_ms = 0;
     rpc_msg_phone_stage_profile_sample samples[RPC_PHONE_STAGE_PROFILE_PAGE] = {};
 };
 struct rpc_msg_phone_auto_task_req {
@@ -6604,6 +6626,11 @@ private:
         int64_t device_service_end_us = 0;
         int64_t capture_begin_us = 0;
         int64_t capture_end_us = 0;
+        // Destination Adreno event: exact same Host F32 allocation was
+        // moved from an HTP predecessor without TCP or Host memcpy.
+        int64_t local_handoff_move_begin_us = 0;
+        int64_t local_handoff_published_us = 0;
+        uint64_t local_handoff_bytes = 0;
     };
     bool phone_local_handoff_publish(phone_auto_job & source);
     enum class phone_npu_preload_status : uint8_t {
@@ -6715,8 +6742,14 @@ private:
     // never write into a freshly re-primed Bank.
     uint64_t phone_npu_banked_run_id = 0;
     std::set<uint32_t> phone_npu_banked_ready_regions;
-    std::deque<std::pair<uint64_t, ggml_phone_npu_serial::weight_bank_refill>>
+    struct phone_npu_queued_bank_refill {
+        uint64_t run_id = 0;
+        ggml_phone_npu_serial::weight_bank_refill refill {};
+        int64_t queued_us = 0;
+    };
+    std::deque<phone_npu_queued_bank_refill>
         phone_npu_bank_refill_jobs; // guarded by phone_auto_mutex
+    uint64_t phone_npu_bank_active_run = 0; // guarded by phone_auto_mutex
     std::thread phone_npu_bank_thread;
     // The async preloader never takes graph_compute_mutex during REPACK,
     // so PC graph/task registration cannot be serialized behind ~2s of
@@ -6852,6 +6885,37 @@ private:
         double repack_ms = 0;
     };
     std::map<uint64_t, phone_profile_bank_stats> phone_stage_profile_banks;
+    struct phone_profile_bank_timeline {
+        uint32_t region = 0;
+        uint32_t bank = 0;
+        int64_t enqueue_us = 0;
+        int64_t dequeue_us = 0;
+        int64_t stage_begin_us = 0;
+        int64_t stage_end_us = 0;
+        int64_t lock_begin_us = 0;
+        int64_t lock_acquired_us = 0;
+        int64_t critical_end_us = 0;
+        double precompile_ms = 0;
+        bool staged = false;
+        bool ok = false;
+    };
+    std::map<uint64_t, std::vector<phone_profile_bank_timeline>>
+        phone_stage_profile_bank_timeline;
+    // Completed same-Phone device-service intervals (separate HTP and A
+    // lanes), retained until Patch33 telemetry is fetched by the PC.
+    std::map<uint64_t, std::array<std::vector<ggml_phone_mixed_pipeline::interval>, 2>>
+        phone_stage_profile_device_windows;
+    struct phone_profile_local_handoff {
+        uint32_t edges = 0;
+        uint32_t incomplete = 0;
+        uint64_t bytes = 0;
+        double move_ms = 0;
+        double to_upload_ms = 0;
+        double upload_ms = 0;
+        double to_device_ms = 0;
+    };
+    std::map<uint64_t, phone_profile_local_handoff>
+        phone_stage_profile_local_handoff;
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
