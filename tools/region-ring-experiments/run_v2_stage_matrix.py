@@ -456,10 +456,10 @@ def main() -> int:
     parser.add_argument("--update", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    if args.warmups < 0 or args.repeats < 1 or args.threads < 1 or \
+    if (args.warmups < 0 or args.repeats < 1 or args.threads < 1 or
             args.timeout < 0 or args.phone_timeout < 1 or
             args.bank_repeats < 0 or args.bank_repeats > 20 or
-            args.host_stage_cap_mib < 1:
+            args.host_stage_cap_mib < 1):
         parser.error("INVALID_PROFILE_TIMINGS")
     try:
         return run_matrix(args)
