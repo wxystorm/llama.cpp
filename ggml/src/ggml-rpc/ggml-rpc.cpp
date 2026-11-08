@@ -522,6 +522,8 @@ struct rpc_msg_phone_stage_profile_rsp {
     uint32_t bank_refill_unstaged = 0;
     uint32_t bank_timeline_overflow = 0;
     uint32_t bank_device_service_windows = 0;
+    uint32_t bank_htp_service_windows = 0;
+    uint32_t bank_adreno_service_windows = 0;
     double bank_queue_ms = 0;
     double bank_host_stage_wall_ms = 0;
     double bank_htp_lock_wait_ms = 0;
@@ -4739,6 +4741,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         "[PHONE_BANK_RUNTIME_PROFILE] source=RPC_PATCH33"
         " run=%" PRIu64 " refills=%u failed=%u inflight=%u"
         " unstaged=%u overflow=%u device_windows=%u"
+        " htp_windows=%u adreno_windows=%u"
         " queue_ms=%.3f host_stage_wall_ms=%.3f"
         " htp_lock_wait_ms=%.3f htp_critical_wall_ms=%.3f"
         " precompile_ms=%.3f host_stage_htp_overlap_ms=%.3f"
@@ -4752,6 +4755,8 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         resources.bank_refill_unstaged,
         resources.bank_timeline_overflow,
         resources.bank_device_service_windows,
+        resources.bank_htp_service_windows,
+        resources.bank_adreno_service_windows,
         resources.bank_queue_ms,
         resources.bank_host_stage_wall_ms,
         resources.bank_htp_lock_wait_ms,
@@ -7723,8 +7728,12 @@ bool rpc_server::phone_stage_profile_pull(
         empty_windows : windows_it->second[0];
     const auto & adreno_windows = windows_it == phone_stage_profile_device_windows.end() ?
         empty_windows : windows_it->second[1];
+    response.bank_htp_service_windows =
+        static_cast<uint32_t>(htp_windows.size());
+    response.bank_adreno_service_windows =
+        static_cast<uint32_t>(adreno_windows.size());
     response.bank_device_service_windows =
-        static_cast<uint32_t>(htp_windows.size() + adreno_windows.size());
+        response.bank_htp_service_windows + response.bank_adreno_service_windows;
     response.bank_timeline_overflow =
         phone_stage_profile_bank_timeline_overflow.count(request.run_id) ? 1 : 0;
     response.bank_refill_inflight =
