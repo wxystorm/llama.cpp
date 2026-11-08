@@ -357,6 +357,10 @@ inline bool build_graph(ggml_context * ctx,
 // consumed by Layer i+1, with independently owned per-layer K/V tensors.
 // This constructs metadata only; the caller is responsible for HTP weight
 // residence, KV initialization, input binding, compilation, and execution.
+// When preserve_layer_outputs is true, flag each intermediate l_out as a
+// Graph OUTPUT before GGML Gallocr plans buffers. This keeps its storage
+// alive for post-run HTP-vs-CPU per-layer diagnosis; normal profiling
+// leaves intermediate tensors recyclable and preserves production timing.
 // It does not silently fall back to an OpenCL or PC executor.
 inline bool build_graph_layers(
         ggml_context * ctx,
@@ -365,7 +369,8 @@ inline bool build_graph_layers(
         const std::vector<layer_weights> & weights,
         multi_graph_result & out,
         const char * & reason,
-        const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & kv = {}) {
+        const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & kv = {},
+        bool preserve_layer_outputs = false) {
     out = {};
     if (!ctx || weights.empty() || weights.size() > 32 ||
             first_layer_plan.layer + weights.size() > 256 ||
@@ -390,7 +395,8 @@ inline bool build_graph_layers(
             nullptr : out.layers.back().output;
         graph_result layer {};
         if (!build_graph(ctx, p, chunk, weights[i], layer, reason,
-                         k, v, input, graph, i + 1 == weights.size())) {
+                         k, v, input, graph,
+                         preserve_layer_outputs || i + 1 == weights.size())) {
             out = {};
             return false;
         }
