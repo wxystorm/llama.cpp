@@ -60,7 +60,7 @@ separately.
    Graph build, prepare, compute, synchronization and memory peaks
    are measured separately; warmups are excluded from medians.
 4. Phone runs N/A probes locally, then reports paged typed results
-   through PC-initiated RPC, reusing the verified Patch32 telemetry
+   through PC-initiated RPC, reusing the verified Patch33 telemetry
    transport primitives. No manual Android log copying and no
    operator-authored HTP Region/layer environment variables.
 5. Transfer profiling uses real PUSH/P2C and PC CUDA H2D/D2H paths
@@ -162,6 +162,17 @@ Implemented in this V2 branch:
 - Phone device/lib/DSP/Android firmware runtime fingerprinting to
   invalidate old timing samples after a backend binary update.
 See V2_NATIVE_STAGE_PROFILE.md and V2_PHONE_PROFILE_RPC.md.
+
+Production-path timing instrumentation (RPC Patch33) now additionally
+records the existing real two-weight-Bank Mover queue/Host staging/HTP
+repack+Graph precompile intervals, measures overlap against completed
+Phone HTP/Adreno service windows, and tracks zero-copy NPU->Adreno
+local handoff until downstream upload/device service. The PC imports
+these from already returned RPC log events into a separate model-bound
+Profile using merge_v2_runtime_profile.py, without Android log copying.
+These changes are NOT equivalent to an observed physical runtime PASS;
+the double-Bank overlap and final combined Planner remain gated on
+a matching PC/Phone hardware test. See V2_RUNTIME_BANK_PROFILE.md.
 
 **Not yet implemented or verified:**
 - end-to-end verification of the new GCNA matrix/RPC sidecar on
