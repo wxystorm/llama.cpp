@@ -220,6 +220,113 @@ struct model {
         region_memory_feasible;
 };
 
+// Planner-side policy: keep the existing G/C/P candidate search, then
+// expand selected Phone Regions into an NPU prefix and an optional Adreno
+// suffix. Physical Region IDs stay in the returned layout, so the Plan can
+// configure HTP ranks without a Phone-side environment list. The caller
+// supplies correctness-qualified native N/A shapes and the *joint* memory
+// guard (two HTP Banks + persistent KV + Adreno resident weights/scratch).
+// This is a pure feasibility/ranking step: no Graphs or RPC are executed.
+struct phone_npu_spill_result {
+    std::vector<llama_region_ring_region> regions;
+    std::vector<size_t> npu_region_indices;
+    int npu_layers = 0;
+    int adreno_layers = 0;
+};
+
+inline bool choose_phone_npu_preferred_spill(
+        const std::vector<llama_region_ring_region> & logical,
+        int max_npu_layers_per_region,
+        const std::function<bool(int, int)> & npu_supported,
+        const std::function<bool(int, int)> & adreno_supported,
+        const std::function<bool(
+            const std::vector<llama_region_ring_region> &,
+            const std::vector<size_t> &)> & memory_feasible,
+        phone_npu_spill_result & selected,
+        size_t max_combinations = 50000) {
+    selected = {};
+    if (logical.empty() || max_npu_layers_per_region < 1 ||
+            !npu_supported || !adreno_supported || !memory_feasible ||
+            max_combinations == 0) {
+        return false;
+    }
+    phone_npu_spill_result work;
+    size_t evaluated = 0;
+    bool exceeded = false;
+    bool found = false;
+    std::function<void(size_t)> extend = [&](size_t index) {
+        if (exceeded) { return; }
+        if (index == logical.size()) {
+            if (++evaluated > max_combinations) {
+                exceeded = true;
+                return;
+            }
+            if (!memory_feasible(
+                    work.regions, work.npu_region_indices)) {
+                return;
+            }
+            if (!found || work.npu_layers > selected.npu_layers) {
+                selected = work;
+                found = true;
+            }
+            return;
+        }
+        const auto & r = logical[index];
+        if (r.layer_end <= r.layer_begin ||
+                (index > 0 &&
+                 r.layer_begin != logical[index - 1].layer_end)) {
+            return;
+        }
+        if (r.device != device::PHONE ||
+                r.kind != llama_region_ring_stage_kind::PHONE) {
+            work.regions.push_back(r);
+            extend(index + 1);
+            work.regions.pop_back();
+            return;
+        }
+        const int depth = r.layer_end - r.layer_begin;
+        for (int n = std::min(depth, max_npu_layers_per_region);
+                n >= 0 && !exceeded; --n) {
+            const int a = depth - n;
+            if (n > 0 &&
+                    !npu_supported(r.layer_begin, r.layer_begin + n)) {
+                continue;
+            }
+            if (a > 0 &&
+                    !adreno_supported(
+                        r.layer_begin + n, r.layer_end)) {
+                continue;
+            }
+            const size_t old_count = work.regions.size();
+            if (n > 0) {
+                work.npu_region_indices.push_back(work.regions.size());
+                work.regions.emplace_back(
+                    device::PHONE, r.layer_begin, r.layer_begin + n);
+            }
+            if (a > 0) {
+                work.regions.emplace_back(
+                    device::PHONE, r.layer_begin + n, r.layer_end);
+            }
+            work.npu_layers += n;
+            work.adreno_layers += a;
+            extend(index + 1);
+            work.npu_layers -= n;
+            work.adreno_layers -= a;
+            work.regions.resize(old_count);
+            if (n > 0) {
+                work.npu_region_indices.pop_back();
+            }
+        }
+    };
+    extend(0);
+    // A truncated search cannot truthfully claim a maximal NPU preference.
+    if (exceeded) {
+        selected = {};
+        return false;
+    }
+    return found;
+}
+
 inline int chunk_for(const candidate & c, device d) {
     return d == device::CPU ? c.xc : d == device::GPU ? c.xg : c.xp;
 }
