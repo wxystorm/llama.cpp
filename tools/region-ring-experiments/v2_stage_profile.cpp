@@ -319,6 +319,9 @@ struct sample_result {
     double prepare_ms = 0;
     double compute_ms = 0;
     double htp_precompile_ms = 0;
+    double activation_upload_median_ms = 0;
+    double activation_readback_median_ms = 0;
+    size_t activation_bytes = 0;
     size_t weight_bytes = 0;
     size_t kv_bytes = 0;
     size_t graph_workspace_bytes = 0;
@@ -587,6 +590,30 @@ sample_result run(const parameters & args) {
     result.output.resize(activation.size());
     ggml_backend_tensor_get(graph.output, result.output.data(), 0,
                             result.output.size() * sizeof(float));
+    // Isolate host<->backend buffer copies from Graph compute. These timings
+    // include backend synchronization and do NOT include PC<->Phone TCP.
+    // Run after the final compute to avoid changing its measurement.
+    const size_t activation_bytes = activation.size() * sizeof(float);
+    std::vector<double> upload_samples, readback_samples;
+    for (int rep = 0; rep < 5; ++rep) {
+        auto start = clock_t::now();
+        ggml_backend_tensor_get(
+            graph.output, result.output.data(), 0, activation_bytes);
+        ggml_backend_synchronize(backend.get());
+        if (rep > 0) {
+            readback_samples.push_back(elapsed_ms(start));
+        }
+        start = clock_t::now();
+        ggml_backend_tensor_set(
+            graph.input, activation.data(), 0, activation_bytes);
+        ggml_backend_synchronize(backend.get());
+        if (rep > 0) {
+            upload_samples.push_back(elapsed_ms(start));
+        }
+    }
+    result.activation_bytes = activation_bytes;
+    result.activation_upload_median_ms = median(upload_samples);
+    result.activation_readback_median_ms = median(readback_samples);
     if (args.diagnose_layers) {
         result.layer_outputs.reserve(graph.layers.size());
         for (const auto & layer : graph.layers) {
@@ -724,7 +751,8 @@ int main(int argc, char ** argv) {
                      "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
                      "compute_median_ms,weight_bytes,kv_bytes,"
                      "graph_workspace_bytes,relative_rmse,max_abs,parity,source,"
-                     "token_begin\n";
+                     "token_begin,activation_bytes,activation_upload_median_ms,"
+                     "activation_readback_median_ms\n";
         std::cout << args.backend << ',' << args.layers << ',' << args.chunk
                   << ',' << args.kv << ',' << args.repeats << ','
                   << measured.graph_build_ms << ','
@@ -737,7 +765,10 @@ int main(int argc, char ** argv) {
                   << (args.diagnose_layers ?
                       ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC," :
                       ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX,")
-                  << (args.kv - args.chunk) << '\n';
+                  << (args.kv - args.chunk) << ','
+                  << measured.activation_bytes << ','
+                  << measured.activation_upload_median_ms << ','
+                  << measured.activation_readback_median_ms << '\n';
         // Exit 2 means native compute succeeded, but numerical accuracy
         // failed. It is NOT a PASS and will never enter the accepted CSV.
         return parity_failed ? 2 : 0;
