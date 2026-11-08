@@ -113,7 +113,7 @@ parameters parse(int argc, char ** argv) {
             (p.backend != 'G' && p.backend != 'C' &&
              p.backend != 'N' && p.backend != 'A') ||
             p.layers < 1 || p.chunk < 1 || p.kv < p.chunk ||
-            p.kv % p.chunk != 0 || p.repeats < 1 || p.threads < 1 ||
+            p.repeats < 1 || p.threads < 1 ||
             !std::isfinite(p.max_relative_rmse) ||
             !std::isfinite(p.max_abs_error) ||
             p.max_relative_rmse < 0 || p.max_abs_error < 0 ||
@@ -476,12 +476,16 @@ sample_result run(const parameters & args) {
         ggml_graph_overhead_custom(512*args.layers, false) + 65536,
         nullptr, true}), ggml_free);
     if (!graph_ctx) { throw std::runtime_error("GRAPH_CONTEXT_ALLOC_FAILED"); }
-    const auto chunk = static_cast<uint32_t>(args.kv/args.chunk - 1);
+    // Always profile the final EXACT X tokens at KV-X..KV-1, not the
+    // final possibly-short scheduling chunk. This also works for
+    // KV512/X96 and keeps the number of computed tokens honest.
+    const uint32_t chunk = 0;
+    const uint32_t token_begin = static_cast<uint32_t>(args.kv - args.chunk);
     ggml_phone_qwen3::multi_graph_result graph {};
     const char * why = "NONE";
     if (!ggml_phone_qwen3::build_graph_layers(
             graph_ctx.get(), p, chunk, weights, graph, why, kv,
-            args.diagnose_layers)) {
+            args.diagnose_layers, token_begin)) {
         throw std::runtime_error(std::string("PREFIX_GRAPH_FAILED:")+why);
     }
     using gallocr_ptr = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>;
@@ -512,7 +516,8 @@ sample_result run(const parameters & args) {
     // Position/mask/KV-index input is replicated per layer but the same
     // synthetic sequence geometry applies to every Transformer layer.
     ggml_phone_qwen3::side_inputs side {};
-    if (!ggml_phone_qwen3::make_side_inputs(p, chunk, side, why)) {
+    if (!ggml_phone_qwen3::make_side_inputs(
+            p, chunk, side, why, token_begin)) {
         throw std::runtime_error(std::string("PROFILE_SIDE_INPUT_FAILED:")+why);
     }
     auto prepare = [&]() {
@@ -718,7 +723,8 @@ int main(int argc, char ** argv) {
         std::cout << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
                      "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
                      "compute_median_ms,weight_bytes,kv_bytes,"
-                     "graph_workspace_bytes,relative_rmse,max_abs,parity,source\n";
+                     "graph_workspace_bytes,relative_rmse,max_abs,parity,source,"
+                     "token_begin\n";
         std::cout << args.backend << ',' << args.layers << ',' << args.chunk
                   << ',' << args.kv << ',' << args.repeats << ','
                   << measured.graph_build_ms << ','
@@ -729,8 +735,9 @@ int main(int argc, char ** argv) {
                   << measured.graph_workspace_bytes << ','
                   << relative_rmse << ',' << max_abs << ',' << parity
                   << (args.diagnose_layers ?
-                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC\n" :
-                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n");
+                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC," :
+                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX,")
+                  << (args.kv - args.chunk) << '\n';
         // Exit 2 means native compute succeeded, but numerical accuracy
         // failed. It is NOT a PASS and will never enter the accepted CSV.
         return parity_failed ? 2 : 0;
