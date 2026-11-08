@@ -781,6 +781,9 @@ int main(int argc, char ** argv) {
             parameters cpu = args;
             cpu.backend = 'C';
             cpu.verify_cpu = false;
+            // Bank refill benchmarking belongs ONLY to the actual HTP
+            // execution, never to the CPU numerical reference.
+            cpu.bank_repeats = 0;
             cpu.warmups = 0;
             cpu.repeats = 1;
             const sample_result reference = run(cpu);
