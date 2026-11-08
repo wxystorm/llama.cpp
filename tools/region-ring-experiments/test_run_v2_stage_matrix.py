@@ -29,13 +29,15 @@ class MatrixTests(unittest.TestCase):
                 exe=exe, model=fake_model, out=folder,
                 backends="GC", layers="2", chunks="64", kvs="512",
                 warmups=1, repeats=2, threads=2, timeout=1,
-                verify_cpu=False, update=False, dry_run=False)
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                update=False, dry_run=False)
             def completed(command, **_):
                 backend = command[command.index("--backend") + 1]
+                repeats = command[command.index("--repeats") + 1]
                 return mock.Mock(
                     returncode=0, stderr="", stdout=(
                         "backend,layers,chunk,kv_tokens,repeats,parity,source\n"
-                        f"{backend},2,64,512,2,NOT_REQUESTED,"
+                        f"{backend},2,64,512,{repeats},NOT_REQUESTED,"
                         "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
             with mock.patch("subprocess.run", side_effect=completed) as run:
                 self.assertEqual(run_matrix(args), 0)
@@ -57,10 +59,13 @@ class MatrixTests(unittest.TestCase):
                 exe=Path(sys.executable), model=model,
                 out=base / "out", backends="N", layers="2", chunks="64",
                 kvs="512", warmups=0, repeats=1, threads=2,
-                timeout=1, verify_cpu=False, update=False, dry_run=False)
+                timeout=1, verify_cpu=False,
+                max_relative_rmse=0.02, max_abs_error=0.5,
+                update=False, dry_run=False)
             response = mock.Mock(returncode=0, stderr="", stdout=(
-                "backend,layers,chunk,kv_tokens,repeats,parity\n"
-                "N,2,64,512,1,NOT_REQUESTED\n"))
+                "backend,layers,chunk,kv_tokens,repeats,parity,source\n"
+                "N,2,64,512,1,NOT_REQUESTED,"
+                "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
             with mock.patch("subprocess.run", return_value=response) as run:
                 self.assertEqual(run_matrix(args), 1)
                 self.assertIn("--verify-cpu", run.call_args.args[0])
