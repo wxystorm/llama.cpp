@@ -146,6 +146,15 @@ double median(std::vector<double> xs) {
     return xs.size() & 1 ? xs[k] : (xs[k-1] + xs[k]) * 0.5;
 }
 
+double percentile_nearest_rank(std::vector<double> xs, int pct) {
+    if (xs.empty() || pct < 1 || pct > 100) {
+        throw std::runtime_error("INVALID_SAMPLE_PERCENTILE");
+    }
+    std::sort(xs.begin(), xs.end());
+    const size_t rank = (xs.size() * size_t(pct) + 99) / 100;
+    return xs[std::max<size_t>(1, rank) - 1];
+}
+
 uint32_t field_u32(const gguf_context * g, const char * name) {
     const auto id = gguf_find_key(g, name);
     if (id < 0) { throw std::runtime_error(std::string("MISSING_GGUF_KEY:") + name); }
@@ -348,6 +357,10 @@ struct sample_result {
     double weight_upload_ms = 0;
     double prepare_ms = 0;
     double compute_ms = 0;
+    double compute_min_ms = 0;
+    double compute_p90_ms = 0;
+    double compute_max_ms = 0;
+    double compute_stddev_ms = 0;
     double htp_precompile_ms = 0;
     double activation_upload_median_ms = 0;
     double activation_readback_median_ms = 0;
@@ -712,6 +725,15 @@ sample_result run(const parameters & args) {
     result.weight_upload_ms = weight_upload_ms;
     result.prepare_ms = median(prepare_ms);
     result.compute_ms = median(compute_ms);
+    result.compute_p90_ms = percentile_nearest_rank(compute_ms, 90);
+    result.compute_min_ms = *std::min_element(compute_ms.begin(), compute_ms.end());
+    result.compute_max_ms = *std::max_element(compute_ms.begin(), compute_ms.end());
+    double mean = 0;
+    for (double x : compute_ms) { mean += x; }
+    mean /= compute_ms.size();
+    double variance = 0;
+    for (double x : compute_ms) { variance += (x-mean)*(x-mean); }
+    result.compute_stddev_ms = std::sqrt(variance / compute_ms.size());
     result.htp_precompile_ms = precompile_ms;
     result.weight_file_read_ms = uploaded.file_read_ms;
     result.weight_backend_set_ms = uploaded.backend_set_ms;
@@ -841,7 +863,8 @@ int main(int argc, char ** argv) {
                      "token_begin,activation_bytes,activation_upload_median_ms,"
                      "activation_readback_median_ms,weight_file_read_ms,"
                      "weight_backend_set_ms,same_bank_refill_median_ms,"
-                     "raw_weight_bytes\n";
+                     "raw_weight_bytes,compute_min_ms,compute_p90_ms,"
+                     "compute_max_ms,compute_stddev_ms\n";
         std::cout << args.backend << ',' << args.layers << ',' << args.chunk
                   << ',' << args.kv << ',' << args.repeats << ','
                   << measured.graph_build_ms << ','
@@ -861,7 +884,11 @@ int main(int argc, char ** argv) {
                   << measured.weight_file_read_ms << ','
                   << measured.weight_backend_set_ms << ','
                   << measured.same_bank_refill_median_ms << ','
-                  << measured.raw_weight_bytes << '\n';
+                  << measured.raw_weight_bytes << ','
+                  << measured.compute_min_ms << ','
+                  << measured.compute_p90_ms << ','
+                  << measured.compute_max_ms << ','
+                  << measured.compute_stddev_ms << '\n';
         // Exit 2 means native compute succeeded, but numerical accuracy
         // failed. It is NOT a PASS and will never enter the accepted CSV.
         return parity_failed ? 2 : 0;
