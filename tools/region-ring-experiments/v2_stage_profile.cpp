@@ -723,7 +723,9 @@ int main(int argc, char ** argv) {
                   << measured.weight_bytes << ',' << measured.kv_bytes << ','
                   << measured.graph_workspace_bytes << ','
                   << relative_rmse << ',' << max_abs << ',' << parity
-                  << ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n";
+                  << (args.diagnose_layers ?
+                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC\n" :
+                      ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n");
         return 0;
     } catch (const std::exception & ex) {
         std::cerr << "[V2_STAGE_PROFILE] status=FAIL reason="
