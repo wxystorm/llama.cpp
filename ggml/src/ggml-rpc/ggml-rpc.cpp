@@ -4733,6 +4733,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         resources.bank_refill_count == 0 ? "NOT_EXERCISED" :
         (resources.bank_refill_failed != 0 ||
          resources.bank_refill_inflight != 0 ||
+         resources.bank_refill_unstaged != 0 ||
          resources.bank_timeline_overflow != 0 ? "INCOMPLETE" : "PASS");
     GGML_LOG_INFO(
         "[PHONE_BANK_RUNTIME_PROFILE] source=RPC_PATCH33"
@@ -10371,9 +10372,13 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
             ggml_phone_npu_serial::full_region_executor::
                 local_only_profile profile {};
             std::string why;
+            const char * stage_runtime_profile =
+                std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
             const bool measure_device = valid_input &&
                 (phone_chunk_timeline_enabled ||
-                 phone_auto_dual_lane_enabled);
+                 phone_auto_dual_lane_enabled ||
+                 (stage_runtime_profile != nullptr &&
+                  std::strcmp(stage_runtime_profile, "1") == 0));
             const int64_t owned_begin_us = measure_device ?
                 ggml_time_us() : 0;
             if (phone_auto_dual_lane_enabled && measure_device) {
