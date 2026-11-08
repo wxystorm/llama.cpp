@@ -1,4 +1,4 @@
-# G/C/N/A compact Profile with automatic Phone telemetry (RPC Patch32)
+# G/C/N/A compact Profile with automatic Phone telemetry (RPC Patch33)
 
 Branch: feat/four-backend-profile-rpc-gcna-20261107
 Status: experimental code integrated; full Windows/Android build and real Snapdragon run are NOT verified.
@@ -21,7 +21,7 @@ continues to use the original full model, with matching source weight
 tensor bytes for the sampled prefix. Rebuild both sides from this commit.
 
 Phone accumulates measured HTP and Adreno per-Chunk service data, then
-exposes fixed-size paged Patch32 RPC snapshots after each Run END.
+exposes fixed-size paged Patch33 RPC snapshots after each Run END.
 PC pulls the records once (not per Chunk), verifies Run IDs and logs them
 inside its own engine.stderr.log. No manual copying of phone.log.
 Phone additionally returns GPU/Host available memory, observed Stage
@@ -31,7 +31,7 @@ failure, never fabricated bandwidth.
 
 ## Phone launch
 
-Phone must be rebuilt with RPC Patch32, the original GGUF and its usual
+Phone must be rebuilt with RPC Patch33, the original GGUF and its usual
 OpenCL/HTP runtime paths. The required environment settings are:
 
     unset GGML_RPC_PHONE_NPU_SERIAL_REGIONS
@@ -59,7 +59,7 @@ OpenCL/HTP runtime paths. The required environment settings are:
 
 Use the ORIGINAL 40-layer GGUF for -Model. Python needs the bundled
 gguf-py package and NumPy (e.g. python -m pip install -e .\gguf-py).
-Keep PC compiled with Patch32; build llama-completion and llama-tokenize.
+Keep PC compiled with Patch33; build llama-completion and llama-tokenize.
 
     .\tools\region-ring-experiments\run_gcna_profile.ps1 -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" -Rpc "10.39.52.114:50052" -PromptFile "D:\prima.cpp\prompts\prompt_512.txt" -Pattern "G7,C1,N1,A1" -Cycles 3 -NoMmap
 
@@ -95,7 +95,7 @@ Outputs plan.json (selected physical G/C/N/A Cycle and handoffs) and
 candidates.csv. Offline Plan never contacts Phone or profiles again.
 
 To run the Plan, use run_saved_plan.ps1 with -ConfirmBankedPhoneReady
-only after rebuilding/validating matching Patch32 Phone and PC binaries.
+only after rebuilding/validating matching Patch33 Phone and PC binaries.
 Use ORIGINAL 40-layer GGUF for this full-model run, not compact probe.
 
 ## Verify
