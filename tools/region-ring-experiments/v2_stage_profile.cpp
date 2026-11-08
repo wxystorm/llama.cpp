@@ -53,6 +53,7 @@ struct parameters {
     int repeats = 8;
     int threads = 8;
     bool verify_cpu = false;
+    bool diagnose_layers = false;
     double max_relative_rmse = 0.02;
     double max_abs_error = 0.5;
 };
@@ -75,10 +76,16 @@ parameters parse(int argc, char ** argv) {
             std::cout << "v2-stage-profile --model FILE --backend G|C|N|A "
                          "--layers N --chunk X --kv K [--warmups N] "
                          "[--repeats N] [--threads N] [--verify-cpu] "
-                         "[--relative-rmse F] [--max-abs-error F]\n";
+                         "[--relative-rmse F] [--max-abs-error F] "
+                         "[--diagnose-layers]\n";
             std::exit(0);
         }
         if (key == "--verify-cpu") {
+            p.verify_cpu = true;
+            continue;
+        }
+        if (key == "--diagnose-layers") {
+            p.diagnose_layers = true;
             p.verify_cpu = true;
             continue;
         }
@@ -316,6 +323,9 @@ struct sample_result {
     size_t kv_bytes = 0;
     size_t graph_workspace_bytes = 0;
     std::vector<float> output;
+    // Filled only in diagnostic mode. Intermediate outputs are retained
+    // in the measured Graph rather than reconstructed with prefix reruns.
+    std::vector<std::vector<float>> layer_outputs;
 };
 
 sample_result run(const parameters & args) {
@@ -470,7 +480,8 @@ sample_result run(const parameters & args) {
     ggml_phone_qwen3::multi_graph_result graph {};
     const char * why = "NONE";
     if (!ggml_phone_qwen3::build_graph_layers(
-            graph_ctx.get(), p, chunk, weights, graph, why, kv)) {
+            graph_ctx.get(), p, chunk, weights, graph, why, kv,
+            args.diagnose_layers)) {
         throw std::runtime_error(std::string("PREFIX_GRAPH_FAILED:")+why);
     }
     using gallocr_ptr = std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)>;
@@ -571,6 +582,15 @@ sample_result run(const parameters & args) {
     result.output.resize(activation.size());
     ggml_backend_tensor_get(graph.output, result.output.data(), 0,
                             result.output.size() * sizeof(float));
+    if (args.diagnose_layers) {
+        result.layer_outputs.reserve(graph.layers.size());
+        for (const auto & layer : graph.layers) {
+            std::vector<float> captured(activation.size());
+            ggml_backend_tensor_get(layer.output, captured.data(), 0,
+                                    captured.size() * sizeof(float));
+            result.layer_outputs.push_back(std::move(captured));
+        }
+    }
     for (float x : result.output) {
         if (!std::isfinite(x)) {
             throw std::runtime_error("NONFINITE_NATIVE_STAGE_OUTPUT");
@@ -588,6 +608,56 @@ sample_result run(const parameters & args) {
         ggml_gallocr_get_buffer_size(allocator.get(), 0);
     return result;
 }
+
+// Compares outputs after both physical devices synchronize; errors refer to
+// the SAME layer output in the SAME full multi-layer Graph, not to isolated
+// reruns of N1/N2/N3 that can have different allocation and cache lifetimes.
+struct parity_metrics {
+    double relative_rmse = 0.0;
+    double max_abs = 0.0;
+    double cosine = 0.0;
+    double reference_rms = 0.0;
+    size_t worst_index = 0;
+    float at_worst = 0;
+    float ref_at_worst = 0;
+};
+
+parity_metrics parity_of(const std::vector<float> & actual,
+                         const std::vector<float> & reference) {
+    if (actual.empty() || actual.size() != reference.size()) {
+        throw std::runtime_error("CPU_REFERENCE_OUTPUT_SHAPE_MISMATCH");
+    }
+    parity_metrics result {};
+    double squared_error = 0.0;
+    double sum_reference_squares = 0.0;
+    double sum_actual_squares = 0.0;
+    double dot = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        if (!std::isfinite(actual[i]) || !std::isfinite(reference[i])) {
+            throw std::runtime_error("NONFINITE_STAGE_PARITY_OUTPUT");
+        }
+        const double difference = double(actual[i]) - double(reference[i]);
+        const double abs_error = std::abs(difference);
+        if (abs_error > result.max_abs) {
+            result.max_abs = abs_error;
+            result.worst_index = i;
+            result.at_worst = actual[i];
+            result.ref_at_worst = reference[i];
+        }
+        squared_error += difference * difference;
+        sum_reference_squares += double(reference[i]) * double(reference[i]);
+        sum_actual_squares += double(actual[i]) * double(actual[i]);
+        dot += double(actual[i]) * double(reference[i]);
+    }
+    result.relative_rmse = std::sqrt(
+        squared_error / std::max(sum_reference_squares, 1e-20));
+    result.reference_rms = std::sqrt(
+        sum_reference_squares / reference.size());
+    result.cosine = dot / std::sqrt(
+        std::max(sum_reference_squares * sum_actual_squares, 1e-40));
+    return result;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -604,20 +674,32 @@ int main(int argc, char ** argv) {
             cpu.warmups = 0;
             cpu.repeats = 1;
             const sample_result reference = run(cpu);
-            if (reference.output.size() != measured.output.size()) {
-                throw std::runtime_error("CPU_REFERENCE_OUTPUT_SHAPE_MISMATCH");
+            const auto final = parity_of(measured.output, reference.output);
+            relative_rmse = final.relative_rmse;
+            max_abs = final.max_abs;
+            if (args.diagnose_layers) {
+                if (measured.layer_outputs.size() != static_cast<size_t>(args.layers) ||
+                        reference.layer_outputs.size() != static_cast<size_t>(args.layers)) {
+                    throw std::runtime_error("INCOMPLETE_SAME_GRAPH_LAYER_OUTPUT_CAPTURE");
+                }
+                for (int i = 0; i < args.layers; ++i) {
+                    const auto m = parity_of(measured.layer_outputs[i],
+                                             reference.layer_outputs[i]);
+                    std::cerr << "[V2_LAYER_PARITY] layer=" << i
+                              << " backend=" << args.backend
+                              << " rel_rmse=" << m.relative_rmse
+                              << " max_abs=" << m.max_abs
+                              << " cosine=" << m.cosine
+                              << " ref_rms=" << m.reference_rms
+                              << " worst_index=" << m.worst_index
+                              << " actual=" << m.at_worst
+                              << " reference=" << m.ref_at_worst
+                              << " status=" <<
+                        (m.relative_rmse <= args.max_relative_rmse &&
+                         m.max_abs <= args.max_abs_error ? "PASS" : "FAIL")
+                              << '\n';
+                }
             }
-            double squared = 0.0, reference_squared = 0.0;
-            for (size_t i = 0; i < reference.output.size(); ++i) {
-                const double difference = double(measured.output[i]) -
-                                          double(reference.output[i]);
-                max_abs = std::max(max_abs, std::abs(difference));
-                squared += difference * difference;
-                reference_squared += double(reference.output[i]) *
-                                     double(reference.output[i]);
-            }
-            relative_rmse = std::sqrt(
-                squared / std::max(reference_squared, 1e-20));
             if (!std::isfinite(relative_rmse) ||
                     relative_rmse > args.max_relative_rmse ||
                     max_abs > args.max_abs_error) {
