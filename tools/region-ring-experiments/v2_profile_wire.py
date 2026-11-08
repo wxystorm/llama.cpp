@@ -126,9 +126,17 @@ def validate_shape(value: dict[str, Any]) -> dict[str, Any]:
             value.get("max_relative_rmse"), "REL_RMSE"),
         "max_abs_error": finite_threshold(
             value.get("max_abs_error"), "MAX_ABS"),
+        "bank_repeats": positive_int(
+            value.get("bank_repeats", 0), "BANK_REPEATS", lower=0,
+            upper=20),
+        "host_stage_cap_mib": positive_int(
+            value.get("host_stage_cap_mib", 1024),
+            "HOST_STAGE_CAP_MIB", upper=8192),
     }
     if result["kv_tokens"] < result["chunk"]:
         raise ProfileProtocolError("INVALID_CHUNK_KV_GEOMETRY")
+    if backend != "N" and result["bank_repeats"]:
+        raise ProfileProtocolError("SAME_BANK_REPACK_ONLY_SUPPORTED_ON_N")
     return result
 
 
@@ -152,6 +160,15 @@ def validate_sample(row: dict[str, Any], shape: dict[str, Any]) -> dict[str, str
                 raise ProfileProtocolError("INVALID_NATIVE_TIMING_OR_PARITY:" + key)
         if float(row["compute_median_ms"]) <= 0:
             raise ProfileProtocolError("ZERO_NATIVE_COMPUTE_TIME")
+        if "token_begin" in row and int(row["token_begin"]) != (
+                shape["kv_tokens"] - shape["chunk"]):
+            raise ProfileProtocolError("WRONG_NATIVE_TOKEN_BEGIN")
+        if "activation_bytes" in row and int(row["activation_bytes"]) <= 0:
+            raise ProfileProtocolError("INVALID_NATIVE_ACTIVATION_BYTES")
+        if shape.get("bank_repeats", 0):
+            if float(row["same_bank_refill_median_ms"]) <= 0 or \
+                    int(row["raw_weight_bytes"]) <= 0:
+                raise ProfileProtocolError("MISSING_HTP_SAME_BANK_REFILL_SAMPLE")
         if shape["backend"] == "N" and row["parity"] not in ("PASS", "FAIL"):
             raise ProfileProtocolError("MISSING_MANDATORY_HTP_PARITY")
         if row.get("parity") not in ("PASS", "FAIL", "NOT_REQUESTED"):
