@@ -135,12 +135,24 @@ Implemented in this V2 branch:
   consecutive layers with separate per-layer KV and unchanged
   single-layer builder API;
 - pure multi-layer HTP Region range-map validation;
-- model-free regression tests for all above.
+- model-free regression tests for all above;
+- a standalone native Stage profiler that loads ONLY [0,N) from the
+  original Qwen3 Dense GGUF, builds a real shared N-layer Graph on exactly
+  one device (G/C/N/A), and executes real KV/Mask with no feeder Stages;
+- HTP0 native quantized-weight repack allocation, fixed-Graph precompile,
+  synchronized N2/N4 compute path, automatic compiled-cache retirement,
+  and CPU output parity (required for N mode);
+- resumable stage matrix with a versioned model/executable fingerprint,
+  and a synthetic tiny-Qwen3 CPU N1/N2 integration-test fixture.
+See V2_NATIVE_STAGE_PROFILE.md for commands and limits.
 
 **Not yet implemented or verified:**
-- running a V2 G/C/N/A isolated compute Profile on real hardware;
-- HTP multi-layer Bank weight binding, KV residence, precompile,
-  native execution, parity and benchmark RPC; metadata is NOT runtime;
+- verification of the new native G/C/N/A isolated Profile on real
+  Windows/Android hardware; currently source code and tests only;
+- integration of N2/N4 native HTP graphs with PRODUCTION per-Cycle
+  two-Bank refill, persistent Decode KV, Phone RPC and runtime ownership;
+  standalone native precompile+compute+CPU parity is implemented in
+  source, but hardware PASS has not been observed;
 - the native Profile cache/control flow in the main executable;
 - complete runtime-matched transfer-only benchmarking;
 - the V2 Planner, memory spill DAG, and V2 Runtime adoption;
