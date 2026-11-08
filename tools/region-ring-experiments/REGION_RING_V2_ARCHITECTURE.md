@@ -142,18 +142,25 @@ Implemented in this V2 branch:
 - HTP0 native quantized-weight repack allocation, fixed-Graph precompile,
   synchronized N2/N4 compute path, automatic compiled-cache retirement,
   and CPU output parity (required for N mode);
-- resumable stage matrix with a versioned model/executable fingerprint,
-  and a synthetic tiny-Qwen3 CPU N1/N2 integration-test fixture.
-See V2_NATIVE_STAGE_PROFILE.md for commands and limits.
+- resumable stage matrix with a versioned model/executable/device
+  fingerprint, and a synthetic tiny-Qwen3 CPU N1/N2/N4 integration-test
+  fixture;
+- dedicated versioned V2 Phone N/A Profile control sidecar: PC requests
+  each N/A shape, Phone executes its own native HTP/OpenCL Graph and
+  sends measured rows back automatically, with no manual CSV copying;
+- explicit PARITY_FAIL measurements retained for analysis but excluded
+  from the planner-eligible PASS profile CSV.
+See V2_NATIVE_STAGE_PROFILE.md and V2_PHONE_PROFILE_RPC.md.
 
 **Not yet implemented or verified:**
-- verification of the new native G/C/N/A isolated Profile on real
-  Windows/Android hardware; currently source code and tests only;
+- end-to-end verification of the new GCNA matrix/RPC sidecar on
+  real PC and Phone hardware; source + regression tests now committed;
+  the user already observed Phone HTP N2 precompile/compute/parity PASS,
+  while N4 precompile/compute succeeded but numerical parity FAILED;
 - integration of N2/N4 native HTP graphs with PRODUCTION per-Cycle
-  two-Bank refill, persistent Decode KV, Phone RPC and runtime ownership;
-  standalone native precompile+compute+CPU parity is implemented in
-  source, but hardware PASS has not been observed;
-- the native Profile cache/control flow in the main executable;
+  two-Bank refill, persistent Decode KV and inference RPC ownership;
+- elimination of the separate Profile sidecar in favor of main-program
+  automatic discovery/control and production RPC handoff;
 - complete runtime-matched transfer-only benchmarking;
 - the V2 Planner, memory spill DAG, and V2 Runtime adoption;
 - Windows+Android builds and real Qwen3 logits/Prefill/Decode parity.
