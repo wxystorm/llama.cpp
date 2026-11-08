@@ -5,6 +5,7 @@
 add_executable(region-ring-v2-stage-profile v2_stage_profile.cpp)
 target_include_directories(region-ring-v2-stage-profile PRIVATE
     ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/ggml/src
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
 target_link_libraries(region-ring-v2-stage-profile PRIVATE ggml ggml-cpu)
 target_compile_features(region-ring-v2-stage-profile PRIVATE cxx_std_17)
