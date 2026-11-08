@@ -52,6 +52,8 @@ struct parameters {
     int warmups = 2;
     int repeats = 8;
     int threads = 8;
+    int bank_repeats = 0;
+    int host_stage_cap_mib = 1024;
     bool verify_cpu = false;
     bool diagnose_layers = false;
     double max_relative_rmse = 0.02;
@@ -77,7 +79,8 @@ parameters parse(int argc, char ** argv) {
                          "--layers N --chunk X --kv K [--warmups N] "
                          "[--repeats N] [--threads N] [--verify-cpu] "
                          "[--relative-rmse F] [--max-abs-error F] "
-                         "[--diagnose-layers]\n";
+                         "[--diagnose-layers] [--bank-repeats N] "
+                         "[--host-stage-cap-mib N]\n";
             std::exit(0);
         }
         if (key == "--verify-cpu") {
@@ -103,6 +106,11 @@ parameters parse(int argc, char ** argv) {
         else if (key == "--warmups") { p.warmups = parse_int(value, "WARMUPS"); }
         else if (key == "--repeats") { p.repeats = parse_int(value, "REPEATS"); }
         else if (key == "--threads") { p.threads = parse_int(value, "THREADS"); }
+        else if (key == "--bank-repeats") {
+            p.bank_repeats = parse_int(value, "BANK_REPEATS");
+        } else if (key == "--host-stage-cap-mib") {
+            p.host_stage_cap_mib = parse_int(value, "HOST_STAGE_CAP_MIB");
+        }
         else if (key == "--relative-rmse") {
             p.max_relative_rmse = std::stod(value);
         } else if (key == "--max-abs-error") {
@@ -114,6 +122,8 @@ parameters parse(int argc, char ** argv) {
              p.backend != 'N' && p.backend != 'A') ||
             p.layers < 1 || p.chunk < 1 || p.kv < p.chunk ||
             p.repeats < 1 || p.threads < 1 ||
+            p.bank_repeats > 20 || p.host_stage_cap_mib < 1 ||
+            (p.backend != 'N' && p.bank_repeats > 0) ||
             !std::isfinite(p.max_relative_rmse) ||
             !std::isfinite(p.max_abs_error) ||
             p.max_relative_rmse < 0 || p.max_abs_error < 0 ||
@@ -214,19 +224,31 @@ ggml_phone_qwen3::layer_weights load_layer(
     return w;
 }
 
-void upload_weights(
-        const std::string & path, const std::vector<to_load> & todo) {
+struct upload_stats {
+    double file_read_ms = 0;
+    double backend_set_ms = 0;
+    size_t original_bytes = 0;
+    std::vector<std::vector<uint8_t>> host_staged;
+};
+
+upload_stats upload_weights(
+        const std::string & path, const std::vector<to_load> & todo,
+        bool keep_staged) {
     std::ifstream in(path, std::ios::binary);
     if (!in) { throw std::runtime_error("MODEL_GGUF_OPEN_FAILED"); }
-    // One Tensor at a time: avoid duplicating N layers of quantized weights
-    // in host memory. The backend owns the already-allocated destination.
+    upload_stats result {};
+    if (keep_staged) { result.host_staged.reserve(todo.size()); }
+    // Without --bank-repeats only one Tensor's raw GGUF bytes are resident
+    // in host memory. This preserves the memory behavior of normal Profile.
     std::vector<uint8_t> scratch;
     for (const auto & item : todo) {
         if (item.bytes > static_cast<size_t>(
                 std::numeric_limits<std::streamsize>::max())) {
             throw std::runtime_error("GGUF_TENSOR_EXCEEDS_IO_LIMIT");
         }
+        result.original_bytes += item.bytes;
         scratch.resize(item.bytes);
+        auto begin = clock_t::now();
         in.clear();
         in.seekg(static_cast<std::streamoff>(item.offset));
         if (!in.read(reinterpret_cast<char *>(scratch.data()),
@@ -234,8 +256,16 @@ void upload_weights(
             throw std::runtime_error("GGUF_READ_FAILED:" +
                                      std::string(item.tensor->name));
         }
+        result.file_read_ms += elapsed_ms(begin);
+        begin = clock_t::now();
         ggml_backend_tensor_set(item.tensor, scratch.data(), 0, item.bytes);
+        result.backend_set_ms += elapsed_ms(begin);
+        if (keep_staged) {
+            result.host_staged.emplace_back(std::move(scratch));
+            scratch = {};
+        }
     }
+    return result;
 }
 
 ggml_phone_owned::region_plan model_plan(
@@ -321,6 +351,10 @@ struct sample_result {
     double htp_precompile_ms = 0;
     double activation_upload_median_ms = 0;
     double activation_readback_median_ms = 0;
+    double weight_file_read_ms = 0;
+    double weight_backend_set_ms = 0;
+    double same_bank_refill_median_ms = 0;
+    size_t raw_weight_bytes = 0;
     size_t activation_bytes = 0;
     size_t weight_bytes = 0;
     size_t kv_bytes = 0;
@@ -428,10 +462,49 @@ sample_result run(const parameters & args) {
         ggml_backend_buffer_set_usage(
             repack_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
+    size_t total_raw_bytes = 0;
+    for (const auto & item : todo) {
+        if (item.bytes > SIZE_MAX - total_raw_bytes) {
+            throw std::runtime_error("STAGE_RAW_WEIGHTS_OVERFLOW");
+        }
+        total_raw_bytes += item.bytes;
+    }
+    if (args.bank_repeats > 0 &&
+            total_raw_bytes > size_t(args.host_stage_cap_mib) * 1024 * 1024) {
+        throw std::runtime_error("HTP_HOST_STAGE_CAP_EXCEEDED");
+    }
     const auto upload_begin = clock_t::now();
-    upload_weights(args.model, todo);
+    auto uploaded = upload_weights(args.model, todo, args.bank_repeats > 0);
     ggml_backend_synchronize(backend.get());
     const double weight_upload_ms = elapsed_ms(upload_begin);
+
+    double same_bank_refill_ms = 0;
+    if (args.bank_repeats > 0) {
+        // Controlled HTP quantized-weight repack/copy into the SAME
+        // allocated Bank using already-staged host bytes. This excludes
+        // storage IO and is not a dual-Bank prefetch/overlap benchmark.
+        std::vector<double> refill;
+        for (int rep = -1; rep < args.bank_repeats; ++rep) {
+            const auto started = clock_t::now();
+            for (size_t i = 0; i < todo.size(); ++i) {
+                ggml_backend_tensor_set(
+                    todo[i].tensor, uploaded.host_staged[i].data(),
+                    0, todo[i].bytes);
+            }
+            ggml_backend_synchronize(backend.get());
+            if (rep >= 0) { refill.push_back(elapsed_ms(started)); }
+        }
+        same_bank_refill_ms = median(refill);
+        std::cerr << "[V2_HTP_BANK] mode=HOST_STAGED_SAME_BANK_REPACK"
+                  << " layers=" << args.layers
+                  << " raw_bytes=" << total_raw_bytes
+                  << " median_ms=" << same_bank_refill_ms
+                  << " status=MEASURED_NOT_DUAL_BANK" << '\n';
+    }
+    // Release the optional host staging allocation before building the
+    // actual full-layer Graph and its GPU/NPU intermediate workspace.
+    uploaded.host_staged.clear();
+    uploaded.host_staged.shrink_to_fit();
 
     // Prefix K/V is real populated tensor memory, not a nominal KV label.
     // The final X positions are overwritten by the measured Chunk, while
@@ -633,6 +706,10 @@ sample_result run(const parameters & args) {
     result.prepare_ms = median(prepare_ms);
     result.compute_ms = median(compute_ms);
     result.htp_precompile_ms = precompile_ms;
+    result.weight_file_read_ms = uploaded.file_read_ms;
+    result.weight_backend_set_ms = uploaded.backend_set_ms;
+    result.same_bank_refill_median_ms = same_bank_refill_ms;
+    result.raw_weight_bytes = uploaded.original_bytes;
     result.weight_bytes = ggml_backend_buffer_get_size(weight_buffer.get()) +
         (repack_buffer ? ggml_backend_buffer_get_size(repack_buffer.get()) : 0);
     result.kv_bytes = ggml_backend_buffer_get_size(kv_buffer.get());
@@ -752,7 +829,9 @@ int main(int argc, char ** argv) {
                      "compute_median_ms,weight_bytes,kv_bytes,"
                      "graph_workspace_bytes,relative_rmse,max_abs,parity,source,"
                      "token_begin,activation_bytes,activation_upload_median_ms,"
-                     "activation_readback_median_ms\n";
+                     "activation_readback_median_ms,weight_file_read_ms,"
+                     "weight_backend_set_ms,same_bank_refill_median_ms,"
+                     "raw_weight_bytes\n";
         std::cout << args.backend << ',' << args.layers << ',' << args.chunk
                   << ',' << args.kv << ',' << args.repeats << ','
                   << measured.graph_build_ms << ','
@@ -768,7 +847,11 @@ int main(int argc, char ** argv) {
                   << (args.kv - args.chunk) << ','
                   << measured.activation_bytes << ','
                   << measured.activation_upload_median_ms << ','
-                  << measured.activation_readback_median_ms << '\n';
+                  << measured.activation_readback_median_ms << ','
+                  << measured.weight_file_read_ms << ','
+                  << measured.weight_backend_set_ms << ','
+                  << measured.same_bank_refill_median_ms << ','
+                  << measured.raw_weight_bytes << '\n';
         // Exit 2 means native compute succeeded, but numerical accuracy
         // failed. It is NOT a PASS and will never enter the accepted CSV.
         return parity_failed ? 2 : 0;
