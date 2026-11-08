@@ -139,6 +139,49 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual({r["backend"] for r in rows}, set("GCNA"))
             self.assertEqual(len(rows), 4)
 
+    def test_phone_unavailable_does_not_block_pc_gc_and_will_resume(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            model = base / "model.gguf"
+            model.write_bytes(b"tiny qwen model identifier")
+            args = argparse.Namespace(
+                exe=Path(sys.executable), model=model, out=base / "out",
+                phone="127.0.0.1:50177", phone_token="", phone_timeout=2,
+                backends="GCNA", layers="2", chunks="64", kvs="512",
+                warmups=1, repeats=2, threads=2, timeout=2,
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                update=False, dry_run=False)
+            def fake_native(command, **_):
+                backend = command[command.index("--backend") + 1]
+                return mock.Mock(
+                    returncode=0, stderr="", stdout=(
+                        "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
+                        "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
+                        "compute_median_ms,weight_bytes,kv_bytes,"
+                        "graph_workspace_bytes,relative_rmse,max_abs,parity,source\n"
+                        f"{backend},2,64,512,2,1,1,0,0.1,2,100,100,100,"
+                        "0,0,NOT_REQUESTED,NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
+            with mock.patch("run_v2_stage_matrix.host_device_id",
+                            return_value="h" * 64), \
+                 mock.patch("run_v2_stage_matrix.hello_phone",
+                            side_effect=RuntimeError("phone offline")), \
+                 mock.patch("subprocess.run", side_effect=fake_native) as native:
+                self.assertEqual(run_matrix(args), 1)
+                self.assertEqual(native.call_count, 2)
+            import json
+            self.assertEqual(
+                json.loads((args.out / "G-L2-X64-KV512.json").read_text())["status"],
+                "PASS")
+            self.assertEqual(
+                json.loads((args.out / "C-L2-X64-KV512.json").read_text())["status"],
+                "PASS")
+            self.assertEqual(
+                json.loads((args.out / "N-L2-X64-KV512.json").read_text())["status"],
+                "FAIL")
+            self.assertEqual(
+                json.loads((args.out / "A-L2-X64-KV512.json").read_text())["status"],
+                "FAIL")
+
     def test_remote_n4_parity_fail_never_enters_pass_csv(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
