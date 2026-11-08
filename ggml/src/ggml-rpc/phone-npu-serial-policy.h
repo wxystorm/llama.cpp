@@ -43,6 +43,14 @@ inline bool htp_region(const std::set<uint32_t> & regions, uint32_t region) {
     return regions.find(region) != regions.end();
 }
 
+// Ranks 0 and 1 have resident HTP weights in the two physical Banks.
+// Rank 2+ is only a planned GGUF layer until the Bank Mover refills it.
+// Its registration-time Graph shape check must use the saved GGUF tensor
+// metadata, never require absent HTP weight tensor allocations.
+inline bool use_deferred_weight_metadata(bool banked, int rank, bool bank_ready) {
+    return banked && rank >= 2 && !bank_ready;
+}
+
 // Match a numbered Transformer layer without confusing e.g. blk.1 with
 // blk.10. The tokenizer format is the ggml weight naming used by llama.cpp.
 inline int layer_from_tensor_name(const char * name) {
