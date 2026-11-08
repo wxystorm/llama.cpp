@@ -65,10 +65,11 @@ def main() -> None:
             model = Path(td) / (
                 "tiny-explicit.gguf" if explicit_rope_dim else "tiny-implicit.gguf")
             create_model(model, layers=4, explicit_rope_dim=explicit_rope_dim)
-            for n in (1, 2, 4):
+            for n, x, kv in ((1, 16, 128), (2, 16, 128),
+                             (4, 16, 128), (2, 96, 128)):
                 command = [str(args.exe.resolve()), "--model", str(model),
                            "--backend", "C", "--layers", str(n),
-                           "--chunk", "16", "--kv", "128",
+                           "--chunk", str(x), "--kv", str(kv),
                            "--threads", "2", "--warmups", "0",
                            "--repeats", "2", "--verify-cpu",
                            "--diagnose-layers"]
@@ -82,7 +83,8 @@ def main() -> None:
                 if len(rows) != 1 or rows[0]["backend"] != "C" or \
                         int(rows[0]["layers"]) != n or \
                         float(rows[0]["compute_median_ms"]) <= 0 or \
-                        rows[0]["parity"] != "PASS":
+                        rows[0]["parity"] != "PASS" or \
+                        int(rows[0]["token_begin"]) != kv-x:
                     raise RuntimeError(
                         f"CPU_L{n}_ROPE_DIM_{explicit_rope_dim}_RESULT:{rows}")
                 diagnostics = [
