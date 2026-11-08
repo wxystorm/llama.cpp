@@ -143,6 +143,20 @@ float field_f32(const gguf_context * g, const char * name) {
     return gguf_get_val_f32(g, id);
 }
 
+uint32_t optional_u32(const gguf_context * g, const char * name, uint32_t fallback) {
+    const auto id = gguf_find_key(g, name);
+    if (id < 0) { return fallback; }
+    if (gguf_get_kv_type(g, id) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error(std::string("INVALID_GGUF_UINT32:") + name);
+    }
+    return gguf_get_val_u32(g, id);
+}
+
+float optional_f32(const gguf_context * g, const char * name, float fallback) {
+    const auto id = gguf_find_key(g, name);
+    return id < 0 ? fallback : field_f32(g, name);
+}
+
 struct to_load {
     ggml_tensor * tensor = nullptr;
     size_t offset = 0;
@@ -237,13 +251,31 @@ ggml_phone_owned::region_plan model_plan(
     p.n_kv = static_cast<uint32_t>(args.kv);
     p.n_embd = field_u32(g, "qwen3.embedding_length");
     p.n_heads = field_u32(g, "qwen3.attention.head_count");
-    p.n_heads_kv = field_u32(g, "qwen3.attention.head_count_kv");
-    p.head_dim = field_u32(g, "qwen3.rope.dimension_count");
+    p.n_heads_kv = optional_u32(g, "qwen3.attention.head_count_kv", p.n_heads);
+    if (p.n_heads == 0 || p.n_embd % p.n_heads != 0) {
+        throw std::runtime_error("INVALID_QWEN3_HEAD_COUNT");
+    }
+    // Match llama_model_base::load_hparams(): Qwen3 GGUF is NOT required
+    // to carry rope.dimension_count. Key head dim defaults to n_embd/n_head,
+    // can be overridden by attention.key_length, and n_rot defaults to
+    // that key dimension. An explicit n_rot must agree for Qwen3.
+    const uint32_t default_head_dim = p.n_embd / p.n_heads;
+    const uint32_t key_dim = optional_u32(
+        g, "qwen3.attention.key_length", default_head_dim);
+    const uint32_t value_dim = optional_u32(
+        g, "qwen3.attention.value_length", default_head_dim);
+    const uint32_t n_rot = optional_u32(
+        g, "qwen3.rope.dimension_count", key_dim);
+    if (n_rot != key_dim || key_dim != value_dim) {
+        throw std::runtime_error("QWEN3_UNSUPPORTED_HEAD_OR_ROPE_DIMENSIONS");
+    }
+    p.head_dim = key_dim;
     p.rope_type = ggml_phone_owned::k_rope_neox;
     p.kv_type = ggml_phone_owned::k_f16;
     p.n_ctx_orig = field_u32(g, "qwen3.context_length");
     p.rms_norm_eps = field_f32(g, "qwen3.attention.layer_norm_rms_epsilon");
-    p.rope_freq_base = field_f32(g, "qwen3.rope.freq_base");
+    // Also optional in the official loader (fallback = 10000).
+    p.rope_freq_base = optional_f32(g, "qwen3.rope.freq_base", 10000.0f);
     p.rope_freq_scale = 1.0f;
     p.rope_ext_factor = -1.0f;
     p.rope_attn_factor = 1.0f;
