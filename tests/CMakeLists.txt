@@ -116,17 +116,12 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
-# V2 PC compute Profile: native single-backend Qwen3 prefix Graph, original
-# GGUF weights, real Position/Mask/KV and no Region Ring or Phone dependency.
-add_executable(region-ring-v2-stage-profile
-    ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/v2_stage_profile.cpp)
-target_include_directories(region-ring-v2-stage-profile PRIVATE
-    ${PROJECT_SOURCE_DIR}/src
-    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-rpc)
-target_link_libraries(region-ring-v2-stage-profile PRIVATE ggml ggml-cpu)
-target_compile_features(region-ring-v2-stage-profile PRIVATE cxx_std_17)
-llama_test(region-ring-v2-stage-profile
-    NAME test-region-ring-v2-profile-help LABEL region-ring ARGS --help)
+# Built by tools/region-ring-experiments/CMakeLists.txt even without tests.
+# Register its no-model CLI smoke when both tools and tests are enabled.
+if (LLAMA_BUILD_TOOLS)
+    llama_test(region-ring-v2-stage-profile
+        NAME test-region-ring-v2-profile-help LABEL region-ring ARGS --help)
+endif()
 
 # V2 descriptor tests are independent of ggml/model/RPC/HTP and run in Release.
 add_executable(test-region-ring-v2-stage test-region-ring-v2-stage.cpp)
