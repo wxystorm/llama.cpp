@@ -175,6 +175,13 @@ struct model {
     std::function<bool(int, int)> phone_npu_region_enabled;
     std::function<bool(int, int, size_t &)> phone_npu_region_weight_bytes;
     std::function<bool(size_t, double &)> phone_npu_weight_refill_ms;
+    // Profile-approved native Stage times, never aggregate PHONE proxy costs.
+    // In the mixed-Phone DAG these callbacks are mandatory for every
+    // participating NPU/Adreno Stage, including the final short Chunk.
+    std::function<bool(int, int, int, double &)> phone_npu_compute_ms;
+    std::function<bool(int, int, int, double &)> phone_adreno_compute_ms;
+    std::function<bool(int, int, int, double &)> phone_npu_prepare_ms;
+    std::function<bool(int, int, int, double &)> phone_adreno_prepare_ms;
     double phone_register_ms = 0.0; // Legacy MoE P5 fallback only.
     // Dense: measured/proxied RPC graph bytes, not a hard-coded P5 graph.
     // embedded_directional means C2P -> Phone Full -> P2C runs inside Meta.
@@ -889,9 +896,21 @@ inline bool simulate(const model & m,
                 region.layer_end - region.layer_begin;
             double ms = 0.0;
             double prepare_ms = 0.0;
+            const bool mixed_phone =
+                m.phone_npu_weight_streaming &&
+                region.kind == llama_region_ring_stage_kind::PHONE;
+            const bool is_npu = mixed_phone &&
+                m.phone_npu_region_enabled(
+                    region.layer_begin, region.layer_end);
+            const auto & native_compute =
+                is_npu ? m.phone_npu_compute_ms :
+                         m.phone_adreno_compute_ms;
             const bool compute_ok = directional ?
                 m.directional_ms(
                     region.kind, end - begin, kv, ms) :
+                mixed_phone ?
+                    (native_compute &&
+                     native_compute(layers, end - begin, kv, ms)) :
                 m.compute_region_ms ?
                     m.compute_region_ms(
                         d, region.layer_begin, region.layer_end,
@@ -915,7 +934,13 @@ inline bool simulate(const model & m,
                         "DIRECTIONAL_PREPARE_PROFILE_MISSING");
                 }
             } else {
-                const bool prepared_ok = m.prepare_region_ms ?
+                const auto & native_prepare =
+                    is_npu ? m.phone_npu_prepare_ms :
+                             m.phone_adreno_prepare_ms;
+                const bool prepared_ok = mixed_phone ?
+                    (native_prepare &&
+                     native_prepare(layers, end - begin, kv, prepare_ms)) :
+                    m.prepare_region_ms ?
                     m.prepare_region_ms(
                         d, region.layer_begin, region.layer_end,
                         end - begin, kv, r + 1 == regions.size(),
