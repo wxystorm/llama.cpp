@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gguf-py"))
 from gguf import GGUFWriter  # noqa: E402
 
 
-def create_model(path: Path, layers: int = 2) -> None:
+def create_model(path: Path, layers: int = 2, *, explicit_rope_dim: bool = False) -> None:
     writer = GGUFWriter(path, "qwen3")
     writer.add_block_count(layers)
     writer.add_context_length(128)
@@ -29,7 +29,9 @@ def create_model(path: Path, layers: int = 2) -> None:
     writer.add_head_count(1)
     writer.add_head_count_kv(1)
     writer.add_feed_forward_length(256)
-    writer.add_rope_dimension_count(128)
+    # This field is optional in real Qwen3 GGUFs. Test both forms.
+    if explicit_rope_dim:
+        writer.add_rope_dimension_count(128)
     writer.add_rope_freq_base(1000000.0)
     writer.add_layer_norm_rms_eps(1e-6)
     rng = np.random.default_rng(42)
@@ -59,25 +61,30 @@ def main() -> None:
     parser.add_argument("--exe", required=True, type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="v2_native_prefix_") as td:
-        model = Path(td) / "tiny-qwen3.gguf"
-        create_model(model)
-        for n in (1, 2):
-            command = [str(args.exe.resolve()), "--model", str(model),
-                       "--backend", "C", "--layers", str(n), "--chunk", "16",
-                       "--kv", "128", "--threads", "2",
-                       "--warmups", "0", "--repeats", "2", "--verify-cpu"]
-            result = subprocess.run(command, check=False,
-                                    capture_output=True, text=True, timeout=120)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"CPU_L{n}_NATIVE_FAIL:{result.stderr[-4000:]}")
-            rows = list(csv.DictReader(io.StringIO(result.stdout)))
-            if len(rows) != 1 or rows[0]["backend"] != "C" or \
-                    int(rows[0]["layers"]) != n or \
-                    float(rows[0]["compute_median_ms"]) <= 0 or \
-                    rows[0]["parity"] != "PASS":
-                raise RuntimeError(f"CPU_L{n}_INVALID_MEASURED_RESULT:{rows}")
-        print("[V2_NATIVE_PREFIX_TEST] status=PASS CPU_N1_N2")
+        for explicit_rope_dim in (False, True):
+            model = Path(td) / (
+                "tiny-explicit.gguf" if explicit_rope_dim else "tiny-implicit.gguf")
+            create_model(model, explicit_rope_dim=explicit_rope_dim)
+            for n in (1, 2):
+                command = [str(args.exe.resolve()), "--model", str(model),
+                           "--backend", "C", "--layers", str(n),
+                           "--chunk", "16", "--kv", "128",
+                           "--threads", "2", "--warmups", "0",
+                           "--repeats", "2", "--verify-cpu"]
+                result = subprocess.run(command, check=False,
+                                        capture_output=True, text=True, timeout=120)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"CPU_L{n}_ROPE_DIM_{explicit_rope_dim}_FAIL:"
+                        f"{result.stderr[-4000:]}")
+                rows = list(csv.DictReader(io.StringIO(result.stdout)))
+                if len(rows) != 1 or rows[0]["backend"] != "C" or \
+                        int(rows[0]["layers"]) != n or \
+                        float(rows[0]["compute_median_ms"]) <= 0 or \
+                        rows[0]["parity"] != "PASS":
+                    raise RuntimeError(
+                        f"CPU_L{n}_ROPE_DIM_{explicit_rope_dim}_RESULT:{rows}")
+        print("[V2_NATIVE_PREFIX_TEST] status=PASS CPU_N1_N2_OPTIONAL_ROPE_DIM")
 
 
 if __name__ == "__main__":
