@@ -124,9 +124,21 @@ class Service:
                     "PHONE_NATIVE_NO_VALID_RESULT exit=" +
                     str(run.returncode) + " stderr=" + run.stderr[-1500:])
             sample = validate_sample(rows[0], shape)
-            if run.returncode == 0 and sample["parity"] != "FAIL":
+            numeric_pass = (
+                float(sample["relative_rmse"]) <= shape["max_relative_rmse"] and
+                float(sample["max_abs"]) <= shape["max_abs_error"])
+            if shape["verify_cpu"]:
+                if sample["parity"] == "PASS" and not numeric_pass:
+                    raise ProfileProtocolError(
+                        "PHONE_NATIVE_PARITY_PASS_CONTRADICTS_MEASURED_ERROR")
+                if sample["parity"] == "FAIL" and numeric_pass:
+                    raise ProfileProtocolError(
+                        "PHONE_NATIVE_PARITY_FAIL_CONTRADICTS_MEASURED_ERROR")
+            if run.returncode == 0 and sample["parity"] != "FAIL" and (
+                    not shape["verify_cpu"] or numeric_pass):
                 state = "PASS"
-            elif run.returncode == 2 and sample["parity"] == "FAIL":
+            elif run.returncode == 2 and sample["parity"] == "FAIL" and (
+                    shape["verify_cpu"] and not numeric_pass):
                 state = "PARITY_FAIL"
             else:
                 raise ProfileProtocolError(
