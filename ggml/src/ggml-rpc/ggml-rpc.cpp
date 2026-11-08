@@ -520,6 +520,8 @@ struct rpc_msg_phone_stage_profile_rsp {
     uint32_t bank_refill_failed = 0;
     uint32_t bank_refill_inflight = 0;
     uint32_t bank_refill_unstaged = 0;
+    uint32_t bank_timeline_overflow = 0;
+    uint32_t bank_device_service_windows = 0;
     double bank_queue_ms = 0;
     double bank_host_stage_wall_ms = 0;
     double bank_htp_lock_wait_ms = 0;
@@ -6901,6 +6903,7 @@ private:
     };
     std::map<uint64_t, std::vector<phone_profile_bank_timeline>>
         phone_stage_profile_bank_timeline;
+    std::set<uint64_t> phone_stage_profile_bank_timeline_overflow;
     // Completed same-Phone device-service intervals (separate HTP and A
     // lanes), retained until Patch33 telemetry is fetched by the PC.
     std::map<uint64_t, std::array<std::vector<ggml_phone_mixed_pipeline::interval>, 2>>
@@ -7648,6 +7651,7 @@ bool rpc_server::phone_stage_profile_pull(
         phone_stage_profile_overflow.erase(oldest);
         phone_stage_profile_banks.erase(oldest);
         phone_stage_profile_bank_timeline.erase(oldest);
+        phone_stage_profile_bank_timeline_overflow.erase(oldest);
         phone_stage_profile_device_windows.erase(oldest);
         phone_stage_profile_local_handoff.erase(oldest);
     }
@@ -7657,6 +7661,66 @@ bool rpc_server::phone_stage_profile_pull(
         response.npu_host_stage_ms = stats->second.staged_ms;
         response.npu_bank_repack_bytes = stats->second.repack_bytes;
         response.npu_bank_repack_ms = stats->second.repack_ms;
+    }
+    // Versioned Patch33 telemetry. Exact interval intersection with
+    // completed HTP/Adreno service windows in the SAME Phone clock.
+    // These are observed scheduling overlaps, not a claim of speedup.
+    const auto bank_timeline = phone_stage_profile_bank_timeline.find(request.run_id);
+    const auto windows_it = phone_stage_profile_device_windows.find(request.run_id);
+    const std::vector<ggml_phone_mixed_pipeline::interval> empty_windows;
+    const auto & htp_windows = windows_it == phone_stage_profile_device_windows.end() ?
+        empty_windows : windows_it->second[0];
+    const auto & adreno_windows = windows_it == phone_stage_profile_device_windows.end() ?
+        empty_windows : windows_it->second[1];
+    response.bank_device_service_windows =
+        static_cast<uint32_t>(htp_windows.size() + adreno_windows.size());
+    response.bank_timeline_overflow =
+        phone_stage_profile_bank_timeline_overflow.count(request.run_id) ? 1 : 0;
+    response.bank_refill_inflight =
+        phone_npu_bank_active_run == request.run_id ? 1 : 0;
+    for (const auto & queued : phone_npu_bank_refill_jobs) {
+        response.bank_refill_inflight += queued.run_id == request.run_id ? 1 : 0;
+    }
+    if (bank_timeline != phone_stage_profile_bank_timeline.end()) {
+        for (const auto & t : bank_timeline->second) {
+            ++response.bank_refill_count;
+            response.bank_refill_failed += t.ok ? 0 : 1;
+            response.bank_refill_unstaged += t.staged ? 0 : 1;
+            const auto delta = [](int64_t begin, int64_t end) {
+                return begin > 0 && end >= begin ?
+                    (end - begin) / 1000.0 : 0.0;
+            };
+            response.bank_queue_ms += delta(t.enqueue_us, t.dequeue_us);
+            response.bank_host_stage_wall_ms += delta(
+                t.stage_begin_us, t.stage_end_us);
+            response.bank_htp_lock_wait_ms += delta(
+                t.lock_begin_us, t.lock_acquired_us);
+            response.bank_htp_critical_wall_ms += delta(
+                t.lock_acquired_us, t.critical_end_us);
+            response.bank_precompile_ms += t.precompile_ms;
+            const auto overlap = [](int64_t begin, int64_t end,
+                                    const std::vector<ggml_phone_mixed_pipeline::interval> & windows) {
+                return ggml_phone_mixed_pipeline::overlap_us(
+                    {{begin, end}}, windows) / 1000.0;
+            };
+            response.bank_host_stage_htp_overlap_ms += overlap(
+                t.stage_begin_us, t.stage_end_us, htp_windows);
+            response.bank_host_stage_adreno_overlap_ms += overlap(
+                t.stage_begin_us, t.stage_end_us, adreno_windows);
+            response.bank_htp_critical_adreno_overlap_ms += overlap(
+                t.lock_acquired_us, t.critical_end_us, adreno_windows);
+        }
+    }
+    const auto handoff = phone_stage_profile_local_handoff.find(request.run_id);
+    if (handoff != phone_stage_profile_local_handoff.end()) {
+        const auto & h = handoff->second;
+        response.local_handoff_edges = h.edges;
+        response.local_handoff_incomplete = h.incomplete;
+        response.local_handoff_bytes = h.bytes;
+        response.local_handoff_move_ms = h.move_ms;
+        response.local_handoff_to_upload_ms = h.to_upload_ms;
+        response.local_handoff_upload_ms = h.upload_ms;
+        response.local_handoff_to_device_ms = h.to_device_ms;
     }
     const auto it = phone_stage_profile_finished.find(request.run_id);
     if (it == phone_stage_profile_finished.end() ||
@@ -9614,6 +9678,8 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 t.staged = prefetched;
                 t.ok = ok;
                 history.push_back(t);
+            } else {
+                phone_stage_profile_bank_timeline_overflow.insert(job.run_id);
             }
             if (!phone_auto_stop) {
                 active = true;
