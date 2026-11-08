@@ -6,6 +6,10 @@
 // The same Qwen3 layer graph builder is used by the Phone NPU path.
 // Each measurement graph contains the model's actual layers [0,N).
 #include "ggml.h"
+// Access to ggml_cgraph::uid is intentionally GGML-internal: Hexagon's
+// fixed-Graph precompiler uses the reserved high-bit UID namespace.
+// Keep this dependency private to the in-tree V2 executable.
+#include "ggml-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -525,21 +529,21 @@ sample_result run(const parameters & args) {
         // Assign the UID only after the fully bound Graph is finalized.
         constexpr uint64_t fixed_graph_namespace = UINT64_C(1) << 63;
         graph.graph->uid = fixed_graph_namespace | UINT64_C(1);
-        if (graph.graph->n_nodes <= 0) {
+        if (ggml_graph_n_nodes(graph.graph) <= 0) {
             throw std::runtime_error("HTP_MULTI_LAYER_GRAPH_EMPTY");
         }
         // HTP specializes opnodes after all repacked weights, KV and
         // fixed per-Chunk input addresses exist. No PC/Adreno fallback.
         prepare();
         std::cerr << "[V2_HTP_GRAPH] event=PRECOMPILE_START uid="
-                  << graph.graph->uid << " nodes=" << graph.graph->n_nodes
+                  << graph.graph->uid << " nodes=" << ggml_graph_n_nodes(graph.graph)
                   << " layers=" << args.layers << '\n';
         const auto start = clock_t::now();
         if (!precompile(backend.get(), graph.graph)) {
             throw std::runtime_error(
                 "HTP_MULTI_LAYER_PRECOMPILE_FAILED uid=" +
                 std::to_string(graph.graph->uid) + " nodes=" +
-                std::to_string(graph.graph->n_nodes));
+                std::to_string(ggml_graph_n_nodes(graph.graph)));
         }
         ggml_backend_synchronize(backend.get());
         precompile_ms = elapsed_ms(start);
