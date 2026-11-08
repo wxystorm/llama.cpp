@@ -28,12 +28,14 @@ From Windows PowerShell, copy the two small control-plane scripts:
 
     adb push .\tools\region-ring-experiments\v2_profile_wire.py /sdcard/Download/
     adb push .\tools\region-ring-experiments\v2_phone_profile_server.py /sdcard/Download/
+    adb push .\tools\region-ring-experiments\v2_profile_transfer.py /sdcard/Download/
 
 In the Termux shell:
 
     cd ~/phone-v2-profile
     cp /sdcard/Download/v2_profile_wire.py .
     cp /sdcard/Download/v2_phone_profile_server.py .
+    cp /sdcard/Download/v2_profile_transfer.py .
     export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
     export ADSP_LIBRARY_PATH="$PWD/lib"
     export GGML_HEXAGON_NDEV=1
@@ -59,9 +61,29 @@ over USB. No need to open the Phone to the LAN or assign a fixed phone
 IP. It works alongside the existing inference RPC server.
 
 For one smoke-test combination on all four backends (single PowerShell
-command):
+command, use the actual Phone IP if connected over direct TCP):
 
-    python .\tools\region-ring-experiments\run_v2_stage_matrix.py --exe ".\build-tensor-v2\bin\Release\region-ring-v2-stage-profile.exe" --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" --out ".\profile-v2\gcna" --phone "127.0.0.1:50177" --backends GCNA --layers "2,4" --chunks "64" --kvs "512" --warmups 1 --repeats 3
+    python .\tools\region-ring-experiments\run_v2_stage_matrix.py --exe ".\build-tensor-v2\bin\Release\region-ring-v2-stage-profile.exe" --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" --out ".\profile-v2\gcna" --phone "10.39.52.114:50177" --backends GCNA --layers "2,4" --chunks "64" --kvs "512" --warmups 1 --repeats 3
+
+For a more comprehensive **real Stage Profile**, set:
+- --layers-g "2,4,6" --layers-c "2,4" --layers-n "2,4"
+  --layers-a "2,4" (G/C/N/A may have different layer-depth axes)
+- --chunks "32,64,96,128" --kvs "512,1024" (KV does not need to be
+  divisible by Chunk; X96 with KV512 uses positions 416..511)
+- --warmups 2 --repeats 5 for repeated compute sampling and p90/stddev
+- --bank-repeats 3 to add opt-in real HTP SAME-BANK host-staged
+  weight repack measurement; it is NOT production dual-Bank overlap
+- --tcp-transfer-sizes-kib "256,1024,2048,4096"
+  --tcp-transfer-repeats 5 for raw binary TCP receiver throughput
+  in both directions. Set --tcp-transfer-sizes-kib "" to skip it.
+Use --update to force fresh samples. The script resumes prior valid
+samples, including known PARITY_FAIL records (with the same threshold
+and hashes) without repeatedly rerunning N4.
+
+When using direct LAN TCP rather than USB, start the Phone server with
+--bind 0.0.0.0 and set V2_PROFILE_TOKEN to the same random secret of
+at least 16 characters on BOTH PC and Phone. The token is plaintext
+and this should only be done on a trusted private LAN.
 
 For larger sweeps, vary layers/chunks/kvs and rerun. Existing PASS
 cases with the same PC/Phone device fingerprint, original GGUF SHA256,
@@ -86,6 +108,14 @@ execution. Inspect outputs regardless of that final exit code.
   N-L4-X64-KV512.json, A-L4-X64-KV512.json: full per-case records,
   keyed with model and executable hash and machine identity.
   Failed executions create a .failed.json diagnostic as well.
+- tcp-link-v2.csv: direct Phone Profile sidecar raw-TCP
+  PC_TO_PHONE and PHONE_TO_PC receiver time, payload bytes and throughput.
+  This is a separate synthetic link diagnostic, NOT production
+  ggml-rpc:50052 Tensor transport nor a Planner-approved transfer rate.
+- profile.json: per-backend Stage measurements, compute dispersion,
+  physical Buffer allocations, a separately labelled unvalidated
+  two-weight-bank capacity estimate, raw TCP link samples and outstanding
+  production RPC/Bank feasibility gaps. planner_ready remains false.
 - Each record marks the transport as LOCAL_NATIVE or PHONE_RPC_V1,
   and only publishes measured rows with native provenance.
 
@@ -119,12 +149,15 @@ adb forward rather than exposing a Profile service.
 - The server serializes all requests to avoid competing Phone Stage
   GPU/NPU workloads, but the concurrent legacy inference server
   should be left idle during benchmarking.
-- Initial implementation accepts Qwen3 Dense and K >= X with K % X=0,
-  up to 32 layers in the current shared Builder.
+- Initial implementation accepts Qwen3 Dense and K >= X, including
+  KV512/X96, up to 32 layers in the current shared Builder.
 - NPU N4 numerical accuracy is not solved by this transport; its
   failed cases are quarantined. Planner must eventually consider
   only correctness-qualified profiles, plus separately measured
   Bank refill/transfer costs and memory feasibility.
-- This step does not yet merge the N/A request into the production
-  ggml-rpc message enum, dynamically drive the production Phone
-  two-Bank executor, implement transfer Profile, or select a layout.
+- A raw-TCP link Profile is now available, but production ggml-rpc
+  Activation transfer, PC GPU H2D bank mover and physical HTP two-Bank
+  overlap still require separate runtime-equivalent measurement.
+- The experimental Profile sidecar is not yet integrated into
+  production ggml-rpc command handling, real two-Bank scheduling or
+  the new Planner.
