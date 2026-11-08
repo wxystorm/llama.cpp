@@ -1,6 +1,6 @@
 # Real four-backend compact Stage Profile. No manual NPU Region IDs and no
 # copying Android logs. Runs only the sampled GGUF Transformer layers.
-# Phone Patch32 RPC Server loads the original full GGUF for local HTP weights.
+# Phone Patch33 RPC Server loads the original full GGUF for local HTP weights.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Model,
@@ -10,6 +10,7 @@ param(
     [ValidateRange(2,4)][int]$Cycles = 3,
     [ValidateSet("16,32,64,128", "16,32,64", "32,64,128", "64")][string]$Chunks = "16,32,64,128",
     [string]$ProfileRoot = "",
+    [string]$V2ProfileJson = "",
     [int]$Threads = 8,
     [switch]$NoMmap,
     [switch]$UpdateCalibration,
@@ -78,7 +79,7 @@ Write-Host "[GCNA_PROFILE] stages=$($spec.pattern) cycles=$Cycles compact_layers
 Write-Host "[GCNA_PROFILE] runtime_layout=$layout auto_htp_regions=$npuRegions"
 Write-Host "[GCNA_PROFILE] Phone must load ORIGINAL GGUF $([IO.Path]::GetFileName($source))"
 Write-Host "[GCNA_PROFILE] Only sampled first $($spec.layers) layers run on PC; no 40-layer CPU filler."
-Write-Host "[GCNA_PROFILE] Phone samples returned via Patch32 RPC; DO NOT copy phone.log."
+Write-Host "[GCNA_PROFILE] Phone samples returned via Patch33 RPC; DO NOT copy phone.log."
 
 $vars = @{
     "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP" = "1"
@@ -155,4 +156,14 @@ if (Test-Path -LiteralPath $baseManifest) {
 }
 Write-Host "[GCNA_PROFILE] status=COMPLETE csv=$outCsv manifest=$manifestPath"
 Write-Host "[GCNA_PROFILE] phone_calibration=$calibration"
+if ($V2ProfileJson) {
+    $v2Profile = (Resolve-Path -LiteralPath $V2ProfileJson).Path
+    $merged = Join-Path $folder "profile-with-runtime.json"
+    $mergeCmd = Join-Path $PSScriptRoot "merge_v2_runtime_profile.py"
+    & $python $mergeCmd --profile $v2Profile --pc-log $runs --out $merged
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not import Patch33 real Bank/handoff telemetry from PC logs."
+    }
+    Write-Host "[GCNA_PROFILE] v2_runtime_profile=$merged"
+}
 Write-Host "[GCNA_PROFILE] No Android phone log was copied."
