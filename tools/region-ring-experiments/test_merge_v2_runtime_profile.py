@@ -17,6 +17,8 @@ def log_lines(*, bank_status="PASS", edge_status="PASS",
         "[PHONE_BANK_RUNTIME_PROFILE] source=RPC_PATCH33 run=818 refills=" +
         str(bank_count) + " failed=0 inflight=0 unstaged=0 overflow=" +
         str(overflow) + " device_windows=" + str(windows) +
+        " htp_windows=" + str(windows // 2) +
+        " adreno_windows=" + str(windows - windows // 2) +
         " queue_ms=2.1 host_stage_wall_ms=30.0 htp_lock_wait_ms=1.3"
         " htp_critical_wall_ms=43.0 precompile_ms=5.0"
         " host_stage_htp_overlap_ms=19.0"
@@ -61,6 +63,8 @@ class RuntimeProfileTests(unittest.TestCase):
         self.assertAlmostEqual(
             rows[0]["bank"]["host_stage_htp_overlap_fraction"], 19/30)
         self.assertEqual(rows[0]["clock_domain"], "PHONE_GGML_TIME_US")
+        self.assertTrue(rows[0]["bank"]["htp_overlap_verified"])
+        self.assertTrue(rows[0]["bank"]["adreno_overlap_verified"])
         out = merge(self.profile, self.log, self.out)
         self.assertFalse(out["planner_ready"])
         self.assertFalse(out["runtime_telemetry"]["planner_eligible"])
