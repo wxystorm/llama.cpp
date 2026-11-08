@@ -15,6 +15,15 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(cases("GC", [1], [32, 64], [32, 48]),
                          [("G", 1, 32, 32), ("C", 1, 32, 32)])
         self.assertEqual(csv_positive("4,2,4,1", "L"), [1, 2, 4])
+        self.assertIn(("N", 2, 96, 512),
+                      cases("N", [2], [96], [512]))
+        self.assertEqual(
+            cases("GCNA", [2], [96], [512],
+                  {"G": [2, 4, 6], "C": [2], "N": [2, 4], "A": [4]}),
+            [("G", 2, 96, 512), ("G", 4, 96, 512),
+             ("G", 6, 96, 512), ("C", 2, 96, 512),
+             ("N", 2, 96, 512), ("N", 4, 96, 512),
+             ("A", 4, 96, 512)])
         with self.assertRaises(ValueError):
             cases("X", [1], [32], [128])
 
@@ -212,8 +221,12 @@ class MatrixTests(unittest.TestCase):
                       "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
             with mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
                  mock.patch("run_v2_stage_matrix.phone_remote",
-                            return_value=("PARITY_FAIL", sample, "")):
+                            return_value=("PARITY_FAIL", sample, "")) as remote:
                 self.assertEqual(run_matrix(args), 1)
+                self.assertEqual(run_matrix(args), 1)
+                # A measured but inaccurate N4 is known and should be
+                # resumed as PARITY_FAIL, not silently treated as PASS.
+                self.assertEqual(remote.call_count, 1)
             self.assertFalse((args.out / "stage-profile-v2.csv").exists())
             self.assertTrue(
                 (args.out / "stage-profile-v2-parity-fail.csv").exists())
