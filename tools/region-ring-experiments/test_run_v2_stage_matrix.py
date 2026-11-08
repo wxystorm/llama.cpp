@@ -156,6 +156,60 @@ class MatrixTests(unittest.TestCase):
                 {item["key"]["backend"] for item in unified["compute_samples"]},
                 set("GCNA"))
 
+    def test_tcp_receiver_samples_are_separate_and_cacheable(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            model = base / "model.gguf"
+            model.write_bytes(b"fake only for TCP profile test")
+            args = argparse.Namespace(
+                exe=Path(sys.executable), model=model, out=base / "profile",
+                phone="127.0.0.1:50177", phone_token="",
+                phone_timeout=15, backends="N", layers="2", chunks="64",
+                kvs="512", warmups=1, repeats=3, threads=4, timeout=2,
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                bank_repeats=0, host_stage_cap_mib=1024,
+                tcp_transfer_sizes_kib="256,1024",
+                tcp_transfer_warmups=1, tcp_transfer_repeats=3,
+                update=False, dry_run=False)
+            info = {"status": "OK", "exe_sha256": "e" * 64,
+                    "device_id": "d" * 64}
+            native = {"backend": "N", "layers": "2", "chunk": "64",
+                      "kv_tokens": "512", "repeats": "3",
+                      "weight_bytes": "10000", "kv_bytes": "1000",
+                      "graph_workspace_bytes": "2000",
+                      "relative_rmse": "0.01", "max_abs": "0.1",
+                      "compute_median_ms": "10.5", "parity": "PASS",
+                      "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
+            def transfer_response(endpoint, *, direction, size_bytes, **_):
+                return {"direction": direction, "size_bytes": size_bytes,
+                        "warmups": 1, "repeats": 3,
+                        "receiver_median_ms": 1.4, "receiver_p90_ms": 1.6,
+                        "receiver_min_ms": 1.2, "receiver_max_ms": 1.7,
+                        "throughput_mib_s": 950.0,
+                        "source": "V2_TCP_SIDECAR_RX_STREAM",
+                        "planner_eligible": False,
+                        "measurement": "unidirectional_stream_receiver_wall"}
+            with mock.patch("run_v2_stage_matrix.host_device_id",
+                            return_value="h" * 64), \
+                 mock.patch("run_v2_stage_matrix.hello_phone",
+                            return_value=info), \
+                 mock.patch("run_v2_stage_matrix.phone_remote",
+                            return_value=("PASS", native, "")) as remote, \
+                 mock.patch("run_v2_stage_matrix.transfer_call",
+                            side_effect=transfer_response) as transfer:
+                self.assertEqual(run_matrix(args), 0)
+                self.assertEqual(transfer.call_count, 4)
+                self.assertEqual(remote.call_count, 1)
+                self.assertEqual(run_matrix(args), 0)
+                self.assertEqual(transfer.call_count, 4)
+                self.assertEqual(remote.call_count, 1)
+            import json
+            meta = json.loads((args.out / "profile.json").read_text())
+            self.assertEqual(len(meta["tcp_transfer_samples"]), 4)
+            self.assertTrue(meta["tcp_transfer_complete"])
+            self.assertFalse(meta["planner_ready"])
+            self.assertTrue((args.out / "tcp-link-v2.csv").exists())
+
     def test_phone_unavailable_does_not_block_pc_gc_and_will_resume(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
