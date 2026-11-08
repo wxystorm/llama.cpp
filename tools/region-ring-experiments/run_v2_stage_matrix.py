@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import statistics
 import subprocess
 import sys
 from typing import Any
@@ -80,6 +81,47 @@ def cases(backends: str, layers: list[int], chunks: list[int],
             for n, x, kv in itertools.product(
                 backend_layers.get(backend, layers), chunks, kvs)
             if kv >= x]
+
+
+def npu_refill_curve(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize independent HTP same-Bank weight reloads, never overlap.
+
+    A source case must be correctness-qualified PASS, have a real positive
+    weight byte count and have actually requested the repeated Bank probe.
+    Pool equal weight shapes across X/KV; no extrapolation or synthetic
+    refill duration is introduced here.
+    """
+    by_shape: dict[tuple[int, int, int], list[float]] = {}
+    for record in records:
+        key = record.get("key", {})
+        sample = record.get("sample", {})
+        if record.get("status") != "PASS" or key.get("backend") != "N" or (
+                sample.get("parity") != "PASS" or
+                int(key.get("bank_repeats", 0)) < 1):
+            continue
+        try:
+            layers = int(key["layers"])
+            raw_bytes = int(sample["raw_weight_bytes"])
+            bank_bytes = int(sample["weight_bytes"])
+            duration = float(sample["same_bank_refill_median_ms"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if min(layers, raw_bytes, bank_bytes) <= 0 or (
+                not math.isfinite(duration) or duration <= 0):
+            continue
+        by_shape.setdefault((layers, raw_bytes, bank_bytes), []).append(
+            duration)
+    return [
+        {"backend": "N", "layers": layers,
+         "raw_weight_bytes": raw_bytes,
+         "bank_weight_allocation_bytes": bank_bytes,
+         "refill_median_ms": statistics.median(times),
+         "samples": len(times),
+         "source": "NATIVE_HTP_SAME_BANK_RELOAD",
+         "overlap_measured": False}
+        for (layers, raw_bytes, bank_bytes), times in
+        sorted(by_shape.items())
+    ]
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -497,9 +539,12 @@ def run_matrix(args: argparse.Namespace) -> int:
             "physical_free_memory_verified": False,
             "two_bank_allocated_and_tested": False,
         })
-    # Unified structured model-specific Profile cache for the future V2
-    # Planner. Never claim Planner readiness before production transfer/Bank
-    # probes and all required numerical/compute samples are complete.
+    # Independent refill durations are directly usable as DAG task costs;
+    # no fixed-layout run or physical overlap percentage is required.
+    refill_points = npu_refill_curve(complete)
+    # Model- and device-bound measurement cache. Planner readiness still
+    # depends on production transport, memory guards and integration, never
+    # on observing overlap in an arbitrary runtime layout.
     aggregate = {
         "schema": 2,
         "model_sha256": model_sha,
@@ -533,6 +578,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                    "failed": len(failed_records)},
         "compute_complete": len(complete) == len(combinations),
         "stage_memory_allocations": stage_allocations,
+        "npu_weight_refill_points": refill_points,
         "tcp_transfer_samples": [
             {"key": record["key"], "sample": record["sample"],
              "source": record["origin"], "planner_eligible": False}
@@ -546,8 +592,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             bool(transfer_records) and not transfer_failed),
         "planner_ready": False,
         "pending": ["production_rpc_activation_transfer_profile",
-                    "real_dual_bank_overlapped_refill_profile",
-                    "runtime_memory_feasibility", "multi_backend_dag"],
+                    "runtime_memory_feasibility", "multi_backend_dag"] +
+                   (["htp_same_bank_refill_samples"] if not refill_points else []),
         "compute_samples": [
             {"key": record["key"], "sample": record["sample"],
              "transport": record["transport"], "status": record["status"]}
