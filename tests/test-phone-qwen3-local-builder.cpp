@@ -189,6 +189,24 @@ int main() {
     CHECK(side.positions.back() == 499);
     CHECK(side.causal_mask_f16[115 * 512 + 499] == 0);
     CHECK(side.causal_mask_f16[115 * 512 + 500] == 0xfc00);
+    // Independent Profile must probe exactly X96 tokens in KV512,
+    // positions 416..511, even though 512 is not divisible by 96.
+    auto nondiv = p;
+    nondiv.chunk_tokens = 96;
+    ggml_phone_qwen3::side_inputs final_96 {};
+    CHECK(ggml_phone_qwen3::make_side_inputs(
+        nondiv, 0, final_96, reason, 416));
+    CHECK(final_96.positions.size() == 96);
+    CHECK(final_96.positions.front() == 416);
+    CHECK(final_96.positions.back() == 511);
+    CHECK(final_96.k_indices.front() == 416);
+    CHECK(final_96.v_indices.back() == 511);
+    CHECK(final_96.causal_mask_f16.size() == 96 * 512);
+    CHECK(final_96.causal_mask_f16[417] == 0xfc00);
+    CHECK(final_96.causal_mask_f16[95 * 512 + 511] == 0);
+    CHECK(!ggml_phone_qwen3::make_side_inputs(
+        nondiv, 0, final_96, reason, 417));
+    CHECK(std::string(reason) == "INVALID_PROFILE_TOKEN_BEGIN");
     auto bad = w;
     bad.ffn_up = w.wq;
     CHECK(!ggml_phone_qwen3::validate_weights(p, bad, reason));
