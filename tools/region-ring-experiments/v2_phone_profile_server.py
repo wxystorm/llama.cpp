@@ -104,6 +104,8 @@ class Service:
                 "--threads", str(shape["threads"]),
                 "--relative-rmse", str(shape["max_relative_rmse"]),
                 "--max-abs-error", str(shape["max_abs_error"]),
+                "--bank-repeats", str(shape["bank_repeats"]),
+                "--host-stage-cap-mib", str(shape["host_stage_cap_mib"]),
             ]
             if shape["verify_cpu"]:
                 command.append("--verify-cpu")
