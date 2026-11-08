@@ -75,7 +75,7 @@ For a more comprehensive **real Stage Profile**, set:
   weight repack measurement; it is NOT production dual-Bank overlap
 - --tcp-transfer-sizes-kib "256,1024,2048,4096"
   --tcp-transfer-repeats 5 for raw binary TCP receiver throughput
-  in both directions. Set --tcp-transfer-sizes-kib "" to skip it.
+  in both directions. Use --skip-tcp-transfer to run Compute only.
 Use --update to force fresh samples. The script resumes prior valid
 samples, including known PARITY_FAIL records (with the same threshold
 and hashes) without repeatedly rerunning N4.
