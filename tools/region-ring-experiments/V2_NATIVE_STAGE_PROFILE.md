@@ -73,6 +73,37 @@ policies, not measured Snapdragon tolerances.
 
 Phone GPU uses --backend A and requires OpenCL.
 
+## N4 accuracy diagnostics
+
+On the user's Snapdragon 8 Elite / Hexagon v79, an initial native
+Qwen3-14B Q4_K_M, X64, KV512 experiment produced:
+
+- N2: HTP graph 70 nodes, native compute 21.914 ms, CPU parity
+  relative RMSE 0.01235 and MaxAbs 0.14021: PASS.
+- N4: HTP graph 140 nodes precompiled and executed successfully,
+  but CPU parity relative RMSE 0.07100 and MaxAbs 2.28937: FAIL.
+
+These are user-reported observations, not repo CI results. Do NOT relax
+accuracy thresholds just to produce N4 PASS or infer that N4 cannot be
+compiled/executed.
+
+Use --diagnose-layers on the phone to capture each l_out from the **same
+N4 Graph** and compare with the CPU Graph at Layer 0/1/2/3:
+
+    ./bin/region-ring-v2-stage-profile --model "$HOME/models/Qwen3-14B-Q4_K_M.gguf" --backend N --layers 4 --chunk 64 --kv 512 --warmups 1 --repeats 3 --verify-cpu --diagnose-layers
+
+Each [V2_LAYER_PARITY] event includes relative RMSE, MaxAbs, cosine,
+reference RMS and the worst element. A diagnostic run marks all layer
+outputs as GGML outputs, keeping their buffers resident. This changes
+Graph allocation and can affect timing; the CSV is labeled with
+NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC, not a regular planner sample.
+
+For an execution-history A/B, also run with --warmups 0 --repeats 1:
+a change in parity between single and repeated execution indicates
+KV update, reused allocation, fixed Graph state or synchronization issues.
+
+
+
 ## Scope and remaining work
 
 The N4 standalone probe intentionally keeps its complete Stage weights
