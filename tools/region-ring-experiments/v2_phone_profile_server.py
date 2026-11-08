@@ -14,6 +14,7 @@ import argparse
 import csv
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import platform
@@ -36,6 +37,24 @@ def sha256(path: Path) -> str:
         for block in iter(lambda: src.read(4 * 1024 * 1024), b""):
             d.update(block)
     return d.hexdigest()
+
+
+def backend_library_hashes(exe: Path) -> dict[str, str]:
+    # The native executable hash alone is insufficient: updating an HTP
+    # DSP .so or OpenCL backend without recompiling the executable changes
+    # the measured kernels. Resolve the local deployment library dir first.
+    search = [exe.parent.parent / "lib"]
+    search.extend(Path(p) for p in
+                  os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep)
+                  if p)
+    names = ("libggml-htp-v79.so", "libggml-hexagon.so",
+             "libggml-opencl.so", "libggml-cpu.so", "libggml.so")
+    result = {}
+    for name in names:
+        found = next((base / name for base in search
+                      if (base / name).is_file()), None)
+        result[name] = sha256(found) if found else "NOT_FOUND"
+    return result
 
 
 def property_value(name: str) -> str:
@@ -65,15 +84,25 @@ class Service:
             "product": property_value("ro.product.model"),
             "soc": property_value("ro.soc.model"),
             "abi": property_value("ro.product.cpu.abi"),
+            "os_build": property_value("ro.build.fingerprint"),
+            "vendor_build": property_value("ro.vendor.build.fingerprint"),
         }
         identity = "|".join(str(x) for x in device.values())
         self.device_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         self.device = device
+        self.backend_library_sha256 = backend_library_hashes(self.exe)
+        runtime = {"exe_sha256": self.exe_sha256,
+                   "library_sha256": self.backend_library_sha256,
+                   "device_id": self.device_id}
+        self.runtime_sha256 = hashlib.sha256(
+            json.dumps(runtime, sort_keys=True).encode("utf-8")).hexdigest()
 
     def hello(self) -> dict[str, Any]:
         return {"version": WIRE_VERSION, "status": "OK",
                 "model_sha256": self.model_sha256,
                 "exe_sha256": self.exe_sha256,
+                "runtime_sha256": self.runtime_sha256,
+                "library_sha256": self.backend_library_sha256,
                 "device_id": self.device_id,
                 "device": self.device,
                 "backends": ["N", "A"],
@@ -162,6 +191,7 @@ class Service:
                 "sample": sample,
                 "model_sha256": self.model_sha256,
                 "exe_sha256": self.exe_sha256,
+                "runtime_sha256": self.runtime_sha256,
                 "device_id": self.device_id,
                 "diagnostics": run.stderr[-2500:],
             }
@@ -220,6 +250,7 @@ def main() -> int:
                           timeout=args.timeout)
         print("[V2_PHONE_PROFILE] model_sha256=" + service.model_sha256,
               "exe_sha256=" + service.exe_sha256,
+              "runtime_sha256=" + service.runtime_sha256,
               "device_id=" + service.device_id, flush=True)
         with Server((args.bind, args.port), service) as server:
             print(f"[V2_PHONE_PROFILE] listening={args.bind}:{args.port} "
