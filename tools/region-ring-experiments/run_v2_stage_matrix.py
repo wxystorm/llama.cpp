@@ -129,6 +129,8 @@ def native_local(exe: Path, model: Path, shape: dict[str, Any],
         "--repeats", str(shape["repeats"]), "--threads", str(shape["threads"]),
         "--relative-rmse", str(shape["max_relative_rmse"]),
         "--max-abs-error", str(shape["max_abs_error"]),
+        "--bank-repeats", str(shape.get("bank_repeats", 0)),
+        "--host-stage-cap-mib", str(shape.get("host_stage_cap_mib", 1024)),
     ]
     if shape["verify_cpu"]:
         argv.append("--verify-cpu")
@@ -300,6 +302,9 @@ def run_matrix(args: argparse.Namespace) -> int:
             "verify_cpu": backend == "N" or args.verify_cpu,
             "max_relative_rmse": args.max_relative_rmse,
             "max_abs_error": args.max_abs_error,
+            "bank_repeats": (getattr(args, "bank_repeats", 0)
+                             if backend == "N" else 0),
+            "host_stage_cap_mib": getattr(args, "host_stage_cap_mib", 1024),
         }
         identity = {
             "model_sha256": model_sha,
@@ -389,6 +394,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             "threads": args.threads,
             "max_relative_rmse": args.max_relative_rmse,
             "max_abs_error": args.max_abs_error,
+            "bank_repeats": getattr(args, "bank_repeats", 0),
+            "host_stage_cap_mib": getattr(args, "host_stage_cap_mib", 1024),
         },
         "expected_cases": len(combinations),
         "counts": {"pass": len(complete),
@@ -440,6 +447,9 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--max-relative-rmse", type=float, default=0.02)
     parser.add_argument("--max-abs-error", type=float, default=0.5)
+    parser.add_argument("--bank-repeats", type=int, default=0,
+                        help="N only: measure raw HTP weight reload into the same Bank, never dual-Bank overlap")
+    parser.add_argument("--host-stage-cap-mib", type=int, default=1024)
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--verify-cpu", action="store_true",
                         help="Check G/C/A output against CPU (N is always verified)")
@@ -447,7 +457,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if args.warmups < 0 or args.repeats < 1 or args.threads < 1 or \
-            args.timeout < 0 or args.phone_timeout < 1:
+            args.timeout < 0 or args.phone_timeout < 1 or
+            args.bank_repeats < 0 or args.bank_repeats > 20 or
+            args.host_stage_cap_mib < 1:
         parser.error("INVALID_PROFILE_TIMINGS")
     try:
         return run_matrix(args)
