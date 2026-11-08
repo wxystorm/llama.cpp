@@ -19,8 +19,10 @@ For G4, X64, KV512:
 - Separately measure weight upload, Graph build, input prepare and
   synchronized native Compute; reject unsupported op/backend.
 
-Initial scope: Qwen3 Dense, 1..32 consecutive layers, KV divisible by X,
-and native supported RoPE. Unsupported model parameters fail closed.
+Initial scope: Qwen3 Dense, 1..32 consecutive layers, KV >= X,
+and native supported RoPE. For any X (including 96) the graph
+measures the exact final X tokens at positions KV-X .. KV-1 and
+records token_begin. Unsupported model parameters fail closed.
 
 ## Windows PC
 
@@ -43,8 +45,15 @@ Resumable G/C matrix (one line):
 
 The orchestrator saves each PASS sample and stage-profile-v2.csv.
 Its cache key includes the full GGUF SHA256, executable SHA256,
-backend, layers, X, KV, repeats and comparison tolerance. --update
-forces reruns. Missing/failed samples are never synthesized.
+device identity, backend, layers, X, KV, repeats and comparison tolerance.
+--update forces reruns. Missing/failed samples are never synthesized.
+PARITY_FAIL is cached as an observed inaccurate result, NOT as PASS.
+
+Compute output includes compute_min_ms, compute_median_ms,
+compute_p90_ms, compute_max_ms and compute_stddev_ms, plus independent
+activation_upload_median_ms and activation_readback_median_ms measured
+on each selected GGML physical backend. These isolated set/get times
+are NOT the CPU/Phone network transport cost.
 
 ## Phone HTP N2 and N4
 
@@ -73,6 +82,23 @@ policies, not measured Snapdragon tolerances.
 
 Phone GPU uses --backend A and requires OpenCL.
 
+To measure actual HTP host-staged weight-repack time without disk
+IO, run --backend N with --bank-repeats 3 and optionally
+--host-stage-cap-mib 1024. This stages the original raw GGUF weights
+once in Phone Host RAM, repeatedly calls native HTP Tensor-set on
+the SAME repack Buffer, synchronizes, and records
+same_bank_refill_median_ms. weight_file_read_ms and
+weight_backend_set_ms are independently measured, alongside the
+initial aggregate weight_upload_ms.
+
+THIS IS NOT A DUAL-BANK REFILL OR OVERLAP TEST. The native
+Profile code does not allocate/rebind a second Bank here; do not
+interpret the result as proof of dual-Bank execution readiness.
+It can consume substantial Host memory and is disabled by default.
+Every measured single-Stage Buffer allocation is tracked, while
+two_weight_banks_allocation_sum_bytes in profile.json is only a
+sizing estimate, never verified free memory.
+
 ## N4 accuracy diagnostics
 
 On the user's Snapdragon 8 Elite / Hexagon v79, an initial native
@@ -99,7 +125,7 @@ Graph allocation and can affect timing; the CSV is labeled with
 NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC, not a regular planner sample.
 
 For an execution-history A/B, also run with --warmups 0 --repeats 1:
-a change in parity between single and repeated execution indicates
+a change in parity between single and repeated execution may indicate
 KV update, reused allocation, fixed Graph state or synchronization issues.
 
 
