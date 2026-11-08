@@ -27,6 +27,7 @@ from v2_profile_wire import (
     ProfileProtocolError, SOURCE, WIRE_VERSION, call, validate_sample,
     validate_shape,
 )
+from v2_profile_transfer import transfer_call, SOURCE as TCP_SOURCE
 
 
 def sha256(path: Path) -> str:
@@ -370,6 +371,72 @@ def run_matrix(args: argparse.Namespace) -> int:
                   flush=True)
     save_rows(out / "stage-profile-v2.csv", complete)
     save_rows(out / "stage-profile-v2-parity-fail.csv", parity_fails)
+    # Measure actual binary bytes in BOTH directions over the same direct
+    # TCP link used for the Phone Profile control. These are socket-stream
+    # receiver times only, NOT production ggml-rpc Tensor transfer costs.
+    transfer_records: list[dict[str, Any]] = []
+    transfer_failed: list[dict[str, Any]] = []
+    sizes_spec = getattr(args, "tcp_transfer_sizes_kib", "")
+    if use_phone and phone and sizes_spec:
+        sizes = csv_positive(sizes_spec, "TRANSFER_SIZES_KIB")
+        if max(sizes) > 32768:
+            raise ValueError("TCP_TRANSFER_SIZE_EXCEEDS_32_MIB")
+        transfer_warmups = int(getattr(args, "tcp_transfer_warmups", 1))
+        transfer_repeats = int(getattr(args, "tcp_transfer_repeats", 5))
+        if not 0 <= transfer_warmups <= 3 or not 1 <= transfer_repeats <= 16:
+            raise ValueError("INVALID_TRANSFER_WARMUPS_OR_REPEATS")
+        source_sha = sha256(
+            Path(__file__).with_name("v2_profile_transfer.py"))
+        pc_link_id = local_device or host_device_id()
+        for size_kib in sizes:
+            for direction in ("PC_TO_PHONE", "PHONE_TO_PC"):
+                key = {
+                    "model_sha256": model_sha,
+                    "phone_exe_sha256": phone["exe_sha256"],
+                    "device_phone": phone["device_id"],
+                    "device_pc": pc_link_id,
+                    "endpoint": endpoint,
+                    "protocol_version": WIRE_VERSION,
+                    "transfer_module_sha256": source_sha,
+                    "direction": direction,
+                    "size_bytes": size_kib * 1024,
+                    "warmups": transfer_warmups,
+                    "repeats": transfer_repeats,
+                }
+                dest = out / f"TCP-{direction}-{size_kib}KiB.json"
+                if not args.update and valid_cached(dest, key):
+                    print(f"[V2_TCP_PROFILE] RESUME direction={direction} "
+                          f"bytes={size_kib * 1024}", flush=True)
+                    transfer_records.append(json.loads(dest.read_text("utf-8")))
+                    continue
+                print(f"[V2_TCP_PROFILE] RUN direction={direction} "
+                      f"bytes={size_kib * 1024}", flush=True)
+                try:
+                    sample = transfer_call(
+                        endpoint, token=token, model_sha256=model_sha,
+                        direction=direction, size_bytes=size_kib * 1024,
+                        warmups=transfer_warmups, repeats=transfer_repeats,
+                        timeout=phone_timeout)
+                    if sample.get("source") != TCP_SOURCE or \
+                            sample.get("planner_eligible") is not False:
+                        raise ProfileProtocolError("INVALID_TRANSFER_PROVENANCE")
+                    record = {"schema": 2, "status": "PASS", "key": key,
+                              "sample": sample,
+                              "origin": TCP_SOURCE,
+                              "planner_eligible": False}
+                    atomic_json(dest, record)
+                    transfer_records.append(record)
+                except (ProfileProtocolError, OSError, ValueError,
+                        RuntimeError) as exc:
+                    failures += 1
+                    failed = {"schema": 2, "status": "FAIL", "key": key,
+                              "reason": str(exc)}
+                    atomic_json(dest, failed)
+                    transfer_failed.append(failed)
+                    print(f"[V2_TCP_PROFILE] FAILED {direction} "
+                          f"size_kib={size_kib}: {exc}",
+                          file=sys.stderr, flush=True)
+    save_rows(out / "tcp-link-v2.csv", transfer_records)
     # Unified structured model-specific Profile cache for the future V2
     # Planner. Never claim Planner readiness before transfer/Bank profiles
     # and all required numerical/compute backend samples are complete.
@@ -402,8 +469,20 @@ def run_matrix(args: argparse.Namespace) -> int:
                    "parity_fail": len(parity_fails),
                    "failed": len(failed_records)},
         "compute_complete": len(complete) == len(combinations),
+        "tcp_transfer_samples": [
+            {"key": record["key"], "sample": record["sample"],
+             "source": record["origin"], "planner_eligible": False}
+            for record in transfer_records
+        ],
+        "tcp_transfer_failures": [
+            {"key": record["key"], "reason": record["reason"]}
+            for record in transfer_failed
+        ],
+        "tcp_transfer_complete": (
+            bool(transfer_records) and not transfer_failed),
         "planner_ready": False,
-        "pending": ["transfer_only_profile", "htp_bank_refill_profile",
+        "pending": ["production_rpc_activation_transfer_profile",
+                    "real_dual_bank_overlapped_refill_profile",
                     "runtime_memory_feasibility", "multi_backend_dag"],
         "compute_samples": [
             {"key": record["key"], "sample": record["sample"],
@@ -450,6 +529,10 @@ def main() -> int:
     parser.add_argument("--bank-repeats", type=int, default=0,
                         help="N only: measure raw HTP weight reload into the same Bank, never dual-Bank overlap")
     parser.add_argument("--host-stage-cap-mib", type=int, default=1024)
+    parser.add_argument("--tcp-transfer-sizes-kib", default="256,1024,2048,4096",
+                        help="Phone TCP unidirectional binary payload sizes in KiB; empty disables")
+    parser.add_argument("--tcp-transfer-warmups", type=int, default=1)
+    parser.add_argument("--tcp-transfer-repeats", type=int, default=5)
     parser.add_argument("--timeout", type=int, default=0)
     parser.add_argument("--verify-cpu", action="store_true",
                         help="Check G/C/A output against CPU (N is always verified)")
@@ -459,7 +542,9 @@ def main() -> int:
     if (args.warmups < 0 or args.repeats < 1 or args.threads < 1 or
             args.timeout < 0 or args.phone_timeout < 1 or
             args.bank_repeats < 0 or args.bank_repeats > 20 or
-            args.host_stage_cap_mib < 1):
+            args.host_stage_cap_mib < 1 or
+            not 0 <= args.tcp_transfer_warmups <= 3 or
+            not 1 <= args.tcp_transfer_repeats <= 16):
         parser.error("INVALID_PROFILE_TIMINGS")
     try:
         return run_matrix(args)
