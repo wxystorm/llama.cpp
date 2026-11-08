@@ -959,8 +959,7 @@ inline bool simulate(const model & m,
     c.npu_weight_refill_busy_ms = 0.0;
     c.npu_weight_refills = 0;
     if (m.phone_npu_weight_streaming &&
-            (!m.phone_npu_region_enabled ||
-             !m.phone_npu_region_weight_bytes)) {
+            !m.phone_npu_region_enabled) {
         return reject("NPU_REGION_PROFILE_MISSING");
     }
 
@@ -1412,6 +1411,7 @@ inline bool simulate(const model & m,
             size_t bytes = 0;
             double ms = 0.0;
             if (!m.phone_npu_weight_refill_ms ||
+                    !m.phone_npu_region_weight_bytes ||
                     !m.phone_npu_region_weight_bytes(
                         regions[r].layer_begin, regions[r].layer_end,
                         bytes) ||
