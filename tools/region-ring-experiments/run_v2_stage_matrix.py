@@ -95,7 +95,9 @@ def run_matrix(args: argparse.Namespace) -> int:
         shape = {"backend": backend, "layers": n, "chunk": x,
                  "kv_tokens": kv, "warmups": args.warmups,
                  "repeats": args.repeats, "threads": args.threads,
-                 "verify_cpu": backend == "N" or args.verify_cpu}
+                 "verify_cpu": backend == "N" or args.verify_cpu,
+                 "max_relative_rmse": args.max_relative_rmse,
+                 "max_abs_error": args.max_abs_error}
         key = {**identities, **shape}
         destination = out / f"{backend}-L{n}-X{x}-KV{kv}.json"
         if not args.update and valid_cached(destination, key):
@@ -107,7 +109,9 @@ def run_matrix(args: argparse.Namespace) -> int:
                 "--layers", str(n), "--chunk", str(x), "--kv", str(kv),
                 "--warmups", str(args.warmups),
                 "--repeats", str(args.repeats),
-                "--threads", str(args.threads)]
+                "--threads", str(args.threads),
+                "--relative-rmse", str(args.max_relative_rmse),
+                "--max-abs-error", str(args.max_abs_error)]
         if shape["verify_cpu"]:
             argv.append("--verify-cpu")
         print(f"[V2_PROFILE_MATRIX] {index}/{len(combinations)} "
@@ -124,7 +128,9 @@ def run_matrix(args: argparse.Namespace) -> int:
                     samples[0]["backend"] != backend or \
                     int(samples[0]["layers"]) != n or \
                     int(samples[0]["chunk"]) != x or \
-                    int(samples[0]["kv_tokens"]) != kv:
+                    int(samples[0]["kv_tokens"]) != kv or \
+                    int(samples[0]["repeats"]) != args.repeats or \
+                    samples[0].get("source") != "NATIVE_SINGLE_BACKEND_GGUF_PREFIX":
                 raise ValueError("MISSING_OR_WRONG_NATIVE_RESULT_ROW")
             if backend == "N" and samples[0]["parity"] != "PASS":
                 raise RuntimeError("HTP_RESULT_MISSING_CPU_PARITY_PASS")
@@ -170,6 +176,8 @@ def main() -> int:
     p.add_argument("--warmups", type=int, default=2)
     p.add_argument("--repeats", type=int, default=8)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--max-relative-rmse", type=float, default=0.02)
+    p.add_argument("--max-abs-error", type=float, default=0.5)
     p.add_argument("--timeout", type=int, default=0)
     p.add_argument("--verify-cpu", action="store_true",
                    help="Also compare G/C/A results against native CPU")
