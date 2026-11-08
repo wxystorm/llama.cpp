@@ -4743,7 +4743,7 @@ static bool ggml_backend_rpc_phone_stage_profile_pull(
         " precompile_ms=%.3f host_stage_htp_overlap_ms=%.3f"
         " host_stage_adreno_overlap_ms=%.3f"
         " htp_critical_adreno_overlap_ms=%.3f"
-        " source=RPC status=%s overlap_state=%s\n",
+        " status=%s overlap_state=%s\n",
         run_id,
         resources.bank_refill_count,
         resources.bank_refill_failed,
