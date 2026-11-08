@@ -70,11 +70,15 @@ def csv_positive(spec: str, name: str) -> list[int]:
 
 
 def cases(backends: str, layers: list[int], chunks: list[int],
-          kvs: list[int]) -> list[tuple[str, int, int, int]]:
+          kvs: list[int], backend_layers: dict[str, list[int]] | None = None
+          ) -> list[tuple[str, int, int, int]]:
     if not backends or not set(backends).issubset("GCNA"):
         raise ValueError("INVALID_BACKENDS:expected a subset of GCNA")
-    return [(backend, n, x, kv) for backend, n, x, kv in
-            itertools.product(dict.fromkeys(backends), layers, chunks, kvs)
+    backend_layers = backend_layers or {}
+    return [(backend, n, x, kv)
+            for backend in dict.fromkeys(backends)
+            for n, x, kv in itertools.product(
+                backend_layers.get(backend, layers), chunks, kvs)
             if kv >= x]
 
 
@@ -85,12 +89,15 @@ def atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temp, path)
 
 
-def valid_cached(path: Path, key: dict[str, Any]) -> bool:
+def valid_cached(path: Path, key: dict[str, Any],
+                 *, allow_parity_fail: bool = False) -> bool:
     if not path.exists():
         return False
     try:
         old = json.loads(path.read_text(encoding="utf-8"))
-        return old.get("status") == "PASS" and old.get("key") == key
+        return old.get("status") in (
+            ("PASS", "PARITY_FAIL") if allow_parity_fail else ("PASS",)
+        ) and old.get("key") == key
     except (OSError, ValueError):
         return False
 
@@ -241,7 +248,12 @@ def run_matrix(args: argparse.Namespace) -> int:
     layers = csv_positive(args.layers, "LAYERS")
     chunks = csv_positive(args.chunks, "CHUNKS")
     kvs = csv_positive(args.kvs, "KVS")
-    combinations = cases(args.backends, layers, chunks, kvs)
+    backend_layers = {}
+    for b in "GCNA":
+        spec = getattr(args, "layers_" + b.lower(), "")
+        if spec:
+            backend_layers[b] = csv_positive(spec, "LAYERS_" + b)
+    combinations = cases(args.backends, layers, chunks, kvs, backend_layers)
     if not combinations:
         raise ValueError("NO_VALID_CHUNK_KV_COMBINATIONS")
     endpoint = getattr(args, "phone", "")
@@ -317,10 +329,17 @@ def run_matrix(args: argparse.Namespace) -> int:
         }
         key = {**identity, **shape}
         destination = out / f"{backend}-L{n}-X{x}-KV{kv}.json"
-        if not args.update and valid_cached(destination, key):
+        if not args.update and valid_cached(destination, key,
+                                            allow_parity_fail=True):
+            cached = json.loads(destination.read_text("utf-8"))
             print(f"[V2_PROFILE_MATRIX] {index}/{len(combinations)} "
-                  f"RESUME backend={backend} L={n} X={x} KV={kv}", flush=True)
-            complete.append(json.loads(destination.read_text("utf-8")))
+                  f"RESUME backend={backend} L={n} X={x} KV={kv} "
+                  f"status={cached['status']}", flush=True)
+            if cached["status"] == "PASS":
+                complete.append(cached)
+            else:
+                parity_fails.append(cached)
+                failures += 1
             continue
         print(f"[V2_PROFILE_MATRIX] {index}/{len(combinations)} "
               f"RUN backend={backend} L={n} X={x} KV={kv} "
@@ -456,7 +475,9 @@ def run_matrix(args: argparse.Namespace) -> int:
         },
         "request": {
             "backends": args.backends,
-            "layers": layers, "chunks": chunks, "kvs": kvs,
+            "layers": layers,
+            "layers_by_backend": backend_layers,
+            "chunks": chunks, "kvs": kvs,
             "warmups": args.warmups, "repeats": args.repeats,
             "threads": args.threads,
             "max_relative_rmse": args.max_relative_rmse,
@@ -518,8 +539,17 @@ def main() -> int:
     parser.add_argument("--phone-token", default="",
                         help="Shared token (prefer V2_PROFILE_TOKEN environment variable)")
     parser.add_argument("--phone-timeout", type=int, default=360)
-    parser.add_argument("--layers", default="1,2,4,6")
-    parser.add_argument("--chunks", default="16,32,64,128")
+    parser.add_argument("--layers", default="2,4",
+                        help="Shared default layer depths for all backends")
+    parser.add_argument("--layers-g", default="",
+                        help="Override G layer depths, e.g. 2,4,6")
+    parser.add_argument("--layers-c", default="",
+                        help="Override C layer depths, e.g. 2,4")
+    parser.add_argument("--layers-n", default="",
+                        help="Override N layer depths, e.g. 2,4")
+    parser.add_argument("--layers-a", default="",
+                        help="Override A layer depths, e.g. 2,4")
+    parser.add_argument("--chunks", default="32,64,96,128")
     parser.add_argument("--kvs", default="128,512,1024")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=8)
