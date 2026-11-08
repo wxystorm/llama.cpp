@@ -15,6 +15,8 @@ on:
       - 'tests/test-phone-plan-region-map.cpp'
       - 'tests/CMakeLists.txt'
       - 'tools/region-ring-experiments/**'
+      - 'ggml/include/ggml-rpc.h'
+      - 'ggml/src/ggml-rpc/ggml-rpc.cpp'
       - 'tools/CMakeLists.txt'
 
 jobs:
@@ -40,4 +42,4 @@ jobs:
         run: |
           PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install --user numpy ./gguf-py
           ctest --test-dir build --output-on-failure \
-            -R "^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache|test-region-ring-v2-phone-profile-wire)$"
+            -R "^(test-region-ring-v2-native-cpu-prefix|test-region-ring-v2-matrix-cache|test-region-ring-v2-phone-profile-wire|test-region-ring-v2-runtime-profile-import)$"
