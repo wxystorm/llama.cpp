@@ -143,6 +143,9 @@ def run_matrix(args: argparse.Namespace) -> int:
             failures += 1
             failed = {"schema": 1, "status": "FAIL", "key": key,
                       "reason": str(exc)}
+            # A forced refresh must never leave an older PASS selectable
+            # after the same case failed. Preserve the error separately.
+            atomic_json(destination, failed)
             atomic_json(destination.with_suffix(".failed.json"), failed)
             print("[V2_PROFILE_MATRIX] FAILED:", exc, file=sys.stderr,
                   flush=True)
