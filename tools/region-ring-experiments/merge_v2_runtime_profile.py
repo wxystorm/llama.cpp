@@ -153,16 +153,33 @@ def merge(profile_path: Path, log_path: Path, out_path: Path) -> dict[str, Any]:
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     if profile.get("schema") != 2 or not profile.get("model_sha256"):
         raise ValueError("V2_PROFILE_SCHEMA_OR_MODEL_FINGERPRINT_MISSING")
-    runs = collect(log_path)
+    # Accept the PC run root directly. Each engine.stderr.log is parsed
+    # independently to preserve per-process RUN IDs and avoid accidental
+    # merging of different sessions that reused a numerical run ID.
+    files = (sorted(log_path.rglob("engine.stderr.log"))
+             if log_path.is_dir() else [log_path])
+    if not files:
+        raise ValueError("NO_PC_ENGINE_LOG_FILES")
+    runs: list[dict[str, Any]] = []
+    source_files = []
+    for source in files:
+        measured = collect(source)
+        digest = hashlib.sha256()
+        with source.open("rb") as f:
+            for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                digest.update(block)
+        source_files.append({"file": str(source),
+                             "sha256": digest.hexdigest(),
+                             "complete_runs": len(measured)})
+        for record in measured:
+            record["pc_log_file"] = str(source)
+            record["pc_log_sha256"] = digest.hexdigest()
+        runs.extend(measured)
     if not runs:
         raise ValueError("NO_COMPLETE_PATCH33_PRODUCTION_RPC_TELEMETRY")
-    digest = hashlib.sha256()
-    with log_path.open("rb") as f:
-        for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
-            digest.update(block)
     profile["runtime_telemetry"] = {
         "source": "PC_ENGINE_LOG_PHONE_RPC_PATCH33",
-        "pc_log_sha256": digest.hexdigest(),
+        "pc_logs": source_files,
         "model_identity_verified_against_runtime": False,
         "runs": runs,
         "bank_measured_run_count": sum(
