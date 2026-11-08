@@ -177,6 +177,10 @@ class PhoneServiceTests(unittest.TestCase):
                              timeout=2)
                 self.assertEqual(hello["model_sha256"],
                                  self.service.model_sha256)
+                self.assertEqual(hello["runtime_sha256"],
+                                 self.service.runtime_sha256)
+                self.assertIn("libggml-htp-v79.so",
+                              hello["library_sha256"])
                 with mock.patch("v2_phone_profile_server.subprocess.run",
                                 return_value=native_response()):
                     response = call(addr, "profile", {
