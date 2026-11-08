@@ -137,7 +137,7 @@ $baseManifest = Join-Path $folder "model_profile.json"
 $calibration = Join-Path $folder "phone_mixed_calibration.json"
 if (Test-Path -LiteralPath $baseManifest) {
     if ((Test-Path -LiteralPath $calibration) -and !$UpdateCalibration) {
-        Write-Warning "Existing phone_mixed_calibration.json preserved. Pass -UpdateCalibration to refresh from measured Patch32 RPC data."
+        Write-Warning "Existing phone_mixed_calibration.json preserved. Pass -UpdateCalibration to refresh from measured Patch33 RPC data."
     } else {
         $calibrationArgs = @(
             (Join-Path $PSScriptRoot "build_gcna_calibration.py"),
