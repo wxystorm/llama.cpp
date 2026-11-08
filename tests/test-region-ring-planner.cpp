@@ -242,6 +242,39 @@ int main() {
             logical, 4, npu_one_only, adreno_valid,
             phone_memory, spill));
         REQUIRE(spill.npu_layers == 2);
+
+        const auto npu_weight_bytes = [](
+                int begin, int end, size_t & bytes) {
+            if (end <= begin) { return false; }
+            bytes = (size_t) (end - begin) * 100;
+            return true;
+        };
+        const auto adreno_weight_bytes = [](
+                int begin, int end, size_t & bytes) {
+            if (end <= begin) { return false; }
+            bytes = (size_t) (end - begin) * 50;
+            return true;
+        };
+        phone_spill_memory footprint;
+        REQUIRE(phone_spill_memory_feasible(
+            spill.regions, spill.npu_region_indices,
+            npu_weight_bytes, adreno_weight_bytes,
+            10, 5, 20, 20, 30, 100, 520, footprint));
+        REQUIRE(footprint.npu_bank_weights[0] == 100);
+        REQUIRE(footprint.npu_bank_weights[1] == 100);
+        REQUIRE(footprint.npu_persistent_kv == 20);
+        REQUIRE(footprint.adreno_weights == 200);
+        REQUIRE(footprint.adreno_persistent_kv == 20);
+        REQUIRE(footprint.shared_overhead == 70);
+        REQUIRE(footprint.total == 510);
+        REQUIRE(!phone_spill_memory_feasible(
+            spill.regions, spill.npu_region_indices,
+            npu_weight_bytes, adreno_weight_bytes,
+            10, 5, 20, 20, 30, 99, 520, footprint));
+        REQUIRE(!phone_spill_memory_feasible(
+            spill.regions, spill.npu_region_indices,
+            npu_weight_bytes, adreno_weight_bytes,
+            10, 5, 20, 20, 30, 100, 509, footprint));
         const auto no_adreno = [](int, int) { return false; };
         REQUIRE(!choose_phone_npu_preferred_spill(
             logical, 1, npu_one_only, no_adreno,
