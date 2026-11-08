@@ -479,7 +479,9 @@ sample_result run(const parameters & args) {
     const double weight_upload_ms = elapsed_ms(upload_begin);
 
     double same_bank_refill_ms = 0;
+    double same_bank_section_ms = 0;
     if (args.bank_repeats > 0) {
+        const auto bank_section_begin = clock_t::now();
         // Controlled HTP quantized-weight repack/copy into the SAME
         // allocated Bank using already-staged host bytes. This excludes
         // storage IO and is not a dual-Bank prefetch/overlap benchmark.
@@ -495,6 +497,7 @@ sample_result run(const parameters & args) {
             if (rep >= 0) { refill.push_back(elapsed_ms(started)); }
         }
         same_bank_refill_ms = median(refill);
+        same_bank_section_ms = elapsed_ms(bank_section_begin);
         std::cerr << "[V2_HTP_BANK] mode=HOST_STAGED_SAME_BANK_REPACK"
                   << " layers=" << args.layers
                   << " raw_bytes=" << total_raw_bytes
@@ -583,7 +586,11 @@ sample_result run(const parameters & args) {
             throw std::runtime_error("HTP_FIXED_GRAPH_CACHE_LIFETIME_UNSUPPORTED");
         }
     }
-    const double graph_build_ms = elapsed_ms(build_begin) - weight_upload_ms;
+    // Keep the optional independent Bank refill experiments OUT of graph
+    // construction time; otherwise comparing runs with and without Bank
+    // profiling would report a fictitious Graph build slowdown.
+    const double graph_build_ms = elapsed_ms(build_begin) -
+        weight_upload_ms - same_bank_section_ms;
     std::vector<float> activation(
         static_cast<size_t>(p.n_embd) * args.chunk);
     for (size_t i = 0; i < activation.size(); ++i) {
