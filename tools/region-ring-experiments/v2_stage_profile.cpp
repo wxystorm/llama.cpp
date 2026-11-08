@@ -256,6 +256,20 @@ ggml_phone_owned::region_plan model_plan(
     return p;
 }
 
+// Must outlive the fixed HTP graph, but be destroyed BEFORE the graph
+// metadata and quantized Bank buffers. Otherwise a cached HTP opnode can
+// hold a pointer into freed graph storage on abnormal exit.
+struct htp_cache_guard {
+    ggml_backend_t backend = nullptr;
+    void (*clear)(ggml_backend_t) = nullptr;
+    ~htp_cache_guard() {
+        if (backend && clear) {
+            ggml_backend_synchronize(backend);
+            clear(backend);
+        }
+    }
+};
+
 struct sample_result {
     double graph_build_ms = 0;
     double weight_upload_ms = 0;
@@ -273,17 +287,18 @@ sample_result run(const parameters & args) {
     ggml_backend_dev_t dev = nullptr;
     if (args.backend == 'N') {
         dev = ggml_backend_dev_by_name("HTP0");
+    } else if (args.backend == 'C') {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     } else {
-        const auto type = args.backend == 'C' ?
-            GGML_BACKEND_DEVICE_TYPE_CPU : GGML_BACKEND_DEVICE_TYPE_GPU;
-        dev = ggml_backend_dev_by_type(type);
-        if (dev && args.backend == 'G' &&
-                std::string(ggml_backend_dev_name(dev)).find("CUDA") == std::string::npos) {
-            throw std::runtime_error("G_REQUIRES_CUDA_DEVICE");
-        }
-        if (dev && args.backend == 'A' &&
-                std::string(ggml_backend_dev_name(dev)).find("OpenCL") == std::string::npos) {
-            throw std::runtime_error("A_REQUIRES_OPENCL_DEVICE");
+        const char * needle = args.backend == 'G' ? "CUDA" : "OpenCL";
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            const auto d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    std::string(ggml_backend_dev_name(d)).find(needle) !=
+                        std::string::npos) {
+                dev = d;
+                break;
+            }
         }
     }
     if (!dev) { throw std::runtime_error("REQUESTED_BACKEND_NOT_AVAILABLE"); }
@@ -428,6 +443,18 @@ sample_result run(const parameters & args) {
         ggml_gallocr_free);
     if (!allocator || !ggml_gallocr_alloc_graph(allocator.get(), graph.graph)) {
         throw std::runtime_error("PREFIX_GRAPH_WORKSPACE_EXCEEDED");
+    }
+    htp_cache_guard cache {};
+    if (htp) {
+        const auto reg = ggml_backend_dev_backend_reg(dev);
+        cache.backend = backend.get();
+        cache.clear = reg == nullptr ? nullptr :
+            reinterpret_cast<void (*)(ggml_backend_t)>(
+                ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_hexagon_clear_fixed_graph_cache"));
+        if (!cache.clear) {
+            throw std::runtime_error("HTP_FIXED_GRAPH_CACHE_LIFETIME_UNSUPPORTED");
+        }
     }
     const double graph_build_ms = elapsed_ms(build_begin) - weight_upload_ms;
     std::vector<float> activation(
