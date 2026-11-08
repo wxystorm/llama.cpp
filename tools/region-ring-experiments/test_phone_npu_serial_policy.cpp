@@ -25,6 +25,17 @@ int main() {
     assert(!parse_regions("1, 3", selected));
     assert(!parse_regions("3;7", selected));
     assert(!parse_regions("0x3", selected));
+
+    // A third planned HTP region must use GGUF metadata while the
+    // physical Bank is still occupied by rank 0. No third Bank exists.
+    assert(!use_deferred_weight_metadata(false, 2, false));
+    assert(!use_deferred_weight_metadata(true, -1, false));
+    assert(!use_deferred_weight_metadata(true, 0, true));
+    assert(!use_deferred_weight_metadata(true, 1, true));
+    assert(use_deferred_weight_metadata(true, 2, false));
+    assert(use_deferred_weight_metadata(true, 3, false));
+    assert(!use_deferred_weight_metadata(true, 2, true));
+
     assert(layer_from_tensor_name("blk.19.attn_k.weight") == 19);
     assert(layer_from_tensor_name("Meta(CPU,RPC0)#blk.39.ffn_up.weight#0") == 39);
     assert(layer_from_tensor_name("blk.1.attn_k.weight") == 1);
