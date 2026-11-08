@@ -193,6 +193,8 @@ def hello_phone(endpoint: str, token: str,
             len(info["exe_sha256"]) != 64 or \
             not isinstance(info.get("device_id"), str) or \
             len(info["device_id"]) != 64 or \
+            not isinstance(info.get("runtime_sha256"), str) or \
+            len(info["runtime_sha256"]) != 64 or \
             info.get("transport") != "V2_PHONE_PROFILE_SIDECAR" or \
             not set(("N", "A")).issubset(info.get("backends", [])):
         raise ProfileProtocolError(
@@ -210,6 +212,7 @@ def phone_remote(endpoint: str, token: str, timeout: int,
     }, token=token, timeout=timeout)
     if response.get("model_sha256") != model_sha or \
             response.get("exe_sha256") != phone["exe_sha256"] or \
+            response.get("runtime_sha256") != phone["runtime_sha256"] or \
             response.get("device_id") != phone["device_id"]:
         raise ProfileProtocolError("PHONE_PROFILE_IDENTITY_CHANGED_DURING_RUN")
     state = response.get("status")
@@ -294,7 +297,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             phone = hello_phone(endpoint, token, phone_timeout, model_sha)
             print("[V2_PROFILE_MATRIX] PHONE_CONNECTED device_id=" +
                   phone["device_id"][:16] + " exe_sha256=" +
-                  phone["exe_sha256"][:16], flush=True)
+                  phone["exe_sha256"][:16] + " runtime_sha256=" +
+              phone["runtime_sha256"][:16], flush=True)
         except (OSError, ValueError, RuntimeError) as exc:
             # Do not abandon PC G/C measurements if Phone is offline or
             # carries a different original GGUF; each N/A case will fail
@@ -326,6 +330,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             "device_id": (phone["device_id"] if phone else "PHONE_UNAVAILABLE")
                 if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
+            "runtime_sha256": phone["runtime_sha256"] if remote and phone
+                              else None,
         }
         key = {**identity, **shape}
         destination = out / f"{backend}-L{n}-X{x}-KV{kv}.json"
@@ -414,6 +420,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                 key = {
                     "model_sha256": model_sha,
                     "phone_exe_sha256": phone["exe_sha256"],
+                    "phone_runtime_sha256": phone["runtime_sha256"],
                     "device_phone": phone["device_id"],
                     "device_pc": pc_link_id,
                     "endpoint": endpoint,
@@ -503,6 +510,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             "phone": {
                 "device_id": phone["device_id"] if phone else None,
                 "exe_sha256": phone["exe_sha256"] if phone else None,
+                "runtime_sha256": phone["runtime_sha256"] if phone else None,
                 "backends": [b for b in "NA" if b in args.backends],
                 "transport": "V2_PHONE_PROFILE_SIDECAR" if use_phone else None,
             },
