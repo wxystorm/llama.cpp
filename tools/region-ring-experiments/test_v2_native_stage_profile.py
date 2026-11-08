@@ -64,13 +64,14 @@ def main() -> None:
         for explicit_rope_dim in (False, True):
             model = Path(td) / (
                 "tiny-explicit.gguf" if explicit_rope_dim else "tiny-implicit.gguf")
-            create_model(model, explicit_rope_dim=explicit_rope_dim)
-            for n in (1, 2):
+            create_model(model, layers=4, explicit_rope_dim=explicit_rope_dim)
+            for n in (1, 2, 4):
                 command = [str(args.exe.resolve()), "--model", str(model),
                            "--backend", "C", "--layers", str(n),
                            "--chunk", "16", "--kv", "128",
                            "--threads", "2", "--warmups", "0",
-                           "--repeats", "2", "--verify-cpu"]
+                           "--repeats", "2", "--verify-cpu",
+                           "--diagnose-layers"]
                 result = subprocess.run(command, check=False,
                                         capture_output=True, text=True, timeout=120)
                 if result.returncode != 0:
@@ -84,7 +85,16 @@ def main() -> None:
                         rows[0]["parity"] != "PASS":
                     raise RuntimeError(
                         f"CPU_L{n}_ROPE_DIM_{explicit_rope_dim}_RESULT:{rows}")
-        print("[V2_NATIVE_PREFIX_TEST] status=PASS CPU_N1_N2_OPTIONAL_ROPE_DIM")
+                diagnostics = [
+                    line for line in result.stderr.splitlines()
+                    if line.startswith("[V2_LAYER_PARITY] ")
+                ]
+                if len(diagnostics) != n or any(
+                        " status=PASS" not in line
+                        for line in diagnostics):
+                    raise RuntimeError(
+                        f"CPU_L{n}_EXPECTED_{n}_CORRECT_LAYER_PARITY:{diagnostics}")
+        print("[V2_NATIVE_PREFIX_TEST] status=PASS CPU_N1_N2_N4_LAYER_PARITY_OPTIONAL_ROPE_DIM")
 
 
 if __name__ == "__main__":
