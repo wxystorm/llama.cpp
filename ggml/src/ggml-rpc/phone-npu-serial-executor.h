@@ -7,6 +7,7 @@
 #include "phone-qwen3-local-builder.h"
 #include "phone-qwen3-local-parity.h"
 #include "phone-npu-weight-banks.h"
+#include "phone-npu-serial-policy.h"
 
 #include <algorithm>
 #include <array>
@@ -588,10 +589,80 @@ public:
             reason = why;
             return false;
         }
+        // Ranks >= 2 do not have weights resident yet: the Bank Mover
+        // installs them only after the previous same-parity Region drains.
+        // Shadow-validation may build GGML *metadata* graphs from the
+        // already-checked GGUF layouts, but must not load another HTP Bank
+        // or precompile against addresses that will be repacked later.
+        const int bank_rank = banked_mode_ ?
+            rank_for_region(plan.region, plan.layer) : -1;
+        const bool deferred_metadata = use_deferred_weight_metadata(
+            banked_mode_, bank_rank,
+            bank_rank >= 0 && rank_banked_ready(plan.region));
+        ggml_context_ptr weight_meta_ctx;
+        if (deferred_metadata) {
+            ggml_init_params params = {
+                ggml_tensor_overhead() * 32 + 4096, nullptr, true
+            };
+            weight_meta_ctx.reset(ggml_init(params));
+            if (!weight_meta_ctx) {
+                reason = "PHONE_LOCAL_DEFERRED_GGUF_CONTEXT_ALLOC";
+                return false;
+            }
+        }
+        std::string deferred_lookup_error;
         ggml_phone_qwen3::layer_weights weights {};
         const auto find_weight = [&](const char * suffix) -> ggml_tensor * {
             char name[GGML_MAX_NAME] = {};
             std::snprintf(name, sizeof(name), "blk.%u.%s", plan.layer, suffix);
+            if (deferred_metadata) {
+                const auto & specs =
+                    banked_layers_[static_cast<size_t>(bank_rank)].tensors;
+                const banked_tensor_spec * found = nullptr;
+                for (const auto & spec : specs) {
+                    if (spec.name != name) { continue; }
+                    if (found != nullptr) {
+                        deferred_lookup_error =
+                            std::string("PHONE_LOCAL_DEFERRED_DUPLICATE_GGUF_WEIGHT:") + name;
+                        return nullptr;
+                    }
+                    found = &spec;
+                }
+                if (found == nullptr) {
+                    deferred_lookup_error =
+                        std::string("PHONE_LOCAL_DEFERRED_MISSING_GGUF_WEIGHT:") + name;
+                    return nullptr;
+                }
+                const auto & info = found->info;
+                if (info.type >= GGML_TYPE_COUNT ||
+                        info.n_dims == 0 || info.n_dims > GGML_MAX_DIMS ||
+                        info.nbytes == 0) {
+                    deferred_lookup_error =
+                        std::string("PHONE_LOCAL_DEFERRED_INVALID_GGUF_LAYOUT:") + name;
+                    return nullptr;
+                }
+                int64_t shape[GGML_MAX_DIMS] = {1, 1, 1, 1};
+                for (uint32_t d = 0; d < info.n_dims; ++d) {
+                    if (info.ne[d] == 0 ||
+                            info.ne[d] > uint64_t(INT64_MAX)) {
+                        deferred_lookup_error =
+                            std::string("PHONE_LOCAL_DEFERRED_INVALID_GGUF_SHAPE:") + name;
+                        return nullptr;
+                    }
+                    shape[d] = static_cast<int64_t>(info.ne[d]);
+                }
+                ggml_tensor * tensor = ggml_new_tensor(
+                    weight_meta_ctx.get(), static_cast<ggml_type>(info.type),
+                    GGML_MAX_DIMS, shape);
+                if (tensor == nullptr ||
+                        ggml_nbytes(tensor) != static_cast<size_t>(info.nbytes)) {
+                    deferred_lookup_error =
+                        std::string("PHONE_LOCAL_DEFERRED_GGUF_SIZE_MISMATCH:") + name;
+                    return nullptr;
+                }
+                ggml_set_name(tensor, name);
+                return tensor;
+            }
             ggml_tensor * selected = nullptr;
             for (const auto & entry : model_weights_) {
                 ggml_tensor * tensor = entry.second->tensor;
@@ -616,7 +687,8 @@ public:
         weights.q_norm = find_weight("attn_q_norm.weight");
         weights.k_norm = find_weight("attn_k_norm.weight");
         if (!ggml_phone_qwen3::validate_weights(plan, weights, why)) {
-            reason = std::string("PHONE_LOCAL_MODEL_") + why;
+            reason = !deferred_lookup_error.empty() ? deferred_lookup_error :
+                std::string("PHONE_LOCAL_MODEL_") + why;
             return false;
         }
         const size_t meta_bytes = ggml_tensor_overhead() * 1024 +
