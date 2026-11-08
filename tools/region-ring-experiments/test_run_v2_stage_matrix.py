@@ -44,7 +44,9 @@ class MatrixTests(unittest.TestCase):
                         f"{backend},2,64,512,{repeats},1.0,2.0,0,0.1,3.0,"
                         "100,100,100,0,0,NOT_REQUESTED,"
                         "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
-            with mock.patch("subprocess.run", side_effect=completed) as run:
+            with mock.patch("run_v2_stage_matrix.host_device_id",
+                            return_value="h" * 64), \
+                 mock.patch("subprocess.run", side_effect=completed) as run:
                 self.assertEqual(run_matrix(args), 0)
                 self.assertEqual(run.call_count, 2)
                 self.assertEqual(run_matrix(args), 0)
@@ -71,7 +73,9 @@ class MatrixTests(unittest.TestCase):
                 "backend,layers,chunk,kv_tokens,repeats,parity,source\n"
                 "N,2,64,512,1,NOT_REQUESTED,"
                 "NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n"))
-            with mock.patch("subprocess.run", return_value=response) as run:
+            with mock.patch("run_v2_stage_matrix.host_device_id",
+                            return_value="h" * 64), \
+                 mock.patch("subprocess.run", return_value=response) as run:
                 self.assertEqual(run_matrix(args), 1)
                 self.assertIn("--verify-cpu", run.call_args.args[0])
             self.assertEqual(
@@ -117,7 +121,9 @@ class MatrixTests(unittest.TestCase):
                                   else "NOT_REQUESTED"),
                        "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
                 return "PASS", row, ""
-            with mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
+            with mock.patch("run_v2_stage_matrix.host_device_id",
+                            return_value="h" * 64), \
+                 mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
                  mock.patch("run_v2_stage_matrix.phone_remote",
                             side_effect=remote_response) as remote, \
                  mock.patch("subprocess.run", side_effect=local_response) as local:
