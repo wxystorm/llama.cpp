@@ -13,6 +13,7 @@ import unittest
 from unittest import mock
 
 from v2_phone_profile_server import Server, Service
+from v2_profile_transfer import transfer_call, validate_transfer
 from v2_profile_wire import (
     ProfileProtocolError, WIRE_VERSION, call, decode, encode,
     validate_shape, validate_sample,
@@ -127,6 +128,39 @@ class PhoneServiceTests(unittest.TestCase):
             done = self.service.dispatch(request)
         self.assertEqual(done["status"], "PARITY_FAIL")
         self.assertEqual(done["sample"]["compute_median_ms"], "20.5")
+
+    def test_real_raw_tcp_binary_stream_both_directions(self):
+        with Server(("127.0.0.1", 0), self.service) as server:
+            port = server.server_address[1]
+            worker = threading.Thread(
+                target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                daemon=True)
+            worker.start()
+            try:
+                for direction in ("PC_TO_PHONE", "PHONE_TO_PC"):
+                    result = transfer_call(
+                        f"127.0.0.1:{port}", token="securelongtoken123",
+                        model_sha256=self.service.model_sha256,
+                        direction=direction, size_bytes=128 * 1024,
+                        warmups=1, repeats=3, timeout=5)
+                    self.assertGreater(result["receiver_median_ms"], 0)
+                    self.assertGreater(result["throughput_mib_s"], 0)
+                    self.assertEqual(result["size_bytes"], 128 * 1024)
+                    self.assertFalse(result["planner_eligible"])
+                with self.assertRaises(ProfileProtocolError):
+                    transfer_call(
+                        f"127.0.0.1:{port}", token="wrong",
+                        model_sha256=self.service.model_sha256,
+                        direction="PC_TO_PHONE", size_bytes=1024,
+                        warmups=0, repeats=1, timeout=5)
+                with self.assertRaises(ProfileProtocolError):
+                    validate_transfer({
+                        "direction": "PHONE_TO_PC",
+                        "size_bytes": 33 * 1024 * 1024,
+                        "warmups": 0, "repeats": 1})
+            finally:
+                server.shutdown()
+                worker.join(timeout=2)
 
     def test_phone_loopback_request_roundtrip(self):
         with Server(("127.0.0.1", 0), self.service) as server:
