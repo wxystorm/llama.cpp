@@ -464,7 +464,7 @@ sample_result run(const parameters & args) {
     }
     size_t total_raw_bytes = 0;
     for (const auto & item : todo) {
-        if (item.bytes > SIZE_MAX - total_raw_bytes) {
+        if (item.bytes > std::numeric_limits<size_t>::max() - total_raw_bytes) {
             throw std::runtime_error("STAGE_RAW_WEIGHTS_OVERFLOW");
         }
         total_raw_bytes += item.bytes;
