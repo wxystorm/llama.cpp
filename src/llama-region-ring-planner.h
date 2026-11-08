@@ -116,6 +116,9 @@ struct candidate {
     double phone_prepare_busy_ms = 0.0;
     int phone_auto_terminal_frames = 0;
     uint64_t phone_auto_terminal_bytes = 0;
+    // Optional HTP dual-Bank refill service, excluding load-time ranks 0/1.
+    double npu_weight_refill_busy_ms = 0.0;
+    int npu_weight_refills = 0;
 };
 
 struct model {
@@ -164,6 +167,14 @@ struct model {
     // weights are rolled through two persistent Banks. Adjacent GPU Regions
     // may interleave; only same-Bank rank k-2 lifetime is serialized.
     bool gpu_weight_streaming = false;
+    // Opt-in NPU Bank model for selected physical Phone Regions. The
+    // existing device::PHONE queue remains the single Phone compute lane;
+    // this models only weight readiness and the independent HTP Bank mover.
+    // No NPU Region may be inferred from a generic P Region.
+    bool phone_npu_weight_streaming = false;
+    std::function<bool(int, int)> phone_npu_region_enabled;
+    std::function<bool(int, int, size_t &)> phone_npu_region_weight_bytes;
+    std::function<bool(size_t, double &)> phone_npu_weight_refill_ms;
     double phone_register_ms = 0.0; // Legacy MoE P5 fallback only.
     // Dense: measured/proxied RPC graph bytes, not a hard-coded P5 graph.
     // embedded_directional means C2P -> Phone Full -> P2C runs inside Meta.
@@ -674,6 +685,7 @@ enum class event_kind : uint8_t {
     EDGE = 1,
     WEIGHT = 2,
     PHONE_PREPARE = 3,
+    NPU_WEIGHT = 4,
 };
 
 struct event {
@@ -739,6 +751,13 @@ inline bool simulate(const model & m,
     c.transfer_service_ms = {};
     c.transfer_payload_bytes = {};
     c.duplex_overlap_ms = 0.0;
+    c.npu_weight_refill_busy_ms = 0.0;
+    c.npu_weight_refills = 0;
+    if (m.phone_npu_weight_streaming &&
+            (!m.phone_npu_region_enabled ||
+             !m.phone_npu_region_weight_bytes)) {
+        return reject("NPU_REGION_PROFILE_MISSING");
+    }
 
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
@@ -1148,6 +1167,40 @@ inline bool simulate(const model & m,
         }
     }
 
+    // HTP ranks are ordered by the physical NPU stages selected by Plan.
+    // Ranks 0/1 are preloaded; rank k>=2 reuses the Bank of rank k-2 only
+    // after that Region has completed all its KV-ordered Chunks.
+    std::vector<int> npu_regions;
+    std::vector<int> npu_rank(regions.size(), -1);
+    std::vector<bool> npu_weight_ready(
+        regions.size(), !m.phone_npu_weight_streaming);
+    std::vector<bool> npu_weight_enqueued(regions.size(), false);
+    std::vector<double> npu_weight_load_ms(regions.size(), 0.0);
+    if (m.phone_npu_weight_streaming) {
+        for (size_t r = 0; r < regions.size(); ++r) {
+            if (regions[r].kind != llama_region_ring_stage_kind::PHONE ||
+                    !m.phone_npu_region_enabled(
+                        regions[r].layer_begin, regions[r].layer_end)) {
+                continue;
+            }
+            npu_rank[r] = (int) npu_regions.size();
+            npu_regions.push_back((int) r);
+            if (npu_rank[r] < 2) { continue; }
+            size_t bytes = 0;
+            double ms = 0.0;
+            if (!m.phone_npu_weight_refill_ms ||
+                    !m.phone_npu_region_weight_bytes(
+                        regions[r].layer_begin, regions[r].layer_end,
+                        bytes) ||
+                    bytes == 0 ||
+                    !m.phone_npu_weight_refill_ms(bytes, ms) ||
+                    !std::isfinite(ms) || ms < 0.0) {
+                return reject("NPU_WEIGHT_PROFILE_MISSING");
+            }
+            npu_weight_load_ms[r] = ms;
+        }
+    }
+
     std::priority_queue<event> events;
     std::array<std::deque<int>, 3> ready_queues;
     // Phone verification/prepare runs on a separate worker from GPU compute.
@@ -1191,6 +1244,8 @@ inline bool simulate(const model & m,
     double duplex_overlap_ms = 0.0;
     std::deque<int> weight_queue;
     bool weight_busy = false;
+    std::deque<int> npu_weight_queue;
+    bool npu_weight_busy = false;
     // A single shared PREPARE lane approximates region graph/split setup and
     // the single Bank mover's Region binding. The lane is
     // independent from CPU/CUDA/Phone compute.
@@ -1275,6 +1330,18 @@ inline bool simulate(const model & m,
             return false;
         }
 
+        if (m.phone_npu_weight_streaming &&
+                npu_rank[(size_t) r] >= 0) {
+            const int rank = npu_rank[(size_t) r];
+            if (rank >= 2 &&
+                    !region_done[(size_t) npu_regions[(size_t) rank - 2]]) {
+                return false;
+            }
+            if (!npu_weight_ready[(size_t) r]) {
+                return false;
+            }
+        }
+
         if (regions[(size_t) r].device == device::GPU &&
                 m.gpu_weight_streaming) {
             const int rank = gpu_rank[(size_t) r];
@@ -1337,6 +1404,14 @@ inline bool simulate(const model & m,
         }
     }
 
+    if (m.phone_npu_weight_streaming) {
+        for (size_t i = 0; i < std::min((size_t) 2, npu_regions.size()); ++i) {
+            const int r = npu_regions[i];
+            npu_weight_ready[(size_t) r] = true;
+            npu_weight_enqueued[(size_t) r] = true;
+        }
+    }
+
     int completed = 0;
     int max_live = 0;
     const int n_tasks = (int) tasks.size();
@@ -1368,6 +1443,20 @@ inline bool simulate(const model & m,
             events.push({
                 prepare_end + ms, r, event_kind::WEIGHT
             });
+            scheduled = true;
+        }
+
+        // The HTP Bank mover is independent from the CUDA H2D lane.
+        // Do not start rank k until the rank k-2 compute Region has drained.
+        if (m.phone_npu_weight_streaming &&
+                !npu_weight_busy && !npu_weight_queue.empty()) {
+            const int r = npu_weight_queue.front();
+            npu_weight_queue.pop_front();
+            npu_weight_busy = true;
+            const double ms = npu_weight_load_ms[(size_t) r];
+            c.npu_weight_refill_busy_ms += ms;
+            ++c.npu_weight_refills;
+            events.push({now + ms, r, event_kind::NPU_WEIGHT});
             scheduled = true;
         }
 
@@ -1641,6 +1730,19 @@ inline bool simulate(const model & m,
                 continue;
             }
 
+            if (current.kind == event_kind::NPU_WEIGHT) {
+                const int r = current.id;
+                if (r < 0 || r >= (int) regions.size() ||
+                        npu_rank[(size_t) r] < 2 ||
+                        !npu_weight_busy ||
+                        npu_weight_ready[(size_t) r]) {
+                    return reject("NPU_WEIGHT_EVENT_INVALID");
+                }
+                npu_weight_ready[(size_t) r] = true;
+                npu_weight_busy = false;
+                continue;
+            }
+
             if (current.kind == event_kind::WEIGHT) {
                 const int r = current.id;
                 if (r < 0 || r >= (int) regions.size() ||
@@ -1712,6 +1814,18 @@ inline bool simulate(const model & m,
                             gpu_weight_release_ms[
                                 (size_t) next_region] = now;
                             weight_queue.push_back(next_region);
+                        }
+                    }
+                }
+                if (m.phone_npu_weight_streaming &&
+                        npu_rank[(size_t) t.region] >= 0) {
+                    const int rank = npu_rank[(size_t) t.region];
+                    if ((size_t) rank + 2 < npu_regions.size()) {
+                        const int next_region =
+                            npu_regions[(size_t) rank + 2];
+                        if (!npu_weight_enqueued[(size_t) next_region]) {
+                            npu_weight_enqueued[(size_t) next_region] = true;
+                            npu_weight_queue.push_back(next_region);
                         }
                     }
                 }
