@@ -241,6 +241,97 @@ struct phone_npu_spill_result {
     int adreno_layers = 0;
 };
 
+// Both Phone accelerators use the same physical RAM budget. HTP ranks
+// alternate across exactly two weight Banks; their KV remains resident.
+// Adreno weight buffers stay resident rather than being streamed. The
+// capacities and scratch reservations come from the versioned Profile.
+struct phone_spill_memory {
+    std::array<size_t, 2> npu_bank_weights {};
+    size_t npu_persistent_kv = 0;
+    size_t adreno_weights = 0;
+    size_t adreno_persistent_kv = 0;
+    size_t shared_overhead = 0;
+    size_t total = 0;
+};
+
+inline bool phone_spill_memory_feasible(
+        const std::vector<llama_region_ring_region> & regions,
+        const std::vector<size_t> & npu_region_indices,
+        const std::function<bool(int, int, size_t &)> & npu_weight_bytes,
+        const std::function<bool(int, int, size_t &)> & adreno_weight_bytes,
+        size_t npu_kv_per_layer, size_t adreno_kv_per_layer,
+        size_t npu_workspace, size_t adreno_workspace,
+        size_t host_stage_reserve, size_t max_htp_bank_bytes,
+        size_t phone_budget_bytes,
+        phone_spill_memory & out) {
+    out = {};
+    if (regions.empty() || !npu_weight_bytes ||
+            !adreno_weight_bytes ||
+            max_htp_bank_bytes == 0 || phone_budget_bytes == 0) {
+        return false;
+    }
+    size_t npu_rank = 0;
+    long double npu_kv = 0.0L, adreno_kv = 0.0L;
+    long double adreno_weights = 0.0L;
+    size_t next_npu_index = 0;
+    for (size_t i = 0; i < regions.size(); ++i) {
+        const auto & r = regions[i];
+        if (r.layer_end <= r.layer_begin ||
+                (i > 0 && r.layer_begin != regions[i - 1].layer_end)) {
+            return false;
+        }
+        const bool npu = next_npu_index < npu_region_indices.size() &&
+            npu_region_indices[next_npu_index] == i;
+        if (npu) { ++next_npu_index; }
+        if (r.device != device::PHONE) {
+            if (npu) { return false; }
+            continue;
+        }
+        const size_t layers = (size_t) (r.layer_end - r.layer_begin);
+        size_t weight = 0;
+        if (npu) {
+            if (!npu_weight_bytes(r.layer_begin, r.layer_end, weight) ||
+                    weight == 0) {
+                return false;
+            }
+            const size_t bank = npu_rank++ % 2;
+            out.npu_bank_weights[bank] =
+                std::max(out.npu_bank_weights[bank], weight);
+            npu_kv += (long double) layers * npu_kv_per_layer;
+        } else {
+            if (!adreno_weight_bytes(r.layer_begin, r.layer_end, weight) ||
+                    weight == 0) {
+                return false;
+            }
+            adreno_weights += (long double) weight;
+            adreno_kv += (long double) layers * adreno_kv_per_layer;
+        }
+    }
+    if (next_npu_index != npu_region_indices.size() ||
+            out.npu_bank_weights[0] > max_htp_bank_bytes ||
+            out.npu_bank_weights[1] > max_htp_bank_bytes) {
+        return false;
+    }
+    const long double overhead =
+        (long double) npu_workspace + adreno_workspace +
+        host_stage_reserve;
+    const long double total =
+        (long double) out.npu_bank_weights[0] +
+        out.npu_bank_weights[1] +
+        npu_kv + adreno_weights + adreno_kv + overhead;
+    if (!std::isfinite(total) ||
+            total > (long double) phone_budget_bytes ||
+            total > (long double) std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+    out.npu_persistent_kv = (size_t) npu_kv;
+    out.adreno_weights = (size_t) adreno_weights;
+    out.adreno_persistent_kv = (size_t) adreno_kv;
+    out.shared_overhead = (size_t) overhead;
+    out.total = (size_t) total;
+    return true;
+}
+
 inline bool choose_phone_npu_preferred_spill(
         const std::vector<llama_region_ring_region> & logical,
         int max_npu_layers_per_region,
