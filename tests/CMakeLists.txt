@@ -122,6 +122,20 @@ if (LLAMA_BUILD_TOOLS)
     llama_test(region-ring-v2-stage-profile
         NAME test-region-ring-v2-profile-help LABEL region-ring ARGS --help)
 endif()
+if (LLAMA_BUILD_TOOLS)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        llama_test_cmd(${Python3_EXECUTABLE}
+            NAME test-region-ring-v2-native-cpu-prefix
+            LABEL region-ring
+            ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_v2_native_stage_profile.py
+                 --exe $<TARGET_FILE:region-ring-v2-stage-profile>)
+        llama_test_cmd(${Python3_EXECUTABLE}
+            NAME test-region-ring-v2-matrix-cache
+            LABEL region-ring
+            ARGS ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_run_v2_stage_matrix.py)
+    endif()
+endif()
 
 # V2 descriptor tests are independent of ggml/model/RPC/HTP and run in Release.
 add_executable(test-region-ring-v2-stage test-region-ring-v2-stage.cpp)
