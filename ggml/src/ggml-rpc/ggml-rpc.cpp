@@ -7968,7 +7968,13 @@ bool rpc_server::phone_input_stream_run(
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
-                    if (job.state == phone_auto_status::COMPLETE &&
+                    const char * runtime_profile_env =
+                        std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
+                    const bool track_runtime =
+                        runtime_profile_env != nullptr &&
+                        std::strcmp(runtime_profile_env, "1") == 0;
+                    if (track_runtime &&
+                            job.state == phone_auto_status::COMPLETE &&
                             job.device_service_begin_us > 0 &&
                             job.device_service_end_us > job.device_service_begin_us) {
                         const size_t lane = ggml_phone_npu_serial::htp_region(
@@ -7978,7 +7984,7 @@ bool rpc_server::phone_input_stream_run(
                             .push_back({job.device_service_begin_us,
                                         job.device_service_end_us});
                     }
-                    if (job.local_handoff_published_us > 0) {
+                    if (track_runtime && job.local_handoff_published_us > 0) {
                         auto & h = phone_stage_profile_local_handoff[request.run_id];
                         ++h.edges;
                         h.bytes += job.local_handoff_bytes;
@@ -8216,6 +8222,19 @@ bool rpc_server::phone_input_stream_run(
                     }
                     ++it;
                 } else { ++it; }
+            }
+            // Bound completed telemetry even when the PC never pulls it.
+            // Patch33 profiling is opt-in and must not accumulate a lifetime
+            // of Bank/Activation timestamps in a busy inference server.
+            while (phone_stage_profile_finished.size() > 8) {
+                const auto oldest = phone_stage_profile_finished.begin()->first;
+                phone_stage_profile_finished.erase(oldest);
+                phone_stage_profile_overflow.erase(oldest);
+                phone_stage_profile_banks.erase(oldest);
+                phone_stage_profile_bank_timeline.erase(oldest);
+                phone_stage_profile_bank_timeline_overflow.erase(oldest);
+                phone_stage_profile_device_windows.erase(oldest);
+                phone_stage_profile_local_handoff.erase(oldest);
             }
             // Keep predecessor records alive through overlap accounting.
             for (auto it = phone_auto_jobs.begin();
@@ -9712,6 +9731,8 @@ void rpc_server::phone_npu_bank_refill_loop() {
             }
             // The EXACT events of the actual HTP Mover, kept bounded
             // per Run. PC pulls the structured stats after Stream END.
+            const char * profile_env = std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
+            if (profile_env != nullptr && std::strcmp(profile_env, "1") == 0) {
             auto & history = phone_stage_profile_bank_timeline[job.run_id];
             if (history.size() < 512) {
                 phone_profile_bank_timeline t {};
@@ -9730,6 +9751,7 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 history.push_back(t);
             } else {
                 phone_stage_profile_bank_timeline_overflow.insert(job.run_id);
+            }
             }
             if (!phone_auto_stop) {
                 active = true;
