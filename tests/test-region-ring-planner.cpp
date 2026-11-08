@@ -98,6 +98,65 @@ int main() {
 
     model m = mock_profile();
 
+    // The existing exact DAG optionally models HTP dual-Bank recycling.
+    // Generic PHONE stays unchanged; only explicitly mapped NPU P1 Regions
+    // participate. Rank0/1 weights are preloaded at t=0, rank2 must wait
+    // until the previous same-parity Region has completed and been refilled.
+    {
+        const auto stages = llama_region_ring_parse(
+            "G4,C1,P1,G4,C1,P1,G4,C1,P1", 18);
+        model plain = mock_profile();
+        plain.layers = 18;
+        plain.tokens = 128;
+        plain.slot_pool = 0;
+        candidate reference;
+        reference.xc = reference.xg = reference.xp = 64;
+        REQUIRE(simulate(plain, stages, reference));
+        REQUIRE(reference.npu_weight_refills == 0);
+        REQUIRE(reference.npu_weight_refill_busy_ms == 0.0);
+
+        model htp = plain;
+        htp.phone_npu_weight_streaming = true;
+        htp.phone_npu_region_enabled = [](int begin, int end) {
+            return begin >= 0 && end - begin == 1;
+        };
+        htp.phone_npu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end - begin != 1) { return false; }
+                bytes = 1024;
+                return true;
+            };
+        htp.phone_npu_weight_refill_ms =
+            [](size_t bytes, double & ms) {
+                ms = (double) bytes / 1024.0 * 10000.0;
+                return true;
+            };
+        candidate banked;
+        banked.xc = banked.xg = banked.xp = 64;
+        REQUIRE(simulate(htp, stages, banked));
+        REQUIRE(banked.npu_weight_refills == 1);
+        REQUIRE(banked.npu_weight_refill_busy_ms == 10000.0);
+        REQUIRE(banked.wall_ms > reference.wall_ms + 9000.0);
+
+        model missing = htp;
+        missing.phone_npu_weight_refill_ms = {};
+        candidate invalid;
+        invalid.xc = invalid.xg = invalid.xp = 64;
+        std::string reason;
+        REQUIRE(!simulate(missing, stages, invalid, &reason));
+        REQUIRE(reason == "NPU_WEIGHT_PROFILE_MISSING");
+
+        // A fourth NPU Region reuses Bank B only after rank1 drains.
+        const auto four = llama_region_ring_parse(
+            "G4,C1,P1,G4,C1,P1,G4,C1,P1,G4,C1,P1", 24);
+        htp.layers = 24;
+        candidate four_banks;
+        four_banks.xc = four_banks.xg = four_banks.xp = 64;
+        REQUIRE(simulate(htp, four, four_banks));
+        REQUIRE(four_banks.npu_weight_refills == 2);
+        REQUIRE(four_banks.npu_weight_refill_busy_ms == 20000.0);
+    }
+
     // Wider offline search is opt-in: default online limits remain identical.
     {
         dag_search_limits defaults;
