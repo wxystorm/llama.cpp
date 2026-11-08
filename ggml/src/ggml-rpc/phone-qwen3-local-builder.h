@@ -63,14 +63,26 @@ struct side_inputs {
 
 inline bool make_side_inputs(const ggml_phone_owned::region_plan & p,
                              uint32_t chunk, side_inputs & out,
-                             const char * & reason) {
+                             const char * & reason,
+                             int64_t begin_override = -1) {
     if (!ggml_phone_owned::validate(p, reason) ||
             chunk >= ggml_phone_owned::chunk_count(p)) {
         reason = "INVALID_SIDE_INPUT_CHUNK";
         return false;
     }
-    const uint32_t begin = chunk * p.chunk_tokens;
-    const uint32_t tokens = std::min(p.chunk_tokens, p.total_tokens - begin);
+    // The optional override is for independent Profile probes: KV read
+    // length may not divide the chosen Chunk width (e.g. KV512/X96).
+    // Legacy Region Ring callers still use the normal Chunk index.
+    if (begin_override < -1 ||
+            (begin_override >= 0 &&
+             uint64_t(begin_override) + p.chunk_tokens > p.total_tokens)) {
+        reason = "INVALID_PROFILE_TOKEN_BEGIN";
+        return false;
+    }
+    const uint32_t begin = begin_override >= 0 ?
+        static_cast<uint32_t>(begin_override) : chunk * p.chunk_tokens;
+    const uint32_t tokens = begin_override >= 0 ? p.chunk_tokens :
+        std::min(p.chunk_tokens, p.total_tokens - begin);
     if (uint64_t(p.n_kv) * tokens * sizeof(uint16_t) >
             ggml_phone_owned::k_max_activation_bytes) {
         reason = "CAUSAL_MASK_BUDGET_EXCEEDED";
@@ -139,7 +151,8 @@ inline bool build_graph(ggml_context * ctx,
                         ggml_tensor * persistent_v = nullptr,
                         ggml_tensor * upstream_input = nullptr,
                         ggml_cgraph * shared_graph = nullptr,
-                        bool publish_output = true) {
+                        bool publish_output = true,
+                        int64_t begin_override = -1) {
     out = {};
     if (!ctx || !ggml_phone_owned::validate(p, reason) ||
             chunk >= ggml_phone_owned::chunk_count(p) ||
@@ -149,8 +162,16 @@ inline bool build_graph(ggml_context * ctx,
         }
         return false;
     }
-    const uint32_t begin = chunk * p.chunk_tokens;
-    const uint32_t tokens = std::min(p.chunk_tokens, p.total_tokens - begin);
+    if (begin_override < -1 ||
+            (begin_override >= 0 &&
+             uint64_t(begin_override) + p.chunk_tokens > p.total_tokens)) {
+        reason = "INVALID_PROFILE_TOKEN_BEGIN";
+        return false;
+    }
+    const uint32_t begin = begin_override >= 0 ?
+        static_cast<uint32_t>(begin_override) : chunk * p.chunk_tokens;
+    const uint32_t tokens = begin_override >= 0 ? p.chunk_tokens :
+        std::min(p.chunk_tokens, p.total_tokens - begin);
     const int64_t kv_width = int64_t(p.n_heads_kv) * p.head_dim;
     if (uint64_t(p.n_kv) * tokens * sizeof(uint16_t) >
             ggml_phone_owned::k_max_activation_bytes) {
@@ -370,7 +391,8 @@ inline bool build_graph_layers(
         multi_graph_result & out,
         const char * & reason,
         const std::vector<std::pair<ggml_tensor *, ggml_tensor *>> & kv = {},
-        bool preserve_layer_outputs = false) {
+        bool preserve_layer_outputs = false,
+        int64_t begin_override = -1) {
     out = {};
     if (!ctx || weights.empty() || weights.size() > 32 ||
             first_layer_plan.layer + weights.size() > 256 ||
@@ -396,7 +418,8 @@ inline bool build_graph_layers(
         graph_result layer {};
         if (!build_graph(ctx, p, chunk, weights[i], layer, reason,
                          k, v, input, graph,
-                         preserve_layer_outputs || i + 1 == weights.size())) {
+                         preserve_layer_outputs || i + 1 == weights.size(),
+                         begin_override)) {
             out = {};
             return false;
         }
