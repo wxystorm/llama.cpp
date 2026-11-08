@@ -69,7 +69,10 @@ class MatrixTests(unittest.TestCase):
             with mock.patch("subprocess.run", return_value=response) as run:
                 self.assertEqual(run_matrix(args), 1)
                 self.assertIn("--verify-cpu", run.call_args.args[0])
-            self.assertFalse((args.out / "N-L2-X64-KV512.json").exists())
+            self.assertEqual(
+                __import__("json").loads(
+                    (args.out / "N-L2-X64-KV512.json").read_text("utf-8")
+                )["status"], "FAIL")
             self.assertTrue((args.out / "N-L2-X64-KV512.failed.json").exists())
 
 
