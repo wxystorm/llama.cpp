@@ -13,7 +13,8 @@ from run_v2_stage_matrix import cases, csv_positive, run_matrix
 class MatrixTests(unittest.TestCase):
     def test_omits_invalid_chunk_kv_shapes_without_faking_rows(self):
         self.assertEqual(cases("GC", [1], [32, 64], [32, 48]),
-                         [("G", 1, 32, 32), ("C", 1, 32, 32)])
+                         [("G", 1, 32, 32), ("G", 1, 32, 48),
+                          ("C", 1, 32, 32), ("C", 1, 32, 48)])
         self.assertEqual(csv_positive("4,2,4,1", "L"), [1, 2, 4])
         self.assertIn(("N", 2, 96, 512),
                       cases("N", [2], [96], [512]))
