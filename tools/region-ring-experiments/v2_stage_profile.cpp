@@ -151,7 +151,7 @@ struct to_load {
 
 ggml_phone_qwen3::layer_weights load_layer(
         ggml_context * plain_ctx, ggml_context * quant_ctx,
-        const ggml_context * model_ctx,
+        ggml_context * model_ctx,
         const gguf_context * gguf, uint32_t layer,
         std::vector<to_load> & todo) {
     ggml_phone_qwen3::layer_weights w {};
