@@ -75,7 +75,7 @@ def describe(pattern: str, cycles: int) -> dict:
         "adreno_regions": [s.region for s in stages if s.backend == "A"],
         "sample_layers": {
             kind: sum(s.layers for s in stages if s.backend == kind)
-            for kind in "GCNA",
+            for kind in "GCNA"
         },
         "original_layer_indices": list(range(offset)),
     }
