@@ -74,6 +74,21 @@ class RuntimeProfileTests(unittest.TestCase):
             json.loads(self.profile.read_text())["compute_samples"][0]
                 ["sample"]["compute_median_ms"], "24.0")
 
+    def test_pc_run_root_collects_each_log_independently(self):
+        run_root = self.root / "runs"
+        for x in ("x64/sessionA", "x128/sessionB"):
+            folder = run_root / x
+            folder.mkdir(parents=True)
+            (folder / "engine.stderr.log").write_text(log_lines())
+        result = merge(self.profile, run_root, self.out)
+        recorded = result["runtime_telemetry"]
+        self.assertEqual(len(recorded["pc_logs"]), 2)
+        self.assertEqual(len(recorded["runs"]), 2)
+        self.assertEqual(recorded["bank_measured_run_count"], 2)
+        self.assertEqual(
+            len(set(x["pc_log_file"] for x in recorded["runs"])), 2)
+        self.assertFalse(recorded["planner_eligible"])
+
     def test_no_refill_does_not_count_as_dual_bank(self):
         self.log.write_text(
             log_lines(bank_status="NOT_EXERCISED", bank_count=0,
