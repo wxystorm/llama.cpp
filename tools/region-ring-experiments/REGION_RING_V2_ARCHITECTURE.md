@@ -149,7 +149,18 @@ Implemented in this V2 branch:
   each N/A shape, Phone executes its own native HTP/OpenCL Graph and
   sends measured rows back automatically, with no manual CSV copying;
 - explicit PARITY_FAIL measurements retained for analysis but excluded
-  from the planner-eligible PASS profile CSV.
+  from the planner-eligible PASS profile CSV;
+- exact KV-X final-token profile window for nondivisible shapes (e.g.
+  KV512/X96), plus measured compute min/median/p90/max/stddev;
+- physical GGML backend Activation set/get times and real raw GGUF
+  file-read versus HTP repack-write separation;
+- optional host-staged HTP SAME-BANK repeated refill measurement
+  (not dual-Bank overlap); optional direct-TCP socket receiver stream
+  calibration for both PC->Phone and Phone->PC directions;
+- buffer allocation measurements and separately labelled NOT-VALIDATED
+  two-HTP-Bank allocation sizing estimates in profile.json;
+- Phone device/lib/DSP/Android firmware runtime fingerprinting to
+  invalidate old timing samples after a backend binary update.
 See V2_NATIVE_STAGE_PROFILE.md and V2_PHONE_PROFILE_RPC.md.
 
 **Not yet implemented or verified:**
