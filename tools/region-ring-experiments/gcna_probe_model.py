@@ -150,10 +150,14 @@ def create_probe(source: Path, dest: Path, spec: dict) -> dict:
         writer.close()
     part = dest.with_suffix(dest.suffix+".partial")
     test = gguf.GGUFReader(part)
-    if int(test.get_field("qwen3.block_count").contents()) != probe_layers or \
-            len(test.tensors) != tensor_count or \
-            any(int(m[1]) >= probe_layers
-                for t in test.tensors if (m := BLOCK.match(t.name))):
+    valid = (int(test.get_field("qwen3.block_count").contents()) == probe_layers and
+             len(test.tensors) == tensor_count and
+             not any(int(m[1]) >= probe_layers
+                     for t in test.tensors if (m := BLOCK.match(t.name))))
+    # GGUFReader uses numpy.memmap. Release the mapping BEFORE replacing
+    # the .partial file; Windows refuses to rename a mapped file (WinError 32).
+    del test
+    if not valid:
         raise ValueError("COMPACT_GGUF_VERIFICATION_FAILED")
     part.replace(dest)
     return {
