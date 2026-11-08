@@ -667,6 +667,7 @@ int main(int argc, char ** argv) {
         double max_abs = 0.0;
         double relative_rmse = 0.0;
         const char * parity = "NOT_REQUESTED";
+        bool parity_failed = false;
         if (args.verify_cpu) {
             parameters cpu = args;
             cpu.backend = 'C';
@@ -700,15 +701,19 @@ int main(int argc, char ** argv) {
                               << '\n';
                 }
             }
-            if (!std::isfinite(relative_rmse) ||
-                    relative_rmse > args.max_relative_rmse ||
-                    max_abs > args.max_abs_error) {
-                throw std::runtime_error(
-                    "HTP_OR_CUDA_CPU_PARITY_FAILED rel_rmse=" +
-                    std::to_string(relative_rmse) +
-                    " max_abs=" + std::to_string(max_abs));
+            parity_failed = !std::isfinite(relative_rmse) ||
+                relative_rmse > args.max_relative_rmse ||
+                max_abs > args.max_abs_error;
+            parity = parity_failed ? "FAIL" : "PASS";
+            if (parity_failed) {
+                // Keep actual, independently measured HTP timing available
+                // for research, but return nonzero and prohibit this sample
+                // from planner-approved profiles. Never relax parity silently.
+                std::cerr << "[V2_STAGE_PARITY] status=FAIL rel_rmse="
+                          << relative_rmse << " max_abs=" << max_abs
+                          << " layers=" << args.layers
+                          << " backend=" << args.backend << '\n';
             }
-            parity = "PASS";
         }
         std::cout << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
                      "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
@@ -726,7 +731,9 @@ int main(int argc, char ** argv) {
                   << (args.diagnose_layers ?
                       ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX_DIAGNOSTIC\n" :
                       ",NATIVE_SINGLE_BACKEND_GGUF_PREFIX\n");
-        return 0;
+        // Exit 2 means native compute succeeded, but numerical accuracy
+        // failed. It is NOT a PASS and will never enter the accepted CSV.
+        return parity_failed ? 2 : 0;
     } catch (const std::exception & ex) {
         std::cerr << "[V2_STAGE_PROFILE] status=FAIL reason="
                   << ex.what() << '\n';
