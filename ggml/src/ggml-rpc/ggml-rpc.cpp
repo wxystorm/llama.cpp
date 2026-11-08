@@ -9464,7 +9464,7 @@ bool rpc_server::phone_npu_preload_ready_locked(
 // The only HTP compute lane remains serialized by phone_npu_backend_mutex.
 void rpc_server::phone_npu_bank_refill_loop() {
     for (;;) {
-        std::pair<uint64_t, ggml_phone_npu_serial::weight_bank_refill> job;
+        phone_npu_queued_bank_refill job {};
         {
             std::unique_lock<std::mutex> lock(phone_auto_mutex);
             phone_auto_cv.wait(lock, [&]() {
@@ -9473,8 +9473,10 @@ void rpc_server::phone_npu_bank_refill_loop() {
             if (phone_auto_stop) { return; }
             job = phone_npu_bank_refill_jobs.front();
             phone_npu_bank_refill_jobs.pop_front();
+            phone_npu_bank_active_run = job.run_id;
         }
-        const int64_t wait_begin_us = ggml_time_us();
+        const int64_t dequeue_us = ggml_time_us();
+        const int64_t wait_begin_us = dequeue_us;
         std::string reason;
         ggml_phone_npu_serial::full_region_executor::model_load_stats load {};
         ggml_phone_npu_serial::full_region_executor::local_htp_prepare_stats
@@ -9488,9 +9490,11 @@ void rpc_server::phone_npu_bank_refill_loop() {
         std::vector<std::vector<uint8_t>> staged;
         double host_stage_ms = 0.0;
         std::string stage_reason;
+        const int64_t host_stage_begin_us = ggml_time_us();
         const bool prefetched = phone_npu_executor != nullptr &&
             phone_npu_executor->stage_banked_rank(
-                job.second.to_rank, staged, host_stage_ms, stage_reason);
+                job.refill.to_rank, staged, host_stage_ms, stage_reason);
+        const int64_t host_stage_end_us = ggml_time_us();
         const bool stage_fallback = stage_reason ==
                 "NPU_BANK_HOST_STAGE_BUDGET_EXCEEDED" ||
             stage_reason == "NPU_BANK_HOST_STAGE_OOM";
@@ -9503,7 +9507,7 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 GGML_LOG_WARN(
                     "[NPU_BANK] event=STAGE_FALLBACK run=%" PRIu64
                     " to_rank=%zu reason=%s mode=SERIAL_GGUF_READ\n",
-                    job.first, job.second.to_rank, stage_reason.c_str());
+                    job.run_id, job.refill.to_rank, stage_reason.c_str());
             }
         } else {
             reason = stage_reason.empty() ?
@@ -9517,39 +9521,67 @@ void rpc_server::phone_npu_bank_refill_loop() {
             // RUN before it can abort a different experiment.
             std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
             lock_acquired_us = ggml_time_us();
-            stale_run = job.first != phone_npu_banked_run_id;
+            stale_run = job.run_id != phone_npu_banked_run_id;
             if (!stale_run && (prefetched || stage_fallback)) {
                 ok = phone_npu_executor->refill_banked_rank(
-                    job.first, job.second, reason, load, compiled,
+                    job.run_id, job.refill, reason, load, compiled,
                     prefetched ? &staged : nullptr);
                 if (ok) {
                     memory_after =
-                        phone_npu_executor->banked_memory_for_run(job.first);
+                        phone_npu_executor->banked_memory_for_run(job.run_id);
                 }
             }
         }
         if (stale_run) {
+            {
+                std::lock_guard<std::mutex> lock(phone_auto_mutex);
+                if (phone_npu_bank_active_run == job.run_id) {
+                    phone_npu_bank_active_run = 0;
+                }
+            }
             GGML_LOG_INFO(
                 "[NPU_BANK] event=STALE_REFILL_DROPPED"
                 " run=%" PRIu64 " to_rank=%zu status=SKIPPED\n",
-                job.first, job.second.to_rank);
+                job.run_id, job.refill.to_rank);
             continue;
         }
         const int64_t finish_us = ggml_time_us();
         bool active = false;
         {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            if (phone_npu_bank_active_run == job.run_id) {
+                phone_npu_bank_active_run = 0;
+            }
+            // The EXACT events of the actual HTP Mover, kept bounded
+            // per Run. PC pulls the structured stats after Stream END.
+            auto & history = phone_stage_profile_bank_timeline[job.run_id];
+            if (history.size() < 512) {
+                phone_profile_bank_timeline t {};
+                t.region = job.refill.to_region;
+                t.bank = static_cast<uint32_t>(job.refill.bank);
+                t.enqueue_us = job.queued_us;
+                t.dequeue_us = dequeue_us;
+                t.stage_begin_us = host_stage_begin_us;
+                t.stage_end_us = host_stage_end_us;
+                t.lock_begin_us = lock_begin_us;
+                t.lock_acquired_us = lock_acquired_us;
+                t.critical_end_us = finish_us;
+                t.precompile_ms = compiled.precompile_ms;
+                t.staged = prefetched;
+                t.ok = ok;
+                history.push_back(t);
+            }
             if (!phone_auto_stop) {
                 active = true;
                 if (ok) {
                     phone_npu_banked_ready_regions.insert(
-                        job.second.to_region);
+                        job.refill.to_region);
                     if (prefetched && host_stage_ms > 0.0 &&
                             host_staged_bytes > 0 &&
                             load.htp_repack_ms > 0.0 && load.new_bytes > 0) {
                         // Measured on the real Bank refill; never infer rates
                         // from generic Host/GPU copy or dummy tensor sizes.
-                        auto & sample = phone_stage_profile_banks[job.first];
+                        auto & sample = phone_stage_profile_banks[job.run_id];
                         sample.staged_bytes += host_staged_bytes;
                         sample.staged_ms += host_stage_ms;
                         sample.repack_bytes += load.new_bytes;
@@ -9558,9 +9590,9 @@ void rpc_server::phone_npu_bank_refill_loop() {
                 } else {
                     for (auto & entry : phone_auto_jobs) {
                         auto & pending = *entry.second;
-                        if (pending.request.key.run_id == job.first &&
+                        if (pending.request.key.run_id == job.run_id &&
                                 pending.request.key.region ==
-                                    job.second.to_region &&
+                                    job.refill.to_region &&
                                 pending.state != phone_auto_status::COMPLETE) {
                             pending.state = phone_auto_status::FAILED;
                         }
@@ -9578,8 +9610,8 @@ void rpc_server::phone_npu_bank_refill_loop() {
             " stage_mode=%s physical_banks=2"
             " bank_a_bytes=%zu bank_b_bytes=%zu kv_bytes=%zu"
             " graph_bytes=%zu status=%s reason=%s\n",
-            job.first, job.second.bank, job.second.from_rank,
-            job.second.to_rank, job.second.to_region,
+            job.run_id, job.refill.bank, job.refill.from_rank,
+            job.refill.to_rank, job.refill.to_region,
             load.new_bytes, load.new_weights, load.file_read_ms,
             host_stage_ms, host_staged_bytes,
             load.htp_repack_ms, compiled.precompile_ms,
@@ -9595,7 +9627,7 @@ void rpc_server::phone_npu_bank_refill_loop() {
             GGML_LOG_ERROR(
                 "[PHONE_AUTO_P2C] event=ABORT run=%" PRIu64
                 " region=%u reason=NPU_BANK_REFILL_FAILED:%s\n",
-                job.first, job.second.to_region, reason.c_str());
+                job.run_id, job.refill.to_region, reason.c_str());
             p2c_arena.abort();
         }
     }
@@ -10731,8 +10763,8 @@ void rpc_server::phone_auto_compute_loop(bool htp_lane_only) {
                 ++phone_auto_next_chunk[
                     { req.key.run_id, req.key.region }];
                 if (bank_refill.has_value()) {
-                    phone_npu_bank_refill_jobs.emplace_back(
-                        req.key.run_id, *bank_refill);
+                    phone_npu_bank_refill_jobs.push_back(
+                        {req.key.run_id, *bank_refill, ggml_time_us()});
                 }
             }
         }
