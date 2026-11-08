@@ -289,6 +289,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                   phone_error, file=sys.stderr, flush=True)
     complete: list[dict[str, Any]] = []
     parity_fails: list[dict[str, Any]] = []
+    failed_records: list[dict[str, Any]] = []
     failures = 0
     for index, (backend, n, x, kv) in enumerate(combinations, 1):
         remote = use_phone and backend in "NA"
@@ -359,10 +360,61 @@ def run_matrix(args: argparse.Namespace) -> int:
                       "reason": str(exc)}
             atomic_json(destination, failed)
             atomic_json(destination.with_suffix(".failed.json"), failed)
+            failed_records.append(failed)
             print("[V2_PROFILE_MATRIX] FAILED:", exc, file=sys.stderr,
                   flush=True)
     save_rows(out / "stage-profile-v2.csv", complete)
     save_rows(out / "stage-profile-v2-parity-fail.csv", parity_fails)
+    # Unified structured model-specific Profile cache for the future V2
+    # Planner. Never claim Planner readiness before transfer/Bank profiles
+    # and all required numerical/compute backend samples are complete.
+    aggregate = {
+        "schema": 2,
+        "model_sha256": model_sha,
+        "devices": {
+            "pc": {"device_id": local_device,
+                   "exe_sha256": native_sha,
+                   "backends": [b for b in "GC" if b in args.backends]},
+            "phone": {
+                "device_id": phone["device_id"] if phone else None,
+                "exe_sha256": phone["exe_sha256"] if phone else None,
+                "backends": [b for b in "NA" if b in args.backends],
+                "transport": "V2_PHONE_PROFILE_SIDECAR" if use_phone else None,
+            },
+        },
+        "request": {
+            "backends": args.backends,
+            "layers": layers, "chunks": chunks, "kvs": kvs,
+            "warmups": args.warmups, "repeats": args.repeats,
+            "threads": args.threads,
+            "max_relative_rmse": args.max_relative_rmse,
+            "max_abs_error": args.max_abs_error,
+        },
+        "expected_cases": len(combinations),
+        "counts": {"pass": len(complete),
+                   "parity_fail": len(parity_fails),
+                   "failed": len(failed_records)},
+        "compute_complete": len(complete) == len(combinations),
+        "planner_ready": False,
+        "pending": ["transfer_only_profile", "htp_bank_refill_profile",
+                    "runtime_memory_feasibility", "multi_backend_dag"],
+        "compute_samples": [
+            {"key": record["key"], "sample": record["sample"],
+             "transport": record["transport"], "status": record["status"]}
+            for record in complete
+        ],
+        "parity_fail_samples": [
+            {"key": record["key"], "sample": record["sample"],
+             "transport": record["transport"], "status": record["status"]}
+            for record in parity_fails
+        ],
+        "failed_samples": [
+            {"key": record["key"], "reason": record["reason"]}
+            for record in failed_records
+        ],
+    }
+    atomic_json(out / "profile.json", aggregate)
+    print(f"[V2_PROFILE_MATRIX] profile_json={out / 'profile.json'}")
     print(f"[V2_PROFILE_MATRIX] pass={len(complete)} "
           f"parity_fail={len(parity_fails)} fail={failures-len(parity_fails)}")
     return 1 if failures else 0
