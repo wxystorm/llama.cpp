@@ -156,6 +156,12 @@ llama_test(test-region-ring-v2-stage LABEL region-ring)
 add_executable(test-phone-autonomous-policy test-phone-autonomous-policy.cpp)
 llama_test(test-phone-autonomous-policy LABEL region-ring)
 
+# Third and later HTP Regions must validate against GGUF metadata until
+# their alternating physical Bank has been refilled (no HTP device needed).
+add_executable(test-phone-npu-serial-policy
+    ${PROJECT_SOURCE_DIR}/tools/region-ring-experiments/test_phone_npu_serial_policy.cpp)
+llama_test(test-phone-npu-serial-policy LABEL region-ring)
+
 # Pure C++ shadow-plan checks; no GGUF, HTP or RPC server required.
 add_executable(test-phone-owned-execution-plan test-phone-owned-execution-plan.cpp)
 llama_test(test-phone-owned-execution-plan LABEL region-ring)
