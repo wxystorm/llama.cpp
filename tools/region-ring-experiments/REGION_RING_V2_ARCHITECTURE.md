@@ -126,6 +126,39 @@ Replace over time:
 Do **not** replace the old runtime immediately: keep it as a
 regression baseline while migrating one capability at a time.
 
+## Incremental integration status (2026-11-09)
+
+The original `apply-wide` search and production entry point remain the
+authoritative target. These pieces are now implemented as opt-in helpers in
+`llama-region-ring-planner.h`, without changing legacy G/C/P behavior:
+
+- The final event simulator models HTP A/B Bank refill on the existing
+  Phone stage queue, with rank k blocked until rank k-2 has finished and
+  its physical Bank reload completes. The HTP weight-mover lane is
+  independent of the existing CUDA H2D mover.
+- In mixed-Phone mode NPU and Adreno must provide distinct measured native
+  Stage compute/prepare curves; an unavailable shape is rejected, not
+  silently charged as aggregate PHONE.
+- `choose_phone_npu_preferred_spill` selects a correctness-qualified NPU
+  prefix followed by an Adreno suffix. `phone_spill_memory_feasible`
+  checks two alternating HTP weight Banks, persistent KV, Adreno resident
+  weights, workspace and the shared Phone RAM budget before DAG admission.
+- The original independent native `run_v2_stage_matrix.py` Profile now
+  publishes `npu_weight_refill_points` from PASS-only repeated HTP
+  same-Bank measurements. These are task durations, not observed overlap
+  percentages. Measuring runtime overlap is **not** a prerequisite for
+  Planner eligibility.
+
+**Not connected yet:** automatic model-specific V2 cache reuse or forced
+refresh in `run_prompt_sweep.ps1`, conversion of native G/C/N/A Profile
+samples into `apply-wide` callbacks, and the final selected N/A mapping
+into production model weight placement and Phone Plan RPC. The current
+mixed Phone executor also only supports one-layer HTP Regions; N2/N4
+native profiler support is not proof that production runs those shapes.
+The new regression tests have not yet been confirmed by a build in the
+connected Windows/Android environment. Do not report this as an
+end-to-end automatic GCNA `apply-wide` implementation.
+
 ## Current implementation / acceptance gates
 
 Implemented in this V2 branch:
