@@ -217,6 +217,9 @@ class MatrixTests(unittest.TestCase):
                       "kv_tokens": "512", "repeats": "3",
                       "relative_rmse": "0.071", "max_abs": "2.289",
                       "compute_median_ms": "41.2",
+                      "weight_bytes": "900000000",
+                      "kv_bytes": "8000000",
+                      "graph_workspace_bytes": "32000000",
                       "parity": "FAIL",
                       "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
             with mock.patch("run_v2_stage_matrix.hello_phone", return_value=info), \
