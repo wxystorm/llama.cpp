@@ -517,15 +517,34 @@ sample_result run(const parameters & args) {
     };
     double precompile_ms = 0.0;
     if (htp) {
+        // Hexagon's precompile_fixed_graph() explicitly rejects ordinary
+        // GGML Graph UIDs: bit 63 is the fixed-Graph cache namespace.
+        // The legacy N1 register_chunk() path sets this bit before calling
+        // the same proc. This standalone profiler owns one HTP Graph per
+        // process, so serial=1 is unique within the fresh HTP session.
+        // Assign the UID only after the fully bound Graph is finalized.
+        constexpr uint64_t fixed_graph_namespace = UINT64_C(1) << 63;
+        graph.graph->uid = fixed_graph_namespace | UINT64_C(1);
+        if (graph.graph->n_nodes <= 0) {
+            throw std::runtime_error("HTP_MULTI_LAYER_GRAPH_EMPTY");
+        }
         // HTP specializes opnodes after all repacked weights, KV and
         // fixed per-Chunk input addresses exist. No PC/Adreno fallback.
         prepare();
+        std::cerr << "[V2_HTP_GRAPH] event=PRECOMPILE_START uid="
+                  << graph.graph->uid << " nodes=" << graph.graph->n_nodes
+                  << " layers=" << args.layers << '\n';
         const auto start = clock_t::now();
         if (!precompile(backend.get(), graph.graph)) {
-            throw std::runtime_error("HTP_MULTI_LAYER_PRECOMPILE_FAILED");
+            throw std::runtime_error(
+                "HTP_MULTI_LAYER_PRECOMPILE_FAILED uid=" +
+                std::to_string(graph.graph->uid) + " nodes=" +
+                std::to_string(graph.graph->n_nodes));
         }
         ggml_backend_synchronize(backend.get());
         precompile_ms = elapsed_ms(start);
+        std::cerr << "[V2_HTP_GRAPH] event=PRECOMPILE_DONE status=PASS"
+                  << " elapsed_ms=" << precompile_ms << '\n';
     }
     std::vector<double> prepare_ms, compute_ms;
     for (int repeat = -args.warmups; repeat < args.repeats; ++repeat) {
