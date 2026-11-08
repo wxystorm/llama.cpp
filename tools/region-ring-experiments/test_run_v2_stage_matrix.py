@@ -138,6 +138,14 @@ class MatrixTests(unittest.TestCase):
                 rows = list(csv.DictReader(stream))
             self.assertEqual({r["backend"] for r in rows}, set("GCNA"))
             self.assertEqual(len(rows), 4)
+            import json
+            unified = json.loads((args.out / "profile.json").read_text())
+            self.assertEqual(unified["counts"]["pass"], 4)
+            self.assertTrue(unified["compute_complete"])
+            self.assertFalse(unified["planner_ready"])
+            self.assertEqual(
+                {item["key"]["backend"] for item in unified["compute_samples"]},
+                set("GCNA"))
 
     def test_phone_unavailable_does_not_block_pc_gc_and_will_resume(self):
         with tempfile.TemporaryDirectory() as td:
@@ -213,6 +221,13 @@ class MatrixTests(unittest.TestCase):
             record = json.loads((args.out / "N-L4-X64-KV512.json").read_text())
             self.assertEqual(record["status"], "PARITY_FAIL")
             self.assertEqual(record["sample"]["compute_median_ms"], "41.2")
+            unified = json.loads((args.out / "profile.json").read_text())
+            self.assertFalse(unified["compute_complete"])
+            self.assertFalse(unified["planner_ready"])
+            self.assertEqual(unified["counts"]["pass"], 0)
+            self.assertEqual(unified["counts"]["parity_fail"], 1)
+            self.assertEqual(unified["parity_fail_samples"][0]["status"],
+                             "PARITY_FAIL")
 
 
 if __name__ == "__main__":
