@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    35
+#define RPC_PROTO_PATCH_VERSION    36
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -224,7 +224,8 @@ struct ggml_backend_rpc_phone_owned_plan {
     uint64_t run_id;
     uint64_t p2c_run_id;
     uint32_t region;
-    uint32_t layer;
+    uint32_t layer;       // first Transformer layer (inclusive)
+    uint32_t layer_end;   // exclusive, may exceed layer + 1
     uint32_t total_tokens;
     uint32_t chunk_tokens;
     uint32_t n_embd;
@@ -260,7 +261,8 @@ using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
 // an intermediate P2C frame or per-Chunk completion notification.
 struct ggml_backend_rpc_phone_npu_region_layer {
     uint32_t region;
-    uint32_t layer;
+    uint32_t layer;       // inclusive
+    uint32_t layer_end;   // exclusive
     uint32_t next_phone_gpu_region = 0;
 };
 #define GGML_BACKEND_RPC_PHONE_NPU_PLAN_CONFIGURE_PROC \
@@ -268,7 +270,7 @@ struct ggml_backend_rpc_phone_npu_region_layer {
 using ggml_backend_rpc_phone_npu_plan_configure_t = bool (*)(
     ggml_backend_t backend, uint64_t run_id,
     const ggml_backend_rpc_phone_npu_region_layer * entries,
-    size_t count);
+    size_t count, uint32_t npu_weight_policy);
 
 // One-time canonical Decode KV destination binding; no per-Chunk Graph.
 #define GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC \
