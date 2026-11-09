@@ -269,15 +269,11 @@ static void test_adjacent_phone_mixed_topology() {
     }
     check(legacy_rejected, "strict legacy parser must reject adjacent Phone Regions");
 
-    bool rejected_pc_tail = false;
-    try {
-        (void) llama_region_ring_parse_apply_wide_layout(
-            "G8,P1,P1,G8,P1,P1,G9,P1,G10", 40);
-    } catch (const std::exception &) {
-        rejected_pc_tail = true;
-    }
-    check(rejected_pc_tail,
-          "APPLY_WIDE must reject a mixed layout ending on PC");
+    const auto pc_tail = llama_region_ring_parse_apply_wide_layout(
+        "G8,P1,P1,G8,P1,P1,G9,P1,G10", 40);
+    check(pc_tail.back().device == llama_region_ring_device::GPU &&
+          llama_region_ring_apply_topology_compatible(pc_tail, 40),
+          "APPLY_WIDE must accept a mixed layout ending on CUDA");
 }
 
 static void test_phone_local_delegation_without_intermediate_p2c() {
@@ -355,15 +351,11 @@ static void test_general_topology() {
     }
     check(legacy_rejected,
           "legacy fixed Ring must still reject PC tail");
-    bool invalid_rejected = false;
-    try {
-        (void) llama_region_ring_parse(
-            "G4,C6,P8,G4,C6,P8,C12",48,true);
-    } catch (const std::exception &) {
-        invalid_rejected = true;
-    }
-    check(invalid_rejected,
-          "general Ring must reject a CPU tail without a GPU stage");
+    const auto cpu_only_final = llama_region_ring_parse(
+        "G4,C6,P8,G4,C6,P8,C12",48,true);
+    check(cpu_only_final.back().device == llama_region_ring_device::CPU &&
+          llama_region_ring_apply_topology_compatible(cpu_only_final, 48),
+          "partial final Cycle may end on CPU without an extra CUDA Stage");
 }
 
 static void test_apply_safe_compatibility() {
