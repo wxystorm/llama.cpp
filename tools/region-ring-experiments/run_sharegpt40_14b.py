@@ -42,7 +42,8 @@ FIELDS = (
     "prompt_file", "group", "attempt", "status", "actual_prefill_tokens",
     "prefill_ms", "prefill_tps", "actual_decode_tokens", "decode_ms",
     "decode_tps", "context", "plan_tokens", "xc", "xg", "xp", "layout_fixed",
-    "predicted_dag_ms",
+    "cuda_kv_mib", "gpu_bank_a_mib", "gpu_bank_b_mib",
+    "gpu_banks_plus_kv_mib", "predicted_dag_ms",
     "exit_code", "commit", "run_dir",
 )
 
@@ -128,18 +129,18 @@ def context_for_tokens(token_count: int, predict: int = PREDICT,
                * CONTEXT_ALIGN)
 
 
-def validate_layout(layout: str) -> str:
-    """A PC GPU-first, GPU-last Region Ring of exactly forty Qwen3 layers."""
+def validate_layout(layout: str, expected_layers: int = 40) -> str:
+    """A PC GPU-first, GPU-last Region Ring with the expected model depth."""
     parts = layout.split(",")
     matched = [re.fullmatch(r"([GP])([1-9][0-9]*)", p) for p in parts]
     if (len(parts) < 3 or len(parts) % 2 == 0 or
             any(m is None for m in matched) or
-            sum(int(m.group(2)) for m in matched) != 40 or
+            sum(int(m.group(2)) for m in matched) != expected_layers or
             any(m.group(1) != ("G" if i % 2 == 0 else "P")
                 for i, m in enumerate(matched))):
         raise ValueError(
             f"invalid layout {layout!r}: expected alternating G/P, "
-            "starting and ending in G, with exactly 40 layers")
+            f"starting and ending in G, with exactly {expected_layers} layers")
     return layout
 
 
@@ -228,6 +229,37 @@ def archive(out: Path, folder: Path, previous: dict) -> int:
     return number + 1
 
 
+
+def gpu_memory_from_log(folder: Path) -> dict:
+    """Record physical CUDA KV and reserved weight Bank peak from engine logs.
+
+    This is a lower bound on VRAM demand: graph buffers, CUDA workspace,
+    runtime allocations and WDDM's real residency budget are not included.
+    """
+    path = folder / "engine.stderr.log"
+    if not path.is_file():
+        return {}
+    log = path.read_text(encoding="utf-8", errors="replace")
+    kv_values = re.findall(
+        r"CUDA0 KV buffer size\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*MiB", log)
+    peaks = re.findall(
+        r"\[REGION_RING_GPU_BANK_PEAK_SUM\][^\r\n]*", log)
+    peak = next((line for line in reversed(peaks) if "status=READY" in line),
+                peaks[-1] if peaks else "")
+    def value(key: str) -> float | None:
+        found = re.search(r"(?:^|\s)" + re.escape(key) +
+                          r"=([0-9]+(?:\.[0-9]+)?)", peak)
+        return float(found.group(1)) if found else None
+    a = value("capacity_a_mib")
+    b = value("capacity_b_mib")
+    kv = float(kv_values[-1]) if kv_values else None
+    total = round(a + b + kv, 3) if None not in (a, b, kv) else None
+    return {
+        "cuda_kv_mib": kv, "gpu_bank_a_mib": a,
+        "gpu_bank_b_mib": b, "gpu_banks_plus_kv_mib": total,
+    }
+
+
 def run_prompt(args: argparse.Namespace, out: Path, group: int,
                prompt: Path, attempt: int, commit: str,
                plan: dict | None = None) -> tuple[dict, bool]:
@@ -255,8 +287,10 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         "--split-mode", "tensor", "--flash-attn", "on",
         "-c", str(context), "-b", str(BATCH), "-ub", str(UBATCH),
         "-n", str(PREDICT), "-t", str(THREADS), "--seed", str(SEED),
-        "--no-conversation", "-f", str(prompt), "-lv", "4", "--no-mmap",
+        "--no-conversation", "-f", str(prompt), "-lv", "4",
     ]
+    if not getattr(args, "mmap", False):
+        command.append("--no-mmap")
     if plan is not None:
         atomic_json(folder / "plan.json", plan)
     atomic_json(folder / "config.json", {
@@ -290,9 +324,11 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     base_args = SimpleNamespace(model=args.model, planner="apply-wide",
                                 skip_profile=True, batch=BATCH, ubatch=UBATCH,
                                 threads=THREADS, seed=SEED, n_predict=PREDICT,
-                                streaming="on", no_mmap=True)
+                                streaming="on",
+                                no_mmap=not getattr(args, "mmap", False))
     row = result_row(base_args, folder, prompt, token_count, context,
                      code, elapsed, commit)
+    row.update(gpu_memory_from_log(folder))
     row.update(attempt=attempt, group=group, context=context,
                plan_tokens=token_count,
                layout_fixed=env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
@@ -441,14 +477,26 @@ def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path
     return profile
 
 
-def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+def main(argv: list[str] | None = None, *,
+         description: str | None = None,
+         defaults: dict | None = None) -> int:
+    defaults = defaults or {}
+    ap = argparse.ArgumentParser(description=description or __doc__)
     ap.add_argument("--exe", type=Path, required=True)
     ap.add_argument("--model", type=Path, required=True)
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--prompt-dir", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--layout", default=LAYOUT)
+    ap.add_argument("--layout", default=defaults.get("layout", LAYOUT))
+    ap.add_argument("--model-layers", type=int,
+                    default=defaults.get("model_layers", 40),
+                    help="required Transformer depth for forced G/P layout (default 40)")
+    mmap_flags = ap.add_mutually_exclusive_group()
+    mmap_flags.add_argument("--mmap", dest="mmap", action="store_true",
+                            help="enable memory-mapped model weights (recommended for 32B)")
+    mmap_flags.add_argument("--no-mmap", dest="mmap", action="store_false",
+                            help="load model weights into memory (14B default)")
+    ap.set_defaults(mmap=bool(defaults.get("mmap", False)))
     ap.add_argument("--context", type=int, default=None,
                     help="optional fixed Context; default is minimum safe 256-aligned per Prompt")
     ap.add_argument("--min-context", type=int, default=MIN_CONTEXT,
@@ -496,6 +544,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--exe, --model and --prompt-dir must exist")
     if args.limit < 0 or args.delay < 0 or args.rerun_below < 0:
         ap.error("limit, delay and rerun-below must be >=0")
+    if not 1 <= args.model_layers <= 256:
+        ap.error("model-layers must be in [1,256]")
     if args.min_context <= 0 or args.context_padding < 0 or (
             args.context is not None and args.context <= 0):
         ap.error("context must be positive and context-padding nonnegative")
@@ -503,7 +553,7 @@ def main(argv: list[str] | None = None) -> int:
            (args.xc, args.xg, args.xp)):
         ap.error("XC/XG/XP must be in [1, 2048]")
     try:
-        args.layout = validate_layout(args.layout)
+        args.layout = validate_layout(args.layout, args.model_layers)
         overrides = load_chunk_overrides(args.chunk_overrides)
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         ap.error(str(exc))
@@ -539,7 +589,7 @@ def main(argv: list[str] | None = None) -> int:
             "padding": args.context_padding, "alignment": CONTEXT_ALIGN,
         },
         "batch": BATCH, "ubatch": UBATCH, "n_predict": PREDICT,
-        "threads": THREADS, "seed": SEED, "no_mmap": True,
+        "threads": THREADS, "seed": SEED, "no_mmap": not args.mmap,
         "ring_environment": {
             **RING_ENV, "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.layout,
         },
@@ -550,6 +600,9 @@ def main(argv: list[str] | None = None) -> int:
         "token_source": args.token_source,
         "tokenizer_exe": str(args.tokenizer_exe) if args.token_source == "model" else None,
     }
+    # Preserve exact 14B run configuration for restart compatibility.
+    if args.model_layers != 40:
+        configuration["model_layers"] = args.model_layers
     config_path = args.out / "run-config.json"
     existing_config = read_json(config_path) if config_path.exists() else {}
     if config_path.exists() and existing_config != configuration:
@@ -656,6 +709,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s "
               f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s",
               flush=True)
+        if row.get("gpu_banks_plus_kv_mib") is not None:
+            print(f"  [GPU_MEMORY] BankA={row['gpu_bank_a_mib']:.1f} MiB "
+                  f"BankB={row['gpu_bank_b_mib']:.1f} MiB "
+                  f"CUDA_KV={row['cuda_kv_mib']:.1f} MiB "
+                  f"subtotal={row['gpu_banks_plus_kv_mib']:.1f} MiB "
+                  "(excludes workspace/other CUDA/WDDM)", flush=True)
         if interrupted:
             stopped = True
             break
