@@ -404,7 +404,8 @@ private:
                                       bool                     embedding_only = false,
                                       bool                     preserve_weight_cache_on_reset = false,
                                       bool *                   graph_reused_out = nullptr,
-                                      llama_hybrid_stage_timing * stage_timing_out = nullptr);
+                                      llama_hybrid_stage_timing * stage_timing_out = nullptr,
+                                      bool                     force_hidden_output = false);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,
