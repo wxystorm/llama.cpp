@@ -347,6 +347,13 @@ int main() {
         REQUIRE(llama_region_ring_apply_topology_compatible(
             selected.concrete_regions, 24));
         const auto physical = selected.concrete_regions;
+        const auto recovered = collapse_adjacent_phone_stages(physical);
+        REQUIRE(recovered.size() == logical.size());
+        for (size_t i = 0; i < logical.size(); ++i) {
+            REQUIRE(recovered[i].device == logical[i].device);
+            REQUIRE(recovered[i].layer_begin == logical[i].layer_begin);
+            REQUIRE(recovered[i].layer_end == logical[i].layer_end);
+        }
         REQUIRE(simulate(native, physical, selected));
         REQUIRE(selected.concrete_regions.size() == 12);
         REQUIRE(selected.npu_region_indices.size() == 3);
