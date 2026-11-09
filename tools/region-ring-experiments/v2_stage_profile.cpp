@@ -299,6 +299,7 @@ ggml_phone_owned::region_plan model_plan(
     p.p2c_run_id = 1;
     p.region = 0;
     p.layer = 0;
+    p.layer_end = static_cast<uint32_t>(args.layers);
     p.total_tokens = static_cast<uint32_t>(args.kv);
     p.chunk_tokens = static_cast<uint32_t>(args.chunk);
     p.position_base = 0;
