@@ -84,6 +84,21 @@ static void test_layout() {
     }
     check(ninth_rejected, "forced layout accepted more than eight cycles");
 
+    // Consecutive NPU layers are a single logical Phone Region, not
+    // three PC->Phone round trips. The Qwen3-32B G7,P3 case is 64 layers:
+    // 54 GPU layers and 10 Phone layers across eight cycles.
+    const std::string multi_phone_spec =
+        "G7,P3,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G5,P1";
+    const auto multi_phone =
+        llama_region_ring_parse_apply_wide_layout(multi_phone_spec, 64);
+    const auto multi_counts = llama_region_ring_layer_counts(multi_phone);
+    check(multi_phone.size() == 16 &&
+              multi_counts[1] == 54 && multi_counts[2] == 10 &&
+              multi_phone[1].layer_begin == 7 &&
+              multi_phone[1].layer_end == 10 &&
+              llama_region_ring_apply_topology_compatible(multi_phone, 64),
+          "G7,P3 forced full-layer NPU Region rejected");
+
     // Forced CPU-final: 8 GPU+CPU cycles with no Phone Region.
     const std::string pc_spec =
         "G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1";
