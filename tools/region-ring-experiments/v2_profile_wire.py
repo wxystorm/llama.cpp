@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Versioned, bounded V2 compute-Profile control protocol.
+"""Versioned, bounded native V2 N/A Profile control protocol.
 
-Only independent N/A Stage probes are accepted on the Phone. This is
-a dedicated Profile transport, NOT the legacy ggml-rpc inference port.
-Use USB adb forward tcp:50177 tcp:50177 with the Phone listener bound
-to localhost, or a trusted LAN and a shared token.
+Production control shares the existing ggml-rpc inference port 50052:
+GGML RPC HELLO, then command 57 carrying one JSON profile frame.
+Legacy standalone 50177 sidecar support is retained for isolated tests,
+but is no longer used by the integrated sweep coordinator.
 """
 from __future__ import annotations
 
