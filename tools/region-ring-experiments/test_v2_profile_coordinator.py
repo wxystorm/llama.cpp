@@ -32,7 +32,8 @@ class NativeProfileCoordinatorTests(unittest.TestCase):
                 "devices": {
                     "pc": {"device_id": "pc", "exe_sha256": "exe"},
                     "phone": {"device_id": "phone",
-                              "runtime_sha256": "runtime"}},
+                              "runtime_sha256": "runtime",
+                              "transport": "V2_PHONE_PROFILE_RPC50052"}},
                 "compute_samples": samples,
                 "parity_fail_samples": [
                     {"status": "PARITY_FAIL",
@@ -83,6 +84,13 @@ class NativeProfileCoordinatorTests(unittest.TestCase):
                 folder, "modelhash", "pc", "exe",
                 required_chunks=(64, 128), required_kvs=(512,)),
                 (False, "INCOMPLETE_G2_X128_KV512"))
+            manifest["devices"]["phone"]["transport"] = "V2_PHONE_PROFILE_SIDECAR"
+            (folder / "profile.json").write_text(json.dumps(manifest))
+            self.assertEqual(validated_profile(
+                folder, "modelhash", "pc", "exe",
+                required_chunks=(64,), required_kvs=(512,)),
+                (False, "PHONE_PROFILE_TRANSPORT_MISMATCH"))
+            manifest["devices"]["phone"]["transport"] = "V2_PHONE_PROFILE_RPC50052"
             del manifest["npu_weight_refill_points"]
             (folder / "profile.json").write_text(json.dumps(manifest))
             self.assertEqual(validated_profile(
