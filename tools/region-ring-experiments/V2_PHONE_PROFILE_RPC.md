@@ -1,7 +1,7 @@
 # V2 Phone native Profile over the existing ggml-rpc port 50052
 
 Branch: `feat/region-ring-v2-stage-profile-rebuild-20261108`  
-Protocol: **ggml-rpc 4.0.34**, V2 Profile wire JSON v1.
+Protocol: **ggml-rpc 4.0.35**, V2 Profile wire JSON v1.
 
 ## What changed
 
