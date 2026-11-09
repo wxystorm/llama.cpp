@@ -11,6 +11,8 @@
 //
 // This header is the shared contract for V2 profiling, planning and runtime.
 // The legacy Region Ring retains its original behavior during migration.
+#include "ggml-phone-npu-budget.h"
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -203,22 +205,32 @@ inline const char * npu_weight_policy_name(npu_weight_policy p) {
 }
 
 struct npu_memory_request {
-    std::vector<size_t> stage_weight_bytes; // one entry per physical N stage
-    size_t npu_kv_bytes = 0;
-    size_t npu_graph_workspace_bytes = 0;
-    size_t host_stage_bytes = 0;
-    size_t adreno_resident_bytes = 0; // weights + KV + workspace
-    size_t other_shared_bytes = 0;
-    size_t phone_budget_bytes = 0;
-    size_t max_htp_allocation_bytes = 0;
+    std::vector<size_t> stage_weight_bytes; // actual HTP-repacked bytes per N stage
+    // Optional per-stage KV + activation + graph workspace, estimated at
+    // the same Chunk/KV geometry as the selected Plan. This is the per-cycle
+    // NPU footprint, NOT just its quantized weights.
+    std::vector<size_t> stage_auxiliary_bytes;
+    size_t npu_kv_bytes = 0;              // total persistent NPU-owned K/V
+    size_t npu_graph_workspace_bytes = 0; // peak reusable NPU graph workspace
+    size_t npu_activation_bytes = 0;      // persistent NPU activation slots
+    size_t host_stage_bytes = 0;          // CPU-side GGUF staging, Phone RAM
+    size_t adreno_resident_bytes = 0;     // weights + KV + workspace
+    size_t other_shared_bytes = 0;       // other Phone allocations
+    size_t phone_budget_bytes = 0;       // aggregate shared RAM budget
+    size_t max_htp_allocation_bytes = 0; // actual HTP repack buffer ceiling
+    size_t npu_total_budget_bytes = ggml_phone_npu_budget::total_bytes;
+    size_t npu_bank_budget_bytes = ggml_phone_npu_budget::bank_bytes;
 };
 
 struct npu_memory_decision {
     bool feasible = false;
     npu_weight_policy policy = npu_weight_policy::DISABLED;
-    size_t resident_total_bytes = 0;
-    size_t streaming_total_bytes = 0;
+    size_t resident_total_bytes = 0;  // all Phone shared memory
+    size_t streaming_total_bytes = 0; // all Phone shared memory
     size_t selected_total_bytes = 0;
+    size_t resident_npu_bytes = 0;    // NPU weights + KV + workspace + activation
+    size_t streaming_npu_bytes = 0;
+    size_t npu_auxiliary_bytes = 0;
     std::array<size_t, 2> bank_weight_bytes {};
     size_t all_npu_weight_bytes = 0;
     const char * reason = "INVALID_BUDGET";
@@ -227,7 +239,11 @@ struct npu_memory_decision {
 inline npu_memory_decision choose_npu_weight_policy(
         const npu_memory_request & m) {
     npu_memory_decision d {};
-    if (m.phone_budget_bytes == 0) { return d; }
+    if (m.phone_budget_bytes == 0 ||
+            m.npu_total_budget_bytes == 0 ||
+            m.npu_bank_budget_bytes == 0) {
+        return d;
+    }
     const auto add = [](size_t a, size_t b, size_t & out) -> bool {
         if (b > std::numeric_limits<size_t>::max() - a) {
             return false;
@@ -235,22 +251,22 @@ inline npu_memory_decision choose_npu_weight_policy(
         out = a + b;
         return true;
     };
-    size_t fixed = 0;
+    size_t phone_fixed = 0;
     for (size_t bytes : {
             m.npu_kv_bytes, m.npu_graph_workspace_bytes,
-            m.host_stage_bytes, m.adreno_resident_bytes,
-            m.other_shared_bytes}) {
-        if (!add(fixed, bytes, fixed)) {
+            m.npu_activation_bytes, m.host_stage_bytes,
+            m.adreno_resident_bytes, m.other_shared_bytes}) {
+        if (!add(phone_fixed, bytes, phone_fixed)) {
             d.reason = "MEMORY_OVERFLOW";
             return d;
         }
     }
     if (m.stage_weight_bytes.empty()) {
         d.policy = npu_weight_policy::DISABLED;
-        d.feasible = fixed <= m.phone_budget_bytes;
-        d.resident_total_bytes = fixed;
-        d.streaming_total_bytes = fixed;
-        d.selected_total_bytes = fixed;
+        d.feasible = phone_fixed <= m.phone_budget_bytes;
+        d.resident_total_bytes = phone_fixed;
+        d.streaming_total_bytes = phone_fixed;
+        d.selected_total_bytes = phone_fixed;
         d.reason = d.feasible ? "NONE" : "PHONE_BUDGET_EXCEEDED";
         return d;
     }
@@ -258,40 +274,78 @@ inline npu_memory_decision choose_npu_weight_policy(
         d.reason = "UNKNOWN_HTP_SINGLE_ALLOCATION_LIMIT";
         return d;
     }
+    if (!m.stage_auxiliary_bytes.empty() &&
+            m.stage_auxiliary_bytes.size() != m.stage_weight_bytes.size()) {
+        d.reason = "NPU_STAGE_AUXILIARY_SHAPE";
+        return d;
+    }
+    // NPU-private budget: do not count Adreno's own residency or CPU-side
+    // raw GGUF staging. Both remain charged to the Phone RAM budget above.
+    for (size_t bytes : {
+            m.npu_kv_bytes, m.npu_graph_workspace_bytes,
+            m.npu_activation_bytes}) {
+        if (!add(d.npu_auxiliary_bytes, bytes, d.npu_auxiliary_bytes)) {
+            d.reason = "MEMORY_OVERFLOW";
+            return d;
+        }
+    }
     for (size_t i = 0; i < m.stage_weight_bytes.size(); ++i) {
-        const size_t bytes = m.stage_weight_bytes[i];
-        if (bytes == 0 || bytes > m.max_htp_allocation_bytes) {
+        const size_t weights = m.stage_weight_bytes[i];
+        if (weights == 0 || weights > m.max_htp_allocation_bytes ||
+                weights > m.npu_bank_budget_bytes) {
             d.reason = "HTP_STAGE_ALLOCATION_EXCEEDED";
             return d;
         }
-        if (!add(d.all_npu_weight_bytes, bytes, d.all_npu_weight_bytes)) {
+        const size_t auxiliary = m.stage_auxiliary_bytes.empty() ?
+            0 : m.stage_auxiliary_bytes[i];
+        size_t stage_total = 0;
+        if (!add(weights, auxiliary, stage_total)) {
+            d.reason = "MEMORY_OVERFLOW";
+            return d;
+        }
+        if (stage_total > m.npu_bank_budget_bytes) {
+            d.reason = "NPU_STAGE_BUDGET_EXCEEDED";
+            return d;
+        }
+        if (!add(d.all_npu_weight_bytes, weights, d.all_npu_weight_bytes)) {
             d.reason = "MEMORY_OVERFLOW";
             return d;
         }
         d.bank_weight_bytes[i % 2] =
-            std::max(d.bank_weight_bytes[i % 2], bytes);
+            std::max(d.bank_weight_bytes[i % 2], weights);
     }
-    size_t bank_total = 0;
+    size_t bank_weight_total = 0;
     if (!add(d.bank_weight_bytes[0], d.bank_weight_bytes[1],
-             bank_total) ||
-            !add(fixed, bank_total, d.streaming_total_bytes) ||
-            !add(fixed, d.all_npu_weight_bytes,
-                 d.resident_total_bytes)) {
+             bank_weight_total) ||
+            !add(phone_fixed, bank_weight_total, d.streaming_total_bytes) ||
+            !add(phone_fixed, d.all_npu_weight_bytes,
+                 d.resident_total_bytes) ||
+            !add(d.npu_auxiliary_bytes, bank_weight_total,
+                 d.streaming_npu_bytes) ||
+            !add(d.npu_auxiliary_bytes, d.all_npu_weight_bytes,
+                 d.resident_npu_bytes)) {
         d.reason = "MEMORY_OVERFLOW";
         return d;
     }
-    // Prefer truly resident weights, even when there are many N stages.
-    if (d.resident_total_bytes <= m.phone_budget_bytes) {
+    // Crucial: if ALL HTP stages fit in 3072 MiB inclusive of NPU
+    // non-weight storage, keep every stage resident. No rolling Banks.
+    if (d.resident_npu_bytes <= m.npu_total_budget_bytes &&
+            d.resident_total_bytes <= m.phone_budget_bytes) {
         d.policy = npu_weight_policy::RESIDENT;
         d.selected_total_bytes = d.resident_total_bytes;
         d.feasible = true;
     } else if (m.stage_weight_bytes.size() >= 2 &&
+            d.streaming_npu_bytes <= m.npu_total_budget_bytes &&
             d.streaming_total_bytes <= m.phone_budget_bytes) {
+        // Two weight arenas alternate by rank; persistent KV, graph
+        // scratch and activation slots stay outside the weight Banks.
         d.policy = npu_weight_policy::STREAMING_2BANK;
         d.selected_total_bytes = d.streaming_total_bytes;
         d.feasible = true;
     }
-    d.reason = d.feasible ? "NONE" : "PHONE_BUDGET_EXCEEDED";
+    d.reason = d.feasible ? "NONE" :
+        d.streaming_npu_bytes > m.npu_total_budget_bytes ?
+            "NPU_TOTAL_BUDGET_EXCEEDED" : "PHONE_BUDGET_EXCEEDED";
     return d;
 }
 
