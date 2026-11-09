@@ -114,11 +114,68 @@ static void test_independent_profile_prefix() {
     }
 }
 
+static void test_adaptive_npu_memory() {
+    npu_memory_request m {};
+    m.phone_budget_bytes = 1500;
+    m.max_htp_allocation_bytes = 300;
+    m.npu_kv_bytes = 100;
+    m.npu_graph_workspace_bytes = 60;
+    m.host_stage_bytes = 30;
+    m.adreno_resident_bytes = 80;
+    m.other_shared_bytes = 30;
+    m.stage_weight_bytes = {210, 215, 200, 205};
+    auto d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
+          "four HTP stages should be fully resident when memory permits");
+    check(d.all_npu_weight_bytes == 830,
+          "resident bytes must include every selected HTP stage");
+    check(d.resident_total_bytes == 1130 &&
+          d.streaming_total_bytes == 730,
+          "memory footprint must charge shared KV and two bank maxima");
+
+    m.phone_budget_bytes = 900;
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::STREAMING_2BANK,
+          "full residency must spill to two banks only if needed");
+    check(d.selected_total_bytes == 730 &&
+          d.bank_weight_bytes[0] == 210 &&
+          d.bank_weight_bytes[1] == 215,
+          "streaming must use rank-parity bank maxima");
+
+    m.phone_budget_bytes = 729;
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible && d.reason == std::string("PHONE_BUDGET_EXCEEDED"),
+          "Plan must reject a joint Phone memory budget overrun");
+
+    m.phone_budget_bytes = 1500;
+    m.max_htp_allocation_bytes = 209;
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible &&
+          d.reason == std::string("HTP_STAGE_ALLOCATION_EXCEEDED"),
+          "single-region HTP allocator limit must be checked");
+
+    m.max_htp_allocation_bytes = 300;
+    m.stage_weight_bytes = {210};
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
+          "one NPU Region must not require dual Banks");
+
+    m.stage_weight_bytes.clear();
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::DISABLED,
+          "NPU0 must not allocate any HTP weight Bank");
+
+    m.phone_budget_bytes = 1;
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible, "NPU0 still shares the Phone's non-NPU budget");
+}
+
 int main() {
     test_four_backend_layouts();
     test_all_four_tail_options_and_optional_backends();
     test_invalid_shapes();
     test_independent_profile_prefix();
+    test_adaptive_npu_memory();
     std::puts("test-region-ring-v2-stage PASS");
     return 0;
 }
