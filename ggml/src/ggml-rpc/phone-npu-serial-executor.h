@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-phone-npu-budget.h"
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "phone-qwen3-local-builder.h"
@@ -116,6 +117,73 @@ public:
         double htp_repack_ms = 0.0;
     };
 
+    // Exact currently committed HTP allocations: the physical weight
+    // arenas, persistent KV, and all registered per-Chunk activation/graph
+    // storage. Do not count model_weights_ tensor objects individually:
+    // they are views of the same resident/rolling repack arenas.
+    bool within_total_npu_budget(size_t additional_bytes) const {
+        size_t remaining = ggml_phone_npu_budget::total_bytes;
+        const auto charge_bytes = [&remaining](size_t bytes) -> bool {
+            if (bytes > remaining) { return false; }
+            remaining -= bytes;
+            return true;
+        };
+        const auto charge = [&charge_bytes](
+                const ggml_backend_buffer_ptr & buffer) -> bool {
+            return !buffer || charge_bytes(
+                ggml_backend_buffer_get_size(buffer.get()));
+        };
+        for (const auto & arena : resident_weight_arenas_) {
+            if (!charge(arena)) { return false; }
+        }
+        for (const auto & arena : bank_weight_arenas_) {
+            if (!charge(arena)) { return false; }
+        }
+        for (const auto & item : owned_kv_) {
+            if (!charge(item.second->buffer)) { return false; }
+        }
+        for (const auto & item : owned_graphs_) {
+            if (!charge(item.second->buffer)) { return false; }
+        }
+        for (const auto & item : arenas_) {
+            if (!charge(item->buffer)) { return false; }
+        }
+        return charge_bytes(additional_bytes);
+    }
+
+    // Region budget includes the Stage's repacked weight arena, its owned
+    // KV and all of its actual per-Chunk Graph allocations. This applies in
+    // both RESIDENT and STREAMING modes; other NPU Region KV remains charged
+    // separately against the 3072 MiB global allowance above.
+    bool within_npu_region_budget(uint32_t region,
+                                  size_t additional_bytes) const {
+        const auto found = region_rank_.find(region);
+        if (found == region_rank_.end() ||
+                found->second >= banked_layers_.size()) { return false; }
+        size_t remaining = ggml_phone_npu_budget::bank_bytes;
+        const auto charge = [&remaining](size_t bytes) -> bool {
+            if (bytes > remaining) { return false; }
+            remaining -= bytes;
+            return true;
+        };
+        if (!charge(banked_layers_[found->second].bytes)) { return false; }
+        for (const auto & entry : owned_kv_) {
+            if (entry.first.second == region &&
+                    !charge(ggml_backend_buffer_get_size(
+                        entry.second->buffer.get()))) {
+                return false;
+            }
+        }
+        for (const auto & entry : owned_graphs_) {
+            if (std::get<1>(entry.first) == region &&
+                    !charge(ggml_backend_buffer_get_size(
+                        entry.second->buffer.get()))) {
+                return false;
+            }
+        }
+        return charge(additional_bytes);
+    }
+
     // Allocate either fully resident Stage weights or exactly two rolling
     // HTP-repack arenas. A Region may contain consecutive Qwen3 layers.
     // Bank A holds even ranks; Bank B holds odd ranks. KV allocations are
@@ -130,6 +198,10 @@ public:
             bool fully_resident) {
         capacities = {};
         reason.clear();
+        // The measured NPU total limit is independent of available Phone
+        // RAM or GGML's configurable single-buffer software ceiling.
+        budget_bytes = std::min(
+            budget_bytes, ggml_phone_npu_budget::total_bytes);
         if (banked_mode_ || resident_mode_ || !model_weights_.empty() ||
                 repack_buft_ == nullptr || !local.get_info || !local.read ||
                 ordered.empty() || (!fully_resident && ordered.size() < 2) ||
@@ -262,7 +334,8 @@ public:
                 return false;
             }
             resident_bytes += stage.bytes;
-            if (stage.bytes > ggml_backend_buft_get_max_size(repack_buft_)) {
+            if (stage.bytes > ggml_backend_buft_get_max_size(repack_buft_) ||
+                    stage.bytes > ggml_phone_npu_budget::bank_bytes) {
                 reason = "NPU_STAGE_SINGLE_ALLOC_EXCEEDED";
                 region_rank_.clear();
                 return false;
@@ -270,6 +343,8 @@ public:
         }
         if (!fully_resident && (capacities[0] > budget_bytes ||
                 capacities[1] > budget_bytes - capacities[0] ||
+                capacities[0] > ggml_phone_npu_budget::bank_bytes ||
+                capacities[1] > ggml_phone_npu_budget::bank_bytes ||
                 capacities[0] > ggml_backend_buft_get_max_size(repack_buft_) ||
                 capacities[1] > ggml_backend_buft_get_max_size(repack_buft_))) {
             reason = "NPU_BANK_BUDGET_OR_SINGLE_ALLOC_EXCEEDED";
