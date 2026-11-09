@@ -843,6 +843,48 @@ llama_region_ring_parse_apply_wide_layout(
     }
 }
 
+// Both ordinary APPLY_WIDE and SKIP_PROFILE use this exact HTP selector.
+// Forced P indices identify physical Region positions, not Transformer layers;
+// Phone RPC receives the model-owned mapping, never a stale server-side list.
+inline bool llama_region_ring_validate_forced_npu_regions(
+        const char * spec,
+        const char * policy,
+        const std::vector<llama_region_ring_region> & regions,
+        std::vector<int> & selected,
+        int & selected_policy,
+        std::string & reason) {
+    selected.clear();
+    reason.clear();
+    std::set<uint32_t> ids;
+    if (!llama_region_ring_parse_region_ids(spec, ids) || ids.empty()) {
+        reason = "INVALID_REGION_IDS";
+        return false;
+    }
+    for (uint32_t id : ids) {
+        if (id >= regions.size() ||
+                regions[id].device != llama_region_ring_device::PHONE ||
+                regions[id].kind != llama_region_ring_stage_kind::PHONE ||
+                regions[id].layer_end <= regions[id].layer_begin ||
+                regions[id].layer_end - regions[id].layer_begin > 32) {
+            reason = "REGION_NOT_PHONE_OR_DEPTH_UNSUPPORTED:" +
+                std::to_string(id);
+            return false;
+        }
+    }
+    const std::string mode =
+        policy == nullptr || *policy == '\0' ? "resident" : policy;
+    if (mode == "resident") {
+        selected_policy = 1;
+    } else if (mode == "streaming-2bank" && ids.size() >= 2) {
+        selected_policy = 2;
+    } else {
+        reason = "INVALID_POLICY_OR_REGION_COUNT";
+        return false;
+    }
+    selected.assign(ids.begin(), ids.end());
+    return true;
+}
+
 // Enforce the general Plan contract before allocating any weights. The
 // legacy parser intentionally remains strict unless allow_pc_tail is set.
 inline bool llama_region_ring_apply_topology_compatible(
