@@ -8797,8 +8797,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // Never fall back to Phone Meta during PC Head execution.
                     const ggml_backend_t backend =
                         ggml_backend_sched_get_split_backend(sched_use, split);
+                    // The independent Head must run on the PC CPU, not
+                    // merely on any non-Meta backend (which may be CUDA).
                     const bool pc_owned =
-                        backend != nullptr && !ggml_backend_is_meta(backend);
+                        backend != nullptr && backend == backend_cpu;
                     LLAMA_LOG_INFO(
                         "[PHONE_AUTO_FINAL_HEAD] event=SPLIT "
                         "index=%d backend=%s pc_owned=%d status=%s\n",
