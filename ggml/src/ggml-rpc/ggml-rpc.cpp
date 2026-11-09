@@ -6409,6 +6409,9 @@ private:
     // HTP weight copies. Backend operations and source-buffer lifetime are
     // guarded separately.
     std::mutex phone_npu_backend_mutex;
+    // Selected NPU Chunk tasks get the next HTP turn between consecutive
+    // precompiled layers, rather than waiting behind the entire P2/P3 chain.
+    std::atomic<uint32_t> phone_npu_compute_waiters { 0 };
     std::mutex phone_npu_weight_source_mutex;
 
     std::mutex phone_region_main_mutex;
@@ -7674,8 +7677,19 @@ bool rpc_server::phone_owned_plan_register(
     }
     if (precompile_requested) {
         const int64_t begin_us = ggml_time_us();
-        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
         for (const auto & child : child_plans) {
+        // Give an already-selected compute task a chance to claim the HTP
+        // mutex before preparing the next layer. The bound prevents starving
+        // plan registration under sustained compute load.
+        const int64_t yield_start_us = ggml_time_us();
+        while (phone_npu_compute_waiters.load(std::memory_order_acquire) > 0 &&
+                ggml_time_us() - yield_start_us < 20000) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const int64_t htp_lock_start_us = ggml_time_us();
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        const double htp_lock_wait_ms =
+            (ggml_time_us() - htp_lock_start_us) / 1000.0;
         auto * child_executor =
             phone_npu_executor_for_region_layer(
                 plan.region, child.layer - plan.layer);
@@ -7708,6 +7722,7 @@ bool rpc_server::phone_owned_plan_register(
             " region=%u layer=%u backend=%s chunks=%u graph_nodes=%zu"
             " kv_bytes=%zu graph_storage_bytes=%zu"
             " compile_ms=%.3f wall_ms=%.3f"
+            " htp_lock_wait_ms=%.3f compute_priority_yield_ms=%.3f"
             " mode=SHADOW_FIXED_STORAGE status=%s reason=%s\n",
             plan.run_id, plan.region, child.layer,
             phone_npu_name_for_region_layer(
@@ -7716,6 +7731,8 @@ bool rpc_server::phone_owned_plan_register(
             stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
             stats.precompile_ms,
             (ggml_time_us() - begin_us) / 1000.0,
+            htp_lock_wait_ms,
+            (htp_lock_start_us - yield_start_us) / 1000.0,
             precompiled ? "PASS" : "FAIL",
             precompiled ? "NONE" : why.c_str());
         if (!precompiled) { return false; }
@@ -9065,13 +9082,24 @@ void rpc_server::phone_auto_compute_loop() {
         const bool stage_profile_enabled = npu_task && !local_only &&
             stage_profile_env != nullptr &&
             std::strcmp(stage_profile_env, "1") == 0;
-        const int64_t htp_lock_begin_us =
-            stage_profile_enabled ? ggml_time_us() : 0;
+        const int64_t htp_lock_begin_us = ggml_time_us();
         std::unique_lock<std::mutex> htp_guard(
             phone_npu_backend_mutex, std::defer_lock);
-        if (npu_task) { htp_guard.lock(); }
-        const double htp_lock_wait_ms = stage_profile_enabled ?
-            (ggml_time_us() - htp_lock_begin_us) / 1000.0 : 0.0;
+        if (npu_task) {
+            phone_npu_compute_waiters.fetch_add(1, std::memory_order_acq_rel);
+            htp_guard.lock();
+            phone_npu_compute_waiters.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        const double htp_lock_wait_ms =
+            (ggml_time_us() - htp_lock_begin_us) / 1000.0;
+        if (npu_task && htp_lock_wait_ms >= 1.0) {
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SESSION] event=COMPUTE_LOCK_WAIT"
+                " run=%" PRIu64 " region=%u chunk=%u backend=%s"
+                " wait_ms=%.3f status=ACQUIRED\n",
+                req.key.run_id, req.key.region, req.key.chunk,
+                phone_npu_name_for_region(req.key.region), htp_lock_wait_ms);
+        }
         const int64_t graph_lock_begin_us =
             stage_profile_enabled ? ggml_time_us() : 0;
         if (task->graphless_owned) {
