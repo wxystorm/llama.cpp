@@ -6540,7 +6540,8 @@ private:
     std::mutex phone_input_mutex;
     std::vector<phone_input_staged> phone_input_staged_slots;
     // Inclusive budget: in-flight recv, staged bytes and APPLY copy lifetime.
-    static constexpr size_t phone_input_stream_budget = 128 * 1024 * 1024;
+    static constexpr size_t phone_input_stream_budget =
+        size_t(GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB) * 1024 * 1024;
     std::condition_variable phone_input_stream_cv;
     std::unordered_set<uint64_t> phone_input_stream_runs;
     std::vector<rpc_phone_input_key> phone_input_stream_failed;
@@ -7599,6 +7600,13 @@ bool rpc_server::phone_input_stream_run(
             report.recv_us / 1000.0,
             report.hash_us / 1000.0,
             report.apply_wait_us / 1000.0);
+    } else {
+        GGML_LOG_INFO(
+            "[PHONE_INPUT_STREAM] event=BUDGET_READY run=%" PRIu64
+            " budget_mib=%d margin_mib=%d policy=BLOCKING_RESERVE_30S "
+            "status=READY\n",
+            request.run_id, GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB,
+            GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB);
     }
     return true;
 }
@@ -9820,7 +9828,16 @@ bool rpc_server::phone_input_stream_reserve(size_t bytes) {
             return phone_input_stream_held_bytes <=
                 phone_input_stream_budget - bytes;
         });
-    if (!capacity) { return false; }
+    if (!capacity) {
+        GGML_LOG_ERROR(
+            "[PHONE_INPUT_STREAM] event=RESERVE_REJECT "
+            "reason=BACKPRESSURE_TIMEOUT requested_mib=%.3f held_mib=%.3f "
+            "budget_mib=%d wait_s=30 status=FAIL\n",
+            bytes / 1048576.0,
+            phone_input_stream_held_bytes / 1048576.0,
+            GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB);
+        return false;
+    }
     phone_input_stream_held_bytes += bytes;
     return true;
 }

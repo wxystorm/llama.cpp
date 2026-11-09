@@ -4429,26 +4429,55 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_input_stream_requested =
         has_phone_stage && phone_input_stream_env != nullptr &&
         std::strcmp(phone_input_stream_env, "1") == 0;
-    // Until the Phone owns a causal admission policy, do not let a full
-    // 128MiB queue block a still-unreceived predecessor. Keep an 8MiB margin
-    // for per-frame headers and system buffers. This is a deliberate Phase-A
-    // safety restriction, not the final intended streaming limit.
+    // Until the Phone owns causal admission, conservatively reserve a
+    // full-UBatch F32 input per Phone Region. The server's held-byte budget
+    // includes in-flight recv, staged frames and APPLY; keep 8 MiB unreserved
+    // for framing/system buffers. Do not disable this Phase-A preflight:
+    // the stream sender has no per-frame ACK and a queued successor must not
+    // block an as-yet-unreceived predecessor on the same socket.
+    static_assert(
+        GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB >
+            GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB,
+        "Phone INPUT_STREAM queue budget must exceed its safety margin");
+    constexpr long double phone_stream_mib = 1024.0L * 1024.0L;
+    constexpr long double phone_stream_preflight_limit =
+        (GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB -
+         GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB) * phone_stream_mib;
     const size_t phone_stream_region_count = std::count_if(
         stages.begin(), stages.end(), [](const auto & s) {
             return s.kind == llama_hybrid_runtime_stage_kind::PHONE;
         });
-    const long double phone_stream_bytes =
+    const long double phone_stream_expected_bytes =
         (long double) ubatch.n_tokens * (long double) n_embd *
-        sizeof(float) * (long double) phone_stream_region_count;
-    if (phone_input_stream_requested &&
-            phone_stream_bytes + 4096.0L * phone_stream_region_count >
-                120.0L * 1024.0L * 1024.0L) {
-        LLAMA_LOG_ERROR(
-            "[PHONE_INPUT_STREAM] event=REJECT reason=PHASE_A_BACKLOG_BUDGET "
-            "tokens=%u phone_regions=%zu status=FAIL\n",
-            ubatch.n_tokens, phone_stream_region_count);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+        sizeof(float) * (long double) phone_stream_region_count +
+        4096.0L * (long double) phone_stream_region_count;
+    if (phone_input_stream_requested) {
+        const bool within_budget =
+            phone_stream_expected_bytes <= phone_stream_preflight_limit;
+        LLAMA_LOG_INFO(
+            "[PHONE_INPUT_STREAM] event=BACKLOG_BUDGET_CHECK "
+            "tokens=%u phone_regions=%zu requested_mib=%.3f "
+            "limit_mib=%d server_budget_mib=%d margin_mib=%d status=%s\n",
+            ubatch.n_tokens, phone_stream_region_count,
+            (double) (phone_stream_expected_bytes / phone_stream_mib),
+            GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB -
+                GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB,
+            GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB,
+            GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB,
+            within_budget ? "PASS" : "REJECT");
+        if (!within_budget) {
+            LLAMA_LOG_ERROR(
+                "[PHONE_INPUT_STREAM] event=REJECT "
+                "reason=PHASE_A_BACKLOG_BUDGET tokens=%u "
+                "phone_regions=%zu requested_mib=%.3f limit_mib=%d "
+                "status=FAIL\n",
+                ubatch.n_tokens, phone_stream_region_count,
+                (double) (phone_stream_expected_bytes / phone_stream_mib),
+                GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB -
+                    GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
     const bool phone_input_push_requested =
         ((phone_input_push_env != nullptr &&
@@ -6021,7 +6050,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "policy=UPSTREAM_READY_BEFORE_KV_COMMIT transport=%s "
                 "status=%s\n",
                 phone_input_push_enabled ? 1 : 0,
-                phone_input_stream_enabled ? "BYTE_BUDGET_128M" : "2",
+                phone_input_stream_enabled ? "BYTE_BUDGET_256M" : "2",
                 phone_input_stream_enabled ? "STREAM_NO_ACK" : "LEGACY_ACK",
                 phone_input_push_enabled ? "READY" : "FALLBACK_LEGACY");
         }

@@ -16,6 +16,14 @@ static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO
 
 #define GGML_RPC_MAX_SERVERS       16
 
+// Shared Region Ring Phone INPUT_STREAM admission contract. The Phone RPC
+// server limits the total bytes held for receive, staging and apply. The PC
+// checks a conservative full-UBatch worst case with an 8 MiB margin before
+// starting a stream, so downstream tasks cannot deadlock behind a predecessor
+// blocked by the Phone queue. Update both endpoints together.
+#define GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB 256
+#define GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB 8
+
 struct ggml_rpc_local_tensor_info {
     uint64_t nbytes;      //张量的字节数
     uint32_t type;      //张量的数据类型
