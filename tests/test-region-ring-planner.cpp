@@ -174,6 +174,17 @@ int main() {
         REQUIRE(make_regions(forced_eight_cycle, 64, eight_rebuilt));
         REQUIRE(eight_rebuilt.size() == 16);
         REQUIRE(eight_rebuilt.back().layer_begin == 63);
+        const auto pc_eight_cycle = llama_region_ring_parse_apply_wide_layout(
+            "G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1", 64);
+        candidate forced_pc_eight_cycle;
+        forced_pc_eight_cycle.cycles = 8;
+        forced_pc_eight_cycle.xc = forced_pc_eight_cycle.xg =
+            forced_pc_eight_cycle.xp = 128;
+        forced_pc_eight_cycle.concrete_regions = pc_eight_cycle;
+        REQUIRE(make_regions(forced_pc_eight_cycle, 64, eight_rebuilt));
+        REQUIRE(eight_rebuilt.size() == 16);
+        REQUIRE(eight_rebuilt.back().device == device::CPU);
+
 
         candidate forced_two_device;
         forced_two_device.cycles = 1;
