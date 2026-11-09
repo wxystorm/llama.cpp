@@ -99,6 +99,27 @@ def validated_profile(directory: Path, model_sha: str,
     if any(row.get("backend") == "N" and row.get("parity") != "PASS"
            for row in rows):
         return False, "UNSAFE_HTP_STAGE_IN_PASS_CSV"
+    # Do not load a PASS CSV from another experiment merely because its
+    # header happens to match. The matrix writes JSON and CSV together,
+    # but a stopped run can leave a stale file behind.
+    try:
+        manifest_shapes = {
+            (record["key"]["backend"],
+             int(record["key"]["layers"]),
+             int(record["key"]["chunk"]),
+             int(record["key"]["kv_tokens"]))
+            for record in profile.get("compute_samples", [])
+            if record.get("status") == "PASS"
+        }
+        csv_shapes = {
+            (row["backend"], int(row["layers"]),
+             int(row["chunk"]), int(row["kv_tokens"]))
+            for row in rows
+        }
+    except (KeyError, ValueError, TypeError):
+        return False, "NATIVE_PROFILE_SHAPES_UNREADABLE"
+    if manifest_shapes != csv_shapes:
+        return False, "NATIVE_PASS_CSV_MANIFEST_MISMATCH"
     return True, "VERIFIED"
 
 
