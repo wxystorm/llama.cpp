@@ -869,7 +869,9 @@ public:
         }
         auto kv = std::make_unique<owned_layer_kv>();
         kv->plan = plan;
-        const size_t kv_ctx_bytes = ggml_tensor_overhead() * 8 + 4096;
+        const size_t depth = plan.layer_end - plan.layer;
+        const size_t kv_ctx_bytes =
+            ggml_tensor_overhead() * (8 + 2 * depth) + 4096;
         ggml_init_params kv_params = {kv_ctx_bytes, nullptr, true};
         kv->ctx.reset(ggml_init(kv_params));
         if (!kv->ctx) {
@@ -877,19 +879,26 @@ public:
             return false;
         }
         const int64_t width = int64_t(plan.n_heads_kv) * plan.head_dim;
-        kv->k = ggml_new_tensor_2d(
-            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
-        kv->v = ggml_new_tensor_2d(
-            kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
-        if (!kv->k || !kv->v) {
-            reason = "PHONE_OWNED_HTP_KV_METADATA";
-            return false;
+        for (uint32_t il = plan.layer; il < plan.layer_end; ++il) {
+            auto * k = ggml_new_tensor_2d(
+                kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+            auto * v = ggml_new_tensor_2d(
+                kv->ctx.get(), GGML_TYPE_F16, width, plan.kv_capacity);
+            if (!k || !v) {
+                reason = "PHONE_OWNED_HTP_KV_METADATA";
+                return false;
+            }
+            char name[GGML_MAX_NAME] = {};
+            std::snprintf(name, sizeof(name), "cache_k_l%u", il);
+            ggml_set_name(k, name);
+            std::snprintf(name, sizeof(name), "cache_v_l%u", il);
+            ggml_set_name(v, name);
+            kv->layer_kv.emplace_back(k, v);
         }
-        char name[GGML_MAX_NAME] = {};
-        std::snprintf(name, sizeof(name), "cache_k_l%u", plan.layer);
-        ggml_set_name(kv->k, name);
-        std::snprintf(name, sizeof(name), "cache_v_l%u", plan.layer);
-        ggml_set_name(kv->v, name);
+        kv->k = kv->layer_kv.front().first;
+        kv->v = kv->layer_kv.front().second;
+        kv->canonical_k_layers.resize(depth, nullptr);
+        kv->canonical_v_layers.resize(depth, nullptr);
         kv->buffer.reset(ggml_backend_alloc_ctx_tensors(
             kv->ctx.get(), backend_));
         if (!kv->buffer) {
@@ -3238,6 +3247,10 @@ private:
         uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
+        std::vector<std::pair<ggml_tensor *, ggml_tensor *>> layer_kv;
+        std::vector<const ggml_tensor *> canonical_k_layers;
+        std::vector<const ggml_tensor *> canonical_v_layers;
+        std::vector<ggml_context_ptr> canonical_extra_contexts;
         // Graphless mode owns the imported canonical OpenCL K/V metadata;
         // PC still owns the underlying physical buffers until RUN END.
         ggml_context_ptr canonical_ctx;
