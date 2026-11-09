@@ -2111,7 +2111,22 @@ int main() {
         std::vector<llama_region_ring_region> forty_regions;
         REQUIRE(make_regions(
             forty_result.selected, 40, forty_regions));
-        REQUIRE(forty_regions.size() == 9);
+        // CPU-optional apply-wide Cycles are legitimate: a three-Cycle
+        // layout can contain G/P only in some Cycles, not always G/C/P.
+        // Assert the physical topology and full coverage rather than the
+        // obsolete fixed three-stages-per-Cycle count of nine.
+        const auto count_stage = [&](device d) {
+            return std::count_if(
+                forty_regions.begin(), forty_regions.end(),
+                [d](const llama_region_ring_region & r) {
+                    return r.device == d;
+                });
+        };
+        REQUIRE(count_stage(device::GPU) == 3);
+        REQUIRE(count_stage(device::PHONE) == 3);
+        REQUIRE(count_stage(device::CPU) <= 3);
+        REQUIRE(forty_regions.size() >= 6 && forty_regions.size() <= 9);
+        REQUIRE(forty_regions.front().layer_begin == 0);
         REQUIRE(forty_regions.back().layer_end == 40);
         REQUIRE(llama_region_ring_apply_topology_compatible(
             forty_regions, 40));
