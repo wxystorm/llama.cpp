@@ -620,6 +620,14 @@ def main():
                     help="refresh the model-bound legacy Profile on the first prompt; then reuse it")
     ap.add_argument("--no-profile-cache", action="store_true",
                     help="disable model-bound legacy Profile reuse (diagnostic only)")
+    ap.add_argument("--no-v2-profile", action="store_true",
+                    help="use legacy G/C/P only, without native GCNA stage profiling")
+    ap.add_argument("--v2-profile-dir", type=Path, default=None,
+                    help="optional folder containing stage-profile-v2.csv and profile.json")
+    ap.add_argument("--v2-profile-phone", default="",
+                    help="native Phone profile service HOST:PORT; default RPC host:50177")
+    ap.add_argument("--native-profile-exe", type=Path, default=None,
+                    help="native isolated G/C/N/A Stage profiler binary")
     ap.add_argument("--no-mmap", action="store_true",
                     help="disable memory mapping when loading the model")
     ap.add_argument("--dry-run", action="store_true")
@@ -662,6 +670,22 @@ def main():
         print(f"[REGION_RING_PROFILE_CACHE] source=LEGACY_HYBRID "
               f"path={profile_cache} exists={int(profile_cache.is_file())}",
               flush=True)
+    # Native isolated G/C/N/A shapes are sampled at most once per sweep.
+    # The cache's PASS-only CSV is consumed by the original C++ apply-wide
+    # shortlist/DAG, not by a second production Planner.
+    v2_csv = None
+    if args.planner == "apply-wide" and not (
+            args.skip_profile or args.no_v2_profile):
+        from v2_profile_coordinator import prepare_native_profile
+        try:
+            v2_csv = prepare_native_profile(
+                root, args.model, args.rpc, args.threads,
+                args.force_profile, args.dry_run,
+                directory=args.v2_profile_dir,
+                profiler_exe=args.native_profile_exe,
+                phone_endpoint=args.v2_profile_phone)
+        except (OSError, ValueError, RuntimeError) as exc:
+            ap.error(f"native GCNA Profile failed: {exc}")
     commit = git_head(root)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = (args.out / f"{stamp}-{os.getpid()}").resolve()
@@ -683,7 +707,10 @@ def main():
                     "LLAMA_HYBRID_REGION_RING_FORCE_XP",
                     "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE",
                     "LLAMA_REGION_RING_PROFILE_CACHE_PATH",
-                    "LLAMA_REGION_RING_PROFILE_FORCE"):
+                    "LLAMA_REGION_RING_PROFILE_FORCE",
+                    "LLAMA_REGION_RING_V2_PROFILE_CSV",
+                    "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS",
+                    "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP"):
             env.pop(key, None)
         env.update({
             "LLAMA_HYBRID_REGION_RING_V1": "1",
@@ -704,6 +731,23 @@ def main():
             env["LLAMA_REGION_RING_PROFILE_CACHE_PATH"] = str(profile_cache)
             env["LLAMA_REGION_RING_PROFILE_FORCE"] = (
                 "1" if args.force_profile and prompt_index == 0 else "0")
+        if v2_csv is not None:
+            env.update({
+                "LLAMA_REGION_RING_V2_PROFILE_CSV": str(v2_csv),
+                # The model-owned Plan supplies HTP Region IDs, so an
+                # operator-provided list must never override selected ranks.
+                "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP": "0",
+                "LLAMA_REGION_RING_PHONE_GRAPHLESS": "0",
+                "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW": "1",
+                "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES": "1",
+                "GGML_META_PHONE_FULL_REGION_GRAPH": "1",
+                "LLAMA_REGION_RING_PHONE_AUTONOMOUS": "1",
+                "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL": "1",
+                "LLAMA_REGION_RING_PHONE_INPUT_PUSH": "1",
+                "LLAMA_REGION_RING_PHONE_INPUT_STREAM": "1",
+                "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM": "1",
+                "LLAMA_REGION_RING_PHONE_ASYNC_GRAPH_SETUP": "0",
+            })
         if env.get("LLAMA_REGION_RING_PHONE_COPY_TRACE") == "1":
             # One opt-in switch collects both the per-copy detail and the
             # reference split breakdown for coverage reconciliation.
@@ -733,12 +777,14 @@ def main():
             "no_mmap": args.no_mmap,
             "skip_profile": args.skip_profile,
             "profile_cache_file": str(profile_cache) if profile_cache else None,
+            "native_v2_profile_csv": str(v2_csv) if v2_csv else None,
             "force_profile": bool(args.force_profile and prompt_index == 0),
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
                                           "LLAMA_REGION_RING_PROFILE_CACHE_PATH",
                                           "LLAMA_REGION_RING_PROFILE_FORCE",
+                                          "LLAMA_REGION_RING_V2_PROFILE_CSV",
                                           "LLAMA_REGION_RING_TASK_TRACE",
                                           "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
                                           "LLAMA_REGION_RING_PHONE_AUTONOMOUS",
