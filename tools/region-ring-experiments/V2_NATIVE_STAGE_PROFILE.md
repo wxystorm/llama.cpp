@@ -132,10 +132,10 @@ KV update, reused allocation, fixed Graph state or synchronization issues.
 
 ## PC-driven Phone Profile control channel
 
-The dedicated versioned V2 Phone Profile sidecar now lets PC request
+The integrated versioned V2 Profile command on ggml-rpc:50052 lets PC request
 actual N/A samples and collect their metrics without copying Phone CSV
 or logs by hand. See V2_PHONE_PROFILE_RPC.md for the USB adb forward
-setup and one-command GCNA sweep. This experimental sidecar is NOT the
+setup and one-command GCNA sweep. The independent native sampler is NOT the
 existing ggml-rpc inference port 50052, and is not yet merged into the
 production Region Ring runtime.
 
