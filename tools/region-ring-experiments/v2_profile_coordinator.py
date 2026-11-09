@@ -1,8 +1,9 @@
 """Model-bound native G/C/N/A Profile discovery and missing-case refresh.
 
 This coordinator is run ONCE before a run_prompt_sweep, never once per
-Prompt. Reuses the existing independent run_v2_stage_matrix.py sidecar
-and its per-case resume logic. N4 PARITY_FAIL is not a performance point:
+Prompt. Reuses the independent run_v2_stage_matrix.py sampler over the
+existing inference RPC port 50052, with per-case resume logic.
+N4 PARITY_FAIL is not a performance point:
 only approved native PASS measurements may enter the C++ Planner.
 """
 from __future__ import annotations
@@ -176,8 +177,9 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
         return folder / "stage-profile-v2.csv"
     if ":" not in rpc or not rpc.rsplit(":", 1)[1].isdigit():
         raise ValueError("INVALID_RPC_ADDRESS_FOR_PHONE_PROFILE")
-    phone_host = rpc.rsplit(":", 1)[0]
-    phone = phone_endpoint or f"{phone_host}:50177"
+    # The native Profile protocol now shares the main GGML inference RPC
+    # listener. The old 50177 Python sidecar is not required.
+    phone = phone_endpoint or rpc
     folder.mkdir(parents=True, exist_ok=True)
     command = [
         sys.executable,
@@ -207,7 +209,8 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
     if not valid:
         raise RuntimeError(
             f"NATIVE_PROFILE_INCOMPLETE: {reason}; exit={result.returncode}. "
-            f"Check {folder}; Phone profiling requires {phone}. "
+            f"Check {folder}; Phone profiling requires a matching Android RPC "
+            f"server and local native profiler on {phone}. "
             "Known N4 parity failures are excluded, not silently accepted.")
     if result.returncode:
         manifest = json.loads((folder / "profile.json").read_text("utf-8"))
