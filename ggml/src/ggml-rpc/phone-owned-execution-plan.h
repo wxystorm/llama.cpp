@@ -14,11 +14,18 @@
 namespace ggml_phone_owned {
 
 static constexpr uint32_t k_plan_version = 2;
+static constexpr uint32_t k_multi_plan_version = 3;
+static constexpr uint32_t k_layer_count_shift = 16;
+static constexpr uint32_t k_max_phone_layers_per_region = 64;
+static constexpr uint32_t k_wire_region_limit = 64;
+static constexpr uint32_t k_internal_region_base = k_wire_region_limit;
 static constexpr uint32_t k_flag_flash_attn = 1;
 static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX
 static constexpr uint32_t k_f16 = 1;      // GGML_TYPE_F16
 static constexpr uint32_t k_slots = 2;
-static constexpr uint32_t k_max_regions = 64;
+static constexpr uint32_t k_max_regions =
+    k_internal_region_base +
+    k_wire_region_limit * k_max_phone_layers_per_region;
 static constexpr uint32_t k_max_chunks = 4096;
 static constexpr uint64_t k_max_activation_bytes = 128ULL * 1024 * 1024;
 
@@ -52,6 +59,33 @@ struct region_plan {
     float rope_beta_slow = 0.0f;
 };
 
+// Plan v3 encodes the consecutive NPU layer count in the upper 16
+// bits of flags, keeping the 108-byte RPC descriptor ABI unchanged.
+// The lower bits retain the exact v2 Flash-Attention contract.
+inline uint32_t layer_count(const region_plan & p) {
+    return p.version == k_multi_plan_version ?
+        p.flags >> k_layer_count_shift : 1;
+}
+inline uint32_t flags_for_layers(uint32_t n_layers) {
+    return k_flag_flash_attn |
+        (n_layers << k_layer_count_shift);
+}
+inline uint32_t internal_layer_region(
+        const region_plan & parent, uint32_t offset) {
+    return layer_count(parent) == 1 ? parent.region :
+        k_internal_region_base +
+        parent.region * k_max_phone_layers_per_region + offset;
+}
+inline region_plan single_layer_plan(
+        const region_plan & parent, uint32_t offset) {
+    region_plan child = parent;
+    child.version = k_plan_version;
+    child.flags = k_flag_flash_attn;
+    child.region = internal_layer_region(parent, offset);
+    child.layer = parent.layer + offset;
+    return child;
+}
+
 inline bool equal(const region_plan & a, const region_plan & b) {
     return a.version == b.version && a.flags == b.flags &&
         a.run_id == b.run_id && a.p2c_run_id == b.p2c_run_id &&
@@ -75,15 +109,21 @@ inline bool equal(const region_plan & a, const region_plan & b) {
 
 inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
-    if (p.version != k_plan_version ||
-            p.flags != k_flag_flash_attn ||
+    const uint32_t layers = layer_count(p);
+    const bool legacy = p.version == k_plan_version &&
+        p.flags == k_flag_flash_attn;
+    const bool multi = p.version == k_multi_plan_version &&
+        (p.flags & 0xffffu) == k_flag_flash_attn &&
+        layers >= 2 && layers <= k_max_phone_layers_per_region;
+    if ((!legacy && !multi) ||
+            p.layer >= 256 || layers > 256 - p.layer ||
             p.rope_type != k_rope_neox ||
             p.kv_type != k_f16) {
         reason = "UNSUPPORTED_QWEN3_PLAN_OR_FORMAT";
         return false;
     }
     if (!p.run_id || !p.p2c_run_id ||
-            p.region >= k_max_regions || p.layer >= 256) {
+            p.region >= k_max_regions) {
         reason = "INVALID_ID_OR_REGION";
         return false;
     }
