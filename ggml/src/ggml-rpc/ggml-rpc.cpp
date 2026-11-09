@@ -18,7 +18,6 @@
 #include "phone-local-host-handoff.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-execution-plan.h"
-#include "phone-v2-profile-stdio.h"
 
 #include <array>
 #include <cmath>
@@ -16582,8 +16581,45 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 */
 
+// Native command 57 is fully handled in the RPC process. No stdio
+// proxy, Python, fork/exec, or second listening TCP port is involved.
+static std::mutex rpc_v2_profile_handler_mutex;
+static ggml_rpc_v2_profile_handler_fn rpc_v2_profile_handler = nullptr;
+static void * rpc_v2_profile_context = nullptr;
+
+void ggml_backend_rpc_set_v2_profile_handler(
+        ggml_rpc_v2_profile_handler_fn handler, void * context) {
+    std::lock_guard<std::mutex> guard(rpc_v2_profile_handler_mutex);
+    rpc_v2_profile_handler = handler;
+    rpc_v2_profile_context = context;
+}
+
+static bool rpc_handle_native_v2_profile(
+        const std::vector<uint8_t> & request,
+        std::vector<uint8_t> & response) {
+    std::lock_guard<std::mutex> guard(rpc_v2_profile_handler_mutex);
+    if (rpc_v2_profile_handler == nullptr) {
+        static constexpr char error[] =
+            "{\"version\":1,\"status\":\"ERROR\","
+            "\"error\":\"NATIVE_V2_PROFILE_NOT_REGISTERED\"}\n";
+        response.assign(error, error + sizeof(error) - 1);
+        return true;
+    }
+    response.resize(256 * 1024);
+    size_t used = 0;
+    const bool ok = rpc_v2_profile_handler(
+        rpc_v2_profile_context,
+        request.data(), request.size(),
+        response.data(), response.size(), &used);
+    if (!ok || used == 0 || used > response.size()) {
+        return false;
+    }
+    response.resize(used);
+    return true;
+}
+
 static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr sock,
-                             size_t device_count, std::shared_ptr<phone_v2_profile_stdio> profile) {
+                             size_t device_count) {
     rpc_server & server = *server_ptr;
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
@@ -16786,7 +16822,7 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 uint64_t nbytes = 0;
                 if (!sock->recv_data(&nbytes, sizeof(nbytes)) ||
                         nbytes == 0 ||
-                        nbytes > phone_v2_profile_stdio::max_frame) {
+                        nbytes > 256 * 1024) {
                     return;
                 }
                 std::vector<uint8_t> request((size_t) nbytes);
@@ -16794,9 +16830,9 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                     return;
                 }
                 std::vector<uint8_t> response;
-                if (!profile->request(request, response) ||
+                if (!rpc_handle_native_v2_profile(request, response) ||
                         response.empty() ||
-                        response.size() > phone_v2_profile_stdio::max_frame ||
+                        response.size() > 256 * 1024 ||
                         !send_msg(sock, response.data(), response.size())) {
                     return;
                 }
@@ -17646,7 +17682,6 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         return;
     }
     auto shared_server = std::make_shared<rpc_server>(backends, cache_dir, tensor_source);
-    auto native_profile = std::make_shared<phone_v2_profile_stdio>(model_path);
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -17655,8 +17690,8 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        std::thread([shared_server, client_socket, n_devices, native_profile]() {
-            rpc_serve_client(shared_server, client_socket, n_devices, native_profile);
+        std::thread([shared_server, client_socket, n_devices]() {
+            rpc_serve_client(shared_server, client_socket, n_devices);
             printf("Client connection closed\n");
             fflush(stdout);
         }).detach();
