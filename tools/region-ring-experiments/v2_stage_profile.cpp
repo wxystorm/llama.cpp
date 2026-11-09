@@ -21,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -640,11 +641,17 @@ sample_result run(const parameters & args) {
         // Hexagon's precompile_fixed_graph() explicitly rejects ordinary
         // GGML Graph UIDs: bit 63 is the fixed-Graph cache namespace.
         // The legacy N1 register_chunk() path sets this bit before calling
-        // the same proc. This standalone profiler owns one HTP Graph per
-        // process, so serial=1 is unique within the fresh HTP session.
-        // Assign the UID only after the fully bound Graph is finalized.
+        // the same proc. The RPC-embedded profiler runs many independent
+        // shapes in one process. Use a reserved, monotonically increasing
+        // UID instead of reusing 1 for every sampled Graph.
         constexpr uint64_t fixed_graph_namespace = UINT64_C(1) << 63;
+#ifdef V2_STAGE_PROFILE_EMBEDDED
+        static std::atomic<uint64_t> profile_graph_serial {UINT64_C(1) << 48};
+        graph.graph->uid = fixed_graph_namespace |
+            profile_graph_serial.fetch_add(1, std::memory_order_relaxed);
+#else
         graph.graph->uid = fixed_graph_namespace | UINT64_C(1);
+#endif
         if (ggml_graph_n_nodes(graph.graph) <= 0) {
             throw std::runtime_error("HTP_MULTI_LAYER_GRAPH_EMPTY");
         }
