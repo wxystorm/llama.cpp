@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -179,18 +180,92 @@ class RunnerTests(unittest.TestCase):
             }
         with patch.object(mod.chunk_dag, 'extract_probe', side_effect=fake_extract):
             self.assertEqual(mod.main(planned_args + ['--limit', '1']), 0)
-        self.assertEqual(len(FakePopen.calls), 4)  # 3 probes + 1 real prompt
+        self.assertEqual(len(FakePopen.calls), len(mod.chunk_dag.GRID) + 1)  # expanded profile + real run
         self.assertTrue((self.out / 'profile' / 'chunk-profile.json').is_file())
         plan = json.loads((self.out / 'prompt_128_01' / 'plan.json').read_text())
         self.assertEqual(plan['layout_fixed'], mod.chunk_dag.LAYOUT)
         self.assertEqual(plan['plan_tokens'], 167)
         self.assertEqual(plan['token_source'], 'manifest')
+        self.assertEqual(plan['candidate_count'], 49)
+        self.assertEqual(plan['candidate_grid'], list(mod.chunk_dag.GRID))
         self.assertIn(plan['xg'], mod.chunk_dag.GRID)
         self.assertIn(plan['xp'], mod.chunk_dag.GRID)
         self.assertEqual(mod.main(planned_args), 0)
-        self.assertEqual(len(FakePopen.calls), 7)
+        self.assertEqual(len(FakePopen.calls), len(mod.chunk_dag.GRID) + 4)
         self.assertEqual(mod.main(planned_args), 0)
-        self.assertEqual(len(FakePopen.calls), 7)
+        self.assertEqual(len(FakePopen.calls), len(mod.chunk_dag.GRID) + 4)
+
+
+    def test_expanded_profile_reuses_old_successful_widths(self):
+        """A previous three-width calibration shouldn't repeat 64/96/128."""
+        prompt = self.prompts / 'prompt_512_01.txt'
+        old = (64, 96, 128)
+        for width in old:
+            folder = self.out / 'profile' / 'probes' / f'x{width}' / prompt.stem
+            folder.mkdir(parents=True)
+            (folder / 'result.json').write_text(json.dumps({
+                'status': 'PASS',
+                'prompt_sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
+            }))
+        options = SimpleNamespace(out=self.out, model=self.model,
+                                  exe=self.exe, rpc='local:50052',
+                                  context=4096, root=self.root,
+                                  update_profile=False)
+        def fake_extract(folder, x):
+            return {
+                'width': x,
+                'stages': [
+                    dict(device='GPU', layers=9, tokens=x, ms=10.0),
+                    dict(device='GPU', layers=10, tokens=x, ms=11.0),
+                    dict(device='PHONE', layers=1, tokens=x, ms=5.0)],
+                'push': [dict(tokens=x, ms=2.0)],
+                'bank_refill_ms': {'4': 200.0, '6': 220.0},
+            }
+        with patch.object(mod.chunk_dag, 'extract_probe', side_effect=fake_extract):
+            profile = mod.ensure_chunk_profile(options, [(512, prompt)], 'test-commit')
+        self.assertEqual(
+            {x['width'] for x in profile['probes']}, set(mod.chunk_dag.GRID))
+        self.assertEqual(len(FakePopen.calls), len(mod.chunk_dag.GRID) - len(old))
+        self.assertTrue((self.out/'profile'/'chunk-profile.json').is_file())
+
+    def test_completed_prompt_replans_only_if_widths_change(self):
+        planned_args = [v for v in self.base if v != '--fixed-chunks']
+        planned_args += ['--token-source', 'manifest']
+        def fake_extract(folder, x):
+            return {
+                'width': x,
+                'stages': [
+                    dict(device='GPU', layers=9, tokens=x, ms=9 + x * .1),
+                    dict(device='GPU', layers=10, tokens=x, ms=10 + x * .1),
+                    dict(device='PHONE', layers=1, tokens=x, ms=2 + x * .08)],
+                'push': [dict(tokens=x, ms=.5 + x * .01)],
+                'bank_refill_ms': {'4': 200.0, '6': 220.0},
+            }
+        with patch.object(mod.chunk_dag, 'extract_probe', side_effect=fake_extract):
+            self.assertEqual(mod.main(planned_args + ['--limit', '1']), 0)
+        original_calls = len(FakePopen.calls)
+        planfile = self.out/'prompt_128_01'/'plan.json'
+        original_plan = json.loads(planfile.read_text())
+        older_plan = dict(original_plan)
+        older_plan.pop('candidate_grid')
+        older_plan.pop('candidate_count')
+        planfile.write_text(json.dumps(older_plan))
+        self.assertEqual(mod.main(planned_args + ['--only', 'prompt_128_01']), 0)
+        self.assertEqual(len(FakePopen.calls), original_calls)
+        self.assertEqual(json.loads(planfile.read_text())['candidate_count'], 49)
+        # A newly chosen different GPU width must archive and re-run.
+        new_width = next(x for x in mod.chunk_dag.GRID if x != original_plan['xg'])
+        def different_plan(profile, tokens):
+            changed = dict(original_plan)
+            changed['xg'] = new_width
+            changed['candidate_count'] = 49
+            return changed
+        with patch.object(mod.chunk_dag, 'choose', side_effect=different_plan):
+            self.assertEqual(mod.main(planned_args + ['--only', 'prompt_128_01']), 0)
+        self.assertEqual(len(FakePopen.calls), original_calls + 1)
+        self.assertTrue((self.out/'history'/'prompt_128_01'/
+                         'attempt-001'/'result.json').exists())
+        self.assertEqual(read_result(self.out, 'prompt_128_01')['xg'], new_width)
 
 if __name__ == '__main__':
     unittest.main()

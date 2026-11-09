@@ -20,7 +20,10 @@ from statistics import median
 LAYOUT = "G9,P1,G9,P1,G9,P1,G10"
 REGIONS = (('G', 9), ('P', 1), ('G', 9), ('P', 1),
            ('G', 9), ('P', 1), ('G', 10))
-GRID = (64, 96, 128)
+# Seven directly measured Chunk widths, rather than interpolating all candidates
+# from the historical three anchors (64/96/128). XG and XP are independent:
+# 7 GPU widths x 7 Phone widths = 49 DAG candidates per prompt.
+GRID = (32, 48, 64, 80, 96, 112, 128)
 TAIL_FRACTION = 0.25
 REFILLS = (4, 6)
 
@@ -336,6 +339,8 @@ def choose(profile: dict, tokens: int, candidates: tuple[int, ...] = GRID) -> di
                                    -item['xg'], -item['xp']))
     selected = dict(options[0])
     selected['alternatives'] = options[1:4]
+    selected['candidate_grid'] = list(candidates)
+    selected['candidate_count'] = len(options)
     selected['plan_tokens'] = tokens
     selected['layout_fixed'] = LAYOUT
     selected['tail_policy'] = 'widen_uniform_if_tail_le_quarter'

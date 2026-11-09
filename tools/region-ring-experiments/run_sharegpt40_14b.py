@@ -262,7 +262,10 @@ def model_token_counts(args: argparse.Namespace, prompts: list[tuple[int, Path]]
 def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path]],
                          commit: str) -> dict:
     """Run the full fixed-layout profile *once*, cache verified real traces."""
-    candidates = tuple(x for x in chunk_dag.GRID if x <= 128)
+    # Each GRID width gets one real, fixed-layout measurement. With a cached
+    # profile the widened search adds only missing widths; old PASS probes
+    # remain untouched unless --update-profile is explicitly requested.
+    candidates = tuple(chunk_dag.GRID)
     representative = next(((g, p) for g, p in prompts if g == 512), None)
     if representative is None:
         representative = min(prompts, key=lambda pair: abs(pair[0] - 512))
@@ -277,6 +280,9 @@ def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path
                      prompt=prompt.name, context=args.context,
                      grid=list(candidates), fixed_layout=chunk_dag.LAYOUT)
     existing = read_json(profile_path)
+    print(f"[PROFILE] chunk_grid={list(candidates)} "
+          f"measurements={len(candidates)} dag_combinations={len(candidates)**2}",
+          flush=True)
     if not args.update_profile and existing.get("signature") == signature:
         if len(existing.get("probes", [])) == len(candidates):
             print(f"[PROFILE] REUSE {profile_path}", flush=True)
@@ -425,33 +431,45 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError):
             slow = True
         force = prompt.name.lower() in rerun
-        old_plan = read_json(folder / "plan.json") if is_pass and profile is not None else {}
-        needs_replan = is_pass and profile is not None and (
-            old_plan.get("token_source") !=
-                ("model_tokenizer" if args.token_source == "model" else "manifest") or
-            old_plan.get("plan_tokens") != token_counts[prompt.name.lower()]
-        )
-        if is_pass and not force and not slow and not needs_replan:
-            print(f"[SKIP] {prompt.name}: PASS {previous.get('prefill_tps')} tok/s", flush=True)
-            continue
-        if args.limit and launched >= args.limit:
-            break
-        reason = ("force" if force else
-                  "stale_dag_tokens" if needs_replan else
-                  "slow" if is_pass and slow else
-                  "retry" if folder.exists() else "new")
-        if args.dry_run:
-            print(f"[DRY] {prompt.name}: {reason}", flush=True)
-            launched += 1
-            continue
+        # Always evaluate the current GRID for a completed prompt as well:
+        # the widened Profile may now select a different optimal XG/XP.
+        # Do not repeat an expensive inference when its chosen widths stay
+        # unchanged; just refresh plan.json with the new predictions/options.
         plan = None
         if profile is not None:
             plan_tokens = token_counts[prompt.name.lower()]
             plan = chunk_dag.choose(profile, plan_tokens)
             plan["token_source"] = ("model_tokenizer" if args.token_source == "model"
                                     else "manifest")
-            print(f"  [DAG] tokens={plan_tokens} source={plan['token_source']} "
+        old_plan = read_json(folder / "plan.json") if is_pass and plan is not None else {}
+        needs_replan = is_pass and plan is not None and (
+            old_plan.get("token_source") != plan["token_source"] or
+            old_plan.get("plan_tokens") != plan["plan_tokens"] or
+            old_plan.get("xg") != plan["xg"] or
+            old_plan.get("xp") != plan["xp"]
+        )
+        if is_pass and not force and not slow and not needs_replan:
+            if plan is not None and old_plan != plan:
+                atomic_json(folder / "plan.json", plan)
+                print(f"[PLAN_REFRESH] {prompt.name}: unchanged XG={plan['xg']} "
+                      f"XP={plan['xp']} ({plan['candidate_count']} candidates)",
+                      flush=True)
+            print(f"[SKIP] {prompt.name}: PASS {previous.get('prefill_tps')} tok/s", flush=True)
+            continue
+        if args.limit and launched >= args.limit:
+            break
+        reason = ("force" if force else
+                  "dag_chunks_changed" if needs_replan else
+                  "slow" if is_pass and slow else
+                  "retry" if folder.exists() else "new")
+        if args.dry_run:
+            print(f"[DRY] {prompt.name}: {reason}", flush=True)
+            launched += 1
+            continue
+        if plan is not None:
+            print(f"  [DAG] tokens={plan['plan_tokens']} source={plan['token_source']} "
                   f"XG={plan['xg']} XP={plan['xp']} "
+                  f"candidates={plan['candidate_count']} "
                   f"predicted={plan['predicted_dag_ms']}ms", flush=True)
         attempt = archive(args.out, folder, previous) if folder.exists() else 1
         print(f"[{launched + 1}] RUN {prompt.name} group={group} attempt={attempt} reason={reason}", flush=True)

@@ -6,7 +6,7 @@ import chunk_dag as m
 
 def synthetic_profile():
     data = []
-    for x in (64, 96, 128):
+    for x in m.GRID:
         stages = []
         for layers in (9, 10):
             stages.append(dict(device='GPU', layers=layers, tokens=x,
@@ -87,10 +87,24 @@ class DagTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'duplicate'):
                 m.manifest_tokens(manifest, 'prompt_128_01.txt')
 
+    def test_extended_chunk_grid(self):
+        self.assertEqual(m.GRID, (32, 48, 64, 80, 96, 112, 128))
+        self.assertEqual(len(m.GRID), 7)
+        # Cover every GPU/Phone combination under a non-aligned tail.
+        p = synthetic_profile()
+        for xg in m.GRID:
+            for xp in m.GRID:
+                estimate = m.dag_simulate(p, 513, xg, xp)
+                self.assertGreater(estimate['predicted_dag_ms'], 0)
+                self.assertEqual(estimate['xg'], xg)
+                self.assertEqual(estimate['xp'], xp)
+
     def test_select_chunks_only(self):
         selected = m.choose(synthetic_profile(), 513)
         self.assertIn(selected['xg'], m.GRID)
         self.assertIn(selected['xp'], m.GRID)
+        self.assertEqual(selected['candidate_grid'], list(m.GRID))
+        self.assertEqual(selected['candidate_count'], 49)
         self.assertEqual(selected['plan_tokens'], 513)
         self.assertEqual(selected['layout_fixed'], m.LAYOUT)
 
