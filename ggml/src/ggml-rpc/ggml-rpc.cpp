@@ -8361,6 +8361,7 @@ bool rpc_server::phone_owned_plan_register(
     plan.p2c_run_id    = request.p2c_run_id;
     plan.region        = request.region;
     plan.layer         = request.layer;
+    plan.layer_end     = request.layer_end;
     plan.total_tokens  = request.total_tokens;
     plan.chunk_tokens  = request.chunk_tokens;
     plan.n_embd        = request.n_embd;
@@ -8390,9 +8391,13 @@ bool rpc_server::phone_owned_plan_register(
     }
     if (phone_npu_plan_controlled) {
         const auto assignment = phone_npu_region_layer.find(plan.region);
+        const auto assignment_end =
+            phone_npu_region_layer_end.find(plan.region);
         if (phone_npu_plan_configured_run != plan.run_id ||
                 assignment == phone_npu_region_layer.end() ||
-                assignment->second != (int) plan.layer) {
+                assignment_end == phone_npu_region_layer_end.end() ||
+                assignment->second != (int) plan.layer ||
+                assignment_end->second != (int) plan.layer_end) {
             GGML_LOG_ERROR(
                 "[PHONE_OWNED_PLAN] event=REJECT "
                 "run=%" PRIu64 " region=%u layer=%u "
@@ -8529,10 +8534,10 @@ bool rpc_server::phone_owned_plan_register(
         std::string why;
         const int64_t begin_us = ggml_time_us();
         std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
-        const int bank_rank = phone_npu_banked_enabled ?
+        const int bank_rank = phone_npu_executor->has_any_weight_plan() ?
             phone_npu_executor->rank_for_region(
                 plan.region, plan.layer) : -1;
-        if (phone_npu_banked_enabled && bank_rank < 0) {
+        if (phone_npu_plan_controlled && bank_rank < 0) {
             GGML_LOG_ERROR(
                 "[PHONE_QWEN3_LOCAL] event=REJECT run=%" PRIu64
                 " region=%u layer=%u"
@@ -8543,7 +8548,8 @@ bool rpc_server::phone_owned_plan_register(
         // All Region KV must exist before PC binds Decode storage.
         // For rank 2+ weights and Graphs are deliberately absent until
         // the old parity Bank has drained and the refill worker runs.
-        const bool deferred = phone_npu_banked_enabled && bank_rank >= 2;
+        const bool deferred =
+            phone_npu_executor->has_weight_banks() && bank_rank >= 2;
         const bool precompiled = deferred ?
             phone_npu_executor->reserve_owned_htp_kv(plan, why) :
             phone_npu_executor->prepare_owned_htp_graphs(plan, why, stats);
@@ -8572,12 +8578,13 @@ bool rpc_server::phone_owned_plan_register(
     }
     GGML_LOG_INFO("[PHONE_OWNED_PLAN] event=REGISTER run=%" PRIu64
                   " p2c_run=%" PRIu64
-                  " region=%u layer=%u chunks=%u chunk_tokens=%u"
+                  " region=%u layers=[%u,%u) chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
                   " graph_mode=%s local_builder=%s"
                   " local_htp=%s status=READY\n",
                   plan.run_id, plan.p2c_run_id, plan.region,
-                  plan.layer, ggml_phone_owned::chunk_count(plan),
+                  plan.layer, plan.layer_end,
+                  ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
                   plan.position_base, plan.kv_capacity,
                   local_only_requested ? "PHONE_LOCAL_HTP_PC_METADATA" :
