@@ -1,79 +1,85 @@
-# V2 Phone native Profile over the existing ggml-rpc port 50052
+# Native V2 Phone Profile inside ggml-rpc-server (one process, one port)
 
-Branch: `feat/region-ring-v2-stage-profile-rebuild-20261108`  
-Protocol: **ggml-rpc 4.0.35**, V2 Profile wire JSON v1.
+Branch: `feat/region-ring-v2-stage-profile-rebuild-20261108`.  
+Wire: **GGML-RPC 4.0.35**, command 57, bounded V2 JSON payload v1.
 
-## What changed
+## Architecture
 
-There is **one listening server, one TCP port**. The Phone's normal
-`ggml-rpc-server -p 50052` also accepts the bounded native Profile request
-(command 57) after the existing GGML-RPC HELLO. The PC side reuses the
-`-Rpc PHONE_IP:50052` argument of `run_prompt_sweep.ps1`.
+There is **one Phone process**: `ggml-rpc-server`, listening only on the
+existing inference RPC port `50052`.
 
-The old independent Python TCP sidecar on `50177` is **not started**.
-Instead, the RPC server launches the Python V2 Profile helper automatically
-**on first Profile request**. That helper communicates over private inherited
-stdio/UNIX socketpair, has no listening TCP socket, and executes the existing
-`region-ring-v2-stage-profile` native binary for actual N/A measurements.
-This reuses the tested model hashing, parity, and CSV schema; it is **not**
-an in-process rewrite of the native profiler.
-
-A worker or native profiler failure becomes a structured error returned to
-the PC. No unrelated RPC connection is allowed to run arbitrary shell
-commands or choose a different GGUF/profiler path.
-
-## 1. Cross-compile Phone targets (Android arm64)
-
-In the existing Android NDK r29 / Hexagon SDK build directory:
-
-```sh
-cmake --build build-phone-npu \
-  --target ggml-rpc-server region-ring-v2-stage-profile -j 8
+```text
+PC run_prompt_sweep.ps1 / run_v2_stage_matrix.py
+    |
+    | GGML-RPC HELLO 4.0.35 + command 57 (port 50052)
+    v
+Phone ggml-rpc-server (C++)
+    |
+    +-- parse, authenticate and validate bounded Profile shape
+    +-- verify exact original GGUF SHA256
+    +-- call v2_stage_profile_run_embedded() directly in-process
+    |       N = HTP0 graph + CPU parity; A = Adreno OpenCL graph
+    |       measured compute/prepare/weight refill and graph memory
+    +-- return native CSV fields as JSON, PASS/PARITY_FAIL/ERROR
+    |
+    +-- existing inference/Plan/Phone-owned execution RPC commands
 ```
 
-On Phone, package/deploy the following with **matching GGML backend and DSP
-libraries**. Preserve the Qualcomm/HTP, `OCL_ICD_VENDORS`,
-`LD_LIBRARY_PATH`, and `ADSP_LIBRARY_PATH` settings from your last
-working NPU+OpenCL configuration.
+The original independent C++ profiler source is compiled into the Android
+`ggml-rpc-server` binary by CMake. It uses the same HTP precompile, GGML
+Graph, and CPU parity logic as the standalone tool, without copying or
+reimplementing the measurement kernels.
+
+**No Python, fork, exec, background worker, subprocess, standalone profiler
+executable, second Termux window or TCP port 50177 is required on Phone.**
+The PC-side Python orchestration scripts remain for cache/resume/scheduling
+and for the G/C native executable; Phone execution itself is C++ only.
+
+## Build and deploy
+
+Cross-compile in the existing NDK r29 / Hexagon / OpenCL build environment:
+
+```bash
+cd /workspace
+git pull --ff-only
+cmake --build build-phone-npu --target ggml-rpc-server -j 8
+```
+
+The Phone deployment contains only:
 
 ```text
 ~/phone-v2-profile/
-  bin/ggml-rpc-server
-  bin/region-ring-v2-stage-profile
-  lib/                    # compatible Android GGML/OpenCL/Hexagon/HTP .so
-  v2_phone_profile_server.py
-  v2_profile_wire.py
-  v2_profile_transfer.py
+    bin/ggml-rpc-server
+    lib/*.so                 (matching Android GGML/HTP/OpenCL libraries)
 ```
 
-The three Python files must be copied from the **same Git revision** as the
-PC scripts; the `v2_profile_transfer.py` dependency is imported by the worker
-but no raw-TCP Profile transfer service is started.
+No Python scripts or `region-ring-v2-stage-profile` executable need to be
+copied to Phone. Retain the working HTP DSP libraries and vendor runtime
+dependencies from the validated NPU setup.
 
-Install `python` in Termux if necessary. The RPC process automatically
-locates these files relative to its executable (`../v2_phone_profile_server.py`
-and sibling `region-ring-v2-stage-profile` under `bin/`). Optional
-overrides: `GGML_RPC_V2_PROFILE_SCRIPT` and `GGML_RPC_V2_PROFILE_EXE`
-are **local phone administrator** environment variables, never remotely
-supplied by a Profile request.
+You must also rebuild the PC binary from protocol 4.0.35 source:
 
-## 2. Start *only* the usual Phone inference RPC
+```powershell
+git pull --ff-only
+cmake --build build-tensor-v2 --config Release `
+  --target llama-completion region-ring-v2-stage-profile -j 8
+```
 
-In Termux:
+## Start Phone (Termux)
 
-```sh
+Keep the previously working OpenCL/HTP driver environment:
+
+```bash
 cd ~/phone-v2-profile
-export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$PWD/lib:${LD_LIBRARY_PATH:-}"
 export ADSP_LIBRARY_PATH="$PWD/lib"
 export GGML_HEXAGON_NDEV=1
-
 unset GGML_RPC_PHONE_NPU_SERIAL_REGIONS
 unset GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS
 export GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1
 export GGML_RPC_PHONE_NPU_WEIGHT_BANKS=2
 export GGML_RPC_PHONE_NPU_MIXED_OPENCL=1
 export GGML_RPC_PHONE_NPU_GPU_PIPELINE=1
-
 export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
 export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
 export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=1
@@ -85,83 +91,69 @@ export GGML_RPC_PHONE_STAGE_SLOT0_EXEC=1
 export GGML_RPC_PHONE_STAGE_DUAL_SLOT=1
 export GGML_RPC_PHONE_PERSISTENT_POOL_PREP=1
 
-python --version
 ./bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -d GPUOpenCL \
-  -m "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 2>&1 | tee phone-v2.log
+    -m "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 2>&1 | tee phone-v2.log
 ```
 
-Do **not** start `v2_phone_profile_server.py` manually. On the first
-missing Profile sample the server should log:
+Expect on startup:
 
 ```text
-[V2_PROFILE_RPC] status=WORKER_STARTED port=SHARED_50052
-[V2_PHONE_PROFILE] transport=RPC50052_STDIO status=READY
+[V2_PROFILE_NATIVE] state=REGISTERED port=50052 process=RPC_ONLY
 ```
 
-The Python worker runs only when needed, and the native profiler remains an
-independent subprocess for each measured shape.
+On an actual N/A profile request, expect:
 
-## 3. PC: run the existing sweep with one RPC endpoint
+```text
+[V2_PROFILE_NATIVE] event=RUN backend=N layers=1 chunk=32 kv=512
+[V2_PROFILE_NATIVE] event=DONE backend=N layers=1 status=PASS
+```
 
-Build PC and Phone from protocol **4.0.34** source. In Windows PowerShell:
+If HTP numerical parity fails, the status must be `PARITY_FAIL`, never
+silently treated as a valid Planner performance point. An N2/N4 profile PASS
+does not prove that production runtime supports multi-layer HTP Regions.
+
+## PC verification
+
+In PowerShell, check the single-port hello first:
 
 ```powershell
-git pull --ff-only
-cmake --build build-tensor-v2 --config Release `
-  --target llama-completion region-ring-v2-stage-profile -j 8
-
-.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
-  -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
-  -Rpc "10.39.52.114:50052" `
-  -PromptDir ".\single-prompt-512" `
-  -Out ".\planner-test-results-v2" `
-  -Planner apply-wide -Streaming on -NPredict 32 `
-  -Threads 8 -Batch 512 -UBatch 512 -LogVerbosity 4
+python -c "import sys; sys.path.insert(0, 'tools/region-ring-experiments'); from v2_profile_wire import call; print(call('10.39.52.114:50052', 'hello'))"
 ```
 
-There is **no** `-V2ProfilePhone` argument and no `adb forward tcp:50177`.
-The PC first checks a model-bound cached V2 Profile; on a miss, it calls
-the native matrix with Phone endpoint `10.39.52.114:50052`.
+Expected JSON fields: `status=OK`, `transport=V2_PHONE_PROFILE_RPC50052`,
+`model_sha256`, `exe_sha256`, `runtime_sha256`, `device_id`.
 
-A previously saved 50177 Profile cache is intentionally rejected with
-`PHONE_PROFILE_TRANSPORT_MISMATCH`; G/C samples retain their own resume
-records. The coordinator then samples missing N/A shapes. If N4 HTP parity
-fails, that record is quarantined, not used by the Planner.
+The PC verifies the Phone SHA256 matches its own GGUF file before accepting
+N/A samples. Phone runtime identity includes the **RPC server executable**
+and selected GGML/HTP/OpenCL libraries; changes invalidate the N/A cache.
+Previously valid G/C records are independently reusable.
 
-Standalone G/C/N/A matrix invocation:
+Run a minimal N1/A1 independent matrix before a full 96-case sweep:
 
 ```powershell
 python .\tools\region-ring-experiments\run_v2_stage_matrix.py `
   --exe ".\build-tensor-v2\bin\Release\region-ring-v2-stage-profile.exe" `
   --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
-  --out ".\profile-v2\gcna-expanded" `
-  --phone "10.39.52.114:50052" --backends GCNA `
-  --layers "2,4" --chunks "64" --kvs "512" `
-  --warmups 1 --repeats 3 --skip-tcp-transfer
+  --phone "10.39.52.114:50052" `
+  --out ".\profile-v2\gcna-native-smoke" `
+  --backends NA --layers "1" --chunks "32" --kvs "512" `
+  --warmups 1 --repeats 2 --skip-tcp-transfer
 ```
 
-## 4. Guarantees and limits
+Only when N/A smoke succeeds, run the usual `run_prompt_sweep.ps1` with
+`-Rpc "10.39.52.114:50052"`; do not supply `-V2ProfilePhone`, launch
+a Python Phone service, or forward 50177.
 
-- One TCP endpoint; HELLO and native Profile are on the **same GGML RPC**
-  transport. The Python control service on 50177 is no longer required.
-- A Profile client sends only numerical shape parameters, a model fingerprint
-  and an optional token. The server owns all executable/model paths.
-- Every HTP result must pass CPU parity; `PARITY_FAIL` rows are excluded
-  from the Planner-eligible CSV.
-- Samples are serialized by the shared Phone worker lock. **External
-  inference clients must remain idle during profiling**; the current RPC
-  does not yet provide a global hardware-idle fence for all execution modes.
-- The former raw-TCP Profile transfer test is skipped on the integrated
-  port. Its stream timing is **not** a production GGML-RPC C2P/P2C timing.
-  Retain production RPC transfer/Bank measurements for Planner calibration.
-- The first worker startup hashes the full Phone GGUF once. Profile cache
-  identity includes Phone hardware, native profiler binary, RPC Server,
-  Python worker script and selected backend libraries.
-- The production mixed HTP runtime still supports N1 per HTP Region; an
-  independent N2/N4 Profile is not proof of production N2/N4 execution.
-- Phone RPC is experimental and is not hardened for an untrusted network.
-  Expose 50052 only on a trusted private LAN or authenticated tunnel.
+## Limits
 
-**Source/test integration is not a Snapdragon runtime PASS.** Rebuild both
-sides, run unit tests, then verify native parity and full Prefill/Decode on
-the actual hardware before trusting a GCNA Plan.
+- Native in-process graph profiling currently serializes all N/A probes on
+  Phone. Do not run a separate inference job during sampling; a global
+  cross-command GPU/HTP idle fence is not yet present.
+- The independent native sampler can load extra weights/graphs alongside
+  the existing RPC Server, so memory feasibility must still be enforced.
+- Unlike the old raw-TCP 50177 diagnostic, production transfer calibration
+  must come from actual ggml-rpc Tensor/Bank timings. No synthetic TCP
+  measurements are marked Planner-eligible.
+- The RPC server is experimental and not hardened for an untrusted network.
+- Compiled code is **not** a Snapdragon runtime PASS. Confirm NPU precompile,
+  CPU parity, real GCNA plans and end-to-end logits on physical hardware.
