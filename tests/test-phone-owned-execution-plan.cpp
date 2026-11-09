@@ -17,6 +17,7 @@ static region_plan make_plan() {
     p.p2c_run_id = 91;
     p.region = 1;
     p.layer = 9;
+    p.layer_end = 10;
     p.total_tokens = 512;
     p.chunk_tokens = 128;
     p.n_embd = 5120;
@@ -44,6 +45,14 @@ int main() {
     const region_plan a = make_plan();
     CHECK(validate(a, reason));
     CHECK(chunk_count(a) == 4);
+    auto n3 = a;
+    n3.layer_end = 12;
+    CHECK(validate(n3, reason));
+    CHECK(!equal(a, n3));
+    n3.layer_end = n3.layer;
+    CHECK(!validate(n3, reason));
+    n3.layer_end = 42;
+    CHECK(!validate(n3, reason));
     CHECK(owned_task_uid(1, 0) != 0);
     CHECK(owned_task_uid(1, 0) != owned_task_uid(1, 1));
     CHECK(owned_task_uid(1, 1) != owned_task_uid(3, 1));
@@ -81,13 +90,14 @@ int main() {
     b = a;
     b.region = 3;
     b.layer = 19;
+    b.layer_end = 20;
     CHECK(plans.add(b, reason));
     CHECK(plans.size() == 2);
     CHECK(plans.count_run(42) == 2);
     CHECK(plans.count_run(41) == 0);
 
     auto invalid = a;
-    invalid.version = 3;
+    invalid.version = 2;
     CHECK(!validate(invalid, reason));
     invalid = a;
     invalid.flags = 0;
