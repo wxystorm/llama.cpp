@@ -714,8 +714,7 @@ inline bool llama_region_ring_single_cycle_force_compatible(
         int n_layer) {
     if (!llama_region_ring_single_cycle_topology_compatible(
             regions, n_layer) ||
-            regions.empty() ||
-            regions.back().device != llama_region_ring_device::PHONE) {
+            regions.empty()) {
         return false;
     }
     std::array<int, 3> counts {};
@@ -730,9 +729,9 @@ inline bool llama_region_ring_single_cycle_force_compatible(
     return active_devices >= 2;
 }
 
-// Forced APPLY_WIDE may use up to eight G -> [C] -> P cycles, including
-// CPU-free G7,P1 x8 on Qwen3-32B. Legacy fixed layouts and automatic
-// Planner search retain the original 2-4 cycle limits.
+// Forced APPLY_WIDE may use up to eight G -> [C] -> [P] cycles,
+// including CPU-free G7,P1 x8 and PC-only G7,C1 x8 on Qwen3-32B.
+// Legacy fixed layouts and automatic Planner search retain 2-4 cycles.
 inline constexpr int LLAMA_REGION_RING_APPLY_MAX_CYCLES = 8;
 
 // The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
@@ -793,10 +792,9 @@ llama_region_ring_parse_optional_cpu_cycles(
             throw std::runtime_error("trailing comma in optional-CPU ring");
         }
     }
-    if (layer != n_layer ||
-            !llama_region_ring_apply_topology_compatible(regions, n_layer) ||
-            regions.back().device != llama_region_ring_device::PHONE) {
-        throw std::runtime_error("invalid optional-CPU G,C?,P cycle topology");
+    if (layer != n_layer || regions.empty() ||
+            !llama_region_ring_apply_topology_compatible(regions, n_layer)) {
+        throw std::runtime_error("invalid forced G,[C],[P] cycle topology");
     }
     return regions;
 }
@@ -827,15 +825,17 @@ llama_region_ring_parse_apply_wide_layout(
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
-    if (regions.size() < 4 ||
+    if (regions.size() < 2 ||
             regions.size() > 3 * LLAMA_REGION_RING_APPLY_MAX_CYCLES ||
             n_layer <= 0 || regions.front().layer_begin != 0 ||
             regions.back().layer_end != n_layer) {
         return false;
     }
-    // Each complete Cycle is GPU -> [CPU] -> Phone. A zero-layer CPU is
-    // absent from this list: it is NEVER an executable Region. Preserve
-    // legacy trailing GPU or GPU+CPU after at least two complete Cycles.
+    // Forced APPLY_WIDE accepts G -> [C] -> [P] cycles, with a CPU or
+    // Phone Region in each completed cycle. A final GPU-only tail is
+    // permitted after at least one completed cycle. All intervals must
+    // be exact, contiguous and nonempty.
+    // The automatic Planner still searches only 2..4 Phone-final cycles.
     size_t i = 0;
     int layer = 0;
     int cycles = 0;
@@ -854,22 +854,23 @@ inline bool llama_region_ring_apply_topology_compatible(
         if (!take(llama_region_ring_device::GPU)) {
             return false;
         }
-        if (i < regions.size() &&
-                regions[i].device == llama_region_ring_device::CPU &&
-                !take(llama_region_ring_device::CPU)) {
-            return false;
+        if (i == regions.size()) {
+            // Reject a degenerate single-GPU layout.
+            return cycles >= 1 && layer == n_layer;
         }
-        if (i == regions.size()) { // Legacy PC tail (never final Phone).
-            return cycles >= 2 && cycles <= LLAMA_REGION_RING_APPLY_MAX_CYCLES && layer == n_layer;
-        }
-        if (!take(llama_region_ring_device::PHONE)) {
-            return false;
-        }
-        if (++cycles > LLAMA_REGION_RING_APPLY_MAX_CYCLES) {
+        const bool has_cpu =
+            regions[i].device == llama_region_ring_device::CPU &&
+            take(llama_region_ring_device::CPU);
+        const bool has_phone =
+            i < regions.size() &&
+            regions[i].device == llama_region_ring_device::PHONE &&
+            take(llama_region_ring_device::PHONE);
+        if ((!has_cpu && !has_phone) ||
+                ++cycles > LLAMA_REGION_RING_APPLY_MAX_CYCLES) {
             return false;
         }
     }
-    return cycles >= 2 && cycles <= LLAMA_REGION_RING_APPLY_MAX_CYCLES && layer == n_layer;
+    return cycles >= 1 && layer == n_layer;
 }
 
 // Canonical Ring layout spelling, shared by the model loader, runtime
