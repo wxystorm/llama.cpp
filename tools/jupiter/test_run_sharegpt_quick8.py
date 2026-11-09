@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from jupiter_memory_partition import DeviceMemory, GGUFWeights, GIB, MIB
-from run_sharegpt_quick8 import build_command, choose_layers_by_memory
+from run_sharegpt_quick8 import (
+    build_command, choose_layers_by_memory, make_identity, make_parser,
+    resume_saved_split,
+)
 
 
 class JupiterQuickCPUStageTests(unittest.TestCase):
@@ -54,6 +58,55 @@ class JupiterQuickCPUStageTests(unittest.TestCase):
             smoke = build_command(args, Path(temp), Path(temp))
             self.assertEqual(smoke[smoke.index("--limit") + 1], "1")
             self.assertIn("--fail-fast", smoke)
+    def test_resume_pins_original_layers_despite_memory_budget_changes(self):
+        selected = [{"prompt": "prompt_128_01.txt", "sha256": "abc"}]
+        previous_args = make_parser().parse_args([])
+        previous_args.model = "fake.gguf"
+        previous_args.per_group = 10
+        previous_args.cpu_layers = 25
+        previous_args.pc_layers = 32
+        previous_args.cpu_reserve_mib = 512
+        previous_args.phone_workspace_mib = 768
+        previous = make_identity(previous_args, selected)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "quick8-config.json").write_text(
+                json.dumps(previous), encoding="utf-8",
+            )
+            restarted = make_parser().parse_args([])
+            restarted.model = "fake.gguf"
+            restarted.per_group = 10
+            restarted.cpu_reserve_mib = 2048
+            restarted.phone_workspace_mib = 1024
+            saved = resume_saved_split(root, selected, restarted)
+            self.assertIsNotNone(saved)
+            self.assertEqual(saved[0], (25, 32))
+            self.assertEqual(saved[1], previous)
+            self.assertIsNone(restarted.pc_layers)
+
+    def test_resume_rejects_real_runtime_or_prompt_change(self):
+        selected = [{"prompt": "prompt_128_01.txt", "sha256": "abc"}]
+        original = make_parser().parse_args([])
+        original.model = "fake.gguf"
+        original.cpu_layers = 25
+        original.pc_layers = 32
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "quick8-config.json").write_text(
+                json.dumps(make_identity(original, selected)), encoding="utf-8",
+            )
+            restarted = make_parser().parse_args([])
+            restarted.model = "fake.gguf"
+            restarted.window = 3
+            with self.assertRaisesRegex(ValueError, "window"):
+                resume_saved_split(root, selected, restarted)
+            restarted.window = 2
+            restarted.pc_layers = 33
+            with self.assertRaisesRegex(ValueError, "saved PC boundary"):
+                resume_saved_split(root, selected, restarted)
+            restarted.pc_layers = None
+            with self.assertRaisesRegex(ValueError, "prompt selection"):
+                resume_saved_split(root, [{"prompt": "changed.txt"}], restarted)
 
 
 if __name__ == "__main__":
