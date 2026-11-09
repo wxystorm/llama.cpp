@@ -5888,6 +5888,10 @@ public:
                             backend.get());
                     phone_npu_names.emplace_back(name);
                     phone_npu_executors.emplace_back(std::move(executor));
+                    phone_npu_backend_locks.emplace_back(
+                        std::make_unique<std::mutex>());
+                    phone_npu_compute_waiters_by_session.emplace_back(
+                        std::make_unique<std::atomic<uint32_t>>(0));
                     phone_npu_backends.emplace_back(std::move(backend));
                     GGML_LOG_INFO(
                         "[PHONE_NPU_SESSION] event=INIT index=%zu"
@@ -5915,6 +5919,11 @@ public:
                 " regions=%zu rpc_visible=GPUOpenCL status=READY\n",
                 phone_npu_executors.size(),
                 phone_npu_serial_regions.size());
+            GGML_LOG_INFO(
+                "[PHONE_NPU_SESSION] event=LOCK_POLICY scope=%s"
+                " sessions=%zu compute=SERIAL status=READY\n",
+                phone_npu_split_session_locks() ? "PER_SESSION" : "GLOBAL",
+                phone_npu_executors.size());
 
             // Optional model-load-time HTP residency. The Phone -m GGUF
             // loader is already constructed before the RPC server starts.
@@ -6404,15 +6413,65 @@ private:
         return false;
     }
     bool phone_npu_async_preload = false;
-    // The async preloader never takes graph_compute_mutex during REPACK,
-    // so PC graph/task registration cannot be serialized behind ~2s of
-    // HTP weight copies. Backend operations and source-buffer lifetime are
-    // guarded separately.
+    // HTP0..HTP3 own separate FastRPC sessions, KV and fixed-graph caches.
+    // Use per-session device locks so preparing the next Region does not
+    // stall compute in an unrelated session. Keep the original global lock
+    // as an explicit A/B fallback (GGML_RPC_PHONE_NPU_SESSION_LOCKS=0).
     std::mutex phone_npu_backend_mutex;
-    // Selected NPU Chunk tasks get the next HTP turn between consecutive
-    // precompiled layers, rather than waiting behind the entire P2/P3 chain.
     std::atomic<uint32_t> phone_npu_compute_waiters { 0 };
+    std::vector<std::unique_ptr<std::mutex>> phone_npu_backend_locks;
+    std::vector<std::unique_ptr<std::atomic<uint32_t>>>
+        phone_npu_compute_waiters_by_session;
     std::mutex phone_npu_weight_source_mutex;
+
+    bool phone_npu_split_session_locks() const {
+        const char * env = std::getenv("GGML_RPC_PHONE_NPU_SESSION_LOCKS");
+        return env == nullptr || std::strcmp(env, "0") != 0;
+    }
+
+    std::vector<size_t> phone_npu_sessions_for_region(
+            uint32_t region, uint32_t n_layers = 1) const {
+        std::vector<size_t> sessions;
+        for (size_t offset = 0;
+                offset < std::min<size_t>(n_layers, phone_npu_executors.size());
+                ++offset) {
+            const size_t index = phone_npu_session_for_region_layer(
+                region, static_cast<uint32_t>(offset));
+            if (index < phone_npu_backend_locks.size()) {
+                sessions.push_back(index);
+            }
+        }
+        std::sort(sessions.begin(), sessions.end());
+        sessions.erase(
+            std::unique(sessions.begin(), sessions.end()), sessions.end());
+        return sessions;
+    }
+
+    std::vector<std::unique_lock<std::mutex>> phone_npu_lock_sessions(
+            std::vector<size_t> sessions) {
+        std::vector<std::unique_lock<std::mutex>> locks;
+        if (!phone_npu_split_session_locks()) {
+            locks.emplace_back(phone_npu_backend_mutex);
+            return locks;
+        }
+        std::sort(sessions.begin(), sessions.end());
+        sessions.erase(
+            std::unique(sessions.begin(), sessions.end()), sessions.end());
+        for (size_t index : sessions) {
+            if (index >= phone_npu_backend_locks.size()) {
+                throw std::runtime_error("Invalid HTP session lock index");
+            }
+            locks.emplace_back(*phone_npu_backend_locks[index]);
+        }
+        return locks;
+    }
+
+    std::atomic<uint32_t> & phone_npu_waiters_for_session(size_t index) {
+        return phone_npu_split_session_locks() ?
+            *phone_npu_compute_waiters_by_session.at(index) :
+            phone_npu_compute_waiters;
+    }
+
 
     std::mutex phone_region_main_mutex;
     std::condition_variable phone_region_main_cv;
@@ -7187,7 +7246,13 @@ bool rpc_server::phone_input_stream_run(
         // Keep one global lock order: HTP before Graph, so an NPU compute
         // awaiting the background preloader never holds graph_compute_mutex
         // and blocks subsequent RPC task registration.
-        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        // RUN reset/sync touches every HTP executor and its KV cache.
+        // Acquire all session locks in a stable order before the graph lock.
+        std::vector<size_t> all_sessions;
+        for (size_t i = 0; i < phone_npu_executors.size(); ++i) {
+            all_sessions.push_back(i);
+        }
+        auto htp_guards = phone_npu_lock_sessions(std::move(all_sessions));
         std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
         if (request.active) {
             for (auto & executor : phone_npu_executors) {
@@ -7678,16 +7743,20 @@ bool rpc_server::phone_owned_plan_register(
     if (precompile_requested) {
         const int64_t begin_us = ggml_time_us();
         for (const auto & child : child_plans) {
-        // Give an already-selected compute task a chance to claim the HTP
-        // mutex before preparing the next layer. The bound prevents starving
-        // plan registration under sustained compute load.
+        const size_t session_index = phone_npu_session_for_region_layer(
+            plan.region, child.layer - plan.layer);
+        if (session_index >= phone_npu_backend_locks.size()) { return false; }
+        // Only compute waiting on this session takes priority. A different
+        // Session may prepare while the current HTP Region is computing.
         const int64_t yield_start_us = ggml_time_us();
-        while (phone_npu_compute_waiters.load(std::memory_order_acquire) > 0 &&
+        while (phone_npu_waiters_for_session(session_index).load(
+                    std::memory_order_acquire) > 0 &&
                 ggml_time_us() - yield_start_us < 20000) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         const int64_t htp_lock_start_us = ggml_time_us();
-        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        auto htp_guards = phone_npu_lock_sessions({session_index});
+        auto & htp_guard = htp_guards.front();
         const double htp_lock_wait_ms =
             (ggml_time_us() - htp_lock_start_us) / 1000.0;
         auto * child_executor =
@@ -7716,7 +7785,7 @@ bool rpc_server::phone_owned_plan_register(
                 load_reason.c_str());
         }
         const bool precompiled = child_executor->prepare_owned_htp_graphs(
-            child, why, stats);
+            child, why, stats, &htp_guard);
         GGML_LOG_INFO(
             "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
             " region=%u layer=%u backend=%s chunks=%u graph_nodes=%zu"
@@ -7841,7 +7910,26 @@ bool rpc_server::phone_owned_kv_bind(
             return reject("STREAM_NOT_ACTIVE_OR_REGION_PUSH_ALREADY_STARTED");
         }
     }
-    std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+    // Determine the actual child Session without nesting the graph lock
+    // inside any device lock. Recheck the immutable Plan after locking.
+    uint32_t requested_offset = 0;
+    {
+        std::lock_guard<std::recursive_mutex> snapshot(graph_compute_mutex);
+        const auto * existing = phone_owned_plans.find(
+            request.run_id, request.region);
+        if (!existing || request.layer < existing->layer ||
+                request.layer - existing->layer >=
+                    ggml_phone_owned::layer_count(*existing)) {
+            return reject("PHONE_OWNED_PLAN_OR_HTP_MISMATCH");
+        }
+        requested_offset = request.layer - existing->layer;
+    }
+    const size_t session_index = phone_npu_session_for_region_layer(
+        request.region, requested_offset);
+    if (session_index >= phone_npu_backend_locks.size()) {
+        return reject("PHONE_OWNED_KV_SESSION_INVALID");
+    }
+    auto htp_guards = phone_npu_lock_sessions({session_index});
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     const auto * plan = phone_owned_plans.find(
         request.run_id, request.region);
@@ -8064,10 +8152,10 @@ bool rpc_server::phone_auto_task_register(
         fixed_env != nullptr && std::strcmp(fixed_env, "1") == 0 &&
         ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, request.key.region);
-    std::unique_lock<std::mutex> fixed_htp_guard(
-        phone_npu_backend_mutex, std::defer_lock);
+    std::vector<std::unique_lock<std::mutex>> fixed_htp_guards;
     if (fixed_npu_requested || local_only_requested) {
-        fixed_htp_guard.lock();
+        fixed_htp_guards = phone_npu_lock_sessions(
+            phone_npu_sessions_for_region(request.key.region));
     }
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     auto it = stored_graphs[request.device].find(request.graph_uid);
@@ -8763,8 +8851,8 @@ void rpc_server::phone_npu_preload_loop() {
             if (!sources_live) {
                 reason = "HTP_PRELOAD_SOURCE_FREED";
             } else {
-                std::lock_guard<std::mutex> htp_guard(
-                    phone_npu_backend_mutex);
+                auto htp_guards = phone_npu_lock_sessions(
+                    phone_npu_sessions_for_region(task.region));
                 service_begin_us = ggml_time_us();
                 auto * phone_npu_executor =
                     phone_npu_executor_for_region(task.region);
@@ -9082,13 +9170,46 @@ void rpc_server::phone_auto_compute_loop() {
         const bool stage_profile_enabled = npu_task && !local_only &&
             stage_profile_env != nullptr &&
             std::strcmp(stage_profile_env, "1") == 0;
+        // One compute worker still executes NPU tasks serially. A P3/P4
+        // chain may touch multiple Session backends, so lock every Session
+        // it will use, in ascending order, before any device operation.
+        uint32_t compute_layers = 1;
+        if (npu_task && task->graphless_owned) {
+            std::lock_guard<std::recursive_mutex> snapshot(
+                graph_compute_mutex);
+            if (const auto * plan = phone_owned_plans.find(
+                    req.key.run_id, req.key.region)) {
+                compute_layers = ggml_phone_owned::layer_count(*plan);
+            }
+        }
+        const auto compute_sessions = npu_task ?
+            phone_npu_sessions_for_region(req.key.region, compute_layers) :
+            std::vector<size_t> {};
         const int64_t htp_lock_begin_us = ggml_time_us();
-        std::unique_lock<std::mutex> htp_guard(
-            phone_npu_backend_mutex, std::defer_lock);
         if (npu_task) {
-            phone_npu_compute_waiters.fetch_add(1, std::memory_order_acq_rel);
-            htp_guard.lock();
-            phone_npu_compute_waiters.fetch_sub(1, std::memory_order_acq_rel);
+            if (phone_npu_split_session_locks()) {
+                for (const size_t index : compute_sessions) {
+                    phone_npu_waiters_for_session(index).fetch_add(
+                        1, std::memory_order_acq_rel);
+                }
+            } else {
+                phone_npu_compute_waiters.fetch_add(
+                    1, std::memory_order_acq_rel);
+            }
+        }
+        auto htp_guards = npu_task ?
+            phone_npu_lock_sessions(compute_sessions) :
+            std::vector<std::unique_lock<std::mutex>> {};
+        if (npu_task) {
+            if (phone_npu_split_session_locks()) {
+                for (const size_t index : compute_sessions) {
+                    phone_npu_waiters_for_session(index).fetch_sub(
+                        1, std::memory_order_acq_rel);
+                }
+            } else {
+                phone_npu_compute_waiters.fetch_sub(
+                    1, std::memory_order_acq_rel);
+            }
         }
         const double htp_lock_wait_ms =
             (ggml_time_us() - htp_lock_begin_us) / 1000.0;
