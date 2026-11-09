@@ -114,27 +114,41 @@ FIELDS = [
 NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
 
 
-# Phone-owned Qwen3 HTP Plans are opt-in only for native G/C/N/A automatic
-# selection. Forced legacy G/C/P A/B has no model-owned NPU Region map; never
-# let an inherited experimental flag register an empty/stale Phone Plan.
+# Phone NPU Region ownership comes from an explicit forced P selection or
+# from the native GCNA model Plan, never from inherited experimental flags.
 _PHONE_PLAN_MODE_KEYS = (
     "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS",
     "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP",
     "LLAMA_REGION_RING_PHONE_GRAPHLESS",
     "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW",
+    "LLAMA_REGION_RING_FORCE_NPU_REGIONS",
+    "LLAMA_REGION_RING_FORCE_NPU_POLICY",
 )
 
 
-def configure_phone_plan_environment(env, v2_csv, force_layout):
-    """Reset Plan ownership, then enable it only for native automatic GCNA."""
+def validate_force_npu_regions(spec: str) -> str:
+    """Accept only unique, zero-based physical Region IDs in [0,63]."""
+    parts = spec.split(",")
+    if not parts or any(re.fullmatch(r"[0-9]+", x) is None for x in parts):
+        raise ValueError("INVALID_FORCE_NPU_REGIONS: expected 0..63 comma-separated IDs")
+    ids = [int(x) for x in parts]
+    if any(x > 63 for x in ids) or len(set(ids)) != len(ids):
+        raise ValueError("INVALID_FORCE_NPU_REGIONS: duplicates or IDs >63")
+    return ",".join(str(x) for x in ids)
+
+
+def configure_phone_plan_environment(
+        env, v2_csv, force_layout, force_npu_regions="", force_npu_policy="resident"):
+    """Enable Phone-owned HTP only when its model-owned Region map is known."""
     for key in _PHONE_PLAN_MODE_KEYS:
         env.pop(key, None)
-    if v2_csv is None or force_layout:
+    if force_npu_regions and not force_layout:
+        raise ValueError("FORCE_NPU_REQUIRES_FORCE_LAYOUT")
+    if not force_npu_regions and (v2_csv is None or force_layout):
         return False
     env.update({
-        "LLAMA_REGION_RING_V2_PROFILE_CSV": str(v2_csv),
-        # The model-owned Plan supplies NPU Region IDs over RPC.
-        "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP": "0",
+        "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP":
+            "1" if force_npu_regions else "0",
         "LLAMA_REGION_RING_PHONE_GRAPHLESS": "0",
         "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW": "1",
         "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES": "1",
@@ -146,8 +160,12 @@ def configure_phone_plan_environment(env, v2_csv, force_layout):
         "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM": "1",
         "LLAMA_REGION_RING_PHONE_ASYNC_GRAPH_SETUP": "0",
     })
+    if force_npu_regions:
+        env["LLAMA_REGION_RING_FORCE_NPU_REGIONS"] = force_npu_regions
+        env["LLAMA_REGION_RING_FORCE_NPU_POLICY"] = force_npu_policy
+    else:
+        env["LLAMA_REGION_RING_V2_PROFILE_CSV"] = str(v2_csv)
     return True
-
 
 
 def profile_kv_anchors(prompt_hint: int) -> tuple[int, ...]:
@@ -669,6 +687,13 @@ def main():
     ap.add_argument("--min-context", type=int, default=1024)
     ap.add_argument("--context-padding", type=int, default=256)
     ap.add_argument("--force-layout", default="")
+    ap.add_argument("--force-npu-regions", default=os.environ.get(
+        "LLAMA_REGION_RING_FORCE_NPU_REGIONS", ""),
+                    help="zero-based P Region IDs sent to HTP, e.g. 1,3,5,7")
+    ap.add_argument("--force-npu-policy",
+                    choices=("resident", "streaming-2bank"),
+                    default=os.environ.get(
+                        "LLAMA_REGION_RING_FORCE_NPU_POLICY", "resident"))
     ap.add_argument("--force-xc", type=int)
     ap.add_argument("--force-xg", type=int)
     ap.add_argument("--force-xp", type=int)
@@ -701,6 +726,14 @@ def main():
         ap.error("--baseline-chunk-tokens must be positive")
     if args.force_layout and None in (args.force_xc, args.force_xg, args.force_xp):
         ap.error("--force-layout requires all three --force-xc/xg/xp arguments")
+    if args.force_npu_regions:
+        if args.planner != "apply-wide" or not args.force_layout:
+            ap.error("--force-npu-regions requires --planner apply-wide and --force-layout")
+        try:
+            args.force_npu_regions = validate_force_npu_regions(
+                args.force_npu_regions)
+        except ValueError as exc:
+            ap.error(str(exc))
     prompts = []
     for path in args.prompt_dir.iterdir():
         m = NAME.fullmatch(path.name)
@@ -807,8 +840,9 @@ def main():
             env["LLAMA_REGION_RING_PROFILE_CACHE_PATH"] = str(profile_cache)
             env["LLAMA_REGION_RING_PROFILE_FORCE"] = (
                 "1" if args.force_profile and prompt_index == 0 else "0")
-        native_phone_plan = configure_phone_plan_environment(
-            env, v2_csv, bool(args.force_layout))
+        phone_owned_npu_plan = configure_phone_plan_environment(
+            env, v2_csv, bool(args.force_layout),
+            args.force_npu_regions, args.force_npu_policy)
         if env.get("LLAMA_REGION_RING_PHONE_COPY_TRACE") == "1":
             # One opt-in switch collects both the per-copy detail and the
             # reference split breakdown for coverage reconciliation.
@@ -840,13 +874,19 @@ def main():
             "profile_cache_file": str(profile_cache) if profile_cache else None,
             "native_v2_profile_csv": str(v2_csv) if v2_csv else None,
             "force_profile": bool(args.force_profile and prompt_index == 0),
-            "native_gcna_phone_plan": native_phone_plan,
+            "phone_owned_npu_plan": phone_owned_npu_plan,
+            "force_npu_regions": args.force_npu_regions,
+            "force_npu_policy": args.force_npu_policy if args.force_npu_regions else None,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
                                           "LLAMA_REGION_RING_PROFILE_CACHE_PATH",
                                           "LLAMA_REGION_RING_PROFILE_FORCE",
                                           "LLAMA_REGION_RING_V2_PROFILE_CSV",
+                                          "LLAMA_REGION_RING_FORCE_NPU_REGIONS",
+                                          "LLAMA_REGION_RING_FORCE_NPU_POLICY",
+                                          "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW",
+                                          "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP",
                                           "LLAMA_REGION_RING_TASK_TRACE",
                                           "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
                                           "LLAMA_REGION_RING_PHONE_AUTONOMOUS",
