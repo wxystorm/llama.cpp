@@ -5861,47 +5861,59 @@ public:
                 throw std::runtime_error(
                     "Serial NPU requires the visible backend to be GPUOpenCL");
             }
-            ggml_backend_dev_t htp = nullptr;
+            // GGML_HEXAGON_NDEV selects independent FastRPC sessions.
+            // Keep one RPC-visible GPUOpenCL backend and serial HTP compute.
 #if defined(GGML_RPC_WITH_HEXAGON)
-            // ggml-rpc is linked only with ggml-base; the global device
-            // registry ggml_backend_dev_by_name() lives in libggml.so.
-            // Query the explicitly linked Hexagon registry instead, avoiding
-            // a circular ggml <-> ggml-rpc link dependency.
             if (ggml_backend_reg_t hexagon_reg =
                     ggml_backend_hexagon_reg()) {
-                const size_t n_htp =
+                const size_t count =
                     ggml_backend_reg_dev_count(hexagon_reg);
-                for (size_t i = 0; i < n_htp; ++i) {
-                    ggml_backend_dev_t candidate =
+                for (size_t i = 0; i < count; ++i) {
+                    ggml_backend_dev_t dev =
                         ggml_backend_reg_dev_get(hexagon_reg, i);
-                    const char * name =
-                        ggml_backend_dev_name(candidate);
-                    if (name != nullptr &&
-                            std::strcmp(name, "HTP0") == 0) {
-                        htp = candidate;
-                        break;
+                    const char * name = dev ?
+                        ggml_backend_dev_name(dev) : nullptr;
+                    if (!name || std::strncmp(name, "HTP", 3) != 0) {
+                        throw std::runtime_error(
+                            "Requested HTP FastRPC session unavailable");
                     }
+                    ggml_backend_ptr backend(
+                        ggml_backend_dev_init(dev, nullptr));
+                    if (!backend) {
+                        throw std::runtime_error(
+                            std::string("Cannot initialize ") + name);
+                    }
+                    auto executor = std::make_unique<
+                        ggml_phone_npu_serial::full_region_executor>(
+                            backend.get());
+                    phone_npu_names.emplace_back(name);
+                    phone_npu_executors.emplace_back(std::move(executor));
+                    phone_npu_backends.emplace_back(std::move(backend));
+                    GGML_LOG_INFO(
+                        "[PHONE_NPU_SESSION] event=INIT index=%zu"
+                        " device=%s status=READY\n", i, name);
                 }
             }
 #endif
-            if (htp == nullptr) {
+            if (phone_npu_executors.empty()) {
                 throw std::runtime_error(
-                    "Serial NPU requested but HTP0 is not available "
-                    "(requires Android build with GGML_HEXAGON=ON)");
+                    "Serial NPU requires available Hexagon HTP sessions");
             }
-            phone_npu_backend.reset(
-                ggml_backend_dev_init(htp, nullptr));
-            if (!phone_npu_backend) {
-                throw std::runtime_error(
-                    "Failed to initialize private HTP0 backend");
+            size_t rank = 0;
+            for (uint32_t region : phone_npu_serial_regions) {
+                const size_t index =
+                    rank++ % phone_npu_executors.size();
+                phone_npu_region_session.emplace(region, index);
+                GGML_LOG_INFO(
+                    "[PHONE_NPU_SESSION] event=ASSIGN_REGION region=%u"
+                    " session=%zu backend=%s policy=SERIAL_ROUND_ROBIN"
+                    " status=READY\n", region, index,
+                    phone_npu_names[index].c_str());
             }
-            phone_npu_executor = std::make_unique<
-                ggml_phone_npu_serial::full_region_executor>(
-                    phone_npu_backend.get());
             GGML_LOG_INFO(
-                "[PHONE_NPU_SERIAL] event=BACKEND_INIT device=HTP0 "
-                "region_count=%zu policy=SERIAL_FULL_REGION "
-                "rpc_visible=GPUOpenCL status=READY\n",
+                "[PHONE_NPU_SERIAL] event=BACKEND_INIT sessions=%zu"
+                " regions=%zu rpc_visible=GPUOpenCL status=READY\n",
+                phone_npu_executors.size(),
                 phone_npu_serial_regions.size());
 
             // Optional model-load-time HTP residency. The Phone -m GGUF
@@ -5923,7 +5935,7 @@ public:
                 GGML_LOG_INFO(
                     "[PHONE_NPU_SERIAL] event=MODEL_LOAD_START "
                     "layers=%zu source=%s model_equivalence=UNVERIFIED "
-                    "backend=HTP0\n",
+                    "backend=HTP_POOL\n",
                     model_layers.size(),
                     local_tensor_source.get_info != nullptr &&
                         local_tensor_source.read != nullptr ?
@@ -5931,12 +5943,21 @@ public:
                 const int64_t model_begin_us = ggml_time_us();
                 size_t layers_ok = 0;
                 size_t resident_bytes = 0;
+                size_t layer_rank = 0;
+                const bool rank_aligned =
+                    model_layers.size() == phone_npu_serial_regions.size();
                 for (uint32_t layer : model_layers) {
+                    // Existing explicit layer list is sorted and normally
+                    // corresponds one-to-one with sorted NPU Regions.
+                    const size_t session = rank_aligned ?
+                        layer_rank++ % phone_npu_executors.size() : 0;
+                    phone_npu_layer_session.emplace(layer, session);
+                    auto * executor = phone_npu_executors[session].get();
                     ggml_phone_npu_serial::full_region_executor::
                         model_load_stats stats {};
                     std::string why;
                     const int64_t layer_begin_us = ggml_time_us();
-                    const bool ok = phone_npu_executor->load_model_layer(
+                    const bool ok = executor->load_model_layer(
                         local_tensor_source, layer, why, stats);
                     const double wall_ms =
                         (ggml_time_us() - layer_begin_us) / 1000.0;
@@ -5946,10 +5967,11 @@ public:
                     }
                     GGML_LOG_INFO(
                         "[PHONE_NPU_SERIAL] event=MODEL_LOAD_LAYER "
-                        "layer=%u backend=HTP0 weights=%zu "
+                        "layer=%u backend=%s weights=%zu "
                         "source_bytes=%zu read_ms=%.3f repack_ms=%.3f "
                         "wall_ms=%.3f status=%s reason=%s\n",
-                        layer, stats.new_weights, stats.new_bytes,
+                        layer, phone_npu_names[session].c_str(),
+                        stats.new_weights, stats.new_bytes,
                         stats.file_read_ms, stats.htp_repack_ms,
                         wall_ms, ok ? "PASS" : "FALLBACK",
                         ok ? "NONE" : why.c_str());
@@ -5960,7 +5982,13 @@ public:
                     "resident_weights=%zu source_bytes=%zu "
                     "wall_ms=%.3f status=%s\n",
                     model_layers.size(), layers_ok,
-                    phone_npu_executor->model_resident_weights(),
+                    [&]() {
+                        size_t count = 0;
+                        for (const auto & executor : phone_npu_executors) {
+                            count += executor->model_resident_weights();
+                        }
+                        return count;
+                    }(),
                     resident_bytes,
                     (ggml_time_us() - model_begin_us) / 1000.0,
                     layers_ok == model_layers.size() ?
@@ -6299,15 +6327,39 @@ private:
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
 
-    // One private HTP backend and one phone-owned compute thread. Explicit
-    // regions are evaluated on HTP instead of GPU, never concurrently.
+    // Sessions have independent HTP address spaces but share physical RAM.
+    // Compute stays serial; do not treat summed virtual mappings as RAM.
     std::set<uint32_t> phone_npu_serial_regions;
     std::unordered_map<uint32_t, int> phone_npu_region_layer;
-    // Immutable shadow plans, guarded by graph_compute_mutex.
+    std::unordered_map<uint32_t, size_t> phone_npu_region_session;
+    std::unordered_map<uint32_t, size_t> phone_npu_layer_session;
     ggml_phone_owned::registry phone_owned_plans;
-    ggml_backend_ptr phone_npu_backend;
-    std::unique_ptr<ggml_phone_npu_serial::full_region_executor>
-        phone_npu_executor;
+    std::vector<ggml_backend_ptr> phone_npu_backends;
+    std::vector<std::unique_ptr<ggml_phone_npu_serial::full_region_executor>>
+        phone_npu_executors;
+    std::vector<std::string> phone_npu_names;
+
+    ggml_phone_npu_serial::full_region_executor *
+    phone_npu_executor_for_region(uint32_t region) const {
+        const auto it = phone_npu_region_session.find(region);
+        if (it == phone_npu_region_session.end() ||
+                it->second >= phone_npu_executors.size()) {
+            return nullptr;
+        }
+        return phone_npu_executors[it->second].get();
+    }
+    const char * phone_npu_name_for_region(uint32_t region) const {
+        const auto it = phone_npu_region_session.find(region);
+        return it == phone_npu_region_session.end() ||
+                it->second >= phone_npu_names.size() ?
+            "HTP_UNAVAILABLE" : phone_npu_names[it->second].c_str();
+    }
+    bool phone_npu_has_registered_chunk(uint64_t uid) const {
+        for (const auto & executor : phone_npu_executors) {
+            if (executor->has_registered_chunk(uid)) { return true; }
+        }
+        return false;
+    }
     bool phone_npu_async_preload = false;
     // The async preloader never takes graph_compute_mutex during REPACK,
     // so PC graph/task registration cannot be serialized behind ~2s of
