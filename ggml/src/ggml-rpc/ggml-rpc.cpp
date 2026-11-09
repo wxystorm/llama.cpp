@@ -7309,6 +7309,13 @@ bool rpc_server::phone_input_stream_run(
                     owned_bytes += bytes;
                     owned_regions += regions;
                 }
+                // Idle HTP sessions legitimately report zero owned
+                // Regions. Reject only if *no* Session has written back KV
+                // for a run that registered an owned Plan.
+                if (synced && owned_regions == 0) {
+                    synced = false;
+                    owned_reason = "PHONE_LOCAL_KV_NO_REGIONS";
+                }
                 if (synced && !backends.empty()) {
                     ggml_backend_synchronize(backends[0]);
                 }
