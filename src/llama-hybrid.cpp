@@ -10211,6 +10211,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 const long double fraction[] = {
                     0.85L, 0.90L, 0.90L};
                 for (size_t i = 0; i < 3; ++i) {
+                    // The old G/C/P prefilter assumes every Phone weight
+                    // stays resident. Native N/A placement instead uses two
+                    // rotating HTP Banks plus Adreno resident allocations,
+                    // checked exactly by phone_stage_allocation in the final
+                    // shortlist. Do not discard that valid banked option
+                    // using the old all-P-resident estimate.
+                    if (i == (size_t) llama_region_ring_device::PHONE &&
+                            model.phone_stage_allocation) {
+                        continue;
+                    }
                     if (free_bytes[i] != 0 &&
                             usage[i] >
                                 (long double) free_bytes[i] *
