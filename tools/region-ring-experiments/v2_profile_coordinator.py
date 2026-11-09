@@ -34,7 +34,10 @@ def select_profile_dir(root: Path, model: Path, model_hash: str,
 
 
 def validated_profile(directory: Path, model_sha: str,
-                      pc_id: str, profiler_sha: str) -> tuple[bool, str]:
+                      pc_id: str, profiler_sha: str,
+                      *, required_chunks: tuple[int, ...] = (32, 64, 96, 128),
+                      required_kvs: tuple[int, ...] = (512, 1024)
+                      ) -> tuple[bool, str]:
     path = directory / "profile.json"
     csv_path = directory / "stage-profile-v2.csv"
     if not path.is_file() or not csv_path.is_file():
@@ -120,6 +123,26 @@ def validated_profile(directory: Path, model_sha: str,
         return False, "NATIVE_PROFILE_SHAPES_UNREADABLE"
     if manifest_shapes != csv_shapes:
         return False, "NATIVE_PASS_CSV_MANIFEST_MISMATCH"
+    # The original apply-wide coarse and full-DAG phases can select any
+    # supported chunk/KV combination. A single N1/A1 sample is NOT enough
+    # to declare the cached matrix ready: the rest of the shapes must be
+    # measured or the coordinator must resume their independent probes.
+    # Only correctness-qualified NPU PASS samples appear in csv_shapes.
+    # N2/N4 are optional until production can execute whole multi-layer
+    # HTP Regions. Do not require their known PARITY_FAIL shapes.
+    required_depths = {"G": 2, "C": 2, "N": 1, "A": 1}
+    if not required_chunks or not required_kvs or any(
+            type(x) is not int or x < 1 for x in
+            (*required_chunks, *required_kvs)):
+        return False, "INVALID_REQUIRED_PROFILE_GRID"
+    for backend, depth in required_depths.items():
+        for chunk in required_chunks:
+            for kv in required_kvs:
+                if kv < chunk:
+                    continue
+                if (backend, depth, chunk, kv) not in manifest_shapes:
+                    return False, (
+                        f"INCOMPLETE_{backend}{depth}_X{chunk}_KV{kv}")
     return True, "VERIFIED"
 
 
