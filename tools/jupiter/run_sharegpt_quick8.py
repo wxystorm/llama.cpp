@@ -23,6 +23,15 @@ from jupiter_memory_partition import (
 
 GROUPS = (128, 256, 512, 1024)
 
+# Memory estimates and measured free RAM can change between invocations.
+# Those values affect only placement feasibility, not the experiment once the
+# original CPU/GPU/Phone split has been pinned.
+MEMORY_ONLY_FIELDS = frozenset({
+    "cpu_reserve_mib", "pc_reserve_mib", "phone_reserve_mib",
+    "cpu_workspace_mib", "gpu_workspace_mib", "phone_workspace_mib",
+    "memory_safety_percent", "kv_bytes_per_element", "kv_per_layer_mib",
+})
+
 
 def file_sha256(path: Path) -> str:
     hasher = hashlib.sha256()
@@ -154,6 +163,75 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
     }
 
 
+def resume_saved_split(out: Path, picked: list[dict],
+                       args: argparse.Namespace) -> tuple[tuple[int, int], dict] | None:
+    """Pin the original layer split when the same experiment is resumed.
+
+    Never silently mix measurements from different splits. Only memory
+    estimates/reserves may change; runtime, model, prompts and RPC must match.
+    The fixed saved split is checked against CURRENT device memory separately.
+    """
+    manifest = out / "quick8-config.json"
+    if not manifest.is_file():
+        return None
+    try:
+        saved = json.loads(manifest.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError(f"cannot parse existing {manifest}: {exc}") from exc
+    if not isinstance(saved, dict) or not isinstance(saved.get("execution"), dict):
+        raise ValueError(f"invalid saved quick8 configuration: {manifest}")
+    original = saved["execution"]
+    cpu_layers = original.get("cpu_layers")
+    pc_layers = original.get("pc_layers")
+    if (type(cpu_layers) is not int or type(pc_layers) is not int
+            or not 0 <= cpu_layers < pc_layers):
+        raise ValueError(f"missing or invalid saved CPU/PC split: {manifest}")
+    if args.pc_layers is not None and args.pc_layers != pc_layers:
+        raise ValueError(
+            f"saved PC boundary is {pc_layers}, but --pc-layers={args.pc_layers}; "
+            "keep the original split to resume or use a new output directory"
+        )
+
+    candidate_args = argparse.Namespace(**vars(args))
+    candidate_args.pc_layers = pc_layers
+    candidate_args.cpu_layers = cpu_layers
+    candidate = make_identity(candidate_args, picked)
+    if saved.get("version") != candidate["version"] or saved.get("selection") != candidate["selection"]:
+        raise ValueError(
+            "saved prompt selection, checksums or manifest version changed; "
+            f"cannot safely resume {manifest}"
+        )
+    # New run options which affect actual measurements are never ignored.
+    # Missing/extra keys also count as a mismatch.
+    changed = [
+        key for key in sorted(set(original) | set(candidate["execution"]))
+        if key not in MEMORY_ONLY_FIELDS
+        and original.get(key) != candidate["execution"].get(key)
+    ]
+    if changed:
+        detail = ", ".join(
+            f"{key} (saved={original.get(key)!r}, requested="
+            f"{candidate['execution'].get(key)!r})"
+            for key in changed[:5]
+        )
+        raise ValueError(
+            f"cannot resume {manifest}: experiment settings differ: {detail}. "
+            "Restore the original runtime options or use a new --out-dir"
+        )
+    memory_changed = [
+        key for key in sorted(MEMORY_ONLY_FIELDS)
+        if original.get(key) != candidate["execution"].get(key)
+    ]
+    print(
+        "[JUPITER_QUICK8_RESUME] action=PIN_SAVED_SPLIT "
+        f"PC_CPU={cpu_layers} pc_boundary={pc_layers} "
+        f"memory_budget_settings_changed={','.join(memory_changed) or 'NONE'} "
+        "note=VALIDATE_AGAINST_CURRENT_FREE_MEMORY",
+        flush=True,
+    )
+    return (cpu_layers, pc_layers), saved
+
+
 def prepare_sample(out: Path, picked: list[dict],
                    identity: dict | None) -> Path:
     manifest = out / "quick8-config.json"
@@ -191,8 +269,9 @@ def prepare_sample(out: Path, picked: list[dict],
     return prompt_dir
 
 
-def choose_layers_by_memory(args: argparse.Namespace):
-    """Read free device memory; pick a contiguous boundary before any model run."""
+def choose_layers_by_memory(args: argparse.Namespace,
+                            pinned_split: tuple[int, int] | None = None):
+    """Read current memory and validate original split or choose a new one."""
     weights = read_gguf_weights(Path(args.model).resolve())
     pc = (pc_gpu_memory() if args.pc_free_mib is None else
           DeviceMemory(args.pc_free_mib*MIB, args.pc_free_mib*MIB))
@@ -205,7 +284,8 @@ def choose_layers_by_memory(args: argparse.Namespace):
         weights, pc, phone,
         pc_reserve_mib=args.pc_reserve_mib,
         phone_reserve_mib=args.phone_reserve_mib,
-        pc_layers_override=args.pc_layers,
+        pc_layers_override=(pinned_split[1] if pinned_split else args.pc_layers),
+        cpu_layers_override=(pinned_split[0] if pinned_split else None),
         cpu=cpu,
         cpu_reserve_mib=args.cpu_reserve_mib,
         context=args.context,
@@ -246,7 +326,7 @@ def choose_layers_by_memory(args: argparse.Namespace):
         f"gpu_workspace_mib={plan.pc_workspace_bytes/MIB:.0f} "
         f"phone_workspace_mib={plan.phone_workspace_bytes/MIB:.0f} "
         f"safety_percent={args.memory_safety_percent:.1f} "
-        f"mode={'OVERRIDE_CHECKED' if args.pc_layers is not None else 'AUTO_BY_MEMORY'}",
+        f"mode={'RESUME_PINNED' if pinned_split else ('OVERRIDE_CHECKED' if args.pc_layers is not None else 'AUTO_BY_MEMORY')}",
         flush=True,
     )
     for name, free, weights_size, kv, workspace, reserve, safety in (
@@ -413,7 +493,24 @@ def main() -> int:
         raise ValueError(f"--model not found: {args.model}")
     if not args.memory_check_only and not Path(args.exe).is_file():
         raise ValueError(f"--exe not found: {args.exe}")
-    memory_plan = choose_layers_by_memory(args)
+    pinned = None
+    saved_identity = None
+    if not args.memory_check_only:
+        resume = resume_saved_split(out, picked, args)
+        if resume is not None:
+            pinned, saved_identity = resume
+    try:
+        memory_plan = choose_layers_by_memory(args, pinned_split=pinned)
+    except ValueError as exc:
+        if pinned is not None:
+            raise ValueError(
+                f"saved CPU={pinned[0]}, PC boundary={pinned[1]} is not "
+                f"feasible with current memory estimates: {exc}. "
+                "Free RAM/VRAM or adjust only memory reserve/workspace "
+                "flags to revalidate this exact split; never delete "
+                "quick8-config.json to bypass the check."
+            ) from exc
+        raise
     if args.memory_check_only:
         print("[JUPITER_MEMORY_CHECK] status=FEASIBLE "
               "note=WEIGHT_ESTIMATE_NOT_RUNTIME_GUARANTEE", flush=True)
@@ -422,7 +519,11 @@ def main() -> int:
     # A changed boundary must not silently reuse measurements from old runs.
     args.pc_layers = memory_plan.pc_layers
     args.cpu_layers = memory_plan.cpu_layers
-    prompt_dir = prepare_sample(out, picked, make_identity(args, picked))
+    prompt_dir = prepare_sample(
+        out, picked,
+        saved_identity if saved_identity is not None
+        else make_identity(args, picked),
+    )
     save_layer_plan(out, memory_plan)
     print(f"[JUPITER_QUICK8_SAMPLE] path={prompt_dir} files={len(picked)}", flush=True)
     cmd = build_command(args, prompt_dir, out)
