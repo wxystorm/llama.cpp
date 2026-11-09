@@ -6334,6 +6334,10 @@ private:
     std::unordered_map<uint32_t, size_t> phone_npu_region_session;
     std::unordered_map<uint32_t, size_t> phone_npu_layer_session;
     ggml_phone_owned::registry phone_owned_plans;
+    // Canonical PC KV must be bound for EVERY internal NPU layer before
+    // any task in a continuous multi-layer Region is admitted.
+    std::map<std::pair<uint64_t, uint32_t>, std::set<uint32_t>>
+        phone_owned_kv_bound_layers;
     std::vector<ggml_backend_ptr> phone_npu_backends;
     std::vector<std::unique_ptr<ggml_phone_npu_serial::full_region_executor>>
         phone_npu_executors;
@@ -7444,6 +7448,14 @@ bool rpc_server::phone_input_stream_run(
         {
             std::lock_guard<std::recursive_mutex> lock(graph_compute_mutex);
             phone_owned_plans.erase_run(request.run_id);
+            for (auto it = phone_owned_kv_bound_layers.begin();
+                    it != phone_owned_kv_bound_layers.end();) {
+                if (it->first.first == request.run_id) {
+                    it = phone_owned_kv_bound_layers.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         phone_auto_cv.notify_all();
         if (auto_jobs_total > 0) {
@@ -7766,7 +7778,9 @@ bool rpc_server::phone_owned_kv_bind(
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     const auto * plan = phone_owned_plans.find(
         request.run_id, request.region);
-    if (!plan || plan->layer != request.layer ||
+    if (!plan || request.layer < plan->layer ||
+            request.layer - plan->layer >=
+                ggml_phone_owned::layer_count(*plan) ||
             plan->total_tokens != request.total_tokens ||
             !ggml_phone_npu_serial::htp_region(
                 phone_npu_serial_regions, request.region) ||
@@ -7819,10 +7833,28 @@ bool rpc_server::phone_owned_kv_bind(
         return reject("CANONICAL_KV_NATIVE_TENSOR");
     }
     std::string why;
+    const uint32_t child_region =
+        ggml_phone_owned::internal_layer_region(
+            *plan, request.layer - plan->layer);
     if (!phone_npu_executor->bind_owned_decode_kv_storage(
-            request.run_id, request.region, request.layer,
+            request.run_id, child_region, request.layer,
             std::move(canonical_ctx), k, v, true, why)) {
         return reject(why.c_str());
+    }
+    auto & bound_layers = phone_owned_kv_bound_layers[
+        {request.run_id, request.region}];
+    if (!bound_layers.insert(request.layer).second) {
+        return reject("DUPLICATE_CANONICAL_KV_LAYER");
+    }
+    if (bound_layers.size() <
+            ggml_phone_owned::layer_count(*plan)) {
+        GGML_LOG_INFO(
+            "[PHONE_OWNED_KV] event=PARTIAL_BIND run=%" PRIu64
+            " region=%u layer=%u bound=%zu required=%u"
+            " status=WAITING\n",
+            request.run_id, request.region, request.layer,
+            bound_layers.size(), ggml_phone_owned::layer_count(*plan));
+        return true;
     }
     // Every task is registered before PC launches PUSH. Per-region FIFO,
     // 128 MiB host budget and P2C Arena backpressure stay unchanged.
@@ -7863,10 +7895,11 @@ bool rpc_server::phone_owned_kv_bind(
     phone_auto_cv.notify_all();
     GGML_LOG_INFO(
         "[PHONE_OWNED_KV] event=BIND run=%" PRIu64
-        " region=%u layer=%u chunks=%zu"
+        " region=%u layer=%u layers=%zu chunks=%zu"
         " slots=PC_VERIFIED_IDENTITY graph_register=SKIPPED"
         " task_register=PHONE_OWNED status=PASS\n",
-        request.run_id, request.region, request.layer, added);
+        request.run_id, request.region, request.layer,
+        bound_layers.size(), added);
     return true;
 }
 
