@@ -5942,6 +5942,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
                 if (valid && (phone_graphless || phone_mixed_requested)) {
+                    for (uint32_t bound_layer = plan.layer;
+                            valid && bound_layer < plan.layer_end;
+                            ++bound_layer) {
+                    const uint32_t layer = bound_layer;
                     // Cache storage belongs to the *Meta* outer buffer in
                     // this layout (Meta(CPU,RPC0)). The RPC client cannot
                     // serialize that outer buffer: it must receive the
@@ -6005,7 +6009,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         " k_ne=[%" PRId64 ",%" PRId64 "]"
                         " v_ne=[%" PRId64 ",%" PRId64 "]"
                         " status=%s\n",
-                        plan.run_id, plan.region, plan.layer,
+                        plan.run_id, plan.region, layer,
                         type_name(outer_k), type_name(outer_v),
                         type_name(canonical_k), type_name(canonical_v),
                         child_index, owner_meta != nullptr ? 1 : 0,
@@ -6018,15 +6022,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     valid = valid && canonical_k != nullptr &&
                         canonical_v != nullptr &&
                         bind_kv(phone_rpc_backend, plan.run_id,
-                                plan.region, plan.layer, plan.total_tokens,
+                                plan.region, layer, plan.total_tokens,
                                 canonical_k, canonical_v, true);
                     LLAMA_LOG_INFO(
                         "[PHONE_OWNED_KV] side=pc event=BIND"
                         " run=%" PRIu64 " region=%u layer=%u"
                         " slots=PC_VERIFIED_IDENTITY"
                         " graph_register=SKIPPED status=%s\n",
-                        plan.run_id, plan.region, plan.layer,
+                        plan.run_id, plan.region, layer,
                         valid ? "PASS" : "FAIL");
+                    }
                 }
                 if (valid) { ++published; }
             }
