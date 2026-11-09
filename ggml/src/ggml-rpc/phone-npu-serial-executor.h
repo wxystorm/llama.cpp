@@ -980,6 +980,16 @@ public:
             reason = "PHONE_OWNED_HTP_KV_ALLOC";
             return false;
         }
+        const size_t kv_bytes =
+            ggml_backend_buffer_get_size(kv->buffer.get());
+        if (!within_total_npu_budget(kv_bytes)) {
+            reason = "NPU_TOTAL_3072_MIB_EXCEEDED_KV";
+            return false;
+        }
+        if (!within_npu_region_budget(plan.region, kv_bytes)) {
+            reason = "NPU_STAGE_1536_MIB_EXCEEDED_KV";
+            return false;
+        }
         ggml_backend_buffer_clear(kv->buffer.get(), 0);
         owned_kv_.emplace(key, std::move(kv));
         reason.clear();
@@ -1119,6 +1129,33 @@ public:
                 item->ctx.get(), backend_));
             if (!item->buffer) {
                 reason = "PHONE_OWNED_HTP_GRAPH_ALLOC";
+                break;
+            }
+            // A prebuilt Chunk Graph has real, persistent HTP activation
+            // storage. Account for all previous Chunks of this Region
+            // and all other Regions before compiling another graph.
+            size_t pending_bytes = 0;
+            for (const auto & existing : pending) {
+                const size_t n = ggml_backend_buffer_get_size(
+                    existing->buffer.get());
+                if (n > SIZE_MAX - pending_bytes) {
+                    reason = "NPU_PENDING_GRAPH_MEMORY_OVERFLOW";
+                    break;
+                }
+                pending_bytes += n;
+            }
+            if (!reason.empty()) { break; }
+            const size_t current_bytes =
+                ggml_backend_buffer_get_size(item->buffer.get());
+            if (current_bytes > SIZE_MAX - pending_bytes ||
+                    !within_total_npu_budget(
+                        pending_bytes + current_bytes)) {
+                reason = "NPU_TOTAL_3072_MIB_EXCEEDED_GRAPH";
+                break;
+            }
+            if (!within_npu_region_budget(
+                    plan.region, pending_bytes + current_bytes)) {
+                reason = "NPU_STAGE_1536_MIB_EXCEEDED_GRAPH";
                 break;
             }
             bool side_ready = true;
@@ -2514,6 +2551,15 @@ public:
             next->buffer.reset(ggml_backend_buft_alloc_buffer(buft, capacity));
             if (!next->buffer) {
                 reason = "HTP_FIXED_ARENA_ALLOC_FAILED";
+                return false;
+            }
+            // The extra fixed-Graph allocation is also part of the NPU
+            // memory footprint, even though it is not a weight Bank.
+            if (has_any_weight_plan() &&
+                    !within_total_npu_budget(
+                        ggml_backend_buffer_get_size(
+                            next->buffer.get()))) {
+                reason = "NPU_TOTAL_3072_MIB_EXCEEDED_FIXED_ARENA";
                 return false;
             }
             next->capacity = capacity;
