@@ -10397,12 +10397,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "reason=%s path=%s\n", why.c_str(), path);
                 return false;
             }
+            // Adreno is optional: valid all-HTP Phone layouts need only
+            // correctness-qualified N1 timing and the shared RAM budget.
+            // A1 is still required by adreno_ok before allocating any A.
             if (!native->has_shape('N', 1) ||
-                    !native->has_shape('A', 1) ||
                     profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_NATIVE_PROFILE] status=REJECT "
-                    "reason=N1_A1_OR_PHONE_MEMORY_MISSING\n");
+                    "reason=N1_OR_PHONE_MEMORY_MISSING\n");
                 return false;
             }
             const auto compute =
@@ -10552,11 +10554,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                     a_ws = std::max(a_ws, ws);
                                 }
                             }
-                            // Runtime requires at least one Adreno Region,
-                            // at least two NPU Regions, and two HTP Banks.
-                            if (phone_stages <= npu_ids.size()) {
-                                return false;
-                            }
+                            // Runtime needs at least two HTP Regions and
+                            // two physical Banks. An Adreno Region is
+                            // optional: a verified all-HTP layout is legal.
+                            // The count guard above still rejects N<2.
                             llama_ring_planner::phone_spill_memory mem;
                             const auto weight = [native](
                                     char dev, int b, int e,
@@ -10598,7 +10599,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_NATIVE_PROFILE] status=LOADED "
                 "points=%zu source=ISOLATED_GCNA_PASSONLY "
-                "npu=PRIORITY adreno=SUFFIX max_htp_region_layers=1 "
+                "npu=PRIORITY adreno=OPTIONAL_SUFFIX max_htp_region_layers=1 "
                 "bank=DUAL_REFILL path=%s\n", native->size(), path);
         }
     }
