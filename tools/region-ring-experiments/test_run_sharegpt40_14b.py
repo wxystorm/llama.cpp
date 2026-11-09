@@ -1,6 +1,7 @@
 import csv
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -28,6 +29,12 @@ class RunnerTests(unittest.TestCase):
         self.prompts = self.root/'sharegpt40'; self.prompts.mkdir()
         for p in ['prompt_128_01.txt', 'prompt_128_02.txt', 'prompt_512_01.txt','prompt_1024_02.txt']:
             (self.prompts/p).write_text('hello '+p)
+        (self.prompts/'manifest.csv').write_text(
+            'file,length_bin,sample_in_bin,actual_tokens\n'
+            'prompt_128_01.txt,128-255,1,167\n'
+            'prompt_128_02.txt,128-255,2,171\n'
+            'prompt_512_01.txt,512-1024,1,587\n'
+            'prompt_1024_02.txt,1024-2000,2,1500\n')
         self.out = self.root/'results'
         self.base = ['--exe', str(self.exe), '--model', str(self.model), '--rpc', 'local:50052',
                      '--prompt-dir', str(self.prompts), '--out', str(self.out), '--delay', '0', '--fixed-chunks']
@@ -122,9 +129,45 @@ class RunnerTests(unittest.TestCase):
             mod.main(self.base+['--context','3072'])
         self.assertEqual(len(FakePopen.calls),1)
 
+
+    def test_model_tokenizer_cache_and_invalidation(self):
+        tokenizer = self.root / 'llama-tokenize.exe'
+        tokenizer.touch()
+        options = SimpleNamespace(
+            tokenizer_exe=tokenizer,
+            model=self.model,
+            out=self.out,
+            root=self.root,
+            update_tokens=False,
+        )
+        self.out.mkdir()
+        prompts = [(128, self.prompts/'prompt_128_01.txt'),
+                   (128, self.prompts/'prompt_128_02.txt')]
+        result = SimpleNamespace(returncode=0,
+                                 stdout='[1,2,3]\nTotal number of tokens: 167\n',
+                                 stderr='')
+        with patch.object(mod.subprocess, 'run', return_value=result) as p:
+            counts = mod.model_token_counts(options, prompts)
+            self.assertEqual(counts['prompt_128_01.txt'], 167)
+            self.assertEqual(p.call_count, 2)
+            self.assertIn('--no-escape', p.call_args.args[0])
+            self.assertIn('--show-count', p.call_args.args[0])
+        self.assertTrue((self.out/'prompt-tokens.json').is_file())
+        with patch.object(mod.subprocess, 'run', side_effect=AssertionError('not cached')):
+            mod.model_token_counts(options, prompts)
+        (self.prompts/'prompt_128_01.txt').write_text('changed')
+        with patch.object(mod.subprocess, 'run', return_value=result) as p:
+            mod.model_token_counts(options, prompts)
+            self.assertEqual(p.call_count, 1)
+        options.update_tokens=True
+        with patch.object(mod.subprocess, 'run', return_value=result) as p:
+            mod.model_token_counts(options, prompts)
+            self.assertEqual(p.call_count, 2)
+
     def test_profile_cached_once_and_chunk_dag(self):
         planned_args = list(self.base)
         planned_args.remove('--fixed-chunks')
+        planned_args += ['--token-source', 'manifest']
         def fake_extract(folder, x):
             return {
                 'width': x, 'stages': [
@@ -140,6 +183,8 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((self.out / 'profile' / 'chunk-profile.json').is_file())
         plan = json.loads((self.out / 'prompt_128_01' / 'plan.json').read_text())
         self.assertEqual(plan['layout_fixed'], mod.chunk_dag.LAYOUT)
+        self.assertEqual(plan['plan_tokens'], 167)
+        self.assertEqual(plan['token_source'], 'manifest')
         self.assertIn(plan['xg'], mod.chunk_dag.GRID)
         self.assertIn(plan['xp'], mod.chunk_dag.GRID)
         self.assertEqual(mod.main(planned_args), 0)

@@ -343,20 +343,67 @@ def choose(profile: dict, tokens: int, candidates: tuple[int, ...] = GRID) -> di
     return selected
 
 
-def manifest_tokens(manifest: Path, name: str) -> int | None:
+def manifest_tokens(manifest: Path, name: str) -> int:
+    """Read real tokens for one input; never silently substitute group medians.
+
+    The ShareGPT extractor's CSV may contain a file name with or without the
+    .txt suffix and versions of the 'actual_tokens' column (e.g. actual_toks).
+    Normalize headers and file basenames, but require an unambiguous match.
+    """
     if not manifest.is_file():
-        return None
+        raise FileNotFoundError(f'missing ShareGPT token manifest: {manifest}')
+
+    def normalized_key(key) -> str:
+        return re.sub(r'[^a-z0-9]', '', str(key or '').casefold())
+
+    def filename(value) -> str:
+        # Also handle CSVs generated on a different operating system.
+        return str(value or '').strip().strip('"\'').replace('\\', '/').rsplit('/', 1)[-1].casefold()
+
+    target = filename(name)
+    target_stem = target[:-4] if target.endswith('.txt') else target
+    file_fields = {'file', 'filename', 'name', 'promptfile', 'outputfile', 'path'}
+    token_fields = (
+        'actualtokens', 'actualtoks', 'actualtoken', 'actualtok',
+        'tokencount', 'ntokens', 'tokens', 'lengthtokens', 'prompttokens'
+    )
+    matches = []
     with manifest.open('r', encoding='utf-8-sig', newline='') as stream:
         reader = csv.DictReader(stream)
-        for row in reader:
-            if any(str(row.get(key, '')).strip().lower().endswith(name.lower())
-                   for key in ('prompt_file', 'file', 'filename', 'name', 'output_file')):
-                for key in ('actual_tokens', 'token_count', 'n_tokens',
-                            'tokens', 'length_tokens', 'prompt_tokens'):
-                    try:
-                        val = int(row.get(key, ''))
-                        if val > 0:
-                            return val
-                    except (TypeError, ValueError):
-                        continue
-    return None
+        if not reader.fieldnames:
+            raise ValueError(f'empty or malformed token manifest: {manifest}')
+        columns = {normalized_key(key) for key in reader.fieldnames}
+        if not (columns & file_fields):
+            raise ValueError(f'no file-name column in {manifest}; headers: {reader.fieldnames}')
+        if not (columns & set(token_fields)):
+            raise ValueError(f'no token-count column in {manifest}; headers: {reader.fieldnames}')
+        for line, raw_row in enumerate(reader, start=2):
+            row = {normalized_key(key): value for key, value in raw_row.items()}
+            candidates = [filename(row.get(key)) for key in file_fields if row.get(key)]
+            if not any(value in (target, target_stem) for value in candidates):
+                continue
+            count = None
+            for key in token_fields:
+                value = row.get(key)
+                if value is None or not str(value).strip():
+                    continue
+                try:
+                    count = int(str(value).strip())
+                except ValueError:
+                    raise ValueError(
+                        f'{manifest}:{line} has non-integer {key}={value!r} for {name}')
+                if count <= 0:
+                    raise ValueError(
+                        f'{manifest}:{line} has invalid {key}={count} for {name}')
+                break
+            if count is None:
+                raise ValueError(
+                    f'{manifest}:{line} is missing a Token count for {name}')
+            matches.append((line, count))
+    if not matches:
+        raise ValueError(
+            f'{name} not found in manifest.csv ({manifest}); check file column')
+    if len(matches) != 1:
+        raise ValueError(
+            f'duplicate manifest entries for {name}: {matches}')
+    return matches[0][1]

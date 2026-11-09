@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import chunk_dag as m
 
 
@@ -49,6 +51,41 @@ class DagTests(unittest.TestCase):
                     len(m.intervals(n, xg if d == 'G' else xp))
                     for d, _ in m.REGIONS))
                 self.assertEqual(len(result['bank_jobs']), 2)
+
+    def test_manifest_exact_tokens_with_sharegpt_headers(self):
+        # Reproduce ShareGPT40's file/length_bin/sample_in_bin/actual_tokens
+        # manifest. Some extractors omit .txt or abbreviate actual_tokens.
+        with TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'manifest.csv'
+            manifest.write_text(
+                'file,length_bin,sample_in_bin,actual_tokens,sharegpt_id,prompt_sha256\n'
+                'prompt_128_01,128-255,1,167,abc,checksum\n'
+                'prompt_128_02.txt,128-255,2,171,def,checksum\n'
+                'prompt_128_03.txt,128-255,3,173,ghi,checksum\n',
+                encoding='utf-8-sig')
+            self.assertEqual(m.manifest_tokens(manifest, 'prompt_128_01.txt'), 167)
+            self.assertEqual(m.manifest_tokens(manifest, 'prompt_128_02.txt'), 171)
+            self.assertEqual(m.manifest_tokens(manifest, 'prompt_128_03.txt'), 173)
+            with self.assertRaisesRegex(ValueError, 'not found'):
+                m.manifest_tokens(manifest, 'prompt_128_04.txt')
+            with self.assertRaises(FileNotFoundError):
+                m.manifest_tokens(Path(directory) / 'missing.csv', 'prompt_128_01.txt')
+            manifest.write_text(
+                ' FILE ,Length Bin,Actual_Toks\n'
+                '"E:\\\\sharegpt\\\\prompt_512_05.txt",512-1024,771\n',
+                encoding='utf-8')
+            self.assertEqual(m.manifest_tokens(manifest, 'prompt_512_05.txt'), 771)
+            manifest.write_text(
+                'file,length_bin,actual_tokens\n'
+                'prompt_128_01.txt,128-255,not-a-token\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'non-integer'):
+                m.manifest_tokens(manifest, 'prompt_128_01.txt')
+            manifest.write_text(
+                'file,length_bin,actual_tokens\n'
+                'prompt_128_01.txt,128-255,167\n'
+                'prompt_128_01.txt,128-255,168\n', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'duplicate'):
+                m.manifest_tokens(manifest, 'prompt_128_01.txt')
 
     def test_select_chunks_only(self):
         selected = m.choose(synthetic_profile(), 513)

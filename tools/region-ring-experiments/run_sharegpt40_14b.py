@@ -203,6 +203,62 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     return row, interrupted
 
 
+def model_token_counts(args: argparse.Namespace, prompts: list[tuple[int, Path]]) -> dict[str, int]:
+    """Count each prompt with the *selected GGUF* tokenizer; cache by model and prompt hash."""
+    tokenizer = args.tokenizer_exe
+    if not tokenizer.is_file():
+        raise FileNotFoundError(
+            f"GGUF tokenizer binary not found: {tokenizer}. "
+            "Build llama-tokenize, pass --tokenizer-exe, or use --token-source manifest.")
+    model_info = args.model.stat()
+    tokenizer_info = tokenizer.stat()
+    signature = {
+        "model": str(args.model), "model_bytes": model_info.st_size,
+        "model_mtime_ns": model_info.st_mtime_ns,
+        "tokenizer": str(tokenizer), "tokenizer_bytes": tokenizer_info.st_size,
+        "tokenizer_mtime_ns": tokenizer_info.st_mtime_ns,
+        "flags": ["--ids", "--show-count", "--no-escape", "--log-disable"],
+    }
+    cache_file = args.out / "prompt-tokens.json"
+    cache = read_json(cache_file)
+    items = cache.get("prompts", {}) if cache.get("signature") == signature else {}
+    if args.update_tokens:
+        items = {}
+    counts = {}
+    for _, prompt in prompts:
+        key = prompt.name.lower()
+        digest = hashlib.sha256(prompt.read_bytes()).hexdigest()
+        previous = items.get(key, {})
+        count = previous.get("tokens") if previous.get("prompt_sha256") == digest else None
+        if not isinstance(count, int) or count <= 0:
+            command = [
+                str(tokenizer), "-m", str(args.model), "-f", str(prompt),
+                "--ids", "--show-count", "--no-escape", "--log-disable",
+            ]
+            proc = subprocess.run(command, cwd=args.root,
+                                  stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=120, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"llama-tokenize failed for {prompt.name} (code {proc.returncode}): "
+                    + proc.stderr[-700:])
+            matches = re.findall(r"Total number of tokens:\s*(\d+)", proc.stdout)
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"llama-tokenize missing unique count for {prompt.name}: "
+                    + proc.stdout[-250:])
+            count = int(matches[0])
+            if count <= 0:
+                raise RuntimeError(f"llama-tokenize returned {count} tokens for {prompt.name}")
+            print(f"[TOKENS] {prompt.name}: model={count}", flush=True)
+        counts[key] = count
+        items[key] = {"prompt_sha256": digest, "tokens": count}
+        # Persist after each prompt to survive an interrupted tokenization pass.
+        atomic_json(cache_file, {"signature": signature, "prompts": items})
+    return counts
+
+
 def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path]],
                          commit: str) -> dict:
     """Run the full fixed-layout profile *once*, cache verified real traces."""
@@ -273,6 +329,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--context", type=int, default=CONTEXT)
     ap.add_argument("--fixed-chunks", action="store_true",
                     help="disable cached-profile DAG planning; use XG=XP=128")
+    ap.add_argument("--token-source", choices=("model", "manifest"), default="model",
+                    help="model: GGUF llama-tokenize (recommended); manifest: use CSV counts")
+    ap.add_argument("--tokenizer-exe", type=Path, default=None,
+                    help="llama-tokenize binary; defaults to build-tensor-v2/bin/Release")
+    ap.add_argument("--update-tokens", action="store_true",
+                    help="force refresh of the model-specific Token count cache")
     ap.add_argument("--update-profile", action="store_true",
                     help="rerun the one-time Chunk calibration, keep old probe history")
     ap.add_argument("--only", action="append", default=[], metavar="PROMPT",
@@ -288,6 +350,9 @@ def main(argv: list[str] | None = None) -> int:
     args.root = Path(__file__).resolve().parents[2]
     for key in ("exe", "model", "prompt_dir", "out"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
+    if args.tokenizer_exe is None:
+        args.tokenizer_exe = args.exe.with_name("llama-tokenize.exe" if os.name == "nt" else "llama-tokenize")
+    args.tokenizer_exe = args.tokenizer_exe.expanduser().resolve()
     if not args.exe.is_file() or not args.model.is_file() or not args.prompt_dir.is_dir():
         ap.error("--exe, --model and --prompt-dir must exist")
     if args.context < 2560 or args.limit < 0 or args.delay < 0 or args.rerun_below < 0:
@@ -315,17 +380,34 @@ def main(argv: list[str] | None = None) -> int:
         "threads": THREADS, "seed": SEED, "no_mmap": True,
         "ring_environment": RING_ENV,
         "chunk_planning": "FIXED_128" if args.fixed_chunks else "PROFILE_DAG_V1",
+        "token_source": args.token_source if not args.fixed_chunks else "unused",
     }
     config_path = args.out / "run-config.json"
-    if config_path.exists() and read_json(config_path) != configuration:
+    existing_config = read_json(config_path) if config_path.exists() else {}
+    old_style_config = {k: v for k, v in configuration.items() if k != "token_source"}
+    if config_path.exists() and existing_config not in (configuration, old_style_config):
         ap.error(f"run configuration differs: {config_path}; use a different --out")
     if args.out.exists() and not config_path.exists() and any(args.out.iterdir()):
         ap.error(f"output folder is not an initialized sweep: {args.out}")
     commit = git_head(args.root)
     if not args.dry_run:
         args.out.mkdir(parents=True, exist_ok=True)
-        if not config_path.exists():
+        if not config_path.exists() or existing_config != configuration:
             atomic_json(config_path, configuration)
+    token_counts = {}
+    if not args.fixed_chunks and not args.dry_run:
+        try:
+            if args.token_source == "model":
+                token_counts = model_token_counts(args, prompts)
+            else:
+                token_counts = {
+                    p.name.lower(): chunk_dag.manifest_tokens(
+                        args.prompt_dir / "manifest.csv", p.name)
+                    for _, p in prompts
+                }
+        except (ValueError, OSError, RuntimeError) as exc:
+            ap.error(str(exc))
+        print(f"[TOKENS] source={args.token_source} count={len(token_counts)}", flush=True)
     profile = None
     if not args.fixed_chunks and not args.dry_run:
         profile = ensure_chunk_profile(args, prompts, commit)
@@ -343,27 +425,42 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, TypeError):
             slow = True
         force = prompt.name.lower() in rerun
-        if is_pass and not force and not slow:
+        old_plan = read_json(folder / "plan.json") if is_pass and profile is not None else {}
+        needs_replan = is_pass and profile is not None and (
+            old_plan.get("token_source") !=
+                ("model_tokenizer" if args.token_source == "model" else "manifest") or
+            old_plan.get("plan_tokens") != token_counts[prompt.name.lower()]
+        )
+        if is_pass and not force and not slow and not needs_replan:
             print(f"[SKIP] {prompt.name}: PASS {previous.get('prefill_tps')} tok/s", flush=True)
             continue
         if args.limit and launched >= args.limit:
             break
-        reason = "force" if force else "slow" if is_pass and slow else "retry" if folder.exists() else "new"
+        reason = ("force" if force else
+                  "stale_dag_tokens" if needs_replan else
+                  "slow" if is_pass and slow else
+                  "retry" if folder.exists() else "new")
         if args.dry_run:
             print(f"[DRY] {prompt.name}: {reason}", flush=True)
             launched += 1
             continue
-        attempt = archive(args.out, folder, previous) if folder.exists() else 1
-        print(f"[{launched + 1}] RUN {prompt.name} group={group} attempt={attempt} reason={reason}", flush=True)
         plan = None
         if profile is not None:
-            measured = chunk_dag.manifest_tokens(args.prompt_dir / "manifest.csv", prompt.name)
-            plan_tokens = measured or {128: 192, 256: 384, 512: 768, 1024: 1500}[group]
+            plan_tokens = token_counts[prompt.name.lower()]
             plan = chunk_dag.choose(profile, plan_tokens)
-            plan["token_source"] = "manifest" if measured else "group_midpoint_estimate"
-            print(f"  [DAG] tokens~{plan_tokens} XG={plan['xg']} "
-                  f"XP={plan['xp']} predicted={plan['predicted_dag_ms']}ms", flush=True)
+            plan["token_source"] = ("model_tokenizer" if args.token_source == "model"
+                                    else "manifest")
+            print(f"  [DAG] tokens={plan_tokens} source={plan['token_source']} "
+                  f"XG={plan['xg']} XP={plan['xp']} "
+                  f"predicted={plan['predicted_dag_ms']}ms", flush=True)
+        attempt = archive(args.out, folder, previous) if folder.exists() else 1
+        print(f"[{launched + 1}] RUN {prompt.name} group={group} attempt={attempt} reason={reason}", flush=True)
         row, interrupted = run_prompt(args, args.out, group, prompt, attempt, commit, plan)
+        if plan is not None and row.get("actual_prefill_tokens") is not None:
+            if int(row["actual_prefill_tokens"]) != plan["plan_tokens"]:
+                print(f"  [TOKEN_MISMATCH] {prompt.name}: "
+                      f"planned={plan['plan_tokens']} actual={row['actual_prefill_tokens']}",
+                      file=sys.stderr, flush=True)
         launched += 1
         summary(args.out, prompts)
         print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s ",

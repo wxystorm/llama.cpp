@@ -15,7 +15,10 @@ param(
     [double] $Delay = 2,
     [switch] $DryRun,
     [switch] $FixedChunks,
-    [switch] $UpdateProfile
+    [switch] $UpdateProfile,
+    [ValidateSet("model","manifest")][string] $TokenSource = "model",
+    [string] $TokenizerExe = "",
+    [switch] $UpdateTokens
 )
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -33,12 +36,15 @@ $callArgs = @(
     "--context", "$Context",
     "--rerun-below", "$RerunBelow",
     "--limit", "$Limit",
-    "--delay", "$Delay"
+    "--delay", "$Delay",
+    "--token-source", $TokenSource
 )
 foreach ($name in $Only) { $callArgs += @("--only", $name) }
 foreach ($name in $Rerun) { $callArgs += @("--rerun", $name) }
 if ($DryRun) { $callArgs += "--dry-run" }
 if ($FixedChunks) { $callArgs += "--fixed-chunks" }
 if ($UpdateProfile) { $callArgs += "--update-profile" }
+if ($UpdateTokens) { $callArgs += "--update-tokens" }
+if ($TokenizerExe -ne "") { $callArgs += @("--tokenizer-exe", $TokenizerExe) }
 & $python.Source @callArgs
 exit $LASTEXITCODE
