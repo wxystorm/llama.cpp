@@ -1426,7 +1426,22 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    // Graphless Phone-owned prefill intentionally handles only real prefill batches.
+    // The default 1-2 token dummy warmup enters the legacy PC-built Phone
+    // graph path and can fail on a Meta(CPU,RPC) split, wasting seconds.
+    // Skip it only for this explicit mode; all other callers keep warmup.
+    const auto env_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    const bool skip_graphless_warmup =
+        env_enabled("LLAMA_HYBRID_REGION_RING_V1") &&
+        env_enabled("LLAMA_REGION_RING_PHONE_GRAPHLESS") &&
+        env_enabled("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+    if (params.warmup && skip_graphless_warmup) {
+        COM_INF("[PHONE_GRAPHLESS_WARMUP] action=SKIP reason=LEGACY_TINY_PHONE_SPLIT status=READY\n");
+    }
+    if (params.warmup && !skip_graphless_warmup) {
         const char * hybrid_prefill_warmup_env =
             std::getenv("LLAMA_HYBRID_PREFILL_WARMUP");
         const bool hybrid_prefill_warmup =
