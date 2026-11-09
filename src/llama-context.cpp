@@ -4903,7 +4903,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             mapped = llama_region_ring_parse_region_ids(
                 region_spec, phone_mixed_htp_regions);
         }
-        if (!mapped || phone_mixed_htp_regions.size() < 2 ||
+        if (!mapped || phone_mixed_htp_regions.empty() ||
+                (phone_mixed_htp_regions.size() == 1 &&
+                 model.hybrid_ring_plan_npu_weight_policy != 1) ||
                 graphless_requested || !separate_final_head) {
             LLAMA_LOG_ERROR(
                 "[PHONE_MIXED_BACKENDS] status=REJECT "
@@ -5753,11 +5755,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         stages[region].kind !=
                             llama_hybrid_runtime_stage_kind::PHONE ||
                         stages[region].layer_begin < 0 ||
-                        stages[region].layer_end !=
-                            stages[region].layer_begin + 1) {
+                        stages[region].layer_end <=
+                            stages[region].layer_begin ||
+                        stages[region].layer_end -
+                            stages[region].layer_begin > 32) {
                     LLAMA_LOG_ERROR(
                         "[PHONE_NPU_PLAN] side=pc status=REJECT "
-                        "region=%u reason=INVALID_HTP_P1_LAYER\n", region);
+                        "region=%u reason=INVALID_HTP_LAYER_RANGE\n", region);
                     ret = GGML_STATUS_FAILED;
                     return nullptr;
                 }
@@ -5775,12 +5779,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
                 mapping.push_back({region,
                     (uint32_t) stages[region].layer_begin,
+                    (uint32_t) stages[region].layer_end,
                     local_successor});
             }
             const bool installed = phone_input_stream_enabled &&
                 configure != nullptr && !mapping.empty() &&
                 configure(phone_rpc_backend, phone_input_push_run_id,
-                          mapping.data(), mapping.size());
+                          mapping.data(), mapping.size(),
+                          (uint32_t) model.hybrid_ring_plan_npu_weight_policy);
             LLAMA_LOG_INFO(
                 "[PHONE_NPU_PLAN] side=pc event=INSTALL "
                 "run=%" PRIu64 " htp_regions=%zu "
@@ -5893,19 +5899,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // Never attempt to register them with the HTP-only ABI.
                     continue;
                 }
-                valid = stage.layer_end == stage.layer_begin + 1 &&
+                valid = stage.layer_end > stage.layer_begin &&
+                    stage.layer_end - stage.layer_begin <= 32 &&
                     stage.layer_begin >= 0 &&
                     stage.macro_tokens > 0 &&
                     (uint32_t) stage.layer_begin < model.hparams.n_layer();
                 if (!valid) { break; }
                 const uint32_t layer = (uint32_t) stage.layer_begin;
                 ggml_backend_rpc_phone_owned_plan plan {};
-                plan.version = 2;
+                plan.version = 3;
                 plan.flags = 1; // Qwen3 Flash Attention with F16 KV
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
                 plan.layer = layer;
+                plan.layer_end = (uint32_t) stage.layer_end;
                 plan.total_tokens = ubatch.n_tokens;
                 plan.chunk_tokens = (uint32_t) stage.macro_tokens;
                 plan.n_embd = (uint32_t) n_embd;
