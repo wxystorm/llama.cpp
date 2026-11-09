@@ -68,8 +68,11 @@ public:
                 continue;
             }
             if (n <= 0) {
+                const int saved_errno = n < 0 ? errno : 0;
+                const std::string detail = worker_failure_detail(
+                    "PHONE_PROFILE_WORKER_WRITE_FAILED", saved_errno);
                 stop_worker();
-                error(result, "PHONE_PROFILE_WORKER_WRITE_FAILED");
+                error(result, detail.c_str());
                 return true;
             }
             sent += (size_t) n;
@@ -84,8 +87,11 @@ public:
                 continue;
             }
             if (n <= 0) {
+                const int saved_errno = n < 0 ? errno : 0;
+                const std::string detail = worker_failure_detail(
+                    "PHONE_PROFILE_WORKER_READ_FAILED", saved_errno);
                 stop_worker();
-                error(result, "PHONE_PROFILE_WORKER_READ_FAILED");
+                error(result, detail.c_str());
                 return true;
             }
             const auto end = buffer.begin() + n;
@@ -117,6 +123,25 @@ private:
     }
 
 #if defined(__ANDROID__)
+    std::string worker_failure_detail(const char * failure, int io_errno) {
+        int status = 0;
+        const pid_t waited = child_ > 0 ? waitpid(child_, &status, WNOHANG) : -1;
+        std::string detail(failure);
+        if (waited == child_) {
+            child_ = -1; // Already reaped: stop_worker must not wait twice.
+            if (WIFEXITED(status)) {
+                detail += "_EXIT_" + std::to_string(WEXITSTATUS(status));
+            } else if (WIFSIGNALED(status)) {
+                detail += "_SIGNAL_" + std::to_string(WTERMSIG(status));
+            }
+        }
+        std::fprintf(stderr,
+            "[V2_PROFILE_RPC] event=WORKER_FAILURE reason=%s errno=%d "
+            "child_wait=%ld status=%d\n", detail.c_str(), io_errno,
+            (long) waited, status);
+        return detail;
+    }
+
     bool start_worker() {
         char pathname[4096] = {};
         const ssize_t n = readlink("/proc/self/exe",
@@ -153,9 +178,28 @@ private:
             dup2(socket_pair[1], STDOUT_FILENO);
             close(socket_pair[0]);
             close(socket_pair[1]);
-            execlp("python", "python", "-u", script.c_str(),
-                   "--model", model_path_.c_str(), "--exe",
-                   profiler.c_str(), "--stdio", (char *) nullptr);
+            // The worker is an internal subprocess, not another TCP server.
+            // Termux may expose either python or python3. Allow an explicit
+            // phone-local interpreter override, never an RPC-supplied path.
+            const char * configured =
+                std::getenv("GGML_RPC_V2_PROFILE_PYTHON");
+            if (configured != nullptr && *configured) {
+                execlp(configured, configured, "-u", script.c_str(),
+                       "--model", model_path_.c_str(), "--exe",
+                       profiler.c_str(), "--stdio", (char *) nullptr);
+            } else {
+                execlp("python", "python", "-u", script.c_str(),
+                       "--model", model_path_.c_str(), "--exe",
+                       profiler.c_str(), "--stdio", (char *) nullptr);
+                execlp("python3", "python3", "-u", script.c_str(),
+                       "--model", model_path_.c_str(), "--exe",
+                       profiler.c_str(), "--stdio", (char *) nullptr);
+            }
+            // exec failed; child stderr is captured by the RPC server log.
+            // Use write() only: the RPC server may have other threads at fork.
+            static const char message[] =
+                "[V2_PROFILE_RPC] event=WORKER_EXEC_FAILED reason=PYTHON_UNAVAILABLE_OR_NOT_EXECUTABLE\n";
+            (void) write(STDERR_FILENO, message, sizeof(message) - 1);
             _exit(127);
         }
         close(socket_pair[1]);
