@@ -6368,11 +6368,34 @@ private:
         }
         return phone_npu_executors[it->second].get();
     }
-    const char * phone_npu_name_for_region(uint32_t region) const {
+    // Consecutive P3/P4/Pn layers may reside in independent FastRPC
+    // address spaces. Compute remains serial, with Phone-host activation
+    // handoff between sessions and no intermediate PC roundtrip.
+    size_t phone_npu_session_for_region_layer(
+            uint32_t region, uint32_t offset) const {
         const auto it = phone_npu_region_session.find(region);
         return it == phone_npu_region_session.end() ||
-                it->second >= phone_npu_names.size() ?
-            "HTP_UNAVAILABLE" : phone_npu_names[it->second].c_str();
+                phone_npu_executors.empty() ?
+            SIZE_MAX :
+            (it->second + offset) % phone_npu_executors.size();
+    }
+    ggml_phone_npu_serial::full_region_executor *
+    phone_npu_executor_for_region_layer(
+            uint32_t region, uint32_t offset) const {
+        const size_t index =
+            phone_npu_session_for_region_layer(region, offset);
+        return index < phone_npu_executors.size() ?
+            phone_npu_executors[index].get() : nullptr;
+    }
+    const char * phone_npu_name_for_region_layer(
+            uint32_t region, uint32_t offset) const {
+        const size_t index =
+            phone_npu_session_for_region_layer(region, offset);
+        return index < phone_npu_names.size() ?
+            phone_npu_names[index].c_str() : "HTP_UNAVAILABLE";
+    }
+    const char * phone_npu_name_for_region(uint32_t region) const {
+        return phone_npu_name_for_region_layer(region, 0);
     }
     bool phone_npu_has_registered_chunk(uint64_t uid) const {
         for (const auto & executor : phone_npu_executors) {
