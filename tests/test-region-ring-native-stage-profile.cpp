@@ -6,7 +6,7 @@
 #include <string>
 
 #define CHECK(x) do { if (!(x)) { \
-    std::fprintf(stderr, "GCNA_NATIVE_TEST_FAIL line=%d\\n", __LINE__); \
+    std::fprintf(stderr, "GCNA_NATIVE_TEST_FAIL line=%d\n", __LINE__); \
     return 1; \
 } } while (0)
 
@@ -18,21 +18,21 @@ int main() {
         out << "backend,layers,chunk,kv_tokens,compute_median_ms,"
                "prepare_median_ms,weight_bytes,kv_bytes,"
                "graph_workspace_bytes,parity,source,"
-               "raw_weight_bytes,same_bank_refill_median_ms\\n";
+               "raw_weight_bytes,same_bank_refill_median_ms\n";
         const char * source = "NATIVE_SINGLE_BACKEND_GGUF_PREFIX";
         out << "G,2,64,512,4,0.1,1000,100,100,NOT_REQUESTED,"
-            << source << ",1000,0\\n";
+            << source << ",1000,0\n";
         out << "C,2,64,512,12,0.4,1000,100,100,NOT_REQUESTED,"
-            << source << ",1000,0\\n";
+            << source << ",1000,0\n";
         out << "N,1,32,512,8,0.3,2500,100,100,PASS,"
-            << source << ",2100,3\\n";
+            << source << ",2100,3\n";
         out << "N,1,64,512,12,0.5,2500,100,100,"
             << (failed_npu ? "FAIL" : "PASS") << ','
-            << source << ",2100,4\\n";
+            << source << ",2100,4\n";
         out << "N,1,64,1024,14,0.6,2500,100,100,PASS,"
-            << source << ",2100,4\\n";
+            << source << ",2100,4\n";
         out << "A,2,64,512,17,1.2,1700,100,100,NOT_REQUESTED,"
-            << source << ",1700,0\\n";
+            << source << ",1700,0\n";
     };
     write(false);
     profile p;
