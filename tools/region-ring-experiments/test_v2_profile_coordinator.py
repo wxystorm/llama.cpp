@@ -63,17 +63,31 @@ class NativeProfileCoordinatorTests(unittest.TestCase):
                         "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX",
                     })
             self.assertEqual(validated_profile(
-                folder, "modelhash", "pc", "exe"), (True, "VERIFIED"))
+                folder, "modelhash", "pc", "exe",
+                required_chunks=(64,), required_kvs=(512,)),
+                (True, "VERIFIED"))
             self.assertEqual(validated_profile(
-                folder, "another_model", "pc", "exe"),
+                folder, "another_model", "pc", "exe",
+                required_chunks=(64,), required_kvs=(512,)),
                 (False, "MODEL_FINGERPRINT_MISMATCH"))
             self.assertEqual(validated_profile(
-                folder, "modelhash", "pc", "new_exe"),
+                folder, "modelhash", "pc", "new_exe",
+                required_chunks=(64,), required_kvs=(512,)),
                 (False, "PC_BINARY_OR_DEVICE_MISMATCH"))
+            # The complete default matrix is NOT satisfied by one
+            # backend/Chunk/KV point, even when N1 and A1 are present.
+            self.assertEqual(validated_profile(
+                folder, "modelhash", "pc", "exe"),
+                (False, "INCOMPLETE_G2_X32_KV512"))
+            self.assertEqual(validated_profile(
+                folder, "modelhash", "pc", "exe",
+                required_chunks=(64, 128), required_kvs=(512,)),
+                (False, "INCOMPLETE_G2_X128_KV512"))
             del manifest["npu_weight_refill_points"]
             (folder / "profile.json").write_text(json.dumps(manifest))
             self.assertEqual(validated_profile(
-                folder, "modelhash", "pc", "exe"),
+                folder, "modelhash", "pc", "exe",
+                required_chunks=(64,), required_kvs=(512,)),
                 (False, "N1_WEIGHT_REFILL_PROFILE_MISSING"))
             self.assertEqual(select_profile_dir(
                 root, root / "model.gguf", "modelhash",
