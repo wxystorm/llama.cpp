@@ -150,7 +150,9 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
                            threads: int, force: bool, dry_run: bool,
                            directory: Path | None = None,
                            profiler_exe: Path | None = None,
-                           phone_endpoint: str = "") -> Path:
+                           phone_endpoint: str = "",
+                           required_kvs: tuple[int, ...] = (512, 1024)
+                           ) -> Path:
     model_sha = sha256(model)
     folder = select_profile_dir(root, model, model_sha, directory)
     native_exe = (profiler_exe or (
@@ -162,7 +164,8 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
             "build region-ring-v2-stage-profile first")
     native_sha = sha256(native_exe)
     pc_id = host_device_id()
-    valid, reason = validated_profile(folder, model_sha, pc_id, native_sha)
+    valid, reason = validated_profile(
+        folder, model_sha, pc_id, native_sha, required_kvs=required_kvs)
     if valid and not force:
         print(f"[V2_PROFILE_CACHE] status=HIT source=NATIVE_GCNA "
               f"file={folder / 'profile.json'}", flush=True)
@@ -189,7 +192,7 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
         "--layers-n", "1,2,4",
         "--layers-a", "1,2,3,4",
         "--chunks", "32,64,96,128",
-        "--kvs", "512,1024",
+        "--kvs", ",".join(str(kv) for kv in required_kvs),
         "--warmups", "2",
         "--repeats", "5",
         "--bank-repeats", "3",
@@ -199,7 +202,8 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
     if force:
         command.append("--update")
     result = subprocess.run(command, cwd=root, check=False)
-    valid, reason = validated_profile(folder, model_sha, pc_id, native_sha)
+    valid, reason = validated_profile(
+        folder, model_sha, pc_id, native_sha, required_kvs=required_kvs)
     if not valid:
         raise RuntimeError(
             f"NATIVE_PROFILE_INCOMPLETE: {reason}; exit={result.returncode}. "
