@@ -397,7 +397,8 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
                       cpu_workspace_mib: int = 0,
                       pc_workspace_mib: int = 0,
                       phone_workspace_mib: int = 0,
-                      safety_percent: float = 0.0) -> MemoryPlan:
+                      safety_percent: float = 0.0,
+                      cpu_layers_override: int | None = None) -> MemoryPlan:
     """Allocate contiguous CPU->CUDA->Phone layers with KV/graph headroom.
 
     1. Budget fixed system/device reserves and safety margins.
@@ -411,6 +412,18 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
     """
     if min(pc_reserve_mib, phone_reserve_mib, cpu_reserve_mib) < 0:
         raise ValueError("fixed memory reserves must be nonnegative")
+    if cpu_layers_override is not None and not (
+        0 <= cpu_layers_override < weights.n_layers - 1
+    ):
+        raise ValueError("invalid saved CPU layer boundary")
+    if pc_layers_override is not None and not (
+        1 <= pc_layers_override < weights.n_layers
+    ):
+        raise ValueError("invalid saved PC layer boundary")
+    if (cpu_layers_override is not None
+            and pc_layers_override is not None
+            and cpu_layers_override >= pc_layers_override):
+        raise ValueError("saved CPU layer boundary must precede PC boundary")
     if (not math.isfinite(safety_percent) or not 0 <= safety_percent <= 50
             or not 0 < kv_dtype_bytes <= 8 or context < 0):
         raise ValueError("invalid KV dtype, context length, or safety percentage")
@@ -467,6 +480,8 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
 
     choices = []
     for cpu_layers in range(weights.n_layers-1):
+        if cpu_layers_override is not None and cpu_layers != cpu_layers_override:
+            continue
         cpu_used = prefix[cpu_layers]
         if cpu_used > cpu_budget:
             break
@@ -489,10 +504,14 @@ def plan_memory_split(weights: GGUFWeights, pc: DeviceMemory,
             break  # Keep as many layers as possible off the PC CPU.
 
     if not choices:
-        boundary = (f" for --pc-layers={pc_layers_override}"
-                    if pc_layers_override is not None else "")
+        saved = (
+            f" (required pinned CPU={cpu_layers_override}, PC={pc_layers_override})"
+            if cpu_layers_override is not None else
+            (f" for --pc-layers={pc_layers_override}"
+             if pc_layers_override is not None else "")
+        )
         raise ValueError(
-            f"INFEASIBLE: no contiguous CPU/CUDA/Phone split{boundary}; "
+            f"INFEASIBLE: no contiguous CPU/CUDA/Phone split{saved}; "
             f"usable weight+KV budgets: CPU {cpu_budget/GIB:.2f} GiB, "
             f"GPU {pc_budget/GIB:.2f} GiB, Phone {phone_budget/GIB:.2f} GiB "
             f"(KV={kv_per_layer/MIB:.1f} MiB per layer)."
