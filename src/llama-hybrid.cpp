@@ -10508,8 +10508,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     llama_ring_planner::candidate & plan) {
                     const auto npu_ok = [native](int b, int e) {
                         const int depth = e - b;
-                        return b >= 0 && depth > 0 &&
-                            native->has_shape('N', depth);
+                        // Match the actual multi-layer HTP Graph builder
+                        // (up to 32 layers), not the matrix's sample depths.
+                        size_t weight = 0;
+                        return b >= 0 && depth > 0 && depth <= 32 &&
+                            native->weight_bytes('N', depth, false, weight);
                     };
                     const auto adreno_ok = [native](int b, int e) {
                         return e > b && native->has_shape('A', e - b);
@@ -10522,8 +10525,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             size_t npu_ws = 0;
                             size_t a_ws = 0;
                             size_t host_stage = 0;
-                            const size_t allocation_limit =
-                                native->max_profiled_weight_bytes('N');
+                            // A measured N1/N3 weight size is NOT the
+                            // physical HTP allocator's maximum allocation.
+                            // Admission uses the shared-RAM upper bound;
+                            // the Phone verifies the actual repack allocation.
+                            const size_t allocation_limit = phone_budget;
                             for (size_t i = 0; i < rs.size(); ++i) {
                                 const auto & stage = rs[i];
                                 if (stage.device !=
@@ -10580,7 +10586,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     };
                     llama_ring_planner::phone_npu_spill_result selected;
                     const int max_depth =
-                        std::min(32, native->max_profiled_depth('N'));
+                        native->max_profiled_depth('N') > 0 ? 32 : 0;
                     if (!llama_ring_planner::
                             choose_phone_npu_preferred_spill(
                                 logical, max_depth, npu_ok, adreno_ok,
@@ -10609,8 +10615,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "[REGION_RING_NATIVE_PROFILE] status=LOADED "
                 "points=%zu source=ISOLATED_GCNA_PASSONLY "
                 "npu=PRIORITY adreno=OPTIONAL_SUFFIX max_htp_region_layers=%d "
-                "bank=RESIDENT_OR_DUAL_REFILL path=%s\n",
-                native->size(), std::min(32, native->max_profiled_depth('N')), path);
+                "bank=RESIDENT_OR_DUAL_REFILL "
+                "deep_htp_depth_model=ESTIMATED_WHEN_UNSAMPLED path=%s\n",
+                native->size(),
+                native->max_profiled_depth('N') > 0 ? 32 : 0, path);
         }
     }
 
