@@ -23,6 +23,8 @@ param(
     [int] $ForceXG = 0,
     [int] $ForceXP = 0,
     [switch] $SkipProfile,
+    [switch] $ForceProfile,
+    [switch] $NoProfileCache,
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
     [ValidateSet("on", "off")]
@@ -76,6 +78,15 @@ if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
         "--force-xg", "$ForceXG",
         "--force-xp", "$ForceXP"
     )
+}
+if ($ForceProfile) {
+    if ($SkipProfile -or $NoProfileCache) {
+        throw "-ForceProfile cannot be combined with -SkipProfile or -NoProfileCache."
+    }
+    $callArgs += "--force-profile"
+}
+if ($NoProfileCache) {
+    $callArgs += "--no-profile-cache"
 }
 if ($NoMmap) {
     $callArgs += "--no-mmap"
