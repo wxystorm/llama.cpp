@@ -123,7 +123,7 @@ def profile_kv_anchors(prompt_hint: int) -> tuple[int, ...]:
     """
     if prompt_hint < 1:
         raise ValueError("INVALID_PROMPT_HINT")
-    needed = prompt_hint + 64
+    needed = prompt_hint + 32
     anchors = [512, 1024]
     for kv in (2048, 4096, 8192, 16384):
         if needed <= anchors[-1]:
