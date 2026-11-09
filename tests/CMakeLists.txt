@@ -437,6 +437,15 @@ set_target_properties(test-region-ring-planner PROPERTIES
 target_include_directories(test-region-ring-planner PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring-planner)
 
+# A device-free roundtrip validates the model-bound Legacy Hybrid Profile
+# cache used to avoid measuring anew for every Prompt in apply-wide.
+add_executable(test-region-ring-profile-cache test-region-ring-profile-cache.cpp)
+set_target_properties(test-region-ring-profile-cache PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+target_include_directories(test-region-ring-profile-cache PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-region-ring-profile-cache)
+
 # The Arena return opt-in must not leak into adjacent Phone stages or
 # parallel CPU/GPU workers. The mode test needs no model or live RPC server.
 add_executable(test-meta-phone-full-stream-mode test-meta-phone-full-stream-mode.cpp)
