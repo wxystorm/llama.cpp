@@ -4857,17 +4857,38 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // This avoids requiring a fake OpenCL Graph/Slot0 for private HTP work.
     const char * phone_mixed_env =
         std::getenv("LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP");
-    const bool phone_mixed_requested = phone_mixed_env != nullptr &&
-        std::strcmp(phone_mixed_env, "1") == 0;
+    const bool model_npu_plan =
+        !model.hybrid_ring_plan_npu_region_ids.empty();
+    const bool phone_mixed_requested =
+        model_npu_plan ||
+        (phone_mixed_env != nullptr &&
+         std::strcmp(phone_mixed_env, "1") == 0);
     std::set<uint32_t> phone_mixed_htp_regions;
     std::set<uint32_t> phone_local_handoff_source_regions;
     std::set<uint32_t> phone_local_handoff_dest_regions;
     if (phone_mixed_requested && ubatch.n_tokens >= 32) {
         const char * region_spec = std::getenv(
             "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS");
-        if (!llama_region_ring_parse_region_ids(
-                region_spec, phone_mixed_htp_regions) ||
-                phone_mixed_htp_regions.size() < 2 ||
+        bool mapped = true;
+        if (model_npu_plan) {
+            for (int id : model.hybrid_ring_plan_npu_region_ids) {
+                if (id < 0 || (size_t) id >= stages.size() ||
+                        !phone_mixed_htp_regions.insert(
+                            (uint32_t) id).second) {
+                    mapped = false;
+                    break;
+                }
+            }
+            LLAMA_LOG_ERROR(
+                "[PHONE_MIXED_BACKENDS] source=MODEL_PLAN "
+                "npu_regions=%zu status=%s\n",
+                phone_mixed_htp_regions.size(),
+                mapped ? "MAPPED" : "REJECT");
+        } else {
+            mapped = llama_region_ring_parse_region_ids(
+                region_spec, phone_mixed_htp_regions);
+        }
+        if (!mapped || phone_mixed_htp_regions.size() < 2 ||
                 graphless_requested || !phone_auto_final_enabled) {
             LLAMA_LOG_ERROR(
                 "[PHONE_MIXED_BACKENDS] status=REJECT "
