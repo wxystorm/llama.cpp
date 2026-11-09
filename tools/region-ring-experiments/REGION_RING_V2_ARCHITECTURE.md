@@ -254,9 +254,9 @@ Implemented in this V2 branch:
   fingerprint, and a synthetic tiny-Qwen3 CPU N1/N2/N4 integration-test
   fixture;
 - integrated versioned V2 N/A Profile requests on GGML RPC 50052:
-  Phone dispatches the independent HTP/OpenCL native sampler through a
-  server-owned local stdio worker and returns measured rows, with no
-  second listener or manual CSV copying;
+  Phone calls the original HTP/OpenCL native Graph sampler *in-process*
+  and returns measured rows, with no Python, worker process, second
+  listener or manual CSV copying;
 - explicit PARITY_FAIL measurements retained for analysis but excluded
   from the planner-eligible PASS profile CSV;
 - exact KV-X final-token profile window for nondivisible shapes (e.g.
