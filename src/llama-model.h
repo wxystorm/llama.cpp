@@ -667,6 +667,7 @@ struct llama_model {
     std::vector<int> hybrid_ring_plan_npu_region_ids;
     // Selected per-model HTP weight policy: 0=OFF, 1=RESIDENT, 2=TWO_BANK.
     int hybrid_ring_plan_npu_weight_policy = 2;
+    bool hybrid_ring_plan_native_gcna = false;
 
     // Region Ring GPU weight streaming V1: layer execution remains CUDA while
     // canonical model weights live in host/CPU buffers and are staged into
