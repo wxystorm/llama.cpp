@@ -1206,3 +1206,25 @@ contains the same breakdown for actual runs. This is NOT an exact ggml
 allocator forecast. If Phone RPC says failed to load tensor from local RPC
 model file, inspect the Phone RPC server's local model source, tensor names,
 and file integrity; adding memory margin does not fix a missing source tensor.
+
+
+### Resuming Quick8 / all40 after free-memory changes
+
+Quick8 creates `quick8-config.json` after the first successful memory
+preflight. On later runs with the same output directory, the runner now **pins
+the exact original CPU/GPU/Phone layer split** rather than selecting a fresh
+one from the newly reported RAM/VRAM. It rechecks that saved split against
+current GGUF weight + KV + workspace + safety budgets. If it still fits,
+the downstream DP runner continues with `--resume --only-incomplete`.
+
+Only memory-planning knobs (reserves/workspace/safety and KV estimation) may
+be changed without changing the experiment identity. A different model,
+prompt selection/checksum, executable path, RPC endpoint, split, chunk settings,
+graph-prebuild flag, or other runtime settings triggers a field-specific error
+instead of mixing incompatible q-profiles. If the same old split no longer
+fits, free device RAM/VRAM, adjust memory-planning margins carefully, or start
+a genuinely new experiment in a different `--out-dir`. Do **not** delete
+`quick8-config.json` to bypass the protection.
+
+The one-shot `--memory-check-only` mode still reports the current *newly
+optimal* split rather than resuming an existing output directory.
