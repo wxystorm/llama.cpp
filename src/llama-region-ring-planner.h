@@ -3072,6 +3072,27 @@ struct result {
     std::vector<candidate> top;
 };
 
+// APPLY_WIDE compares a selected plan against the legacy fixed Ring only
+// when that baseline is executable under the *same* backend policy.
+// With native N/A allocation, the old logical G/C/P baseline may have no
+// legal two-HTP-bank + Adreno split; that must not discard an otherwise
+// valid, fully scored N/A candidate from the exact event DAG.
+// Legacy (non-N/A) searches continue to require a scoreable baseline.
+inline bool runtime_plan_eligible_for_apply(
+        const result & planned, bool native_na) {
+    if (!planned.valid || planned.top.empty() ||
+            !std::isfinite(planned.selected.wall_ms) ||
+            planned.selected.wall_ms <= 0.0) {
+        return false;
+    }
+    if (native_na) {
+        return true;
+    }
+    return planned.baseline_valid &&
+        std::isfinite(planned.baseline.wall_ms) &&
+        planned.baseline.wall_ms > 0.0;
+}
+
 inline result search(
         const model & m,
         int max_simulations = 256,
