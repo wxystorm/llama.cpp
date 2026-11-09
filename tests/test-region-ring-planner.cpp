@@ -144,11 +144,11 @@ int main() {
         REQUIRE(llama_region_ring_single_cycle_force_compatible(
             no_cpu, 40));
 
-        // Current fifo-pc-phone final-output path is still Phone-owned.
+        // A forced G->C plan may end on PC, without any Phone Region.
         const auto no_phone =
             llama_region_ring_parse_apply_wide_layout(
                 "G37,C3,P0", 40);
-        REQUIRE(!llama_region_ring_single_cycle_force_compatible(
+        REQUIRE(llama_region_ring_single_cycle_force_compatible(
             no_phone, 40));
 
         // A zero-count stage is allowed, but a forced collaborative
@@ -226,11 +226,15 @@ int main() {
         REQUIRE(simulate(single_model, rebuilt, forced_no_cpu));
         REQUIRE(forced_no_cpu.tasks == 9);
 
-        // Neither a final-PC layout nor Phone-only work may reach
-        // APPLY_WIDE concrete-plan runtime validation.
+        // PC-only forced geometry is executable; one-device Phone-only
+        // remains invalid for collaborative Region Ring.
+        candidate forced_pc = forced_three;
+        forced_pc.concrete_regions = no_phone;
+        REQUIRE(make_regions(forced_pc, 40, rebuilt));
+        REQUIRE(rebuilt.size() == 2);
+        REQUIRE(rebuilt.back().device == device::CPU);
+        REQUIRE(simulate(single_model, rebuilt, forced_pc));
         candidate invalid = forced_three;
-        invalid.concrete_regions = no_phone;
-        REQUIRE(!make_regions(invalid, 40, rebuilt));
         invalid.concrete_regions = phone_only;
         REQUIRE(!make_regions(invalid, 40, rebuilt));
 
