@@ -381,6 +381,7 @@ public:
         size_t graph_storage_bytes = 0;
         double precompile_ms = 0.0;
         double cpu_build_ms = 0.0;
+        double cpu_relock_wait_ms = 0.0;
         double buffer_alloc_ms = 0.0;
         double input_setup_ms = 0.0;
     };
@@ -531,7 +532,10 @@ public:
             stats.cpu_build_ms +=
                 (ggml_time_us() - cpu_begin_us) / 1000.0;
             if (session_guard != nullptr) {
+                const int64_t relock_begin_us = ggml_time_us();
                 session_guard->lock();
+                stats.cpu_relock_wait_ms +=
+                    (ggml_time_us() - relock_begin_us) / 1000.0;
             }
             if (!item->ctx) {
                 reason = "PHONE_OWNED_HTP_GRAPH_CONTEXT";
