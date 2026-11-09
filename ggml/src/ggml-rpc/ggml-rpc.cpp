@@ -563,6 +563,7 @@ struct rpc_msg_phone_owned_plan_req {
     uint64_t p2c_run_id = 0;
     uint32_t region = 0;
     uint32_t layer = 0;
+    uint32_t layer_end = 0;
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
     uint32_t n_embd = 0;
@@ -586,14 +587,17 @@ struct rpc_msg_phone_owned_plan_req {
 // Fixed-size versioned request. Avoid dynamic wire sizes and reject unknown
 // Region indices, duplicate layers and invalid physical Bank assignments.
 struct rpc_msg_phone_npu_plan_configure_req {
-    uint32_t version = 2;
+    uint32_t version = 3;
     uint32_t count = 0;
     uint64_t run_id = 0;
+    uint32_t weight_policy = 2;
+    uint32_t reserved = 0;
     uint32_t regions[64] = {};
     uint32_t layers[64] = {};
+    uint32_t layer_ends[64] = {};
     uint32_t local_successors[64] = {};
 };
-static_assert(sizeof(rpc_msg_phone_npu_plan_configure_req) == 784,
+static_assert(sizeof(rpc_msg_phone_npu_plan_configure_req) == 1048,
               "Plan-driven HTP wire ABI changed; bump RPC protocol");
 // One canonical storage binding per Region; no KV payload or host pointer.
 struct rpc_msg_phone_owned_kv_bind_req {
@@ -607,7 +611,7 @@ struct rpc_msg_phone_owned_kv_bind_req {
     rpc_tensor canonical_k {};
     rpc_tensor canonical_v {};
 };
-static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 108,
+static_assert(sizeof(rpc_msg_phone_owned_plan_req) == 112,
               "Phone-owned plan wire ABI changed; bump RPC protocol");
 static_assert(sizeof(rpc_msg_phone_auto_task_req) == 60,
               "Autonomous task registration ABI changed; bump RPC protocol");
@@ -4407,7 +4411,7 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (ctx == nullptr) { return false; }
     auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 27) {
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 36) {
         return false;
     }
     rpc_msg_phone_owned_plan_req req {};
@@ -4417,6 +4421,7 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
     req.p2c_run_id    = plan->p2c_run_id;
     req.region        = plan->region;
     req.layer         = plan->layer;
+    req.layer_end     = plan->layer_end;
     req.total_tokens  = plan->total_tokens;
     req.chunk_tokens  = plan->chunk_tokens;
     req.n_embd        = plan->n_embd;
@@ -4444,20 +4449,24 @@ static bool ggml_backend_rpc_phone_owned_plan_register(
 static bool ggml_backend_rpc_phone_npu_plan_configure(
         ggml_backend_t backend, uint64_t run_id,
         const ggml_backend_rpc_phone_npu_region_layer * entries,
-        size_t count) {
+        size_t count, uint32_t weight_policy) {
     if (!backend || !ggml_backend_is_rpc(backend) || !entries ||
-            run_id == 0 || count < 2 || count > 64) {
+            run_id == 0 || count == 0 || count > 64 ||
+            (weight_policy != 1 && weight_policy != 2) ||
+            (count < 2 && weight_policy != 1)) {
         return false;
     }
-    std::vector<ggml_phone_plan::region_layer> ordered;
+    std::vector<ggml_phone_plan::stage_region_range> ordered;
     std::vector<uint32_t> successors;
     ordered.reserve(count);
     successors.reserve(count);
     for (size_t i = 0; i < count; ++i) {
-        ordered.emplace_back(entries[i].region, entries[i].layer);
+        ordered.push_back({
+            entries[i].region, entries[i].layer, entries[i].layer_end});
         successors.push_back(entries[i].next_phone_gpu_region);
     }
-    if (!ggml_phone_plan::valid_local_successors(ordered, successors)) {
+    if (!ggml_phone_plan::valid_htp_stage_successors(
+            ordered, successors, 256)) {
         GGML_LOG_ERROR("[PHONE_NPU_PLAN] side=pc "
                        "reason=INVALID_ORDERED_HTP_MAP status=REJECT\n");
         return false;
@@ -4465,7 +4474,7 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (!ctx) { return false; }
     auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 31) {
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 36) {
         GGML_LOG_ERROR(
             "[PHONE_NPU_PLAN] side=pc reason=PHONE_PATCH_BELOW_31 "
             "status=REJECT\n");
@@ -4474,9 +4483,11 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
     rpc_msg_phone_npu_plan_configure_req req {};
     req.run_id = run_id;
     req.count = static_cast<uint32_t>(count);
+    req.weight_policy = weight_policy;
     for (size_t i = 0; i < count; ++i) {
         req.regions[i] = entries[i].region;
         req.layers[i] = entries[i].layer;
+        req.layer_ends[i] = entries[i].layer_end;
         req.local_successors[i] = entries[i].next_phone_gpu_region;
     }
     rpc_msg_phone_input_ack rsp {};
@@ -4485,8 +4496,9 @@ static bool ggml_backend_rpc_phone_npu_plan_configure(
         &rsp, sizeof(rsp)) && rsp.accepted != 0;
     GGML_LOG_INFO(
         "[PHONE_NPU_PLAN] side=pc event=CONFIGURE "
-        "run=%" PRIu64 " htp_regions=%zu physical_banks=2 status=%s\n",
-        run_id, count, accepted ? "PASS" : "REJECT");
+        "run=%" PRIu64 " htp_regions=%zu weights=%s status=%s\n",
+        run_id, count, weight_policy == 1 ? "RESIDENT" : "STREAMING_2BANK",
+        accepted ? "PASS" : "REJECT");
     return accepted;
 }
 
