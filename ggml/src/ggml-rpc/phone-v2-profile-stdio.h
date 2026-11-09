@@ -1,14 +1,15 @@
 #pragma once
 
-// Single-port V2 Profile adapter for the existing ggml-rpc-server.
-// Android RPC process owns TCP :50052. This adapter launches an internal
-// long-lived stdio worker only on demand; it does NOT bind a second port.
-// All GGUF/Profiler paths are server-owned. The worker validates every shape,
-// verifies HTP parity, and uses the existing independent native Stage profiler.
+// Single-port V2 Profile adapter for ggml-rpc-server.
+// A server-owned, on-demand local Python worker has NO listening socket:
+// only the existing inference RPC port 50052 is exposed. It dispatches
+// bounded requests to the existing native N/A graph profiler, preserving
+// model fingerprint and HTP parity checks.
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,6 +18,7 @@
 #include <cerrno>
 #include <csignal>
 #include <filesystem>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -35,9 +37,10 @@ public:
         stop_worker();
     }
 
-    // A single bound JSON request/response, transported as an ordinary RPC
-    // command AFTER the normal HELLO. Never accepts an arbitrary executable
-    // or GGUF path from the network.
+    static constexpr size_t max_frame = 256 * 1024;
+
+    // Wire: one JSON line in, one JSON line out. All requests are
+    // serialized, even across concurrent inference RPC client sockets.
     bool request(const std::vector<uint8_t> & bytes, std::vector<uint8_t> & result) {
         std::lock_guard<std::mutex> guard(mutex_);
         if (bytes.empty() || bytes.size() > max_frame ||
@@ -51,40 +54,59 @@ public:
             error(result, "RPC_SERVER_REQUIRES_MODEL_PATH");
             return true;
         }
-        if (!read_ || !write_) {
-            if (!start_worker()) {
-                error(result, "PHONE_PROFILE_WORKER_START_FAILED");
+        if (worker_fd_ < 0 && !start_worker()) {
+            error(result, "PHONE_PROFILE_WORKER_START_FAILED");
+            return true;
+        }
+        size_t sent = 0;
+        while (sent < bytes.size()) {
+            // MSG_NOSIGNAL: a crashed child must never kill the inference
+            // RPC server with SIGPIPE.
+            const ssize_t n = send(worker_fd_, bytes.data() + sent,
+                                    bytes.size() - sent, MSG_NOSIGNAL);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                stop_worker();
+                error(result, "PHONE_PROFILE_WORKER_WRITE_FAILED");
+                return true;
+            }
+            sent += (size_t) n;
+        }
+        result.clear();
+        std::array<uint8_t, 4096> buffer {};
+        while (result.size() < max_frame) {
+            const size_t wanted = std::min(buffer.size(),
+                                           max_frame - result.size());
+            const ssize_t n = recv(worker_fd_, buffer.data(), wanted, 0);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                stop_worker();
+                error(result, "PHONE_PROFILE_WORKER_READ_FAILED");
+                return true;
+            }
+            const auto end = buffer.begin() + n;
+            const auto newline = std::find(buffer.begin(), end, uint8_t('\n'));
+            if (newline != end && newline + 1 != end) {
+                stop_worker();
+                error(result, "PHONE_PROFILE_WORKER_EXTRA_RESPONSE_DATA");
+                return true;
+            }
+            result.insert(result.end(), buffer.begin(), end);
+            if (newline != end) {
                 return true;
             }
         }
-        if (std::fwrite(bytes.data(), 1, bytes.size(), write_) != bytes.size() ||
-                std::fflush(write_) != 0) {
-            stop_worker();
-            error(result, "PHONE_PROFILE_WORKER_WRITE_FAILED");
-            return true;
-        }
-        // Worker emits exactly one bounded JSON line. Its subprocess timeout
-        // is enforced in v2_phone_profile_server.py, not by a socket timeout.
-        std::vector<char> line(max_frame + 2, 0);
-        if (!std::fgets(line.data(), (int) line.size(), read_)) {
-            stop_worker();
-            error(result, "PHONE_PROFILE_WORKER_READ_FAILED");
-            return true;
-        }
-        const size_t len = std::strlen(line.data());
-        if (len < 2 || len > max_frame || line[len - 1] != '\n') {
-            stop_worker();
-            error(result, "PHONE_PROFILE_WORKER_BAD_RESPONSE");
-            return true;
-        }
-        result.assign(line.data(), line.data() + len);
+        stop_worker();
+        error(result, "PHONE_PROFILE_WORKER_RESPONSE_TOO_LARGE");
 #else
         error(result, "PHONE_PROFILE_ONLY_SUPPORTED_ON_ANDROID");
 #endif
         return true;
     }
-
-    static constexpr size_t max_frame = 256 * 1024;
 
 private:
     static void error(std::vector<uint8_t> & out, const char * reason) {
@@ -96,15 +118,15 @@ private:
 
 #if defined(__ANDROID__)
     bool start_worker() {
-        char executable[4096] = {};
-        const ssize_t path_length = readlink("/proc/self/exe",
-                                              executable, sizeof(executable) - 1);
-        if (path_length <= 0) {
+        char pathname[4096] = {};
+        const ssize_t n = readlink("/proc/self/exe",
+                                   pathname, sizeof(pathname) - 1);
+        if (n <= 0) {
             return false;
         }
-        executable[path_length] = '\0';
+        pathname[n] = '\0';
         const std::filesystem::path root =
-            std::filesystem::path(executable).parent_path().parent_path();
+            std::filesystem::path(pathname).parent_path().parent_path();
         const char * script_env = std::getenv("GGML_RPC_V2_PROFILE_SCRIPT");
         const char * exe_env = std::getenv("GGML_RPC_V2_PROFILE_EXE");
         const std::string script = script_env && *script_env ? script_env :
@@ -119,67 +141,48 @@ private:
                 "script=%s profiler=%s\n", script.c_str(), profiler.c_str());
             return false;
         }
-        int parent_to_child[2] = {-1, -1};
-        int child_to_parent[2] = {-1, -1};
-        if (pipe(parent_to_child) != 0) {
+        int socket_pair[2] = {-1, -1};
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) != 0) {
             return false;
         }
-        if (pipe(child_to_parent) != 0) {
-            close(parent_to_child[0]);
-            close(parent_to_child[1]);
-            return false;
-        }
-        pid_t child = fork();
+        const pid_t child = fork();
         if (child == 0) {
-            // In a multi-threaded RPC process, perform only async-signal-safe
-            // operations between fork and exec.
-            dup2(parent_to_child[0], STDIN_FILENO);
-            dup2(child_to_parent[1], STDOUT_FILENO);
-            close(parent_to_child[0]);
-            close(parent_to_child[1]);
-            close(child_to_parent[0]);
-            close(child_to_parent[1]);
+            // In the multi-threaded RPC process use only async-signal-safe
+            // functions between fork and exec.
+            dup2(socket_pair[1], STDIN_FILENO);
+            dup2(socket_pair[1], STDOUT_FILENO);
+            close(socket_pair[0]);
+            close(socket_pair[1]);
             execlp("python", "python", "-u", script.c_str(),
                    "--model", model_path_.c_str(), "--exe",
                    profiler.c_str(), "--stdio", (char *) nullptr);
             _exit(127);
         }
-        close(parent_to_child[0]);
-        close(child_to_parent[1]);
+        close(socket_pair[1]);
         if (child < 0) {
-            close(parent_to_child[1]);
-            close(child_to_parent[0]);
+            close(socket_pair[0]);
             return false;
         }
-        write_ = fdopen(parent_to_child[1], "w");
-        read_ = fdopen(child_to_parent[0], "r");
+        worker_fd_ = socket_pair[0];
         child_ = child;
-        if (!write_ || !read_) {
-            if (write_) { std::fclose(write_); write_ = nullptr; }
-            else { close(parent_to_child[1]); }
-            if (read_) { std::fclose(read_); read_ = nullptr; }
-            else { close(child_to_parent[0]); }
-            kill(child_, SIGTERM);
-            waitpid(child_, nullptr, 0);
-            child_ = -1;
-            return false;
-        }
         std::fprintf(stderr,
             "[V2_PROFILE_RPC] status=WORKER_STARTED port=SHARED_50052\n");
         return true;
     }
 
     void stop_worker() {
-        if (write_) { std::fclose(write_); write_ = nullptr; }
-        if (read_) { std::fclose(read_); read_ = nullptr; }
+        if (worker_fd_ >= 0) {
+            shutdown(worker_fd_, SHUT_RDWR);
+            close(worker_fd_);
+            worker_fd_ = -1;
+        }
         if (child_ > 0) {
             kill(child_, SIGTERM);
             waitpid(child_, nullptr, 0);
             child_ = -1;
         }
     }
-    FILE * read_ = nullptr;
-    FILE * write_ = nullptr;
+    int worker_fd_ = -1;
     pid_t child_ = -1;
 #else
     void stop_worker() {}
