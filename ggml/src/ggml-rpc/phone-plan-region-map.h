@@ -55,6 +55,14 @@ struct stage_region_range {
     uint32_t region = 0;
     uint32_t layer_begin = 0;
     uint32_t layer_end = 0; // exclusive
+    bool operator==(const stage_region_range & other) const {
+        return region == other.region &&
+            layer_begin == other.layer_begin &&
+            layer_end == other.layer_end;
+    }
+    bool operator!=(const stage_region_range & other) const {
+        return !(*this == other);
+    }
 };
 
 // Empty is valid: a Plan may assign zero layers to HTP. One Stage is valid
