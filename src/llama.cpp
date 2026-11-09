@@ -562,6 +562,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             int selected_xg = 0;
             int selected_xp = 0;
             std::vector<int> selected_npu_region_ids;
+            int selected_npu_weight_policy = 2;
             const bool selected = ring_plan_apply_baseline ?
                 llama_hybrid_region_ring_planner_apply_baseline(
                     target_tokens, 0, chunk_tokens,selected_layout) :
@@ -569,7 +570,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 llama_hybrid_region_ring_planner_apply_wide(
                     target_tokens, 0, chunk_tokens, selected_layout,
                     selected_xc, selected_xg, selected_xp,
-                    &selected_npu_region_ids) :
+                    &selected_npu_region_ids,
+                    &selected_npu_weight_policy) :
                 ring_plan_apply_cgp ?
                 llama_hybrid_region_ring_planner_apply_cgp(
                     target_tokens, 0, chunk_tokens,selected_layout) :
@@ -583,8 +585,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 v2_csv && *v2_csv &&
                 (!forced_layout || !*forced_layout);
             if (native_gcna &&
-                    (!selected || selected_layout.empty() ||
-                     selected_npu_region_ids.size() < 2)) {
+                    (!selected || selected_layout.empty())) {
                 // Never continue with the old P-only baseline when the
                 // operator requested a native N/A Plan. Doing so would
                 // charge the wrong compute costs and configure wrong Phone
@@ -604,6 +605,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 model_ptr->hybrid_ring_plan_mode = ring_plan_apply_mode;
                 model_ptr->hybrid_ring_plan_npu_region_ids =
                     std::move(selected_npu_region_ids);
+                model_ptr->hybrid_ring_plan_npu_weight_policy =
+                    selected_npu_weight_policy;
                 if (ring_plan_apply_wide) {
                     model_ptr->hybrid_ring_plan_chunk_tokens = 0;
                     model_ptr->hybrid_ring_plan_cpu_chunk_tokens =
