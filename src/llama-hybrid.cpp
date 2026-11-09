@@ -10504,8 +10504,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 (size_t) (model.kv_start + model.tokens);
             const size_t hidden_size = model.hidden > 0 ?
                 (size_t) model.hidden : 0;
+            const size_t prompt_tokens = model.tokens > 0 ?
+                (size_t) model.tokens : 0;
             model.phone_stage_allocation =
-                [native, phone_budget, kv_per_layer, hidden_size](
+                [native, phone_budget, kv_per_layer, hidden_size,
+                 prompt_tokens](
                     const std::vector<llama_region_ring_region> & logical,
                     llama_ring_planner::candidate & plan) {
                     // Each NPU cycle may use at most 1536 MiB INCLUDING
@@ -10513,12 +10516,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     // impossible weight-only depths; the full memory check
                     // below validates non-weight allocations too.
                     if (hidden_size == 0 || plan.xp <= 0 ||
+                            prompt_tokens == 0 ||
                             hidden_size > SIZE_MAX / (size_t) plan.xp /
                                 (2 * sizeof(float))) {
                         return false;
                     }
                     const size_t npu_activation_bytes =
                         hidden_size * (size_t) plan.xp * 2 * sizeof(float);
+                    const size_t npu_graph_count =
+                        1 + (prompt_tokens - 1) / (size_t) plan.xp;
                     const auto npu_ok = [native](int b, int e) {
                         const int depth = e - b;
                         // Match the actual multi-layer HTP Graph builder
@@ -10534,7 +10540,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     };
                     const auto compute_memory =
                         [native, phone_budget, kv_per_layer,
-                         npu_activation_bytes](
+                         npu_activation_bytes, npu_graph_count](
                             const std::vector<llama_region_ring_region> & rs,
                             const std::vector<size_t> & npu_ids,
                             llama_ring_planner::phone_spill_memory & result) {
@@ -10564,7 +10570,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                     return false;
                                 }
                                 if (npu) {
-                                    npu_ws = std::max(npu_ws, ws);
+                                    // Phone-owned HTP graphs keep a distinct
+                                    // storage allocation for EVERY registered
+                                    // Chunk. Account for each instead of
+                                    // charging one max scratch allocation.
+                                    if (ws > SIZE_MAX / npu_graph_count ||
+                                            npu_ws > SIZE_MAX -
+                                                ws * npu_graph_count) {
+                                        return false;
+                                    }
+                                    npu_ws += ws * npu_graph_count;
                                     size_t raw = 0;
                                     if (!native->weight_bytes(
                                             'N', layers, true, raw)) {
@@ -10594,7 +10609,20 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                     kv_per_layer, kv_per_layer, npu_ws, a_ws,
                                     host_stage, allocation_limit,
                                     phone_budget, result,
-                                    npu_ids.empty() ? 0 : npu_activation_bytes);
+                                    npu_ids.empty() ? 0 : npu_activation_bytes,
+                                    [native, npu_graph_count](
+                                            int b, int e, size_t & bytes) {
+                                        size_t one = 0;
+                                        if (b < 0 || e <= b ||
+                                                !native->workspace_bytes(
+                                                    'N', e - b, one) ||
+                                                one > SIZE_MAX /
+                                                    npu_graph_count) {
+                                            return false;
+                                        }
+                                        bytes = one * npu_graph_count;
+                                        return true;
+                                    });
                         };
                     const auto memory_ok = [&compute_memory](
                             const std::vector<llama_region_ring_region> & rs,
