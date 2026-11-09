@@ -7135,7 +7135,7 @@ bool rpc_server::phone_input_push(
 bool rpc_server::phone_input_stream_run(
         const rpc_msg_phone_input_stream_run_req & request) {
     if (request.run_id == 0) { return false; }
-    if (phone_npu_executor != nullptr) {
+    if (!phone_npu_executors.empty()) {
         // The PC may use the ordinary OpenCL decode Graph after prefill.
         // Without this copy its Phone KV would be stale after HTP execution.
         // Keep one global lock order: HTP before Graph, so an NPU compute
@@ -7144,16 +7144,22 @@ bool rpc_server::phone_input_stream_run(
         std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
         std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
         if (request.active) {
-            phone_npu_executor->reset_kv();
+            for (auto & executor : phone_npu_executors) {
+                executor->reset_kv();
+            }
         } else {
             std::string reason;
             size_t kv_bytes = 0;
-            if (!phone_npu_executor->synchronize_kv(reason, kv_bytes)) {
+            for (const auto & executor : phone_npu_executors) {
+                size_t bytes = 0;
+                if (!executor->synchronize_kv(reason, bytes)) {
                 GGML_LOG_ERROR(
                     "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
                     " status=FAIL reason=%s\n",
                     request.run_id, reason.c_str());
-                return false;
+                    return false;
+                }
+                kv_bytes += bytes;
             }
             GGML_LOG_INFO(
                 "[PHONE_NPU_SERIAL] event=KV_SYNC run=%" PRIu64
@@ -7180,10 +7186,18 @@ bool rpc_server::phone_input_stream_run(
                 size_t owned_bytes = 0;
                 size_t owned_regions = 0;
                 std::string owned_reason;
-                const bool synced =
-                    phone_npu_executor->synchronize_owned_decode_kv(
-                        request.run_id, owned_reason,
-                        owned_bytes, owned_regions);
+                bool synced = true;
+                for (const auto & executor : phone_npu_executors) {
+                    size_t bytes = 0;
+                    size_t regions = 0;
+                    if (!executor->synchronize_owned_decode_kv(
+                            request.run_id, owned_reason, bytes, regions)) {
+                        synced = false;
+                        break;
+                    }
+                    owned_bytes += bytes;
+                    owned_regions += regions;
+                }
                 if (synced && !backends.empty()) {
                     ggml_backend_synchronize(backends[0]);
                 }
@@ -7200,7 +7214,9 @@ bool rpc_server::phone_input_stream_run(
             // In local-only mode this releases the owned HTP KV only AFTER
             // writeback and OpenCL synchronization. In the A/B path it
             // merely releases experiment scratch after legacy KV sync.
-            phone_npu_executor->release_owned_htp_graphs();
+            for (const auto & executor : phone_npu_executors) {
+                executor->release_owned_htp_graphs();
+            }
         }
     }
     phone_input_stream_profile report {};
@@ -7466,6 +7482,8 @@ bool rpc_server::phone_input_stream_run(
 // dual-slot plan: never guess graph UID, KV offsets, or tensor ownership.
 bool rpc_server::phone_owned_plan_register(
         const rpc_msg_phone_owned_plan_req & request) {
+    auto * phone_npu_executor =
+        phone_npu_executor_for_region(request.region);
     ggml_phone_owned::region_plan plan {};
     plan.version       = request.version;
     plan.flags         = request.flags;
@@ -7673,6 +7691,8 @@ bool rpc_server::phone_owned_plan_register(
 // all Chunk tasks from the immutable Plan. This never deserializes a PC Graph.
 bool rpc_server::phone_owned_kv_bind(
         const rpc_msg_phone_owned_kv_bind_req & request) {
+    auto * phone_npu_executor =
+        phone_npu_executor_for_region(request.region);
     const auto reject = [&](const char * why) {
         GGML_LOG_ERROR(
             "[PHONE_OWNED_KV] event=REJECT run=%" PRIu64
@@ -7816,6 +7836,8 @@ bool rpc_server::phone_owned_kv_bind(
 
 bool rpc_server::phone_auto_task_register(
         const rpc_msg_phone_auto_task_req & request) {
+    auto * phone_npu_executor =
+        phone_npu_executor_for_region(request.key.region);
     const int64_t register_begin_us =
         phone_chunk_timeline_enabled ? ggml_time_us() : 0;
     // Reject explicitly; a PC-side BIND_FAIL otherwise conceals the reason
@@ -7958,9 +7980,10 @@ bool rpc_server::phone_auto_task_register(
         GGML_LOG_INFO(
             "[PHONE_NPU_SERIAL] event=REGISTER run=%" PRIu64
             " region=%u layer=%d chunk=%u tokens=%u "
-            "uid=%" PRIu64 " backend=HTP0 status=READY\n",
+            "uid=%" PRIu64 " backend=%s status=READY\n",
             request.key.run_id, request.key.region, layer,
-            request.key.chunk, request.n_tokens, request.graph_uid);
+            request.key.chunk, request.n_tokens, request.graph_uid,
+            phone_npu_name_for_region(request.key.region));
     }
     const auto & slot_plan = it->second.slot0;
     size_t output_count = 0;
@@ -8602,6 +8625,8 @@ void rpc_server::phone_npu_preload_loop() {
                 std::lock_guard<std::mutex> htp_guard(
                     phone_npu_backend_mutex);
                 service_begin_us = ggml_time_us();
+                auto * phone_npu_executor =
+                    phone_npu_executor_for_region(task.region);
                 ok = phone_npu_executor != nullptr &&
                     phone_npu_executor->preload_weights(
                         task.weights, backends[task.device],
@@ -8888,6 +8913,8 @@ void rpc_server::phone_auto_compute_loop() {
         }
         if (!task) { continue; }
         const auto & req = task->request;
+        auto * phone_npu_executor =
+            phone_npu_executor_for_region(req.key.region);
         task->compute_begin_us = ggml_time_us();
         ggml_status status = GGML_STATUS_FAILED;
         // A READY L19 Chunk may arrive while the preloader is working on
@@ -8951,7 +8978,7 @@ void rpc_server::phone_auto_compute_loop() {
             GGML_LOG_INFO(
                 "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
                 " run=%" PRIu64 " region=%u layer=%u chunk=%u tokens=%u"
-                " backend=HTP0 source=PHONE_LOCAL_HTP kv_owner=PHONE_LOCAL"
+                " backend=%s source=PHONE_LOCAL_HTP kv_owner=PHONE_LOCAL"
                 " input_read_ms=%.3f input_upload_ms=%.3f"
                 " htp_compute_ms=%.3f output_copy_ms=%.3f"
                 " legacy_htp_compute=SKIPPED input=VERIFIED_PUSH_HOST"
@@ -8959,6 +8986,7 @@ void rpc_server::phone_auto_compute_loop() {
                 " status=%s reason=%s\n",
                 req.key.run_id, req.key.region, profile.layer,
                 req.key.chunk, req.n_tokens,
+                phone_npu_name_for_region(req.key.region),
                 profile.input_read_ms, profile.input_upload_ms,
                 profile.htp_compute_ms, profile.output_copy_ms,
                 ok ? "PASS" : "FAIL",
@@ -13441,8 +13469,7 @@ bool rpc_server::graph_compute(
     // A fixed HTP stage retains source tensor pointers from this RPC graph.
     // Never overwrite those graph metadata bytes while the stage is live.
     // The next RUN calls reset_kv(), which clears fixed stages beforehand.
-    if (register_only && phone_npu_executor != nullptr &&
-            phone_npu_executor->has_registered_chunk(graph_uid)) {
+    if (register_only && phone_npu_has_registered_chunk(graph_uid)) {
         GGML_LOG_ERROR(
             "[PHONE_NPU_FIXED] event=REGISTER_REJECT uid=%" PRIu64
             " reason=ACTIVE_FIXED_UID_REUSED status=REJECT\n", graph_uid);
