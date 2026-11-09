@@ -38,7 +38,8 @@ class RunnerTests(unittest.TestCase):
             'prompt_1024_02.txt,1024-2000,2,1500\n')
         self.out = self.root/'results'
         self.base = ['--exe', str(self.exe), '--model', str(self.model), '--rpc', 'local:50052',
-                     '--prompt-dir', str(self.prompts), '--out', str(self.out), '--delay', '0', '--fixed-chunks']
+                     '--prompt-dir', str(self.prompts), '--out', str(self.out), '--delay', '0',
+                     '--token-source', 'manifest']
         FakePopen.calls.clear()
         self.patch = patch.object(mod.subprocess, 'Popen', FakePopen)
         self.patch.start(); self.addCleanup(self.patch.stop)
@@ -50,7 +51,7 @@ class RunnerTests(unittest.TestCase):
                 'prompt_file': prompt.name,
                 'prompt_sha256': hashlib.sha256(prompt.read_bytes()).hexdigest(),
                 'actual_prefill_tokens': hint,
-                'actual_decode_tokens': 32,
+                'actual_decode_tokens': 1,
                 'prefill_ms': 5.0 if code == 0 else None,
                 'prefill_tps': 321.1 if code == 0 else None,
                 'decode_ms': 10.0,
@@ -87,7 +88,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT'], mod.LAYOUT)
         self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_XG'], '128')
         self.assertEqual(cmd[cmd.index('-ub')+1], '2048')
-        self.assertEqual(cmd[cmd.index('-c')+1], '4096')
+        self.assertEqual(cmd[cmd.index('-c')+1], '1024')
+        self.assertEqual(cmd[cmd.index('-n')+1], '1')
+        self.assertFalse((self.out / 'profile').exists())
         self.assertIn('--no-mmap',cmd)
 
     def test_changed_prompt_automatically_retried(self):
@@ -131,6 +134,81 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(FakePopen.calls),1)
 
 
+    def test_context_auto_uses_real_manifest_counts(self):
+        self.assertEqual(mod.main(self.base), 0)
+        by_name = {Path(cmd[cmd.index("-f") + 1]).name:
+                   (int(cmd[cmd.index("-c") + 1]), int(cmd[cmd.index("-n") + 1]))
+                   for cmd, env in FakePopen.calls}
+        self.assertEqual(by_name["prompt_128_01.txt"], (1024, 1))
+        self.assertEqual(by_name["prompt_512_01.txt"], (1024, 1))
+        # 1500 + 1 predicted + 64 safety = 1565; round to 1792.
+        self.assertEqual(by_name["prompt_1024_02.txt"], (1792, 1))
+        plan = json.loads((self.out/"prompt_1024_02"/"plan.json").read_text())
+        self.assertEqual(plan["context"], 1792)
+        self.assertEqual(plan["plan_tokens"], 1500)
+        self.assertEqual(plan["layout_fixed"], "G9,P1,G9,P1,G9,P1,G10")
+        self.assertEqual(plan["model"], "fixed_manual_no_profile")
+        self.assertEqual(plan["xp"], 128)
+        self.assertFalse((self.out/"profile").exists())
+
+    def test_context_boundaries_and_fixed_overflow(self):
+        self.assertEqual(mod.context_for_tokens(1855), 2048)
+        self.assertEqual(mod.context_for_tokens(1013), 1280)
+        self.assertEqual(mod.context_for_tokens(1900), 2048)
+        self.assertEqual(mod.context_for_tokens(1984), 2304)
+        with self.assertRaisesRegex(ValueError, "cannot fit"):
+            mod.context_for_tokens(1855, fixed=1856)
+        with self.assertRaises(SystemExit):
+            mod.main(self.base + ["--context", "1024",
+                                  "--only", "prompt_1024_02"])
+        self.assertFalse(FakePopen.calls)
+
+    def test_manual_overrides_and_independent_chunks(self):
+        overrides = self.root/"chunks.json"
+        overrides.write_text(json.dumps({
+            "groups": {"1024": {"xg": 112, "xp": 96}},
+            "prompts": {"prompt_1024_02": {"xp": 64}}
+        }))
+        self.assertEqual(mod.main(self.base + [
+            "--xc", "128", "--xg", "128", "--xp", "128",
+            "--chunk-overrides", str(overrides)]), 0)
+        cmd, env = FakePopen.calls[-1]
+        self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
+                         "G9,P1,G9,P1,G9,P1,G10")
+        self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_XC"], "128")
+        self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_XG"], "112")
+        self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_XP"], "64")
+        self.assertEqual(env["LLAMA_HYBRID_REGION_RING_PLAN_TOKENS"], "1500")
+        self.assertEqual(cmd[cmd.index("-n") + 1], "1")
+        previous_count = len(FakePopen.calls)
+        with self.assertRaises(SystemExit):
+            mod.main(self.base + ["--chunk-overrides", str(overrides),
+                                  "--xp", "96"])
+        self.assertEqual(len(FakePopen.calls), previous_count)
+
+    def test_default_dry_run_reports_context_without_writing(self):
+        output = self.root/"new-dry-run"
+        with patch("sys.stdout", new_callable=__import__('io').StringIO) as capture:
+            self.assertEqual(mod.main([
+                "--exe", str(self.exe), "--model", str(self.model),
+                "--rpc", "local:50052", "--prompt-dir", str(self.prompts),
+                "--out", str(output), "--token-source", "manifest",
+                "--dry-run", "--limit", "4", "--delay", "0"]), 0)
+        self.assertFalse(output.exists())
+        self.assertIn("context=1792", capture.getvalue())
+        self.assertIn("profile=SKIPPED", capture.getvalue())
+        self.assertFalse(FakePopen.calls)
+
+    def test_reject_invalid_layout_or_override(self):
+        with self.assertRaisesRegex(ValueError, "invalid layout"):
+            mod.validate_layout("G8,P2,G8,P2,G8,P2,G9")
+        with self.assertRaisesRegex(ValueError, "invalid layout"):
+            mod.validate_layout("P2,G8,P2,G8,P2,G8,G10")
+        over = self.root / "invalid-chunks.json"
+        over.write_text('{"groups":{"1024":{"xp":0}}}')
+        with self.assertRaisesRegex(ValueError, "integer"):
+            mod.load_chunk_overrides(over)
+
     def test_model_tokenizer_cache_and_invalidation(self):
         tokenizer = self.root / 'llama-tokenize.exe'
         tokenizer.touch()
@@ -166,9 +244,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(p.call_count, 2)
 
     def test_profile_cached_once_and_chunk_dag(self):
-        planned_args = list(self.base)
-        planned_args.remove('--fixed-chunks')
-        planned_args += ['--token-source', 'manifest']
+        planned_args = list(self.base) + ['--profile-chunks', '--layout', mod.chunk_dag.LAYOUT]
         def fake_extract(folder, x):
             return {
                 'width': x, 'stages': [
@@ -229,8 +305,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((self.out/'profile'/'chunk-profile.json').is_file())
 
     def test_completed_prompt_replans_only_if_widths_change(self):
-        planned_args = [v for v in self.base if v != '--fixed-chunks']
-        planned_args += ['--token-source', 'manifest']
+        planned_args = list(self.base) + ['--profile-chunks', '--layout', mod.chunk_dag.LAYOUT]
         def fake_extract(folder, x):
             return {
                 'width': x,

@@ -1,13 +1,21 @@
-# Fixed Qwen3-14B G9/P1 x3 + G10 ShareGPT40 sweep.
-# Re-run without switches to resume; -Rerun prompt_512_05 forces one fresh attempt.
+# Formal Qwen3-14B ShareGPT40 prefill-only sweep (G9/P1 x3 + G10).
+# Per-Prompt minimum safe Context; one predicted token; no Profile by default.
+# Re-run without switches to resume; -Rerun prompt_512_05 archives/retries.
 [CmdletBinding()]
 param(
     [string] $Model = "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
     [string] $Rpc = "10.39.52.114:50052",
     [string] $PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
-    [string] $Out = "E:\llama\sharegpt40-14b-chunk-dag-results",
+    [string] $Out = "E:\llama\sharegpt40-14b-g9p1-prefill1",
     [string] $Exe = "",
-    [int] $Context = 4096,
+    [string] $Layout = "G9,P1,G9,P1,G9,P1,G10",
+    [int] $Context = 0,
+    [int] $MinContext = 1024,
+    [int] $ContextPadding = 64,
+    [int] $XC = 128,
+    [int] $XG = 128,
+    [int] $XP = 128,
+    [string] $ChunkOverrides = "",
     [string[]] $Only = @(),
     [string[]] $Rerun = @(),
     [double] $RerunBelow = 0,
@@ -15,6 +23,7 @@ param(
     [double] $Delay = 2,
     [switch] $DryRun,
     [switch] $FixedChunks,
+    [switch] $ProfileChunks,
     [switch] $UpdateProfile,
     [ValidateSet("model","manifest")][string] $TokenSource = "model",
     [string] $TokenizerExe = "",
@@ -33,16 +42,22 @@ $callArgs = @(
     "--rpc", $Rpc,
     "--prompt-dir", $PromptDir,
     "--out", $Out,
-    "--context", "$Context",
+    "--layout", $Layout,
+    "--min-context", "$MinContext",
+    "--context-padding", "$ContextPadding",
+    "--xc", "$XC", "--xg", "$XG", "--xp", "$XP",
     "--rerun-below", "$RerunBelow",
     "--limit", "$Limit",
     "--delay", "$Delay",
     "--token-source", $TokenSource
 )
+if ($Context -gt 0) { $callArgs += @("--context", "$Context") }
+if ($ChunkOverrides -ne "") { $callArgs += @("--chunk-overrides", $ChunkOverrides) }
 foreach ($name in $Only) { $callArgs += @("--only", $name) }
 foreach ($name in $Rerun) { $callArgs += @("--rerun", $name) }
 if ($DryRun) { $callArgs += "--dry-run" }
 if ($FixedChunks) { $callArgs += "--fixed-chunks" }
+if ($ProfileChunks) { $callArgs += "--profile-chunks" }
 if ($UpdateProfile) { $callArgs += "--update-profile" }
 if ($UpdateTokens) { $callArgs += "--update-tokens" }
 if ($TokenizerExe -ne "") { $callArgs += @("--tokenizer-exe", $TokenizerExe) }

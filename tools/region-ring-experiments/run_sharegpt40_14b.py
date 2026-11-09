@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Fixed Qwen3-14B Region Ring ShareGPT40 sweep with safe resume/reruns.
+"""Qwen3-14B ShareGPT40 prefill-only Region Ring sweep with safe resume.
 
-Each prompt has its own current attempt directory. Before a retry, the old
-attempt moves into history/<prompt>/attempt-NNN; successful runs are skipped
-on restart unless explicitly selected for rerun.
+Defaults: G9,P1 x3 + G10, one predicted token, 128-token G/P Chunks, no
+profiling. Each GGUF-tokenized prompt gets the smallest 256-aligned Context
+that safely fits the prompt, one predicted token and a 64-token margin.
+Independent XG/XP and per-group/per-prompt overrides remain available for
+imbalanced pipelines. Old attempts are archived on retry.
 """
 from __future__ import annotations
 
@@ -30,14 +32,17 @@ LAYOUT = "G9,P1,G9,P1,G9,P1,G10"
 CHUNK = 128
 BATCH = 2048
 UBATCH = 2048
-CONTEXT = 4096
-PREDICT = 32
+MIN_CONTEXT = 1024
+CONTEXT_PADDING = 64
+CONTEXT_ALIGN = 256
+PREDICT = 1
 THREADS = 8
 SEED = 1234
 FIELDS = (
     "prompt_file", "group", "attempt", "status", "actual_prefill_tokens",
     "prefill_ms", "prefill_tps", "actual_decode_tokens", "decode_ms",
-    "decode_tps", "xg", "xp", "predicted_dag_ms",
+    "decode_tps", "context", "plan_tokens", "xc", "xg", "xp", "layout_fixed",
+    "predicted_dag_ms",
     "exit_code", "commit", "run_dir",
 )
 
@@ -47,7 +52,7 @@ RING_ENV = {
     "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
     "LLAMA_HYBRID_REGION_RING_PLANNER": "apply-wide",
     "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "1",
-    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": "64",
+    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": str(CHUNK),
     "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1",
     "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE": "0",
     "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": LAYOUT,
@@ -98,6 +103,95 @@ def names(values: list[str]) -> set[str]:
             for item in value.split(",") if item.strip()}
 
 
+
+
+def context_for_tokens(token_count: int, predict: int = PREDICT,
+                       minimum: int = MIN_CONTEXT,
+                       padding: int = CONTEXT_PADDING,
+                       fixed: int | None = None) -> int:
+    """Minimum safe Context, aligned to 256 tokens for the GGML KV allocator.
+
+    Reserve for the one prediction plus a small tokenizer/runtime margin.
+    Never silently truncate prompts to fit an explicitly undersized context.
+    """
+    if token_count <= 0 or predict < 1 or padding < 0 or minimum <= 0:
+        raise ValueError("invalid token count or context parameters")
+    required = token_count + predict + padding
+    if fixed is not None:
+        if fixed < required:
+            raise ValueError(
+                f"fixed context {fixed} cannot fit {token_count} prompt + "
+                f"{predict} predicted + {padding} safety tokens "
+                f"(requires >= {required})")
+        return fixed
+    return max(minimum, ((required + CONTEXT_ALIGN - 1) // CONTEXT_ALIGN)
+               * CONTEXT_ALIGN)
+
+
+def validate_layout(layout: str) -> str:
+    """A PC GPU-first, GPU-last Region Ring of exactly forty Qwen3 layers."""
+    parts = layout.split(",")
+    matched = [re.fullmatch(r"([GP])([1-9][0-9]*)", p) for p in parts]
+    if (len(parts) < 3 or len(parts) % 2 == 0 or
+            any(m is None for m in matched) or
+            sum(int(m.group(2)) for m in matched) != 40 or
+            any(m.group(1) != ("G" if i % 2 == 0 else "P")
+                for i, m in enumerate(matched))):
+        raise ValueError(
+            f"invalid layout {layout!r}: expected alternating G/P, "
+            "starting and ending in G, with exactly 40 layers")
+    return layout
+
+
+def load_chunk_overrides(path: Path | None) -> dict:
+    """Optional JSON: {"groups":{"1024":{"xp":96}},
+                           "prompts":{"prompt_1024_10":{"xg":112}}}."""
+    if path is None:
+        return {"groups": {}, "prompts": {}}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or set(value) - {"groups", "prompts"}:
+        raise ValueError("chunk override JSON needs groups/prompts objects only")
+    out = {"groups": {}, "prompts": {}}
+    for kind in out:
+        entries = value.get(kind, {})
+        if not isinstance(entries, dict):
+            raise ValueError(f"chunk overrides {kind} must be an object")
+        for key, widths in entries.items():
+            if kind == "groups":
+                if str(key) not in ("128", "256", "512", "1024"):
+                    raise ValueError(f"unknown ShareGPT group: {key}")
+                name = str(key)
+            else:
+                name = prompt_id(str(key))
+            if (not isinstance(widths, dict) or not widths or
+                    set(widths) - {"xc", "xg", "xp"}):
+                raise ValueError(f"invalid chunk settings for {key}")
+            for field, width in widths.items():
+                if type(width) is not int or not 1 <= width <= BATCH:
+                    raise ValueError(f"{key}: {field} must be an integer in [1,{BATCH}]")
+            if name in out[kind]:
+                raise ValueError(f"duplicate chunk override: {name}")
+            out[kind][name] = dict(widths)
+    return out
+
+
+def fixed_plan(args: argparse.Namespace, group: int, prompt: Path,
+               token_count: int, overrides: dict) -> dict:
+    widths = {"xc": args.xc, "xg": args.xg, "xp": args.xp}
+    widths.update(overrides["groups"].get(str(group), {}))
+    widths.update(overrides["prompts"].get(prompt.name.lower(), {}))
+    return {
+        **widths, "context": context_for_tokens(
+            token_count, minimum=args.min_context,
+            padding=args.context_padding, fixed=args.context),
+        "plan_tokens": token_count,
+        "layout_fixed": args.layout,
+        "token_source": ("model_tokenizer" if args.token_source == "model"
+                         else "manifest"),
+        "model": "fixed_manual_no_profile",
+        "predicted_dag_ms": None,
+    }
+
 def summary(out: Path, prompts: list[tuple[int, Path]]) -> dict[str, int]:
     values = []
     counts: dict[str, int] = {}
@@ -144,15 +238,22 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         if key.startswith(("LLAMA_HYBRID_REGION_RING_", "LLAMA_REGION_RING_")):
             env.pop(key)
     env.update(RING_ENV)
-    if plan is not None:
-        env["LLAMA_HYBRID_REGION_RING_FORCE_XG"] = str(plan["xg"])
-        env["LLAMA_HYBRID_REGION_RING_FORCE_XP"] = str(plan["xp"])
-    env["LLAMA_HYBRID_REGION_RING_PLAN_TOKENS"] = str(group)
+    token_count = (plan or {}).get("plan_tokens",
+                    getattr(args, "token_counts", {}).get(prompt.name.lower(), group))
+    context = (plan or {}).get("context") or context_for_tokens(
+        token_count, minimum=getattr(args, "min_context", MIN_CONTEXT),
+        padding=getattr(args, "context_padding", CONTEXT_PADDING),
+        fixed=getattr(args, "context", None))
+    env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"] = getattr(args, "layout", LAYOUT)
+    for key in ("xc", "xg", "xp"):
+        env["LLAMA_HYBRID_REGION_RING_FORCE_" + key.upper()] = str(
+            (plan or {}).get(key, getattr(args, key, CHUNK)))
+    env["LLAMA_HYBRID_REGION_RING_PLAN_TOKENS"] = str(token_count)
     env["LLAMA_REGION_RING_METRICS_FILE"] = str(folder / "metrics.jsonl")
     command = [
         str(args.exe), "-m", str(args.model), "--rpc", args.rpc,
         "--split-mode", "tensor", "--flash-attn", "on",
-        "-c", str(args.context), "-b", str(BATCH), "-ub", str(UBATCH),
+        "-c", str(context), "-b", str(BATCH), "-ub", str(UBATCH),
         "-n", str(PREDICT), "-t", str(THREADS), "--seed", str(SEED),
         "--no-conversation", "-f", str(prompt), "-lv", "4", "--no-mmap",
     ]
@@ -160,6 +261,8 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         atomic_json(folder / "plan.json", plan)
     atomic_json(folder / "config.json", {
         "command": command, "cwd": str(args.root), "commit": commit,
+        "prompt_tokens": token_count, "context": context,
+        "layout": env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
         "attempt": attempt, "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
         "ring_environment": {k: v for k, v in env.items()
                              if k.startswith(("LLAMA_HYBRID_REGION_RING_", "LLAMA_REGION_RING_"))},
@@ -188,11 +291,14 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
                                 skip_profile=True, batch=BATCH, ubatch=UBATCH,
                                 threads=THREADS, seed=SEED, n_predict=PREDICT,
                                 streaming="on", no_mmap=True)
-    row = result_row(base_args, folder, prompt, group, args.context,
+    row = result_row(base_args, folder, prompt, token_count, context,
                      code, elapsed, commit)
-    row.update(attempt=attempt, group=group,
-               xg=(plan or {}).get("xg", CHUNK),
-               xp=(plan or {}).get("xp", CHUNK),
+    row.update(attempt=attempt, group=group, context=context,
+               plan_tokens=token_count,
+               layout_fixed=env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
+               xc=(plan or {}).get("xc", getattr(args, "xc", CHUNK)),
+               xg=(plan or {}).get("xg", getattr(args, "xg", CHUNK)),
+               xp=(plan or {}).get("xp", getattr(args, "xp", CHUNK)),
                predicted_dag_ms=(plan or {}).get("predicted_dag_ms"),
                finished_utc=datetime.now(timezone.utc).isoformat())
     if interrupted:
@@ -203,7 +309,8 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     return row, interrupted
 
 
-def model_token_counts(args: argparse.Namespace, prompts: list[tuple[int, Path]]) -> dict[str, int]:
+def model_token_counts(args: argparse.Namespace, prompts: list[tuple[int, Path]],
+                       persist: bool = True) -> dict[str, int]:
     """Count each prompt with the *selected GGUF* tokenizer; cache by model and prompt hash."""
     tokenizer = args.tokenizer_exe
     if not tokenizer.is_file():
@@ -254,8 +361,9 @@ def model_token_counts(args: argparse.Namespace, prompts: list[tuple[int, Path]]
             print(f"[TOKENS] {prompt.name}: model={count}", flush=True)
         counts[key] = count
         items[key] = {"prompt_sha256": digest, "tokens": count}
-        # Persist after each prompt to survive an interrupted tokenization pass.
-        atomic_json(cache_file, {"signature": signature, "prompts": items})
+        # Persist after each prompt, but keep --dry-run strictly read-only.
+        if persist:
+            atomic_json(cache_file, {"signature": signature, "prompts": items})
     return counts
 
 
@@ -273,12 +381,18 @@ def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path
     profile_dir = args.out / "profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
     profile_path = profile_dir / "chunk-profile.json"
-    signature = dict(schema=1, model=str(args.model),
+    token_count = getattr(args, "token_counts", {}).get(prompt.name.lower(), group)
+    profile_context = context_for_tokens(
+        token_count, minimum=getattr(args, "min_context", MIN_CONTEXT),
+        padding=getattr(args, "context_padding", CONTEXT_PADDING),
+        fixed=getattr(args, "context", None))
+    signature = dict(schema=2, model=str(args.model),
                      model_size=args.model.stat().st_size,
                      executable=str(args.exe), rpc=args.rpc,
                      prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
-                     prompt=prompt.name, context=args.context,
-                     grid=list(candidates), fixed_layout=chunk_dag.LAYOUT)
+                     prompt=prompt.name, context=profile_context,
+                     predict=PREDICT, layout=chunk_dag.LAYOUT,
+                     grid=list(candidates))
     existing = read_json(profile_path)
     print(f"[PROFILE] chunk_grid={list(candidates)} "
           f"measurements={len(candidates)} dag_combinations={len(candidates)**2}",
@@ -303,7 +417,9 @@ def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path
         if not folder.exists():
             print(f"[PROFILE] measure G/P X={x} using {prompt.name}", flush=True)
             # Probe is fixed-layout. Only device Chunk widths change.
-            probe_plan = {"xg": x, "xp": x, "profile_probe": True}
+            probe_plan = {"xc": getattr(args, "xc", CHUNK), "xg": x, "xp": x,
+                          "plan_tokens": token_count, "context": profile_context,
+                          "profile_probe": True}
             row, interrupted = run_prompt(args, probe_dir, group, prompt,
                                           attempt, commit, probe_plan)
             if interrupted or row["status"] != "PASS":
@@ -332,17 +448,30 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rpc", required=True)
     ap.add_argument("--prompt-dir", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--context", type=int, default=CONTEXT)
+    ap.add_argument("--layout", default=LAYOUT)
+    ap.add_argument("--context", type=int, default=None,
+                    help="optional fixed Context; default is minimum safe 256-aligned per Prompt")
+    ap.add_argument("--min-context", type=int, default=MIN_CONTEXT,
+                    help="minimum Context for auto-sizing (default: 1024)")
+    ap.add_argument("--context-padding", type=int, default=CONTEXT_PADDING,
+                    help="reserved tokens beyond Prompt + one predicted token (default: 64)")
+    ap.add_argument("--xc", type=int, default=CHUNK)
+    ap.add_argument("--xg", type=int, default=CHUNK)
+    ap.add_argument("--xp", type=int, default=CHUNK)
+    ap.add_argument("--chunk-overrides", type=Path, default=None,
+                    help="optional JSON overrides per group and/or per Prompt")
     ap.add_argument("--fixed-chunks", action="store_true",
-                    help="disable cached-profile DAG planning; use XG=XP=128")
+                    help="legacy alias; fixed XG/XP=128 is already the default")
+    ap.add_argument("--profile-chunks", action="store_true",
+                    help="opt-in legacy G9/P1 Chunk DAG calibration, not used by default")
     ap.add_argument("--token-source", choices=("model", "manifest"), default="model",
-                    help="model: GGUF llama-tokenize (recommended); manifest: use CSV counts")
+                    help="GGUF tokenizer (preferred), or manifest.csv counts")
     ap.add_argument("--tokenizer-exe", type=Path, default=None,
                     help="llama-tokenize binary; defaults to build-tensor-v2/bin/Release")
     ap.add_argument("--update-tokens", action="store_true",
-                    help="force refresh of the model-specific Token count cache")
+                    help="force refresh of the model Token count cache")
     ap.add_argument("--update-profile", action="store_true",
-                    help="rerun the one-time Chunk calibration, keep old probe history")
+                    help="rerun opt-in legacy Chunk calibration")
     ap.add_argument("--only", action="append", default=[], metavar="PROMPT",
                     help="run only named prompts (unless already PASS)")
     ap.add_argument("--rerun", action="append", default=[], metavar="PROMPT",
@@ -350,19 +479,41 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rerun-below", type=float, default=0,
                     help="rerun PASS prompts with prefill tok/s below threshold")
     ap.add_argument("--limit", type=int, default=0, help="maximum processes this invocation")
-    ap.add_argument("--delay", type=float, default=2.0, help="pause between processes in seconds")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="pause between processes in seconds")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     args.root = Path(__file__).resolve().parents[2]
     for key in ("exe", "model", "prompt_dir", "out"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
+    if args.chunk_overrides is not None:
+        args.chunk_overrides = args.chunk_overrides.expanduser().resolve()
     if args.tokenizer_exe is None:
-        args.tokenizer_exe = args.exe.with_name("llama-tokenize.exe" if os.name == "nt" else "llama-tokenize")
+        args.tokenizer_exe = args.exe.with_name(
+            "llama-tokenize.exe" if os.name == "nt" else "llama-tokenize")
     args.tokenizer_exe = args.tokenizer_exe.expanduser().resolve()
     if not args.exe.is_file() or not args.model.is_file() or not args.prompt_dir.is_dir():
         ap.error("--exe, --model and --prompt-dir must exist")
-    if args.context < 2560 or args.limit < 0 or args.delay < 0 or args.rerun_below < 0:
-        ap.error("context must be >=2560; limit, delay and rerun-below must be >=0")
+    if args.limit < 0 or args.delay < 0 or args.rerun_below < 0:
+        ap.error("limit, delay and rerun-below must be >=0")
+    if args.min_context <= 0 or args.context_padding < 0 or (
+            args.context is not None and args.context <= 0):
+        ap.error("context must be positive and context-padding nonnegative")
+    if any(type(x) is not int or x < 1 or x > BATCH for x in
+           (args.xc, args.xg, args.xp)):
+        ap.error("XC/XG/XP must be in [1, 2048]")
+    try:
+        args.layout = validate_layout(args.layout)
+        overrides = load_chunk_overrides(args.chunk_overrides)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        ap.error(str(exc))
+    if args.profile_chunks and (
+            args.fixed_chunks or args.layout != chunk_dag.LAYOUT or
+            overrides != {"groups": {}, "prompts": {}}):
+        ap.error("--profile-chunks supports only legacy G9/P1 and no manual overrides")
+    if args.update_profile and not args.profile_chunks:
+        ap.error("--update-profile requires --profile-chunks")
+
     prompts = [(int(m.group(1)), p) for p in args.prompt_dir.iterdir()
                if p.is_file() and (m := PATTERN.fullmatch(p.name))]
     prompts.sort(key=lambda item: (item[0], item[1].name))
@@ -378,44 +529,64 @@ def main(argv: list[str] | None = None) -> int:
     if missing:
         ap.error("prompt(s) not found: " + ", ".join(sorted(missing)))
     selected = only | rerun if (only or rerun) else available
+
     configuration = {
-        "schema": 1, "exe": str(args.exe), "model": str(args.model),
+        "schema": 2, "exe": str(args.exe), "model": str(args.model),
         "model_bytes": args.model.stat().st_size, "rpc": args.rpc,
-        "prompt_dir": str(args.prompt_dir), "context": args.context,
+        "prompt_dir": str(args.prompt_dir), "layout": args.layout,
+        "context_policy": {
+            "fixed": args.context, "minimum": args.min_context,
+            "padding": args.context_padding, "alignment": CONTEXT_ALIGN,
+        },
         "batch": BATCH, "ubatch": UBATCH, "n_predict": PREDICT,
         "threads": THREADS, "seed": SEED, "no_mmap": True,
-        "ring_environment": RING_ENV,
-        "chunk_planning": "FIXED_128" if args.fixed_chunks else "PROFILE_DAG_V1",
-        "token_source": args.token_source if not args.fixed_chunks else "unused",
+        "ring_environment": {
+            **RING_ENV, "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.layout,
+        },
+        "chunk_planning": "PROFILE_DAG_LEGACY" if args.profile_chunks
+                          else "FIXED_MANUAL_NO_PROFILE",
+        "xc": args.xc, "xg": args.xg, "xp": args.xp,
+        "chunk_overrides": overrides,
+        "token_source": args.token_source,
+        "tokenizer_exe": str(args.tokenizer_exe) if args.token_source == "model" else None,
     }
     config_path = args.out / "run-config.json"
     existing_config = read_json(config_path) if config_path.exists() else {}
-    old_style_config = {k: v for k, v in configuration.items() if k != "token_source"}
-    if config_path.exists() and existing_config not in (configuration, old_style_config):
+    if config_path.exists() and existing_config != configuration:
         ap.error(f"run configuration differs: {config_path}; use a different --out")
     if args.out.exists() and not config_path.exists() and any(args.out.iterdir()):
         ap.error(f"output folder is not an initialized sweep: {args.out}")
+
     commit = git_head(args.root)
     if not args.dry_run:
         args.out.mkdir(parents=True, exist_ok=True)
-        if not config_path.exists() or existing_config != configuration:
+        if not config_path.exists():
             atomic_json(config_path, configuration)
-    token_counts = {}
-    if not args.fixed_chunks and not args.dry_run:
-        try:
-            if args.token_source == "model":
-                token_counts = model_token_counts(args, prompts)
-            else:
-                token_counts = {
-                    p.name.lower(): chunk_dag.manifest_tokens(
-                        args.prompt_dir / "manifest.csv", p.name)
-                    for _, p in prompts
-                }
-        except (ValueError, OSError, RuntimeError) as exc:
-            ap.error(str(exc))
-        print(f"[TOKENS] source={args.token_source} count={len(token_counts)}", flush=True)
+
+    try:
+        if args.token_source == "model":
+            token_counts = model_token_counts(args, prompts, persist=not args.dry_run)
+        else:
+            token_counts = {
+                p.name.lower(): chunk_dag.manifest_tokens(
+                    args.prompt_dir / "manifest.csv", p.name)
+                for _, p in prompts
+            }
+        args.token_counts = token_counts
+        for group, prompt in prompts:
+            if prompt.name.lower() not in selected:
+                continue
+            context_for_tokens(
+                token_counts[prompt.name.lower()],
+                minimum=args.min_context, padding=args.context_padding,
+                fixed=args.context)
+        print(f"[TOKENS] source={args.token_source} count={len(token_counts)}",
+              flush=True)
+    except (ValueError, OSError, RuntimeError) as exc:
+        ap.error(str(exc))
+
     profile = None
-    if not args.fixed_chunks and not args.dry_run:
+    if args.profile_chunks and not args.dry_run:
         profile = ensure_chunk_profile(args, prompts, commit)
     launched = 0
     stopped = False
@@ -427,62 +598,64 @@ def main(argv: list[str] | None = None) -> int:
         sha = hashlib.sha256(prompt.read_bytes()).hexdigest()
         is_pass = previous.get("status") == "PASS" and previous.get("prompt_sha256") == sha
         try:
-            slow = args.rerun_below > 0 and float(previous.get("prefill_tps") or 0) < args.rerun_below
+            slow = args.rerun_below > 0 and (
+                float(previous.get("prefill_tps") or 0) < args.rerun_below)
         except (ValueError, TypeError):
             slow = True
         force = prompt.name.lower() in rerun
-        # Always evaluate the current GRID for a completed prompt as well:
-        # the widened Profile may now select a different optimal XG/XP.
-        # Do not repeat an expensive inference when its chosen widths stay
-        # unchanged; just refresh plan.json with the new predictions/options.
-        plan = None
+        plan_tokens = token_counts[prompt.name.lower()]
+        plan = fixed_plan(args, group, prompt, plan_tokens, overrides)
         if profile is not None:
-            plan_tokens = token_counts[prompt.name.lower()]
-            plan = chunk_dag.choose(profile, plan_tokens)
-            plan["token_source"] = ("model_tokenizer" if args.token_source == "model"
-                                    else "manifest")
-        old_plan = read_json(folder / "plan.json") if is_pass and plan is not None else {}
-        needs_replan = is_pass and plan is not None and (
-            old_plan.get("token_source") != plan["token_source"] or
-            old_plan.get("plan_tokens") != plan["plan_tokens"] or
-            old_plan.get("xg") != plan["xg"] or
-            old_plan.get("xp") != plan["xp"]
-        )
+            selected_plan = chunk_dag.choose(profile, plan_tokens)
+            plan.update(selected_plan)
+            plan["xc"] = args.xc
+            plan["layout_fixed"] = args.layout
+            plan["token_source"] = ("model_tokenizer"
+                                    if args.token_source == "model" else "manifest")
+        old_plan = read_json(folder / "plan.json") if is_pass else {}
+        needs_replan = is_pass and any(
+            old_plan.get(key) != plan.get(key)
+            for key in ("context", "plan_tokens", "xc", "xg", "xp",
+                        "layout_fixed", "token_source"))
         if is_pass and not force and not slow and not needs_replan:
-            if plan is not None and old_plan != plan:
+            if old_plan != plan and not args.dry_run:
                 atomic_json(folder / "plan.json", plan)
-                print(f"[PLAN_REFRESH] {prompt.name}: unchanged XG={plan['xg']} "
-                      f"XP={plan['xp']} ({plan['candidate_count']} candidates)",
+                print(f"[PLAN_REFRESH] {prompt.name}: same Context/Chunks",
                       flush=True)
-            print(f"[SKIP] {prompt.name}: PASS {previous.get('prefill_tps')} tok/s", flush=True)
+            print(f"[SKIP] {prompt.name}: PASS {previous.get('prefill_tps')} tok/s",
+                  flush=True)
             continue
         if args.limit and launched >= args.limit:
             break
         reason = ("force" if force else
-                  "dag_chunks_changed" if needs_replan else
+                  "context_or_chunks_changed" if needs_replan else
                   "slow" if is_pass and slow else
                   "retry" if folder.exists() else "new")
+        print(f"[PLAN] {prompt.name}: prompt_tokens={plan_tokens} "
+              f"context={plan['context']} layout={args.layout} "
+              f"XC={plan['xc']} XG={plan['xg']} XP={plan['xp']} "
+              f"profile={'legacy' if profile is not None else 'SKIPPED'} "
+              f"predict={PREDICT}", flush=True)
         if args.dry_run:
             print(f"[DRY] {prompt.name}: {reason}", flush=True)
             launched += 1
             continue
-        if plan is not None:
-            print(f"  [DAG] tokens={plan['plan_tokens']} source={plan['token_source']} "
-                  f"XG={plan['xg']} XP={plan['xp']} "
-                  f"candidates={plan['candidate_count']} "
-                  f"predicted={plan['predicted_dag_ms']}ms", flush=True)
         attempt = archive(args.out, folder, previous) if folder.exists() else 1
-        print(f"[{launched + 1}] RUN {prompt.name} group={group} attempt={attempt} reason={reason}", flush=True)
-        row, interrupted = run_prompt(args, args.out, group, prompt, attempt, commit, plan)
-        if plan is not None and row.get("actual_prefill_tokens") is not None:
-            if int(row["actual_prefill_tokens"]) != plan["plan_tokens"]:
+        print(f"[{launched + 1}] RUN {prompt.name} group={group} "
+              f"attempt={attempt} reason={reason}", flush=True)
+        row, interrupted = run_prompt(args, args.out, group, prompt,
+                                      attempt, commit, plan)
+        if row.get("actual_prefill_tokens") is not None:
+            if int(row["actual_prefill_tokens"]) != plan_tokens:
                 print(f"  [TOKEN_MISMATCH] {prompt.name}: "
-                      f"planned={plan['plan_tokens']} actual={row['actual_prefill_tokens']}",
+                      f"model_tokenizer={plan_tokens} "
+                      f"actual={row['actual_prefill_tokens']}",
                       file=sys.stderr, flush=True)
         launched += 1
         summary(args.out, prompts)
-        print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s ",
-              f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s", flush=True)
+        print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s "
+              f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s",
+              flush=True)
         if interrupted:
             stopped = True
             break
@@ -492,7 +665,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     counts = summary(args.out, prompts)
     print(f"Summary: {args.out / 'summary.csv'} | " +
-          " ".join(f"{key}={value}" for key, value in sorted(counts.items())), flush=True)
+          " ".join(f"{key}={value}" for key, value in sorted(counts.items())),
+          flush=True)
     if stopped:
         print("Interrupted; rerun the same command to resume.", file=sys.stderr)
         return 130
