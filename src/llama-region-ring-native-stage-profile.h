@@ -282,7 +282,9 @@ public:
         if (logical_layers < 1) { return false; }
         double npu = 0.0;
         if (!estimate('N', 1, chunk, kv, kind, npu)) {
-            return false;
+            // With NPU0 the phone can run an Adreno-only Stage. The
+            // physical DAG still uses exact A samples for each Region.
+            return estimate('A', logical_layers, chunk, kv, kind, ms);
         }
         if (logical_layers == 1) {
             ms = npu;
