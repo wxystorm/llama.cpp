@@ -618,6 +618,17 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
 
+// Optional server-side native V2 Profile callback. The normal RPC server
+// executable registers an in-process C++ implementation before listening;
+// other ggml-rpc users have no Profile handler. Never exposes a file or
+// executable path in the network request.
+typedef bool (*ggml_rpc_v2_profile_handler_fn)(
+    void * context, const uint8_t * request, size_t request_size,
+    uint8_t * response, size_t response_capacity, size_t * response_size);
+
+GGML_BACKEND_API void ggml_backend_rpc_set_v2_profile_handler(
+    ggml_rpc_v2_profile_handler_fn handler, void * context);
+
 GGML_BACKEND_API void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_dir, size_t n_threads,
         size_t n_devices, ggml_backend_dev_t * devices, const struct ggml_rpc_local_tensor_source * tensor_source,
         const char * model_path, int tp_rank, int tp_world_size);
