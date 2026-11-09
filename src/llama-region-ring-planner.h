@@ -1647,7 +1647,7 @@ inline bool simulate(const model & m,
             return false;
         }
 
-        if (m.phone_npu_weight_streaming &&
+        if (npu_streaming &&
                 npu_rank[(size_t) r] >= 0) {
             const int rank = npu_rank[(size_t) r];
             if (rank >= 2 &&
@@ -1721,7 +1721,7 @@ inline bool simulate(const model & m,
         }
     }
 
-    if (m.phone_npu_weight_streaming) {
+    if (npu_streaming) {
         for (size_t i = 0; i < std::min((size_t) 2, npu_regions.size()); ++i) {
             const int r = npu_regions[i];
             npu_weight_ready[(size_t) r] = true;
