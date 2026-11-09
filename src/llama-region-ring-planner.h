@@ -554,6 +554,27 @@ inline bool make_regions(const candidate & c, int total_layers,
     return layer == total_layers;
 }
 
+// Recover logical G/C/P geometry for the unchanged E/Beam local refiners.
+ // NPU and Adreno are physically distinct only inside exact shortlisted DAG
+ // evaluation; moving a logical Phone boundary must not split N/A ownership.
+inline std::vector<llama_region_ring_region>
+collapse_adjacent_phone_stages(
+        const std::vector<llama_region_ring_region> & physical) {
+    std::vector<llama_region_ring_region> logical;
+    logical.reserve(physical.size());
+    for (const auto & stage : physical) {
+        if (!logical.empty() &&
+                stage.kind == llama_region_ring_stage_kind::PHONE &&
+                logical.back().kind == llama_region_ring_stage_kind::PHONE &&
+                logical.back().layer_end == stage.layer_begin) {
+            logical.back().layer_end = stage.layer_end;
+        } else {
+            logical.push_back(stage);
+        }
+    }
+    return logical;
+}
+
 inline bool gpu_weight_bank_peaks(
         const model & m,
         const std::vector<llama_region_ring_region> & regions,
@@ -3274,8 +3295,13 @@ inline void search_runtime_cpu_optional(
             continue;
         }
         std::vector<llama_region_ring_region> rs;
-        if (!make_regions(base, m.layers, rs) ||
-                rs.size() != (size_t) (3 * base.cycles)) {
+        if (!make_regions(base, m.layers, rs)) {
+            continue;
+        }
+        if (m.phone_stage_allocation) {
+            rs = collapse_adjacent_phone_stages(rs);
+        }
+        if (rs.size() != (size_t) (3 * base.cycles)) {
             continue;
         }
         bool all_gcp = true;
@@ -3600,6 +3626,9 @@ inline void refine_runtime_local_candidates(
             std::vector<llama_region_ring_region> rs;
             if (!make_regions(from, m.layers, rs)) {
                 continue;
+            }
+            if (m.phone_stage_allocation) {
+                rs = collapse_adjacent_phone_stages(rs);
             }
             // Moving an adjacent boundary includes P(i)->G(i+1), which
             // changes Cycle widths without altering the model's layer count.
