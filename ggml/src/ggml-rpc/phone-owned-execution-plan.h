@@ -13,7 +13,7 @@
 // Runtime cutover is deliberately separate from this plan/Graph shadow path.
 namespace ggml_phone_owned {
 
-static constexpr uint32_t k_plan_version = 2;
+static constexpr uint32_t k_plan_version = 3;
 static constexpr uint32_t k_flag_flash_attn = 1;
 static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX
 static constexpr uint32_t k_f16 = 1;      // GGML_TYPE_F16
@@ -28,7 +28,8 @@ struct region_plan {
     uint64_t run_id = 0;
     uint64_t p2c_run_id = 0;
     uint32_t region = 0;
-    uint32_t layer = 0;
+    uint32_t layer = 0;      // inclusive
+    uint32_t layer_end = 0;  // exclusive
     uint32_t total_tokens = 0;
     uint32_t chunk_tokens = 0;
     uint32_t n_embd = 0;
@@ -56,6 +57,7 @@ inline bool equal(const region_plan & a, const region_plan & b) {
     return a.version == b.version && a.flags == b.flags &&
         a.run_id == b.run_id && a.p2c_run_id == b.p2c_run_id &&
         a.region == b.region && a.layer == b.layer &&
+        a.layer_end == b.layer_end &&
         a.total_tokens == b.total_tokens &&
         a.chunk_tokens == b.chunk_tokens && a.n_embd == b.n_embd &&
         a.position_base == b.position_base &&
@@ -83,7 +85,9 @@ inline bool validate(const region_plan & p, const char * & reason) {
         return false;
     }
     if (!p.run_id || !p.p2c_run_id ||
-            p.region >= k_max_regions || p.layer >= 256) {
+            p.region >= k_max_regions || p.layer >= 256 ||
+            p.layer_end <= p.layer || p.layer_end > 256 ||
+            p.layer_end - p.layer > 32) {
         reason = "INVALID_ID_OR_REGION";
         return false;
     }
