@@ -10502,34 +10502,51 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             const size_t kv_per_layer =
                 profile.kv_bytes_per_token_per_layer *
                 (size_t) (model.kv_start + model.tokens);
+            const size_t hidden_size = model.hidden > 0 ?
+                (size_t) model.hidden : 0;
             model.phone_stage_allocation =
-                [native, phone_budget, kv_per_layer](
+                [native, phone_budget, kv_per_layer, hidden_size](
                     const std::vector<llama_region_ring_region> & logical,
                     llama_ring_planner::candidate & plan) {
+                    // Each NPU cycle may use at most 1536 MiB INCLUDING
+                    // its NPU KV and graph/activation footprint. First prune
+                    // impossible weight-only depths; the full memory check
+                    // below validates non-weight allocations too.
+                    if (hidden_size == 0 || plan.xp <= 0 ||
+                            hidden_size > SIZE_MAX / (size_t) plan.xp /
+                                (2 * sizeof(float))) {
+                        return false;
+                    }
+                    const size_t npu_activation_bytes =
+                        hidden_size * (size_t) plan.xp * 2 * sizeof(float);
                     const auto npu_ok = [native](int b, int e) {
                         const int depth = e - b;
                         // Match the actual multi-layer HTP Graph builder
                         // (up to 32 layers), not the matrix's sample depths.
                         size_t weight = 0;
                         return b >= 0 && depth > 0 && depth <= 32 &&
-                            native->weight_bytes('N', depth, false, weight);
+                            native->weight_bytes('N', depth, false, weight) &&
+                            weight > 0 &&
+                            weight <= ggml_phone_npu_budget::bank_bytes;
                     };
                     const auto adreno_ok = [native](int b, int e) {
                         return e > b && native->has_shape('A', e - b);
                     };
                     const auto compute_memory =
-                        [native, phone_budget, kv_per_layer](
+                        [native, phone_budget, kv_per_layer,
+                         npu_activation_bytes](
                             const std::vector<llama_region_ring_region> & rs,
                             const std::vector<size_t> & npu_ids,
                             llama_ring_planner::phone_spill_memory & result) {
                             size_t npu_ws = 0;
                             size_t a_ws = 0;
                             size_t host_stage = 0;
-                            // A measured N1/N3 weight size is NOT the
-                            // physical HTP allocator's maximum allocation.
-                            // Admission uses the shared-RAM upper bound;
-                            // the Phone verifies the actual repack allocation.
-                            const size_t allocation_limit = phone_budget;
+                            // Calibrated single HTP Bank/Stage target.
+                            // DSP physical allocation remains the Phone's
+                            // final authority; Planner budgets non-weights
+                            // separately from the raw repacked weight arena.
+                            const size_t allocation_limit =
+                                ggml_phone_npu_budget::bank_bytes;
                             for (size_t i = 0; i < rs.size(); ++i) {
                                 const auto & stage = rs[i];
                                 if (stage.device !=
@@ -10576,7 +10593,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                     },
                                     kv_per_layer, kv_per_layer, npu_ws, a_ws,
                                     host_stage, allocation_limit,
-                                    phone_budget, result);
+                                    phone_budget, result,
+                                    npu_ids.empty() ? 0 : npu_activation_bytes);
                         };
                     const auto memory_ok = [&compute_memory](
                             const std::vector<llama_region_ring_region> & rs,
@@ -10616,9 +10634,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "points=%zu source=ISOLATED_GCNA_PASSONLY "
                 "npu=PRIORITY adreno=OPTIONAL_SUFFIX max_htp_region_layers=%d "
                 "bank=RESIDENT_OR_DUAL_REFILL "
+                "htp_total_mib=%zu htp_stage_mib=%zu "
                 "deep_htp_depth_model=ESTIMATED_WHEN_UNSAMPLED path=%s\n",
                 native->size(),
-                native->max_profiled_depth('N') > 0 ? 32 : 0, path);
+                native->max_profiled_depth('N') > 0 ? 32 : 0,
+                ggml_phone_npu_budget::total_mib,
+                ggml_phone_npu_budget::bank_mib, path);
         }
     }
 
