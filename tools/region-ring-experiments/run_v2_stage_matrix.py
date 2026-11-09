@@ -26,7 +26,7 @@ from typing import Any
 
 from v2_profile_wire import (
     ProfileProtocolError, SOURCE, WIRE_VERSION, call, validate_sample,
-    validate_shape,
+    validate_shape, parse_endpoint, NATIVE_RPC_PORT,
 )
 from v2_profile_transfer import transfer_call, SOURCE as TCP_SOURCE
 
@@ -229,6 +229,9 @@ def native_local(exe: Path, model: Path, shape: dict[str, Any],
 def hello_phone(endpoint: str, token: str,
                 timeout: int, model_sha: str) -> dict[str, Any]:
     info = call(endpoint, "hello", token=token, timeout=timeout)
+    expected_transport = ("V2_PHONE_PROFILE_RPC50052"
+                          if parse_endpoint(endpoint)[1] == NATIVE_RPC_PORT
+                          else "V2_PHONE_PROFILE_SIDECAR")
     if info.get("status") != "OK" or \
             info.get("model_sha256") != model_sha or \
             not isinstance(info.get("exe_sha256"), str) or \
@@ -237,7 +240,7 @@ def hello_phone(endpoint: str, token: str,
             len(info["device_id"]) != 64 or \
             not isinstance(info.get("runtime_sha256"), str) or \
             len(info["runtime_sha256"]) != 64 or \
-            info.get("transport") != "V2_PHONE_PROFILE_SIDECAR" or \
+            info.get("transport") != expected_transport or \
             not set(("N", "A")).issubset(info.get("backends", [])):
         raise ProfileProtocolError(
             "PHONE_MODEL_OR_RUNTIME_IDENTITY_MISMATCH: "
@@ -372,6 +375,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             "device_id": (phone["device_id"] if phone else "PHONE_UNAVAILABLE")
                 if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
+            "rpc_transport": phone["transport"] if remote and phone else None,
             "runtime_sha256": phone["runtime_sha256"] if remote and phone
                               else None,
         }
@@ -405,7 +409,10 @@ def run_matrix(args: argparse.Namespace) -> int:
             record = {
                 "schema": 2, "status": state, "key": key,
                 "sample": sample,
-                "transport": "PHONE_RPC_V1" if remote else "LOCAL_NATIVE",
+                "transport": ("PHONE_RPC50052_V1" if remote and
+                              parse_endpoint(endpoint)[1] == NATIVE_RPC_PORT
+                              else "PHONE_RPC_V1" if remote
+                              else "LOCAL_NATIVE"),
                 "origin": SOURCE,
             }
             if diag:
@@ -446,6 +453,11 @@ def run_matrix(args: argparse.Namespace) -> int:
     sizes_spec = (
         "" if getattr(args, "skip_tcp_transfer", False) else
         getattr(args, "tcp_transfer_sizes_kib", ""))
+    if use_phone and phone and sizes_spec and \
+            parse_endpoint(endpoint)[1] == NATIVE_RPC_PORT:
+        print("[V2_TCP_PROFILE] SKIP reason=RPC50052_USES_PRODUCTION_TRANSPORT "
+              "and_sidecar_TCP_measurements_are_not_comparable", flush=True)
+        sizes_spec = ""
     if use_phone and phone and sizes_spec:
         sizes = csv_positive(sizes_spec, "TRANSFER_SIZES_KIB")
         if max(sizes) > 32768:
