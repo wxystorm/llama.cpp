@@ -116,7 +116,8 @@ inline bool valid(const llama_hybrid_profile & p) {
            p.n_embd > 0 && p.n_ff > 0 &&
            !p.cpu_layer_blocks.empty() && !p.gpu_layer_blocks.empty() &&
            !p.phone_layer_blocks.empty() &&
-           !p.pc_to_phone.empty() && !p.phone_to_pc.empty() &&
+           !p.pc_to_phone.empty() &&
+           (!p.phone_to_pc.empty() || !p.snapshot_phone_to_pc.empty()) &&
            p.layer_weight_bytes.size() == (size_t) p.n_layer;
 }
 
