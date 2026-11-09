@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Phone-side V2 N/A independent Stage profiling service.
+"""Phone-side V2 N/A native Stage profiling worker.
 
-This is an isolated, versioned profiling sidecar, not a new inference
-command in the legacy ggml-rpc socket. Bind to 127.0.0.1 and use
-adb forward tcp:50177 tcp:50177 for USB transport. A non-loopback
-listener requires a long token and must only be used on a trusted LAN.
-The phone model path and executable are fixed by the server operator;
-remote requests cannot select files or shell commands.
+Production --stdio mode runs as a private subprocess owned by the existing
+ggml-rpc-server on port 50052. It does not open a listening TCP port.
+Standalone --bind/--port mode is retained only for legacy isolated tests.
+Model and profiler paths are fixed on the Phone; remote requests may select
+only bounded numeric shapes, never files or commands.
 """
 from __future__ import annotations
 
