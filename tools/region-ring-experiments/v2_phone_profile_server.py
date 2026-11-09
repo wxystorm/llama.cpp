@@ -221,6 +221,35 @@ class Handler(socketserver.StreamRequestHandler):
             pass
 
 
+def serve_stdio(service: Service) -> int:
+    """Internal worker for the *existing* ggml-rpc port 50052.
+
+    The RPC server owns the network listener and forwards only bounded JSON
+    frames through pipes. No second socket or exposed arbitrary shell command.
+    stdout is reserved exclusively for protocol frames; logging uses stderr.
+    """
+    print("[V2_PHONE_PROFILE] transport=RPC50052_STDIO status=READY",
+          file=sys.stderr, flush=True)
+    while True:
+        raw = sys.stdin.buffer.readline(MAX_FRAME + 1)
+        if not raw:
+            return 0
+        try:
+            request = decode(raw)
+            # The independent TCP throughput diagnostic is not a valid
+            # substitute for production ggml-rpc tensor transport.
+            if request.get("action") == "transfer":
+                raise ProfileProtocolError("USE_PRODUCTION_RPC_FOR_TRANSFERS")
+            response = service.dispatch(request)
+            if response.get("transport") == "V2_PHONE_PROFILE_SIDECAR":
+                response["transport"] = "V2_PHONE_PROFILE_RPC50052"
+        except (OSError, ValueError, ProfileProtocolError) as exc:
+            response = {"version": WIRE_VERSION, "status": "ERROR",
+                        "error": str(exc)[:3000]}
+        sys.stdout.buffer.write(encode(response))
+        sys.stdout.buffer.flush()
+
+
 class Server(socketserver.TCPServer):
     allow_reuse_address = True
     request_queue_size = 4
@@ -235,19 +264,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--exe", type=Path, required=True)
+    parser.add_argument("--stdio", action="store_true",
+                        help="serve JSON over inherited pipes, no listening port")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--token", default=os.getenv("V2_PROFILE_TOKEN", ""))
     parser.add_argument("--timeout", type=int, default=300)
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535:
-        parser.error("INVALID_PROFILE_PORT")
-    if args.bind not in ("127.0.0.1", "localhost", "::1") and \
-            len(args.token) < 16:
-        parser.error("NON_LOOPBACK_PHONE_PROFILE_REQUIRES_TOKEN_16_CHARS")
+    if not args.stdio:
+        if not 1 <= args.port <= 65535:
+            parser.error("INVALID_PROFILE_PORT")
+        if args.bind not in ("127.0.0.1", "localhost", "::1") and \
+                len(args.token) < 16:
+            parser.error("NON_LOOPBACK_PHONE_PROFILE_REQUIRES_TOKEN_16_CHARS")
     try:
         service = Service(args.model, args.exe, token=args.token,
                           timeout=args.timeout)
+        if args.stdio:
+            return serve_stdio(service)
         print("[V2_PHONE_PROFILE] model_sha256=" + service.model_sha256,
               "exe_sha256=" + service.exe_sha256,
               "runtime_sha256=" + service.runtime_sha256,
