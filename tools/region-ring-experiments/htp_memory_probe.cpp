@@ -18,7 +18,7 @@
 namespace {
 constexpr uint64_t MIB = 1024ULL * 1024;
 struct options {
-    std::vector<uint64_t> sizes {256, 512, 768, 1024, 1280, 1536, 1792, 2048};
+    std::vector<uint64_t> sizes {256, 512, 768, 1024, 1280, 1536, 1792};
     std::string mode = "both";
     uint64_t aggregate_cap_mib = 0; // 0: conservative auto cap
     bool touch_pages = false;       // optional; substantially increases pressure
@@ -28,7 +28,9 @@ uint64_t parse_u64(const std::string & s) {
     if (s.empty() || s[0] == '-') { throw std::runtime_error("INVALID_INTEGER"); }
     size_t pos = 0;
     const auto n = std::stoull(s, &pos, 10);
-    if (pos != s.size() || n == 0 || n > 8192) {
+    // Keep room for the Hexagon 4 KiB guard page when rpcmem_alloc2
+    // falls back to the signed 32-bit rpcmem_alloc API.
+    if (pos != s.size() || n == 0 || n > 1984) {
         throw std::runtime_error("INVALID_MIB_VALUE");
     }
     return n;
