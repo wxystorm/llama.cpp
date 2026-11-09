@@ -376,11 +376,15 @@ def run_matrix(args: argparse.Namespace) -> int:
             "device_id": (phone["device_id"] if phone else "PHONE_UNAVAILABLE")
                 if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
-            "rpc_transport": (phone.get("transport", "V2_PHONE_PROFILE_SIDECAR")
-                              if remote and phone else None),
             "runtime_sha256": phone["runtime_sha256"] if remote and phone
                               else None,
         }
+        # Preserve old G/C cache keys: only remote N/A identity is tied
+        # to its RPC transport. Switching off the legacy 50177 sidecar
+        # must not force 40 already measured PC samples to run again.
+        if remote and phone:
+            identity["rpc_transport"] = phone.get(
+                "transport", "V2_PHONE_PROFILE_SIDECAR")
         key = {**identity, **shape}
         destination = out / f"{backend}-L{n}-X{x}-KV{kv}.json"
         if not args.update and valid_cached(destination, key,
