@@ -1293,7 +1293,7 @@ public:
         std::vector<weight_bank_region> regions;
         for (const auto & item : banked_layers_) {
             regions.push_back({item.region, static_cast<int>(item.layer),
-                static_cast<int>(item.layer + 1), item.bytes});
+                static_cast<int>(item.layer_end), item.bytes});
         }
         weight_banks_.reset();
         if (!weight_banks_.configure(regions, 0, 0,
