@@ -4924,13 +4924,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 r, stages[r].layer_begin, stages[r].layer_end,
                 htp ? "HTP0" : "GPUOpenCL");
         }
-        if (opencl_regions == 0) {
-            LLAMA_LOG_ERROR(
-                "[PHONE_MIXED_BACKENDS] status=REJECT "
-                "reason=NO_PHONE_OPENCL_REGION\n");
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
+        // A suffix is optional. Previous NPU-only P1 Region plans already
+        // use the same Phone-owned HTP KV/Chunk registration and final P2C
+        // return; do not reject them solely for lacking OpenCL Regions.
+        LLAMA_LOG_INFO(
+            "[PHONE_MIXED_BACKENDS] htp_regions=%zu opencl_regions=%zu "
+            "mode=%s status=READY\n",
+            phone_mixed_htp_regions.size(), opencl_regions,
+            opencl_regions == 0 ? "HTP_ONLY" : "HTP_OPENCL");
         for (uint32_t region : phone_mixed_htp_regions) {
             if (region >= stages.size()) {
                 LLAMA_LOG_ERROR(
