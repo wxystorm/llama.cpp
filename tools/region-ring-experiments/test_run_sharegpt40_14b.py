@@ -30,7 +30,7 @@ class RunnerTests(unittest.TestCase):
             (self.prompts/p).write_text('hello '+p)
         self.out = self.root/'results'
         self.base = ['--exe', str(self.exe), '--model', str(self.model), '--rpc', 'local:50052',
-                     '--prompt-dir', str(self.prompts), '--out', str(self.out), '--delay', '0']
+                     '--prompt-dir', str(self.prompts), '--out', str(self.out), '--delay', '0', '--fixed-chunks']
         FakePopen.calls.clear()
         self.patch = patch.object(mod.subprocess, 'Popen', FakePopen)
         self.patch.start(); self.addCleanup(self.patch.stop)
@@ -121,6 +121,31 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             mod.main(self.base+['--context','3072'])
         self.assertEqual(len(FakePopen.calls),1)
+
+    def test_profile_cached_once_and_chunk_dag(self):
+        planned_args = list(self.base)
+        planned_args.remove('--fixed-chunks')
+        def fake_extract(folder, x):
+            return {
+                'width': x, 'stages': [
+                    dict(device='GPU', layers=9, tokens=x, ms=9 + x * 0.1),
+                    dict(device='GPU', layers=10, tokens=x, ms=10 + x * 0.1),
+                    dict(device='PHONE', layers=1, tokens=x, ms=2 + x * 0.08),
+                ], 'push': [dict(tokens=x, ms=0.5 + x * 0.01)],
+                'bank_refill_ms': {'4': 200.0, '6': 220.0},
+            }
+        with patch.object(mod.chunk_dag, 'extract_probe', side_effect=fake_extract):
+            self.assertEqual(mod.main(planned_args + ['--limit', '1']), 0)
+        self.assertEqual(len(FakePopen.calls), 4)  # 3 probes + 1 real prompt
+        self.assertTrue((self.out / 'profile' / 'chunk-profile.json').is_file())
+        plan = json.loads((self.out / 'prompt_128_01' / 'plan.json').read_text())
+        self.assertEqual(plan['layout_fixed'], mod.chunk_dag.LAYOUT)
+        self.assertIn(plan['xg'], mod.chunk_dag.GRID)
+        self.assertIn(plan['xp'], mod.chunk_dag.GRID)
+        self.assertEqual(mod.main(planned_args), 0)
+        self.assertEqual(len(FakePopen.calls), 7)
+        self.assertEqual(mod.main(planned_args), 0)
+        self.assertEqual(len(FakePopen.calls), 7)
 
 if __name__ == '__main__':
     unittest.main()

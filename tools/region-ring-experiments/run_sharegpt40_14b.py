@@ -23,6 +23,7 @@ from types import SimpleNamespace
 
 from run_prompt_sweep import (git_head, result_row, write_phone_copy_timeline,
                               write_phone_input_push_timeline)
+import chunk_dag
 
 PATTERN = re.compile(r"^prompt_(128|256|512|1024)_(\d{2})\.txt$", re.I)
 LAYOUT = "G9,P1,G9,P1,G9,P1,G10"
@@ -36,7 +37,8 @@ SEED = 1234
 FIELDS = (
     "prompt_file", "group", "attempt", "status", "actual_prefill_tokens",
     "prefill_ms", "prefill_tps", "actual_decode_tokens", "decode_ms",
-    "decode_tps", "exit_code", "commit", "run_dir",
+    "decode_tps", "xg", "xp", "predicted_dag_ms",
+    "exit_code", "commit", "run_dir",
 )
 
 # Explicit PC configuration to avoid inheriting an older run's layout/mode.
@@ -64,6 +66,7 @@ RING_ENV = {
     "LLAMA_REGION_RING_PRIORITY_BANK_MOVER": "1",
     "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH": "1",
     "LLAMA_REGION_RING_TASK_TRACE": "1",
+    "LLAMA_REGION_RING_COALESCE_TINY_TAIL": "1",
 }
 
 
@@ -132,7 +135,8 @@ def archive(out: Path, folder: Path, previous: dict) -> int:
 
 
 def run_prompt(args: argparse.Namespace, out: Path, group: int,
-               prompt: Path, attempt: int, commit: str) -> tuple[dict, bool]:
+               prompt: Path, attempt: int, commit: str,
+               plan: dict | None = None) -> tuple[dict, bool]:
     folder = out / prompt.stem
     folder.mkdir()
     env = os.environ.copy()
@@ -140,6 +144,9 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         if key.startswith(("LLAMA_HYBRID_REGION_RING_", "LLAMA_REGION_RING_")):
             env.pop(key)
     env.update(RING_ENV)
+    if plan is not None:
+        env["LLAMA_HYBRID_REGION_RING_FORCE_XG"] = str(plan["xg"])
+        env["LLAMA_HYBRID_REGION_RING_FORCE_XP"] = str(plan["xp"])
     env["LLAMA_HYBRID_REGION_RING_PLAN_TOKENS"] = str(group)
     env["LLAMA_REGION_RING_METRICS_FILE"] = str(folder / "metrics.jsonl")
     command = [
@@ -149,6 +156,8 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         "-n", str(PREDICT), "-t", str(THREADS), "--seed", str(SEED),
         "--no-conversation", "-f", str(prompt), "-lv", "4", "--no-mmap",
     ]
+    if plan is not None:
+        atomic_json(folder / "plan.json", plan)
     atomic_json(folder / "config.json", {
         "command": command, "cwd": str(args.root), "commit": commit,
         "attempt": attempt, "prompt_sha256": hashlib.sha256(prompt.read_bytes()).hexdigest(),
@@ -182,6 +191,9 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     row = result_row(base_args, folder, prompt, group, args.context,
                      code, elapsed, commit)
     row.update(attempt=attempt, group=group,
+               xg=(plan or {}).get("xg", CHUNK),
+               xp=(plan or {}).get("xp", CHUNK),
+               predicted_dag_ms=(plan or {}).get("predicted_dag_ms"),
                finished_utc=datetime.now(timezone.utc).isoformat())
     if interrupted:
         row["status"] = "INTERRUPTED"
@@ -189,6 +201,66 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     write_phone_copy_timeline(folder)
     atomic_json(folder / "result.json", row)
     return row, interrupted
+
+
+def ensure_chunk_profile(args: argparse.Namespace, prompts: list[tuple[int, Path]],
+                         commit: str) -> dict:
+    """Run the full fixed-layout profile *once*, cache verified real traces."""
+    candidates = tuple(x for x in chunk_dag.GRID if x <= 128)
+    representative = next(((g, p) for g, p in prompts if g == 512), None)
+    if representative is None:
+        representative = min(prompts, key=lambda pair: abs(pair[0] - 512))
+    group, prompt = representative
+    profile_dir = args.out / "profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = profile_dir / "chunk-profile.json"
+    signature = dict(schema=1, model=str(args.model),
+                     model_size=args.model.stat().st_size,
+                     executable=str(args.exe), rpc=args.rpc,
+                     prompt_sha256=hashlib.sha256(prompt.read_bytes()).hexdigest(),
+                     prompt=prompt.name, context=args.context,
+                     grid=list(candidates), fixed_layout=chunk_dag.LAYOUT)
+    existing = read_json(profile_path)
+    if not args.update_profile and existing.get("signature") == signature:
+        if len(existing.get("probes", [])) == len(candidates):
+            print(f"[PROFILE] REUSE {profile_path}", flush=True)
+            return existing
+    probes = []
+    for x in candidates:
+        probe_dir = profile_dir / "probes" / f"x{x}"
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        folder = probe_dir / prompt.stem
+        previous = read_json(folder / "result.json")
+        sha = hashlib.sha256(prompt.read_bytes()).hexdigest()
+        if (folder.exists() and
+            (args.update_profile or previous.get("status") != "PASS" or
+             previous.get("prompt_sha256") != sha)):
+            attempt = archive(probe_dir, folder, previous)
+        else:
+            attempt = 1
+        if not folder.exists():
+            print(f"[PROFILE] measure G/P X={x} using {prompt.name}", flush=True)
+            # Probe is fixed-layout. Only device Chunk widths change.
+            probe_plan = {"xg": x, "xp": x, "profile_probe": True}
+            row, interrupted = run_prompt(args, probe_dir, group, prompt,
+                                          attempt, commit, probe_plan)
+            if interrupted or row["status"] != "PASS":
+                raise RuntimeError(f"Chunk profile failed at X={x}: {folder}")
+        probes.append(chunk_dag.extract_probe(folder, x))
+    profile = {"signature": signature, "probes": probes,
+               "saved_utc": datetime.now(timezone.utc).isoformat()}
+    if args.update_profile and profile_path.exists():
+        history = profile_dir / "history"
+        history.mkdir(exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        old = history / f"chunk-profile-{stamp}.json"
+        if old.exists():
+            old = history / f"chunk-profile-{stamp}-{os.getpid()}.json"
+        shutil.copy2(profile_path, old)
+    atomic_json(profile_path, profile)
+    print(f"[PROFILE] READY points={sum(len(x['stages']) for x in probes)} "
+          f"stored={profile_path}", flush=True)
+    return profile
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,6 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--prompt-dir", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--context", type=int, default=CONTEXT)
+    ap.add_argument("--fixed-chunks", action="store_true",
+                    help="disable cached-profile DAG planning; use XG=XP=128")
+    ap.add_argument("--update-profile", action="store_true",
+                    help="rerun the one-time Chunk calibration, keep old probe history")
     ap.add_argument("--only", action="append", default=[], metavar="PROMPT",
                     help="run only named prompts (unless already PASS)")
     ap.add_argument("--rerun", action="append", default=[], metavar="PROMPT",
@@ -238,6 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         "batch": BATCH, "ubatch": UBATCH, "n_predict": PREDICT,
         "threads": THREADS, "seed": SEED, "no_mmap": True,
         "ring_environment": RING_ENV,
+        "chunk_planning": "FIXED_128" if args.fixed_chunks else "PROFILE_DAG_V1",
     }
     config_path = args.out / "run-config.json"
     if config_path.exists() and read_json(config_path) != configuration:
@@ -249,6 +326,9 @@ def main(argv: list[str] | None = None) -> int:
         args.out.mkdir(parents=True, exist_ok=True)
         if not config_path.exists():
             atomic_json(config_path, configuration)
+    profile = None
+    if not args.fixed_chunks and not args.dry_run:
+        profile = ensure_chunk_profile(args, prompts, commit)
     launched = 0
     stopped = False
     for index, (group, prompt) in enumerate(prompts):
@@ -275,7 +355,15 @@ def main(argv: list[str] | None = None) -> int:
             continue
         attempt = archive(args.out, folder, previous) if folder.exists() else 1
         print(f"[{launched + 1}] RUN {prompt.name} group={group} attempt={attempt} reason={reason}", flush=True)
-        row, interrupted = run_prompt(args, args.out, group, prompt, attempt, commit)
+        plan = None
+        if profile is not None:
+            measured = chunk_dag.manifest_tokens(args.prompt_dir / "manifest.csv", prompt.name)
+            plan_tokens = measured or {128: 192, 256: 384, 512: 768, 1024: 1500}[group]
+            plan = chunk_dag.choose(profile, plan_tokens)
+            plan["token_source"] = "manifest" if measured else "group_midpoint_estimate"
+            print(f"  [DAG] tokens~{plan_tokens} XG={plan['xg']} "
+                  f"XP={plan['xp']} predicted={plan['predicted_dag_ms']}ms", flush=True)
+        row, interrupted = run_prompt(args, args.out, group, prompt, attempt, commit, plan)
         launched += 1
         summary(args.out, prompts)
         print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s ",

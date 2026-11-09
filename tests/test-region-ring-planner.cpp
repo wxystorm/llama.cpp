@@ -55,6 +55,25 @@ static model mock_profile() {
 }
 
 int main() {
+    // Tiny-tail coalescence must remain a uniform Phone-compatible width,
+    // even though logically it removes one very small final Chunk.
+    REQUIRE(llama_region_ring_coalesced_chunk_width(512, 128) == 128);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(513, 128) == 129);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(257, 128) == 129);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(511, 128) == 128);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(160, 128) == 160);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(161, 128) == 128);
+    REQUIRE(llama_region_ring_coalesced_chunk_width(10, 128) == 128);
+    for (int tokens = 1; tokens <= 4096; ++tokens) {
+        for (const int width : {32, 64, 96, 128}) {
+            const int adjusted = llama_region_ring_coalesced_chunk_width(
+                tokens, width);
+            REQUIRE(adjusted >= width && adjusted <= width + width / 4);
+            const int count = (tokens + adjusted - 1) / adjusted;
+            REQUIRE(count >= 1);
+            REQUIRE((count - 1) * adjusted < tokens);
+        }
+    }
     // Service costs are real Stage samples, distinct from DAG queue wait.
     {
         const char * file = "region-ring-real-stage-profile-test.csv";

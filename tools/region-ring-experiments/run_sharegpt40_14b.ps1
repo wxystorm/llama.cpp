@@ -5,7 +5,7 @@ param(
     [string] $Model = "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
     [string] $Rpc = "10.39.52.114:50052",
     [string] $PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
-    [string] $Out = "E:\llama\sharegpt40-14b-g10-results",
+    [string] $Out = "E:\llama\sharegpt40-14b-chunk-dag-results",
     [string] $Exe = "",
     [int] $Context = 4096,
     [string[]] $Only = @(),
@@ -13,7 +13,9 @@ param(
     [double] $RerunBelow = 0,
     [int] $Limit = 0,
     [double] $Delay = 2,
-    [switch] $DryRun
+    [switch] $DryRun,
+    [switch] $FixedChunks,
+    [switch] $UpdateProfile
 )
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -36,5 +38,7 @@ $callArgs = @(
 foreach ($name in $Only) { $callArgs += @("--only", $name) }
 foreach ($name in $Rerun) { $callArgs += @("--rerun", $name) }
 if ($DryRun) { $callArgs += "--dry-run" }
+if ($FixedChunks) { $callArgs += "--fixed-chunks" }
+if ($UpdateProfile) { $callArgs += "--update-profile" }
 & $python.Source @callArgs
 exit $LASTEXITCODE

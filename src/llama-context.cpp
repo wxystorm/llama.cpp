@@ -3741,7 +3741,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         llama_memory_context_i * mctx,
         ggml_backend_sched_t sched_use,
         llm_graph_result * res_use,
-        const std::vector<llama_hybrid_runtime_stage> & stages,
+        const std::vector<llama_hybrid_runtime_stage> & planned_stages,
         int ubatch_id,
         bool device_fifo_simulation,
         bool isolate_device_resources,
@@ -3751,6 +3751,30 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         bool audit_backend_resources,
         bool pc_phone_overlap,
         ggml_status & ret) {
+    // Preserve the model-owned layer allocation; only a short tail's Chunk
+    // width may change. The adjusted stages are shared by READY, GPU graph
+    // builders, Phone-owned Plan descriptors, and RPC graph registration.
+    std::vector<llama_hybrid_runtime_stage> stages = planned_stages;
+    const char * coalesce_env =
+        std::getenv("LLAMA_REGION_RING_COALESCE_TINY_TAIL");
+    if (coalesce_env != nullptr && std::strcmp(coalesce_env, "1") == 0 &&
+            ubatch.n_tokens > 1) {
+        for (auto & stage : stages) {
+            const int requested = stage.macro_tokens;
+            const int actual = llama_region_ring_coalesced_chunk_width(
+                (int) ubatch.n_tokens, requested);
+            if (actual != requested) {
+                stage.macro_tokens = actual;
+                LLAMA_LOG_INFO(
+                    "[REGION_RING_TAIL_COALESCE] device=%s "
+                    "layers=[%d,%d) tokens=%u requested=%d actual=%d "
+                    "policy=UNIFORM_WIDEN_TO_REDUCE_CHUNKS status=READY\n",
+                    llama_hybrid_runtime_stage_name(stage.kind),
+                    stage.layer_begin, stage.layer_end, ubatch.n_tokens,
+                    requested, actual);
+            }
+        }
+    }
     auto * kv_mctx = dynamic_cast<llama_kv_cache_context *>(mctx);
     // Automatic Region Ring still searches 2..4 G/C/P Cycles (>= 6 stages),
     // but deterministic APPLY_WIDE A/B may execute one logical Cycle. After

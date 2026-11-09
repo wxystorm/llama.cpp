@@ -1035,6 +1035,29 @@ inline int llama_region_ring_directional_layer_count(
     return count;
 }
 
+// Phone-owned Plan v2/v3 encodes one uniform Chunk width, so arbitrary
+// last-Chunk merging would desynchronize PC/Phone (region, chunk) identities.
+// Instead, if the tiny remainder is <= 1/4 of the requested width, widen
+// the uniform width just enough to use one fewer Chunk. This redistributes
+// the old last two Chunks without exceeding 1.25x the requested width.
+// Example: tokens=513, X=128 => Xeff=129 => [129,129,129,126].
+// All regions independently derive this using the actual UBatch token count.
+inline int llama_region_ring_coalesced_chunk_width(
+        int n_tokens, int chunk_tokens) {
+    if (n_tokens <= 0 || chunk_tokens <= 0) {
+        return chunk_tokens;
+    }
+    const int full = n_tokens / chunk_tokens;
+    const int tail = n_tokens % chunk_tokens;
+    const int threshold = chunk_tokens / 4;
+    if (full == 0 || tail == 0 || tail > threshold) {
+        return chunk_tokens;
+    }
+    const int effective_width = (n_tokens + full - 1) / full;
+    return effective_width <= chunk_tokens + threshold ?
+        effective_width : chunk_tokens;
+}
+
 struct llama_region_ring_task {
     size_t region = 0;
     size_t chunk = 0;
