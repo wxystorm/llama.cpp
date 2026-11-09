@@ -218,6 +218,17 @@ public:
         return bytes > 0;
     }
 
+    bool workspace_bytes(char backend, int layers,
+                         size_t & bytes) const {
+        bytes = 0;
+        for (const auto & p : points_) {
+            if (p.backend == backend && p.layers == layers) {
+                bytes = std::max(bytes, p.workspace_bytes);
+            }
+        }
+        return bytes > 0;
+    }
+
     // One conservative HTP Bank refill event, not a measured overlap
     // percentage. Reject extrapolation beyond measured HTP weight sizes.
     bool npu_refill_ms(size_t bytes, double & cost) const {
