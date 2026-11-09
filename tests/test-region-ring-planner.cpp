@@ -275,6 +275,53 @@ int main() {
             spill.regions, spill.npu_region_indices,
             npu_weight_bytes, adreno_weight_bytes,
             10, 5, 20, 20, 30, 100, 509, footprint));
+        // Measured HTP policy: memory is allocated for EACH prebuilt
+        // Chunk graph, and each physical N Stage must include KV + graph
+        // storage + activation reserve within its 1536 MiB footprint.
+        {
+            constexpr size_t MiB = size_t(1024) * 1024;
+            std::vector<llama_region_ring_region> npu_regions {
+                {device::GPU,   0, 2},
+                {device::PHONE, 2, 4},
+                {device::GPU,   4, 6},
+                {device::PHONE, 6, 8},
+            };
+            const std::vector<size_t> npu_indices {1, 3};
+            const auto npu_weights = [](int b, int e, size_t & bytes) {
+                if (b < 0 || e <= b) { return false; }
+                bytes = 700 * size_t(1024) * 1024 * size_t(e - b);
+                return true;
+            };
+            const auto adreno_weights = [](int, int, size_t & bytes) {
+                bytes = 0;
+                return true;
+            };
+            const auto per_npu_graph = [](int b, int e, size_t & bytes) {
+                if (b < 0 || e <= b) { return false; }
+                bytes = 60 * size_t(1024) * 1024;
+                return true;
+            };
+            REQUIRE(phone_spill_memory_feasible(
+                npu_regions, npu_indices, npu_weights, adreno_weights,
+                8 * MiB, 0, 120 * MiB, 0, 0,
+                1536 * MiB, 7 * size_t(1024) * MiB, footprint,
+                8 * MiB, per_npu_graph));
+            REQUIRE(footprint.weight_policy ==
+                llama_ring_v2::npu_weight_policy::RESIDENT);
+            REQUIRE(footprint.resident_npu_weight_bytes == 2800 * MiB);
+            // A large per-region graph would make this Cycle exceed
+            // 1536 MiB despite the repacked weights fitting alone.
+            const auto large_graph = [](int b, int e, size_t & bytes) {
+                if (b < 0 || e <= b) { return false; }
+                bytes = 120 * size_t(1024) * 1024;
+                return true;
+            };
+            REQUIRE(!phone_spill_memory_feasible(
+                npu_regions, npu_indices, npu_weights, adreno_weights,
+                8 * MiB, 0, 240 * MiB, 0, 0,
+                1536 * MiB, 7 * size_t(1024) * MiB, footprint,
+                8 * MiB, large_graph));
+        }
         const auto no_adreno = [](int, int) { return false; };
         REQUIRE(!choose_phone_npu_preferred_spill(
             logical, 1, npu_one_only, no_adreno,
