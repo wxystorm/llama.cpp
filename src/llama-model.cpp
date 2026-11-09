@@ -1864,8 +1864,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 ((apply_wide || ring_regions.size() == 9) &&
                  selected_topology_ok &&
                  !ring_regions.empty() &&
-                 ring_regions.back().device ==
-                     llama_region_ring_device::PHONE) :
+                 (apply_wide || ring_regions.back().device ==
+                     llama_region_ring_device::PHONE)) :
                 (llama_region_ring_apply_safe_phone_shape(original) &&
                  llama_region_ring_apply_safe_compatible(
                      original, ring_regions));
