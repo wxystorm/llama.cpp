@@ -7512,11 +7512,18 @@ bool rpc_server::phone_owned_plan_register(
     plan.rope_beta_slow = request.rope_beta_slow;
 
     const char * reason = "NONE";
-    if (!ggml_phone_owned::validate(plan, reason)) {
+    if (plan.region >= ggml_phone_owned::k_wire_region_limit ||
+            !ggml_phone_owned::validate(plan, reason)) {
         GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
                        " region=%u reason=%s\n",
                        plan.run_id, plan.region, reason);
         return false;
+    }
+    std::vector<ggml_phone_owned::region_plan> child_plans;
+    for (uint32_t offset = 0;
+            offset < ggml_phone_owned::layer_count(plan); ++offset) {
+        child_plans.push_back(
+            ggml_phone_owned::single_layer_plan(plan, offset));
     }
     if (!ggml_phone_npu_serial::htp_region(
             phone_npu_serial_regions, plan.region) ||
@@ -7543,24 +7550,26 @@ bool rpc_server::phone_owned_plan_register(
     const bool local_builder_check = local_builder_env != nullptr &&
         std::strcmp(local_builder_env, "1") == 0;
     if (local_builder_check) {
+        for (const auto & child : child_plans) {
         ggml_phone_npu_serial::full_region_executor::
             local_graph_shadow_stats stats {};
         std::string why;
         const int64_t begin_us = ggml_time_us();
         const bool built = phone_npu_executor->validate_owned_local_graphs(
-            plan, why, stats);
+            child, why, stats);
         GGML_LOG_INFO(
             "[PHONE_QWEN3_LOCAL] event=GRAPH_BUILD run=%" PRIu64
             " region=%u layer=%u chunks=%u graph_nodes=%zu "
             "kv_writes=%zu flash_nodes=%zu rope_nodes=%zu "
             "builder_ms=%.3f mode=SHADOW_NO_HTP_ALLOC status=%s reason=%s\n",
-            plan.run_id, plan.region, plan.layer,
+            plan.run_id, plan.region, child.layer,
             stats.chunks, stats.total_nodes, stats.kv_writes,
             stats.flash_nodes, stats.rope_nodes,
             (ggml_time_us() - begin_us) / 1000.0,
             built ? "PASS" : "FAIL",
             built ? "NONE" : why.c_str());
         if (!built) { return false; }
+        }
     }
     // Explicit precompile A/B. Prepared HTP graphs do not consume streamed
     // activations yet: the proven PC Graph remains the only compute owner.
@@ -7641,26 +7650,52 @@ bool rpc_server::phone_owned_plan_register(
         return false;
     }
     if (precompile_requested) {
+        const int64_t begin_us = ggml_time_us();
+        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        for (const auto & child : child_plans) {
         ggml_phone_npu_serial::full_region_executor::
             local_htp_prepare_stats stats {};
         std::string why;
-        const int64_t begin_us = ggml_time_us();
-        std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
+        // A Session has a distinct weight mapping. Lazily populate any
+        // missing layers from the local GGUF instead of assuming that
+        // GGML_HEXAGON_NDEV copies weights between FastRPC sessions.
+        ggml_phone_npu_serial::full_region_executor::
+            model_load_stats loaded {};
+        std::string load_reason;
+        const bool resident = phone_npu_executor->load_model_layer(
+            local_tensor_source, child.layer, load_reason, loaded);
+        if (!resident) {
+            GGML_LOG_WARN(
+                "[PHONE_NPU_SESSION] event=ON_DEMAND_LOAD"
+                " region=%u layer=%u backend=%s"
+                " status=FALLBACK reason=%s\n",
+                plan.region, child.layer,
+                phone_npu_name_for_region(plan.region),
+                load_reason.c_str());
+        }
         const bool precompiled = phone_npu_executor->prepare_owned_htp_graphs(
-            plan, why, stats);
+            child, why, stats);
         GGML_LOG_INFO(
             "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
             " region=%u layer=%u chunks=%u graph_nodes=%zu"
             " kv_bytes=%zu graph_storage_bytes=%zu"
             " compile_ms=%.3f wall_ms=%.3f"
             " mode=SHADOW_FIXED_STORAGE status=%s reason=%s\n",
-            plan.run_id, plan.region, plan.layer, stats.chunks,
+            plan.run_id, plan.region, child.layer, stats.chunks,
             stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
             stats.precompile_ms,
             (ggml_time_us() - begin_us) / 1000.0,
             precompiled ? "PASS" : "FAIL",
             precompiled ? "NONE" : why.c_str());
         if (!precompiled) { return false; }
+        }
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SERIAL] event=REGION_CHAIN_READY"
+            " region=%u first_layer=%u layers=%zu backend=%s"
+            " wall_ms=%.3f status=READY\n",
+            plan.region, plan.layer, child_plans.size(),
+            phone_npu_name_for_region(plan.region),
+            (ggml_time_us() - begin_us) / 1000.0);
     }
     // Shadow-only: avoid racing the existing Graph and NPU life cycle.
     std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
@@ -7672,12 +7707,13 @@ bool rpc_server::phone_owned_plan_register(
     }
     GGML_LOG_INFO("[PHONE_OWNED_PLAN] event=REGISTER run=%" PRIu64
                   " p2c_run=%" PRIu64
-                  " region=%u layer=%u chunks=%u chunk_tokens=%u"
+                  " region=%u layer=%u layers=%zu chunks=%u chunk_tokens=%u"
                   " n_embd=%u pos=%u kv_capacity=%u"
                   " graph_mode=%s local_builder=%s"
                   " local_htp=%s status=READY\n",
                   plan.run_id, plan.p2c_run_id, plan.region,
-                  plan.layer, ggml_phone_owned::chunk_count(plan),
+                  plan.layer, child_plans.size(),
+                  ggml_phone_owned::chunk_count(plan),
                   plan.chunk_tokens, plan.n_embd,
                   plan.position_base, plan.kv_capacity,
                   local_only_requested ? "PHONE_LOCAL_HTP_PC_METADATA" :
