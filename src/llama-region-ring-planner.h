@@ -283,7 +283,8 @@ inline bool phone_spill_memory_feasible(
         size_t npu_workspace, size_t adreno_workspace,
         size_t host_stage_reserve, size_t max_htp_bank_bytes,
         size_t phone_budget_bytes,
-        phone_spill_memory & out) {
+        phone_spill_memory & out,
+        size_t npu_activation_bytes = 0) {
     out = {};
     if (regions.empty() || !npu_weight_bytes ||
             !adreno_weight_bytes ||
@@ -295,6 +296,7 @@ inline bool phone_spill_memory_feasible(
     long double npu_kv = 0.0L, adreno_kv = 0.0L;
     long double adreno_weights = 0.0L;
     std::vector<size_t> npu_stage_weights;
+    std::vector<size_t> npu_stage_auxiliary;
     size_t next_npu_index = 0;
     for (size_t i = 0; i < regions.size(); ++i) {
         const auto & r = regions[i];
@@ -319,8 +321,22 @@ inline bool phone_spill_memory_feasible(
             const size_t bank = npu_rank++ % 2;
             out.npu_bank_weights[bank] =
                 std::max(out.npu_bank_weights[bank], weight);
+            // A Cycle must fit its NPU *working set*, not just its weight
+            // arena: charge this Region's KV, peak NPU graph workspace
+            // and activation-slot reserve against the 1536 MiB limit.
+            if (layers > SIZE_MAX / std::max<size_t>(1, npu_kv_per_layer)) {
+                return false;
+            }
+            const size_t region_kv = layers * npu_kv_per_layer;
+            if (region_kv > SIZE_MAX - npu_workspace ||
+                    region_kv + npu_workspace >
+                        SIZE_MAX - npu_activation_bytes) {
+                return false;
+            }
             npu_stage_weights.push_back(weight);
-            npu_kv += (long double) layers * npu_kv_per_layer;
+            npu_stage_auxiliary.push_back(
+                region_kv + npu_workspace + npu_activation_bytes);
+            npu_kv += (long double) region_kv;
         } else {
             if (!adreno_weight_bytes(r.layer_begin, r.layer_end, weight) ||
                     weight == 0) {
@@ -337,7 +353,8 @@ inline bool phone_spill_memory_feasible(
     }
     const long double overhead =
         (long double) npu_workspace + adreno_workspace +
-        host_stage_reserve;
+        host_stage_reserve + (npu_stage_weights.empty() ?
+            0 : npu_activation_bytes);
     const long double adreno_resident = adreno_weights + adreno_kv +
         (long double) adreno_workspace;
     const long double max_size =
@@ -349,8 +366,11 @@ inline bool phone_spill_memory_feasible(
     }
     llama_ring_v2::npu_memory_request request;
     request.stage_weight_bytes = std::move(npu_stage_weights);
+    request.stage_auxiliary_bytes = std::move(npu_stage_auxiliary);
     request.npu_kv_bytes = (size_t) npu_kv;
     request.npu_graph_workspace_bytes = npu_workspace;
+    request.npu_activation_bytes =
+        request.stage_weight_bytes.empty() ? 0 : npu_activation_bytes;
     request.adreno_resident_bytes = (size_t) adreno_resident;
     request.host_stage_bytes = host_stage_reserve;
     request.phone_budget_bytes = phone_budget_bytes;
