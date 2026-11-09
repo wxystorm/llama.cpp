@@ -10900,14 +10900,31 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
+        // The legacy G/C/P baseline is not guaranteed to have an
+        // executable N/A spill (e.g. missing a second HTP Region). Its
+        // failure must not veto a *different* native N/A candidate that
+        // already passed full-DAG scoring and runtime memory checks.
+        const bool native_na = (bool) model.phone_stage_allocation;
         if (!force_ab_requested &&
-                (!result.valid || !result.baseline_valid ||
-                 !(result.baseline.wall_ms > 0.0))) {
+                !llama_ring_planner::runtime_plan_eligible_for_apply(
+                    result, native_na)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
                 "reason=NO_SCOREABLE_RUNTIME_PLAN "
-                "status=KEEP_BASELINE\n");
+                "candidate_valid=%d baseline_valid=%d native_na=%d "
+                "status=KEEP_BASELINE\n",
+                result.valid ? 1 : 0,
+                result.baseline_valid ? 1 : 0,
+                native_na ? 1 : 0);
             return false;
+        }
+        if (!force_ab_requested && native_na && !result.baseline_valid) {
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_BASELINE] status=UNSCOREABLE "
+                "reason=LEGACY_GCP_BASELINE_NOT_EXECUTABLE_AS_GCNA "
+                "candidate_valid=%d candidates=%zu "
+                "action=APPLY_VALID_NATIVE_CANDIDATE\n",
+                result.valid ? 1 : 0, result.top.size());
         }
 
         for (size_t i = 0; i < result.top.size(); ++i) {
@@ -11366,8 +11383,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             std::isfinite(result.baseline.wall_ms) &&
             result.baseline.wall_ms > 0.0 ?
                 result.baseline.wall_ms : -1.0;
+        // A missing legacy baseline cannot define a relative speedup.
+        // Keep the selected native runtime plan, but report gain=N/A (-1).
         const double improvement_pct = baseline_ms > 0.0 ?
-            100.0 * (baseline_ms - best.wall_ms) / baseline_ms : 0.0;
+            100.0 * (baseline_ms - best.wall_ms) / baseline_ms : -1.0;
         double min_gain_pct = 2.0;
         if (const char * raw = std::getenv(
                 "LLAMA_HYBRID_REGION_RING_PLAN_MIN_GAIN_PCT")) {
@@ -11465,6 +11484,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 std::ofstream metrics(metrics_path, std::ios::app);
                 if (metrics) {
                     const bool accepted = forced_ab ||
+                        (bool) model.phone_stage_allocation ||
                         (!identical && improvement_pct >= min_gain_pct);
                     metrics << std::fixed << std::setprecision(4)
                             << "{\"type\":\"planner\","
