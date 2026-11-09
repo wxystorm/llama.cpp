@@ -958,33 +958,40 @@ public:
             // until the previous rank-k Region drains and rank-k+2 refills.
         }
 
-        ggml_phone_qwen3::layer_weights w {};
-        const auto load = [&](const char * suffix) -> ggml_tensor * {
-            char name[GGML_MAX_NAME] = {};
-            std::snprintf(name, sizeof(name), "blk.%u.%s", plan.layer, suffix);
-            for (const auto & entry : model_weights_) {
-                ggml_tensor * t = entry.second->tensor;
-                if (t && std::strcmp(t->name, name) == 0 &&
-                        t->buffer && t->data) {
-                    return t;
+        std::vector<ggml_phone_qwen3::layer_weights> all_weights;
+        all_weights.reserve(plan.layer_end - plan.layer);
+        for (uint32_t il = plan.layer; il < plan.layer_end; ++il) {
+            const auto load = [&](const char * suffix) -> ggml_tensor * {
+                char name[GGML_MAX_NAME] = {};
+                std::snprintf(name, sizeof(name), "blk.%u.%s", il, suffix);
+                for (const auto & entry : model_weights_) {
+                    ggml_tensor * t = entry.second->tensor;
+                    if (t && std::strcmp(t->name, name) == 0 &&
+                            t->buffer && t->data) {
+                        return t;
+                    }
                 }
+                return nullptr;
+            };
+            ggml_phone_qwen3::layer_weights w {};
+            w.attn_norm = load("attn_norm.weight");
+            w.wq = load("attn_q.weight");
+            w.wk = load("attn_k.weight");
+            w.wv = load("attn_v.weight");
+            w.wo = load("attn_output.weight");
+            w.ffn_norm = load("ffn_norm.weight");
+            w.ffn_gate = load("ffn_gate.weight");
+            w.ffn_up = load("ffn_up.weight");
+            w.ffn_down = load("ffn_down.weight");
+            w.q_norm = load("attn_q_norm.weight");
+            w.k_norm = load("attn_k_norm.weight");
+            ggml_phone_owned::region_plan one = plan;
+            one.layer = il;
+            if (!ggml_phone_qwen3::validate_weights(one, w, why)) {
+                reason = std::string("PHONE_OWNED_HTP_WEIGHTS:") + why;
+                return false;
             }
-            return nullptr;
-        };
-        w.attn_norm = load("attn_norm.weight");
-        w.wq = load("attn_q.weight");
-        w.wk = load("attn_k.weight");
-        w.wv = load("attn_v.weight");
-        w.wo = load("attn_output.weight");
-        w.ffn_norm = load("ffn_norm.weight");
-        w.ffn_gate = load("ffn_gate.weight");
-        w.ffn_up = load("ffn_up.weight");
-        w.ffn_down = load("ffn_down.weight");
-        w.q_norm = load("attn_q_norm.weight");
-        w.k_norm = load("attn_k_norm.weight");
-        if (!ggml_phone_qwen3::validate_weights(plan, w, why)) {
-            reason = std::string("PHONE_OWNED_HTP_WEIGHTS:") + why;
-            return false;
+            all_weights.push_back(w);
         }
 
         if (!reserve_owned_htp_kv(plan, reason)) {
@@ -1008,9 +1015,10 @@ public:
         // successful HTP compilation never sees prematurely released memory.
         std::vector<std::unique_ptr<owned_chunk_graph>> pending;
         pending.reserve(ggml_phone_owned::chunk_count(plan));
+        const size_t depth = plan.layer_end - plan.layer;
         const size_t graph_ctx_bytes =
-            ggml_tensor_overhead() * 1024 +
-            ggml_graph_overhead_custom(512, false) + 4096;
+            ggml_tensor_overhead() * (1024 * depth + 32) +
+            ggml_graph_overhead_custom(512 * depth, false) + 4096;
         for (uint32_t chunk = 0;
                 chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
             auto item = std::make_unique<owned_chunk_graph>();
@@ -1020,36 +1028,50 @@ public:
                 reason = "PHONE_OWNED_HTP_GRAPH_CONTEXT";
                 break;
             }
-            if (!ggml_phone_qwen3::build_graph(
-                    item->ctx.get(), plan, chunk, w, item->built, why,
-                    kv->k, kv->v)) {
+            ggml_phone_qwen3::multi_graph_result built_stage {};
+            if (!ggml_phone_qwen3::build_graph_layers(
+                    item->ctx.get(), plan, chunk, all_weights,
+                    built_stage, why, kv->layer_kv)) {
                 reason = std::string("PHONE_OWNED_HTP_BUILD:") + why;
                 break;
             }
+            item->all_layer_graphs = std::move(built_stage.layers);
+            item->built = item->all_layer_graphs.front();
+            item->built.graph = built_stage.graph;
+            item->built.input = built_stage.input;
+            item->built.output = built_stage.output;
             item->buffer.reset(ggml_backend_alloc_ctx_tensors(
                 item->ctx.get(), backend_));
             if (!item->buffer) {
                 reason = "PHONE_OWNED_HTP_GRAPH_ALLOC";
                 break;
             }
-            ggml_phone_qwen3::side_inputs side {};
-            if (!ggml_phone_qwen3::make_side_inputs(
-                    plan, chunk, side, why)) {
-                reason = std::string("PHONE_OWNED_HTP_INPUTS:") + why;
-                break;
+            bool side_ready = true;
+            for (size_t il = 0; il < item->all_layer_graphs.size(); ++il) {
+                ggml_phone_owned::region_plan layer_plan = plan;
+                layer_plan.layer += (uint32_t) il;
+                ggml_phone_qwen3::side_inputs side {};
+                if (!ggml_phone_qwen3::make_side_inputs(
+                        layer_plan, chunk, side, why)) {
+                    reason = std::string("PHONE_OWNED_HTP_INPUTS:") + why;
+                    side_ready = false;
+                    break;
+                }
+                const auto & g = item->all_layer_graphs[il];
+                ggml_backend_tensor_set(
+                    g.positions, side.positions.data(), 0,
+                    side.positions.size() * sizeof(int32_t));
+                ggml_backend_tensor_set(
+                    g.k_indices, side.k_indices.data(), 0,
+                    side.k_indices.size() * sizeof(int64_t));
+                ggml_backend_tensor_set(
+                    g.v_indices, side.v_indices.data(), 0,
+                    side.v_indices.size() * sizeof(int64_t));
+                ggml_backend_tensor_set(
+                    g.mask, side.causal_mask_f16.data(), 0,
+                    side.causal_mask_f16.size() * sizeof(uint16_t));
             }
-            ggml_backend_tensor_set(
-                item->built.positions, side.positions.data(), 0,
-                side.positions.size() * sizeof(int32_t));
-            ggml_backend_tensor_set(
-                item->built.k_indices, side.k_indices.data(), 0,
-                side.k_indices.size() * sizeof(int64_t));
-            ggml_backend_tensor_set(
-                item->built.v_indices, side.v_indices.data(), 0,
-                side.v_indices.size() * sizeof(int64_t));
-            ggml_backend_tensor_set(
-                item->built.mask, side.causal_mask_f16.data(), 0,
-                side.causal_mask_f16.size() * sizeof(uint16_t));
+            if (!side_ready) { break; }
             // Ensure fixed-position/mask bytes are visible to any backend
             // compile-time specialization before registering this graph.
             ggml_backend_synchronize(backend_);
@@ -3263,6 +3285,7 @@ private:
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
         ggml_phone_qwen3::graph_result built {};
+        std::vector<ggml_phone_qwen3::graph_result> all_layer_graphs;
         uint64_t bank_generation = 0;
         const ggml_tensor * canonical_k_indices = nullptr;
         const ggml_tensor * canonical_v_indices = nullptr;
