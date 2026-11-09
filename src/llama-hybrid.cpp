@@ -10749,8 +10749,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 (forced_counts[2] == 0 ? 1 : 0);
             if ((!single_cycle && !multi_cycle) ||
                     forced_regions.empty() ||
-                    forced_regions.back().device !=
-                        llama_region_ring_device::PHONE ||
                     (single_cycle && zero_devices > 1)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
@@ -10765,10 +10763,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
 
             forced_single_cycle = single_cycle;
+            const bool terminal_pc =
+                forced_regions.back().device !=
+                llama_region_ring_device::PHONE;
             const int cycles = single_cycle ? 1 :
                 (int) std::count_if(forced_regions.begin(),
                     forced_regions.end(), [](const auto & r) {
-                        return r.device == llama_region_ring_device::PHONE;
+                        return r.device == llama_region_ring_device::GPU;
                     });
             llama_ring_planner::candidate forced;
             forced.cycles = cycles;
@@ -10782,10 +10783,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 forced_counts[(size_t) llama_region_ring_device::CPU] :
                 first_cycle_has_cpu ?
                     forced_regions[1].layer_end - forced_regions[1].layer_begin : 0;
+            const size_t first_phone =
+                first_cycle_has_cpu ? 2 : 1;
             forced.p = single_cycle ?
                 forced_counts[(size_t) llama_region_ring_device::PHONE] :
-                forced_regions[first_cycle_has_cpu ? 2 : 1].layer_end -
-                    forced_regions[first_cycle_has_cpu ? 2 : 1].layer_begin;
+                first_phone < forced_regions.size() &&
+                forced_regions[first_phone].device ==
+                    llama_region_ring_device::PHONE ?
+                    forced_regions[first_phone].layer_end -
+                    forced_regions[first_phone].layer_begin : 0;
             forced.tail_c = 0;
             forced.tail_g = 0;
             forced.xc = force_xc;
@@ -10807,9 +10813,19 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return false;
             }
 
+            // Phone-autonomous terminal delivery is inapplicable when
+            // the final activation belongs to CPU/CUDA. Keep nonterminal
+            // Phone prebuilds and link timings when Phone is still present.
+            if (terminal_pc) {
+                model.phone_autonomous_final = false;
+                if (forced_counts[(size_t) llama_region_ring_device::PHONE] == 0) {
+                    model.phone_autonomous_prebuild = false;
+                    model.phone_autonomous_prepare_overlap = false;
+                }
+            }
             std::string force_reason;
             bool balance_ok = true;
-            if (!single_cycle) {
+            if (!single_cycle && !terminal_pc) {
                 balance_ok =
                     llama_ring_planner::estimate_region_ring_balance(
                         model, forced_regions, forced);
@@ -11018,8 +11034,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 llama_region_ring_apply_topology_compatible(
                     best_regions, model.layers);
         if (!best_topology_ok ||
-                best_regions.back().device !=
-                    llama_region_ring_device::PHONE ||
+                (!forced_ab &&
+                 best_regions.back().device !=
+                     llama_region_ring_device::PHONE) ||
                 best.tail_c != 0 || best.tail_g != 0) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
