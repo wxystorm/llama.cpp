@@ -9162,7 +9162,7 @@ void rpc_server::phone_auto_compute_loop() {
             status = ok ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
             GGML_LOG_INFO(
                 "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
-                " run=%" PRIu64 " region=%u layer=%u chunk=%u tokens=%u"
+                " run=%" PRIu64 " region=%u layer=%u layers=%u chunk=%u tokens=%u"
                 " backend=%s source=PHONE_LOCAL_HTP kv_owner=PHONE_LOCAL"
                 " input_read_ms=%.3f input_upload_ms=%.3f"
                 " htp_compute_ms=%.3f output_copy_ms=%.3f"
@@ -9170,8 +9170,10 @@ void rpc_server::phone_auto_compute_loop() {
                 " p2c=PHONE_OWNED_HOST graph_lookup=SKIPPED"
                 " status=%s reason=%s\n",
                 req.key.run_id, req.key.region, profile.layer,
+                found_plan ? ggml_phone_owned::layer_count(chain_plan) : 0u,
                 req.key.chunk, req.n_tokens,
-                phone_npu_name_for_region(req.key.region),
+                found_plan && ggml_phone_owned::layer_count(chain_plan) > 1 ?
+                    "HTP_STRIPED" : phone_npu_name_for_region(req.key.region),
                 profile.input_read_ms, profile.input_upload_ms,
                 profile.htp_compute_ms, profile.output_copy_ms,
                 ok ? "PASS" : "FAIL",
