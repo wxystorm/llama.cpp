@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -581,6 +582,89 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 std::getenv("LLAMA_REGION_RING_V2_PROFILE_CSV");
             const char * forced_layout =
                 std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+            // Explicit forced G/C/P A/B may assign selected P Regions to
+            // HTP without running the native GCNA search. The assignment
+            // becomes part of the model-owned Plan; the Phone never relies
+            // on a separately maintained Region/Layer environment list.
+            const char * forced_npu_spec =
+                std::getenv("LLAMA_REGION_RING_FORCE_NPU_REGIONS");
+            const char * forced_npu_policy =
+                std::getenv("LLAMA_REGION_RING_FORCE_NPU_POLICY");
+            const bool force_npu = forced_npu_spec && *forced_npu_spec;
+            if (force_npu) {
+                if (!ring_plan_apply_wide || !selected ||
+                        selected_layout.empty() ||
+                        !forced_layout || !*forced_layout) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_FORCE_NPU] status=REJECT "
+                        "reason=REQUIRES_APPLIED_FORCED_WIDE_LAYOUT\n");
+                    return {-1, nullptr};
+                }
+                std::set<uint32_t> npu_ids;
+                if (!llama_region_ring_parse_region_ids(
+                            forced_npu_spec, npu_ids) || npu_ids.empty()) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_FORCE_NPU] status=REJECT "
+                        "reason=INVALID_REGION_IDS\n");
+                    return {-1, nullptr};
+                }
+                std::vector<llama_region_ring_region> forced_regions;
+                try {
+                    forced_regions = llama_region_ring_parse_apply_wide_layout(
+                        selected_layout, model_ptr->hparams.n_layer());
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_FORCE_NPU] status=REJECT "
+                        "reason=INVALID_LAYOUT detail=%s\n", e.what());
+                    return {-1, nullptr};
+                }
+                for (uint32_t id : npu_ids) {
+                    if (id >= forced_regions.size() ||
+                            forced_regions[id].device !=
+                                llama_region_ring_device::PHONE ||
+                            forced_regions[id].layer_end <=
+                                forced_regions[id].layer_begin ||
+                            forced_regions[id].layer_end -
+                                forced_regions[id].layer_begin > 32) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_FORCE_NPU] status=REJECT "
+                            "reason=REGION_NOT_PHONE_OR_DEPTH_UNSUPPORTED "
+                            "region=%u\n", id);
+                        return {-1, nullptr};
+                    }
+                }
+                // The runtime and Phone enforce the 1536 MiB per-Region,
+                // 3072 MiB total NPU limits on actual HTP allocations.
+                // Resident is the default for deterministic small P1 tests;
+                // streaming must be explicitly requested for larger layouts.
+                if (!forced_npu_policy || !*forced_npu_policy ||
+                        std::strcmp(forced_npu_policy, "resident") == 0) {
+                    selected_npu_weight_policy = 1;
+                } else if (std::strcmp(
+                        forced_npu_policy, "streaming-2bank") == 0 &&
+                        npu_ids.size() >= 2) {
+                    selected_npu_weight_policy = 2;
+                } else {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_FORCE_NPU] status=REJECT "
+                        "reason=INVALID_POLICY_OR_REGION_COUNT\n");
+                    return {-1, nullptr};
+                }
+                selected_npu_region_ids.assign(
+                    npu_ids.begin(), npu_ids.end());
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_FORCE_NPU] mode=APPLY_WIDE "
+                    "source=FORCED_MODEL_PLAN regions=%s count=%zu "
+                    "policy=%s status=SELECTED\n",
+                    forced_npu_spec, npu_ids.size(),
+                    selected_npu_weight_policy == 1 ?
+                        "RESIDENT" : "STREAMING_2BANK");
+            } else if (forced_npu_policy && *forced_npu_policy) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_FORCE_NPU] status=REJECT "
+                    "reason=POLICY_REQUIRES_REGIONS\n");
+                return {-1, nullptr};
+            }
             const bool native_gcna = ring_plan_apply_wide &&
                 v2_csv && *v2_csv &&
                 (!forced_layout || !*forced_layout);
