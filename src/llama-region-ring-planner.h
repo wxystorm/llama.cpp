@@ -931,11 +931,25 @@ inline bool simulate(const model & m,
     // shortlist candidates are expanded into N/A before exact DAG work.
     // Copy first: logical_regions may alias c.concrete_regions.
     if (m.phone_stage_allocation) {
-        const std::vector<llama_region_ring_region> original =
-            logical_regions;
-        if (!m.phone_stage_allocation(original, c) ||
-                c.concrete_regions.empty()) {
-            return reject("PHONE_NPU_SPILL_INFEASIBLE");
+        // Diagnostic re-simulation may receive the already expanded
+        // physical N/A layout. Never split its Phone suffix a second time.
+        const bool physical =
+            !c.npu_region_indices.empty() &&
+            logical_regions.size() == c.concrete_regions.size() &&
+            std::equal(logical_regions.begin(), logical_regions.end(),
+                       c.concrete_regions.begin(),
+                       [](const auto & a, const auto & b) {
+                           return a.kind == b.kind &&
+                                  a.layer_begin == b.layer_begin &&
+                                  a.layer_end == b.layer_end;
+                       });
+        if (!physical) {
+            const std::vector<llama_region_ring_region> original =
+                logical_regions;
+            if (!m.phone_stage_allocation(original, c) ||
+                    c.concrete_regions.empty()) {
+                return reject("PHONE_NPU_SPILL_INFEASIBLE");
+            }
         }
     }
     const auto & regions = m.phone_stage_allocation ?
