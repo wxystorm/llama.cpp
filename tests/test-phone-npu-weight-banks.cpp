@@ -62,6 +62,30 @@ int main() {
     CHECK(!banks.begin_chunk(3, 0, banks.bank(1).generation)); // failure never becomes READY
     CHECK(banks.kv_resident_bytes() == 2 * MiB); // KV never reused/evicted
 
+    // Bank lifetime is per physical Stage, not per Transformer layer:
+    // N3 and N4 must each reserve one Bank slot and refill only after all
+    // Chunks across that entire Stage have completed.
+    const std::vector<weight_bank_region> multi_layer = {
+        {1, 2, 5, 12 * MiB},  // N3
+        {3, 9, 13, 16 * MiB}, // N4
+        {5, 18, 21, 10 * MiB},
+    };
+    two_weight_banks multi;
+    CHECK(multi.configure(multi_layer, 4 * MiB, 2 * MiB,
+                          34 * MiB, reason));
+    CHECK(multi.bank_capacity(0) == 12 * MiB);
+    CHECK(multi.bank_capacity(1) == 16 * MiB);
+    CHECK(multi.prime_complete(0) && multi.prime_complete(1));
+    CHECK(multi.begin_chunk(0, 0, multi.bank(0).generation));
+    CHECK(!multi.finish_chunk(0, 0, false));
+    CHECK(multi.begin_chunk(0, 1, multi.bank(0).generation));
+    const auto stage_refill = multi.finish_chunk(0, 1, true);
+    CHECK(stage_refill && stage_refill->to_rank == 2 &&
+          stage_refill->to_region == 5);
+    CHECK(!multi.begin_refill(*stage_refill));
+    CHECK(multi.graphs_retired(0));
+    CHECK(multi.begin_refill(*stage_refill));
+
     auto invalid = regions;
     invalid[1].region = invalid[0].region;
     CHECK(!banks.configure(invalid, 0, 0, 100 * MiB, reason));
