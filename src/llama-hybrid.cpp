@@ -9433,8 +9433,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         int * selected_xc = nullptr,
         int * selected_xg = nullptr,
         int * selected_xp = nullptr,
-        std::vector<int> * selected_npu_ids = nullptr) {
+        std::vector<int> * selected_npu_ids = nullptr,
+        int * selected_npu_policy = nullptr) {
     if (selected_npu_ids) { selected_npu_ids->clear(); }
+    if (selected_npu_policy) { *selected_npu_policy = 2; }
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
@@ -11690,6 +11692,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 selected_npu_ids->push_back((int) id);
             }
         }
+        if (selected_npu_policy) {
+            *selected_npu_policy = best.npu_region_indices.empty() ? 0 :
+                (int) best.npu_weight_policy;
+        }
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_NPU_MEMORY] policy=%s bytes=%zu regions=%zu "
+            "status=SELECTED\n",
+            llama_ring_v2::npu_weight_policy_name(
+                best.npu_region_indices.empty() ?
+                    llama_ring_v2::npu_weight_policy::DISABLED :
+                    best.npu_weight_policy),
+            best.npu_memory_bytes, best.npu_region_indices.size());
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
             "phase=PRE_MODEL_LOAD selected=1 source=%s "
@@ -12334,10 +12348,11 @@ bool llama_hybrid_region_ring_planner_apply_wide(
         int tokens, int kv_start, int baseline_chunk,
         std::string & selected_layout,
         int & selected_xc, int & selected_xg, int & selected_xp,
-        std::vector<int> * selected_npu_region_ids) {
+        std::vector<int> * selected_npu_region_ids,
+        int * selected_npu_weight_policy) {
     return llama_hybrid_region_ring_planner_evaluate(
         tokens, kv_start, baseline_chunk, &selected_layout,
         false, false, false, true,
         &selected_xc, &selected_xg, &selected_xp,
-        selected_npu_region_ids);
+        selected_npu_region_ids, selected_npu_weight_policy);
 }
