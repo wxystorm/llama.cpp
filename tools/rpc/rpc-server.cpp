@@ -634,5 +634,8 @@ tensor_source.read      = llama_rpc_read_local_tensor;
     ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
                                      local_loader ? &tensor_source : nullptr,
                                      params.model_path.c_str(), params.tp_rank, params.tp_world_size);
+#if defined(__ANDROID__)
+    ggml_backend_rpc_set_v2_profile_handler(nullptr, nullptr);
+#endif
     return 0;
 }
