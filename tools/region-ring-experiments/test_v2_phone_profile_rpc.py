@@ -2,6 +2,7 @@
 """No-device regression tests for V2 Phone N/A profiling control plane."""
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import socket
@@ -12,7 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from v2_phone_profile_server import Server, Service
+from v2_phone_profile_server import Server, Service, serve_stdio
 from v2_profile_transfer import transfer_call, validate_transfer
 from v2_profile_wire import (
     ProfileProtocolError, WIRE_VERSION, call, decode, encode,
@@ -193,6 +194,31 @@ class PhoneServiceTests(unittest.TestCase):
             finally:
                 server.shutdown()
                 worker.join(timeout=2)
+
+
+
+class ProfileStdioWorkerTests(unittest.TestCase):
+    def test_stdio_worker_accepts_bounded_frames_and_no_tcp_listener(self):
+        request = {"version": WIRE_VERSION, "action": "hello", "token": ""}
+        transfer = {"version": WIRE_VERSION, "action": "transfer"}
+        source = SimpleNamespace(buffer=io.BytesIO(
+            encode(request) + encode(transfer)))
+        result = io.BytesIO()
+        dest = SimpleNamespace(buffer=result)
+        service = mock.Mock()
+        service.dispatch.return_value = {
+            "version": WIRE_VERSION, "status": "OK",
+            "transport": "V2_PHONE_PROFILE_SIDECAR"}
+        with mock.patch("v2_phone_profile_server.sys.stdin", source), \
+             mock.patch("v2_phone_profile_server.sys.stdout", dest):
+            self.assertEqual(serve_stdio(service), 0)
+        received = [decode(line + b"\n")
+                    for line in result.getvalue().splitlines()]
+        self.assertEqual(received[0]["transport"], "V2_PHONE_PROFILE_RPC50052")
+        self.assertEqual(received[1]["status"], "ERROR")
+        self.assertIn("USE_PRODUCTION_RPC_FOR_TRANSFERS",
+                      received[1]["error"])
+        self.assertEqual(service.dispatch.call_count, 1)
 
 
 if __name__ == "__main__":
