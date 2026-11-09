@@ -1553,8 +1553,13 @@ public:
             const auto & state = *item;
             const auto & p = state.plan;
             if (state.next_chunk != ggml_phone_owned::chunk_count(p) ||
-                    !state.canonical_k || !state.canonical_v ||
-                    !state.k || !state.v) {
+                    !state.graphless_identity_slots ||
+                    state.layer_kv.size() !=
+                        size_t(p.layer_end - p.layer) ||
+                    state.canonical_k_layers.size() !=
+                        state.layer_kv.size() ||
+                    state.canonical_v_layers.size() !=
+                        state.layer_kv.size()) {
                 reason = "PHONE_LOCAL_KV_INCOMPLETE_PREFILL_OR_BINDING";
                 return false;
             }
@@ -1563,24 +1568,34 @@ public:
             const uint64_t bytes =
                 width * p.total_tokens * sizeof(uint16_t);
             if (bytes > ggml_phone_owned::k_max_activation_bytes ||
-                    bytes == 0 || bytes > SIZE_MAX ||
-                    ggml_nbytes(state.k) < bytes ||
-                    ggml_nbytes(state.v) < bytes ||
-                    ggml_nbytes(state.canonical_k) < bytes ||
-                    ggml_nbytes(state.canonical_v) < bytes) {
+                    bytes == 0 || bytes > SIZE_MAX) {
                 reason = "PHONE_LOCAL_KV_SYNC_SIZE_MISMATCH";
                 return false;
             }
             scratch.resize(static_cast<size_t>(bytes / sizeof(uint16_t)));
-            for (const auto & pair : {
-                    std::make_pair(state.k, state.canonical_k),
-                    std::make_pair(state.v, state.canonical_v) }) {
-                ggml_backend_tensor_get(
-                    pair.first, scratch.data(), 0, size_t(bytes));
-                ggml_backend_tensor_set(
-                    const_cast<ggml_tensor *>(pair.second),
-                    scratch.data(), 0, size_t(bytes));
-                copied_bytes += size_t(bytes);
+            for (size_t i = 0; i < state.layer_kv.size(); ++i) {
+                const auto & pair = state.layer_kv[i];
+                const auto * canonical_k = state.canonical_k_layers[i];
+                const auto * canonical_v = state.canonical_v_layers[i];
+                if (!canonical_k || !canonical_v ||
+                        !pair.first || !pair.second ||
+                        ggml_nbytes(pair.first) < bytes ||
+                        ggml_nbytes(pair.second) < bytes ||
+                        ggml_nbytes(canonical_k) < bytes ||
+                        ggml_nbytes(canonical_v) < bytes) {
+                    reason = "PHONE_LOCAL_KV_SYNC_LAYER_SHAPE";
+                    return false;
+                }
+                for (const auto & entry : {
+                        std::make_pair(pair.first, canonical_k),
+                        std::make_pair(pair.second, canonical_v) }) {
+                    ggml_backend_tensor_get(
+                        entry.first, scratch.data(), 0, size_t(bytes));
+                    ggml_backend_tensor_set(
+                        const_cast<ggml_tensor *>(entry.second),
+                        scratch.data(), 0, size_t(bytes));
+                    copied_bytes += size_t(bytes);
+                }
             }
             ++regions;
         }
