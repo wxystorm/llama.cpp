@@ -4002,9 +4002,18 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // The caller uses the main scheduler to discover and extract logits
         // after this function returns. The last Phone Region must still write
         // the final output into the canonical graph result/scheduler.
+        const char * pc_final_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
+        const bool pc_final_head_requested =
+            pc_final_env != nullptr && std::strcmp(pc_final_env, "1") == 0 &&
+            model.arch == LLM_ARCH_QWEN3;
+        const bool runtime_final_owner_supported =
+            regions.back().device == llama_region_ring_device::PHONE ||
+            (pc_final_head_requested &&
+             (regions.back().device == llama_region_ring_device::CPU ||
+              regions.back().device == llama_region_ring_device::GPU));
         if (!device_fifo_simulation || sched_use != sched.get() ||
-            res_use != gf_res_prev.get() ||
-            regions.back().device != llama_region_ring_device::PHONE) {
+            res_use != gf_res_prev.get() || !runtime_final_owner_supported) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_RESOURCE] status=REJECT reason=UNSAFE_FINAL_OUTPUT_OWNER\n");
             ret = GGML_STATUS_FAILED;
