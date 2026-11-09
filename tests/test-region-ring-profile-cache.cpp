@@ -7,7 +7,7 @@
 #include <string>
 
 #define CHECK(x) do { if (!(x)) { \
-    std::fprintf(stderr, "PROFILE_CACHE_TEST_FAIL line=%d expr=%s\\n", \
+    std::fprintf(stderr, "PROFILE_CACHE_TEST_FAIL line=%d expr=%s\n", \
                  __LINE__, #x); \
     return 1; \
 } } while (0)
@@ -62,6 +62,6 @@ int main() {
     profile.phone_layer_blocks.clear();
     CHECK(!save(path, profile));
     CHECK(!load(path, recovered));
-    std::printf("REGION_RING_PROFILE_CACHE_TEST status=PASS\\n");
+    std::printf("REGION_RING_PROFILE_CACHE_TEST status=PASS\n");
     return 0;
 }
