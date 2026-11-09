@@ -630,7 +630,8 @@ LLAMA_API bool llama_hybrid_region_ring_planner_apply_cgp(
 LLAMA_API bool llama_hybrid_region_ring_planner_apply_wide(
     int tokens, int kv_start, int baseline_chunk,
     std::string & selected_layout,
-    int & selected_xc, int & selected_xg, int & selected_xp);
+    int & selected_xc, int & selected_xg, int & selected_xp,
+    std::vector<int> * selected_npu_region_ids = nullptr);
 
 LLAMA_API int  llama_hybrid_runtime_prefill_chunk_tokens();
 LLAMA_API std::vector<int> llama_hybrid_runtime_tensor_chunks(
