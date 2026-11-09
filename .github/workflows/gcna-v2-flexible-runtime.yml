@@ -1,0 +1,30 @@
+name: GCNA V2 flexible runtime compile and tests
+
+on:
+  push:
+    branches:
+      - feat/gcna-v2-flexible-tail-npu-resident-20261109
+  workflow_dispatch:
+
+jobs:
+  linux-rpc-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure RPC, runtime and host contract
+        run: >
+          cmake -S . -B build-gcna-v2
+          -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON
+          -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+      - name: Compile planner, inference runtime and Phone RPC server
+        run: >
+          cmake --build build-gcna-v2 --parallel 4
+          --target llama-cli ggml-rpc-server
+          test-region-ring-planner test-region-ring
+          test-region-ring-v2-stage test-phone-plan-region-map
+          test-phone-owned-execution-plan test-phone-qwen3-local-builder
+      - name: Run host-side contracts
+        run: >
+          ctest --test-dir build-gcna-v2 --output-on-failure
+          -R '^(test-region-ring-planner|test-region-ring|test-region-ring-v2-stage|test-phone-plan-region-map|test-phone-owned-execution-plan|test-phone-qwen3-local-builder)$'
