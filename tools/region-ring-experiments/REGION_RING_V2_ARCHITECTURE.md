@@ -155,8 +155,9 @@ authoritative target. These pieces are now implemented as opt-in helpers in
   entry point. It checks the model-bound native `profile.json` once per
   sweep; a cache miss/force calls the existing resumable *independent*
   `run_v2_stage_matrix.py`, not a compact fixed-layout runtime benchmark.
-  Native Phone samples currently require the separate profile sidecar at
-  the RPC host's port 50177.
+  Native Phone samples now use command 57 on inference RPC 50052
+  (protocol 4.0.34). Phone RPC starts a private stdio worker automatically,
+  without a second TCP listening port.
 - The native cache is accepted only after its model/device/binary
   fingerprints, PASS CSV/manifest consistency, and all required
   G2/C2/N1/A1 Chunk x KV shapes have been checked. Incomplete grids
@@ -202,7 +203,7 @@ authoritative target. These pieces are now implemented as opt-in helpers in
    Graph registration, Plan RPC, KV and final logits. Tests and sample
    commands live below.
 3. Native Profile-cache hits validate the stored Phone fingerprint, not a
-   fresh live sidecar Hello. After changing the Phone DSP/runtime/binary,
+   fresh live Phone RPC identity query. After changing the Phone DSP/runtime/binary,
    use `-ForceProfile` until live identity checking is integrated.
 4. Some independent samples (e.g. N4) have a known numeric parity failure.
    These are excluded rather than synthesized; if no executable N1/A
@@ -252,9 +253,10 @@ Implemented in this V2 branch:
 - resumable stage matrix with a versioned model/executable/device
   fingerprint, and a synthetic tiny-Qwen3 CPU N1/N2/N4 integration-test
   fixture;
-- dedicated versioned V2 Phone N/A Profile control sidecar: PC requests
-  each N/A shape, Phone executes its own native HTP/OpenCL Graph and
-  sends measured rows back automatically, with no manual CSV copying;
+- integrated versioned V2 N/A Profile requests on GGML RPC 50052:
+  Phone dispatches the independent HTP/OpenCL native sampler through a
+  server-owned local stdio worker and returns measured rows, with no
+  second listener or manual CSV copying;
 - explicit PARITY_FAIL measurements retained for analysis but excluded
   from the planner-eligible PASS profile CSV;
 - exact KV-X final-token profile window for nondivisible shapes (e.g.
@@ -282,14 +284,14 @@ the double-Bank overlap and final combined Planner remain gated on
 a matching PC/Phone hardware test. See V2_RUNTIME_BANK_PROFILE.md.
 
 **Not yet implemented or verified:**
-- end-to-end verification of the new GCNA matrix/RPC sidecar on
-  real PC and Phone hardware; source + regression tests now committed;
+- end-to-end verification of the integrated GCNA matrix/RPC 50052 path
+  on real PC and Phone hardware; source + regression tests committed;
   the user already observed Phone HTP N2 precompile/compute/parity PASS,
   while N4 precompile/compute succeeded but numerical parity FAILED;
 - integration of N2/N4 native HTP graphs with PRODUCTION per-Cycle
   two-Bank refill, persistent Decode KV and inference RPC ownership;
-- elimination of the separate Profile sidecar in favor of main-program
-  automatic discovery/control and production RPC handoff;
+- eventual replacement of the private stdio helper with an in-process
+  C++ profiler (optional; the separate TCP sidecar is no longer needed);
 - complete runtime-matched transfer-only benchmarking;
 - the V2 Planner, memory spill DAG, and V2 Runtime adoption;
 - Windows+Android builds and real Qwen3 logits/Prefill/Decode parity.
