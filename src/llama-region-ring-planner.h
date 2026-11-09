@@ -1737,10 +1737,16 @@ inline bool simulate(const model & m,
         // The HTP Bank mover is independent from the CUDA H2D lane.
         // Do not start rank k until the rank k-2 compute Region has drained.
         if (m.phone_npu_weight_streaming &&
-                !npu_weight_busy && !npu_weight_queue.empty()) {
+                !npu_weight_busy && !npu_weight_queue.empty() &&
+                !device_busy[(size_t) device::PHONE]) {
             const int r = npu_weight_queue.front();
             npu_weight_queue.pop_front();
             npu_weight_busy = true;
+            // The independent Bank-mover worker still needs the Phone HTP
+            // critical section. A single measured refill duration is
+            // conservatively serialized with Phone compute rather than
+            // pretending an unavailable HTP compute+repack overlap.
+            device_busy[(size_t) device::PHONE] = true;
             const double ms = npu_weight_load_ms[(size_t) r];
             c.npu_weight_refill_busy_ms += ms;
             ++c.npu_weight_refills;
@@ -2028,6 +2034,7 @@ inline bool simulate(const model & m,
                 }
                 npu_weight_ready[(size_t) r] = true;
                 npu_weight_busy = false;
+                device_busy[(size_t) device::PHONE] = false;
                 continue;
             }
 
