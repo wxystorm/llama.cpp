@@ -1020,9 +1020,7 @@ inline bool simulate(const model & m,
     }
     if ((m.phone_autonomous_prebuild &&
             (!m.phone_full_return_stream || m.slot_pool != 0)) ||
-        (m.phone_autonomous_final &&
-            (!m.phone_autonomous_prebuild ||
-             regions.back().kind != llama_region_ring_stage_kind::PHONE)) ||
+        (m.phone_autonomous_final && !m.phone_autonomous_prebuild) ||
         !std::isfinite(m.phone_auto_final_head_ms) ||
         m.phone_auto_final_head_ms < 0.0 ||
         !std::isfinite(m.phone_auto_setup_per_graph_ms) ||
