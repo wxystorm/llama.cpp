@@ -1,4 +1,5 @@
 #include "ggml-rpc.h"
+#include "ggml-phone-npu-budget.h"
 #include "ggml-opencl.h"
 #if defined(GGML_RPC_WITH_HEXAGON)
 #include "ggml-hexagon.h"
@@ -8694,7 +8695,10 @@ bool rpc_server::phone_npu_plan_configure(
             "status=READY\n", request.run_id);
     }
     if (phone_npu_plan_mapping.empty()) {
-        size_t limit = std::numeric_limits<size_t>::max();
+        // The measured Phone HTP budget applies even if the user did not
+        // supply a manual environment cap. A smaller override is respected;
+        // an override >3072 MiB cannot raise the physical admission limit.
+        size_t limit = ggml_phone_npu_budget::total_bytes;
         const char * cap = std::getenv("GGML_RPC_PHONE_NPU_BANK_BUDGET_MIB");
         if (cap && *cap) {
             char * end = nullptr;
@@ -8703,7 +8707,7 @@ bool rpc_server::phone_npu_plan_configure(
                     mib > (unsigned long long) (SIZE_MAX / (1024 * 1024))) {
                 return reject("INVALID_PHYSICAL_BANK_BUDGET");
             }
-            limit = (size_t) mib * 1024 * 1024;
+            limit = std::min(limit, (size_t) mib * 1024 * 1024);
         }
         std::string why;
         std::array<size_t, 2> caps {};
@@ -8727,10 +8731,12 @@ bool rpc_server::phone_npu_plan_configure(
             "[NPU_BANK_MEMORY] event=ALLOCATED policy=%s "
             "a_bytes=%zu b_bytes=%zu mapped_bytes=%zu "
             "kv=INDEPENDENT buffer=HTP_REPACK "
-            "budget_bytes=%zu allocator=RPCMEM "
+            "budget_bytes=%zu max_bank_bytes=%zu allocator=RPCMEM "
+            "runtime_kv_graph=CHECK_AT_ALLOCATION "
             "origin=PC_PLAN status=PASS\n",
             request.weight_policy == 1 ? "RESIDENT" : "STREAMING_2BANK",
-            caps[0], caps[1], caps[0] + caps[1], limit);
+            caps[0], caps[1], caps[0] + caps[1], limit,
+            ggml_phone_npu_budget::bank_bytes);
         for (size_t rank = 0; rank < ordered.size(); ++rank) {
             GGML_LOG_INFO(
                 "[NPU_BANK_PLAN] rank=%zu bank=%d region=%u "
