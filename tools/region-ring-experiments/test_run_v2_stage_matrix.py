@@ -186,6 +186,45 @@ class MatrixTests(unittest.TestCase):
                 {item["key"]["backend"] for item in unified["compute_samples"]},
                 set("GCNA"))
 
+    def test_rpc50052_skips_sidecar_tcp_and_keeps_phone_provenance(self):
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            model = base / "m.gguf"
+            model.write_bytes(b"identifiable Qwen GGUF placeholder")
+            args = argparse.Namespace(
+                exe=None, model=model, out=base / "out",
+                phone="127.0.0.1:50052", phone_token="", phone_timeout=10,
+                backends="N", layers="1", chunks="64", kvs="512",
+                warmups=1, repeats=3, threads=4, timeout=2,
+                verify_cpu=False, max_relative_rmse=0.02, max_abs_error=0.5,
+                tcp_transfer_sizes_kib="256,1024", update=False,
+                dry_run=False)
+            info = {"status": "OK", "device_id": "d" * 64,
+                    "exe_sha256": "e" * 64, "runtime_sha256": "r" * 64,
+                    "transport": "V2_PHONE_PROFILE_RPC50052"}
+            native = {
+                "backend": "N", "layers": "1", "chunk": "64",
+                "kv_tokens": "512", "repeats": "3",
+                "weight_bytes": "4096", "kv_bytes": "512",
+                "graph_workspace_bytes": "2048",
+                "compute_median_ms": "12", "relative_rmse": "0",
+                "max_abs": "0", "parity": "PASS",
+                "source": "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"}
+            with mock.patch("run_v2_stage_matrix.hello_phone",
+                            return_value=info), \
+                 mock.patch("run_v2_stage_matrix.phone_remote",
+                            return_value=("PASS", native, "")), \
+                 mock.patch("run_v2_stage_matrix.transfer_call") as tcp:
+                self.assertEqual(run_matrix(args), 0)
+                tcp.assert_not_called()
+            import json
+            profile = json.loads((args.out / "profile.json").read_text())
+            self.assertEqual(profile["devices"]["phone"]["transport"],
+                             "V2_PHONE_PROFILE_RPC50052")
+            row = json.loads((args.out / "N-L1-X64-KV512.json").read_text())
+            self.assertEqual(row["transport"], "PHONE_RPC50052_V1")
+            self.assertFalse((args.out / "tcp-link-v2.csv").exists())
+
     def test_tcp_receiver_samples_are_separate_and_cacheable(self):
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
