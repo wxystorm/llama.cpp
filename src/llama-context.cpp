@@ -2088,7 +2088,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  bool                     embedding_only,
                                                  bool                     preserve_weight_cache_on_reset,
                                                  bool *                   graph_reused_out,
-                                                 llama_hybrid_stage_timing * stage_timing_out) {
+                                                 llama_hybrid_stage_timing * stage_timing_out,
+                                                 bool                     force_hidden_output) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -2139,7 +2140,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         gparams.hybrid_hidden_input  =
             stage->layer_begin > 0 || force_hidden_input;
         gparams.hybrid_output_head   =
-            !embedding_only && stage->layer_end == n_layer;
+            !embedding_only && !force_hidden_output &&
+            stage->layer_end == n_layer;
         gparams.hybrid_wave_probe    = stage->wave_probe;
         gparams.hybrid_embedding_only = embedding_only;
     }
@@ -2762,7 +2764,12 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             stage_input != nullptr, false,
             preserve_weight_cache_on_graph_reset,
             timing != nullptr ? &timing->graph_reused : nullptr,
-            timing);
+            timing,
+            // A terminal PC or Phone Stage may still need to publish
+            // its full l_out. Only the separate Head graph may project
+            // logits after the entire Stage DAG has drained.
+            stage_output != nullptr &&
+                stage.layer_end == model.hparams.n_layer());
     }
     if (timing != nullptr) {
         const int64_t prepare_end_us = ggml_time_us();
