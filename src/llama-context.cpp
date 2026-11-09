@@ -5704,15 +5704,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 if (stage.kind != llama_hybrid_runtime_stage_kind::PHONE) {
                     continue;
                 }
-                valid = stage.layer_end == stage.layer_begin + 1 &&
-                    stage.layer_begin >= 0 &&
+                const int n_phone_layers =
+                    stage.layer_end - stage.layer_begin;
+                valid = stage.layer_begin >= 0 &&
+                    n_phone_layers >= 1 && n_phone_layers <= 64 &&
                     stage.macro_tokens > 0 &&
-                    (uint32_t) stage.layer_begin < model.hparams.n_layer();
+                    (uint32_t) stage.layer_end <= model.hparams.n_layer();
                 if (!valid) { break; }
                 const uint32_t layer = (uint32_t) stage.layer_begin;
                 ggml_backend_rpc_phone_owned_plan plan {};
-                plan.version = 2;
-                plan.flags = 1; // Qwen3 Flash Attention with F16 KV
+                plan.version = n_phone_layers == 1 ? 2 : 3;
+                // Plan v3 packs contiguous layer count into flags[31:16].
+                // The wire descriptor remains 108 bytes on both endpoints.
+                plan.flags = n_phone_layers == 1 ?
+                    1u : (1u | (uint32_t(n_phone_layers) << 16));
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
@@ -5728,7 +5733,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 // The first Phone-local Builder has an intentionally narrow
                 // contract: fresh single-sequence prefill, full-head RoPE,
                 // flash-attn, F16 KV. A wider KV format needs a new ABI.
-                valid = model.hparams.n_embd_head_v(layer) == plan.head_dim;
+                for (int l = stage.layer_begin;
+                        valid && l < stage.layer_end; ++l) {
+                    valid = model.hparams.n_head(l) == plan.n_heads &&
+                        model.hparams.n_head_kv(l) == plan.n_heads_kv &&
+                        model.hparams.n_embd_head_k(l) == plan.head_dim &&
+                        model.hparams.n_embd_head_v(l) == plan.head_dim;
+                }
                 const uint64_t padded_kv =
                     (uint64_t(ubatch.n_tokens) + 255) / 256 * 256;
                 plan.n_kv = (uint32_t) std::min<uint64_t>(
@@ -5745,6 +5756,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
                 if (valid && phone_graphless) {
+                    for (int sublayer = stage.layer_begin;
+                            valid && sublayer < stage.layer_end; ++sublayer) {
                     // Cache storage belongs to the *Meta* outer buffer in
                     // this layout (Meta(CPU,RPC0)). The RPC client cannot
                     // serialize that outer buffer: it must receive the
@@ -5753,9 +5766,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // whose backend is phone_rpc_backend, not a guessed
                     // child index or a new allocation.
                     const ggml_tensor * outer_k =
-                        kv_mctx->get_k_storage((int32_t) layer);
+                        kv_mctx->get_k_storage(sublayer);
                     const ggml_tensor * outer_v =
-                        kv_mctx->get_v_storage((int32_t) layer);
+                        kv_mctx->get_v_storage(sublayer);
                     const ggml_tensor * canonical_k = outer_k;
                     const ggml_tensor * canonical_v = outer_v;
                     ggml_backend_t owner_meta = nullptr;
@@ -5808,7 +5821,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         " k_ne=[%" PRId64 ",%" PRId64 "]"
                         " v_ne=[%" PRId64 ",%" PRId64 "]"
                         " status=%s\n",
-                        plan.run_id, plan.region, plan.layer,
+                        plan.run_id, plan.region, (uint32_t) sublayer,
                         type_name(outer_k), type_name(outer_v),
                         type_name(canonical_k), type_name(canonical_v),
                         child_index, owner_meta != nullptr ? 1 : 0,
@@ -5821,16 +5834,17 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     valid = valid && canonical_k != nullptr &&
                         canonical_v != nullptr &&
                         bind_kv(phone_rpc_backend, plan.run_id,
-                                plan.region, plan.layer, plan.total_tokens,
+                                plan.region, (uint32_t) sublayer, plan.total_tokens,
                                 canonical_k, canonical_v, true);
                     LLAMA_LOG_INFO(
                         "[PHONE_OWNED_KV] side=pc event=BIND"
                         " run=%" PRIu64 " region=%u layer=%u"
                         " slots=PC_VERIFIED_IDENTITY"
                         " graph_register=SKIPPED status=%s\n",
-                        plan.run_id, plan.region, plan.layer,
+                        plan.run_id, plan.region, (uint32_t) sublayer,
                         valid ? "PASS" : "FAIL");
                 }
+                    }
                 if (valid) {
                     ++published;
                     if (phone_plan_async_registration) {
