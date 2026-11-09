@@ -448,6 +448,15 @@ target_include_directories(test-region-ring-profile-cache PRIVATE
     ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_test(test-region-ring-profile-cache)
 
+# Regression: a native GCNA candidate may be fully DAG-scored while the
+# old logical G/C/P baseline has no legal NPU/Adreno split.
+add_executable(test-native-gcna-apply-eligibility
+    test-native-gcna-apply-eligibility.cpp)
+target_include_directories(test-native-gcna-apply-eligibility PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(test-native-gcna-apply-eligibility PRIVATE cxx_std_17)
+llama_test(test-native-gcna-apply-eligibility)
+
 # Strict, device-free loader for native G/C/N/A first-N-layer Profile CSV.
 add_executable(test-region-ring-native-stage-profile
     test-region-ring-native-stage-profile.cpp)
