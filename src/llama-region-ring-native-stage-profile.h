@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -210,8 +211,12 @@ public:
         return bytes;
     }
 
-    bool estimate(char backend, int layers, int chunk, int kv,
-                  phase kind, double & ms) const {
+    // A sampled Stage depth is always used as-is. For NPU regions deeper
+    // than the sampled matrix, the Planner needs a service-cost model to
+    // consider a single true N3/N4/... Region. This approximation never
+    // changes its physical layer range or bypasses the Phone allocator.
+    bool estimate_measured(char backend, int layers, int chunk, int kv,
+                           phase kind, double & ms) const {
         std::map<int, std::vector<std::pair<int, double>>> by_chunk;
         for (const auto & p : points_) {
             if (p.backend != backend || p.layers != layers) { continue; }
@@ -227,6 +232,43 @@ public:
             }
         }
         return interpolation(at_kv, chunk, ms);
+    }
+
+    bool estimate(char backend, int layers, int chunk, int kv,
+                  phase kind, double & ms) const {
+        if (layers <= 0) { return false; }
+        if (estimate_measured(backend, layers, chunk, kv, kind, ms)) {
+            return true;
+        }
+        // Only the HTP backend supports deep contiguous Stage estimates.
+        // No interpolation across unsupported Chunk/KV windows is allowed.
+        if (backend != 'N' || layers > 32) { return false; }
+        std::map<int, double> depth_values;
+        for (const auto & p : points_) {
+            if (p.backend != 'N' || depth_values.count(p.layers)) {
+                continue;
+            }
+            double value = 0.0;
+            if (estimate_measured(
+                    'N', p.layers, chunk, kv, kind, value)) {
+                depth_values[p.layers] = value;
+            }
+        }
+        if (depth_values.empty()) { return false; }
+        const auto upper = depth_values.lower_bound(layers);
+        if (upper == depth_values.begin()) {
+            ms = upper->second * (double) layers / upper->first;
+        } else if (upper == depth_values.end()) {
+            const auto last = std::prev(depth_values.end());
+            ms = last->second * (double) layers / last->first;
+        } else {
+            const auto lower = std::prev(upper);
+            const double alpha = (double) (layers - lower->first) /
+                (upper->first - lower->first);
+            ms = lower->second +
+                alpha * (upper->second - lower->second);
+        }
+        return std::isfinite(ms) && ms >= 0.0;
     }
 
     // PC CPU/CUDA search may ask for more layers than the sampled
@@ -314,6 +356,42 @@ public:
         return std::isfinite(ms) && ms >= 0.0;
     }
 
+    // Padded HTP repack allocations and Graph scratch are estimated from
+    // the deepest measured prefix. They are only admission estimates:
+    // actual resident arenas, individual HTP allocations and shared RAM
+    // are verified again by the Phone when the exact Plan is installed.
+    bool estimate_npu_allocation(int layers, bool raw, bool workspace,
+                                 size_t & bytes) const {
+        if (layers <= 0 || layers > 32) { return false; }
+        int deepest = 0;
+        size_t measured = 0;
+        for (const auto & p : points_) {
+            if (p.backend != 'N') { continue; }
+            const size_t n = workspace ? p.workspace_bytes :
+                (raw ? p.raw_weight_bytes : p.weight_bytes);
+            if (n == 0) { continue; }
+            if (p.layers > deepest) {
+                deepest = p.layers;
+                measured = n;
+            } else if (p.layers == deepest) {
+                measured = std::max(measured, n);
+            }
+        }
+        if (deepest == 0) { return false; }
+        const long double scaling = workspace ? 1.10L : 1.05L;
+        const long double estimated =
+            std::ceil(((long double) measured * layers / deepest) *
+                      scaling);
+        if (!std::isfinite(estimated) ||
+                estimated <= 0 ||
+                estimated > (long double)
+                    std::numeric_limits<size_t>::max()) {
+            return false;
+        }
+        bytes = (size_t) estimated;
+        return true;
+    }
+
     bool weight_bytes(char backend, int layers, bool raw,
                       size_t & bytes) const {
         bytes = 0;
@@ -322,7 +400,9 @@ public:
             bytes = std::max(bytes, raw ?
                 p.raw_weight_bytes : p.weight_bytes);
         }
-        return bytes > 0;
+        if (bytes > 0) { return true; }
+        return backend == 'N' &&
+            estimate_npu_allocation(layers, raw, false, bytes);
     }
 
     bool workspace_bytes(char backend, int layers,
@@ -333,7 +413,9 @@ public:
                 bytes = std::max(bytes, p.workspace_bytes);
             }
         }
-        return bytes > 0;
+        if (bytes > 0) { return true; }
+        return backend == 'N' &&
+            estimate_npu_allocation(layers, false, true, bytes);
     }
 
     // One conservative HTP Bank refill event, not a measured overlap
