@@ -7883,10 +7883,14 @@ bool rpc_server::phone_owned_kv_bind(
         return reject("CANONICAL_KV_NATIVE_TENSOR");
     }
     std::string why;
+    const uint32_t layer_offset = request.layer - plan->layer;
     const uint32_t child_region =
-        ggml_phone_owned::internal_layer_region(
-            *plan, request.layer - plan->layer);
-    if (!phone_npu_executor->bind_owned_decode_kv_storage(
+        ggml_phone_owned::internal_layer_region(*plan, layer_offset);
+    auto * child_executor =
+        phone_npu_executor_for_region_layer(
+            request.region, layer_offset);
+    if (!child_executor ||
+            !child_executor->bind_owned_decode_kv_storage(
             request.run_id, child_region, request.layer,
             std::move(canonical_ctx), k, v, true, why)) {
         return reject(why.c_str());
@@ -9118,7 +9122,10 @@ void rpc_server::phone_auto_compute_loop() {
                     const uint32_t internal_region =
                         ggml_phone_owned::internal_layer_region(
                             chain_plan, i);
-                    ok = phone_npu_executor->run_owned_only_chunk(
+                    auto * child_executor =
+                        phone_npu_executor_for_region_layer(req.key.region, i);
+                    ok = child_executor &&
+                        child_executor->run_owned_only_chunk(
                         req.key.run_id, internal_region, req.key.chunk,
                         nullptr, nullptr, why, one, output,
                         activation, n_floats);
@@ -9131,7 +9138,7 @@ void rpc_server::phone_auto_compute_loop() {
                             req.key.run_id, req.key.region,
                             chain_plan.layer + i, req.key.chunk,
                             i + 1, count,
-                            phone_npu_name_for_region(req.key.region),
+                            phone_npu_name_for_region_layer(req.key.region, i),
                             one.input_upload_ms, one.htp_compute_ms,
                             one.output_copy_ms,
                             ok ? "PASS" : "FAIL",
