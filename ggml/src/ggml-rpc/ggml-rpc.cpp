@@ -6796,6 +6796,7 @@ private:
     // verified Chunks to execute concurrently. Per-Region KV FIFO is shared.
     std::set<uint32_t> phone_npu_serial_regions;
     std::unordered_map<uint32_t, int> phone_npu_region_layer;
+    std::unordered_map<uint32_t, int> phone_npu_region_layer_end;
     // Immutable shadow plans, guarded by graph_compute_mutex.
     ggml_phone_owned::registry phone_owned_plans;
     ggml_backend_ptr phone_npu_backend;
@@ -6805,7 +6806,8 @@ private:
     bool phone_npu_banked_enabled = false;
     bool phone_npu_plan_controlled = false;
     uint64_t phone_npu_plan_configured_run = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> phone_npu_plan_mapping;
+    std::vector<ggml_phone_plan::stage_region_range> phone_npu_plan_mapping;
+    uint32_t phone_npu_weight_policy = 2;
     // Source HTP Region -> immediately adjacent Adreno Region. Guarded by
     // phone_auto_mutex and scoped to phone_npu_plan_configured_run.
     std::map<uint32_t, uint32_t> phone_npu_local_successors;
@@ -8601,27 +8603,25 @@ bool rpc_server::phone_npu_plan_configure(
             !phone_npu_executor || !phone_npu_executor->has_backend()) {
         return reject("PLAN_CONTROLLED_BANKED_HTP_NOT_ENABLED");
     }
-    if (request.version != 2 || request.run_id == 0 ||
-            request.count < 2 || request.count > 64) {
-        return reject("INVALID_PLAN_VERSION_RUN_OR_REGION_COUNT");
+    if (request.version != 3 || request.run_id == 0 ||
+            request.count == 0 || request.count > 64 ||
+            request.reserved != 0 ||
+            (request.weight_policy != 1 && request.weight_policy != 2) ||
+            (request.weight_policy == 2 && request.count < 2)) {
+        return reject("INVALID_PLAN_VERSION_RUN_POLICY_OR_COUNT");
     }
     std::vector<uint32_t> successors;
     successors.reserve(request.count);
-    std::vector<std::pair<uint32_t, uint32_t>> ordered;
+    std::vector<ggml_phone_plan::stage_region_range> ordered;
     ordered.reserve(request.count);
     for (uint32_t i = 0; i < request.count; ++i) {
-        const uint32_t region = request.regions[i];
-        const uint32_t layer = request.layers[i];
-        if (region >= 64 || layer >= 256 ||
-                (i != 0 && (ordered.back().first >= region ||
-                            ordered.back().second >= layer))) {
-            return reject("HTP_REGIONS_OR_LAYERS_NOT_STRICTLY_ORDERED");
-        }
-        ordered.emplace_back(region, layer);
+        ordered.push_back({
+            request.regions[i], request.layers[i], request.layer_ends[i]});
         successors.push_back(request.local_successors[i]);
     }
-    if (!ggml_phone_plan::valid_local_successors(ordered, successors)) {
-        return reject("INVALID_ORDERED_HTP_OR_LOCAL_SUCCESSOR_MAP");
+    if (!ggml_phone_plan::valid_htp_stage_successors(
+            ordered, successors, 256)) {
+        return reject("INVALID_ORDERED_HTP_RANGES_OR_SUCCESSOR_MAP");
     }
     if (!phone_auto_dual_lane_enabled &&
             std::any_of(successors.begin(), successors.end(),
@@ -8630,6 +8630,7 @@ bool rpc_server::phone_npu_plan_configure(
     }
     for (size_t i = request.count; i < 64; ++i) {
         if (request.regions[i] != 0 || request.layers[i] != 0 ||
+                request.layer_ends[i] != 0 ||
                 request.local_successors[i] != 0) {
             return reject("NONZERO_UNUSED_WIRE_ENTRIES");
         }
@@ -8658,7 +8659,8 @@ bool rpc_server::phone_npu_plan_configure(
         }
     }
     if (!phone_npu_plan_mapping.empty() &&
-            phone_npu_plan_mapping != ordered) {
+            (phone_npu_plan_mapping != ordered ||
+             phone_npu_weight_policy != request.weight_policy)) {
         // The new RUN has not registered any Graphs or Chunks. BEGIN has
         // drained old HTP execution, cleared the Hexagon UID cache and
         // reset old owned KVs. No Bank tensor pointer can still be live.
@@ -8677,6 +8679,7 @@ bool rpc_server::phone_npu_plan_configure(
         phone_npu_plan_mapping.clear();
         phone_npu_serial_regions.clear();
         phone_npu_region_layer.clear();
+        phone_npu_region_layer_end.clear();
         phone_npu_banked_ready_regions.clear();
         GGML_LOG_INFO(
             "[PHONE_NPU_PLAN] side=phone event=RECONFIGURE "
@@ -8698,29 +8701,37 @@ bool rpc_server::phone_npu_plan_configure(
         std::string why;
         std::array<size_t, 2> caps {};
         if (!phone_npu_executor->configure_banked_model(
-                local_tensor_source, ordered, limit, why, caps)) {
-            return reject("TWO_BANK_CONFIG:" + why);
+                local_tensor_source, ordered, limit, why, caps,
+                request.weight_policy == 1)) {
+            return reject("NPU_WEIGHT_CONFIG:" + why);
         }
         phone_npu_plan_mapping = ordered;
+        phone_npu_weight_policy = request.weight_policy;
         phone_npu_serial_regions.clear();
         phone_npu_region_layer.clear();
-        for (const auto & [region, layer] : ordered) {
-            phone_npu_serial_regions.insert(region);
-            phone_npu_region_layer[region] = (int) layer;
+        phone_npu_region_layer_end.clear();
+        for (const auto & stage : ordered) {
+            phone_npu_serial_regions.insert(stage.region);
+            phone_npu_region_layer[stage.region] = (int) stage.layer_begin;
+            phone_npu_region_layer_end[stage.region] =
+                (int) stage.layer_end;
         }
         GGML_LOG_INFO(
-            "[NPU_BANK_MEMORY] event=ALLOCATED banks=2 "
+            "[NPU_BANK_MEMORY] event=ALLOCATED policy=%s "
             "a_bytes=%zu b_bytes=%zu mapped_bytes=%zu "
             "kv=INDEPENDENT buffer=HTP_REPACK "
             "budget_bytes=%zu allocator=RPCMEM "
             "origin=PC_PLAN status=PASS\n",
+            request.weight_policy == 1 ? "RESIDENT" : "STREAMING_2BANK",
             caps[0], caps[1], caps[0] + caps[1], limit);
         for (size_t rank = 0; rank < ordered.size(); ++rank) {
             GGML_LOG_INFO(
-                "[NPU_BANK_PLAN] rank=%zu bank=%zu region=%u "
-                "layer=%u initial_resident=%d origin=PC_PLAN\n",
-                rank, rank % 2, ordered[rank].first,
-                ordered[rank].second, rank < 2 ? 1 : 0);
+                "[NPU_BANK_PLAN] rank=%zu bank=%d region=%u "
+                "layers=[%u,%u) resident=%d origin=PC_PLAN\n",
+                rank, request.weight_policy == 1 ? -1 : (int)(rank % 2),
+                ordered[rank].region, ordered[rank].layer_begin,
+                ordered[rank].layer_end,
+                request.weight_policy == 1 || rank < 2 ? 1 : 0);
         }
     } else {
         // Same mapping across runs: old KV/Graph metadata is gone after
@@ -8728,7 +8739,9 @@ bool rpc_server::phone_npu_plan_configure(
         // previous run. Re-prime ranks 0/1 under the HTP mutex.
         std::string why;
         ggml_phone_npu_serial::full_region_executor::model_load_stats stats {};
-        if (!phone_npu_executor->reset_banked_initial_weights(why, stats)) {
+        if (phone_npu_weight_policy == 2 &&
+                !phone_npu_executor->reset_banked_initial_weights(
+                    why, stats)) {
             return reject("TWO_BANK_REPRIME:" + why);
         }
         GGML_LOG_INFO(
@@ -8742,18 +8755,23 @@ bool rpc_server::phone_npu_plan_configure(
     phone_npu_local_successors.clear();
     for (size_t i = 0; i < successors.size(); ++i) {
         if (successors[i] != 0) {
-            phone_npu_local_successors.emplace(ordered[i].first,
+            phone_npu_local_successors.emplace(ordered[i].region,
                                                successors[i]);
         }
     }
     phone_npu_banked_ready_regions.clear();
-    phone_npu_banked_ready_regions.insert(ordered[0].first);
-    phone_npu_banked_ready_regions.insert(ordered[1].first);
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        if (request.weight_policy == 1 || i < 2) {
+            phone_npu_banked_ready_regions.insert(ordered[i].region);
+        }
+    }
     GGML_LOG_INFO(
         "[PHONE_NPU_PLAN] side=phone event=CONFIGURE "
-        "run=%" PRIu64 " regions=%zu banks=2 local_links=%zu "
+        "run=%" PRIu64 " regions=%zu weights=%s local_links=%zu "
         "authority=PC_PLANNER status=PASS\n",
-        request.run_id, ordered.size(), phone_npu_local_successors.size());
+        request.run_id, ordered.size(),
+        request.weight_policy == 1 ? "RESIDENT" : "STREAMING_2BANK",
+        phone_npu_local_successors.size());
     phone_auto_cv.notify_all();
     return true;
 }
