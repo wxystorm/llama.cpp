@@ -7555,34 +7555,6 @@ bool rpc_server::phone_owned_plan_register(
             return false;
         }
     }
-    // Optional Phone-local Qwen3 graph construction check. No RPC graph is
-    // consulted, and no NPU kernel is dispatched from this shadow path.
-    const char * local_builder_env =
-        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW");
-    const bool local_builder_check = local_builder_env != nullptr &&
-        std::strcmp(local_builder_env, "1") == 0;
-    if (local_builder_check) {
-        for (const auto & child : child_plans) {
-        ggml_phone_npu_serial::full_region_executor::
-            local_graph_shadow_stats stats {};
-        std::string why;
-        const int64_t begin_us = ggml_time_us();
-        const bool built = phone_npu_executor->validate_owned_local_graphs(
-            child, why, stats);
-        GGML_LOG_INFO(
-            "[PHONE_QWEN3_LOCAL] event=GRAPH_BUILD run=%" PRIu64
-            " region=%u layer=%u chunks=%u graph_nodes=%zu "
-            "kv_writes=%zu flash_nodes=%zu rope_nodes=%zu "
-            "builder_ms=%.3f mode=SHADOW_NO_HTP_ALLOC status=%s reason=%s\n",
-            plan.run_id, plan.region, child.layer,
-            stats.chunks, stats.total_nodes, stats.kv_writes,
-            stats.flash_nodes, stats.rope_nodes,
-            (ggml_time_us() - begin_us) / 1000.0,
-            built ? "PASS" : "FAIL",
-            built ? "NONE" : why.c_str());
-        if (!built) { return false; }
-        }
-    }
     // Explicit precompile A/B. Prepared HTP graphs do not consume streamed
     // activations yet: the proven PC Graph remains the only compute owner.
     const char * precompile_env =
@@ -7708,6 +7680,34 @@ bool rpc_server::phone_owned_plan_register(
             plan.region, plan.layer, child_plans.size(),
             phone_npu_name_for_region(plan.region),
             (ggml_time_us() - begin_us) / 1000.0);
+    }
+    // Optional Phone-local Qwen3 graph construction check. No RPC graph is
+    // consulted, and no NPU kernel is dispatched from this shadow path.
+    const char * local_builder_env =
+        std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_BUILDER_SHADOW");
+    const bool local_builder_check = local_builder_env != nullptr &&
+        std::strcmp(local_builder_env, "1") == 0;
+    if (local_builder_check) {
+        for (const auto & child : child_plans) {
+        ggml_phone_npu_serial::full_region_executor::
+            local_graph_shadow_stats stats {};
+        std::string why;
+        const int64_t begin_us = ggml_time_us();
+        const bool built = phone_npu_executor->validate_owned_local_graphs(
+            child, why, stats);
+        GGML_LOG_INFO(
+            "[PHONE_QWEN3_LOCAL] event=GRAPH_BUILD run=%" PRIu64
+            " region=%u layer=%u chunks=%u graph_nodes=%zu "
+            "kv_writes=%zu flash_nodes=%zu rope_nodes=%zu "
+            "builder_ms=%.3f mode=SHADOW_NO_HTP_ALLOC status=%s reason=%s\n",
+            plan.run_id, plan.region, child.layer,
+            stats.chunks, stats.total_nodes, stats.kv_writes,
+            stats.flash_nodes, stats.rope_nodes,
+            (ggml_time_us() - begin_us) / 1000.0,
+            built ? "PASS" : "FAIL",
+            built ? "NONE" : why.c_str());
+        if (!built) { return false; }
+        }
     }
     // Shadow-only: avoid racing the existing Graph and NPU life cycle.
     std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
