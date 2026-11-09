@@ -25,6 +25,10 @@ param(
     [switch] $SkipProfile,
     [switch] $ForceProfile,
     [switch] $NoProfileCache,
+    [switch] $NoV2Profile,
+    [string] $V2ProfileDir = "",
+    [string] $V2ProfilePhone = "",
+    [string] $NativeProfileExe = "",
     [ValidateSet("on", "off")]
     [string] $Streaming = "on",
     [ValidateSet("on", "off")]
@@ -87,6 +91,18 @@ if ($ForceProfile) {
 }
 if ($NoProfileCache) {
     $callArgs += "--no-profile-cache"
+}
+if ($NoV2Profile) {
+    $callArgs += "--no-v2-profile"
+}
+if ($V2ProfileDir) {
+    $callArgs += @("--v2-profile-dir", $V2ProfileDir)
+}
+if ($V2ProfilePhone) {
+    $callArgs += @("--v2-profile-phone", $V2ProfilePhone)
+}
+if ($NativeProfileExe) {
+    $callArgs += @("--native-profile-exe", $NativeProfileExe)
 }
 if ($NoMmap) {
     $callArgs += "--no-mmap"
