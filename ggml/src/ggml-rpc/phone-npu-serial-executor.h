@@ -16,6 +16,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <map>
 #include <tuple>
 #include <string>
@@ -379,6 +380,9 @@ public:
         size_t kv_bytes = 0;
         size_t graph_storage_bytes = 0;
         double precompile_ms = 0.0;
+        double cpu_build_ms = 0.0;
+        double buffer_alloc_ms = 0.0;
+        double input_setup_ms = 0.0;
     };
 
     // Opt-in precompile stage. The Phone allocates KV once per assigned Layer,
@@ -387,12 +391,14 @@ public:
     // Graph is consulted. This prepares graphs only: input PUSH and P2C still
     // follow the legacy path until a later cutover.
     //
-    // Caller holds phone_npu_backend_mutex, and may not call this while a
-    // different RUN is executing. Stream reset clears these plans first.
+    // Caller holds the owning Session mutex for all HTP operations, and may
+    // release it only while building private, unpublished CPU graph metadata.
+    // A different RUN must not touch this Session; reset clears plans first.
     bool prepare_owned_htp_graphs(
             const ggml_phone_owned::region_plan & plan,
             std::string & reason,
-            local_htp_prepare_stats & stats) {
+            local_htp_prepare_stats & stats,
+            std::unique_lock<std::mutex> * session_guard = nullptr) {
         stats = {};
         const char * why = "NONE";
         if (!ggml_phone_owned::validate(plan, why)) {
@@ -504,30 +510,51 @@ public:
         for (uint32_t chunk = 0;
                 chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
             auto item = std::make_unique<owned_chunk_graph>();
+            ggml_phone_qwen3::side_inputs side {};
+            // The Graph, masks and indices are CPU-only objects. Construct
+            // them ahead of the next Region while a different HTP session
+            // (or this session's prepared Graph) is computing.
+            const int64_t cpu_begin_us = ggml_time_us();
+            if (session_guard != nullptr) {
+                GGML_ASSERT(session_guard->owns_lock());
+                session_guard->unlock();
+            }
             ggml_init_params params = {graph_ctx_bytes, nullptr, true};
             item->ctx.reset(ggml_init(params));
+            const bool graph_built = item->ctx != nullptr &&
+                ggml_phone_qwen3::build_graph(
+                    item->ctx.get(), plan, chunk, w, item->built, why,
+                    kv->k, kv->v);
+            const bool side_ready = graph_built &&
+                ggml_phone_qwen3::make_side_inputs(
+                    plan, chunk, side, why);
+            stats.cpu_build_ms +=
+                (ggml_time_us() - cpu_begin_us) / 1000.0;
+            if (session_guard != nullptr) {
+                session_guard->lock();
+            }
             if (!item->ctx) {
                 reason = "PHONE_OWNED_HTP_GRAPH_CONTEXT";
                 break;
             }
-            if (!ggml_phone_qwen3::build_graph(
-                    item->ctx.get(), plan, chunk, w, item->built, why,
-                    kv->k, kv->v)) {
+            if (!graph_built) {
                 reason = std::string("PHONE_OWNED_HTP_BUILD:") + why;
                 break;
             }
+            if (!side_ready) {
+                reason = std::string("PHONE_OWNED_HTP_INPUTS:") + why;
+                break;
+            }
+            const int64_t alloc_begin_us = ggml_time_us();
             item->buffer.reset(ggml_backend_alloc_ctx_tensors(
                 item->ctx.get(), backend_));
+            stats.buffer_alloc_ms +=
+                (ggml_time_us() - alloc_begin_us) / 1000.0;
             if (!item->buffer) {
                 reason = "PHONE_OWNED_HTP_GRAPH_ALLOC";
                 break;
             }
-            ggml_phone_qwen3::side_inputs side {};
-            if (!ggml_phone_qwen3::make_side_inputs(
-                    plan, chunk, side, why)) {
-                reason = std::string("PHONE_OWNED_HTP_INPUTS:") + why;
-                break;
-            }
+            const int64_t setup_begin_us = ggml_time_us();
             ggml_backend_tensor_set(
                 item->built.positions, side.positions.data(), 0,
                 side.positions.size() * sizeof(int32_t));
@@ -543,6 +570,8 @@ public:
             // Ensure fixed-position/mask bytes are visible to any backend
             // compile-time specialization before registering this graph.
             ggml_backend_synchronize(backend_);
+            stats.input_setup_ms +=
+                (ggml_time_us() - setup_begin_us) / 1000.0;
             bool supported = true;
             for (int i = 0; i < ggml_graph_n_nodes(item->built.graph); ++i) {
                 if (!ggml_backend_supports_op(
