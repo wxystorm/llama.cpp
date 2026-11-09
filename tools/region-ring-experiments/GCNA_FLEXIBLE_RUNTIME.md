@@ -41,6 +41,18 @@ also fit an individual physical HTP allocation.
 - If neither mode can fit, the candidate is rejected or an NPU suffix may
   be assigned to Adreno without changing Transformer layer coverage.
 
+The current Android Hexagon default single-buffer limit is 1024 MiB
+(`GGML_HEXAGON_MBUF`). Native GCNA planning conservatively uses that default
+as its physical allocation ceiling until the Phone reports a measured
+per-buffer cap over RPC. A **single NPU Stage per Cycle** must occupy no
+more than half of BOTH the remaining shared Phone weight budget (after
+KV/workspace/Host/Adreno reserves) and the physical HTP single-buffer limit.
+With the default Hexagon cap, that is at most 512 MiB per N Stage. The
+constraint also applies to RESIDENT plans; a larger Stage is never admitted
+just because the entire Plan's weights fit in aggregate. Planner can shrink
+an N Stage and place the remaining Phone layers on Adreno if profiled and
+memory-feasible; it does not hardcode a maximum NPU layer count.
+
 Planning budget is an admission estimate, not a promise that arbitrary
 HTP allocations will succeed. The Phone's repack-buffer allocations are
 the final capacity check.
