@@ -560,13 +560,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             int selected_xc = 0;
             int selected_xg = 0;
             int selected_xp = 0;
+            std::vector<int> selected_npu_region_ids;
             const bool selected = ring_plan_apply_baseline ?
                 llama_hybrid_region_ring_planner_apply_baseline(
                     target_tokens, 0, chunk_tokens,selected_layout) :
                 ring_plan_apply_wide ?
                 llama_hybrid_region_ring_planner_apply_wide(
                     target_tokens, 0, chunk_tokens, selected_layout,
-                    selected_xc, selected_xg, selected_xp) :
+                    selected_xc, selected_xg, selected_xp,
+                    &selected_npu_region_ids) :
                 ring_plan_apply_cgp ?
                 llama_hybrid_region_ring_planner_apply_cgp(
                     target_tokens, 0, chunk_tokens,selected_layout) :
@@ -579,6 +581,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 // graph execution from allocated model weight ownership.
                 model_ptr->hybrid_ring_plan_layout = selected_layout;
                 model_ptr->hybrid_ring_plan_mode = ring_plan_apply_mode;
+                model_ptr->hybrid_ring_plan_npu_region_ids =
+                    std::move(selected_npu_region_ids);
                 if (ring_plan_apply_wide) {
                     model_ptr->hybrid_ring_plan_chunk_tokens = 0;
                     model_ptr->hybrid_ring_plan_cpu_chunk_tokens =
