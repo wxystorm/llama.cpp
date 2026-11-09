@@ -156,8 +156,8 @@ authoritative target. These pieces are now implemented as opt-in helpers in
   sweep; a cache miss/force calls the existing resumable *independent*
   `run_v2_stage_matrix.py`, not a compact fixed-layout runtime benchmark.
   Native Phone samples now use command 57 on inference RPC 50052
-  (protocol 4.0.34). Phone RPC starts a private stdio worker automatically,
-  without a second TCP listening port.
+  (protocol 4.0.35). Phone RPC directly invokes the native C++ N/A
+  Graph profiler within the server process: no Python worker or second port.
 - The native cache is accepted only after its model/device/binary
   fingerprints, PASS CSV/manifest consistency, and all required
   G2/C2/N1/A1 Chunk x KV shapes have been checked. Incomplete grids
@@ -290,8 +290,8 @@ a matching PC/Phone hardware test. See V2_RUNTIME_BANK_PROFILE.md.
   while N4 precompile/compute succeeded but numerical parity FAILED;
 - integration of N2/N4 native HTP graphs with PRODUCTION per-Cycle
   two-Bank refill, persistent Decode KV and inference RPC ownership;
-- eventual replacement of the private stdio helper with an in-process
-  C++ profiler (optional; the separate TCP sidecar is no longer needed);
+- real-hardware N/A native in-process tests, including repeated HTP Graph
+  lifetimes, CPU parity, capacity limits, and inference co-existence;
 - complete runtime-matched transfer-only benchmarking;
 - the V2 Planner, memory spill DAG, and V2 Runtime adoption;
 - Windows+Android builds and real Qwen3 logits/Prefill/Decode parity.
