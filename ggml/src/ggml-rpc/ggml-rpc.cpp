@@ -7790,7 +7790,8 @@ bool rpc_server::phone_owned_plan_register(
             "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
             " region=%u layer=%u backend=%s chunks=%u graph_nodes=%zu"
             " kv_bytes=%zu graph_storage_bytes=%zu"
-            " compile_ms=%.3f wall_ms=%.3f"
+            " compile_ms=%.3f cpu_build_ms=%.3f"
+            " buffer_alloc_ms=%.3f input_setup_ms=%.3f wall_ms=%.3f"
             " htp_lock_wait_ms=%.3f compute_priority_yield_ms=%.3f"
             " mode=SHADOW_FIXED_STORAGE status=%s reason=%s\n",
             plan.run_id, plan.region, child.layer,
@@ -7798,7 +7799,8 @@ bool rpc_server::phone_owned_plan_register(
                 plan.region, child.layer - plan.layer),
             stats.chunks,
             stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
-            stats.precompile_ms,
+            stats.precompile_ms, stats.cpu_build_ms,
+            stats.buffer_alloc_ms, stats.input_setup_ms,
             (ggml_time_us() - begin_us) / 1000.0,
             htp_lock_wait_ms,
             (htp_lock_start_us - yield_start_us) / 1000.0,
