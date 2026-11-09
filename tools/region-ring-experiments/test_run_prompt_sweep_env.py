@@ -3,7 +3,8 @@
 import unittest
 from pathlib import Path
 
-from run_prompt_sweep import configure_phone_plan_environment
+from run_prompt_sweep import (configure_phone_plan_environment,
+                              validate_force_npu_regions)
 
 
 class PhonePlanSweepEnvironmentTests(unittest.TestCase):
@@ -50,6 +51,40 @@ class PhonePlanSweepEnvironmentTests(unittest.TestCase):
         self.assertEqual(env["LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP"], "0")
         self.assertEqual(env["LLAMA_REGION_RING_PHONE_GRAPHLESS"], "0")
         self.assertNotIn("LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS", env)
+
+    def test_force_four_phone_p1_regions_to_resident_htp(self):
+        env = self.stale_plan_environment()
+        self.assertTrue(configure_phone_plan_environment(
+            env, v2_csv=None, force_layout=True,
+            force_npu_regions="1,3,5,7", force_npu_policy="resident"))
+        self.assertEqual(env["LLAMA_REGION_RING_FORCE_NPU_REGIONS"], "1,3,5,7")
+        self.assertEqual(env["LLAMA_REGION_RING_FORCE_NPU_POLICY"], "resident")
+        self.assertEqual(env["LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW"], "1")
+        self.assertEqual(env["LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP"], "1")
+        self.assertEqual(env["LLAMA_REGION_RING_PHONE_AUTONOMOUS"], "1")
+        self.assertNotIn("LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS", env)
+        self.assertNotIn("LLAMA_REGION_RING_V2_PROFILE_CSV", env)
+
+    def test_force_streaming_policy_is_opt_in(self):
+        env = {}
+        self.assertTrue(configure_phone_plan_environment(
+            env, v2_csv=None, force_layout=True,
+            force_npu_regions="1,3", force_npu_policy="streaming-2bank"))
+        self.assertEqual(env["LLAMA_REGION_RING_FORCE_NPU_POLICY"],
+                         "streaming-2bank")
+
+    def test_force_npu_requires_force_layout(self):
+        with self.assertRaisesRegex(ValueError, "FORCE_NPU_REQUIRES_FORCE_LAYOUT"):
+            configure_phone_plan_environment(
+                {}, v2_csv=None, force_layout=False,
+                force_npu_regions="1", force_npu_policy="resident")
+
+    def test_invalid_npu_region_lists_rejected(self):
+        for spec in ("", "1,1", "1,", "1, 3", "-1", "64", "1;3", "x"):
+            with self.subTest(spec=spec), self.assertRaises(ValueError):
+                validate_force_npu_regions(spec)
+        self.assertEqual(validate_force_npu_regions("01,3,5,7"),
+                         "1,3,5,7")
 
     def test_no_v2_does_not_inherit_stale_plan_on_default_sweep(self):
         env = self.stale_plan_environment()
