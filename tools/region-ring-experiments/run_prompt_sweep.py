@@ -277,7 +277,8 @@ def file_sha256(path: Path) -> str:
 def legacy_profile_cache_file(root: Path, model: Path, exe: Path,
                               rpc: str, threads: int,
                               no_mmap: bool, batch: int,
-                              ubatch: int) -> Path:
+                              ubatch: int,
+                              phone_fingerprint: str = "") -> Path:
     """Cache one measured legacy Hybrid Profile across prompt processes.
 
     NOTE: This is not the native G/C/N/A matrix. That is stored separately
@@ -293,6 +294,7 @@ def legacy_profile_cache_file(root: Path, model: Path, exe: Path,
         "engine_sha256": file_sha256(exe),
         "pc_id": host_device_id(),
         "rpc_endpoint": rpc,
+        "phone_fingerprint": phone_fingerprint,
         "threads": threads,
         "no_mmap": no_mmap,
         "batch": batch,
@@ -660,16 +662,6 @@ def main():
         ap.error("--force-profile cannot be combined with --skip-profile or --no-profile-cache")
     root = Path(__file__).resolve().parents[2]
     profile_cache = None
-    if args.planner == "apply-wide" and not (
-            args.skip_profile or args.no_profile_cache):
-        profile_cache = legacy_profile_cache_file(
-            root, args.model, args.exe, args.rpc,
-            args.threads, args.no_mmap, args.batch, args.ubatch)
-        if not args.dry_run:
-            profile_cache.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[REGION_RING_PROFILE_CACHE] source=LEGACY_HYBRID "
-              f"path={profile_cache} exists={int(profile_cache.is_file())}",
-              flush=True)
     # Native isolated G/C/N/A shapes are sampled at most once per sweep.
     # The cache's PASS-only CSV is consumed by the original C++ apply-wide
     # shortlist/DAG, not by a second production Planner.
@@ -686,6 +678,26 @@ def main():
                 phone_endpoint=args.v2_profile_phone)
         except (OSError, ValueError, RuntimeError) as exc:
             ap.error(f"native GCNA Profile failed: {exc}")
+    phone_identity = ""
+    if v2_csv is not None and (v2_csv.parent / "profile.json").is_file():
+        info = json.loads((v2_csv.parent / "profile.json").read_text("utf-8"))
+        phone = info.get("devices", {}).get("phone", {})
+        phone_identity = json.dumps({
+            "device_id": phone.get("device_id"),
+            "exe_sha256": phone.get("exe_sha256"),
+            "runtime_sha256": phone.get("runtime_sha256"),
+        }, sort_keys=True)
+    if args.planner == "apply-wide" and not (
+            args.skip_profile or args.no_profile_cache):
+        profile_cache = legacy_profile_cache_file(
+            root, args.model, args.exe, args.rpc,
+            args.threads, args.no_mmap, args.batch, args.ubatch,
+            phone_fingerprint=phone_identity)
+        if not args.dry_run:
+            profile_cache.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[REGION_RING_PROFILE_CACHE] source=LEGACY_HYBRID "
+              f"path={profile_cache} exists={int(profile_cache.is_file())}",
+              flush=True)
     commit = git_head(root)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = (args.out / f"{stamp}-{os.getpid()}").resolve()
