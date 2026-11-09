@@ -7646,9 +7646,12 @@ bool rpc_server::phone_owned_kv_bind(
                 std::any_of(phone_input_staged_slots.begin(),
                     phone_input_staged_slots.end(),
                     [&](const phone_input_staged & e) {
-                        return e.key.run_id == request.run_id;
+                        return e.key.run_id == request.run_id &&
+                            e.key.region == request.region;
                     })) {
-            return reject("STREAM_NOT_ACTIVE_OR_PUSH_ALREADY_STARTED");
+            // Other Regions may already be executing. Only the target
+            // Region must remain untouched until its KV is fully bound.
+            return reject("STREAM_NOT_ACTIVE_OR_REGION_PUSH_ALREADY_STARTED");
         }
     }
     std::lock_guard<std::mutex> htp_guard(phone_npu_backend_mutex);
