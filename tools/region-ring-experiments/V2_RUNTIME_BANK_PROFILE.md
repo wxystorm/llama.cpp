@@ -29,7 +29,7 @@ The Phone HTP mutex intentionally serializes Bank mutation and HTP
 compute. Unavailable device windows and incomplete runs are visible,
 not fabricated as a successful Profile.
 
-## Build both RPC endpoints at Patch33
+## Build both RPC endpoints at matching protocol version (now Patch34)
 
 The ggml/include/ggml-rpc.h protocol patch is now **33**.
 Build both Windows PC and Android Phone RPC from the same commit:
@@ -44,7 +44,7 @@ Build both Windows PC and Android Phone RPC from the same commit:
 Deploy the new Phone RPC server plus its compatible runtime libraries
 using the existing successful installation method. The Phone's HTP
 DSP kernels need no recompilation merely for the RPC schema change.
-Old Patch32 and new Patch33 RPC peers must NOT be mixed.
+Different RPC protocol versions (including Patch33 and Patch34) must NOT be mixed.
 
 Enable on the PHONE:
 
