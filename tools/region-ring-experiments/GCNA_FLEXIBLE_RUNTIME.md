@@ -16,9 +16,10 @@ have compiled and completed an end-to-end inference run.
   the complete interval. This is not three new PC->Phone boundary Regions.
 - A Plan may choose NPU0. In this case Phone HTP Region registration and
   its weight arenas are absent; A Regions use the normal OpenCL path.
-- The native NPU graph execution ABI supports Stage depths 1..32. The
-  Planner may estimate larger Stage service demands from measured smaller
-  depths within that bound. The Phone still verifies exact HTP buffers.
+- The native NPU graph builder supports Stage depths 1..32, but the
+  executable Planner selects only **measured, supported NPU depths** in the
+  native Stage Profile. An unmeasured NPU depth is not silently estimated;
+  the Phone also checks the real HTP allocation and Graph compilation.
 - Every selected HTP Layer owns its own persistent K/V tensors. The PC
   sends the canonical Decode K/V binding for every layer before the Phone
   registers the Stage's Chunk tasks.
@@ -53,6 +54,33 @@ The Phone-owned HTP Stage descriptor now carries an exclusive
 `layer_end` and uses Plan version 3. Both PC and Android RPC binaries
 must be rebuilt from the same revision. The V2 native Profile wire also
 expects RPC version 4.0.36.
+
+The final Transformer Stage must publish full `l_out` when a separate
+Head is enabled. `prepare_ubatch()` suppresses the inline Head for that
+Stage, and the canonical result is built once after every task and return
+frame has finished. The separate Head is validated to run **only on PC CPU**,
+whether the final Transformer Stage is G, C, N or A. GCNA PC-final execution
+currently requires the autonomous-final output mode and its Phone stream
+prerequisites; it is not a universal legacy inference fallback.
+
+## Build and host regression checks
+
+After switching to this branch, rebuild the **PC executable and Phone RPC
+server from the same patch-36 source revision**. On PC PowerShell (use
+an existing configured `build-tensor-v2` with RPC and tests enabled):
+
+```powershell
+cmake --build build-tensor-v2 --config Release --parallel 8 --target llama-cli ggml-rpc-server test-region-ring-v2-stage test-region-ring-planner test-region-ring test-phone-plan-region-map test-phone-npu-weight-banks test-phone-owned-execution-plan test-phone-qwen3-local-builder
+ctest --test-dir build-tensor-v2 -C Release --output-on-failure -R "^(test-region-ring-v2-stage|test-region-ring-planner|test-region-ring|test-phone-plan-region-map|test-phone-npu-weight-banks|test-phone-owned-execution-plan|test-phone-qwen3-local-builder)$"
+```
+
+Use the repository's Android/NDK build procedure for
+`ggml-rpc-server` and install matching libraries on Phone; an older binary
+using RPC 4.0.35 is **not** compatible. Keep the manual
+`NPU_SERIAL_REGIONS` and `MODEL_LOAD_LAYERS` lists unset in
+plan-controlled mode. Inspect the per-run logs for
+`[REGION_RING_NPU_MEMORY]`, `[PHONE_NPU_PLAN]` and
+`[PHONE_OWNED_KV]` before relying on any speed measurement.
 
 The supported diagnostic logs include
 `[REGION_RING_NPU_MEMORY] policy=...`,
