@@ -375,7 +375,8 @@ def run_matrix(args: argparse.Namespace) -> int:
             "device_id": (phone["device_id"] if phone else "PHONE_UNAVAILABLE")
                 if remote else local_device,
             "rpc_version": WIRE_VERSION if remote else 0,
-            "rpc_transport": phone["transport"] if remote and phone else None,
+            "rpc_transport": (phone.get("transport", "V2_PHONE_PROFILE_SIDECAR")
+                              if remote and phone else None),
             "runtime_sha256": phone["runtime_sha256"] if remote and phone
                               else None,
         }
@@ -569,7 +570,8 @@ def run_matrix(args: argparse.Namespace) -> int:
                 "exe_sha256": phone["exe_sha256"] if phone else None,
                 "runtime_sha256": phone["runtime_sha256"] if phone else None,
                 "backends": [b for b in "NA" if b in args.backends],
-                "transport": phone["transport"] if phone else None,
+                "transport": (phone.get("transport", "V2_PHONE_PROFILE_SIDECAR")
+                              if phone else None),
             },
         },
         "request": {
