@@ -9432,7 +9432,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         bool wide_apply = false,
         int * selected_xc = nullptr,
         int * selected_xg = nullptr,
-        int * selected_xp = nullptr) {
+        int * selected_xp = nullptr,
+        std::vector<int> * selected_npu_ids = nullptr) {
+    if (selected_npu_ids) { selected_npu_ids->clear(); }
     if (selected_layout != nullptr) {
         selected_layout->clear();
     }
@@ -10370,7 +10372,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     // Phone Stage allocation or its resource-constrained event DAG.
     if (const char * path =
             std::getenv("LLAMA_REGION_RING_V2_PROFILE_CSV")) {
-        if (*path != '\0') {
+        // Exact forced A/B retains its historical layout and execution
+        // semantics even when a native four-backend Profile is available.
+        const char * forced =
+            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+        if (*path != '\0' &&
+                (forced == nullptr || *forced == '\0')) {
             auto native = std::make_shared<
                 llama_ring_native_stage::profile>();
             std::string why;
@@ -11073,7 +11080,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // E_n is its cyclic minimax mismatch after the first n Cycles.
         // The subsequent optional Tensor pass and final wall ranking stay
         // unchanged.
-        if (!forced_ab && best.prefix_cycles > 0) {
+        if (!forced_ab && !model.phone_stage_allocation &&
+                best.prefix_cycles > 0) {
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_PREFIX_SELECTED] "
                 "cycles=%d layout=%s mode=E1_THEN_PREFIX_LOAD "
@@ -11097,7 +11105,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
 
         bool boundary_tensor_selected = false;
-        if (!forced_ab && !best.cpu_optional_seed) {
+        if (!forced_ab && !model.phone_stage_allocation &&
+                !best.cpu_optional_seed) {
             // The new Full-Frame Sender and directional Tensor return workers
             // are mutually exclusive runtime modes; do not score impossible
             // directional refiner candidates while the Full stream is on.
@@ -11583,6 +11592,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         *selected_xc = best.xc;
         *selected_xg = best.xg;
         *selected_xp = best.xp;
+        if (selected_npu_ids) {
+            for (size_t id : best.npu_region_indices) {
+                selected_npu_ids->push_back((int) id);
+            }
+        }
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
             "phase=PRE_MODEL_LOAD selected=1 source=%s "
@@ -12226,9 +12240,11 @@ bool llama_hybrid_region_ring_planner_apply_cgp(
 bool llama_hybrid_region_ring_planner_apply_wide(
         int tokens, int kv_start, int baseline_chunk,
         std::string & selected_layout,
-        int & selected_xc, int & selected_xg, int & selected_xp) {
+        int & selected_xc, int & selected_xg, int & selected_xp,
+        std::vector<int> * selected_npu_region_ids) {
     return llama_hybrid_region_ring_planner_evaluate(
         tokens, kv_start, baseline_chunk, &selected_layout,
         false, false, false, true,
-        &selected_xc, &selected_xg, &selected_xp);
+        &selected_xc, &selected_xg, &selected_xp,
+        selected_npu_region_ids);
 }
