@@ -252,6 +252,46 @@ public:
         return std::isfinite(ms) && ms >= 0;
     }
 
+    // Cheap original E/Beam search proxy only. Logical P is one native N1
+    // followed by a resident Adreno suffix, NOT the old arbitrary PHONE
+    // backend. When the Adreno suffix is deeper than measured shapes,
+    // extrapolate its service demand as an explicit cheap-search heuristic.
+    // Exact final DAG uses measured N/A shapes and fails closed on misses.
+    bool estimate_phone_coarse(int logical_layers, int chunk, int kv,
+                               phase kind, double & ms) const {
+        if (logical_layers < 1) { return false; }
+        double npu = 0.0;
+        if (!estimate('N', 1, chunk, kv, kind, npu)) {
+            return false;
+        }
+        if (logical_layers == 1) {
+            ms = npu;
+            return true;
+        }
+        const int adreno_layers = logical_layers - 1;
+        double a = 0.0;
+        if (estimate('A', adreno_layers, chunk, kv, kind, a)) {
+            ms = npu + a;
+            return true;
+        }
+        int largest = 0;
+        double measured = 0.0;
+        for (const auto & p : points_) {
+            if (p.backend != 'A' || p.layers <= largest) {
+                continue;
+            }
+            double value = 0.0;
+            if (estimate('A', p.layers, chunk, kv, kind, value)) {
+                largest = p.layers;
+                measured = value;
+            }
+        }
+        if (largest == 0) { return false; }
+        a = measured * (double) adreno_layers / largest;
+        ms = npu + a;
+        return std::isfinite(ms) && ms >= 0.0;
+    }
+
     bool weight_bytes(char backend, int layers, bool raw,
                       size_t & bytes) const {
         bytes = 0;
