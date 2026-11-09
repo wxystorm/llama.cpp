@@ -37,6 +37,9 @@ struct candidate {
     // Exact ordered full-stage layout for non-uniform cycles. Empty retains
     // the historical uniform (G,C,P)*cycles + optional tail generator.
     std::vector<llama_region_ring_region> concrete_regions;
+    // Exact physical Phone Region indices chosen as HTP by the optional
+    // native GCNA spill policy. Absent in legacy G/C/P Plans.
+    std::vector<size_t> npu_region_indices;
     // Complete first-Cycle-seeded prefix trace (not a runtime measurement).
     // Used to explain how each subsequent Cycle compensates previous load.
     int prefix_cycles = 0;
@@ -175,6 +178,12 @@ struct model {
     std::function<bool(int, int)> phone_npu_region_enabled;
     std::function<bool(int, int, size_t &)> phone_npu_region_weight_bytes;
     std::function<bool(size_t, double &)> phone_npu_weight_refill_ms;
+    // Optional shortlist-only expansion from logical Phone P into
+    // NPU prefix / Adreno suffix. It must produce exact physical Regions
+    // and candidate.npu_region_indices. Legacy mode leaves this empty.
+    std::function<bool(
+        const std::vector<llama_region_ring_region> &,
+        candidate &)> phone_stage_allocation;
     // Profile-approved native Stage times, never aggregate PHONE proxy costs.
     // In the mixed-Phone DAG these callbacks are mandatory for every
     // participating NPU/Adreno Stage, including the final short Chunk.
@@ -912,12 +921,25 @@ struct event {
 // only for bounded-slot regression tests. Boundary transfers are explicit
 // link events.
 inline bool simulate(const model & m,
-                     const std::vector<llama_region_ring_region> & regions,
+                     const std::vector<llama_region_ring_region> & logical_regions,
                      candidate & c, std::string * reason = nullptr) {
     auto reject = [&](const char * why) {
         if (reason) { *reason = why; }
         return false;
     };
+    // The search still generates G/C/P geometry. Only the selected
+    // shortlist candidates are expanded into N/A before exact DAG work.
+    // Copy first: logical_regions may alias c.concrete_regions.
+    if (m.phone_stage_allocation) {
+        const std::vector<llama_region_ring_region> original =
+            logical_regions;
+        if (!m.phone_stage_allocation(original, c) ||
+                c.concrete_regions.empty()) {
+            return reject("PHONE_NPU_SPILL_INFEASIBLE");
+        }
+    }
+    const auto & regions = m.phone_stage_allocation ?
+        c.concrete_regions : logical_regions;
     if (regions.empty() || m.tokens <= 0 || m.hidden <= 0 ||
         m.slot_pool < 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
@@ -959,9 +981,20 @@ inline bool simulate(const model & m,
     c.npu_weight_refill_busy_ms = 0.0;
     c.npu_weight_refills = 0;
     if (m.phone_npu_weight_streaming &&
-            !m.phone_npu_region_enabled) {
+            !m.phone_npu_region_enabled &&
+            !m.phone_stage_allocation) {
         return reject("NPU_REGION_PROFILE_MISSING");
     }
+    const auto is_npu_region = [&](size_t r) {
+        if (m.phone_stage_allocation) {
+            return std::find(c.npu_region_indices.begin(),
+                             c.npu_region_indices.end(), r) !=
+                   c.npu_region_indices.end();
+        }
+        return m.phone_npu_region_enabled &&
+               m.phone_npu_region_enabled(
+                   regions[r].layer_begin, regions[r].layer_end);
+    };
 
     std::vector<task> tasks;
     std::vector<std::vector<int>> by_region(regions.size());
@@ -989,9 +1022,7 @@ inline bool simulate(const model & m,
             const bool mixed_phone =
                 m.phone_npu_weight_streaming &&
                 region.kind == llama_region_ring_stage_kind::PHONE;
-            const bool is_npu = mixed_phone &&
-                m.phone_npu_region_enabled(
-                    region.layer_begin, region.layer_end);
+            const bool is_npu = mixed_phone && is_npu_region(r);
             const auto & native_compute =
                 is_npu ? m.phone_npu_compute_ms :
                          m.phone_adreno_compute_ms;
@@ -1401,8 +1432,7 @@ inline bool simulate(const model & m,
     if (m.phone_npu_weight_streaming) {
         for (size_t r = 0; r < regions.size(); ++r) {
             if (regions[r].kind != llama_region_ring_stage_kind::PHONE ||
-                    !m.phone_npu_region_enabled(
-                        regions[r].layer_begin, regions[r].layer_end)) {
+                    !is_npu_region(r)) {
                 continue;
             }
             npu_rank[r] = (int) npu_regions.size();
