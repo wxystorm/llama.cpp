@@ -404,7 +404,8 @@ private:
                                       bool                     embedding_only = false,
                                       bool                     preserve_weight_cache_on_reset = false,
                                       bool *                   graph_reused_out = nullptr,
-                                      llama_hybrid_stage_timing * stage_timing_out = nullptr);
+                                      llama_hybrid_stage_timing * stage_timing_out = nullptr,
+                                      bool                     suppress_output_head = false);
 
     llm_graph_result * process_ubatch_staged(
                                       const llama_ubatch &                            ubatch,
@@ -472,7 +473,8 @@ private:
                                       int64_t *                            ring_cuda_wait_us = nullptr,
                                       bool                                 preserve_weight_cache_on_graph_reset = false,
                                       bool                                 phone_prebuilt_graph = false,
-                                      bool                                 phone_auto_wait = false);
+                                      bool                                 phone_auto_wait = false,
+                                      bool                                 suppress_output_head = false);
 
     bool copy_hybrid_stage_output(
                                       llm_graph_result *   res,
