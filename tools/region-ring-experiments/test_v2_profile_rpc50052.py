@@ -25,7 +25,7 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 
 class MockRpc:
-    def __init__(self, payload: dict, *, version=(4, 0, 34),
+    def __init__(self, payload: dict, *, version=(4, 0, 35),
                  oversized=False):
         self.payload = payload
         self.version = version
