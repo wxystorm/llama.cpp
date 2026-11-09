@@ -18,6 +18,7 @@
 #include "phone-local-host-handoff.h"
 #include "phone-npu-serial-executor.h"
 #include "phone-owned-execution-plan.h"
+#include "phone-v2-profile-stdio.h"
 
 #include <array>
 #include <cmath>
@@ -406,6 +407,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_KV_BIND,
     RPC_CMD_PHONE_NPU_PLAN_CONFIGURE,
     RPC_CMD_PHONE_STAGE_PROFILE_PULL,
+    RPC_CMD_PHONE_V2_NATIVE_PROFILE,
     RPC_CMD_COUNT,
 };
 
@@ -447,6 +449,7 @@ static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC com
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
 static_assert(RPC_CMD_PHONE_NPU_PLAN_CONFIGURE == 55, "Plan-driven Phone HTP config index");
 static_assert(RPC_CMD_PHONE_STAGE_PROFILE_PULL == 56, "Structured Phone Stage Profile RPC index");
+static_assert(RPC_CMD_PHONE_V2_NATIVE_PROFILE == 57, "Native V2 Profile RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -16579,7 +16582,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
 }
 */
 
-static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr sock, size_t device_count) {
+static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr sock,
+                             size_t device_count, std::shared_ptr<phone_v2_profile_stdio> profile) {
     rpc_server & server = *server_ptr;
     uint8_t cmd;
     if (!sock->recv_data(&cmd, 1)) {
@@ -16771,6 +16775,29 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_stage_profile_rsp response {};
                 if (!server.phone_stage_profile_pull(request, response) ||
                         !send_msg(sock, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PHONE_V2_NATIVE_PROFILE: {
+                // Versioned 50052 Profile control frame. Do not allocate an
+                // arbitrary client-supplied size; the JSON shape is bounded.
+                // The shared worker serializes N/A samples across clients.
+                uint64_t nbytes = 0;
+                if (!sock->recv_data(&nbytes, sizeof(nbytes)) ||
+                        nbytes == 0 ||
+                        nbytes > phone_v2_profile_stdio::max_frame) {
+                    return;
+                }
+                std::vector<uint8_t> request((size_t) nbytes);
+                if (!sock->recv_data(request.data(), request.size())) {
+                    return;
+                }
+                std::vector<uint8_t> response;
+                if (!profile->request(request, response) ||
+                        response.empty() ||
+                        response.size() > phone_v2_profile_stdio::max_frame ||
+                        !send_msg(sock, response.data(), response.size())) {
                     return;
                 }
                 break;
@@ -17619,6 +17646,7 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         return;
     }
     auto shared_server = std::make_shared<rpc_server>(backends, cache_dir, tensor_source);
+    auto native_profile = std::make_shared<phone_v2_profile_stdio>(model_path);
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -17627,8 +17655,8 @@ void ggml_backend_rpc_start_server_ex(const char * endpoint, const char * cache_
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        std::thread([shared_server, client_socket, n_devices]() {
-            rpc_serve_client(shared_server, client_socket, n_devices);
+        std::thread([shared_server, client_socket, n_devices, native_profile]() {
+            rpc_serve_client(shared_server, client_socket, n_devices, native_profile);
             printf("Client connection closed\n");
             fflush(stdout);
         }).detach();
