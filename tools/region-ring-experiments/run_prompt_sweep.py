@@ -114,6 +114,42 @@ FIELDS = [
 NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
 
 
+# Phone-owned Qwen3 HTP Plans are opt-in only for native G/C/N/A automatic
+# selection. Forced legacy G/C/P A/B has no model-owned NPU Region map; never
+# let an inherited experimental flag register an empty/stale Phone Plan.
+_PHONE_PLAN_MODE_KEYS = (
+    "LLAMA_REGION_RING_PHONE_NPU_SERIAL_REGIONS",
+    "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP",
+    "LLAMA_REGION_RING_PHONE_GRAPHLESS",
+    "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW",
+)
+
+
+def configure_phone_plan_environment(env, v2_csv, force_layout):
+    """Reset Plan ownership, then enable it only for native automatic GCNA."""
+    for key in _PHONE_PLAN_MODE_KEYS:
+        env.pop(key, None)
+    if v2_csv is None or force_layout:
+        return False
+    env.update({
+        "LLAMA_REGION_RING_V2_PROFILE_CSV": str(v2_csv),
+        # The model-owned Plan supplies NPU Region IDs over RPC.
+        "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP": "0",
+        "LLAMA_REGION_RING_PHONE_GRAPHLESS": "0",
+        "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW": "1",
+        "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES": "1",
+        "GGML_META_PHONE_FULL_REGION_GRAPH": "1",
+        "LLAMA_REGION_RING_PHONE_AUTONOMOUS": "1",
+        "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL": "1",
+        "LLAMA_REGION_RING_PHONE_INPUT_PUSH": "1",
+        "LLAMA_REGION_RING_PHONE_INPUT_STREAM": "1",
+        "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM": "1",
+        "LLAMA_REGION_RING_PHONE_ASYNC_GRAPH_SETUP": "0",
+    })
+    return True
+
+
+
 def profile_kv_anchors(prompt_hint: int) -> tuple[int, ...]:
     """Use the smallest native KV anchor set covering the sweep.
 
@@ -694,7 +730,7 @@ def main():
     # shortlist/DAG, not by a second production Planner.
     v2_csv = None
     if args.planner == "apply-wide" and not (
-            args.skip_profile or args.no_v2_profile):
+            args.skip_profile or args.no_v2_profile or args.force_layout):
         from v2_profile_coordinator import prepare_native_profile
         try:
             v2_csv = prepare_native_profile(
@@ -771,23 +807,8 @@ def main():
             env["LLAMA_REGION_RING_PROFILE_CACHE_PATH"] = str(profile_cache)
             env["LLAMA_REGION_RING_PROFILE_FORCE"] = (
                 "1" if args.force_profile and prompt_index == 0 else "0")
-        if v2_csv is not None:
-            env.update({
-                "LLAMA_REGION_RING_V2_PROFILE_CSV": str(v2_csv),
-                # The model-owned Plan supplies HTP Region IDs, so an
-                # operator-provided list must never override selected ranks.
-                "LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP": "0",
-                "LLAMA_REGION_RING_PHONE_GRAPHLESS": "0",
-                "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW": "1",
-                "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES": "1",
-                "GGML_META_PHONE_FULL_REGION_GRAPH": "1",
-                "LLAMA_REGION_RING_PHONE_AUTONOMOUS": "1",
-                "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL": "1",
-                "LLAMA_REGION_RING_PHONE_INPUT_PUSH": "1",
-                "LLAMA_REGION_RING_PHONE_INPUT_STREAM": "1",
-                "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM": "1",
-                "LLAMA_REGION_RING_PHONE_ASYNC_GRAPH_SETUP": "0",
-            })
+        native_phone_plan = configure_phone_plan_environment(
+            env, v2_csv, bool(args.force_layout))
         if env.get("LLAMA_REGION_RING_PHONE_COPY_TRACE") == "1":
             # One opt-in switch collects both the per-copy detail and the
             # reference split breakdown for coverage reconciliation.
@@ -819,6 +840,7 @@ def main():
             "profile_cache_file": str(profile_cache) if profile_cache else None,
             "native_v2_profile_csv": str(v2_csv) if v2_csv else None,
             "force_profile": bool(args.force_profile and prompt_index == 0),
+            "native_gcna_phone_plan": native_phone_plan,
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
