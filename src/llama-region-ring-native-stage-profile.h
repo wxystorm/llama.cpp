@@ -430,10 +430,15 @@ public:
                     std::max(by_weight[p.raw_weight_bytes], p.refill_ms);
             }
         }
+        if (bytes == 0 || by_weight.empty()) { return false; }
         const auto it = by_weight.lower_bound(bytes);
-        if (bytes == 0 || it == by_weight.end()) { return false; }
-        cost = it->second;
-        return true;
+        if (it != by_weight.end()) {
+            cost = it->second;
+        } else {
+            const auto last = std::prev(by_weight.end());
+            cost = last->second * (double) bytes / last->first;
+        }
+        return std::isfinite(cost) && cost >= 0.0;
     }
 };
 
