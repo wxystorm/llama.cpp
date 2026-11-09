@@ -117,7 +117,7 @@ static void test_independent_profile_prefix() {
 static void test_adaptive_npu_memory() {
     npu_memory_request m {};
     m.phone_budget_bytes = 1500;
-    m.max_htp_allocation_bytes = 300;
+    m.max_htp_allocation_bytes = 700;
     m.npu_kv_bytes = 100;
     m.npu_graph_workspace_bytes = 60;
     m.host_stage_bytes = 30;
@@ -178,7 +178,7 @@ static void test_adaptive_npu_memory() {
           d.reason == std::string("HTP_STAGE_ALLOCATION_EXCEEDED"),
           "single-region HTP allocator limit must be checked");
 
-    m.max_htp_allocation_bytes = 300;
+    m.max_htp_allocation_bytes = 700;
     m.stage_weight_bytes = {210};
     d = choose_npu_weight_policy(m);
     check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
