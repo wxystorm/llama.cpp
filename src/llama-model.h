@@ -662,6 +662,9 @@ struct llama_model {
     int hybrid_ring_plan_cpu_chunk_tokens = 0;
     int hybrid_ring_plan_gpu_chunk_tokens = 0;
     int hybrid_ring_plan_phone_chunk_tokens = 0;
+    // Exact physical Phone Region indices selected by native GCNA Planner
+    // for HTP execution. Empty preserves the legacy Phone/OpenCL path.
+    std::vector<int> hybrid_ring_plan_npu_region_ids;
 
     // Region Ring GPU weight streaming V1: layer execution remains CUDA while
     // canonical model weights live in host/CPU buffers and are staged into
