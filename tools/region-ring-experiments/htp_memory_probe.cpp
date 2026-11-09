@@ -26,6 +26,7 @@ struct options {
     uint64_t aggregate_cap_mib = 0; // 0: conservative auto cap
     bool touch_pages = false;       // optional; substantially increases pressure
     bool dsp_check = false;         // execute a real HTP F32 ADD using both arenas
+    bool tight_dsp_vmem = false;    // explicit reduced mapping reserve (64 MiB)
 };
 
 uint64_t parse_u64(const std::string & s) {
@@ -95,7 +96,7 @@ void usage() {
     std::cout <<
         "Usage: ggml-htp-memory-probe [--mode single|dual|both] "
         "[--sizes-mib 256,512,...] [--max-aggregate-mib N] "
-        "[--touch-pages] [--dsp-check]\n"
+        "[--touch-pages] [--dsp-check] [--allow-tight-dsp-vmem]\n"
         "By default measures RPCMEM/FastRPC host mapping only. "
         "--dsp-check additionally executes a tiny HTP ADD graph referencing "
         "the complete large-buffer descriptors. Stop the RPC server first.\n";
@@ -111,6 +112,10 @@ options parse(int argc, char ** argv) {
         }
         if (arg == "--touch-pages") { o.touch_pages = true; continue; }
         if (arg == "--dsp-check") { o.dsp_check = true; continue; }
+        if (arg == "--allow-tight-dsp-vmem") {
+            o.tight_dsp_vmem = true;
+            continue;
+        }
         if (i + 1 >= argc) { throw std::runtime_error("MISSING_ARGUMENT:" + arg); }
         const std::string value = argv[++i];
         if (arg == "--mode") {
@@ -125,6 +130,9 @@ options parse(int argc, char ** argv) {
         } else {
             throw std::runtime_error("UNKNOWN_ARGUMENT:" + arg);
         }
+    }
+    if (o.tight_dsp_vmem && !o.dsp_check) {
+        throw std::runtime_error("TIGHT_DSP_VMEM_REQUIRES_DSP_CHECK");
     }
     return o;
 }
@@ -222,6 +230,7 @@ int main(int argc, char ** argv) {
                   << " aggregate_cap_mib=" << aggregate_cap
                   << " touch_pages=" << (opts.touch_pages ? 1 : 0)
                   << " dsp_check=" << (opts.dsp_check ? 1 : 0)
+                  << " tight_dsp_vmem=" << (opts.tight_dsp_vmem ? 1 : 0)
                   << " scope=RPCMEM_FASTRPC_HOST_MAP" << std::endl;
 
         ggml_backend_load_all();
@@ -298,21 +307,27 @@ int main(int argc, char ** argv) {
                         }
                     }
                     if (failure < 0 && opts.dsp_check) {
-                        // Leave 320 MiB of active DSP mapping headroom for
-                        // other allocations. Exact graph working-set limits
-                        // must also be verified with the real runtime.
+                        // Default: 320 MiB DSP mapping reserve. Explicit
+                        // opt-in: 64 MiB for near-limit experiments such
+                        // as two 1536 MiB arenas within a 3200 MiB VMEM
+                        // limit. This is intentionally NOT the default:
+                        // real inference graphs need additional KV/workspace.
+                        const uint64_t dsp_reserve_mib =
+                            opts.tight_dsp_vmem ? 64 : 320;
                         const uint64_t vmem_mib = std::getenv(
                             "GGML_HEXAGON_VMEM") ?
                             std::strtoull(std::getenv(
                                 "GGML_HEXAGON_VMEM"), nullptr, 10) : 3200;
                         const uint64_t active = each * count + 1;
-                        if (active + 320 > vmem_mib) {
+                        if (active > vmem_mib ||
+                                dsp_reserve_mib > vmem_mib - active) {
                             std::cout << "[HTP_MEM_PROBE] event=DSP_RESULT"
                                       << " mode=" << mode
                                       << " each_mib=" << each
                                       << " total_mib=" << each * count
                                       << " status=SKIP_DSP_VMEM_HEADROOM"
                                       << " vmem_mib=" << vmem_mib
+                                      << " dsp_reserve_mib=" << dsp_reserve_mib
                                       << std::endl;
                         } else {
                             std::cout << "[HTP_MEM_PROBE] event=DSP_ATTEMPT"
@@ -320,6 +335,7 @@ int main(int argc, char ** argv) {
                                       << " each_mib=" << each
                                       << " total_mib=" << each * count
                                       << " vmem_mib=" << vmem_mib
+                                      << " dsp_reserve_mib=" << dsp_reserve_mib
                                       << " scope=HTP_DSP_GRAPH"
                                       << std::endl;
                             const auto dsp_start =
