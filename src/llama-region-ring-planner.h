@@ -287,7 +287,8 @@ inline bool phone_spill_memory_feasible(
     out = {};
     if (regions.empty() || !npu_weight_bytes ||
             !adreno_weight_bytes ||
-            max_htp_bank_bytes == 0 || phone_budget_bytes == 0) {
+            (max_htp_bank_bytes == 0 && !npu_region_indices.empty()) ||
+            phone_budget_bytes == 0) {
         return false;
     }
     size_t npu_rank = 0;
@@ -380,7 +381,7 @@ inline bool choose_phone_npu_preferred_spill(
         phone_npu_spill_result & selected,
         size_t max_combinations = 50000) {
     selected = {};
-    if (logical.empty() || max_npu_layers_per_region < 1 ||
+    if (logical.empty() || max_npu_layers_per_region < 0 ||
             !npu_supported || !adreno_supported || !memory_feasible ||
             max_combinations == 0) {
         return false;
@@ -3907,7 +3908,8 @@ inline void search_runtime_pc_tail(
         const model & m, result & out,
         std::unordered_set<std::string> & scored,
         const dag_search_limits & limits = {}) {
-    if (out.top.empty() || !m.region_memory_feasible) { return; }
+    if (!m.phone_stage_allocation || out.top.empty() ||
+            !m.region_memory_feasible) { return; }
     std::vector<candidate> origins = out.top;
     std::sort(origins.begin(), origins.end(),
         [](const candidate & a, const candidate & b) {
