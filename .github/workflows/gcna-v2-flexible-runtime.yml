@@ -23,9 +23,10 @@ jobs:
           --target llama-cli ggml-rpc-server
           test-region-ring-planner test-region-ring
           test-region-ring-v2-stage test-region-ring-native-stage-profile
-          test-phone-plan-region-map
+          test-phone-plan-region-map test-phone-npu-weight-banks
           test-phone-owned-execution-plan test-phone-qwen3-local-builder
       - name: Run host-side contracts
         run: >
           ctest --test-dir build-gcna-v2 --output-on-failure
-          -R '^(test-region-ring-planner|test-region-ring|test-region-ring-v2-stage|test-region-ring-native-stage-profile|test-phone-plan-region-map|test-phone-owned-execution-plan|test-phone-qwen3-local-builder)$'
+          -R '^(test-region-ring-planner|test-region-ring|test-region-ring-v2-stage|test-region-ring-native-stage-profile|test-phone-plan-region-map|test-phone-npu-weight-banks|test-phone-owned-execution-plan|test-phone-qwen3-local-builder)
+
