@@ -89,6 +89,24 @@ class PhoneServiceTests(unittest.TestCase):
         self.service = Service(path, Path(sys.executable), token="securelongtoken123",
                                timeout=5)
 
+    def test_integrated_runtime_hash_tracks_rpc_server_binary(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            model = directory / "qwen.gguf"
+            model.write_bytes(b"test model")
+            exe = directory / "region-ring-v2-stage-profile"
+            exe.write_bytes(b"native profiler bytes")
+            rpc = directory / "ggml-rpc-server"
+            rpc.write_bytes(b"RPC patch 34 initial")
+            first = Service(model, exe, timeout=5)
+            self.assertEqual(first.rpc_server_sha256, first.hello()["rpc_server_sha256"])
+            self.assertEqual(len(first.control_sha256), 64)
+            rpc.write_bytes(b"RPC patch 34 updated")
+            second = Service(model, exe, timeout=5)
+            self.assertEqual(first.exe_sha256, second.exe_sha256)
+            self.assertNotEqual(first.rpc_server_sha256, second.rpc_server_sha256)
+            self.assertNotEqual(first.runtime_sha256, second.runtime_sha256)
+
     def test_rejects_non_model_prefix_and_wrong_token_without_exec(self):
         data = {"version": WIRE_VERSION, "action": "profile",
                 "token": "securelongtoken123",
