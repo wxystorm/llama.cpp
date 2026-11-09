@@ -77,8 +77,10 @@ SKIP_AGGREGATE_SAFETY_CAP, NOT evidence of HTP failure. For a deliberate
 second pass, use e.g. --max-aggregate-mib 3584 after checking available
 memory, preferably while the phone is cool, connected to power and idle.
 This override remains bounded by MemAvailable - 2048 MiB.
-All sizes are limited to 1984 MiB to avoid overflow when rpcmem_alloc2
-falls back to signed 32-bit rpcmem_alloc (Hexagon adds a 4 KiB guard page).
+By default sizes are limited to 1984 MiB to avoid overflow when
+rpcmem_alloc2 falls back to signed 32-bit rpcmem_alloc. The dedicated
+--allow-large-single experiment below can opt into sizes up to 3072 MiB,
+but only when the Android driver exports rpcmem_alloc2.
 
 Do not run the probe on a phone with active inference or important unsaved
 work. Even an allocation attempt that returns failure can cause Android to
@@ -166,3 +168,49 @@ GGML_HEXAGON_VMEM: collect logcat/kernel-related clues first.
 
 This is a controlled stress experiment. Other phone apps and the system may
 still compete for shared RAM, and DSP session failure is possible.
+
+
+## Phase 4: single 3072 MiB buffer (3 GiB)
+
+Two 1536 MiB buffers passing a DSP operation does not prove that one
+3072 MiB contiguous buffer can be allocated and mapped. A single 3 GiB
+Buffer is close to the 3200 MiB HTP active mapping budget and may fail
+inside RPCMEM, FastRPC, or the DSP for different reasons.
+
+Use the updated probe executable. The opt-in --allow-large-single flag:
+* requires --mode single and --dsp-check;
+* allows 1985-3072 MiB sizes only for a single arena;
+* checks that Android's libcdsprpc.so exports rpcmem_alloc2, refusing
+  the test if only the int-size rpcmem_alloc API is available;
+* leaves the usual shared-RAM safety check active.
+
+The low DSP mapping headroom flag is separate and also required at
+3072 MiB. Do NOT increase GGML_HEXAGON_VMEM just for this test.
+
+Rebuild the probe and copy the new binary to the phone. Stop the RPC
+server and any other heavy phone inference tasks before testing.
+
+    cd ~/phone-v2-profile
+    export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
+    export ADSP_LIBRARY_PATH="$PWD/lib"
+
+    GGML_HEXAGON_MBUF=3072 ./bin/ggml-htp-memory-probe \
+        --mode single \
+        --allow-large-single \
+        --dsp-check \
+        --allow-tight-dsp-vmem \
+        --max-aggregate-mib 3072 \
+        --sizes-mib 2048,2560,3072 \
+        2>&1 | tee htp-single-3g.log
+
+    grep -E 'RPCMEM_ALLOC2|ATTEMPT|RESULT|event=ERROR' htp-single-3g.log
+
+To claim the 3 GiB DSP mapping experiment passed, require:
+* event=RPCMEM_ALLOC2 available=1;
+* event=RESULT mode=single each_mib=3072 status=PASS;
+* event=DSP_RESULT mode=single each_mib=3072 status=PASS.
+
+A stopped process or failed allocation is NOT proof of an NPU DRAM
+capacity ceiling. Only one small F32 ADD operation is executed; this
+does not establish that a Qwen3 multi-layer stage fits with KV, Graph
+workspace or any additional buffers.
