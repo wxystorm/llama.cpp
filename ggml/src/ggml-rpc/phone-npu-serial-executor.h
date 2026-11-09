@@ -172,7 +172,9 @@ public:
             spec.layer = ordered[rank].layer_begin;
             spec.layer_end = ordered[rank].layer_end;
             ggml_init_params params {
-                ggml_tensor_overhead() * 32 + 4096, nullptr, true
+                ggml_tensor_overhead() *
+                    (size_t(32) * (spec.layer_end - spec.layer) + 8) +
+                    4096, nullptr, true
             };
             ggml_context_ptr ctx { ggml_init(params) };
             if (!ctx) {
@@ -287,6 +289,7 @@ public:
             return false;
         }
         banked_layers_ = std::move(layouts);
+        bank_local_source_ = local;
         if (fully_resident) {
             resident_weight_arenas_.resize(banked_layers_.size());
             for (size_t rank = 0; rank < banked_layers_.size(); ++rank) {
@@ -384,7 +387,7 @@ public:
             reason = "NPU_BANK_HOST_STAGE_INVALID_RANK";
             return false;
         }
-        size_t cap_mib = 512;
+        size_t cap_mib = 2048;
         if (const char * budget =
                 std::getenv("GGML_RPC_PHONE_NPU_HOST_STAGE_MIB")) {
             char * end = nullptr;
@@ -440,11 +443,19 @@ public:
     };
     banked_memory_snapshot banked_memory_for_run(uint64_t run_id) const {
         banked_memory_snapshot result {};
-        if (!banked_mode_) { return result; }
-        result.a_bytes = ggml_backend_buffer_get_size(
-            bank_weight_arenas_[0].get());
-        result.b_bytes = ggml_backend_buffer_get_size(
-            bank_weight_arenas_[1].get());
+        if (!has_any_weight_plan()) { return result; }
+        if (resident_mode_) {
+            for (const auto & arena : resident_weight_arenas_) {
+                if (arena) {
+                    result.a_bytes += ggml_backend_buffer_get_size(arena.get());
+                }
+            }
+        } else {
+            result.a_bytes = ggml_backend_buffer_get_size(
+                bank_weight_arenas_[0].get());
+            result.b_bytes = ggml_backend_buffer_get_size(
+                bank_weight_arenas_[1].get());
+        }
         result.weight_tensor_count = model_weights_.size();
         for (const auto & item : owned_kv_) {
             if (item.first.first == run_id && item.second->buffer) {
@@ -506,8 +517,8 @@ public:
                           model_load_stats & stats) {
         reason.clear();
         stats = {};
-        if (banked_mode_) {
-            reason = "HTP_MODEL_LOAD_PROHIBITED_WHILE_BANKED";
+        if (has_any_weight_plan()) {
+            reason = "HTP_MODEL_LOAD_PROHIBITED_WHILE_PLAN_WEIGHTS_ACTIVE";
             return false;
         }
         if (backend_ == nullptr || local.get_info == nullptr ||
