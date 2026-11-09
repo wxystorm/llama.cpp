@@ -96,6 +96,33 @@ class JupiterMemoryPlannerTest(unittest.TestCase):
         self.assertLessEqual(result.pc_weight_bytes, result.pc_budget_bytes)
         self.assertLessEqual(result.phone_weight_bytes, result.phone_budget_bytes)
 
+    def test_fixed_resume_split_is_kept_even_if_auto_would_change(self):
+        model = GGUFWeights('qwen3', (100*MIB,)*10, 0, 0)
+        cpu = DeviceMemory(1024*MIB, 1024*MIB)
+        pc = DeviceMemory(1024*MIB, 1024*MIB)
+        phone = DeviceMemory(1024*MIB, 1024*MIB)
+        automatic = plan_memory_split(
+            model, pc, phone, 0, 0, cpu=cpu, cpu_reserve_mib=0
+        )
+        self.assertEqual(automatic.cpu_layers, 0)
+        pinned = plan_memory_split(
+            model, pc, phone, 0, 0, cpu=cpu, cpu_reserve_mib=0,
+            cpu_layers_override=3, pc_layers_override=6,
+        )
+        self.assertEqual((pinned.cpu_layers, pinned.pc_layers), (3, 6))
+        self.assertEqual((pinned.pc_gpu_layers, pinned.phone_layers), (3, 4))
+        with self.assertRaisesRegex(ValueError, 'INFEASIBLE'):
+            plan_memory_split(
+                model, pc, phone, 0, 0,
+                cpu=DeviceMemory(200*MIB, 1024*MIB), cpu_reserve_mib=0,
+                cpu_layers_override=3, pc_layers_override=6,
+            )
+        with self.assertRaisesRegex(ValueError, 'saved CPU layer boundary'):
+            plan_memory_split(
+                model, pc, phone, 0, 0, cpu=cpu,
+                cpu_layers_override=6, pc_layers_override=5,
+            )
+
     def test_cpu_is_not_used_if_two_accelerators_suffice(self):
         weights = GGUFWeights('qwen3', (64*MIB,)*4, 32*MIB, 0)
         result = plan_memory_split(
