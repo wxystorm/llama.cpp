@@ -10402,7 +10402,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // Adreno is optional: valid all-HTP Phone layouts need only
             // correctness-qualified N1 timing and the shared RAM budget.
             // A1 is still required by adreno_ok before allocating any A.
-            if (!native->has_shape('N', 1) ||
+            if ((!native->has_shape('N', 1) &&
+                 !native->has_shape('A', 1)) ||
                     profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_NATIVE_PROFILE] status=REJECT "
