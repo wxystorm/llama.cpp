@@ -14349,6 +14349,57 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
 }
 
 void llama_context::perf_reset() {
+    // Graphless Phone-owned runs intentionally skip the legacy two-token
+    // warmup. Initialize the independent CUDA Bank schedulers here instead
+    // of loading the first ~4 GiB inside the measured Prefill. This is the
+    // same scheduler configuration created by process_ubatch_region_ring().
+    // Direct API clients without a warmup/reset retain its cold-start fallback.
+    const auto graphless_env = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    const bool graphless_cold_start =
+        !has_evaluated_once && model.hybrid_ring_gpu_weight_streaming &&
+        graphless_env("LLAMA_HYBRID_REGION_RING_V1") &&
+        graphless_env("LLAMA_REGION_RING_PHONE_GRAPHLESS") &&
+        graphless_env("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+    if (graphless_cold_start) {
+        const int64_t begin_us = ggml_time_us();
+        const size_t max_nodes =
+            graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
+        bool ready =
+            backend_ptrs.size() >= 3 && backend_buft.size() >= 3 &&
+            backend_ptrs[1] != nullptr && backend_ptrs[2] == backend_cpu;
+        if (ready) {
+            for (size_t id = 1; id <= 2; ++id) {
+                auto & bank = region_ring_worker_resources[id];
+                if (!bank.sched) {
+                    bank.sched.reset(ggml_backend_sched_new(
+                        backend_ptrs.data() + 1,
+                        backend_buft.data() + 1, 2, max_nodes,
+                        false, false));
+                    bank.bank_region = std::numeric_limits<size_t>::max();
+                    bank.bank_generation = 0;
+                    bank.bank_ready = false;
+                }
+                if (!bank.sched) {
+                    ready = false;
+                    break;
+                }
+                ggml_backend_sched_set_weight_cache(bank.sched.get(), true);
+                if (!bank.res) {
+                    bank.res.reset(new llm_graph_result(max_nodes));
+                }
+            }
+        }
+        ready = ready && region_ring_load_initial_gpu_banks();
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_BANK] phase=LOAD_TIME "
+            "event=GRAPHLESS_PRELOAD wall_ms=%.3f status=%s\n",
+            (ggml_time_us() - begin_us) / 1000.0,
+            ready ? "READY" : "FAIL");
+    }
+
     // The standard load/server initialization path calls perf_reset() after
     // warmup/probes. Ensure the first GPU Region (and second if present)
     // is resident here, including forced single-Cycle A/B layouts.
