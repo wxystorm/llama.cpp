@@ -16,6 +16,9 @@
 #include "gguf.h"
 #include "phone-qwen3-local-builder.h"
 #include "llama-region-ring-v2.h"
+#ifdef V2_STAGE_PROFILE_EMBEDDED
+#include "v2_stage_profile_embedded.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +28,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -798,7 +802,9 @@ parity_metrics parity_of(const std::vector<float> & actual,
 
 } // namespace
 
-int main(int argc, char ** argv) {
+static int v2_stage_profile_execute(
+        int argc, char ** argv, std::ostream & csv,
+        std::string * error_out = nullptr) {
     try {
         const parameters args = parse(argc, argv);
         const sample_result measured = run(args);
@@ -856,7 +862,7 @@ int main(int argc, char ** argv) {
                           << " backend=" << args.backend << '\n';
             }
         }
-        std::cout << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
+        csv << "backend,layers,chunk,kv_tokens,repeats,graph_build_ms,"
                      "weight_upload_ms,htp_precompile_ms,prepare_median_ms,"
                      "compute_median_ms,weight_bytes,kv_bytes,"
                      "graph_workspace_bytes,relative_rmse,max_abs,parity,source,"
@@ -865,7 +871,7 @@ int main(int argc, char ** argv) {
                      "weight_backend_set_ms,same_bank_refill_median_ms,"
                      "raw_weight_bytes,compute_min_ms,compute_p90_ms,"
                      "compute_max_ms,compute_stddev_ms\n";
-        std::cout << args.backend << ',' << args.layers << ',' << args.chunk
+        csv << args.backend << ',' << args.layers << ',' << args.chunk
                   << ',' << args.kv << ',' << args.repeats << ','
                   << measured.graph_build_ms << ','
                   << measured.weight_upload_ms << ','
@@ -893,8 +899,50 @@ int main(int argc, char ** argv) {
         // failed. It is NOT a PASS and will never enter the accepted CSV.
         return parity_failed ? 2 : 0;
     } catch (const std::exception & ex) {
+        if (error_out != nullptr) {
+            *error_out = ex.what();
+        }
         std::cerr << "[V2_STAGE_PROFILE] status=FAIL reason="
                   << ex.what() << '\n';
         return 1;
     }
 }
+
+#ifdef V2_STAGE_PROFILE_EMBEDDED
+v2_stage_profile_native_result v2_stage_profile_run_embedded(
+        const v2_stage_profile_native_options & options) {
+    v2_stage_profile_native_result result;
+    std::vector<std::string> arguments = {
+        "region-ring-v2-stage-profile",
+        "--model", options.model,
+        "--backend", std::string(1, options.backend),
+        "--layers", std::to_string(options.layers),
+        "--chunk", std::to_string(options.chunk),
+        "--kv", std::to_string(options.kv),
+        "--warmups", std::to_string(options.warmups),
+        "--repeats", std::to_string(options.repeats),
+        "--threads", std::to_string(options.threads),
+        "--bank-repeats", std::to_string(options.bank_repeats),
+        "--host-stage-cap-mib", std::to_string(options.host_stage_cap_mib),
+        "--relative-rmse", std::to_string(options.max_relative_rmse),
+        "--max-abs-error", std::to_string(options.max_abs_error),
+    };
+    if (options.verify_cpu || options.backend == 'N') {
+        arguments.push_back("--verify-cpu");
+    }
+    std::vector<char *> argv;
+    argv.reserve(arguments.size());
+    for (auto & arg : arguments) {
+        argv.push_back(&arg[0]);
+    }
+    std::ostringstream output;
+    result.exit_code = v2_stage_profile_execute(
+        static_cast<int>(argv.size()), argv.data(), output, &result.error);
+    result.csv = output.str();
+    return result;
+}
+#else
+int main(int argc, char ** argv) {
+    return v2_stage_profile_execute(argc, argv, std::cout);
+}
+#endif
