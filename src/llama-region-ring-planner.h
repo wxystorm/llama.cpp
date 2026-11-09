@@ -3898,6 +3898,92 @@ inline double region_ring_e_absolute_score(
     return 0.35 * e_norm + 0.65 * abs_norm;
 }
 
+// Exact-DAG expansion of non-Phone final tails.  It starts from candidates
+// that have already passed the complete G/C/N/A simulator, moves one or
+// more terminal Phone layers onto the next PC partial Cycle, and rechecks
+// the real Region memory model.  No fake last-Phone sentinel is appended.
+// Keep this bounded: the normal search and its profiling remain unchanged.
+inline void search_runtime_pc_tail(
+        const model & m, result & out,
+        std::unordered_set<std::string> & scored,
+        const dag_search_limits & limits = {}) {
+    if (out.top.empty() || !m.region_memory_feasible) { return; }
+    std::vector<candidate> origins = out.top;
+    std::sort(origins.begin(), origins.end(),
+        [](const candidate & a, const candidate & b) {
+            return a.wall_ms < b.wall_ms;
+        });
+    const size_t cap = limits.cpu_optional_dag_cap;
+    size_t attempted = 0;
+    for (size_t source = 0; source < origins.size() &&
+            source < 32 && attempted < cap; ++source) {
+        const auto & parent = origins[source];
+        std::vector<llama_region_ring_region> logical;
+        if (!make_regions(parent, m.layers, logical)) { continue; }
+        if (m.phone_stage_allocation) {
+            logical = collapse_adjacent_phone_stages(logical);
+        }
+        if (logical.size() < 4 ||
+                logical.back().device != device::PHONE) {
+            continue;
+        }
+        const auto phone = logical.back();
+        const int width = phone.layer_end - phone.layer_begin;
+        for (int tail = 1; tail <= std::min(width, 8) &&
+                attempted < cap; ++tail) {
+            for (device owner : {device::GPU, device::CPU}) {
+                if (attempted >= cap) { break; }
+                auto rs = logical;
+                rs.pop_back();
+                if (width > tail) {
+                    rs.emplace_back(
+                        device::PHONE, phone.layer_begin,
+                        phone.layer_end - tail);
+                    rs.emplace_back(
+                        owner, phone.layer_end - tail, phone.layer_end);
+                } else {
+                    // When the entire final P Stage moves to the PC,
+                    // extend the preceding G/C Stage if it has that owner.
+                    // This produces a legal partial final Cycle with no P.
+                    if (rs.empty() || rs.back().device != owner) {
+                        continue;
+                    }
+                    rs.back().layer_end = phone.layer_end;
+                }
+                if (!llama_region_ring_apply_topology_compatible(
+                        rs, m.layers)) {
+                    continue;
+                }
+                candidate proposal = parent;
+                proposal.concrete_regions = rs;
+                proposal.npu_region_indices.clear();
+                proposal.npu_weight_policy =
+                    llama_ring_v2::npu_weight_policy::STREAMING_2BANK;
+                const std::string key =
+                    llama_region_ring_layout_string(rs) + "/" +
+                    std::to_string(proposal.xc) + "/" +
+                    std::to_string(proposal.xg) + "/" +
+                    std::to_string(proposal.xp);
+                if (!scored.insert(key).second) { continue; }
+                ++attempted;
+                ++out.enumerated;
+                if (!m.region_memory_feasible(rs)) {
+                    ++out.rejected_memory;
+                    continue;
+                }
+                std::string why;
+                if (!simulate(m, rs, proposal, &why)) {
+                    ++out.rejected_deadlock;
+                    continue;
+                }
+                ++out.simulated;
+                ++out.shortlisted;
+                out.top.push_back(std::move(proposal));
+            }
+        }
+    }
+}
+
 // Runtime-applicable wide search. Unlike WIDE_PREVIEW, every candidate
 // ends on Phone and has no tail, so the selected topology can be loaded and
 // executed by the current canonical final-output path. C/G/P and XC/XG/XP
@@ -5218,6 +5304,9 @@ inline result search_runtime_applicable(
     refine_runtime_local_candidates(m, out, scored, limits);
     // CPU-optional candidates are introduced after that legacy local pass.
     search_runtime_cpu_optional(m, out, scored, limits);
+    // Allow the partial final Cycle to stop on CUDA or CPU.  This pass
+    // re-simulates complete executable layouts, not preview-only tails.
+    search_runtime_pc_tail(m, out, scored, limits);
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();
