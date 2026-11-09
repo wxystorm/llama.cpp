@@ -281,6 +281,78 @@ int main() {
             phone_memory, spill));
     }
 
+    // The real search still proposes G/C/P geometry. A shortlist-only
+    // callback physically expands selected Phone regions into N1->A2 and
+    // carries exact NPU IDs through the event DAG. Re-simulation must
+    // recognize an already expanded layout, not spill it a second time.
+    {
+        const auto logical = llama_region_ring_parse(
+            "G4,C1,P3,G4,C1,P3,G4,C1,P3", 24);
+        model native = mock_profile();
+        native.layers = 24;
+        native.tokens = 128;
+        native.slot_pool = 0;
+        native.phone_npu_weight_streaming = true;
+        native.phone_npu_compute_ms =
+            [](int n, int x, int kv, double & ms) {
+                ms = n * (0.5 + 0.06 * x + kv * 0.0001);
+                return true;
+            };
+        native.phone_adreno_compute_ms =
+            [](int n, int x, int kv, double & ms) {
+                ms = n * (0.7 + 0.08 * x + kv * 0.0001);
+                return true;
+            };
+        native.phone_npu_prepare_ms =
+            [](int, int, int, double & ms) { ms = 0.2; return true; };
+        native.phone_adreno_prepare_ms =
+            [](int, int, int, double & ms) { ms = 0.3; return true; };
+        native.phone_npu_region_weight_bytes =
+            [](int b, int e, size_t & bytes) {
+                if (e - b != 1) { return false; }
+                bytes = 1024;
+                return true;
+            };
+        native.phone_npu_weight_refill_ms =
+            [](size_t, double & ms) { ms = 5.0; return true; };
+        native.phone_stage_allocation =
+            [](const std::vector<llama_region_ring_region> & rs,
+               candidate & c) {
+                phone_npu_spill_result selected;
+                const auto npu = [](int b, int e) { return e - b == 1; };
+                const auto adreno = [](int b, int e) {
+                    return e > b && e - b <= 2;
+                };
+                const auto memory = [](
+                        const std::vector<llama_region_ring_region> &,
+                        const std::vector<size_t> & ids) {
+                    return ids.size() == 3;
+                };
+                if (!choose_phone_npu_preferred_spill(
+                        rs, 1, npu, adreno, memory, selected)) {
+                    return false;
+                }
+                c.concrete_regions = std::move(selected.regions);
+                c.npu_region_indices =
+                    std::move(selected.npu_region_indices);
+                return true;
+            };
+        candidate selected;
+        selected.xc = selected.xg = selected.xp = 64;
+        REQUIRE(simulate(native, logical, selected));
+        REQUIRE(selected.concrete_regions.size() == 12);
+        REQUIRE(selected.npu_region_indices.size() == 3);
+        REQUIRE(selected.npu_weight_refills == 1);
+        REQUIRE(selected.npu_weight_refill_busy_ms == 5.0);
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            selected.concrete_regions, 24));
+        const auto physical = selected.concrete_regions;
+        REQUIRE(simulate(native, physical, selected));
+        REQUIRE(selected.concrete_regions.size() == 12);
+        REQUIRE(selected.npu_region_indices.size() == 3);
+        REQUIRE(selected.npu_weight_refills == 1);
+    }
+
     // Wider offline search is opt-in: default online limits remain identical.
     {
         dag_search_limits defaults;
