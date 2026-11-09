@@ -12,3 +12,12 @@ target_compile_features(region-ring-v2-stage-profile PRIVATE cxx_std_17)
 if (LLAMA_TOOLS_INSTALL)
     install(TARGETS region-ring-v2-stage-profile RUNTIME)
 endif()
+
+# Standalone Android HTP0 shared-memory allocation/mapping probe. No GGUF,
+# model loading, inference runner or RPC server. Same GGML linkage as profiler.
+add_executable(ggml-htp-memory-probe htp_memory_probe.cpp)
+target_link_libraries(ggml-htp-memory-probe PRIVATE ggml)
+target_compile_features(ggml-htp-memory-probe PRIVATE cxx_std_17)
+if (LLAMA_TOOLS_INSTALL)
+    install(TARGETS ggml-htp-memory-probe RUNTIME)
+endif()
