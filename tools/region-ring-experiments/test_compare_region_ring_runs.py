@@ -74,6 +74,23 @@ class CompareRegionRingRunsTests(unittest.TestCase):
             self.assertIn("1024", output.getvalue())
             self.assertIn("4096", output.getvalue())
 
+    def test_legacy_without_chunk_traces_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = self.make_run(root, "legacy", 512, 1024, 100, "same")
+            (folder / "metrics.jsonl").write_text(
+                '{"type":"measurement_start"}\n'
+                '{"type":"region_ring","tokens":512,"wall_ms":1500}\n',
+                encoding="utf-8")
+            run = compare.load(root / "legacy")
+            self.assertFalse(run["has_chunk_traces"])
+            self.assertEqual(run["result"]["actual_prefill_tokens"], 512)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                compare.compare(run, run)
+            self.assertIn("No GPU per-Chunk trace", output.getvalue())
+            self.assertIn("GPU compute range ms", output.getvalue())
+
     def test_ambiguous_run_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

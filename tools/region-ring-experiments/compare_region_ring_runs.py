@@ -17,7 +17,7 @@ SUMMARY = (
     ("actual_prefill_tokens", "Prefill tokens", False),
     ("context", "Context size", False),
     ("prefill_tps", "Prefill tok/s", False),
-    ("prefill_ms", "Prefill wall ms", False),
+    ("prefill_ms", "Prefill wall ms", True),
     ("ring_wall_ms", "Ring wall ms", False),
     ("gpu_compute_range_ms", "GPU compute range ms", True),
     ("gpu_bank_wait_ms", "GPU bank wait ms", True),
@@ -49,12 +49,27 @@ def locate_run(path: Path) -> Path:
 
 def load(path: Path):
     folder = locate_run(path)
-    gpu, banks, result = diag.summarize(folder, folder.name)
+    # The legacy run_prompt_sweep.ps1 does not enable per-Chunk tracing by
+    # default. Its result.json still contains useful Ring and Bank aggregates.
+    try:
+        gpu, banks, result = diag.summarize(folder, folder.name)
+        has_chunk_traces = True
+    except ValueError as exc:
+        if "no GPU prefill Chunk traces" not in str(exc):
+            raise
+        gpu, banks = [], []
+        result = json.loads((folder / "result.json").read_text("utf-8"))
+        has_chunk_traces = False
     config = {}
     cfg = folder / "config.json"
     if cfg.is_file():
         config = json.loads(cfg.read_text("utf-8"))
-    events = diag.load_measured(folder)
+    try:
+        events = diag.load_measured(folder)
+    except ValueError as exc:
+        if "no measurement_start boundary" not in str(exc):
+            raise
+        events = []
     trace = [row for row in events if row.get("type") == "region_ring_chunk_trace"
              and row.get("device") == "GPU" and int(row.get("tokens") or 0) > 1]
     chunks = {}
@@ -63,7 +78,7 @@ def load(path: Path):
     return {"folder": folder, "result": result, "config": config,
             "gpu": {row["region"]: row for row in gpu},
             "banks": {int(row["region"]): row for row in banks},
-            "chunks": chunks}
+            "chunks": chunks, "has_chunk_traces": has_chunk_traces}
 
 
 def fmt(value, precision=2):
@@ -147,6 +162,16 @@ def compare(fast, slow):
           "compute cannot be summed to reconstruct wall time.")
 
     print("\n=== GPU REGION (actual CUDA lane incl. synchronization) ===")
+    if not fast["has_chunk_traces"] or not slow["has_chunk_traces"]:
+        missing = []
+        if not fast["has_chunk_traces"]:
+            missing.append("FAST")
+        if not slow["has_chunk_traces"]:
+            missing.append("SLOW")
+        print(f"No GPU per-Chunk trace for: {', '.join(missing)}.")
+        print("Legacy sweep may not enable task traces by default. "
+              "For a repeat, set $env:LLAMA_REGION_RING_TASK_TRACE='1' "
+              "before running run_prompt_sweep.ps1.")
     regions = sorted(set(fast["gpu"]) | set(slow["gpu"]))
     rows = []
     for r in regions:
@@ -166,9 +191,10 @@ def compare(fast, slow):
             fmt(ratio(per_tok_a, per_tok_b), 3),
             f"{fmt(ga.get('lane_ms'),1)}/{fmt(gb.get('lane_ms'),1)}",
         ])
-    print_rows(rows, ["R", "Bank", "Chunks A/B", "Full-Chunk lane A/B ms",
-                      "Chunk tokens A/B", "Samples A/B", "ms/token B/A",
-                      "Total lane A/B ms"])
+    if rows:
+        print_rows(rows, ["R", "Bank", "Chunks A/B", "Full-Chunk lane A/B ms",
+                          "Chunk tokens A/B", "Samples A/B", "ms/token B/A",
+                          "Total lane A/B ms"])
     print("A/B here means FAST/SLOW, not GPU Bank A/B. "
           "Only full-width, non-first Chunk samples are compared.")
 
@@ -181,8 +207,11 @@ def compare(fast, slow):
                      fmt(ratio(ga.get("total_ms"), gb.get("total_ms")), 3),
                      fmt(ga.get("queue_wait_ms")),
                      fmt(gb.get("queue_wait_ms"))])
-    print_rows(rows, ["Refill R", "Fast ms", "Slow ms", "Ratio B/A",
-                      "Fast queue", "Slow queue"])
+    if rows:
+        print_rows(rows, ["Refill R", "Fast ms", "Slow ms", "Ratio B/A",
+                          "Fast queue", "Slow queue"])
+    else:
+        print("No per-Refill traces; use aggregate GPU Bank counters above.")
 
     print("\n=== RECORDED CONFIG DIFFERENCES ===")
     changed = []
