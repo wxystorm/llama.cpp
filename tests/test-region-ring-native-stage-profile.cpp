@@ -48,12 +48,21 @@ int main() {
     CHECK(p.estimate('N', 1, 64, 768, phase::COMPUTE, compute));
     CHECK(std::fabs(compute - 13.0) < 1e-9);
     CHECK(!p.estimate('N', 1, 96, 512, phase::COMPUTE, compute));
-    CHECK(!p.estimate('N', 4, 64, 512, phase::COMPUTE, compute));
+    CHECK(p.estimate('N', 4, 64, 512, phase::COMPUTE, compute));
+    CHECK(std::fabs(compute - 48.0) < 1e-9);
+    CHECK(!p.estimate('N', 33, 64, 512, phase::COMPUTE, compute));
+    CHECK(!p.estimate('N', 4, 96, 512, phase::COMPUTE, compute));
     size_t weight = 0;
     CHECK(p.weight_bytes('N', 1, true, weight));
     CHECK(weight == 2100);
     CHECK(p.weight_bytes('N', 1, false, weight));
     CHECK(weight == 2500);
+    CHECK(p.weight_bytes('N', 4, false, weight));
+    CHECK(weight >= 10500);
+    CHECK(p.weight_bytes('N', 4, true, weight));
+    CHECK(weight >= 8820);
+    CHECK(p.workspace_bytes('N', 4, weight));
+    CHECK(weight >= 440);
     // Cheap E/Beam uses measured N1 + an Adreno suffix. This is only a
     // shortlist proxy; the exact DAG still rejects unmeasured A3/A5 shapes.
     CHECK(p.estimate_phone_coarse(
