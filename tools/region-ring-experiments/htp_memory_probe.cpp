@@ -17,6 +17,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef __ANDROID__
+#  include <dlfcn.h>
+#endif
 
 namespace {
 constexpr uint64_t MIB = 1024ULL * 1024;
@@ -27,6 +30,7 @@ struct options {
     bool touch_pages = false;       // optional; substantially increases pressure
     bool dsp_check = false;         // execute a real HTP F32 ADD using both arenas
     bool tight_dsp_vmem = false;    // explicit reduced mapping reserve (64 MiB)
+    bool allow_large_single = false; // opt-in 2-3 GiB single arena, only with rpcmem_alloc2
 };
 
 uint64_t parse_u64(const std::string & s) {
@@ -47,10 +51,10 @@ std::vector<uint64_t> sizes_from_csv(const std::string & csv) {
         const std::string part = csv.substr(start,
             comma == std::string::npos ? std::string::npos : comma - start);
         const uint64_t n = parse_u64(part);
-        // Keep room for Hexagon's 4 KiB guard page if rpcmem_alloc2
-        // falls back to the signed 32-bit rpcmem_alloc API.
-        if (n < 64 || n > 1984) {
-            throw std::runtime_error("SIZE_MUST_BE_64_TO_1984_MIB");
+        // A large (>1984 MiB) request requires a separate explicit
+        // opt-in and runtime proof of the size_t-based rpcmem_alloc2 symbol.
+        if (n < 64 || n > 3072) {
+            throw std::runtime_error("SIZE_MUST_BE_64_TO_3072_MIB");
         }
         out.push_back(n);
         if (comma == std::string::npos) { break; }
@@ -96,7 +100,8 @@ void usage() {
     std::cout <<
         "Usage: ggml-htp-memory-probe [--mode single|dual|both] "
         "[--sizes-mib 256,512,...] [--max-aggregate-mib N] "
-        "[--touch-pages] [--dsp-check] [--allow-tight-dsp-vmem]\n"
+        "[--touch-pages] [--dsp-check] [--allow-tight-dsp-vmem] "
+        "[--allow-large-single]\n"
         "By default measures RPCMEM/FastRPC host mapping only. "
         "--dsp-check additionally executes a tiny HTP ADD graph referencing "
         "the complete large-buffer descriptors. Stop the RPC server first.\n";
@@ -112,6 +117,10 @@ options parse(int argc, char ** argv) {
         }
         if (arg == "--touch-pages") { o.touch_pages = true; continue; }
         if (arg == "--dsp-check") { o.dsp_check = true; continue; }
+        if (arg == "--allow-large-single") {
+            o.allow_large_single = true;
+            continue;
+        }
         if (arg == "--allow-tight-dsp-vmem") {
             o.tight_dsp_vmem = true;
             continue;
@@ -134,7 +143,35 @@ options parse(int argc, char ** argv) {
     if (o.tight_dsp_vmem && !o.dsp_check) {
         throw std::runtime_error("TIGHT_DSP_VMEM_REQUIRES_DSP_CHECK");
     }
+    if (o.allow_large_single &&
+            (o.mode != "single" || !o.dsp_check)) {
+        throw std::runtime_error(
+            "LARGE_SINGLE_REQUIRES_SINGLE_MODE_AND_DSP_CHECK");
+    }
+    for (uint64_t mib : o.sizes) {
+        if (mib > 1984 &&
+                (!o.allow_large_single || o.mode != "single")) {
+            throw std::runtime_error(
+                "OVER_1984_MIB_REQUIRES_ALLOW_LARGE_SINGLE");
+        }
+    }
     return o;
+}
+
+// The old rpcmem_alloc(heap, flags, int size) API cannot represent a 3 GiB
+// allocation. On Android refuse the experiment unless libcdsprpc.so exports
+// rpcmem_alloc2(heap, flags, size_t size), avoiding silent int truncation
+// inside the Hexagon backend's fallback code path.
+bool has_rpcmem_alloc2() {
+#ifdef __ANDROID__
+    void * driver = dlopen("libcdsprpc.so", RTLD_NOW | RTLD_LOCAL);
+    if (!driver) { return false; }
+    const bool available = dlsym(driver, "rpcmem_alloc2") != nullptr;
+    dlclose(driver);
+    return available;
+#else
+    return false;
+#endif
 }
 
 void record(const char * mode, uint64_t size, const char * status,
@@ -212,6 +249,19 @@ const char * run_dsp_mapping_check(
 int main(int argc, char ** argv) {
     try {
         const options opts = parse(argc, argv);
+        const bool large_single = opts.allow_large_single &&
+            std::any_of(opts.sizes.begin(), opts.sizes.end(),
+                [](uint64_t size) { return size > 1984; });
+        if (large_single) {
+            const bool has_alloc2 = has_rpcmem_alloc2();
+            std::cout << "[HTP_MEM_PROBE] event=RPCMEM_ALLOC2"
+                      << " available=" << (has_alloc2 ? 1 : 0)
+                      << " large_single_requested=1" << std::endl;
+            if (!has_alloc2) {
+                throw std::runtime_error(
+                    "OVER_2_GIB_REFUSED_RPCMEM_ALLOC2_SYMBOL_MISSING");
+            }
+        }
         const uint64_t available = available_mib();
         if (available < 3072) {
             throw std::runtime_error("MEMAVAILABLE_BELOW_3072_MIB:REFUSE_PRESSURE_TEST");
@@ -231,6 +281,7 @@ int main(int argc, char ** argv) {
                   << " touch_pages=" << (opts.touch_pages ? 1 : 0)
                   << " dsp_check=" << (opts.dsp_check ? 1 : 0)
                   << " tight_dsp_vmem=" << (opts.tight_dsp_vmem ? 1 : 0)
+                  << " allow_large_single=" << (opts.allow_large_single ? 1 : 0)
                   << " scope=RPCMEM_FASTRPC_HOST_MAP" << std::endl;
 
         ggml_backend_load_all();
