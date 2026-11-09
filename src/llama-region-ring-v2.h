@@ -11,6 +11,7 @@
 //
 // This header is the shared contract for V2 profiling, planning and runtime.
 // The legacy Region Ring retains its original behavior during migration.
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
