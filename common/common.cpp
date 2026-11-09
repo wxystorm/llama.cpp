@@ -1440,6 +1440,10 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         env_enabled("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
     if (params.warmup && skip_graphless_warmup) {
         COM_INF("%s", "[PHONE_GRAPHLESS_WARMUP] action=SKIP reason=LEGACY_TINY_PHONE_SPLIT status=READY\n");
+        // A normal warmup would prepare the CUDA weight Banks before timing
+        // starts. Keep that benefit without executing a legacy Phone Graph.
+        llama_perf_context_reset(lctx);
+        COM_INF("%s", "[PHONE_GRAPHLESS_WARMUP] action=PRIME_BANKS_AND_RESET_PERF status=READY\n");
     }
     if (params.warmup && !skip_graphless_warmup) {
         const char * hybrid_prefill_warmup_env =
