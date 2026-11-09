@@ -569,7 +569,7 @@ def run_matrix(args: argparse.Namespace) -> int:
                 "exe_sha256": phone["exe_sha256"] if phone else None,
                 "runtime_sha256": phone["runtime_sha256"] if phone else None,
                 "backends": [b for b in "NA" if b in args.backends],
-                "transport": "V2_PHONE_PROFILE_SIDECAR" if use_phone else None,
+                "transport": phone["transport"] if phone else None,
             },
         },
         "request": {
