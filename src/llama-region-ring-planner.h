@@ -267,6 +267,7 @@ struct phone_spill_memory {
     size_t resident_npu_weight_bytes = 0;
     size_t resident_total_bytes = 0;
     size_t streaming_total_bytes = 0;
+    size_t npu_memory_bytes = 0; // NPU-only selected weights + KV + graph
     size_t npu_persistent_kv = 0;
     size_t adreno_weights = 0;
     size_t adreno_persistent_kv = 0;
@@ -390,6 +391,11 @@ inline bool phone_spill_memory_feasible(
     out.resident_npu_weight_bytes = choice.all_npu_weight_bytes;
     out.resident_total_bytes = choice.resident_total_bytes;
     out.streaming_total_bytes = choice.streaming_total_bytes;
+    out.npu_memory_bytes =
+        choice.policy == llama_ring_v2::npu_weight_policy::RESIDENT ?
+            choice.resident_npu_bytes :
+        choice.policy == llama_ring_v2::npu_weight_policy::STREAMING_2BANK ?
+            choice.streaming_npu_bytes : 0;
     out.npu_persistent_kv = request.npu_kv_bytes;
     out.adreno_weights = (size_t) adreno_weights;
     out.adreno_persistent_kv = (size_t) adreno_kv;
