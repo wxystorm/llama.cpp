@@ -18,9 +18,23 @@ PASS, allocation/mapping failure or a preflight skip, the failed buffer index,
 time and MemAvailable. --touch-pages optionally writes to every 4 KiB host
 page; it costs substantially more RAM bandwidth.
 
-A PASS means RPCMEM + FastRPC host-side mapping succeeded. It is NOT proof
-that the DSP mapped all bytes at once using HAP_mmap or that a multi-layer
-HTP graph will run: DSP mapping happens during HTP execution. The Hexagon
+A PASS from event=RESULT means RPCMEM + FastRPC host-side mapping
+succeeded. It is NOT proof that the DSP mapped all bytes at once using
+HAP_mmap or that a multi-layer HTP graph will run: DSP mapping happens
+during HTP execution.
+
+Option --dsp-check adds an HTP0 F32 ADD graph with inputs located in the
+actual large allocation(s) and an independently allocated small output.
+The Hexagon op serializer sends the full allocation sizes to the DSP, not
+only the 1 KiB tensor spans. The probe records DSP_ATTEMPT and DSP_RESULT.
+A DSP_RESULT status=PASS means a real DSP operator executed with those
+full-sized buffer descriptors. This still does not guarantee the full
+production multi-layer Graph and its additional KV/scratch requirements.
+The DSP test conservatively skips pairs leaving less than 320 MiB of
+mapping headroom. If DSP_RESULT fails, the probe stops increasing sizes
+for that mode.
+
+The Hexagon
 backend defaults to GGML_HEXAGON_MBUF=1024 MiB (single Buffer interface cap)
 and GGML_HEXAGON_VMEM=3200 MiB (HTP active mapping budget). Neither value
 is dedicated NPU DRAM. The HTP0 memory API currently reports free=total=0
@@ -88,3 +102,29 @@ DSP_active_mapping_limit. Do not assume one Buffer max equals all NPU
 memory. Do not impose a hard 512 MiB per-stage ceiling without evidence.
 A production Graph run must still test DSP-side active mappings and HTP
 execution before relying on a Plan.
+
+
+## Phase 2: actual DSP mapping test
+
+Rebuild/redeploy the latest probe executable (the earlier binary will not
+understand --dsp-check) and keep the phone RPC server stopped.
+
+    cd ~/phone-v2-profile
+    export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
+    export ADSP_LIBRARY_PATH="$PWD/lib"
+    export GGML_HEXAGON_NDEV=1
+    GGML_HEXAGON_MBUF=2048 ./bin/ggml-htp-memory-probe \
+        --mode both --dsp-check \
+        --sizes-mib 512,768,1024,1280 \
+        2>&1 | tee htp-memory-dsp.log
+
+    grep -E 'DSP_ATTEMPT|DSP_RESULT|event=ERROR' htp-memory-dsp.log
+
+A 1280+1280 MiB test plus a small result buffer fits the 3200 MiB
+default active mapping budget, with roughly 640 MiB left. Testing
+1536+1536 MiB would leave only about 128 MiB and is deliberately
+skipped by the 320 MiB-headroom guard. The guard is not a device limit.
+
+A DSP_RESULT PASS verifies a small real HTP operation. This is NOT a
+production Qwen3 multi-layer test, and it should not be labeled as
+physical NPU VRAM capacity or as an upper bound for all HTP workloads.
