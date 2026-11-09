@@ -18,6 +18,7 @@ static ggml_phone_owned::region_plan plan() {
     p.p2c_run_id = 45;
     p.region = 1;
     p.layer = 9;
+    p.layer_end = 10;
     p.total_tokens = 512;
     p.chunk_tokens = 128;
     p.n_embd = 5120;
@@ -74,8 +75,10 @@ static void test_multi_layer_graphs() {
         }
         const char * reason = "NONE";
         ggml_phone_qwen3::multi_graph_result chain {};
+        auto multi = first;
+        multi.layer_end = first.layer + (uint32_t) depth;
         CHECK(ggml_phone_qwen3::build_graph_layers(
-            ctx, first, 0, all, chain, reason));
+            ctx, multi, 0, all, chain, reason));
         CHECK(chain.graph != nullptr);
         CHECK(chain.layers.size() == depth);
         CHECK(chain.input == chain.layers.front().input);
