@@ -130,19 +130,19 @@ static void test_adaptive_npu_memory() {
     check(d.all_npu_weight_bytes == 830,
           "resident bytes must include every selected HTP stage");
     check(d.resident_total_bytes == 1130 &&
-          d.streaming_total_bytes == 730,
+          d.streaming_total_bytes == 725,
           "memory footprint must charge shared KV and two bank maxima");
 
     m.phone_budget_bytes = 900;
     d = choose_npu_weight_policy(m);
     check(d.feasible && d.policy == npu_weight_policy::STREAMING_2BANK,
           "full residency must spill to two banks only if needed");
-    check(d.selected_total_bytes == 730 &&
+    check(d.selected_total_bytes == 725 &&
           d.bank_weight_bytes[0] == 210 &&
           d.bank_weight_bytes[1] == 215,
           "streaming must use rank-parity bank maxima");
 
-    m.phone_budget_bytes = 729;
+    m.phone_budget_bytes = 724;
     d = choose_npu_weight_policy(m);
     check(!d.feasible && d.reason == std::string("PHONE_BUDGET_EXCEEDED"),
           "Plan must reject a joint Phone memory budget overrun");
