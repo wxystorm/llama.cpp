@@ -11055,8 +11055,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 (forced_counts[2] == 0 ? 1 : 0);
             if ((!single_cycle && !multi_cycle) ||
                     forced_regions.empty() ||
-                    forced_regions.back().device !=
-                        llama_region_ring_device::PHONE ||
                     (single_cycle && zero_devices > 1)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
@@ -11326,9 +11324,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 llama_region_ring_apply_topology_compatible(
                     best_regions, model.layers);
         if (!best_topology_ok ||
-                best_regions.back().device !=
-                    llama_region_ring_device::PHONE ||
-                best.tail_c != 0 || best.tail_g != 0) {
+                best_regions.empty() ||
+                (best.tail_c != 0 || best.tail_g != 0) &&
+                    !model.phone_stage_allocation) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
                 "reason=SELECTED_RUNTIME_CONTRACT_INVALID "
