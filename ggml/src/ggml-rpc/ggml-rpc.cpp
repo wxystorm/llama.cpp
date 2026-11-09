@@ -9031,13 +9031,55 @@ void rpc_server::phone_auto_compute_loop() {
             ggml_phone_npu_serial::full_region_executor::
                 local_only_profile profile {};
             std::string why;
-            const bool ok = valid_input &&
-                phone_npu_executor->run_owned_only_chunk(
-                    req.key.run_id, req.key.region, req.key.chunk,
-                    nullptr, nullptr, why, profile,
-                    &task->direct_p2c_payload,
-                    task->direct_input_activation.data(),
-                    task->direct_input_activation.size());
+            // A physical P3/P4/... Region has one input PUSH and one P2C.
+            // Internally its independent layer graphs share the same HTP
+            // session and run in Transformer order. No intermediate output
+            // crosses the PC/Phone link. Each layer owns separate F16 KV.
+            ggml_phone_owned::region_plan chain_plan {};
+            bool found_plan = false;
+            if (valid_input) {
+                std::lock_guard<std::recursive_mutex> guard(
+                    graph_compute_mutex);
+                const auto * existing = phone_owned_plans.find(
+                    req.key.run_id, req.key.region);
+                if (existing != nullptr) {
+                    chain_plan = *existing;
+                    found_plan = true;
+                }
+            }
+            bool ok = valid_input && found_plan;
+            std::vector<float> intermediate[2];
+            const float * activation =
+                task->direct_input_activation.data();
+            const size_t n_floats = task->direct_input_activation.size();
+            if (ok) {
+                const uint32_t count =
+                    ggml_phone_owned::layer_count(chain_plan);
+                profile.layer = chain_plan.layer;
+                for (uint32_t i = 0; i < count; ++i) {
+                    std::vector<float> * output =
+                        i + 1 == count ?
+                            &task->direct_p2c_payload :
+                            &intermediate[i % 2];
+                    ggml_phone_npu_serial::full_region_executor::
+                        local_only_profile one {};
+                    const uint32_t internal_region =
+                        ggml_phone_owned::internal_layer_region(
+                            chain_plan, i);
+                    ok = phone_npu_executor->run_owned_only_chunk(
+                        req.key.run_id, internal_region, req.key.chunk,
+                        nullptr, nullptr, why, one, output,
+                        activation, n_floats);
+                    if (!ok) { break; }
+                    profile.input_read_ms += one.input_read_ms;
+                    profile.input_upload_ms += one.input_upload_ms;
+                    profile.htp_compute_ms += one.htp_compute_ms;
+                    profile.output_copy_ms += one.output_copy_ms;
+                    activation = output->data();
+                }
+            } else if (valid_input) {
+                why = "PHONE_LOCAL_CHAIN_PLAN_MISSING";
+            }
             std::vector<float>().swap(task->direct_input_activation);
             if (phone_chunk_timeline_enabled) {
                 task->npu_exec_begin_us = task->compute_begin_us;
