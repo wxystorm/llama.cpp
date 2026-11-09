@@ -443,7 +443,9 @@ add_executable(test-region-ring-profile-cache test-region-ring-profile-cache.cpp
 set_target_properties(test-region-ring-profile-cache PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 target_include_directories(test-region-ring-profile-cache PRIVATE
-    ${PROJECT_SOURCE_DIR}/src)
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/ggml/include)
 llama_test(test-region-ring-profile-cache)
 
 # Strict, device-free loader for native G/C/N/A first-N-layer Profile CSV.
