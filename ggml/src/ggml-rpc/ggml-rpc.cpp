@@ -8821,7 +8821,8 @@ bool rpc_server::phone_owned_kv_bind(
     std::lock_guard<std::recursive_mutex> graph_guard(graph_compute_mutex);
     const auto * plan = phone_owned_plans.find(
         request.run_id, request.region);
-    if (!plan || plan->layer != request.layer ||
+    if (!plan || request.layer < plan->layer ||
+            request.layer >= plan->layer_end ||
             plan->total_tokens != request.total_tokens ||
             !ggml_phone_npu_serial::htp_region(
                 phone_npu_serial_regions, request.region) ||
@@ -8878,6 +8879,16 @@ bool rpc_server::phone_owned_kv_bind(
             request.run_id, request.region, request.layer,
             std::move(canonical_ctx), k, v, true, why)) {
         return reject(why.c_str());
+    }
+    // The first layers only bind their own Decode K/V. The final layer
+    // atomically opens the Region's immutable Chunk queue exactly once.
+    if (!phone_npu_executor->all_owned_decode_kv_bound(
+            request.run_id, request.region)) {
+        GGML_LOG_INFO(
+            "[PHONE_OWNED_KV] event=LAYER_BOUND run=%" PRIu64
+            " region=%u layer=%u status=PARTIAL\n",
+            request.run_id, request.region, request.layer);
+        return true;
     }
     // Every task is registered before PC launches PUSH. Per-region FIFO,
     // 128 MiB host budget and P2C Arena backpressure stay unchanged.
