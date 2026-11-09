@@ -258,10 +258,24 @@ inline npu_memory_decision choose_npu_weight_policy(
         d.reason = "UNKNOWN_HTP_SINGLE_ALLOCATION_LIMIT";
         return d;
     }
+    if (fixed >= m.phone_budget_bytes) {
+        d.reason = "PHONE_FIXED_MEMORY_BUDGET_EXCEEDED";
+        return d;
+    }
+    // The two HTP weight Banks may coexist. Reserve all Phone-shared
+    // allocations first, then limit EACH NPU Stage to one half of the
+    // remaining weight budget, independently of the chosen residency mode.
+    // The physical HTP single-allocation limit is a separate hard ceiling.
+    const size_t max_stage_weight_bytes =
+        (m.phone_budget_bytes - fixed) / 2;
     for (size_t i = 0; i < m.stage_weight_bytes.size(); ++i) {
         const size_t bytes = m.stage_weight_bytes[i];
         if (bytes == 0 || bytes > m.max_htp_allocation_bytes) {
             d.reason = "HTP_STAGE_ALLOCATION_EXCEEDED";
+            return d;
+        }
+        if (bytes > max_stage_weight_bytes) {
+            d.reason = "HTP_STAGE_HALF_BANK_BUDGET_EXCEEDED";
             return d;
         }
         if (!add(d.all_npu_weight_bytes, bytes, d.all_npu_weight_bytes)) {
