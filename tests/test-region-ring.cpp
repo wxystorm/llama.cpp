@@ -54,6 +54,35 @@ static void test_layout() {
     check(alternative.size() == 6, "two-cycle layout region count");
     check(other_counts[0] == 22 && other_counts[1] == 11 &&
           other_counts[2] == 15, "two-cycle layout device totals");
+
+    // Force eight CPU-free cycles; legacy fixed-layout parsing stays strict.
+    const std::string eight_spec =
+        "G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1";
+    const auto eight = llama_region_ring_parse_apply_wide_layout(
+        eight_spec, 64);
+    const auto eight_counts = llama_region_ring_layer_counts(eight);
+    check(eight.size() == 16 && eight_counts[0] == 0 &&
+              eight_counts[1] == 56 && eight_counts[2] == 8,
+          "Qwen3-32B eight-cycle layer ownership");
+    check(llama_region_ring_apply_topology_compatible(eight, 64) &&
+              eight.back().layer_begin == 63 &&
+              eight.back().layer_end == 64,
+          "Qwen3-32B eight-cycle apply-wide topology");
+    bool legacy_rejected = false;
+    try {
+        (void) llama_region_ring_parse(eight_spec, 64);
+    } catch (const std::runtime_error &) {
+        legacy_rejected = true;
+    }
+    check(legacy_rejected, "legacy parser unexpectedly accepts eight cycles");
+    bool ninth_rejected = false;
+    try {
+        (void) llama_region_ring_parse_apply_wide_layout(
+            eight_spec + ",G7,P1", 72);
+    } catch (const std::runtime_error &) {
+        ninth_rejected = true;
+    }
+    check(ninth_rejected, "forced layout accepted more than eight cycles");
 }
 
 

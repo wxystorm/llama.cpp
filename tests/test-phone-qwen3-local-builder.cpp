@@ -39,14 +39,16 @@ static ggml_phone_owned::region_plan plan() {
     return p;
 }
 
-static ggml_phone_qwen3::layer_weights weights(ggml_context * ctx) {
+static ggml_phone_qwen3::layer_weights weights(
+        ggml_context * ctx, int64_t n_heads = 40) {
     using ggml_phone_qwen3::layer_weights;
     layer_weights w {};
+    const int64_t q_width = n_heads * 128;
     w.attn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
-    w.wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 5120);
+    w.wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, q_width);
     w.wk = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 1024);
     w.wv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 1024);
-    w.wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 5120);
+    w.wo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q_width, 5120);
     w.ffn_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 5120);
     w.ffn_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 17408);
     w.ffn_up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5120, 17408);
@@ -128,6 +130,37 @@ int main() {
     auto bad = w;
     bad.ffn_up = w.wq;
     CHECK(!ggml_phone_qwen3::validate_weights(p, bad, reason));
+
+    // Check GGML graph shape for Qwen3-32B, not only plan metadata.
+    auto wide = p;
+    wide.layer = 63;
+    wide.region = 15;
+    wide.n_heads = 64;
+    const auto wide_weights = weights(ctx, 64);
+    CHECK(ggml_phone_owned::validate(wide, reason));
+    CHECK(ggml_phone_qwen3::validate_weights(wide, wide_weights, reason));
+    ggml_phone_qwen3::graph_result wide_graph {};
+    CHECK(ggml_phone_qwen3::build_graph(
+        ctx, wide, 0, wide_weights, wide_graph, reason));
+    CHECK(wide_graph.graph && wide_graph.output);
+    CHECK(wide_graph.output->ne[0] == 5120 &&
+          wide_graph.output->ne[1] == 128);
+    const ggml_tensor * out_projection = nullptr;
+    for (int n = 0; n < ggml_graph_n_nodes(wide_graph.graph); ++n) {
+        const ggml_tensor * node = ggml_graph_node(wide_graph.graph, n);
+        if (std::strcmp(node->name, "attn_out-63") == 0) {
+            out_projection = node;
+            break;
+        }
+    }
+    CHECK(out_projection && out_projection->op == GGML_OP_MUL_MAT);
+    CHECK(out_projection->src[1] &&
+          out_projection->src[1]->ne[0] == 8192 &&
+          out_projection->src[1]->ne[1] == 128);
+    auto wrong_projection = wide_weights;
+    wrong_projection.wo = w.wo; // 14B's narrower Q output projection
+    CHECK(!ggml_phone_qwen3::validate_weights(
+        wide, wrong_projection, reason));
     ggml_free(ctx);
     std::puts("test-phone-qwen3-local-builder PASS");
     return 0;

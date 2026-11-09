@@ -43,6 +43,13 @@ int main() {
     const char * reason = nullptr;
     const region_plan a = make_plan();
     CHECK(validate(a, reason));
+    // Qwen3-32B: 5120 hidden features, 64 query heads, 128 head dim.
+    auto wide = a;
+    wide.region = 15;
+    wide.layer = 63;
+    wide.n_heads = 64;
+    CHECK(validate(wide, reason));
+    CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
     CHECK(owned_task_uid(1, 0) != 0);
     CHECK(owned_task_uid(1, 0) != owned_task_uid(1, 1));
@@ -96,7 +103,13 @@ int main() {
     invalid.position_base = 2000;
     CHECK(!validate(invalid, reason));
     invalid = a;
-    invalid.n_embd = 4096;
+    invalid.n_embd = 0;
+    CHECK(!validate(invalid, reason));
+    invalid = a;
+    invalid.n_heads = 63; // not divisible by 8 KV heads
+    CHECK(!validate(invalid, reason));
+    invalid = a;
+    invalid.n_heads = 1024; // 1024*128 exceeds output width budget
     CHECK(!validate(invalid, reason));
     invalid = a;
     invalid.chunk_tokens = 0;

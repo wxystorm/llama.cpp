@@ -140,6 +140,7 @@ inline bool build_graph(ggml_context * ctx,
     const uint32_t begin = chunk * p.chunk_tokens;
     const uint32_t tokens = std::min(p.chunk_tokens, p.total_tokens - begin);
     const int64_t kv_width = int64_t(p.n_heads_kv) * p.head_dim;
+    const int64_t attn_width = int64_t(p.n_heads) * p.head_dim;
     if (uint64_t(p.n_kv) * tokens * sizeof(uint16_t) >
             ggml_phone_owned::k_max_activation_bytes) {
         reason = "CAUSAL_MASK_BUDGET_EXCEEDED";
@@ -270,7 +271,9 @@ inline bool build_graph(ggml_context * ctx,
              ggml_permute(ctx, v4, 0, 2, 1, 3),
              mask, 1.0f / std::sqrt(float(p.head_dim)), 0.0f, 0.0f);
     ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-    attn = ggml_reshape_2d(ctx, attn, p.n_embd, tokens);
+    // Flash attention yields n_heads * head_dim features, not necessarily
+    // n_embd (Qwen3-32B uses 8192 Q features vs 5120 hidden features).
+    attn = ggml_reshape_2d(ctx, attn, attn_width, tokens);
     ggml_tensor * attn_out = ggml_mul_mat(ctx, w.wo, attn);
     mark(attn_out, "attn_out");
     ggml_tensor * ffn_inp = ggml_add(ctx, attn_out, input);

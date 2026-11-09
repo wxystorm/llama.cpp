@@ -159,6 +159,22 @@ int main() {
         REQUIRE(!llama_region_ring_single_cycle_force_compatible(
             phone_only, 40));
 
+        // Exact 64-layer CPU-free 8-cycle layout is valid for forced APPLY.
+        // Automatic search remains limited to 2-4 cycles.
+        const auto eight_cycle = llama_region_ring_parse_apply_wide_layout(
+            "G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1", 64);
+        REQUIRE(eight_cycle.size() == 16);
+        REQUIRE(llama_region_ring_apply_topology_compatible(eight_cycle, 64));
+        candidate forced_eight_cycle;
+        forced_eight_cycle.cycles = 8;
+        forced_eight_cycle.xc = forced_eight_cycle.xg =
+            forced_eight_cycle.xp = 128;
+        forced_eight_cycle.concrete_regions = eight_cycle;
+        std::vector<llama_region_ring_region> eight_rebuilt;
+        REQUIRE(make_regions(forced_eight_cycle, 64, eight_rebuilt));
+        REQUIRE(eight_rebuilt.size() == 16);
+        REQUIRE(eight_rebuilt.back().layer_begin == 63);
+
         candidate forced_two_device;
         forced_two_device.cycles = 1;
         forced_two_device.c = 3;

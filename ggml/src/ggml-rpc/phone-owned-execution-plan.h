@@ -99,8 +99,9 @@ inline bool validate(const region_plan & p, const char * & reason) {
             p.n_heads_kv > p.n_heads ||
             p.n_heads % p.n_heads_kv != 0 || !p.head_dim ||
             p.head_dim > 512 || (p.head_dim & 1) != 0 ||
-            p.n_embd % p.n_heads != 0 ||
-            p.n_embd / p.n_heads != p.head_dim) {
+            // Qwen3-32B: 64*128 Q features != 5120 hidden features.
+            // The output projection maps Q width back into hidden size.
+            uint64_t(p.n_heads) * p.head_dim > 65536) {
         reason = "INVALID_QWEN3_SHAPE";
         return false;
     }

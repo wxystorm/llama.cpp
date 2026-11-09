@@ -730,6 +730,11 @@ inline bool llama_region_ring_single_cycle_force_compatible(
     return active_devices >= 2;
 }
 
+// Forced APPLY_WIDE may use up to eight G -> [C] -> P cycles, including
+// CPU-free G7,P1 x8 on Qwen3-32B. Legacy fixed layouts and automatic
+// Planner search retain the original 2-4 cycle limits.
+inline constexpr int LLAMA_REGION_RING_APPLY_MAX_CYCLES = 8;
+
 // The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
 // Ordinary fixed/legacy parsing stays strict and unchanged.
 inline bool llama_region_ring_apply_topology_compatible(
@@ -822,7 +827,8 @@ llama_region_ring_parse_apply_wide_layout(
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
-    if (regions.size() < 4 || regions.size() > 14 ||
+    if (regions.size() < 4 ||
+            regions.size() > 3 * LLAMA_REGION_RING_APPLY_MAX_CYCLES ||
             n_layer <= 0 || regions.front().layer_begin != 0 ||
             regions.back().layer_end != n_layer) {
         return false;
@@ -854,16 +860,16 @@ inline bool llama_region_ring_apply_topology_compatible(
             return false;
         }
         if (i == regions.size()) { // Legacy PC tail (never final Phone).
-            return cycles >= 2 && cycles <= 4 && layer == n_layer;
+            return cycles >= 2 && cycles <= LLAMA_REGION_RING_APPLY_MAX_CYCLES && layer == n_layer;
         }
         if (!take(llama_region_ring_device::PHONE)) {
             return false;
         }
-        if (++cycles > 4) {
+        if (++cycles > LLAMA_REGION_RING_APPLY_MAX_CYCLES) {
             return false;
         }
     }
-    return cycles >= 2 && cycles <= 4 && layer == n_layer;
+    return cycles >= 2 && cycles <= LLAMA_REGION_RING_APPLY_MAX_CYCLES && layer == n_layer;
 }
 
 // Canonical Ring layout spelling, shared by the model loader, runtime
