@@ -419,7 +419,7 @@ inline bool choose_phone_npu_preferred_spill(
             extend(index + 1);
             work.npu_layers -= n;
             work.adreno_layers -= a;
-            work.regions.resize(old_count);
+            work.regions.erase(work.regions.begin() + old_count, work.regions.end());
             if (n > 0) {
                 work.npu_region_indices.pop_back();
             }
