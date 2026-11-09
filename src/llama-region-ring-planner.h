@@ -284,7 +284,9 @@ inline bool phone_spill_memory_feasible(
         size_t host_stage_reserve, size_t max_htp_bank_bytes,
         size_t phone_budget_bytes,
         phone_spill_memory & out,
-        size_t npu_activation_bytes = 0) {
+        size_t npu_activation_bytes = 0,
+        const std::function<bool(int, int, size_t &)> &
+            npu_stage_workspace_bytes = {}) {
     out = {};
     if (regions.empty() || !npu_weight_bytes ||
             !adreno_weight_bytes ||
@@ -328,14 +330,20 @@ inline bool phone_spill_memory_feasible(
                 return false;
             }
             const size_t region_kv = layers * npu_kv_per_layer;
-            if (region_kv > SIZE_MAX - npu_workspace ||
-                    region_kv + npu_workspace >
+            size_t region_workspace = npu_workspace;
+            if (npu_stage_workspace_bytes &&
+                    !npu_stage_workspace_bytes(
+                        r.layer_begin, r.layer_end, region_workspace)) {
+                return false;
+            }
+            if (region_kv > SIZE_MAX - region_workspace ||
+                    region_kv + region_workspace >
                         SIZE_MAX - npu_activation_bytes) {
                 return false;
             }
             npu_stage_weights.push_back(weight);
             npu_stage_auxiliary.push_back(
-                region_kv + npu_workspace + npu_activation_bytes);
+                region_kv + region_workspace + npu_activation_bytes);
             npu_kv += (long double) region_kv;
         } else {
             if (!adreno_weight_bytes(r.layer_begin, r.layer_end, weight) ||
