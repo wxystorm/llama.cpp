@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run/resume independent G/C/N/A Qwen3 Dense Stage Graph samples.
 
-PC G/C runs through native local CPU/CUDA executable. With --phone,
-N/A runs through a dedicated versioned V2 Phone profile control service.
-No manual profile copying. Both sides use identical original GGUF bytes,
+PC G/C runs through the native local CPU/CUDA executable. With --phone
+PHONE:50052, N/A uses the existing GGML inference RPC listener and a
+private native Profile worker (no second TCP port or manual log copying).
+Both sides use identical original GGUF bytes,
 verified by SHA256. Only CPU-parity-approved HTP samples enter the PASS
 performance CSV. PARITY_FAIL samples remain inspectable separately.
 """
