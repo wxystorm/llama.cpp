@@ -3,6 +3,7 @@
 #include "llama-hybrid-profile-cpu-threadpool.h"
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
+#include "llama-region-ring-profile-cache.h"
 #include "llama-region-ring-real-profile.h"
 
 #include "../ggml/src/ggml-impl.h"
@@ -8853,6 +8854,37 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
 bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & params, llama_hybrid_plan & best_plan) {
     llama_hybrid_runtime_plan_clear();
 
+    // A cached legacy Hybrid Profile bypasses the expensive synthetic
+    // CPU/CUDA/RPC probes, but NEVER bypasses apply-wide candidate search.
+    // The coordinator owns the model+device+runtime+thread fingerprint.
+    const char * cache_path = std::getenv("LLAMA_REGION_RING_PROFILE_CACHE_PATH");
+    const char * ring_mode = std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+    const bool cache_allowed = cache_path && *cache_path && ring_mode &&
+        std::strcmp(ring_mode, "apply-wide") == 0 &&
+        !params.hybrid_auto;
+    const char * force_raw = std::getenv("LLAMA_REGION_RING_PROFILE_FORCE");
+    const bool force_refresh = force_raw &&
+        std::strcmp(force_raw, "1") == 0;
+    if (cache_allowed && !force_refresh) {
+        llama_hybrid_profile cached;
+        if (llama_ring_profile_cache::load(cache_path, cached)) {
+            std::lock_guard<std::mutex> lock(g_llama_hybrid_runtime_plan_mutex);
+            g_llama_hybrid_runtime_profile = std::move(cached);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PROFILE_CACHE] status=HIT source=LEGACY_HYBRID "
+                "path=%s profile=SKIPPED plan=RECOMPUTE\n", cache_path);
+            best_plan = {};
+            return true;
+        }
+        LLAMA_LOG_WARN(
+            "[REGION_RING_PROFILE_CACHE] status=MISS action=MEASURE "
+            "path=%s\n", cache_path);
+    } else if (cache_allowed) {
+        LLAMA_LOG_WARN(
+            "[REGION_RING_PROFILE_CACHE] status=FORCE_REFRESH "
+            "action=MEASURE path=%s\n", cache_path);
+    }
+
     ggml_backend_ptr cpu;
     ggml_backend_ptr phone;
     ggml_backend_ptr gpu;
@@ -9096,6 +9128,15 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             profile.cpu_layer_blocks.size(),
             profile.gpu_layer_blocks.size(),
             profile.phone_layer_blocks.size());
+        if (cache_allowed) {
+            const bool saved =
+                llama_ring_profile_cache::save(cache_path, profile);
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PROFILE_CACHE] status=%s "
+                "source=LEGACY_HYBRID path=%s "
+                "plan=RECOMPUTE\n",
+                saved ? "SAVED" : "SAVE_FAILED", cache_path);
+        }
     }
 
     llama_hybrid_constraints constraints;
