@@ -418,8 +418,9 @@ public:
             estimate_npu_allocation(layers, false, true, bytes);
     }
 
-    // One conservative HTP Bank refill event, not a measured overlap
-    // percentage. Reject extrapolation beyond measured HTP weight sizes.
+    // One conservative HTP Bank refill event, not a measured overlap.
+    // A deeper NPU Region can require more repack bytes than the sampler's
+    // maximum; scale the last measured refill duration by raw bytes.
     bool npu_refill_ms(size_t bytes, double & cost) const {
         std::map<size_t, double> by_weight;
         for (const auto & p : points_) {
