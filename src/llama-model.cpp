@@ -1707,6 +1707,34 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         hybrid_ring_plan_cpu_chunk_tokens = xc;
         hybrid_ring_plan_gpu_chunk_tokens = xg;
         hybrid_ring_plan_phone_chunk_tokens = xp;
+        // SKIP_PROFILE performs model placement here, rather than through
+        // llama.cpp's APPLY_WIDE Planner. Preserve the same model-owned NPU
+        // Region selection before the Phone weight allocation is finalized.
+        const char * forced_npu_spec =
+            std::getenv("LLAMA_REGION_RING_FORCE_NPU_REGIONS");
+        const char * forced_npu_policy =
+            std::getenv("LLAMA_REGION_RING_FORCE_NPU_POLICY");
+        if (forced_npu_spec && *forced_npu_spec) {
+            std::string reason;
+            if (!llama_region_ring_validate_forced_npu_regions(
+                        forced_npu_spec, forced_npu_policy,
+                        forced_regions, hybrid_ring_plan_npu_region_ids,
+                        hybrid_ring_plan_npu_weight_policy, reason)) {
+                throw std::runtime_error(
+                    "SKIP_PROFILE forced NPU: " + reason);
+            }
+            hybrid_ring_plan_native_gcna = false;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_FORCE_NPU] mode=APPLY_WIDE "
+                "source=FORCED_SKIP_PROFILE regions=%s count=%zu "
+                "policy=%s status=SELECTED\n",
+                forced_npu_spec, hybrid_ring_plan_npu_region_ids.size(),
+                hybrid_ring_plan_npu_weight_policy == 1 ?
+                    "RESIDENT" : "STREAMING_2BANK");
+        } else if (forced_npu_policy && *forced_npu_policy) {
+            throw std::runtime_error(
+                "SKIP_PROFILE forced NPU: POLICY_REQUIRES_REGIONS");
+        }
         LLAMA_LOG_ERROR(
             "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE "
             "phase=MODEL_LOAD applied=1 source=FORCED_SKIP_PROFILE "
