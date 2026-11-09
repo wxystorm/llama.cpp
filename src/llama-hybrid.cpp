@@ -10508,11 +10508,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // Actual device allocation still decides final admission.
             const size_t htp_single_alloc_limit = std::min(
                 phone_budget, size_t(1024) * 1024 * 1024);
+            const size_t htp_cycle_weight_limit =
+                htp_single_alloc_limit / 2;
             model.phone_stage_allocation =
-                [native, phone_budget, kv_per_layer, htp_single_alloc_limit](
+                [native, phone_budget, kv_per_layer, htp_single_alloc_limit,
+                 htp_cycle_weight_limit](
                     const std::vector<llama_region_ring_region> & logical,
                     llama_ring_planner::candidate & plan) {
-                    const auto npu_ok = [native, htp_single_alloc_limit](int b, int e) {
+                    const auto npu_ok = [native, htp_cycle_weight_limit](int b, int e) {
                         const int depth = e - b;
                         // HTP supports contiguous multi-layer Stages, but
                         // each Stage still uses one physical weight arena.
@@ -10520,7 +10523,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         size_t weight = 0;
                         return b >= 0 && depth > 0 && depth <= 32 &&
                             native->weight_bytes('N', depth, false, weight) &&
-                            weight > 0 && weight <= htp_single_alloc_limit;
+                            weight > 0 && weight <= htp_cycle_weight_limit;
                     };
                     const auto adreno_ok = [native](int b, int e) {
                         return e > b && native->has_shape('A', e - b);
