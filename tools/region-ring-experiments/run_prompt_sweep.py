@@ -661,6 +661,19 @@ def main():
     if args.force_profile and (args.skip_profile or args.no_profile_cache):
         ap.error("--force-profile cannot be combined with --skip-profile or --no-profile-cache")
     root = Path(__file__).resolve().parents[2]
+    # Native attention Profile KV anchors must cover the actual sweep
+    # length. The filename hints are conservative here: the runtime logs
+    # actual tokens for each prompt independently. Add longer KV probes
+    # only when needed, and reuse existing per-shape cache entries.
+    max_prompt_hint = max(hint for hint, _ in prompts)
+    required_profile_kvs = [512, 1024]
+    for kv_anchor in (2048, 4096, 8192, 16384):
+        if max_prompt_hint > required_profile_kvs[-1]:
+            required_profile_kvs.append(kv_anchor)
+        else:
+            break
+    if max_prompt_hint > required_profile_kvs[-1]:
+        ap.error("prompt length exceeds supported native KV profile anchors")
     profile_cache = None
     # Native isolated G/C/N/A shapes are sampled at most once per sweep.
     # The cache's PASS-only CSV is consumed by the original C++ apply-wide
@@ -675,7 +688,8 @@ def main():
                 args.force_profile, args.dry_run,
                 directory=args.v2_profile_dir,
                 profiler_exe=args.native_profile_exe,
-                phone_endpoint=args.v2_profile_phone)
+                phone_endpoint=args.v2_profile_phone,
+                required_kvs=tuple(required_profile_kvs))
         except (OSError, ValueError, RuntimeError) as exc:
             ap.error(f"native GCNA Profile failed: {exc}")
     phone_identity = ""
