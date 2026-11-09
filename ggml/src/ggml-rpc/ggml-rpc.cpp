@@ -5946,9 +5946,24 @@ public:
                 size_t layer_rank = 0;
                 const bool rank_aligned =
                     model_layers.size() == phone_npu_serial_regions.size();
+                const bool defer_to_plan =
+                    !rank_aligned && phone_npu_executors.size() > 1;
+                if (defer_to_plan) {
+                    // More layer IDs than Region IDs means a P2/P3/... Plan.
+                    // Assigning all weights to HTP0 would duplicate them
+                    // when the actual Region is placed on HTP1..3.
+                    GGML_LOG_WARN(
+                        "[PHONE_NPU_SESSION] event=MODEL_LOAD_DEFER"
+                        " layers=%zu regions=%zu sessions=%zu"
+                        " reason=LAYER_REGION_COUNT_MISMATCH"
+                        " policy=LOAD_ON_PLAN_SESSION status=READY\n",
+                        model_layers.size(), phone_npu_serial_regions.size(),
+                        phone_npu_executors.size());
+                }
                 for (uint32_t layer : model_layers) {
-                    // Existing explicit layer list is sorted and normally
-                    // corresponds one-to-one with sorted NPU Regions.
+                    if (defer_to_plan) { continue; }
+                    // Explicit one-layer Region preload pairs the sorted
+                    // layer IDs with the sorted NPU Region IDs.
                     const size_t session = rank_aligned ?
                         layer_rank++ % phone_npu_executors.size() : 0;
                     phone_npu_layer_session.emplace(layer, session);
@@ -5991,6 +6006,7 @@ public:
                     }(),
                     resident_bytes,
                     (ggml_time_us() - model_begin_us) / 1000.0,
+                    defer_to_plan ? "DEFERRED_TO_REGION_PLAN" :
                     layers_ok == model_layers.size() ?
                         "PASS" : "PARTIAL_FALLBACK");
             }
