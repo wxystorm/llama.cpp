@@ -10651,7 +10651,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         return false;
                     }
                     plan.npu_weight_policy = memory.weight_policy;
-                    plan.npu_memory_bytes = memory.total;
+                    // This counter is the NPU-owned footprint, not Phone
+                    // shared RAM consumed by the accompanying Adreno stages.
+                    plan.npu_memory_bytes = memory.npu_memory_bytes;
                     plan.concrete_regions = std::move(selected.regions);
                     plan.npu_region_indices =
                         std::move(selected.npu_region_indices);
