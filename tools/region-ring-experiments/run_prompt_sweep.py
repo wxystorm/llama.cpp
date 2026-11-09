@@ -266,6 +266,46 @@ def git_head(root):
         return ""
 
 
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as src:
+        for block in iter(lambda: src.read(4 * 1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def legacy_profile_cache_file(root: Path, model: Path, exe: Path,
+                              rpc: str, threads: int,
+                              no_mmap: bool, batch: int,
+                              ubatch: int) -> Path:
+    """Cache one measured legacy Hybrid Profile across prompt processes.
+
+    NOTE: This is not the native G/C/N/A matrix. That is stored separately
+    by run_v2_stage_matrix.py. The RPC endpoint is only a location key;
+    a Phone backend/firmware update requires -ForceProfile until a
+    production-RPC device fingerprint API is wired into this coordinator.
+    """
+    from run_v2_stage_matrix import host_device_id
+    material = {
+        "schema": 1,
+        "model_sha256": file_sha256(model),
+        "model_bytes": model.stat().st_size,
+        "engine_sha256": file_sha256(exe),
+        "pc_id": host_device_id(),
+        "rpc_endpoint": rpc,
+        "threads": threads,
+        "no_mmap": no_mmap,
+        "batch": batch,
+        "ubatch": ubatch,
+    }
+    digest = hashlib.sha256(json.dumps(
+        material, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", model.stem)[:80]
+    return root / "model-profiles" / stem / "hybrid-cache" / (
+        digest + ".rrhp")
+
+
 def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
     entries = records(folder / "metrics.jsonl")
     plan = next((r for r in reversed(entries) if r.get("type") == "planner"), {})
@@ -576,6 +616,10 @@ def main():
     ap.add_argument("--force-xp", type=int)
     ap.add_argument("--skip-profile", action="store_true",
                     help="skip Hybrid profiling and Planner search for a forced layout")
+    ap.add_argument("--force-profile", action="store_true",
+                    help="refresh the model-bound legacy Profile on the first prompt; then reuse it")
+    ap.add_argument("--no-profile-cache", action="store_true",
+                    help="disable model-bound legacy Profile reuse (diagnostic only)")
     ap.add_argument("--no-mmap", action="store_true",
                     help="disable memory mapping when loading the model")
     ap.add_argument("--dry-run", action="store_true")
@@ -604,13 +648,26 @@ def main():
             not all(isinstance(x, int) and x > 0
                     for x in (args.force_xc, args.force_xg, args.force_xp))):
         ap.error("--skip-profile requires --planner apply-wide and full --force-layout/xc/xg/xp")
+    if args.force_profile and (args.skip_profile or args.no_profile_cache):
+        ap.error("--force-profile cannot be combined with --skip-profile or --no-profile-cache")
     root = Path(__file__).resolve().parents[2]
+    profile_cache = None
+    if args.planner == "apply-wide" and not (
+            args.skip_profile or args.no_profile_cache):
+        profile_cache = legacy_profile_cache_file(
+            root, args.model, args.exe, args.rpc,
+            args.threads, args.no_mmap, args.batch, args.ubatch)
+        if not args.dry_run:
+            profile_cache.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[REGION_RING_PROFILE_CACHE] source=LEGACY_HYBRID "
+              f"path={profile_cache} exists={int(profile_cache.is_file())}",
+              flush=True)
     commit = git_head(root)
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = (args.out / f"{stamp}-{os.getpid()}").resolve()
     out.mkdir(parents=True)
     rows = []
-    for hint, prompt in prompts:
+    for prompt_index, (hint, prompt) in enumerate(prompts):
         folder = out / prompt.stem
         folder.mkdir(exist_ok=False)
         ctx = max(args.min_context,
@@ -624,7 +681,9 @@ def main():
                     "LLAMA_HYBRID_REGION_RING_FORCE_XC",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XG",
                     "LLAMA_HYBRID_REGION_RING_FORCE_XP",
-                    "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE"):
+                    "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE",
+                    "LLAMA_REGION_RING_PROFILE_CACHE_PATH",
+                    "LLAMA_REGION_RING_PROFILE_FORCE"):
             env.pop(key, None)
         env.update({
             "LLAMA_HYBRID_REGION_RING_V1": "1",
@@ -641,6 +700,10 @@ def main():
                 "1" if args.duplex_profile == "on" else "0",
             "LLAMA_REGION_RING_METRICS_FILE": str(folder / "metrics.jsonl"),
         })
+        if profile_cache is not None:
+            env["LLAMA_REGION_RING_PROFILE_CACHE_PATH"] = str(profile_cache)
+            env["LLAMA_REGION_RING_PROFILE_FORCE"] = (
+                "1" if args.force_profile and prompt_index == 0 else "0")
         if env.get("LLAMA_REGION_RING_PHONE_COPY_TRACE") == "1":
             # One opt-in switch collects both the per-copy detail and the
             # reference split breakdown for coverage reconciliation.
@@ -669,9 +732,13 @@ def main():
             "commit": commit, "log_verbosity": args.log_verbosity,
             "no_mmap": args.no_mmap,
             "skip_profile": args.skip_profile,
+            "profile_cache_file": str(profile_cache) if profile_cache else None,
+            "force_profile": bool(args.force_profile and prompt_index == 0),
             "ring_environment": {k: v for k, v in env.items()
                                  if k.startswith("LLAMA_HYBRID_REGION_RING_")
                                  or k in ("LLAMA_REGION_RING_METRICS_FILE",
+                                          "LLAMA_REGION_RING_PROFILE_CACHE_PATH",
+                                          "LLAMA_REGION_RING_PROFILE_FORCE",
                                           "LLAMA_REGION_RING_TASK_TRACE",
                                           "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES",
                                           "LLAMA_REGION_RING_PHONE_AUTONOMOUS",
