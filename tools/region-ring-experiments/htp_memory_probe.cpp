@@ -168,7 +168,10 @@ const char * run_dsp_mapping_check(
             ggml_backend_buffer_get_base(buffers[0])) !=
             GGML_STATUS_SUCCESS ||
         ggml_backend_tensor_alloc(
-            bbuf, b, ggml_backend_buffer_get_base(bbuf)) !=
+            bbuf, b,
+            static_cast<unsigned char *>(
+                ggml_backend_buffer_get_base(bbuf)) +
+                (buffers.size() > 1 ? 0 : 4096)) !=
             GGML_STATUS_SUCCESS ||
         ggml_backend_tensor_alloc(
             out, dst, ggml_backend_buffer_get_base(out)) !=
@@ -205,8 +208,8 @@ int main(int argc, char ** argv) {
         if (available < 3072) {
             throw std::runtime_error("MEMAVAILABLE_BELOW_3072_MIB:REFUSE_PRESSURE_TEST");
         }
-        // An explicit cap is allowed up to (MemAvailable - 2 GiB). Never
-        // automatically consume more than one third of currently available
+        // An explicit cap is allowed up to (MemAvailable - 2 GiB). The
+        // default never consumes more than one third of currently available
         // RAM, nor more than 3 GiB in a single attempt.
         const uint64_t safe_cap = available - 2048;
         const uint64_t aggregate_cap = opts.aggregate_cap_mib ?
@@ -276,6 +279,7 @@ int main(int argc, char ** argv) {
                 const auto start = std::chrono::steady_clock::now();
                 int failure = -1;
                 const char * status = "PASS";
+                bool dsp_failed = false;
                 {
                     buffer_guard buffers;
                     for (int b = 0; b < count; ++b) {
@@ -323,6 +327,7 @@ int main(int argc, char ** argv) {
                             const char * dsp_status =
                                 run_dsp_mapping_check(
                                     backend, repack, buffers.handles);
+                            dsp_failed = std::string(dsp_status) != "PASS";
                             const double dsp_elapsed =
                                 std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() -
@@ -342,7 +347,9 @@ int main(int argc, char ** argv) {
                     std::chrono::steady_clock::now() - start).count();
                 record(mode.c_str(), each, status, failure,
                        elapsed, available_mib());
-                if (failure >= 0) { break; } // Do not stress larger sizes.
+                if (failure >= 0 || dsp_failed) {
+                    break; // Do not stress larger sizes after a real failure.
+                }
                 ++passed;
             }
         }
