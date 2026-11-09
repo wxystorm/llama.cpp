@@ -1694,10 +1694,11 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             llama_region_ring_single_cycle_force_compatible(
                 forced_regions, hparams.n_layer());
         if (!topology_ok || forced_regions.empty() ||
-                forced_regions.back().device !=
-                    llama_region_ring_device::PHONE) {
+                (forced_regions.back().device !=
+                    llama_region_ring_device::PHONE &&
+                 arch != LLM_ARCH_QWEN3)) {
             throw std::runtime_error(
-                "SKIP_PROFILE forced layout is not a supported Phone-final topology");
+                "SKIP_PROFILE requires a valid layout; PC-final requires Qwen3");
         }
         llama_hybrid_runtime_plan_clear();
         hybrid_ring_plan_layout =
@@ -1864,8 +1865,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                 ((apply_wide || ring_regions.size() == 9) &&
                  selected_topology_ok &&
                  !ring_regions.empty() &&
-                 ring_regions.back().device ==
-                     llama_region_ring_device::PHONE) :
+                 (apply_wide || ring_regions.back().device ==
+                     llama_region_ring_device::PHONE)) :
                 (llama_region_ring_apply_safe_phone_shape(original) &&
                  llama_region_ring_apply_safe_compatible(
                      original, ring_regions));
@@ -2350,11 +2351,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         hybrid_layer_modes.back() == llama_hybrid_layer_mode::PHONE_ONLY &&
         phone_final_output_env != nullptr &&
         std::strcmp(phone_final_output_env, "1") == 0;
-    if (phone_final_pc_head) {
+    const bool pc_terminal_head =
+        llama_region_ring_enabled() && arch == LLM_ARCH_QWEN3 &&
+        !hybrid_layer_modes.empty() &&
+        hybrid_layer_modes.back() == llama_hybrid_layer_mode::PC_ONLY;
+    if (phone_final_pc_head || pc_terminal_head) {
         pimpl->dev_output = { cpu_dev, &pimpl->cpu_buft_list };
         LLAMA_LOG_INFO(
-            "[PHONE_AUTO_FINAL_HEAD] event=WEIGHT_PLACEMENT "
-            "backend=CPU reason=PC_ONLY_HEAD status=READY\n");
+            "[%s] event=WEIGHT_PLACEMENT backend=CPU "
+            "reason=PC_ONLY_HEAD status=READY\n",
+            phone_final_pc_head ? "PHONE_AUTO_FINAL_HEAD" :
+                                  "REGION_RING_PC_FINAL_HEAD");
     } else if (!hybrid_layer_modes.empty()) {
         if (meta_dev == nullptr) {
             throw std::runtime_error(format(
