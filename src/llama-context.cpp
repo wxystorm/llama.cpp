@@ -4848,6 +4848,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         has_phone_stage && graphless_requested && ubatch.n_tokens >= 32 &&
         phone_auto_eligible && own_stage_resources &&
         (phone_auto_final_enabled || pc_final_head_enabled);
+    const char * owned_plan_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+    const bool owned_plan_requested =
+        has_phone_stage && owned_plan_env != nullptr &&
+        std::strcmp(owned_plan_env, "1") == 0;
+    // Region Plan/KV registration is independent of the PC's first GPU
+    // stage. A Phone Region is published only after its OWN KV binding.
+    // Keep the legacy synchronous mode available for A/B and rollback.
+    const char * plan_async_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_PLAN_ASYNC");
+    const bool phone_plan_async_registration =
+        phone_graphless && owned_plan_requested &&
+        !(plan_async_env && std::strcmp(plan_async_env, "0") == 0);
     if (has_phone_stage && graphless_requested && ubatch.n_tokens >= 32 &&
             !phone_graphless) {
         LLAMA_LOG_ERROR(
@@ -5078,7 +5091,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     }
     auto wait_phone_graph_bound = [&](size_t region, size_t chunk,
                                       const char * consumer) -> bool {
-        if (!phone_async_graph_setup) { return true; }
+        if (!phone_async_graph_setup && !phone_plan_async_registration) {
+            return true;
+        }
         if (region >= phone_graph_ready.size() ||
                 chunk >= phone_graph_ready[region].size()) {
             return false;
@@ -5605,11 +5620,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // First migration step: send immutable Region descriptors ahead of
         // the existing PC-built per-Chunk Graph path. This is intentionally
         // a SHADOW contract; Phone-local graph building is not enabled yet.
-        const char * owned_plan_env =
-            std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
-        const bool owned_plan_requested =
-            has_phone_stage && owned_plan_env != nullptr &&
-            std::strcmp(owned_plan_env, "1") == 0;
+        // owned_plan_requested is established before Phone Graph readiness
+        // because graphless Plan publication now runs asynchronously.
         if (phone_graphless && !owned_plan_requested) {
             LLAMA_LOG_ERROR(
                 "[PHONE_OWNED_KV] side=pc event=REJECT"
@@ -5627,7 +5639,27 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        // This owner precedes all later RPC setup so EVERY early-return
+        // joins the registration thread before its referenced storage dies.
+        struct phone_plan_registration_thread_owner {
+            std::thread worker;
+            ~phone_plan_registration_thread_owner() {
+                if (worker.joinable()) { worker.join(); }
+            }
+        } phone_plan_thread;
+        std::atomic<bool> phone_plan_registration_failed { false };
         if (owned_plan_requested && phone_auto_enabled) {
+            // Graphless Chunk UIDs are pure metadata and do not depend on
+            // registering the remote Plan. Publish them before workers start.
+            if (phone_graphless) {
+                for (auto & item : phone_auto_templates) {
+                    item.graph_uid = (UINT64_C(2) << 62) |
+                        (uint64_t(item.region) << 32) |
+                        (uint64_t(item.chunk) + 1);
+                }
+            }
+            auto publish_owned_plan = [&]() -> bool {
+
             if (ring_trace_enabled) {
                 ring_trace_owned_plan_begin_us = ggml_time_us();
             }
@@ -5802,7 +5834,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         plan.run_id, plan.region, plan.layer,
                         valid ? "PASS" : "FAIL");
                 }
-                if (valid) { ++published; }
+                if (valid) {
+                    ++published;
+                    if (phone_plan_async_registration) {
+                        {
+                            std::lock_guard<std::mutex> guard(
+                                phone_graph_ready_mutex);
+                            for (auto & flag : phone_graph_ready[r]) {
+                                flag = 1;
+                            }
+                        }
+                        phone_graph_ready_cv.notify_all();
+                        LLAMA_LOG_INFO(
+                            "[PHONE_OWNED_PLAN_ASYNC] event=REGION_READY"
+                            " region=%zu layers=[%d,%d) chunks=%zu"
+                            " status=READY\n",
+                            r, stage.layer_begin, stage.layer_end,
+                            phone_graph_ready[r].size());
+                    }
+                }
             }
             LLAMA_LOG_INFO(
                 "[PHONE_OWNED_PLAN] side=pc mode=%s"
@@ -5811,19 +5861,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                   "SHADOW_PC_BUILT",
                 published, valid ? "PASS" : "FAIL");
             if (!valid || published == 0) {
-                (void) phone_input_stream_run(
-                    phone_rpc_backend, phone_input_push_run_id, false);
-                ret = GGML_STATUS_FAILED;
-                return nullptr;
+                return false;
             }
             if (phone_graphless) {
-                // The Phone owns every Chunk task. The PC keeps only
-                // logical descriptors for its FIFO and P2C receiver.
-                for (auto & item : phone_auto_templates) {
-                    item.graph_uid = (UINT64_C(2) << 62) |
-                        (uint64_t(item.region) << 32) |
-                        (uint64_t(item.chunk) + 1);
-                }
                 LLAMA_LOG_INFO(
                     "[PHONE_AUTO] event=GRAPHLESS_READY"
                     " regions=%zu chunks=%zu"
@@ -5833,6 +5873,44 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             if (ring_trace_enabled) {
                 ring_trace_owned_plan_end_us = ggml_time_us();
+            }
+            return true;
+            };
+            if (phone_plan_async_registration) {
+                try {
+                    phone_plan_thread.worker = std::thread([&]() {
+                        bool ok = false;
+                        try {
+                            ok = publish_owned_plan();
+                        } catch (const std::exception & e) {
+                            LLAMA_LOG_ERROR(
+                                "[PHONE_OWNED_PLAN_ASYNC] event=FAIL"
+                                " reason=%s\n", e.what());
+                        } catch (...) {
+                            LLAMA_LOG_ERROR(
+                                "[PHONE_OWNED_PLAN_ASYNC] event=FAIL"
+                                " reason=UNKNOWN\n");
+                        }
+                        if (!ok) {
+                            phone_plan_registration_failed.store(
+                                true, std::memory_order_release);
+                            ready.cancel();
+                            phone_graph_ready_cv.notify_all();
+                        }
+                    });
+                } catch (...) {
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+                LLAMA_LOG_INFO(
+                    "[PHONE_OWNED_PLAN_ASYNC] event=START"
+                    " registration=REGION_SCOPED"
+                    " pc_gpu_overlap=ENABLED status=READY\n");
+            } else if (!publish_owned_plan()) {
+                (void) phone_input_stream_run(
+                    phone_rpc_backend, phone_input_push_run_id, false);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
             }
         }
         ggml_backend_rpc_phone_auto_task_register_t phone_auto_register_task = nullptr;
@@ -8048,6 +8126,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
         if (phone_push_thread.joinable()) {
             phone_push_thread.join();
+        }
+        if (phone_plan_thread.worker.joinable()) {
+            phone_plan_thread.worker.join();
+        }
+        if (phone_plan_registration_failed.load(std::memory_order_acquire)) {
+            ret = GGML_STATUS_FAILED;
         }
         if (phone_graph_thread.worker.joinable()) {
             phone_graph_thread.worker.join();
