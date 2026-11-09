@@ -128,7 +128,7 @@ inline std::string file_sha256(const std::string & path) {
         throw std::runtime_error("SHA256_FILE_OPEN_FAILED:" + path);
     }
     sha256 hash;
-    std::array<uint8_t, 1024 * 1024> chunk {};
+    std::array<uint8_t, 64 * 1024> chunk {};
     while (true) {
         const size_t n = std::fread(chunk.data(), 1, chunk.size(), file);
         if (n) { hash.update(chunk.data(), n); }
