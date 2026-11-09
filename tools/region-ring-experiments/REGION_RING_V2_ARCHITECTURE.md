@@ -157,6 +157,13 @@ authoritative target. These pieces are now implemented as opt-in helpers in
   `run_v2_stage_matrix.py`, not a compact fixed-layout runtime benchmark.
   Native Phone samples currently require the separate profile sidecar at
   the RPC host's port 50177.
+- The native cache is accepted only after its model/device/binary
+  fingerprints, PASS CSV/manifest consistency, and all required
+  G2/C2/N1/A1 Chunk x KV shapes have been checked. Incomplete grids
+  resume the independent matrix sampler instead of being treated as
+  Planner-ready. For longer prompt groups, KV anchors grow from
+  512/1024 to 2048/4096 only when the sweep needs them; previously
+  measured shapes are reused.
 - The existing Hybrid measurements (PC/CUDA memory and real ggml-rpc
   transfer curves) are cached independently as a versioned model-/device-/
   binary-bound `.rrhp` snapshot. On a hit the next
