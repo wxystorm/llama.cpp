@@ -1,5 +1,8 @@
 #include "ggml-rpc.h"
 #include "llama-model-loader.h"
+#if defined(__ANDROID__)
+#include "v2-profile-native.h"
+#endif
 #ifdef _WIN32
 #  define NOMINMAX
 #  define DIRECTORY_SEPARATOR '\\'
@@ -618,7 +621,16 @@ tensor_source.user_data = &tensor_context;
 tensor_source.get_info  = llama_rpc_get_local_tensor_info;
 tensor_source.read      = llama_rpc_read_local_tensor;
 
-// 4. 获取新启动函数
+// 4. Register a *native in-process* N/A Profile handler. Only the
+// ggml-rpc-server process runs: no Python, external sampler or sidecar.
+#if defined(__ANDROID__)
+    v2_profile_native_service native_profile(params.model_path);
+    ggml_backend_rpc_set_v2_profile_handler(
+        v2_profile_native_service::rpc_callback, &native_profile);
+    std::fprintf(stderr,
+        "[V2_PROFILE_NATIVE] state=REGISTERED port=%d process=RPC_ONLY\n",
+        params.port);
+#endif
     ggml_backend_rpc_start_server_ex(endpoint.c_str(), cache_dir, params.n_threads, devices.size(), devices.data(),
                                      local_loader ? &tensor_source : nullptr,
                                      params.model_path.c_str(), params.tp_rank, params.tp_world_size);
