@@ -114,6 +114,26 @@ FIELDS = [
 NAME = re.compile(r"^prompt_(\d+)\.txt$", re.I)
 
 
+def profile_kv_anchors(prompt_hint: int) -> tuple[int, ...]:
+    """Use the smallest native KV anchor set covering the sweep.
+
+    File-name token hints are approximate: leave a modest allowance for
+    tokenizer/chat-template differences rather than silently asking the
+    Planner to extrapolate beyond a measured KV window.
+    """
+    if prompt_hint < 1:
+        raise ValueError("INVALID_PROMPT_HINT")
+    needed = prompt_hint + 64
+    anchors = [512, 1024]
+    for kv in (2048, 4096, 8192, 16384):
+        if needed <= anchors[-1]:
+            break
+        anchors.append(kv)
+    if needed > anchors[-1]:
+        raise ValueError("PROMPT_EXCEEDS_NATIVE_PROFILE_KV")
+    return tuple(anchors)
+
+
 def records(path: Path):
     result = []
     if path.is_file():
@@ -661,19 +681,13 @@ def main():
     if args.force_profile and (args.skip_profile or args.no_profile_cache):
         ap.error("--force-profile cannot be combined with --skip-profile or --no-profile-cache")
     root = Path(__file__).resolve().parents[2]
-    # Native attention Profile KV anchors must cover the actual sweep
-    # length. The filename hints are conservative here: the runtime logs
-    # actual tokens for each prompt independently. Add longer KV probes
-    # only when needed, and reuse existing per-shape cache entries.
-    max_prompt_hint = max(hint for hint, _ in prompts)
-    required_profile_kvs = [512, 1024]
-    for kv_anchor in (2048, 4096, 8192, 16384):
-        if max_prompt_hint > required_profile_kvs[-1]:
-            required_profile_kvs.append(kv_anchor)
-        else:
-            break
-    if max_prompt_hint > required_profile_kvs[-1]:
-        ap.error("prompt length exceeds supported native KV profile anchors")
+    # Add only the longer KV shapes needed by this sweep. Actual token
+    # counts are checked at Runtime; filename hints are not exact.
+    try:
+        required_profile_kvs = profile_kv_anchors(
+            max(hint for hint, _ in prompts))
+    except ValueError as exc:
+        ap.error(str(exc))
     profile_cache = None
     # Native isolated G/C/N/A shapes are sampled at most once per sweep.
     # The cache's PASS-only CSV is consumed by the original C++ apply-wide
