@@ -182,6 +182,118 @@ inline compiled_plan compile(const plan_spec & p) {
     return result;
 }
 
+// Select the physical HTP weight policy from the complete Plan, rather
+// than assuming that Region count > 2 implies weight streaming.  We budget
+// total shared Phone memory separately from the maximum HTP allocation.
+// KV and resident Adreno storage must not be evicted by weight refills.
+enum class npu_weight_policy : uint8_t {
+    DISABLED = 0,
+    RESIDENT = 1,
+    STREAMING_2BANK = 2,
+};
+
+inline const char * npu_weight_policy_name(npu_weight_policy p) {
+    switch (p) {
+        case npu_weight_policy::DISABLED:        return "DISABLED";
+        case npu_weight_policy::RESIDENT:        return "RESIDENT";
+        case npu_weight_policy::STREAMING_2BANK: return "STREAMING_2BANK";
+    }
+    return "INVALID";
+}
+
+struct npu_memory_request {
+    std::vector<size_t> stage_weight_bytes; // one entry per physical N stage
+    size_t npu_kv_bytes = 0;
+    size_t npu_graph_workspace_bytes = 0;
+    size_t host_stage_bytes = 0;
+    size_t adreno_resident_bytes = 0; // weights + KV + workspace
+    size_t other_shared_bytes = 0;
+    size_t phone_budget_bytes = 0;
+    size_t max_htp_allocation_bytes = 0;
+};
+
+struct npu_memory_decision {
+    bool feasible = false;
+    npu_weight_policy policy = npu_weight_policy::DISABLED;
+    size_t resident_total_bytes = 0;
+    size_t streaming_total_bytes = 0;
+    size_t selected_total_bytes = 0;
+    std::array<size_t, 2> bank_weight_bytes {};
+    size_t all_npu_weight_bytes = 0;
+    const char * reason = "INVALID_BUDGET";
+};
+
+inline npu_memory_decision choose_npu_weight_policy(
+        const npu_memory_request & m) {
+    npu_memory_decision d {};
+    if (m.phone_budget_bytes == 0) { return d; }
+    const auto add = [](size_t a, size_t b, size_t & out) -> bool {
+        if (b > std::numeric_limits<size_t>::max() - a) {
+            return false;
+        }
+        out = a + b;
+        return true;
+    };
+    size_t fixed = 0;
+    for (size_t bytes : {
+            m.npu_kv_bytes, m.npu_graph_workspace_bytes,
+            m.host_stage_bytes, m.adreno_resident_bytes,
+            m.other_shared_bytes}) {
+        if (!add(fixed, bytes, fixed)) {
+            d.reason = "MEMORY_OVERFLOW";
+            return d;
+        }
+    }
+    if (m.stage_weight_bytes.empty()) {
+        d.policy = npu_weight_policy::DISABLED;
+        d.feasible = fixed <= m.phone_budget_bytes;
+        d.resident_total_bytes = fixed;
+        d.streaming_total_bytes = fixed;
+        d.selected_total_bytes = fixed;
+        d.reason = d.feasible ? "NONE" : "PHONE_BUDGET_EXCEEDED";
+        return d;
+    }
+    if (m.max_htp_allocation_bytes == 0) {
+        d.reason = "UNKNOWN_HTP_SINGLE_ALLOCATION_LIMIT";
+        return d;
+    }
+    for (size_t i = 0; i < m.stage_weight_bytes.size(); ++i) {
+        const size_t bytes = m.stage_weight_bytes[i];
+        if (bytes == 0 || bytes > m.max_htp_allocation_bytes) {
+            d.reason = "HTP_STAGE_ALLOCATION_EXCEEDED";
+            return d;
+        }
+        if (!add(d.all_npu_weight_bytes, bytes, d.all_npu_weight_bytes)) {
+            d.reason = "MEMORY_OVERFLOW";
+            return d;
+        }
+        d.bank_weight_bytes[i % 2] =
+            std::max(d.bank_weight_bytes[i % 2], bytes);
+    }
+    size_t bank_total = 0;
+    if (!add(d.bank_weight_bytes[0], d.bank_weight_bytes[1],
+             bank_total) ||
+            !add(fixed, bank_total, d.streaming_total_bytes) ||
+            !add(fixed, d.all_npu_weight_bytes,
+                 d.resident_total_bytes)) {
+        d.reason = "MEMORY_OVERFLOW";
+        return d;
+    }
+    // Prefer truly resident weights, even when there are many N stages.
+    if (d.resident_total_bytes <= m.phone_budget_bytes) {
+        d.policy = npu_weight_policy::RESIDENT;
+        d.selected_total_bytes = d.resident_total_bytes;
+        d.feasible = true;
+    } else if (m.stage_weight_bytes.size() >= 2 &&
+            d.streaming_total_bytes <= m.phone_budget_bytes) {
+        d.policy = npu_weight_policy::STREAMING_2BANK;
+        d.selected_total_bytes = d.streaming_total_bytes;
+        d.feasible = true;
+    }
+    d.reason = d.feasible ? "NONE" : "PHONE_BUDGET_EXCEEDED";
+    return d;
+}
+
 // A profile request is independent of a final inference Plan. It describes
 // exactly the first N layers on ONE backend, with no hidden feeder Stage and
 // no output Head. The executor must populate real Position/KV/Mask inputs.
