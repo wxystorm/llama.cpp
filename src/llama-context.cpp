@@ -6395,12 +6395,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_sched_set_weight_cache(
                         bank.sched.get(), true);
 
+                    // A PC-terminal Region publishes l_out; the separate
+                    // CPU Head owns RMSNorm/LM projection. Preload exactly
+                    // the graph the GPU worker will execute, without Head
+                    // weights in the CUDA Bank.
                     refill_result = prepare_ubatch(
                         bank.res.get(), bank.sched.get(),
                         refill_ubatch, gtype,
                         gpu_bank_mover_kv_view.get(),
                         refill_status, false,
-                        &refill_stage, 0, true, false);
+                        &refill_stage, 0, true, false,
+                        false, nullptr, nullptr,
+                        pc_final_head_enabled &&
+                            region + 1 == stages.size());
                 }
                 const int64_t prepare_us =
                     ggml_time_us() - prepare_begin_us;
