@@ -2,8 +2,11 @@
 // This measures GGML -> rpcmem_alloc2 -> FastRPC host-side mapping only.
 // It does NOT establish the DSP's active HAP_mmap/graph capacity.
 #include "ggml-backend.h"
+#include "ggml.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +25,7 @@ struct options {
     std::string mode = "both";
     uint64_t aggregate_cap_mib = 0; // 0: conservative auto cap
     bool touch_pages = false;       // optional; substantially increases pressure
+    bool dsp_check = false;         // execute a real HTP F32 ADD using both arenas
 };
 
 uint64_t parse_u64(const std::string & s) {
@@ -90,9 +94,11 @@ struct buffer_guard {
 void usage() {
     std::cout <<
         "Usage: ggml-htp-memory-probe [--mode single|dual|both] "
-        "[--sizes-mib 256,512,...] [--max-aggregate-mib N] [--touch-pages]\n"
-        "Measures rpcmem allocation and FastRPC host mapping only, not DSP "
-        "active graph mapping. Stop inference server before running.\n";
+        "[--sizes-mib 256,512,...] [--max-aggregate-mib N] "
+        "[--touch-pages] [--dsp-check]\n"
+        "By default measures RPCMEM/FastRPC host mapping only. "
+        "--dsp-check additionally executes a tiny HTP ADD graph referencing "
+        "the complete large-buffer descriptors. Stop the RPC server first.\n";
 }
 
 options parse(int argc, char ** argv) {
@@ -104,6 +110,7 @@ options parse(int argc, char ** argv) {
             std::exit(0);
         }
         if (arg == "--touch-pages") { o.touch_pages = true; continue; }
+        if (arg == "--dsp-check") { o.dsp_check = true; continue; }
         if (i + 1 >= argc) { throw std::runtime_error("MISSING_ARGUMENT:" + arg); }
         const std::string value = argv[++i];
         if (arg == "--mode") {
@@ -126,12 +133,68 @@ void record(const char * mode, uint64_t size, const char * status,
             int failed_index, double elapsed_ms, uint64_t avail_after) {
     std::cout << "[HTP_MEM_PROBE] event=RESULT"
               << " mode=" << mode << " each_mib=" << size
-              << " total_mib=" << size * (std::string(mode) == "dual" ? 2 : 1)
+              << " total_mib=" << size * (std::string(mode).find("dual") != std::string::npos ? 2 : 1)
               << " status=" << status
               << " failed_buffer=" << failed_index
               << " elapsed_ms=" << elapsed_ms
               << " mem_available_after_mib=" << avail_after
               << " scope=RPCMEM_FASTRPC_HOST_MAP" << std::endl;
+}
+// Execute a real HTP graph that references both giant RPCMEM arenas.
+// Hexagon's op serializer passes the entire buffer descriptor (not merely
+// the 256-element F32 tensor) to the DSP and charges that whole allocation
+// against the active mapping budget. This is a mapping test, not a bandwidth
+// or full-layer accuracy/performance benchmark.
+const char * run_dsp_mapping_check(
+        ggml_backend_t backend, ggml_backend_buffer_type_t buft,
+        const std::vector<ggml_backend_buffer_t> & buffers) {
+    if (buffers.empty()) { return "NO_INPUT_BUFFERS"; }
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(
+        ggml_init({1024 * 1024, nullptr, true}), &ggml_free);
+    if (!ctx) { return "GRAPH_METADATA_ALLOC_FAILED"; }
+    ggml_tensor * a = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 256);
+    ggml_tensor * b = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 256);
+    ggml_tensor * dst = ggml_add(ctx.get(), a, b);
+    if (!a || !b || !dst) { return "GRAPH_TENSOR_SETUP_FAILED"; }
+    buffer_guard output_buf;
+    ggml_backend_buffer_t out =
+        ggml_backend_buft_alloc_buffer(buft, 64 * 1024);
+    if (!out) { return "OUTPUT_BUFFER_ALLOC_FAILED"; }
+    output_buf.handles.push_back(out);
+    const ggml_backend_buffer_t bbuf = buffers.size() > 1 ?
+        buffers[1] : buffers[0];
+    if (ggml_backend_tensor_alloc(
+            buffers[0], a,
+            ggml_backend_buffer_get_base(buffers[0])) !=
+            GGML_STATUS_SUCCESS ||
+        ggml_backend_tensor_alloc(
+            bbuf, b, ggml_backend_buffer_get_base(bbuf)) !=
+            GGML_STATUS_SUCCESS ||
+        ggml_backend_tensor_alloc(
+            out, dst, ggml_backend_buffer_get_base(out)) !=
+            GGML_STATUS_SUCCESS) {
+        return "GRAPH_TENSOR_BIND_FAILED";
+    }
+    std::array<float, 256> av, bv, result {};
+    av.fill(1.25f);
+    bv.fill(2.50f);
+    ggml_backend_tensor_set(a, av.data(), 0, sizeof(av));
+    ggml_backend_tensor_set(b, bv.data(), 0, sizeof(bv));
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    if (!graph) { return "GRAPH_CREATE_FAILED"; }
+    ggml_build_forward_expand(graph, dst);
+    const ggml_status status = ggml_backend_graph_compute(backend, graph);
+    ggml_backend_synchronize(backend);
+    if (status != GGML_STATUS_SUCCESS) {
+        return "HTP_GRAPH_COMPUTE_FAILED";
+    }
+    ggml_backend_tensor_get(dst, result.data(), 0, sizeof(result));
+    for (float value : result) {
+        if (!std::isfinite(value) || std::fabs(value - 3.75f) > 1e-3f) {
+            return "HTP_GRAPH_OUTPUT_MISMATCH";
+        }
+    }
+    return "PASS";
 }
 } // namespace
 
@@ -155,6 +218,7 @@ int main(int argc, char ** argv) {
                   << " mem_available_mib=" << available
                   << " aggregate_cap_mib=" << aggregate_cap
                   << " touch_pages=" << (opts.touch_pages ? 1 : 0)
+                  << " dsp_check=" << (opts.dsp_check ? 1 : 0)
                   << " scope=RPCMEM_FASTRPC_HOST_MAP" << std::endl;
 
         ggml_backend_load_all();
@@ -227,6 +291,50 @@ int main(int argc, char ** argv) {
                             handle, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                         if (opts.touch_pages) {
                             touch_pages(handle, each * MIB);
+                        }
+                    }
+                    if (failure < 0 && opts.dsp_check) {
+                        // Leave 320 MiB of active DSP mapping headroom for
+                        // other allocations. Exact graph working-set limits
+                        // must also be verified with the real runtime.
+                        const uint64_t vmem_mib = std::getenv(
+                            "GGML_HEXAGON_VMEM") ?
+                            std::strtoull(std::getenv(
+                                "GGML_HEXAGON_VMEM"), nullptr, 10) : 3200;
+                        const uint64_t active = each * count + 1;
+                        if (active + 320 > vmem_mib) {
+                            std::cout << "[HTP_MEM_PROBE] event=DSP_RESULT"
+                                      << " mode=" << mode
+                                      << " each_mib=" << each
+                                      << " total_mib=" << each * count
+                                      << " status=SKIP_DSP_VMEM_HEADROOM"
+                                      << " vmem_mib=" << vmem_mib
+                                      << std::endl;
+                        } else {
+                            std::cout << "[HTP_MEM_PROBE] event=DSP_ATTEMPT"
+                                      << " mode=" << mode
+                                      << " each_mib=" << each
+                                      << " total_mib=" << each * count
+                                      << " vmem_mib=" << vmem_mib
+                                      << " scope=HTP_DSP_GRAPH"
+                                      << std::endl;
+                            const auto dsp_start =
+                                std::chrono::steady_clock::now();
+                            const char * dsp_status =
+                                run_dsp_mapping_check(
+                                    backend, repack, buffers.handles);
+                            const double dsp_elapsed =
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() -
+                                    dsp_start).count();
+                            std::cout << "[HTP_MEM_PROBE] event=DSP_RESULT"
+                                      << " mode=" << mode
+                                      << " each_mib=" << each
+                                      << " total_mib=" << each * count
+                                      << " status=" << dsp_status
+                                      << " elapsed_ms=" << dsp_elapsed
+                                      << " scope=HTP_DSP_GRAPH"
+                                      << std::endl;
                         }
                     }
                 } // Always release all buffers before the next attempt.
