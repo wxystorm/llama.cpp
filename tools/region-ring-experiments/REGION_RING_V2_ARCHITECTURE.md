@@ -149,15 +149,77 @@ authoritative target. These pieces are now implemented as opt-in helpers in
   percentages. Measuring runtime overlap is **not** a prerequisite for
   Planner eligibility.
 
-**Not connected yet:** automatic model-specific V2 cache reuse or forced
-refresh in `run_prompt_sweep.ps1`, conversion of native G/C/N/A Profile
-samples into `apply-wide` callbacks, and the final selected N/A mapping
-into production model weight placement and Phone Plan RPC. The current
-mixed Phone executor also only supports one-layer HTP Regions; N2/N4
-native profiler support is not proof that production runs those shapes.
-The new regression tests have not yet been confirmed by a build in the
-connected Windows/Android environment. Do not report this as an
-end-to-end automatic GCNA `apply-wide` implementation.
+**Main-program integration is now committed but not device-verified:**
+
+- `run_prompt_sweep.ps1` keeps the original `llama-completion + apply-wide`
+  entry point. It checks the model-bound native `profile.json` once per
+  sweep; a cache miss/force calls the existing resumable *independent*
+  `run_v2_stage_matrix.py`, not a compact fixed-layout runtime benchmark.
+  Native Phone samples currently require the separate profile sidecar at
+  the RPC host's port 50177.
+- The existing Hybrid measurements (PC/CUDA memory and real ggml-rpc
+  transfer curves) are cached independently as a versioned model-/device-/
+  binary-bound `.rrhp` snapshot. On a hit the next
+  `llama-completion` process skips those probes, but every Prompt reruns
+  the original E/Beam/shortlist DAG candidate search.
+- `llama-region-ring-native-stage-profile.h` loads only valid native
+  PASS rows; N4 parity-failed rows are excluded. The E/Beam stage-cost
+  callbacks use native G/C timings; the final N/A physical Stage DAG uses
+  distinct measured N/A compute/prepare costs and NPU same-Bank refill
+  durations. It never requires observed physical overlap.
+- For shortlisted logical P Regions, the original Planner now chooses
+  correctness-qualified NPU prefixes and resident Adreno suffixes,
+  checks the joint Phone memory budget and HTP A/B Bank capacity, then
+  computes precise refill fences in its existing event simulator.
+- The winning HTP Region IDs are stored on the model before its weights
+  are placed. The existing phone-owned Plan RPC gets the actual mapping
+  from that model, rather than asking the operator to write a Region-ID
+  environment variable. Unsupported candidates fail instead of silently
+  falling back to P-only timing.
+
+**Known restrictions / validation still outstanding:**
+
+1. Production mixed-Phone execution accepts **N1 per HTP Region**, with
+   at least two HTP Regions and one Adreno Region. N2/N4 native Stage
+   profiling is not production multi-layer HTP support. Accordingly
+   the spill policy currently caps each physical HTP Region to N1; once
+   production N2+ is proven, increase the cap and retest.
+2. New C++ and Python regression fixtures were committed but not yet
+   compiled/executed on the user's Windows PC or Snapdragon Phone. The
+   first true `llama-completion` PC+Phone `apply-wide` run must verify
+   Graph registration, Plan RPC, KV and final logits. Tests and sample
+   commands live below.
+3. Native Profile-cache hits validate the stored Phone fingerprint, not a
+   fresh live sidecar Hello. After changing the Phone DSP/runtime/binary,
+   use `-ForceProfile` until live identity checking is integrated.
+4. Some independent samples (e.g. N4) have a known numeric parity failure.
+   These are excluded rather than synthesized; if no executable N1/A
+   combination fits, Planner fails closed.
+
+**Main-program invocation:**
+
+```powershell
+.\tools\region-ring-experiments\run_prompt_sweep.ps1 `
+  -Model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir ".\single-prompt-512" `
+  -Out ".\planner-test-results-v2" `
+  -Planner apply-wide -Streaming on -NPredict 32 `
+  -Threads 8 -Batch 512 -UBatch 512 -LogVerbosity 4
+```
+
+Add `-ForceProfile` to refresh measurements or
+`-NoV2Profile` to run only the legacy G/C/P Planner. Use
+`-V2ProfileDir ".\profile-v2\gcna-expanded"` for an explicitly
+selected persisted independent matrix. Old `-SkipProfile -ForceLayout
+-ForceXC -ForceXG -ForceXP` continues to be a separate fixed A/B
+benchmark bypass.
+
+```powershell
+cmake --build build-tensor-v2 --config Release --target llama-completion region-ring-v2-stage-profile test-region-ring-planner test-region-ring-profile-cache test-region-ring-native-stage-profile -j 8
+ctest --test-dir build-tensor-v2 -C Release -R "test-region-ring-(planner|profile-cache|native-stage-profile)" --output-on-failure
+python -m unittest discover -s tools/region-ring-experiments -p "test_*profile*.py" -v
+```
 
 ## Current implementation / acceptance gates
 
