@@ -11,9 +11,11 @@
 #include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <utility>
