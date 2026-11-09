@@ -457,6 +457,14 @@ target_include_directories(test-region-ring-native-stage-profile PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring-native-stage-profile)
 
+# Native Phone RPC must compute the *exact* SHA256 used by the PC's
+# hashlib-based model fingerprint, without Python or OpenSSL dependencies.
+add_executable(test-v2-profile-native-sha test-v2-profile-native-sha.cpp)
+target_include_directories(test-v2-profile-native-sha PRIVATE
+    ${PROJECT_SOURCE_DIR}/tools/rpc)
+target_compile_features(test-v2-profile-native-sha PRIVATE cxx_std_17)
+llama_test(test-v2-profile-native-sha)
+
 # The Arena return opt-in must not leak into adjacent Phone stages or
 # parallel CPU/GPU workers. The mode test needs no model or live RPC server.
 add_executable(test-meta-phone-full-stream-mode test-meta-phone-full-stream-mode.cpp)
