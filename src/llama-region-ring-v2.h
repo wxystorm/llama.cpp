@@ -266,8 +266,9 @@ inline npu_memory_decision choose_npu_weight_policy(
     // allocations first, then limit EACH NPU Stage to one half of the
     // remaining weight budget, independently of the chosen residency mode.
     // The physical HTP single-allocation limit is a separate hard ceiling.
-    const size_t max_stage_weight_bytes =
-        (m.phone_budget_bytes - fixed) / 2;
+    const size_t max_stage_weight_bytes = std::min(
+        (m.phone_budget_bytes - fixed) / 2,
+        m.max_htp_allocation_bytes / 2);
     for (size_t i = 0; i < m.stage_weight_bytes.size(); ++i) {
         const size_t bytes = m.stage_weight_bytes[i];
         if (bytes == 0 || bytes > m.max_htp_allocation_bytes) {
