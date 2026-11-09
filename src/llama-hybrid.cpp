@@ -4,6 +4,7 @@
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
 #include "llama-region-ring-profile-cache.h"
+#include "llama-region-ring-native-stage-profile.h"
 #include "llama-region-ring-real-profile.h"
 
 #include "../ggml/src/ggml-impl.h"
@@ -10360,6 +10361,171 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     }
                     return true;
                 };
+        }
+    }
+
+    // Native first-N-layer G/C/N/A Profile is independent of the legacy
+    // Hybrid measurements used above for host memory, CUDA H2D and real RPC
+    // link costs. Only correctness-qualified native N/A rows may enter
+    // Phone Stage allocation or its resource-constrained event DAG.
+    if (const char * path =
+            std::getenv("LLAMA_REGION_RING_V2_PROFILE_CSV")) {
+        if (*path != '\0') {
+            auto native = std::make_shared<
+                llama_ring_native_stage::profile>();
+            std::string why;
+            if (!native->load(path, why)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_NATIVE_PROFILE] status=REJECT "
+                    "reason=%s path=%s\n", why.c_str(), path);
+                return false;
+            }
+            if (!native->has_shape('N', 1) ||
+                    !native->has_shape('A', 1) ||
+                    profile.phone_free_mem == 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_NATIVE_PROFILE] status=REJECT "
+                    "reason=N1_A1_OR_PHONE_MEMORY_MISSING\n");
+                return false;
+            }
+            const auto compute =
+                llama_ring_native_stage::phase::COMPUTE;
+            const auto prepare =
+                llama_ring_native_stage::phase::PREPARE;
+            model.phone_npu_weight_streaming = true;
+            model.phone_npu_compute_ms =
+                [native, compute](int n, int x, int kv, double & ms) {
+                    return native->estimate('N', n, x, kv, compute, ms);
+                };
+            model.phone_adreno_compute_ms =
+                [native, compute](int n, int x, int kv, double & ms) {
+                    return native->estimate('A', n, x, kv, compute, ms);
+                };
+            model.phone_npu_prepare_ms =
+                [native, prepare](int n, int x, int kv, double & ms) {
+                    return native->estimate('N', n, x, kv, prepare, ms);
+                };
+            model.phone_adreno_prepare_ms =
+                [native, prepare](int n, int x, int kv, double & ms) {
+                    return native->estimate('A', n, x, kv, prepare, ms);
+                };
+            model.phone_npu_region_weight_bytes =
+                [native](int begin, int end, size_t & bytes) {
+                    return begin >= 0 && end > begin &&
+                        native->weight_bytes('N', end - begin, true, bytes);
+                };
+            model.phone_npu_weight_refill_ms =
+                [native](size_t bytes, double & ms) {
+                    return native->npu_refill_ms(bytes, ms);
+                };
+            const size_t phone_budget = (size_t) (
+                (long double) profile.phone_free_mem * 0.90L);
+            const size_t kv_per_layer =
+                profile.kv_bytes_per_token_per_layer *
+                (size_t) (model.kv_start + model.tokens);
+            model.phone_stage_allocation =
+                [native, phone_budget, kv_per_layer](
+                    const std::vector<llama_region_ring_region> & logical,
+                    llama_ring_planner::candidate & plan) {
+                    const auto npu_ok = [native](int b, int e) {
+                        // Production mixed HTP execution currently supports
+                        // exactly one layer per physical NPU Region.
+                        return e - b == 1 && native->has_shape('N', 1);
+                    };
+                    const auto adreno_ok = [native](int b, int e) {
+                        return e > b && native->has_shape('A', e - b);
+                    };
+                    const auto memory_ok =
+                        [native, phone_budget, kv_per_layer](
+                            const std::vector<llama_region_ring_region> & rs,
+                            const std::vector<size_t> & npu_ids) {
+                            if (npu_ids.size() < 2) { return false; }
+                            size_t phone_stages = 0;
+                            size_t npu_ws = 0;
+                            size_t a_ws = 0;
+                            size_t host_stage = 0;
+                            size_t one_bank_limit = 0;
+                            if (!native->weight_bytes(
+                                    'N', 1, false, one_bank_limit)) {
+                                return false;
+                            }
+                            for (size_t i = 0; i < rs.size(); ++i) {
+                                const auto & stage = rs[i];
+                                if (stage.device !=
+                                        llama_region_ring_device::PHONE) {
+                                    continue;
+                                }
+                                ++phone_stages;
+                                const bool npu = std::find(
+                                    npu_ids.begin(), npu_ids.end(), i) !=
+                                    npu_ids.end();
+                                const int layers =
+                                    stage.layer_end - stage.layer_begin;
+                                size_t ws = 0;
+                                if (!native->workspace_bytes(
+                                        npu ? 'N' : 'A', layers, ws)) {
+                                    return false;
+                                }
+                                if (npu) {
+                                    npu_ws = std::max(npu_ws, ws);
+                                    size_t raw = 0;
+                                    if (!native->weight_bytes(
+                                            'N', layers, true, raw)) {
+                                        return false;
+                                    }
+                                    host_stage = std::max(host_stage, raw);
+                                } else {
+                                    a_ws = std::max(a_ws, ws);
+                                }
+                            }
+                            // Runtime requires at least one Adreno Region,
+                            // at least two NPU Regions, and two HTP Banks.
+                            if (phone_stages <= npu_ids.size()) {
+                                return false;
+                            }
+                            llama_ring_planner::phone_spill_memory mem;
+                            const auto weight = [native](
+                                    char dev, int b, int e,
+                                    size_t & bytes) {
+                                return b >= 0 && e > b &&
+                                    native->weight_bytes(
+                                        dev, e - b, false, bytes);
+                            };
+                            return llama_ring_planner::
+                                phone_spill_memory_feasible(
+                                    rs, npu_ids,
+                                    [weight](int b, int e, size_t & bytes) {
+                                        return weight('N', b, e, bytes);
+                                    },
+                                    [weight](int b, int e, size_t & bytes) {
+                                        return weight('A', b, e, bytes);
+                                    },
+                                    kv_per_layer, kv_per_layer, npu_ws, a_ws,
+                                    host_stage, one_bank_limit,
+                                    phone_budget, mem);
+                        };
+                    llama_ring_planner::phone_npu_spill_result selected;
+                    if (!llama_ring_planner::
+                            choose_phone_npu_preferred_spill(
+                                logical, 1, npu_ok, adreno_ok,
+                                memory_ok, selected)) {
+                        return false;
+                    }
+                    if (!llama_region_ring_apply_topology_compatible(
+                            selected.regions,
+                            logical.back().layer_end)) {
+                        return false;
+                    }
+                    plan.concrete_regions = std::move(selected.regions);
+                    plan.npu_region_indices =
+                        std::move(selected.npu_region_indices);
+                    return true;
+                };
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_NATIVE_PROFILE] status=LOADED "
+                "points=%zu source=ISOLATED_GCNA_PASSONLY "
+                "npu=PRIORITY adreno=SUFFIX max_htp_region_layers=1 "
+                "bank=DUAL_REFILL path=%s\n", native->size(), path);
         }
     }
 
