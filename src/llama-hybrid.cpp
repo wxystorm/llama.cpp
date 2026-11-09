@@ -10412,37 +10412,34 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // The original E/Beam search retains its structure. Replace
             // only the service-cost callbacks with measured G/C native
             // Stage blocks; depth interpolation is explicit and bounded.
-            const auto old_compute = model.compute_ms;
-            const auto old_prepare = model.prepare_ms;
-            const auto old_region_compute = model.compute_region_ms;
-            const auto old_region_prepare = model.prepare_region_ms;
             model.compute_ms =
-                [native, old_compute, compute](
+                [native, compute](
                     llama_ring_planner::device dev,
                     int layers, int tokens, int kv, double & ms) {
                     const char backend =
                         dev == llama_region_ring_device::GPU ? 'G' :
                         dev == llama_region_ring_device::CPU ? 'C' : '?';
                     return backend == '?' ?
-                        old_compute(dev, layers, tokens, kv, ms) :
+                        native->estimate_phone_coarse(
+                            layers, tokens, kv, compute, ms) :
                         native->estimate_pc_depth(
                             backend, layers, tokens, kv, compute, ms);
                 };
             model.prepare_ms =
-                [native, old_prepare, prepare](
+                [native, prepare](
                     llama_ring_planner::device dev,
                     int layers, int tokens, int kv, double & ms) {
                     const char backend =
                         dev == llama_region_ring_device::GPU ? 'G' :
                         dev == llama_region_ring_device::CPU ? 'C' : '?';
                     return backend == '?' ?
-                        (!old_prepare ||
-                         old_prepare(dev, layers, tokens, kv, ms)) :
+                        native->estimate_phone_coarse(
+                            layers, tokens, kv, prepare, ms) :
                         native->estimate_pc_depth(
                             backend, layers, tokens, kv, prepare, ms);
                 };
             model.compute_region_ms =
-                [native, old_region_compute, old_compute, compute](
+                [native, compute](
                     llama_ring_planner::device dev, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
                     const char backend =
@@ -10452,13 +10449,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         return native->estimate_pc_depth(
                             backend, end - begin, tokens, kv, compute, ms);
                     }
-                    return old_region_compute ?
-                        old_region_compute(
-                            dev, begin, end, tokens, kv, terminal, ms) :
-                        old_compute(dev, end - begin, tokens, kv, ms);
+                    return native->estimate_phone_coarse(
+                        end - begin, tokens, kv, compute, ms);
                 };
             model.prepare_region_ms =
-                [native, old_region_prepare, old_prepare, prepare](
+                [native, prepare](
                     llama_ring_planner::device dev, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
                     const char backend =
@@ -10468,11 +10463,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         return native->estimate_pc_depth(
                             backend, end - begin, tokens, kv, prepare, ms);
                     }
-                    return old_region_prepare ?
-                        old_region_prepare(
-                            dev, begin, end, tokens, kv, terminal, ms) :
-                        !old_prepare ||
-                        old_prepare(dev, end - begin, tokens, kv, ms);
+                    return native->estimate_phone_coarse(
+                        end - begin, tokens, kv, prepare, ms);
                 };
             model.phone_npu_weight_streaming = true;
             model.phone_npu_compute_ms =
