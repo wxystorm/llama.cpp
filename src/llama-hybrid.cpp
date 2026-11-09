@@ -10504,26 +10504,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     const std::vector<llama_region_ring_region> & logical,
                     llama_ring_planner::candidate & plan) {
                     const auto npu_ok = [native](int b, int e) {
-                        // Production mixed HTP execution currently supports
-                        // exactly one layer per physical NPU Region.
-                        return e - b == 1 && native->has_shape('N', 1);
+                        const int depth = e - b;
+                        return b >= 0 && depth > 0 &&
+                            native->has_shape('N', depth);
                     };
                     const auto adreno_ok = [native](int b, int e) {
                         return e > b && native->has_shape('A', e - b);
                     };
-                    const auto memory_ok =
+                    const auto compute_memory =
                         [native, phone_budget, kv_per_layer](
                             const std::vector<llama_region_ring_region> & rs,
-                            const std::vector<size_t> & npu_ids) {
-                            if (npu_ids.size() < 2) { return false; }
+                            const std::vector<size_t> & npu_ids,
+                            llama_ring_planner::phone_spill_memory & result) {
                             size_t npu_ws = 0;
                             size_t a_ws = 0;
                             size_t host_stage = 0;
-                            size_t one_bank_limit = 0;
-                            if (!native->weight_bytes(
-                                    'N', 1, false, one_bank_limit)) {
-                                return false;
-                            }
+                            const size_t allocation_limit =
+                                native->max_profiled_weight_bytes('N');
                             for (size_t i = 0; i < rs.size(); ++i) {
                                 const auto & stage = rs[i];
                                 if (stage.device !=
@@ -10552,11 +10549,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                     a_ws = std::max(a_ws, ws);
                                 }
                             }
-                            // Runtime needs at least two HTP Regions and
-                            // two physical Banks. An Adreno Region is
-                            // optional: a verified all-HTP layout is legal.
-                            // The count guard above still rejects N<2.
-                            llama_ring_planner::phone_spill_memory mem;
                             const auto weight = [native](
                                     char dev, int b, int e,
                                     size_t & bytes) {
@@ -10574,13 +10566,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                         return weight('A', b, e, bytes);
                                     },
                                     kv_per_layer, kv_per_layer, npu_ws, a_ws,
-                                    host_stage, one_bank_limit,
-                                    phone_budget, mem);
+                                    host_stage, allocation_limit,
+                                    phone_budget, result);
                         };
+                    const auto memory_ok = [&compute_memory](
+                            const std::vector<llama_region_ring_region> & rs,
+                            const std::vector<size_t> & npu_ids) {
+                        llama_ring_planner::phone_spill_memory memory;
+                        return compute_memory(rs, npu_ids, memory);
+                    };
                     llama_ring_planner::phone_npu_spill_result selected;
+                    const int max_depth =
+                        std::min(32, native->max_profiled_depth('N'));
                     if (!llama_ring_planner::
                             choose_phone_npu_preferred_spill(
-                                logical, 1, npu_ok, adreno_ok,
+                                logical, max_depth, npu_ok, adreno_ok,
                                 memory_ok, selected)) {
                         return false;
                     }
@@ -10589,6 +10589,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             logical.back().layer_end)) {
                         return false;
                     }
+                    llama_ring_planner::phone_spill_memory memory;
+                    if (!compute_memory(
+                            selected.regions, selected.npu_region_indices,
+                            memory)) {
+                        return false;
+                    }
+                    plan.npu_weight_policy = memory.weight_policy;
+                    plan.npu_memory_bytes = memory.total;
                     plan.concrete_regions = std::move(selected.regions);
                     plan.npu_region_indices =
                         std::move(selected.npu_region_indices);
@@ -10597,8 +10605,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_ERROR(
                 "[REGION_RING_NATIVE_PROFILE] status=LOADED "
                 "points=%zu source=ISOLATED_GCNA_PASSONLY "
-                "npu=PRIORITY adreno=OPTIONAL_SUFFIX max_htp_region_layers=1 "
-                "bank=DUAL_REFILL path=%s\n", native->size(), path);
+                "npu=PRIORITY adreno=OPTIONAL_SUFFIX max_htp_region_layers=%d "
+                "bank=RESIDENT_OR_DUAL_REFILL path=%s\n",
+                native->size(), std::min(32, native->max_profiled_depth('N')), path);
         }
     }
 
