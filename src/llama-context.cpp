@@ -4800,15 +4800,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::getenv("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES");
     const bool phone_static_requested =
         phone_static_env != nullptr && std::atoi(phone_static_env) == 1;
-    const bool phone_static_eligible =
+    const bool terminal_is_phone = !stages.empty() &&
+        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE;
+    const bool phone_runtime_eligible =
         threaded_execution && pc_phone_overlap && own_stage_resources &&
         task_local_graph_outputs && !directional_runtime &&
-        !stages.empty() &&
-        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
+        !stages.empty() && ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
         !ubatch.equal_seqs() && ubatch.output != nullptr &&
         worker_kv_views[2] != nullptr && backend_ptrs.size() == 3 &&
         sched_use == sched.get() && res_use == gf_res_prev.get();
+    const bool phone_static_eligible =
+        phone_runtime_eligible && terminal_is_phone;
+    const bool pc_tail_phone_eligible =
+        phone_runtime_eligible && !terminal_is_phone &&
+        std::any_of(stages.begin(), stages.end(), [](const auto & stage) {
+            return stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
+        });
     // The current caller consumes logits from one canonical final graph.
     // Multi-output prefills need a separate multi-chunk gather contract.
     bool single_terminal_output = ubatch.n_tokens > 0;
@@ -4829,7 +4836,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool phone_auto_p2c_required =
         phone_auto_p2c_env != nullptr && std::atoi(phone_auto_p2c_env) != 0;
     const bool phone_auto_eligible =
-        phone_auto_requested && phone_static_templates &&
+        phone_auto_requested &&
+        (phone_static_templates ||
+         (pc_tail_phone_eligible && phone_static_requested &&
+          single_terminal_output)) &&
         phone_auto_p2c_required &&
         phone_input_stream_requested && pc_phone_overlap &&
         threaded_execution && !directional_runtime &&
@@ -4839,6 +4849,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // The terminal Phone region may publish l_out autonomously; only Qwen3
     // currently supports the separate zero-layer PC Output Head graph.
     const bool phone_auto_final_enabled =
+        phone_auto_final_requested && phone_auto_eligible &&
+        terminal_is_phone && model.arch == LLM_ARCH_QWEN3;
+    // A PC-final GCNA plan still uses a separate CPU Head after its final
+    // CUDA/CPU Stage completes. This is distinct from a final Phone return.
+    const bool separate_final_head =
         phone_auto_final_requested && phone_auto_eligible &&
         model.arch == LLM_ARCH_QWEN3;
     // Graphless only changes the full Prefill path; tiny/decode retain
@@ -4889,7 +4904,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 region_spec, phone_mixed_htp_regions);
         }
         if (!mapped || phone_mixed_htp_regions.size() < 2 ||
-                graphless_requested || !phone_auto_final_enabled) {
+                graphless_requested || !separate_final_head) {
             LLAMA_LOG_ERROR(
                 "[PHONE_MIXED_BACKENDS] status=REJECT "
                 "reason=INVALID_HTP_REGION_LIST_OR_GRAPHLESS_CONFIG "
@@ -4956,7 +4971,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // Do not fail the entire test suite before reaching its target prompt.
     const bool phone_auto_candidate = ubatch.n_tokens >= 32;
     if (phone_auto_final_requested && phone_auto_candidate &&
-            !phone_auto_final_enabled) {
+            !separate_final_head) {
         LLAMA_LOG_ERROR("[PHONE_AUTO_FINAL_HEAD] event=REJECT "
                         "reason=REQUIRES_QWEN3_PHONE_AUTO_AND_SINGLE_OUTPUT\n");
         ret = GGML_STATUS_FAILED;
@@ -4972,7 +4987,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     }
     // Autonomous final P2C prebinds every token at its global UBatch offset.
     // It requires a full-UBatch host buffer, not a rotating output slot.
-    if (phone_auto_final_enabled &&
+    if (separate_final_head &&
             (slot_pool_size != 0 || outputs.size() != stages.size() ||
              outputs.back().size() <
                  (size_t) ubatch.n_tokens * (size_t) n_embd)) {
@@ -4997,7 +5012,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // In autonomous-final mode every Phone Chunk has an immutable registered
     // Graph below. The legacy PC static templates would never be executed,
     // yet would retain four full-model Schedulers during the entire Prefill.
-    if (phone_auto_final_enabled) {
+    if (separate_final_head) {
         LLAMA_LOG_INFO(
             "[PHONE_STATIC_TEMPLATE] event=SKIP "
             "reason=AUTONOMOUS_ALL_PHONE_REGIONS status=OK\n");
@@ -7277,7 +7292,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             (size_t) task.token_begin;
                     const size_t output_host_token_begin =
                         llama_region_ring_output_host_token_begin(
-                            last, phone_auto_final_enabled,
+                            last, separate_final_head,
                             (size_t) task.token_begin, task.output_slot,
                             (size_t) chunk_tokens, slot_pool_size);
                     float * input = first ?
@@ -7287,12 +7302,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             nullptr) :
                         outputs[task.region - 1].data() +
                             input_host_token_begin * n_embd;
-                    float * output = last && !phone_auto_final_enabled ? nullptr :
+                    float * output = last && !separate_final_head ? nullptr :
                         outputs[task.region].data() +
                             output_host_token_begin * n_embd;
 
                     int32_t block_outputs = 0;
-                    if (last) {
+                    if (last && !separate_final_head) {
                         for (int i = 0; i < task.n_tokens; ++i) {
                             block_outputs += ubatch.output[task.token_begin + i] != 0;
                         }
@@ -8135,7 +8150,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // and final outputs before returning.
                     if (cancelled_before_compute || task_result == nullptr ||
                         task_status != GGML_STATUS_SUCCESS ||
-                        (last && !phone_auto_final_enabled &&
+                        (last && !separate_final_head &&
                          task.token_begin + task.n_tokens ==
                              (int) ubatch.n_tokens &&
                          task_result != res_use)) {
@@ -8687,8 +8702,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         executed +=
             p2c_join_completed.load(
                 std::memory_order_relaxed);
-        result = phone_auto_final_enabled ? res_use :
-            worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
+        result = separate_final_head ? res_use :
+            worker_states[(size_t) regions.back().device].final_result;
         if (!launched_all || created != devices.size() ||
             joined != devices.size() || ready.failed() || !ready.all_done() ||
             executed != ready.finished() ||
@@ -8701,7 +8716,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // l_out to outputs[last_region]. The PC-only Head operates on the
         // terminal token; it neither updates KV nor issues Phone RPC.
         int64_t phone_final_head_us = 0;
-        if (phone_auto_final_enabled && ret == GGML_STATUS_SUCCESS &&
+        if (separate_final_head && ret == GGML_STATUS_SUCCESS &&
                 !ready.failed() && ready.all_done()) {
             const int64_t head_begin_us = ggml_time_us();
             const size_t last_region = stages.size() - 1;
