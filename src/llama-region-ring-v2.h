@@ -11,7 +11,9 @@
 //
 // This header is the shared contract for V2 profiling, planning and runtime.
 // The legacy Region Ring retains its original behavior during migration.
-#include "ggml-phone-npu-budget.h"
+// Use a path relative to this header: standalone Planner tests do not
+// all add ggml/include to their compiler include directories.
+#include "../ggml/include/ggml-phone-npu-budget.h"
 
 #include <algorithm>
 #include <array>
