@@ -38,6 +38,7 @@ FIELDS = [
     "prefix_cycles", "prefix_e_json", "prefix_service_mspt_json",
     "ring_ubatches", "ring_tokens", "ring_wall_ms", "ring_complete",
     "phone_auto_final_enabled", "phone_final_head_ms",
+    "pc_final_head_enabled", "pc_final_head_ms",
     "cpu_full_meta_queue", "phone_graph_cache", "phone_graph_slots",
     "phone_graph_slot_revisits", "phone_graph_reuses",
     "phone_graph_reuse_count", "phone_graph_reuse_check_ms",
@@ -397,6 +398,11 @@ def result_row(args, folder, prompt, hint, context, code, elapsed, commit):
         "phone_final_head_ms": (
             total(ring, "phone_final_head_ms")
             if any("phone_final_head_ms" in x for x in ring) else None),
+        "pc_final_head_enabled": any(
+            x.get("pc_final_head_enabled") is True for x in ring),
+        "pc_final_head_ms": (
+            total(ring, "pc_final_head_ms")
+            if any("pc_final_head_ms" in x for x in ring) else None),
         "cpu_full_meta_queue": ring[0].get("cpu_full_meta_queue") if ring else None,
         "phone_graph_cache": ring[0].get("phone_graph_cache") if ring else None,
         "phone_graph_slots": ring[0].get("phone_graph_slots") if ring else None,
