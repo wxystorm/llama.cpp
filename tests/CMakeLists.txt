@@ -446,6 +446,15 @@ target_include_directories(test-region-ring-profile-cache PRIVATE
     ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-region-ring-profile-cache)
 
+# Strict, device-free loader for native G/C/N/A first-N-layer Profile CSV.
+add_executable(test-region-ring-native-stage-profile
+    test-region-ring-native-stage-profile.cpp)
+set_target_properties(test-region-ring-native-stage-profile PROPERTIES
+    CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+target_include_directories(test-region-ring-native-stage-profile PRIVATE
+    ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-region-ring-native-stage-profile)
+
 # The Arena return opt-in must not leak into adjacent Phone stages or
 # parallel CPU/GPU workers. The mode test needs no model or live RPC server.
 add_executable(test-meta-phone-full-stream-mode test-meta-phone-full-stream-mode.cpp)
