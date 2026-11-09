@@ -42,6 +42,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
 #include "ggml-hexagon.h"
+#include "ggml-phone-npu-budget.h"
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "htp-opnode.h"
@@ -5703,6 +5704,22 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf)                      : opt_hostbuf;
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
+
+    // In PC-Planner-controlled Phone HTP mode, choose the calibrated
+    // 1536 MiB per-buffer policy automatically. The Phone executor still
+    // validates its own 3072 MiB total and non-weight allocations. Keep
+    // the upstream 1024 MiB default for every other Hexagon user.
+    const char * phone_plan_mode = getenv("GGML_RPC_PHONE_NPU_PLAN_CONTROLLED");
+    if (!str_mbuf && opt_arch >= 79 && phone_plan_mode &&
+            strcmp(phone_plan_mode, "1") == 0) {
+        opt_mbuf = ggml_phone_npu_budget::bank_bytes;
+        GGML_LOG_INFO(
+            "[NPU_BANK_MEMORY] event=HTP_BUFFER_LIMIT_AUTO "
+            "per_buffer_mib=%zu total_policy_mib=%zu "
+            "origin=PC_PLAN status=READY\n",
+            ggml_phone_npu_budget::bank_mib,
+            ggml_phone_npu_budget::total_mib);
+    }
 
     if (opt_ndev > GGML_HEXAGON_MAX_SESSIONS) {
         opt_ndev = GGML_HEXAGON_MAX_SESSIONS;
