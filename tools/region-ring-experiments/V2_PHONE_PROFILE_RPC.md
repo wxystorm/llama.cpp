@@ -155,8 +155,8 @@ python .\tools\region-ring-experiments\run_v2_stage_matrix.py `
   port. Its stream timing is **not** a production GGML-RPC C2P/P2C timing.
   Retain production RPC transfer/Bank measurements for Planner calibration.
 - The first worker startup hashes the full Phone GGUF once. Profile cache
-  identity includes the Phone hardware, native profiler binary and selected
-  backend libraries.
+  identity includes Phone hardware, native profiler binary, RPC Server,
+  Python worker script and selected backend libraries.
 - The production mixed HTP runtime still supports N1 per HTP Region; an
   independent N2/N4 Profile is not proof of production N2/N4 execution.
 - Phone RPC is experimental and is not hardened for an untrusted network.
