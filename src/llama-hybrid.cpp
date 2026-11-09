@@ -10516,7 +10516,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             const std::vector<llama_region_ring_region> & rs,
                             const std::vector<size_t> & npu_ids) {
                             if (npu_ids.size() < 2) { return false; }
-                            size_t phone_stages = 0;
                             size_t npu_ws = 0;
                             size_t a_ws = 0;
                             size_t host_stage = 0;
@@ -10531,7 +10530,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                         llama_region_ring_device::PHONE) {
                                     continue;
                                 }
-                                ++phone_stages;
                                 const bool npu = std::find(
                                     npu_ids.begin(), npu_ids.end(), i) !=
                                     npu_ids.end();
