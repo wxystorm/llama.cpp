@@ -128,3 +128,41 @@ skipped by the 320 MiB-headroom guard. The guard is not a device limit.
 A DSP_RESULT PASS verifies a small real HTP operation. This is NOT a
 production Qwen3 multi-layer test, and it should not be labeled as
 physical NPU VRAM capacity or as an upper bound for all HTP workloads.
+
+
+## Phase 3: explicit near-limit dual 1536 MiB mapping
+
+Run only after phase 2 succeeds. This test uses two independent 1536 MiB
+arenas (3072 MiB total). With the default 3200 MiB active DSP VMEM budget,
+only 128 MiB remains for all other simultaneously mapped buffers.
+
+The default --dsp-check guard reserves 320 MiB and therefore skips this
+test. A NEW, explicit --allow-tight-dsp-vmem option relaxes this guard to
+64 MiB for this experiment only. It does NOT increase DSP VMEM, imply that
+this size is safe for a full Qwen3 multi-layer graph, or change the
+Planner. The allocation safety limit also needs explicit override.
+
+Rebuild and transfer the new probe; stop the phone RPC server.
+
+    cd ~/phone-v2-profile
+    export LD_LIBRARY_PATH="$PWD/lib:$LD_LIBRARY_PATH"
+    export ADSP_LIBRARY_PATH="$PWD/lib"
+    GGML_HEXAGON_MBUF=2048 ./bin/ggml-htp-memory-probe \
+        --mode dual \
+        --dsp-check \
+        --allow-tight-dsp-vmem \
+        --max-aggregate-mib 3072 \
+        --sizes-mib 1536 \
+        2>&1 | tee htp-dual-1536.log
+
+    grep -E '\[HTP_MEM_PROBE\]|mmap failed|mapping failed|alloc failed' \
+        htp-dual-1536.log
+
+Verify an ATTEMPT followed by a DSP_ATTEMPT and a DSP_RESULT status=PASS.
+A plain RESULT status=PASS only proves the host-side allocation path.
+A SKIP means the preflight guard prevented the test. If it hangs, fails or
+Android kills the process, do not blindly retry or increase
+GGML_HEXAGON_VMEM: collect logcat/kernel-related clues first.
+
+This is a controlled stress experiment. Other phone apps and the system may
+still compete for shared RAM, and DSP session failure is possible.
