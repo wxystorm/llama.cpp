@@ -5,6 +5,7 @@
 #include <fstream>
 #include <cmath>
 #include <cstdio>
+#include <set>
 #include <string>
 #include <vector>
 using namespace llama_ring_planner;
@@ -451,6 +452,30 @@ int main() {
             strict_rejected = true;
         }
         REQUIRE(strict_rejected);
+
+        // Forced Qwen3-14B: four P1 Regions can be selected as HTP by
+        // zero-based *Region* ID, not by Transformer layer number.
+        const auto forced_p1 = llama_region_ring_parse_apply_wide_layout(
+            "G9,P1,G9,P1,G9,P1,G9,P1", 40);
+        REQUIRE(forced_p1.size() == 8);
+        REQUIRE(llama_region_ring_apply_topology_compatible(forced_p1, 40));
+        std::set<uint32_t> forced_htp_ids;
+        REQUIRE(llama_region_ring_parse_region_ids(
+            "1,3,5,7", forced_htp_ids));
+        REQUIRE(forced_htp_ids.size() == 4);
+        for (uint32_t id : forced_htp_ids) {
+            REQUIRE(id < forced_p1.size());
+            REQUIRE(forced_p1[id].device == device::PHONE);
+            REQUIRE(forced_p1[id].layer_end - forced_p1[id].layer_begin == 1);
+        }
+        REQUIRE(forced_p1[1].layer_begin == 9);
+        REQUIRE(forced_p1[3].layer_begin == 19);
+        REQUIRE(forced_p1[5].layer_begin == 29);
+        REQUIRE(forced_p1[7].layer_begin == 39);
+        REQUIRE(!llama_region_ring_parse_region_ids(
+            "1,1", forced_htp_ids));
+        REQUIRE(!llama_region_ring_parse_region_ids(
+            "1,64", forced_htp_ids));
 
         const auto single =
             llama_region_ring_parse_apply_wide_layout(
