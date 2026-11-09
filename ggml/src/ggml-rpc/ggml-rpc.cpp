@@ -9088,6 +9088,21 @@ void rpc_server::phone_auto_compute_loop() {
                         req.key.run_id, internal_region, req.key.chunk,
                         nullptr, nullptr, why, one, output,
                         activation, n_floats);
+                    if (count > 1) {
+                        GGML_LOG_INFO(
+                            "[PHONE_NPU_CHAIN] run=%" PRIu64
+                            " region=%u layer=%u chunk=%u position=%u/%u"
+                            " backend=%s upload_ms=%.3f compute_ms=%.3f"
+                            " output_copy_ms=%.3f status=%s reason=%s\n",
+                            req.key.run_id, req.key.region,
+                            chain_plan.layer + i, req.key.chunk,
+                            i + 1, count,
+                            phone_npu_name_for_region(req.key.region),
+                            one.input_upload_ms, one.htp_compute_ms,
+                            one.output_copy_ms,
+                            ok ? "PASS" : "FAIL",
+                            ok ? "NONE" : why.c_str());
+                    }
                     if (!ok) { break; }
                     profile.input_read_ms += one.input_read_ms;
                     profile.input_upload_ms += one.input_upload_ms;
