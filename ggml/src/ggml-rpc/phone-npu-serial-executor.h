@@ -868,10 +868,10 @@ public:
             }
             ++regions;
         }
-        if (regions == 0) {
-            reason = "PHONE_LOCAL_KV_NO_REGIONS";
-            return false;
-        }
+        // A multi-HTP Plan can use fewer sessions than
+        // GGML_HEXAGON_NDEV. An idle session has no owned KV to synchronize
+        // and must not fail the entire prefill/decode handoff. The RPC server
+        // validates that the run synchronized at least one owned Region.
         return true;
     }
 
