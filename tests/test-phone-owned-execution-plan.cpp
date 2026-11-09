@@ -51,6 +51,49 @@ int main() {
     CHECK(validate(wide, reason));
     CHECK(owned_task_uid(15, 0) != owned_task_uid(1, 0));
     CHECK(chunk_count(a) == 4);
+    // Versioned contiguous NPU Region: one external Region/Chunk can
+    // dispatch several ordered, separately cached whole-layer graphs.
+    auto chain = a;
+    chain.version = k_multi_plan_version;
+    chain.flags = flags_for_layers(3);
+    chain.region = 5;
+    chain.layer = 23;
+    CHECK(validate(chain, reason));
+    CHECK(layer_count(chain) == 3);
+    CHECK(chunk_count(chain) == 4);
+    CHECK(internal_layer_region(chain, 0) != chain.region);
+    CHECK(internal_layer_region(chain, 0) !=
+          internal_layer_region(chain, 1));
+    for (uint32_t off = 0; off < 3; ++off) {
+        const auto child = single_layer_plan(chain, off);
+        CHECK(child.version == k_plan_version);
+        CHECK(child.flags == k_flag_flash_attn);
+        CHECK(child.layer == 23 + off);
+        CHECK(child.region == internal_layer_region(chain, off));
+        CHECK(child.region < k_max_regions);
+        CHECK(layer_count(child) == 1);
+        CHECK(validate(child, reason));
+        CHECK(chunk_count(child) == chunk_count(chain));
+    }
+    auto separate_chain = chain;
+    separate_chain.region = 6;
+    CHECK(internal_layer_region(separate_chain, 0) !=
+          internal_layer_region(chain, 0));
+    auto invalid_chain = chain;
+    invalid_chain.flags = flags_for_layers(1);
+    CHECK(!validate(invalid_chain, reason));
+    invalid_chain.flags = flags_for_layers(65);
+    CHECK(!validate(invalid_chain, reason));
+    invalid_chain = chain;
+    invalid_chain.layer = 254;
+    CHECK(!validate(invalid_chain, reason));
+    invalid_chain = chain;
+    invalid_chain.flags = flags_for_layers(3) | 2;
+    CHECK(!validate(invalid_chain, reason));
+    const auto legacy_child = single_layer_plan(a, 0);
+    CHECK(legacy_child.region == a.region);
+    CHECK(legacy_child.layer == a.layer);
+
     CHECK(owned_task_uid(1, 0) != 0);
     CHECK(owned_task_uid(1, 0) != owned_task_uid(1, 1));
     CHECK(owned_task_uid(1, 1) != owned_task_uid(3, 1));
