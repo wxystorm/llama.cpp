@@ -472,6 +472,33 @@ int main() {
         REQUIRE(forced_p1[3].layer_begin == 19);
         REQUIRE(forced_p1[5].layer_begin == 29);
         REQUIRE(forced_p1[7].layer_begin == 39);
+        // The same contract is used during both normal model-load and
+        // SKIP_PROFILE model-load: forced P Regions become an HTP Plan.
+        std::vector<int> forced_plan_npu_ids;
+        int forced_plan_policy = 0;
+        std::string forced_plan_error;
+        REQUIRE(llama_region_ring_validate_forced_npu_regions(
+            "1,3,5,7", "resident", forced_p1,
+            forced_plan_npu_ids, forced_plan_policy, forced_plan_error));
+        REQUIRE(forced_plan_npu_ids == std::vector<int>({1, 3, 5, 7}));
+        REQUIRE(forced_plan_policy == 1);
+        REQUIRE(forced_plan_error.empty());
+        REQUIRE(llama_region_ring_validate_forced_npu_regions(
+            "1,3,5,7", "streaming-2bank", forced_p1,
+            forced_plan_npu_ids, forced_plan_policy, forced_plan_error));
+        REQUIRE(forced_plan_policy == 2);
+        REQUIRE(!llama_region_ring_validate_forced_npu_regions(
+            "0,1", "resident", forced_p1,
+            forced_plan_npu_ids, forced_plan_policy, forced_plan_error));
+        REQUIRE(forced_plan_error.find("REGION_NOT_PHONE") == 0);
+        REQUIRE(!llama_region_ring_validate_forced_npu_regions(
+            "1", "streaming-2bank", forced_p1,
+            forced_plan_npu_ids, forced_plan_policy, forced_plan_error));
+        REQUIRE(forced_plan_error == "INVALID_POLICY_OR_REGION_COUNT");
+        REQUIRE(!llama_region_ring_validate_forced_npu_regions(
+            "1,1", "resident", forced_p1,
+            forced_plan_npu_ids, forced_plan_policy, forced_plan_error));
+        REQUIRE(forced_plan_error == "INVALID_REGION_IDS");
         REQUIRE(!llama_region_ring_parse_region_ids(
             "1,1", forced_htp_ids));
         REQUIRE(!llama_region_ring_parse_region_ids(
