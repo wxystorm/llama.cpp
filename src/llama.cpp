@@ -27,6 +27,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #if defined(_MSC_VER)
