@@ -91,9 +91,20 @@ class Service:
         self.device_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         self.device = device
         self.backend_library_sha256 = backend_library_hashes(self.exe)
+        # The integrated sampler has three independently updateable pieces:
+        # the native graph profiler, its Python control worker, and the
+        # inference RPC server hosting command 57. All are part of the
+        # measurement provenance, not just the native profiler executable.
+        self.control_sha256 = sha256(Path(__file__).resolve())
+        rpc_server_exe = self.exe.parent / "ggml-rpc-server"
+        self.rpc_server_sha256 = (
+            sha256(rpc_server_exe) if rpc_server_exe.is_file()
+            else "NOT_FOUND")
         runtime = {"exe_sha256": self.exe_sha256,
                    "library_sha256": self.backend_library_sha256,
-                   "device_id": self.device_id}
+                   "device_id": self.device_id,
+                   "control_sha256": self.control_sha256,
+                   "rpc_server_sha256": self.rpc_server_sha256}
         self.runtime_sha256 = hashlib.sha256(
             json.dumps(runtime, sort_keys=True).encode("utf-8")).hexdigest()
 
@@ -102,6 +113,8 @@ class Service:
                 "model_sha256": self.model_sha256,
                 "exe_sha256": self.exe_sha256,
                 "runtime_sha256": self.runtime_sha256,
+                "control_sha256": self.control_sha256,
+                "rpc_server_sha256": self.rpc_server_sha256,
                 "library_sha256": self.backend_library_sha256,
                 "device_id": self.device_id,
                 "device": self.device,
