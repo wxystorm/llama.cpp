@@ -4,6 +4,7 @@
 // sizes, then simulate token-interval dependencies. It never modifies the
 // live Ring scheduler, buffers, KV cache, or Phone RPC state.
 #include "llama-region-ring.h"
+#include "llama-region-ring-v2.h"
 
 #include <algorithm>
 #include <array>
@@ -256,6 +257,11 @@ struct phone_npu_spill_result {
 // capacities and scratch reservations come from the versioned Profile.
 struct phone_spill_memory {
     std::array<size_t, 2> npu_bank_weights {};
+    llama_ring_v2::npu_weight_policy weight_policy =
+        llama_ring_v2::npu_weight_policy::DISABLED;
+    size_t resident_npu_weight_bytes = 0;
+    size_t resident_total_bytes = 0;
+    size_t streaming_total_bytes = 0;
     size_t npu_persistent_kv = 0;
     size_t adreno_weights = 0;
     size_t adreno_persistent_kv = 0;
@@ -282,6 +288,7 @@ inline bool phone_spill_memory_feasible(
     size_t npu_rank = 0;
     long double npu_kv = 0.0L, adreno_kv = 0.0L;
     long double adreno_weights = 0.0L;
+    std::vector<size_t> npu_stage_weights;
     size_t next_npu_index = 0;
     for (size_t i = 0; i < regions.size(); ++i) {
         const auto & r = regions[i];
@@ -306,6 +313,7 @@ inline bool phone_spill_memory_feasible(
             const size_t bank = npu_rank++ % 2;
             out.npu_bank_weights[bank] =
                 std::max(out.npu_bank_weights[bank], weight);
+            npu_stage_weights.push_back(weight);
             npu_kv += (long double) layers * npu_kv_per_layer;
         } else {
             if (!adreno_weight_bytes(r.layer_begin, r.layer_end, weight) ||
@@ -324,20 +332,35 @@ inline bool phone_spill_memory_feasible(
     const long double overhead =
         (long double) npu_workspace + adreno_workspace +
         host_stage_reserve;
-    const long double total =
-        (long double) out.npu_bank_weights[0] +
-        out.npu_bank_weights[1] +
-        npu_kv + adreno_weights + adreno_kv + overhead;
-    if (!std::isfinite(total) ||
-            total > (long double) phone_budget_bytes ||
-            total > (long double) std::numeric_limits<size_t>::max()) {
+    const long double adreno_resident = adreno_weights + adreno_kv +
+        (long double) adreno_workspace;
+    const long double max_size =
+        (long double) std::numeric_limits<size_t>::max();
+    if (!std::isfinite(overhead) || !std::isfinite(adreno_resident) ||
+            npu_kv > max_size || adreno_resident > max_size ||
+            adreno_weights > max_size || adreno_kv > max_size) {
         return false;
     }
-    out.npu_persistent_kv = (size_t) npu_kv;
+    llama_ring_v2::npu_memory_request request;
+    request.stage_weight_bytes = std::move(npu_stage_weights);
+    request.npu_kv_bytes = (size_t) npu_kv;
+    request.npu_graph_workspace_bytes = npu_workspace;
+    request.adreno_resident_bytes = (size_t) adreno_resident;
+    request.host_stage_bytes = host_stage_reserve;
+    request.phone_budget_bytes = phone_budget_bytes;
+    request.max_htp_allocation_bytes = max_htp_bank_bytes;
+    const auto choice = llama_ring_v2::choose_npu_weight_policy(request);
+    if (!choice.feasible) { return false; }
+    out.weight_policy = choice.policy;
+    out.npu_bank_weights = choice.bank_weight_bytes;
+    out.resident_npu_weight_bytes = choice.all_npu_weight_bytes;
+    out.resident_total_bytes = choice.resident_total_bytes;
+    out.streaming_total_bytes = choice.streaming_total_bytes;
+    out.npu_persistent_kv = request.npu_kv_bytes;
     out.adreno_weights = (size_t) adreno_weights;
     out.adreno_persistent_kv = (size_t) adreno_kv;
     out.shared_overhead = (size_t) overhead;
-    out.total = (size_t) total;
+    out.total = choice.selected_total_bytes;
     return true;
 }
 
