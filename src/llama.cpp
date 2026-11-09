@@ -574,6 +574,26 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     target_tokens, 0, chunk_tokens,selected_layout) :
                 llama_hybrid_region_ring_planner_apply_safe(
                     target_tokens, 0, chunk_tokens,selected_layout);
+            const char * v2_csv =
+                std::getenv("LLAMA_REGION_RING_V2_PROFILE_CSV");
+            const char * forced_layout =
+                std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+            const bool native_gcna = ring_plan_apply_wide &&
+                v2_csv && *v2_csv &&
+                (!forced_layout || !*forced_layout);
+            if (native_gcna &&
+                    (!selected || selected_layout.empty() ||
+                     selected_npu_region_ids.size() < 2)) {
+                // Never continue with the old P-only baseline when the
+                // operator requested a native N/A Plan. Doing so would
+                // charge the wrong compute costs and configure wrong Phone
+                // Region ownership.
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_NATIVE_PLAN] status=REJECT "
+                    "reason=NO_EXECUTABLE_NPU_ADRENO_PLAN "
+                    "action=DO_NOT_FALLBACK_TO_LEGACY_PHONE\n");
+                return {-1, nullptr};
+            }
             if (selected && !selected_layout.empty()) {
                 // The model permanently owns this decision. The graph
                 // scheduler reads these exact values from the same model;
