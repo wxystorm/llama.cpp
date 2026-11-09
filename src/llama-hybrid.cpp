@@ -10502,41 +10502,34 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             const size_t kv_per_layer =
                 profile.kv_bytes_per_token_per_layer *
                 (size_t) (model.kv_start + model.tokens);
-            // The default Hexagon GGML_HEXAGON_MBUF is 1024 MiB; the
-            // native Profile currently does not export a per-buffer limit.
-            // Do not substitute aggregate Phone free RAM for one HTP arena.
-            // Actual device allocation still decides final admission.
-            const size_t htp_single_alloc_limit = std::min(
-                phone_budget, size_t(1024) * 1024 * 1024);
-            const size_t htp_cycle_weight_limit =
-                htp_single_alloc_limit / 2;
             model.phone_stage_allocation =
-                [native, phone_budget, kv_per_layer, htp_single_alloc_limit,
-                 htp_cycle_weight_limit](
+                [native, phone_budget, kv_per_layer](
                     const std::vector<llama_region_ring_region> & logical,
                     llama_ring_planner::candidate & plan) {
-                    const auto npu_ok = [native, htp_cycle_weight_limit](int b, int e) {
+                    const auto npu_ok = [native](int b, int e) {
                         const int depth = e - b;
-                        // HTP supports contiguous multi-layer Stages, but
-                        // each Stage still uses one physical weight arena.
-                        // Prune overlarge depths before spill enumeration.
+                        // Match the actual multi-layer HTP Graph builder
+                        // (up to 32 layers), not the matrix's sample depths.
                         size_t weight = 0;
                         return b >= 0 && depth > 0 && depth <= 32 &&
-                            native->weight_bytes('N', depth, false, weight) &&
-                            weight > 0 && weight <= htp_cycle_weight_limit;
+                            native->weight_bytes('N', depth, false, weight);
                     };
                     const auto adreno_ok = [native](int b, int e) {
                         return e > b && native->has_shape('A', e - b);
                     };
                     const auto compute_memory =
-                        [native, phone_budget, kv_per_layer,
-                         htp_single_alloc_limit](
+                        [native, phone_budget, kv_per_layer](
                             const std::vector<llama_region_ring_region> & rs,
                             const std::vector<size_t> & npu_ids,
                             llama_ring_planner::phone_spill_memory & result) {
                             size_t npu_ws = 0;
                             size_t a_ws = 0;
                             size_t host_stage = 0;
+                            // A measured N1/N3 weight size is NOT the
+                            // physical HTP allocator's maximum allocation.
+                            // Admission uses the shared-RAM upper bound;
+                            // the Phone verifies the actual repack allocation.
+                            const size_t allocation_limit = phone_budget;
                             for (size_t i = 0; i < rs.size(); ++i) {
                                 const auto & stage = rs[i];
                                 if (stage.device !=
@@ -10582,7 +10575,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                         return weight('A', b, e, bytes);
                                     },
                                     kv_per_layer, kv_per_layer, npu_ws, a_ws,
-                                    host_stage, htp_single_alloc_limit,
+                                    host_stage, allocation_limit,
                                     phone_budget, result);
                         };
                     const auto memory_ok = [&compute_memory](
