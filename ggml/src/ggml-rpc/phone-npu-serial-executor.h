@@ -1342,19 +1342,47 @@ public:
                 ggml_nbytes(t) >= width * p.total_tokens * sizeof(uint16_t) &&
                 !ggml_backend_buffer_is_host(t->buffer);
         };
-        if (p.layer != layer || state.next_chunk != 0 ||
-                state.canonical_ctx || state.canonical_k || state.canonical_v ||
+        if (layer < p.layer || layer >= p.layer_end ||
+                state.next_chunk != 0 ||
                 !valid(canonical_k) || !valid(canonical_v) ||
                 (canonical_k->buffer == canonical_v->buffer &&
                  canonical_k->data == canonical_v->data)) {
             reason = "PHONE_LOCAL_KV_GRAPHLESS_DESTINATION_CONTRACT";
             return false;
         }
-        state.canonical_ctx = std::move(canonical_ctx);
-        state.canonical_k = canonical_k;
-        state.canonical_v = canonical_v;
+        const size_t index = layer - p.layer;
+        if (index >= state.canonical_k_layers.size() ||
+                state.canonical_k_layers[index] ||
+                state.canonical_v_layers[index]) {
+            reason = "PHONE_LOCAL_KV_DUPLICATE_LAYER_BINDING";
+            return false;
+        }
+        state.canonical_k_layers[index] = canonical_k;
+        state.canonical_v_layers[index] = canonical_v;
+        if (index == 0) {
+            state.canonical_ctx = std::move(canonical_ctx);
+            state.canonical_k = canonical_k;
+            state.canonical_v = canonical_v;
+        } else {
+            state.canonical_extra_contexts.push_back(
+                std::move(canonical_ctx));
+        }
         state.graphless_identity_slots = true;
+        for (size_t i = 0; i < state.canonical_k_layers.size(); ++i) {
+            if (!state.canonical_k_layers[i] ||
+                    !state.canonical_v_layers[i]) {
+                state.graphless_identity_slots = false;
+                break;
+            }
+        }
         return true;
+    }
+
+    bool all_owned_decode_kv_bound(
+            uint64_t run_id, uint32_t region) const {
+        const auto it = owned_kv_.find({run_id, region});
+        return it != owned_kv_.end() &&
+            it->second->graphless_identity_slots;
     }
 
     // The PC-built Graph remains registered as a metadata carrier in the
