@@ -4874,7 +4874,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::getenv("LLAMA_REGION_RING_PHONE_MIXED_OPENCL_HTP");
     const bool model_npu_plan =
         !model.hybrid_ring_plan_npu_region_ids.empty();
+    // A native model-owned NPU0 Plan wins over any stale manual HTP list.
     const bool phone_mixed_requested =
+        model.hybrid_ring_plan_native_gcna ? model_npu_plan :
         model_npu_plan ||
         (phone_mixed_env != nullptr &&
          std::strcmp(phone_mixed_env, "1") == 0);
@@ -5821,7 +5823,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
         const bool owned_plan_requested =
             owned_plan_env != nullptr &&
-            std::strcmp(owned_plan_env, "1") == 0;
+            std::strcmp(owned_plan_env, "1") == 0 &&
+            (!model.hybrid_ring_plan_native_gcna || model_npu_plan);
         if (phone_mixed_requested && ubatch.n_tokens >= 32 &&
                 !owned_plan_requested) {
             LLAMA_LOG_ERROR(
