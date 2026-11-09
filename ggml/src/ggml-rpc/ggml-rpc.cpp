@@ -8209,13 +8209,14 @@ bool rpc_server::phone_auto_task_register(
             GGML_LOG_INFO(
                 "[PHONE_NPU_SERIAL] event=WEIGHTS_PRELOAD "
                 "run=%" PRIu64 " region=%u layer=%d chunk=%u "
-                "uid=%" PRIu64 " backend=HTP0 "
+                "uid=%" PRIu64 " backend=%s "
                 "new_weights=%zu reused_weights=%zu "
                 "model_hits=%zu source_bytes=%zu sync_ms=%.3f "
                 "copy_ms=%.3f wall_ms=%.3f status=%s reason=%s\n",
                 request.key.run_id, request.key.region,
                 phone_npu_region_layer.at(request.key.region),
                 request.key.chunk, request.graph_uid,
+                phone_npu_name_for_region(request.key.region),
                 preload_stats.new_weights, preload_stats.reused_weights,
                 preload_stats.model_hits, preload_stats.new_bytes,
                 preload_stats.sync_ms,
@@ -8734,13 +8735,14 @@ void rpc_server::phone_npu_preload_loop() {
         GGML_LOG_INFO(
             "[PHONE_NPU_SERIAL] event=WEIGHTS_PRELOAD "
             "run=%" PRIu64 " region=%u layer=%d chunk=%u "
-            "uid=%" PRIu64 " backend=HTP0 mode=ASYNC "
+            "uid=%" PRIu64 " backend=%s mode=ASYNC "
             "new_weights=%zu reused_weights=%zu "
             "model_hits=%zu source_bytes=%zu queue_ms=%.3f "
             "lock_wait_ms=%.3f sync_ms=%.3f copy_ms=%.3f wall_ms=%.3f "
             "status=%s reason=%s\n",
             task.run_id, task.region, task.layer, task.chunk,
-            task.uid, stats.new_weights, stats.reused_weights,
+            task.uid, phone_npu_name_for_region(task.region),
+            stats.new_weights, stats.reused_weights,
             stats.model_hits, stats.new_bytes,
             (begin_us - task.enqueued_us) / 1000.0,
             (service_begin_us - begin_us) / 1000.0,
@@ -9214,7 +9216,7 @@ void rpc_server::phone_auto_compute_loop() {
                         GGML_LOG_INFO(
                             "[PHONE_QWEN3_LOCAL] event=EXECUTE_ONLY"
                             " run=%" PRIu64 " region=%u layer=%u"
-                            " chunk=%u tokens=%u backend=HTP0"
+                            " chunk=%u tokens=%u backend=%s"
                             " source=PHONE_LOCAL_HTP"
                             " kv_owner=PHONE_LOCAL"
                             " input_read_ms=%.3f input_upload_ms=%.3f"
@@ -9224,7 +9226,8 @@ void rpc_server::phone_auto_compute_loop() {
                             " status=%s reason=%s\n",
                             req.key.run_id, req.key.region,
                             local_stats.layer, req.key.chunk,
-                            local_stats.tokens, local_stats.input_read_ms,
+                            local_stats.tokens, phone_npu_name_for_region(req.key.region),
+                            local_stats.input_read_ms,
                             local_stats.input_upload_ms,
                             local_stats.htp_compute_ms,
                             local_stats.output_copy_ms,
@@ -9282,7 +9285,7 @@ void rpc_server::phone_auto_compute_loop() {
                         GGML_LOG_INFO(
                             "[PHONE_QWEN3_LOCAL] event=EXECUTE_AB"
                             " run=%" PRIu64 " region=%u layer=%u"
-                            " chunk=%u tokens=%u backend=HTP0"
+                            " chunk=%u tokens=%u backend=%s"
                             " input_read_ms=%.3f input_upload_ms=%.3f"
                             " htp_compute_ms=%.3f compare_ms=%.3f"
                             " max_abs=%.9g mean_abs=%.9g rmse=%.9g"
@@ -9294,6 +9297,7 @@ void rpc_server::phone_auto_compute_loop() {
                             req.key.run_id, req.key.region,
                             local_stats.layer, req.key.chunk,
                             local_stats.tokens,
+                            phone_npu_name_for_region(req.key.region),
                             local_stats.input_read_ms,
                             local_stats.input_upload_ms,
                             local_stats.compute_ms, local_stats.compare_ms,
@@ -9477,13 +9481,14 @@ void rpc_server::phone_auto_compute_loop() {
                 GGML_LOG_INFO(
                     "[PHONE_NPU_SERIAL] event=EXECUTE run=%" PRIu64
                     " region=%u layer=%d chunk=%u tokens=%u "
-                    "uid=%" PRIu64 " backend=HTP0 "
+                    "uid=%" PRIu64 " backend=%s "
                     "stage_ms=%.3f compute_ms=%.3f return_ms=%.3f "
                     "mode=%s status=%s reason=%s\n",
                     req.key.run_id, req.key.region,
                     phone_npu_region_layer.count(req.key.region) ?
                         phone_npu_region_layer.at(req.key.region) : -1,
                     req.key.chunk, req.n_tokens, req.graph_uid,
+                    phone_npu_name_for_region(req.key.region),
                     stage_ms, htp_ms, return_ms,
                     local_only ? "PHONE_LOCAL_ONLY" :
                         phone_npu_executor != nullptr &&
