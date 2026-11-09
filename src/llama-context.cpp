@@ -4929,10 +4929,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 continue;
             }
             const bool htp = phone_mixed_htp_regions.count((uint32_t) r) != 0;
-            if (htp && stages[r].layer_end - stages[r].layer_begin != 1) {
+            if (htp && (stages[r].layer_end <= stages[r].layer_begin ||
+                        stages[r].layer_end - stages[r].layer_begin > 32)) {
                 LLAMA_LOG_ERROR(
                     "[PHONE_MIXED_BACKENDS] status=REJECT region=%zu "
-                    "reason=HTP_REQUIRES_P1\n", r);
+                    "reason=INVALID_HTP_RANGE_OR_DEPTH\n", r);
                 ret = GGML_STATUS_FAILED;
                 return nullptr;
             }
