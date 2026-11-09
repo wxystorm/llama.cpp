@@ -57,6 +57,9 @@ def validated_profile(directory: Path, model_sha: str,
     if (not isinstance(phone.get("device_id"), str) or
             not isinstance(phone.get("runtime_sha256"), str)):
         return False, "PHONE_PROFILE_IDENTITY_MISSING"
+    # A 50177 cache is not proof of the integrated 50052 RPC transport.
+    if phone.get("transport") != "V2_PHONE_PROFILE_RPC50052":
+        return False, "PHONE_PROFILE_TRANSPORT_MISMATCH"
     eligible: dict[str, set[int]] = {b: set() for b in "GCNA"}
     for record in profile.get("compute_samples", []):
         if record.get("status") != "PASS":
