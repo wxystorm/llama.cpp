@@ -607,6 +607,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     std::move(selected_npu_region_ids);
                 model_ptr->hybrid_ring_plan_npu_weight_policy =
                     selected_npu_weight_policy;
+                model_ptr->hybrid_ring_plan_native_gcna = native_gcna;
                 if (ring_plan_apply_wide) {
                     model_ptr->hybrid_ring_plan_chunk_tokens = 0;
                     model_ptr->hybrid_ring_plan_cpu_chunk_tokens =
