@@ -8,6 +8,7 @@
 #include "phone-qwen3-local-parity.h"
 #include "phone-npu-weight-banks.h"
 #include "phone-npu-serial-policy.h"
+#include "phone-plan-region-map.h"
 
 #include <algorithm>
 #include <array>
@@ -115,30 +116,32 @@ public:
         double htp_repack_ms = 0.0;
     };
 
-    // Allocate exactly two stable physical HTP-repack arenas. Every NPU
-    // Region is a single Qwen3 layer, ordered like PC GPU's region ranks.
+    // Allocate either fully resident Stage weights or exactly two rolling
+    // HTP-repack arenas. A Region may contain consecutive Qwen3 layers.
     // Bank A holds even ranks; Bank B holds odd ranks. KV allocations are
     // outside both Banks. No third Bank exists even when many NPU layers are
     // assigned. Physical allocation (not device_get_memory(), which reports
     // zero on Hexagon) validates the user's optional budget.
     bool configure_banked_model(
             const ggml_rpc_local_tensor_source & local,
-            const std::vector<std::pair<uint32_t, uint32_t>> & ordered,
+            const std::vector<ggml_phone_plan::stage_region_range> & ordered,
             size_t budget_bytes, std::string & reason,
-            std::array<size_t, 2> & capacities) {
+            std::array<size_t, 2> & capacities,
+            bool fully_resident) {
         capacities = {};
         reason.clear();
-        if (banked_mode_ || !model_weights_.empty() ||
+        if (banked_mode_ || resident_mode_ || !model_weights_.empty() ||
                 repack_buft_ == nullptr || !local.get_info || !local.read ||
-                ordered.size() < 2 || budget_bytes == 0) {
+                ordered.empty() || (!fully_resident && ordered.size() < 2) ||
+                budget_bytes == 0) {
             reason = "NPU_BANK_CONFIG_OR_LOCAL_GGUF_UNAVAILABLE";
             return false;
         }
         const auto dev_reg = ggml_backend_dev_backend_reg(
             ggml_backend_get_device(backend_));
-        if (dev_reg == nullptr ||
+        if (!fully_resident && (dev_reg == nullptr ||
                 ggml_backend_reg_get_proc_address(dev_reg,
-                    "ggml_backend_hexagon_evict_fixed_graph_uid") == nullptr) {
+                    "ggml_backend_hexagon_evict_fixed_graph_uid") == nullptr)) {
             reason = "NPU_BANK_REQUIRES_SELECTIVE_GRAPH_EVICTION";
             return false;
         }
@@ -158,14 +161,16 @@ public:
         layouts.reserve(ordered.size());
         policy_regions.reserve(ordered.size());
         for (size_t rank = 0; rank < ordered.size(); ++rank) {
-            if (rank > 0 && (ordered[rank - 1].first >= ordered[rank].first ||
-                             ordered[rank - 1].second >= ordered[rank].second)) {
+            if (rank > 0 &&
+                    (ordered[rank - 1].region >= ordered[rank].region ||
+                     ordered[rank - 1].layer_end > ordered[rank].layer_begin)) {
                 reason = "NPU_BANK_REGION_LAYER_ORDER";
                 return false;
             }
             banked_layer_spec spec {};
-            spec.region = ordered[rank].first;
-            spec.layer = ordered[rank].second;
+            spec.region = ordered[rank].region;
+            spec.layer = ordered[rank].layer_begin;
+            spec.layer_end = ordered[rank].layer_end;
             ggml_init_params params {
                 ggml_tensor_overhead() * 32 + 4096, nullptr, true
             };
@@ -174,11 +179,18 @@ public:
                 reason = "NPU_BANK_METADATA_CONTEXT";
                 return false;
             }
+            if (spec.layer >= spec.layer_end ||
+                    spec.layer_end > 256 ||
+                    spec.layer_end - spec.layer > 32) {
+                reason = "NPU_STAGE_RANGE_INVALID";
+                return false;
+            }
+            for (uint32_t il = spec.layer; il < spec.layer_end; ++il) {
             for (const char * suffix : weights) {
                 banked_tensor_spec tensor {};
                 char name[GGML_MAX_NAME] = {};
                 const int written = std::snprintf(name, sizeof(name),
-                    "blk.%u.%s", spec.layer, suffix);
+                    "blk.%u.%s", il, suffix);
                 if (written <= 0 ||
                         (size_t) written >= sizeof(name)) {
                     reason = "NPU_BANK_WEIGHT_NAME";
@@ -230,30 +242,84 @@ public:
                 spec.bytes = aligned + need;
                 spec.tensors.push_back(std::move(tensor));
             }
+            }
             capacities[rank % 2] =
                 std::max(capacities[rank % 2], spec.bytes);
             policy_regions.push_back({
                 spec.region, static_cast<int>(spec.layer),
-                static_cast<int>(spec.layer + 1), spec.bytes
+                static_cast<int>(spec.layer_end), spec.bytes
             });
             region_rank_[spec.region] = rank;
             layouts.push_back(std::move(spec));
         }
-        if (capacities[0] > budget_bytes ||
+        size_t resident_bytes = 0;
+        for (const auto & stage : layouts) {
+            if (stage.bytes > SIZE_MAX - resident_bytes) {
+                reason = "NPU_RESIDENT_SIZE_OVERFLOW";
+                region_rank_.clear();
+                return false;
+            }
+            resident_bytes += stage.bytes;
+            if (stage.bytes > ggml_backend_buft_get_max_size(repack_buft_)) {
+                reason = "NPU_STAGE_SINGLE_ALLOC_EXCEEDED";
+                region_rank_.clear();
+                return false;
+            }
+        }
+        if (!fully_resident && (capacities[0] > budget_bytes ||
                 capacities[1] > budget_bytes - capacities[0] ||
                 capacities[0] > ggml_backend_buft_get_max_size(repack_buft_) ||
-                capacities[1] > ggml_backend_buft_get_max_size(repack_buft_)) {
+                capacities[1] > ggml_backend_buft_get_max_size(repack_buft_))) {
             reason = "NPU_BANK_BUDGET_OR_SINGLE_ALLOC_EXCEEDED";
             region_rank_.clear();
             return false;
         }
-        // Logical state and actual HTP allocations must *both* succeed.
-        if (!weight_banks_.configure(policy_regions, 0, 0,
-                                      budget_bytes, reason)) {
+        if (fully_resident && resident_bytes > budget_bytes) {
+            reason = "NPU_RESIDENT_BUDGET_EXCEEDED";
+            region_rank_.clear();
+            return false;
+        }
+        // The rolling Bank lifetime protocol does not apply to resident
+        // weights. All selected Stage buffers are allocated once and remain.
+        if (!fully_resident && !weight_banks_.configure(
+                policy_regions, 0, 0, budget_bytes, reason)) {
             region_rank_.clear();
             return false;
         }
         banked_layers_ = std::move(layouts);
+        if (fully_resident) {
+            resident_weight_arenas_.resize(banked_layers_.size());
+            for (size_t rank = 0; rank < banked_layers_.size(); ++rank) {
+                auto & arena = resident_weight_arenas_[rank];
+                arena.reset(ggml_backend_buft_alloc_buffer(
+                    repack_buft_, banked_layers_[rank].bytes));
+                if (!arena) {
+                    reason = "NPU_RESIDENT_PHYSICAL_ALLOC_FAILED";
+                    model_weights_.clear();
+                    resident_weight_arenas_.clear();
+                    banked_layers_.clear();
+                    region_rank_.clear();
+                    return false;
+                }
+                ggml_backend_buffer_set_usage(
+                    arena.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            }
+            resident_mode_ = true;
+            for (size_t rank = 0; rank < banked_layers_.size(); ++rank) {
+                model_load_stats stats {};
+                if (!load_banked_rank(rank, reason, stats)) {
+                    model_weights_.clear();
+                    resident_weight_arenas_.clear();
+                    banked_layers_.clear();
+                    region_rank_.clear();
+                    resident_mode_ = false;
+                    return false;
+                }
+            }
+            capacities[0] = resident_bytes;
+            capacities[1] = 0;
+            return true;
+        }
         for (size_t bank = 0; bank < 2; ++bank) {
             bank_weight_arenas_[bank].reset(ggml_backend_buft_alloc_buffer(
                 repack_buft_, capacities[bank]));
@@ -289,6 +355,20 @@ public:
         }
         reason.clear();
         return true;
+    }
+
+    bool configure_banked_model(
+            const ggml_rpc_local_tensor_source & local,
+            const std::vector<std::pair<uint32_t, uint32_t>> & ordered,
+            size_t budget_bytes, std::string & reason,
+            std::array<size_t, 2> & capacities) {
+        std::vector<ggml_phone_plan::stage_region_range> stages;
+        stages.reserve(ordered.size());
+        for (const auto & item : ordered) {
+            stages.push_back({item.first, item.second, item.second + 1});
+        }
+        return configure_banked_model(
+            local, stages, budget_bytes, reason, capacities, false);
     }
 
     // Host-only GGUF prefetch; no HTP mutex, no Bank mutation.
@@ -384,18 +464,24 @@ public:
     }
 
     bool has_weight_banks() const { return banked_mode_; }
+    bool has_resident_weights() const { return resident_mode_; }
+    bool has_any_weight_plan() const { return banked_mode_ || resident_mode_; }
     int rank_for_region(uint32_t region, uint32_t layer) const {
-        if (!banked_mode_) { return -1; }
+        if (!has_any_weight_plan()) { return -1; }
         const auto it = region_rank_.find(region);
         if (it == region_rank_.end() ||
-                banked_layers_[it->second].layer != layer) {
+                layer < banked_layers_[it->second].layer ||
+                layer >= banked_layers_[it->second].layer_end) {
             return -1;
         }
         return static_cast<int>(it->second);
     }
     bool rank_banked_ready(uint32_t region) const {
         const auto it = region_rank_.find(region);
-        if (!banked_mode_ || it == region_rank_.end()) { return false; }
+        if (!has_any_weight_plan() || it == region_rank_.end()) {
+            return false;
+        }
+        if (resident_mode_) { return true; }
         const size_t rank = it->second;
         const auto & bank = weight_banks_.bank(rank % 2);
         return bank.rank == rank &&
@@ -2824,6 +2910,7 @@ private:
     struct banked_layer_spec {
         uint32_t region = 0;
         uint32_t layer = 0;
+        uint32_t layer_end = 0;
         size_t bytes = 0;
         std::vector<banked_tensor_spec> tensors;
         std::vector<std::string> keys;
@@ -2845,7 +2932,7 @@ private:
                           const std::vector<std::vector<uint8_t>> * staged = nullptr) {
         reason.clear();
         stats = {};
-        if (!banked_mode_ || rank >= banked_layers_.size() ||
+        if (!has_any_weight_plan() || rank >= banked_layers_.size() ||
                 !bank_local_source_.get_info || !bank_local_source_.read) {
             reason = "NPU_BANK_LOAD_INVALID_RANK_OR_SOURCE";
             return false;
@@ -2855,7 +2942,8 @@ private:
             reason = "NPU_BANK_STAGE_COUNT_MISMATCH";
             return false;
         }
-        ggml_backend_buffer_t bank =
+        ggml_backend_buffer_t bank = resident_mode_ ?
+            resident_weight_arenas_[rank].get() :
             bank_weight_arenas_[rank % 2].get();
         if (!bank) {
             reason = "NPU_BANK_ARENA_NOT_MAPPED";
@@ -3126,9 +3214,11 @@ private:
     two_weight_banks weight_banks_;
     ggml_rpc_local_tensor_source bank_local_source_ {};
     std::array<ggml_backend_buffer_ptr, 2> bank_weight_arenas_ {};
+    std::vector<ggml_backend_buffer_ptr> resident_weight_arenas_;
     std::vector<banked_layer_spec> banked_layers_;
     std::unordered_map<uint32_t, size_t> region_rank_;
     bool banked_mode_ = false;
+    bool resident_mode_ = false;
 
     struct owned_layer_kv {
         ggml_context_ptr ctx;
