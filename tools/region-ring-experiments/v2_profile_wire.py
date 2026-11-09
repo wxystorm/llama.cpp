@@ -11,11 +11,16 @@ from __future__ import annotations
 import json
 import math
 import socket
+import struct
 from typing import Any
 
 WIRE_VERSION = 1
 MAX_FRAME = 256 * 1024
-DEFAULT_PORT = 50177
+DEFAULT_PORT = 50177  # legacy standalone sidecar, no longer required
+NATIVE_RPC_PORT = 50052
+NATIVE_RPC_HELLO = 14
+NATIVE_RPC_PROFILE = 57
+NATIVE_RPC_VERSION = (4, 0, 34)
 SOURCE = "NATIVE_SINGLE_BACKEND_GGUF_PREFIX"
 
 
@@ -70,6 +75,57 @@ def receive(sock: socket.socket) -> dict[str, Any]:
     return decode(bytes(chunks))
 
 
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ProfileProtocolError("PHONE_RPC50052_TRUNCATED_FRAME")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _rpc50052_frame(sock: socket.socket) -> bytes:
+    (size,) = struct.unpack("<Q", _recv_exact(sock, 8))
+    if not 0 < size <= MAX_FRAME:
+        raise ProfileProtocolError("PHONE_RPC50052_INVALID_FRAME_SIZE")
+    return _recv_exact(sock, size)
+
+
+def call_rpc50052(endpoint: str, data: bytes, *, timeout: float) -> dict[str, Any]:
+    """Use ggml-rpc's HELLO + bounded command 57 on the *same* 50052 socket.
+
+    Zero capability bytes explicitly opt out of RDMA so this Python client
+    can use the ordinary TCP transport even if the Phone advertises RDMA.
+    No new port, second network service, or user-supplied executable path.
+    """
+    host, port = parse_endpoint(endpoint)
+    if port != NATIVE_RPC_PORT:
+        raise ProfileProtocolError("EXPECTED_RPC50052_ENDPOINT")
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(bytes([NATIVE_RPC_HELLO]) +
+                         struct.pack("<Q", 24) + bytes(24))
+            hello = _recv_exact(sock, 8)
+            (hello_length,) = struct.unpack("<Q", hello)
+            if hello_length != 28:
+                raise ProfileProtocolError("PHONE_RPC50052_BAD_HELLO_SIZE")
+            info = _recv_exact(sock, hello_length)
+            if tuple(info[:3]) != NATIVE_RPC_VERSION:
+                raise ProfileProtocolError(
+                    "PHONE_RPC_VERSION_MISMATCH: expected=" +
+                    ".".join(map(str, NATIVE_RPC_VERSION)) + " actual=" +
+                    ".".join(map(str, info[:3])) +
+                    "; rebuild PC and Phone from matching source")
+            sock.sendall(bytes([NATIVE_RPC_PROFILE]) +
+                         struct.pack("<Q", len(data)) + data)
+            return decode(_rpc50052_frame(sock))
+    except (OSError, TimeoutError) as exc:
+        raise ProfileProtocolError(
+            "PHONE_PROFILE_RPC50052_IO_FAILED:" + str(exc)) from exc
+
+
 def call(endpoint: str, action: str, payload: dict[str, Any] | None = None,
          *, token: str = "", timeout: float = 300.0) -> dict[str, Any]:
     if action not in ("hello", "profile"):
@@ -78,6 +134,13 @@ def call(endpoint: str, action: str, payload: dict[str, Any] | None = None,
     message = {"version": WIRE_VERSION, "action": action,
                "token": token, **(payload or {})}
     data = encode(message)
+    if port == NATIVE_RPC_PORT:
+        result = call_rpc50052(endpoint, data, timeout=timeout)
+        if result.get("status") == "ERROR":
+            raise ProfileProtocolError(
+                "PHONE_PROFILE_RPC_REJECTED:" +
+                str(result.get("error", "UNKNOWN")))
+        return result
     try:
         with socket.create_connection((host, port), timeout=timeout) as sock:
             sock.settimeout(timeout)
