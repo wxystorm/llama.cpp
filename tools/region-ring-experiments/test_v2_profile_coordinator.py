@@ -22,7 +22,8 @@ class NativeProfileCoordinatorTests(unittest.TestCase):
                     ("A", 1, "NOT_REQUESTED")]:
                 samples.append({
                     "status": "PASS",
-                    "key": {"backend": backend, "layers": layers},
+                    "key": {"backend": backend, "layers": layers,
+                            "chunk": 64, "kv_tokens": 512},
                     "sample": {"compute_median_ms": "2.4",
                                "parity": parity}})
             manifest = {
