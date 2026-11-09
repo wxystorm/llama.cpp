@@ -19,6 +19,9 @@ param(
     [int] $MinContext = 1024,
     [int] $ContextPadding = 256,
     [string] $ForceLayout = "",
+    [string] $ForceNpuRegions = "",
+    [ValidateSet("resident", "streaming-2bank")]
+    [string] $ForceNpuPolicy = "resident",
     [int] $ForceXC = 0,
     [int] $ForceXG = 0,
     [int] $ForceXP = 0,
@@ -81,6 +84,15 @@ if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
         "--force-xc", "$ForceXC",
         "--force-xg", "$ForceXG",
         "--force-xp", "$ForceXP"
+    )
+}
+if ($ForceNpuRegions) {
+    if ([string]::IsNullOrWhiteSpace($ForceLayout) -or $Planner -ne "apply-wide") {
+        throw "-ForceNpuRegions requires -Planner apply-wide and -ForceLayout."
+    }
+    $callArgs += @(
+        "--force-npu-regions", $ForceNpuRegions,
+        "--force-npu-policy", $ForceNpuPolicy
     )
 }
 if ($ForceProfile) {
