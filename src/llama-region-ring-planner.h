@@ -41,6 +41,11 @@ struct candidate {
     // Exact physical Phone Region indices chosen as HTP by the optional
     // native GCNA spill policy. Absent in legacy G/C/P Plans.
     std::vector<size_t> npu_region_indices;
+    // Chosen per-candidate HTP residency: never charge/refill Banks in
+    // the DAG when all of this Plan's NPU weights fit at load time.
+    llama_ring_v2::npu_weight_policy npu_weight_policy =
+        llama_ring_v2::npu_weight_policy::STREAMING_2BANK;
+    size_t npu_memory_bytes = 0;
     // Complete first-Cycle-seeded prefix trace (not a runtime measurement).
     // Used to explain how each subsequent Cycle compensates previous load.
     int prefix_cycles = 0;
@@ -1481,13 +1486,16 @@ inline bool simulate(const model & m,
     // HTP ranks are ordered by the physical NPU stages selected by Plan.
     // Ranks 0/1 are preloaded; rank k>=2 reuses the Bank of rank k-2 only
     // after that Region has completed all its KV-ordered Chunks.
+    const bool npu_streaming =
+        m.phone_npu_weight_streaming &&
+        c.npu_weight_policy == llama_ring_v2::npu_weight_policy::STREAMING_2BANK;
     std::vector<int> npu_regions;
     std::vector<int> npu_rank(regions.size(), -1);
     std::vector<bool> npu_weight_ready(
-        regions.size(), !m.phone_npu_weight_streaming);
+        regions.size(), !npu_streaming);
     std::vector<bool> npu_weight_enqueued(regions.size(), false);
     std::vector<double> npu_weight_load_ms(regions.size(), 0.0);
-    if (m.phone_npu_weight_streaming) {
+    if (npu_streaming) {
         for (size_t r = 0; r < regions.size(); ++r) {
             if (regions[r].kind != llama_region_ring_stage_kind::PHONE ||
                     !is_npu_region(r)) {
@@ -1759,7 +1767,7 @@ inline bool simulate(const model & m,
 
         // The HTP Bank mover is independent from the CUDA H2D lane.
         // Do not start rank k until the rank k-2 compute Region has drained.
-        if (m.phone_npu_weight_streaming &&
+        if (npu_streaming &&
                 !npu_weight_busy && !npu_weight_queue.empty() &&
                 !device_busy[(size_t) device::PHONE]) {
             const int r = npu_weight_queue.front();
@@ -2135,7 +2143,7 @@ inline bool simulate(const model & m,
                         }
                     }
                 }
-                if (m.phone_npu_weight_streaming &&
+                if (npu_streaming &&
                         npu_rank[(size_t) t.region] >= 0) {
                     const int rank = npu_rank[(size_t) t.region];
                     if ((size_t) rank + 2 < npu_regions.size()) {
