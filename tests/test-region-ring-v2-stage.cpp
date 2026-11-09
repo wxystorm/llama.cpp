@@ -170,7 +170,85 @@ static void test_adaptive_npu_memory() {
     check(!d.feasible, "NPU0 still shares the Phone's non-NPU budget");
 }
 
+static void test_measured_npu_limits() {
+    constexpr size_t MiB = size_t(1024) * 1024;
+    constexpr size_t G = 1024 * MiB;
+    check(ggml_phone_npu_budget::total_bytes == 3072 * MiB &&
+          ggml_phone_npu_budget::bank_bytes == 1536 * MiB,
+          "Phone HTP policy must match measured 3072/1536 MiB targets");
+
+    npu_memory_request m {};
+    m.phone_budget_bytes = 7 * G;
+    m.max_htp_allocation_bytes = ggml_phone_npu_budget::bank_bytes;
+    m.npu_kv_bytes = 64 * MiB;
+    m.npu_graph_workspace_bytes = 48 * MiB;
+    m.npu_activation_bytes = 16 * MiB;
+    m.stage_weight_bytes = {1400 * MiB, 1400 * MiB};
+    m.stage_auxiliary_bytes = {96 * MiB, 96 * MiB};
+    auto d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
+          "two NPU regions including non-weight memory fit: do not start Banks");
+    check(d.resident_npu_bytes == 2928 * MiB,
+          "resident NPU footprint must include KV, workspace and activations");
+    check(d.bank_weight_bytes[0] == 1400 * MiB &&
+          d.bank_weight_bytes[1] == 1400 * MiB,
+          "per-bank weights must respect 1536 MiB");
+
+    // More stages fit neither a resident model nor a single allocation,
+    // but their rolling max A/B weights still fit the calibrated total.
+    m.stage_weight_bytes = {1400 * MiB, 1400 * MiB, 1400 * MiB};
+    m.stage_auxiliary_bytes = {96 * MiB, 96 * MiB, 96 * MiB};
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::STREAMING_2BANK &&
+          d.streaming_npu_bytes == 2928 * MiB &&
+          d.resident_npu_bytes > ggml_phone_npu_budget::total_bytes,
+          "three NPU stages exceeding 3072 MiB must use two rolling Banks");
+
+    m.stage_weight_bytes = {1500 * MiB, 1300 * MiB};
+    m.stage_auxiliary_bytes = {40 * MiB, 40 * MiB};
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible && std::string(d.reason) ==
+          "NPU_STAGE_BUDGET_EXCEEDED",
+          "per-cycle NPU limit must include KV/Graph beyond 1500 MiB weights");
+
+    m.stage_weight_bytes = {1600 * MiB};
+    m.stage_auxiliary_bytes = {0};
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible && std::string(d.reason) ==
+          "HTP_STAGE_ALLOCATION_EXCEEDED",
+          "physical NPU per-region Buffer cannot exceed 1536 MiB");
+
+    // Global NPU non-weights can exhaust total 3072 even when each
+    // individual Region remains under the 1536 MiB limit.
+    m.stage_weight_bytes = {1500 * MiB, 1500 * MiB, 1500 * MiB};
+    m.stage_auxiliary_bytes = {25 * MiB, 25 * MiB, 25 * MiB};
+    m.npu_kv_bytes = 200 * MiB;
+    m.npu_graph_workspace_bytes = 48 * MiB;
+    m.npu_activation_bytes = 16 * MiB;
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible && std::string(d.reason) ==
+          "NPU_TOTAL_BUDGET_EXCEEDED",
+          "two full weight Banks plus KV/Graph must remain under 3072 MiB");
+
+    // A single stage is always a resident allocation if it fits;
+    // NPU0 has no Bank allocation at all.
+    m.npu_kv_bytes = 16 * MiB;
+    m.npu_graph_workspace_bytes = 16 * MiB;
+    m.npu_activation_bytes = 8 * MiB;
+    m.stage_weight_bytes = {1200 * MiB};
+    m.stage_auxiliary_bytes = {40 * MiB};
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
+          "one NPU Region must not allocate dual Banks");
+    m.stage_weight_bytes.clear();
+    m.stage_auxiliary_bytes.clear();
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::DISABLED,
+          "NPU0 must remain legal with no Bank allocation");
+}
+
 int main() {
+    test_measured_npu_limits();
     test_four_backend_layouts();
     test_all_four_tail_options_and_optional_backends();
     test_invalid_shapes();
