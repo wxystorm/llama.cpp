@@ -144,10 +144,34 @@ static void test_adaptive_npu_memory() {
 
     m.phone_budget_bytes = 724;
     d = choose_npu_weight_policy(m);
-    check(!d.feasible && d.reason == std::string("PHONE_BUDGET_EXCEEDED"),
-          "Plan must reject a joint Phone memory budget overrun");
+    check(!d.feasible &&
+          d.reason == std::string("HTP_STAGE_HALF_BANK_BUDGET_EXCEEDED"),
+          "A single HTP Stage must fit half the remaining Phone weight budget");
+
+    // Even when the TOTAL set of weights can fit in Resident mode,
+    // every physical N Stage must fit its own half-budget allowance.
+    m.phone_budget_bytes = 1000; // fixed = 300, half weight budget = 350
+    m.stage_weight_bytes = {351, 100};
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible &&
+          d.reason == std::string("HTP_STAGE_HALF_BANK_BUDGET_EXCEEDED"),
+          "Resident must not bypass per-cycle half-bank admission");
+    m.stage_weight_bytes = {350, 100};
+    d = choose_npu_weight_policy(m);
+    check(d.feasible && d.policy == npu_weight_policy::RESIDENT,
+          "Per-cycle half-bank boundary must be inclusive");
+
+    // The physical HTP allocator ceiling remains independently enforced.
+    m.phone_budget_bytes = 2000;
+    m.max_htp_allocation_bytes = 300;
+    m.stage_weight_bytes = {301, 100};
+    d = choose_npu_weight_policy(m);
+    check(!d.feasible &&
+          d.reason == std::string("HTP_STAGE_ALLOCATION_EXCEEDED"),
+          "Physical HTP single-allocation cap must remain a hard bound");
 
     m.phone_budget_bytes = 1500;
+    m.stage_weight_bytes = {210, 215, 200, 205};
     m.max_htp_allocation_bytes = 209;
     d = choose_npu_weight_policy(m);
     check(!d.feasible &&
