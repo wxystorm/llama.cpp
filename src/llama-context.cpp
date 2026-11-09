@@ -2088,7 +2088,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
                                                  bool                     embedding_only,
                                                  bool                     preserve_weight_cache_on_reset,
                                                  bool *                   graph_reused_out,
-                                                 llama_hybrid_stage_timing * stage_timing_out) {
+                                                 llama_hybrid_stage_timing * stage_timing_out,
+                                                 bool                     suppress_output_head) {
     const bool log_formal_prepare =
         ubatch.n_tokens > 1 &&
         stage == nullptr &&
@@ -2139,7 +2140,8 @@ llm_graph_result * llama_context::prepare_ubatch(llm_graph_result *       res,
         gparams.hybrid_hidden_input  =
             stage->layer_begin > 0 || force_hidden_input;
         gparams.hybrid_output_head   =
-            !embedding_only && stage->layer_end == n_layer;
+            !embedding_only && !suppress_output_head &&
+            stage->layer_end == n_layer;
         gparams.hybrid_wave_probe    = stage->wave_probe;
         gparams.hybrid_embedding_only = embedding_only;
     }
@@ -2632,7 +2634,8 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
         int64_t *                          ring_cuda_wait_us,
         bool                               preserve_weight_cache_on_graph_reset,
         bool                               phone_prebuilt_graph,
-        bool                               phone_auto_wait) {
+        bool                               phone_auto_wait,
+        bool                               suppress_output_head) {
     llama_region_ring_tls_p2c_deferred = {};
     GGML_ASSERT(!phone_auto_wait || (ring_lane == 2 && phone_prebuilt_graph));
     // Scoped to a single synchronous Scheduler prepare_split call. Other
@@ -2762,7 +2765,7 @@ llm_graph_result * llama_context::run_hybrid_stage_block(
             stage_input != nullptr, false,
             preserve_weight_cache_on_graph_reset,
             timing != nullptr ? &timing->graph_reused : nullptr,
-            timing);
+            timing, suppress_output_head);
     }
     if (timing != nullptr) {
         const int64_t prepare_end_us = ggml_time_us();
@@ -3772,6 +3775,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     stage.kind == llama_hybrid_runtime_stage_kind::C2P ||
                     stage.kind == llama_hybrid_runtime_stage_kind::P2C;
             });
+    const bool terminal_phone =
+        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE;
+    const bool has_phone_stage = std::any_of(
+        stages.begin(), stages.end(), [](const auto & stage) {
+            return stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
+        });
+    // PC-final stages publish l_out for a canonical CPU-only Qwen3 Head.
+    // The legacy Phone-final graph still owns the caller's logits otherwise.
+    const bool pc_final_head_enabled =
+        !terminal_phone && !directional_runtime &&
+        model.arch == LLM_ARCH_QWEN3;
+    if (!terminal_phone && !pc_final_head_enabled) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PC_FINAL_HEAD] event=REJECT "
+            "reason=UNSUPPORTED_FINAL_ARCH_OR_TOPOLOGY\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
 
     ggml_backend_t region_ring_meta_cpu_backend = nullptr;
     if (directional_runtime && pc_phone_overlap) {
@@ -3966,12 +3987,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order[0], gpu_region_order[1]);
     }
     if (isolate_device_resources) {
-        // The caller uses the main scheduler to discover and extract logits
-        // after this function returns. The last Phone Region must still write
-        // the final output into the canonical graph result/scheduler.
+        // The caller reads logits from the canonical Scheduler. Phone-final
+        // retains its Graph; PC-final builds a separate CPU Head after drain.
         if (!device_fifo_simulation || sched_use != sched.get() ||
             res_use != gf_res_prev.get() ||
-            regions.back().device != llama_region_ring_device::PHONE) {
+            (!terminal_phone && !pc_final_head_enabled)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_RESOURCE] status=REJECT reason=UNSAFE_FINAL_OUTPUT_OWNER\n");
             ret = GGML_STATUS_FAILED;
@@ -4365,7 +4385,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const char * phone_input_stream_env =
         std::getenv("LLAMA_REGION_RING_PHONE_INPUT_STREAM");
     const bool phone_input_stream_requested =
-        phone_input_stream_env != nullptr &&
+        has_phone_stage && phone_input_stream_env != nullptr &&
         std::strcmp(phone_input_stream_env, "1") == 0;
     // Until the Phone owns a causal admission policy, do not let a full
     // 128MiB queue block a still-unreceived predecessor. Keep an 8MiB margin
@@ -4392,7 +4412,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ((phone_input_push_env != nullptr &&
           std::strcmp(phone_input_push_env, "1") == 0) ||
          phone_input_stream_requested) &&
-        ubatch.n_tokens > 1 && pc_phone_overlap &&
+        has_phone_stage && ubatch.n_tokens > 1 && pc_phone_overlap &&
         threaded_execution && !directional_runtime && slot_pool_size == 0;
     // Optional PC-clock timeline. READY/CLAIM/DEFER/COMPLETE are observed
     // inside the scheduler's existing mutex; the callback only stores one
@@ -4552,11 +4572,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         slot_pool_size * (size_t) chunk_tokens : (size_t) ubatch.n_tokens;
     const char * phone_final_env = std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
     const bool phone_auto_final_requested =
-        phone_final_env != nullptr && std::strcmp(phone_final_env, "1") == 0;
+        terminal_phone && phone_final_env != nullptr &&
+        std::strcmp(phone_final_env, "1") == 0;
     // Reserve a PC host return buffer for the terminal Phone l_out.
     std::vector<std::vector<float>> outputs(
         ready.n_regions() - 1 +
-        (phone_auto_final_requested && ubatch.n_tokens >= 32 ? 1 : 0));
+        ((pc_final_head_enabled ||
+          (phone_auto_final_requested && ubatch.n_tokens >= 32)) ? 1 : 0));
     for (auto & hidden : outputs) {
         hidden.resize((size_t) n_embd * host_tokens_per_edge);
     }
@@ -4763,7 +4785,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const char * phone_auto_env =
         std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS");
     const bool phone_auto_requested =
-        phone_auto_env != nullptr && std::strcmp(phone_auto_env, "1") == 0;
+        has_phone_stage && phone_auto_env != nullptr &&
+        std::strcmp(phone_auto_env, "1") == 0;
     // Real-path Stage measurements are opt-in and do not execute extra graphs.
     const char * stage_profile_env =
         std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE");
@@ -4773,13 +4796,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const char * phone_static_env =
         std::getenv("LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES");
     const bool phone_static_requested =
-        phone_static_env != nullptr && std::atoi(phone_static_env) == 1;
+        has_phone_stage && phone_static_env != nullptr &&
+        std::atoi(phone_static_env) == 1;
     const bool phone_static_eligible =
         threaded_execution && pc_phone_overlap && own_stage_resources &&
         task_local_graph_outputs && !directional_runtime &&
-        !stages.empty() &&
-        stages.back().kind == llama_hybrid_runtime_stage_kind::PHONE &&
-        ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
+        has_phone_stage && ubatch.n_tokens >= 32 && ubatch.n_pos == 1 &&
         !ubatch.equal_seqs() && ubatch.output != nullptr &&
         worker_kv_views[2] != nullptr && backend_ptrs.size() == 3 &&
         sched_use == sched.get() && res_use == gf_res_prev.get();
@@ -4823,9 +4845,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool graphless_requested = graphless_env != nullptr &&
         std::strcmp(graphless_env, "1") == 0;
     const bool phone_graphless =
-        graphless_requested && ubatch.n_tokens >= 32 &&
-        phone_auto_final_enabled && own_stage_resources;
-    if (graphless_requested && ubatch.n_tokens >= 32 &&
+        has_phone_stage && graphless_requested && ubatch.n_tokens >= 32 &&
+        phone_auto_eligible && own_stage_resources &&
+        (phone_auto_final_enabled || pc_final_head_enabled);
+    if (has_phone_stage && graphless_requested && ubatch.n_tokens >= 32 &&
             !phone_graphless) {
         LLAMA_LOG_ERROR(
             "[PHONE_OWNED_KV] side=pc event=REJECT"
@@ -4885,7 +4908,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "[PHONE_STATIC_TEMPLATE] event=SKIP "
             "reason=AUTONOMOUS_ALL_PHONE_REGIONS status=OK\n");
     }
-    if (phone_static_templates && !phone_auto_final_enabled) {
+    if (phone_static_templates && !phone_auto_final_enabled &&
+            !phone_graphless) {
         const int64_t prebuild_begin_us = ggml_time_us();
         // The catalog is also unit-tested independently of GGML.
         const auto shapes = llama_region_ring_phone_static_shapes(
@@ -4981,7 +5005,9 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     "PHONE_FULL_TO_NEXT_REGION",
                 (void *) item.scheduler, (void *) item.result);
         }
-        if (canonical_count != (phone_auto_final_enabled ? 0u : 1u)) {
+        const size_t expected_canonical =
+            terminal_phone && !phone_auto_final_enabled ? 1u : 0u;
+        if (canonical_count != expected_canonical) {
             LLAMA_LOG_ERROR(
                 "[PHONE_STATIC_TEMPLATE] event=REJECT "
                 "reason=FINAL_OWNER_COUNT canonical=%zu status=FAIL\n",
@@ -5582,7 +5608,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         const char * owned_plan_env =
             std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
         const bool owned_plan_requested =
-            owned_plan_env != nullptr &&
+            has_phone_stage && owned_plan_env != nullptr &&
             std::strcmp(owned_plan_env, "1") == 0;
         if (phone_graphless && !owned_plan_requested) {
             LLAMA_LOG_ERROR(
@@ -6854,7 +6880,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             (size_t) task.token_begin;
                     const size_t output_host_token_begin =
                         llama_region_ring_output_host_token_begin(
-                            last, phone_auto_final_enabled,
+                            last, phone_auto_final_enabled || pc_final_head_enabled,
                             (size_t) task.token_begin, task.output_slot,
                             (size_t) chunk_tokens, slot_pool_size);
                     float * input = first ?
@@ -6864,7 +6890,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             nullptr) :
                         outputs[task.region - 1].data() +
                             input_host_token_begin * n_embd;
-                    float * output = last && !phone_auto_final_enabled ? nullptr :
+                    float * output = last &&
+                        !(phone_auto_final_enabled || pc_final_head_enabled) ? nullptr :
                         outputs[task.region].data() +
                             output_host_token_begin * n_embd;
 
@@ -7282,7 +7309,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     pc_phone_overlap ? &state.cuda_wait_us : nullptr,
                                     dev == 1 && gpu_weight_streaming &&
                                         gpu_bank_resident,
-                                    phone_prebuilt_task, false);
+                                    phone_prebuilt_task, false,
+                                    pc_final_head_enabled && last);
                             }
                             const int64_t compute_end_us = ggml_time_us();
                             if (task_trace != nullptr) {
@@ -7697,7 +7725,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // and final outputs before returning.
                     if (cancelled_before_compute || task_result == nullptr ||
                         task_status != GGML_STATUS_SUCCESS ||
-                        (last && !phone_auto_final_enabled &&
+                        (last && !(phone_auto_final_enabled ||
+                                   pc_final_head_enabled) &&
                          task.token_begin + task.n_tokens ==
                              (int) ubatch.n_tokens &&
                          task_result != res_use)) {
@@ -8200,21 +8229,25 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         executed +=
             p2c_join_completed.load(
                 std::memory_order_relaxed);
-        result = phone_auto_final_enabled ? res_use :
+        const bool pc_final_stage_complete =
+            !pc_final_head_enabled ||
+            worker_states[(size_t) regions.back().device].final_result != nullptr;
+        result = (phone_auto_final_enabled || pc_final_head_enabled) ?
+            res_use :
             worker_states[(size_t) llama_region_ring_device::PHONE].final_result;
         if (!launched_all || created != devices.size() ||
             joined != devices.size() || ready.failed() || !ready.all_done() ||
-            executed != ready.finished() ||
+            executed != ready.finished() || !pc_final_stage_complete ||
             result == nullptr || result != res_use) {
             if (ret == GGML_STATUS_SUCCESS) {
                 ret = GGML_STATUS_FAILED;
             }
         }
-        // The terminal Phone Region has already published its full final
-        // l_out to outputs[last_region]. The PC-only Head operates on the
-        // terminal token; it neither updates KV nor issues Phone RPC.
+        // The terminal Phone/CPU/GPU Region published l_out to the host.
+        // Perform the canonical Qwen3 PC-only Head after workers drain.
         int64_t phone_final_head_us = 0;
-        if (phone_auto_final_enabled && ret == GGML_STATUS_SUCCESS &&
+        if ((phone_auto_final_enabled || pc_final_head_enabled) &&
+                ret == GGML_STATUS_SUCCESS &&
                 !ready.failed() && ready.all_done()) {
             const int64_t head_begin_us = ggml_time_us();
             const size_t last_region = stages.size() - 1;
@@ -8265,8 +8298,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const bool pc_owned =
                         backend != nullptr && !ggml_backend_is_meta(backend);
                     LLAMA_LOG_INFO(
-                        "[PHONE_AUTO_FINAL_HEAD] event=SPLIT "
+                        "[%s] event=SPLIT "
                         "index=%d backend=%s pc_owned=%d status=%s\n",
+                        pc_final_head_enabled ? "REGION_RING_PC_FINAL_HEAD" :
+                                                "PHONE_AUTO_FINAL_HEAD",
                         split, backend != nullptr ? ggml_backend_name(backend) : "NULL",
                         pc_owned ? 1 : 0, pc_owned ? "PASS" : "REJECT");
                     head_ok = pc_owned;
@@ -8283,9 +8318,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
             phone_final_head_us = ggml_time_us() - head_begin_us;
             LLAMA_LOG_INFO(
-                "[PHONE_AUTO_FINAL_HEAD] event=PC_EXEC "
+                "[%s] event=PC_EXEC "
                 "tokens=1 source_region=%zu source_token=%zu "
                 "head_ms=%.3f status=%s\n",
+                pc_final_head_enabled ? "REGION_RING_PC_FINAL_HEAD" :
+                                        "PHONE_AUTO_FINAL_HEAD",
                 last_region, terminal_token,
                 phone_final_head_us / 1000.0, head_ok ? "PASS" : "FAIL");
             if (!head_ok) {
@@ -8371,8 +8408,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << (phone_static_templates ? "true" : "false") << ","
                             << "\"phone_auto_final_enabled\":"
                             << (phone_auto_final_enabled ? "true" : "false") << ","
+                            << "\"pc_final_head_enabled\":"
+                            << (pc_final_head_enabled ? "true" : "false") << ","
+                            << "\"pc_final_head_ms\":"
+                            << (pc_final_head_enabled ?
+                                phone_final_head_us / 1000.0 : 0.0) << ","
                             << "\"phone_final_head_ms\":"
-                            << phone_final_head_us / 1000.0 << ","
+                            << (phone_auto_final_enabled ?
+                                phone_final_head_us / 1000.0 : 0.0) << ","
                             << "\"phone_static_prebuild_ms\":"
                             << phone_static_prebuild_us / 1000.0 << ","
                             << "\"phone_static_template_count\":"
