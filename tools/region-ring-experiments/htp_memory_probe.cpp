@@ -28,9 +28,7 @@ uint64_t parse_u64(const std::string & s) {
     if (s.empty() || s[0] == '-') { throw std::runtime_error("INVALID_INTEGER"); }
     size_t pos = 0;
     const auto n = std::stoull(s, &pos, 10);
-    // Keep room for the Hexagon 4 KiB guard page when rpcmem_alloc2
-    // falls back to the signed 32-bit rpcmem_alloc API.
-    if (pos != s.size() || n == 0 || n > 1984) {
+    if (pos != s.size() || n == 0 || n > 8192) {
         throw std::runtime_error("INVALID_MIB_VALUE");
     }
     return n;
@@ -44,7 +42,11 @@ std::vector<uint64_t> sizes_from_csv(const std::string & csv) {
         const std::string part = csv.substr(start,
             comma == std::string::npos ? std::string::npos : comma - start);
         const uint64_t n = parse_u64(part);
-        if (n < 64) { throw std::runtime_error("MINIMUM_SIZE_IS_64_MIB"); }
+        // Keep room for Hexagon's 4 KiB guard page if rpcmem_alloc2
+        // falls back to the signed 32-bit rpcmem_alloc API.
+        if (n < 64 || n > 1984) {
+            throw std::runtime_error("SIZE_MUST_BE_64_TO_1984_MIB");
+        }
         out.push_back(n);
         if (comma == std::string::npos) { break; }
         start = comma + 1;
