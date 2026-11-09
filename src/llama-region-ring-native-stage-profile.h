@@ -209,6 +209,49 @@ public:
         return interpolation(at_kv, chunk, ms);
     }
 
+    // PC CPU/CUDA search may ask for more layers than the sampled
+    // 2/4/6 prefixes. Use an explicit linear-depth estimate from measured
+    // native blocks; do not apply this approximation to NPU parity-gated
+    // regions or resident Adreno capacity checks.
+    bool estimate_pc_depth(char backend, int layers, int chunk, int kv,
+                           phase kind, double & ms) const {
+        if ((backend != 'C' && backend != 'G') || layers <= 0) {
+            return false;
+        }
+        if (estimate(backend, layers, chunk, kv, kind, ms)) {
+            return true;
+        }
+        std::map<int, double> depths;
+        for (const auto & row : points_) {
+            if (row.backend != backend || depths.count(row.layers)) {
+                continue;
+            }
+            double value = 0;
+            if (estimate(backend, row.layers, chunk, kv, kind, value)) {
+                depths[row.layers] = value;
+            }
+        }
+        if (depths.empty()) { return false; }
+        const auto upper = depths.lower_bound(layers);
+        if (upper == depths.begin()) {
+            // One smaller stage cannot cost less than the measured
+            // smallest-depth block; this is a conservative proxy.
+            ms = upper->second;
+            return true;
+        }
+        if (upper == depths.end()) {
+            const auto last = std::prev(depths.end());
+            ms = last->second * (double) layers / last->first;
+            return std::isfinite(ms) && ms >= 0;
+        }
+        const auto lower = std::prev(upper);
+        const double alpha = (double) (layers - lower->first) /
+            (upper->first - lower->first);
+        ms = lower->second +
+            alpha * (upper->second - lower->second);
+        return std::isfinite(ms) && ms >= 0;
+    }
+
     bool weight_bytes(char backend, int layers, bool raw,
                       size_t & bytes) const {
         bytes = 0;
