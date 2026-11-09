@@ -73,7 +73,8 @@ int main() {
     CHECK(std::fabs(compute - 46.0) < 1e-9);
     CHECK(p.npu_refill_ms(2100, compute));
     CHECK(std::fabs(compute - 4.0) < 1e-9);
-    CHECK(!p.npu_refill_ms(2101, compute));
+    CHECK(p.npu_refill_ms(2101, compute));
+    CHECK(compute > 4.0 && compute < 4.1);
     write(true);
     CHECK(!p.load(file, reason));
     CHECK(reason == "UNSAFE_OR_DUPLICATE_NATIVE_STAGE");
