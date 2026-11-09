@@ -83,6 +83,41 @@ static void test_layout() {
         ninth_rejected = true;
     }
     check(ninth_rejected, "forced layout accepted more than eight cycles");
+
+    // Forced CPU-final: 8 GPU+CPU cycles with no Phone Region.
+    const std::string pc_spec =
+        "G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1,G7,C1";
+    const auto pc = llama_region_ring_parse_apply_wide_layout(pc_spec, 64);
+    const auto pc_counts = llama_region_ring_layer_counts(pc);
+    check(pc.size() == 16 && pc_counts[0] == 8 &&
+              pc_counts[1] == 56 && pc_counts[2] == 0 &&
+              pc.back().device == llama_region_ring_device::CPU &&
+              llama_region_ring_apply_topology_compatible(pc, 64),
+          "G7,C1 x8 CPU-final layer ownership is incorrect");
+    check(llama_region_ring_layout_string(pc) == pc_spec,
+          "CPU-final layout serialization changed");
+
+    // A mixed NPU/Phone chain may terminate on PC CPU.
+    const std::string mixed_spec =
+        "G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,P1,G7,C1";
+    const auto mixed = llama_region_ring_parse_apply_wide_layout(
+        mixed_spec, 64);
+    check(mixed.size() == 16 &&
+              mixed.back().device == llama_region_ring_device::CPU &&
+              llama_region_ring_apply_topology_compatible(mixed, 64),
+          "mixed Phone-to-CPU final topology rejected");
+
+    // An explicit trailing GPU-only Region is allowed after an earlier Cycle.
+    const auto gpu_tail = llama_region_ring_parse_apply_wide_layout(
+        "G7,P1,G56", 64);
+    check(llama_region_ring_apply_topology_compatible(gpu_tail, 64) &&
+              gpu_tail.back().device == llama_region_ring_device::GPU,
+          "forced GPU-final tail rejected");
+    const std::vector<llama_region_ring_region> only_gpu {
+        {llama_region_ring_device::GPU, 0, 64}
+    };
+    check(!llama_region_ring_apply_topology_compatible(only_gpu, 64),
+          "degenerate GPU-only layout was accepted");
 }
 
 
