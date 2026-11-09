@@ -162,6 +162,11 @@ authoritative target. These pieces are now implemented as opt-in helpers in
   binary-bound `.rrhp` snapshot. On a hit the next
   `llama-completion` process skips those probes, but every Prompt reruns
   the original E/Beam/shortlist DAG candidate search.
+- The cheap E/Beam candidate screen uses native G/C compute curves and
+  a measured N1 + resident Adreno suffix service proxy for logical Phone
+  depth P; this preserves the existing search structure. The exact
+  shortlisted DAG uses distinct real N/A curves and rejects missing shapes.
+  A3 is now among the automatically sampled Adreno depth shapes.
 - `llama-region-ring-native-stage-profile.h` loads only valid native
   PASS rows; N4 parity-failed rows are excluded. The E/Beam stage-cost
   callbacks use native G/C timings; the final N/A physical Stage DAG uses
