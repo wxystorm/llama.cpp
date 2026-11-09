@@ -96,6 +96,43 @@ int main() {
     auto invalid = a;
     invalid.version = 3;
     CHECK(!validate(invalid, reason));
+    // V3 represents one physical P3 Region with three independent HTP
+    // layer graphs and KV stores. Internal IDs cannot collide with
+    // physical [0,64) Region IDs or one another.
+    auto three = a;
+    three.version = k_multi_plan_version;
+    three.flags = flags_for_layers(3);
+    three.region = 5;
+    three.layer = 23;
+    CHECK(validate(three, reason));
+    CHECK(layer_count(three) == 3);
+    const auto c0 = single_layer_plan(three, 0);
+    const auto c1 = single_layer_plan(three, 1);
+    const auto c2 = single_layer_plan(three, 2);
+    CHECK(validate(c0, reason));
+    CHECK(validate(c1, reason));
+    CHECK(validate(c2, reason));
+    CHECK(c0.version == k_plan_version);
+    CHECK(c0.layer == 23 && c1.layer == 24 && c2.layer == 25);
+    CHECK(c0.region >= k_wire_region_limit);
+    CHECK(c0.region != c1.region && c1.region != c2.region);
+    CHECK(internal_layer_region(three, 1) !=
+          internal_layer_region(a, 0));
+    CHECK(internal_layer_region(a, 0) == a.region);
+    CHECK(matches_chunk(three, 3, 384, 128, 91,
+                        128ULL*5120*4, 128ULL*5120*4));
+    auto bad_multi = three;
+    bad_multi.flags = flags_for_layers(1);
+    CHECK(!validate(bad_multi, reason));
+    bad_multi.flags = flags_for_layers(65);
+    CHECK(!validate(bad_multi, reason));
+    bad_multi = three;
+    bad_multi.layer = 255;
+    CHECK(!validate(bad_multi, reason));
+    bad_multi = three;
+    bad_multi.flags |= 2;
+    CHECK(!validate(bad_multi, reason));
+
     invalid = a;
     invalid.flags = 0;
     CHECK(!validate(invalid, reason));
