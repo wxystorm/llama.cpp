@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Phone-side V2 N/A native Stage profiling worker.
+"""LEGACY standalone Python V2 Profile sidecar for regression tests only.
 
-Production --stdio mode runs as a private subprocess owned by the existing
-ggml-rpc-server on port 50052. It does not open a listening TCP port.
-Standalone --bind/--port mode is retained only for legacy isolated tests.
-Model and profiler paths are fixed on the Phone; remote requests may select
-only bounded numeric shapes, never files or commands.
+The production Android ggml-rpc-server (4.0.35+) invokes the C++ native
+profiler *in-process* on port 50052 and NEVER runs this Python module.
+This file remains solely to reproduce old sidecar tests and data formats.
+Do not deploy it to Phone or start a 50177 listener for a GCNA sweep.
 """
 from __future__ import annotations
 
