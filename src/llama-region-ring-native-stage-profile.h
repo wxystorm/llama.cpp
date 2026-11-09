@@ -190,6 +190,26 @@ public:
         return false;
     }
 
+    int max_profiled_depth(char backend) const {
+        int n = 0;
+        for (const auto & p : points_) {
+            if (p.backend == backend) {
+                n = std::max(n, p.layers);
+            }
+        }
+        return n;
+    }
+
+    size_t max_profiled_weight_bytes(char backend) const {
+        size_t bytes = 0;
+        for (const auto & p : points_) {
+            if (p.backend == backend) {
+                bytes = std::max(bytes, p.weight_bytes);
+            }
+        }
+        return bytes;
+    }
+
     bool estimate(char backend, int layers, int chunk, int kv,
                   phase kind, double & ms) const {
         std::map<int, std::vector<std::pair<int, double>>> by_chunk;
