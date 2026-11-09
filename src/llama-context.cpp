@@ -10229,8 +10229,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ((apply_wide || ring_runtime_regions.size() == 9) &&
              selected_topology_ok &&
              !ring_runtime_regions.empty() &&
-             ring_runtime_regions.back().device ==
-                 llama_region_ring_device::PHONE) :
+             (apply_wide || ring_runtime_regions.back().device ==
+                 llama_region_ring_device::PHONE)) :
             llama_region_ring_apply_safe_phone_shape(ring_runtime_regions);
         const bool chunk_shape_ok = apply_wide ?
             (region_ring_xc > 0 && region_ring_xg > 0 &&
