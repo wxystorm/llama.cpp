@@ -477,11 +477,15 @@ int main() {
         REQUIRE(llama_region_ring_single_cycle_force_compatible(
             no_cpu, 40));
 
-        // Current fifo-pc-phone final-output path is still Phone-owned.
+        // GCNA allows the final Transformer Stage to remain on PC.
+        // In a single Cycle, GPU -> CPU is a valid two-device topology;
+        // the independent CPU Head does not require a Phone P2C return.
         const auto no_phone =
             llama_region_ring_parse_apply_wide_layout(
                 "G37,C3,P0", 40);
-        REQUIRE(!llama_region_ring_single_cycle_force_compatible(
+        REQUIRE(no_phone.size() == 2);
+        REQUIRE(no_phone.back().device == device::CPU);
+        REQUIRE(llama_region_ring_single_cycle_force_compatible(
             no_phone, 40));
 
         // A zero-count stage is allowed, but a forced collaborative
@@ -532,12 +536,23 @@ int main() {
         REQUIRE(simulate(single_model, rebuilt, forced_no_cpu));
         REQUIRE(forced_no_cpu.tasks == 9);
 
-        // Neither a final-PC layout nor Phone-only work may reach
-        // APPLY_WIDE concrete-plan runtime validation.
+        // A final-PC layout is valid. Still reject a single-device force
+        // layout (not collaborative) and an out-of-order PC topology.
+        candidate forced_pc_tail = forced_three;
+        forced_pc_tail.concrete_regions = no_phone;
+        REQUIRE(make_regions(forced_pc_tail, 40, rebuilt));
+        REQUIRE(rebuilt.size() == 2);
+        REQUIRE(rebuilt.back().device == device::CPU);
+        REQUIRE(simulate(single_model, rebuilt, forced_pc_tail));
+        REQUIRE(forced_pc_tail.wall_ms > 0.0);
+
         candidate invalid = forced_three;
-        invalid.concrete_regions = no_phone;
-        REQUIRE(!make_regions(invalid, 40, rebuilt));
         invalid.concrete_regions = phone_only;
+        REQUIRE(!make_regions(invalid, 40, rebuilt));
+        invalid.concrete_regions = {
+            {device::CPU, 0, 3},
+            {device::GPU, 3, 40},
+        };
         REQUIRE(!make_regions(invalid, 40, rebuilt));
 
         REQUIRE(llama_region_ring_gpu_initial_bank_count(0) == 0);
