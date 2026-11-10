@@ -29,7 +29,7 @@ if behavior=='wrong_layout' and prompt=='prompt_128_01.txt':
 if behavior=='timeout' and prompt=='prompt_128_01.txt': time.sleep(2)
 layout=os.environ['LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT']
 with config.open('w') as f:
-  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':layout}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
+  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':layout,'xc':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XC']),'xg':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XG']),'xp':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XP'])}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
     f.write(json.dumps(x)+'\\n')
 '''
 
@@ -175,6 +175,8 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(row['plan_layout'], layout)
         self.assertEqual((row['plan_xc'], row['plan_xg'], row['plan_xp']),
                          (48, 96, 128))
+        self.assertEqual((row['runtime_xc'], row['runtime_xg'],
+                          row['runtime_xp']), (48, 96, 128))
         env = row['env_overrides']
         self.assertEqual(env['LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS'], '64')
         self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_XC'], '48')
