@@ -499,8 +499,8 @@ def main():
                     help="prompt folder; omitted => use saved sweep-config.json on resume")
     ap.add_argument("--out", type=Path,
                     default=repo / "32b-g8p6-sharegpt40")
-    ap.add_argument("--limit", type=int, default=1,
-                    help="max prompts this invocation; default 1, 0 = all pending")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="max prompts this invocation; default 0 = all pending")
     ap.add_argument("--continue-on-fail", action="store_true",
                     help="explicit opt-in to continue after an inference failure")
     ap.add_argument("--rerun", default="",
