@@ -37,7 +37,7 @@ The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1
 
 `-Out` is optional: the existing default configuration keeps `32b-g8p6-x128-n1-all40`, while custom layout/Chunk settings automatically get a deterministic different output directory. When you specify `-Out` explicitly, use a separate directory for a different layout/Chunk; otherwise the existing run signature rejects mixing results. The optional `-AutoPlan` mode is preserved but cannot be combined with manual layout/Chunk options.
 
-**Tiny tail:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the native width adjustment on the actual UBatch token count, separately for each requested stage width. With X=128 a remainder of 1..32 may be coalesced by widening the uniform width slightly (at most 160). For example 513 tokens become `[129,129,129,126]` rather than `[128,128,128,128,1]`. The layout does not change. Check `[REGION_RING_TAIL_COALESCE]` in engine logs for the actual width.
+**Tiny tail:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the native width adjustment on the actual UBatch token count, separately for each requested stage width. With X=128 a remainder of 1..32 may be coalesced by widening the uniform width slightly (at most 160). For example 513 tokens become `[129,129,129,126]` rather than `[128,128,128,128,1]`. The layout does not change. Check `[REGION_RING_TAIL_COALESCE]` in engine logs for the actual width. `summary.csv` records both the selected/forced `plan_xc/xg/xp` and `runtime_xc/xg/xp` reported by the engine (when available).
 
 ## Restart, retry, rerun
 
@@ -57,6 +57,7 @@ To **force rerun one previously successful Prompt** while retaining the same lay
 ```
 
 The rerun receives a new `attempt-XXXX` folder; older logs are retained. Without `-RerunAll`, a PASS prompt is skipped and a failed/interrupted prompt is retried.
+
 Useful controls:
 
 - `-DryRun` prints all planned commands without creating result files.
