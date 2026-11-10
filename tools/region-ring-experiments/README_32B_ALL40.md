@@ -1,6 +1,6 @@
 # Qwen3-32B ShareGPT40: independent resumable sweep
 
-This is a new runner; it does **not** import or call any previous 32B sweep script. It invokes the existing local `llama-completion` executable directly (not the server-client `llama-cli`). Python 3.9+ and a running phone RPC server are required. The benchmark engine must support Region Ring JSONL metrics.
+This is a new runner; it does **not** import or call any previous 32B sweep script. It invokes the existing local `llama-completion` executable directly (not the server-client `llama-cli`). Python 3.9+ and a running phone RPC server are required. By default weights stay memory-mapped, which is safer for a large 32B GGUF; `-NoMmap` is optional if host RAM is sufficient. The benchmark engine must support Region Ring JSONL metrics.
 
 ## Windows PowerShell
 
@@ -12,8 +12,7 @@ From the repository root (`E:\llama\llama-tensor-v2` in this example):
   -Rpc "10.39.52.114:50052" `
   -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
   -Out ".\32b-g8p6-x128-all40" `
-  -Batch 2048 -UBatch 2048 -NPredict 32 -Threads 8 `
-  -NoMmap
+  -Batch 2048 -UBatch 2048 -NPredict 32 -Threads 8
 ```
 
 The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1024_10.txt`, with 10 files each in the 128/256/512/1024 groups. Missing files are a preflight error. `manifest.csv` provides per-file token estimates when possible; absent token counts use conservative bin ceilings (255, 511, 1023, 2000). `-c` is rounded to 256 tokens with padding and an initial minimum of 1024 tokens. Runtime-reported prefill token counts, not manifest estimates, are recorded in results. The default maximum context is 4096; override `-MaxContext` for unusually large prompts.
