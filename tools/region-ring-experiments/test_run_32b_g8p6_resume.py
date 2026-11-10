@@ -117,6 +117,46 @@ class Resumable32BSweepTests(unittest.TestCase):
             self.assertEqual(prior_runs(out, prompt, "digest", 0)["status"],
                              "PASS")
 
+    def test_reuse_saved_prompt_dir_when_omitted(self):
+        from run_32b_g8p6_resume import resolve_prompt_dir
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            initial = out / "sharegpt40-prompts"
+            initial.mkdir()
+            (out / "sweep-config.json").write_text(
+                json.dumps({"prompt_dir": str(initial)}), encoding="utf-8")
+            self.assertEqual(resolve_prompt_dir(None, out), initial.resolve())
+            explicit = out / "another-prompts"
+            explicit.mkdir()
+            self.assertEqual(resolve_prompt_dir(explicit, out),
+                             explicit.resolve())
+
+    def test_explicit_mismatched_prompt_dir_still_rejected(self):
+        from argparse import Namespace
+        from run_32b_g8p6_resume import ensure_config, stable_config
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            model = out / "test.gguf"
+            model.write_bytes(b"fake model")
+            base = {
+                "model": model, "exe": out / "llama-completion.exe",
+                "tokenizer": out / "llama-tokenize.exe",
+                "prompt_dir": out / "prompts1", "rpc": "127.0.0.1:50052",
+                "out": out, "batch": 2048, "ubatch": 2048,
+                "predict": 1, "threads": 8, "seed": 1234,
+                "min_context": 1024, "padding": 256, "log_verbosity": 4,
+                "no_ram_preload": False, "no_trace": False,
+                "mover_priority": False,
+            }
+            original = stable_config(Namespace(**base), "old-commit")
+            (out / "sweep-config.json").write_text(
+                json.dumps(original), encoding="utf-8")
+            # Script-only updates are allowed.
+            ensure_config(Namespace(**base), "new-commit")
+            base["prompt_dir"] = out / "prompts2"
+            with self.assertRaisesRegex(RuntimeError, "prompt_dir"):
+                ensure_config(Namespace(**base), "new-commit")
+
     def test_interrupted_attempt_is_retryable(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = Path(temporary)
