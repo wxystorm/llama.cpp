@@ -27,8 +27,9 @@ if behavior=='wrong_layout' and prompt=='prompt_128_01.txt':
       f.write(json.dumps(x)+'\\n')
   sys.exit(0)
 if behavior=='timeout' and prompt=='prompt_128_01.txt': time.sleep(2)
+layout=os.environ['LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT']
 with config.open('w') as f:
-  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':'G8,P6,G8,P6,G8,P6,G8,P6,G8'}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
+  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':layout}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
     f.write(json.dumps(x)+'\\n')
 '''
 
@@ -161,6 +162,69 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(old.returncode, 2)
         self.assertIn('different configuration', old.stderr)
         self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+
+    def test_custom_layout_and_chunks_pass_and_rerun_one(self):
+        layout = 'G7,P6,G8,P6,G8,P6,G8,P6,G9'
+        options = ('--layout', ' g7, p6, G8,P6,G8,P6,G8,P6,G9 ',
+                   '--chunk', '64', '--xc', '48', '--xg', '96', '--xp', '128')
+        r = self.invoke(*options, '--limit', '2')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = self.load('prompt_128_01.txt')[0]
+        self.assertEqual(row['status'], 'PASS')
+        self.assertEqual(row['layout'], layout)
+        self.assertEqual(row['plan_layout'], layout)
+        self.assertEqual((row['plan_xc'], row['plan_xg'], row['plan_xp']),
+                         (48, 96, 128))
+        env = row['env_overrides']
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS'], '64')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_XC'], '48')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_XG'], '96')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_XP'], '128')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_SKIP_PROFILE'], '1')
+        cfg = json.loads((self.out / 'run-config.json').read_text())
+        self.assertEqual(cfg['fixed_layout'], layout)
+        self.assertEqual((cfg['fixed_xc'], cfg['fixed_xg'], cfg['fixed_xp']),
+                         (48, 96, 128))
+        r = self.invoke(*options, '--only-prompt', 'prompt_128_01.txt',
+                        '--rerun-all')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 2)
+        self.assertEqual(len(self.load('prompt_128_02.txt')), 1)
+        self.assertEqual(self.invoke(*options, '--only-prompt',
+                         'prompt_128_01.txt').returncode, 0)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 2)
+
+    def test_config_changed_with_manual_parameters_is_refused(self):
+        self.assertEqual(self.invoke('--limit', '1').returncode, 0)
+        for flag, value in (('--layout', 'G7,P6,G8,P6,G8,P6,G8,P6,G9'),
+                            ('--chunk', '64'), ('--xp', '96')):
+            r = self.invoke('--limit', '1', flag, value)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('different configuration', r.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+
+    def test_reject_invalid_manual_layouts_and_chunks(self):
+        for flag, value in (('--layout', 'G8,P6'),
+                            ('--layout', 'G64'),
+                            ('--layout', 'G8,G8,P48'),
+                            ('--layout', 'P1,G63'),
+                            ('--chunk', '256'), ('--xg', '7'), ('--xp', '0')):
+            r = self.invoke('--limit', '1', flag, value)
+            self.assertEqual(r.returncode, 2, (flag, value, r.stderr))
+        self.assertFalse(self.out.exists())
+
+    def test_auto_plan_rejects_manual_override(self):
+        for flag, value in (('--layout', 'G8,P56'), ('--chunk', '64'),
+                            ('--xc', '64'), ('--xp', '128')):
+            r = self.invoke('--auto-plan', flag, value)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn('cannot be combined', r.stderr)
+        self.assertFalse(self.out.exists())
+
+    def test_c0_is_canonicalized(self):
+        r = self.invoke('--layout', 'G8,C0,P56', '--limit', '1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.load('prompt_128_01.txt')[-1]['layout'], 'G8,P56')
 
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
