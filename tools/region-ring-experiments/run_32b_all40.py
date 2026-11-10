@@ -23,6 +23,9 @@ import time
 GROUPS = (128, 256, 512, 1024)
 FIXED_LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"  # 5*G8 + 4*P6 = 64 layers
 CHUNK_TOKENS = 128
+MODEL_LAYERS = 64
+SUPPORTED_CHUNKS = (8, 12, 16, 20, 24, 28, 32, 40, 48,
+                    56, 64, 80, 96, 112, 128, 160, 192)
 FORCED_RING_ENV = {
     "LLAMA_HYBRID_REGION_RING_PLANNER": "apply-wide",
     "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "1",
@@ -63,6 +66,66 @@ RESULT_COLUMNS = (
     "plan_xp", "plan_predicted_ms", "plan_baseline_predicted_ms",
     "phone_native_profile_points", "error", "result_file",
 )
+
+
+def normalize_layout(spec: str) -> str:
+    """Validate and normalize 64-layer G -> [C] -> [P] APPLY_WIDE topology.
+
+    The native runtime accepts 1-8 complete cycles with an optional GPU tail.
+    Explicit C0 stages are omitted from the canonical representation.
+    """
+    parts = [part.strip().upper() for part in spec.split(",")]
+    parsed = []
+    for part in parts:
+        m = re.fullmatch(r"([GCP])(0|[1-9][0-9]*)", part)
+        if not m:
+            raise ValueError("Invalid -Layout segment: " + repr(part) +
+                             ". Expected G8,P6,... with optional C layers.")
+        kind, depth = m.group(1), int(m.group(2))
+        if depth == 0 and kind != "C":
+            raise ValueError("Only C0 may have zero layers")
+        if depth:
+            parsed.append((kind, depth))
+    total = sum(depth for _, depth in parsed)
+    if total != MODEL_LAYERS:
+        raise ValueError(f"-Layout must allocate exactly {MODEL_LAYERS} layers; got {total}")
+    i, cycles = 0, 0
+    while i < len(parsed):
+        if parsed[i][0] != "G":
+            raise ValueError("-Layout must use G -> [C] -> [P] cycles, starting with G")
+        i += 1
+        if i == len(parsed):
+            if cycles == 0:
+                raise ValueError("-Layout cannot be GPU-only")
+            break
+        used = False
+        if parsed[i][0] == "C":
+            used = True
+            i += 1
+        if i < len(parsed) and parsed[i][0] == "P":
+            used = True
+            i += 1
+        if not used:
+            raise ValueError("-Layout needs C or P after G, except for final GPU tail")
+        cycles += 1
+        if cycles > 8:
+            raise ValueError("-Layout supports a maximum of 8 cycles")
+    return ",".join(f"{kind}{depth}" for kind, depth in parsed)
+
+
+def default_out(args) -> Path:
+    if args.auto_plan:
+        return Path("32b-auto-plan-n1-all40")
+    if (args.layout == FIXED_LAYOUT and args.chunk == CHUNK_TOKENS and
+            args.xc == CHUNK_TOKENS and args.xg == CHUNK_TOKENS and
+            args.xp == CHUNK_TOKENS and args.n_predict == 1):
+        return Path("32b-g8p6-x128-n1-all40")  # backward-compatible default
+    slug = args.layout.lower().replace(",", "-")
+    if len(slug) > 48:
+        slug = slug[:37].rstrip("-") + "-" + hashlib.sha256(
+            args.layout.encode("ascii")).hexdigest()[:8]
+    return Path(f"32b-{slug}-base{args.chunk}-xc{args.xc}-xg{args.xg}"
+                f"-xp{args.xp}-n{args.n_predict}-all40")
 
 
 def utc_now():
@@ -123,7 +186,9 @@ def prompts_in(folder: Path):
     return expected
 
 
-def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False):
+def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
+                  fixed_layout=FIXED_LAYOUT, xc=CHUNK_TOKENS,
+                  xg=CHUNK_TOKENS, xp=CHUNK_TOKENS):
     perf = {}
     ring = []
     planner = {}
@@ -200,7 +265,7 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False):
             not planner.get("selected_layout") or
             any(item.get("layout") != planner["selected_layout"] for item in ring)):
         status = "PLAN_MISMATCH"
-    elif not auto_plan and any(item.get("layout") != FIXED_LAYOUT for item in ring):
+    elif not auto_plan and any(item.get("layout") != fixed_layout for item in ring):
         status = "WRONG_LAYOUT"
     else:
         # A baseline run can PASS after the planner explicitly decides to
@@ -217,11 +282,11 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False):
         "plan_mode": "native-auto" if auto_plan else "fixed",
         "plan_applied": planner.get("applied") if auto_plan else status == "PASS",
         "plan_source": planner.get("source", "") if auto_plan else "forced-skip-profile",
-        "plan_layout": planner.get("selected_layout", "") if auto_plan else FIXED_LAYOUT,
+        "plan_layout": planner.get("selected_layout", "") if auto_plan else fixed_layout,
         "plan_baseline_layout": planner.get("baseline_layout", "") if auto_plan else "",
-        "plan_xc": planner.get("xc") if auto_plan else CHUNK_TOKENS,
-        "plan_xg": planner.get("xg") if auto_plan else CHUNK_TOKENS,
-        "plan_xp": planner.get("xp") if auto_plan else CHUNK_TOKENS,
+        "plan_xc": planner.get("xc") if auto_plan else xc,
+        "plan_xg": planner.get("xg") if auto_plan else xg,
+        "plan_xp": planner.get("xp") if auto_plan else xp,
         "plan_predicted_ms": planner.get("predicted_ms") if auto_plan else None,
         "plan_baseline_predicted_ms": planner.get("baseline_predicted_ms") if auto_plan else None,
         "phone_native_profile_points": phone_native_points,
@@ -320,7 +385,14 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(estimate),
         "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1" if args.streaming == "on" else "0",
         "LLAMA_REGION_RING_METRICS_FILE": str(metrics_path),
-        **(AUTO_RING_ENV if args.auto_plan else FORCED_RING_ENV),
+        **(AUTO_RING_ENV if args.auto_plan else {
+            **FORCED_RING_ENV,
+            "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": str(args.chunk),
+            "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.layout,
+            "LLAMA_HYBRID_REGION_RING_FORCE_XC": str(args.xc),
+            "LLAMA_HYBRID_REGION_RING_FORCE_XG": str(args.xg),
+            "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.xp),
+        }),
     })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
@@ -384,7 +456,9 @@ def execute(args, prompt, group, context, estimate, out: Path):
                 code = 127
     finally:
         elapsed = (time.monotonic() - start) * 1000
-        row.update(parse_metrics(trial, code, elapsed, auto_plan=args.auto_plan))
+        row.update(parse_metrics(trial, code, elapsed, auto_plan=args.auto_plan,
+                                 fixed_layout=args.layout, xc=args.xc,
+                                 xg=args.xg, xp=args.xp))
         row["end_time"] = utc_now()
         row["result_file"] = str(result_file)
         save_json(result_file, row)
