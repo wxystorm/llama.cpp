@@ -7290,7 +7290,45 @@ bool rpc_server::phone_input_stream_run(
                 std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_ONLY");
             const bool local_only = local_only_env != nullptr &&
                 std::strcmp(local_only_env, "1") == 0;
-            if (local_only && phone_owned_plans.count_run(request.run_id) == 0) {
+            bool htp_only_run = false;
+            for (uint32_t region = 0;
+                    region < ggml_phone_owned::k_wire_region_limit;
+                    ++region) {
+                const auto * plan =
+                    phone_owned_plans.find(request.run_id, region);
+                if (plan && plan->version ==
+                        ggml_phone_owned::k_htp_only_plan_version) {
+                    htp_only_run = true;
+                    break;
+                }
+            }
+            if (htp_only_run) {
+                size_t regions = 0;
+                std::string why;
+                bool valid = true;
+                for (const auto & executor : phone_npu_executors) {
+                    size_t ready = 0;
+                    if (!executor->validate_owned_htp_only_prefill(
+                            request.run_id, why, ready)) {
+                        valid = false;
+                        break;
+                    }
+                    regions += ready;
+                }
+                if (regions == 0) {
+                    valid = false;
+                    why = "HTP_ONLY_NO_COMPLETED_REGIONS";
+                }
+                GGML_LOG_INFO(
+                    "[PHONE_HTP_ONLY] event=RUN_END run=%" PRIu64
+                    " regions=%zu kv_owner=HTP"
+                    " opencl_sync=SKIPPED decode=UNSUPPORTED"
+                    " status=%s reason=%s\n",
+                    request.run_id, regions,
+                    valid ? "PASS" : "FAIL",
+                    valid ? "NONE" : why.c_str());
+                if (!valid) { return false; }
+            } else if (local_only && phone_owned_plans.count_run(request.run_id) == 0) {
                 // A tiny warmup or decode-only stream has no owned Regions.
                 // It must not be misreported as a failed KV handoff. Any
                 // real HTP task without a Plan is rejected at registration.
