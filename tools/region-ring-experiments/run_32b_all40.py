@@ -124,7 +124,8 @@ def default_out(args) -> Path:
         return Path("32b-auto-plan-n1-all40")
     if (args.layout == FIXED_LAYOUT and args.chunk == CHUNK_TOKENS and
             args.xc == CHUNK_TOKENS and args.xg == CHUNK_TOKENS and
-            args.xp == CHUNK_TOKENS and args.n_predict == 1):
+            args.xp == CHUNK_TOKENS and args.n_predict == 1 and
+            not args.force_small_batch_mover):
         return Path("32b-g8p6-x128-n1-all40")  # backward-compatible default
     slug = args.layout.lower().replace(",", "-")
     if len(slug) > 48:
