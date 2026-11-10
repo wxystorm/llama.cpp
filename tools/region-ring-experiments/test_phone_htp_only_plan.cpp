@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <initializer_list>
 
 static ggml_phone_owned::region_plan make_plan(uint32_t layers) {
     using namespace ggml_phone_owned;
