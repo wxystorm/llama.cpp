@@ -157,6 +157,70 @@ class Resumable32BSweepTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "prompt_dir"):
                 ensure_config(Namespace(**base), "new-commit")
 
+    def test_default_all_pending_and_fail_fast(self):
+        """Exercise main() with 3 prompts; no model, CUDA or RPC needed."""
+        import sys
+        from unittest import mock
+        import run_32b_g8p6_resume as runner
+
+        for result_status, expected_return, expected_attempts, extra in (
+            ("PASS", 0, 3, []),
+            ("FAIL", 1, 1, []),
+            ("PASS", 0, 1, ["--limit", "1"]),
+        ):
+            with self.subTest(result_status=result_status, extra=extra):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    model = root / "model.gguf"
+                    exe = root / "llama-completion.exe"
+                    tokenizer = root / "llama-tokenize.exe"
+                    for f in (model, exe, tokenizer):
+                        f.write_bytes(b"test")
+                    prompts = root / "prompts"
+                    prompts.mkdir()
+                    for number in range(1, 4):
+                        (prompts / f"prompt_128_{number:02d}.txt").write_text(
+                            "sample", encoding="utf-8")
+                    out = root / "output"
+                    argv = [
+                        "run_32b_g8p6_resume.py",
+                        "--model", str(model), "--exe", str(exe),
+                        "--tokenizer", str(tokenizer),
+                        "--prompt-dir", str(prompts), "--out", str(out),
+                    ] + extra
+                    def fake_tokens(_args, selected):
+                        return {
+                            p.name: {"sha256": "test-hash", "tokens": 167}
+                            for _, _, p in selected
+                        }
+
+                    with mock.patch.object(sys, "argv", argv), mock.patch(
+                        "run_32b_g8p6_resume.old.git_head", return_value="test"
+                    ), mock.patch(
+                        "run_32b_g8p6_resume.tokens_for_prompts",
+                        side_effect=fake_tokens,
+                    ), mock.patch(
+                        "run_32b_g8p6_resume.run_prompt",
+                        return_value={"status": result_status},
+                    ) as process:
+                        self.assertEqual(runner.main(), expected_return)
+                        self.assertEqual(process.call_count, expected_attempts)
+
+    def test_failure_report_captures_engine_error(self):
+        from run_32b_g8p6_resume import failure_report
+        with tempfile.TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "engine.stderr.log").write_text(
+                "[REGION_RING_GPU_BANK] event=REJECT reason=TEST_FAILURE\\n"
+                "test ending\\n", encoding="utf-8")
+            output = failure_report(folder, {
+                "prompt_file": "prompt_128_01.txt",
+                "status": "FAIL", "exit_code": 1, "prefill_tps": None
+            })
+            self.assertIn("TEST_FAILURE", output)
+            self.assertIn("exit_code=1", output)
+            self.assertTrue((folder / "failure-summary.txt").exists())
+
     def test_interrupted_attempt_is_retryable(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = Path(temporary)
