@@ -1333,12 +1333,14 @@ public:
 
     std::optional<llama_region_ring_task> try_take(
             llama_region_ring_device device,
-            const task_eligibility & eligible = {}) {
+            const task_eligibility & eligible = {},
+            bool drain_oldest_region = false) {
         const size_t dev = device_index(device);
         std::lock_guard<std::mutex> lock(mutex_);
         return failed_ ?
             std::nullopt : take_device_locked(
-                dev, std::numeric_limits<size_t>::max(), -1, eligible);
+                dev, std::numeric_limits<size_t>::max(), -1, eligible,
+                drain_oldest_region);
     }
 
     // Bank eligibility and Phone graph affinity apply only to tasks already
@@ -1350,7 +1352,8 @@ public:
             size_t preferred_region = std::numeric_limits<size_t>::max(),
             int preferred_tokens = -1,
             const task_eligibility & eligible = {},
-            int64_t * filtered_wait_us = nullptr) {
+            int64_t * filtered_wait_us = nullptr,
+            bool drain_oldest_region = false) {
         const size_t dev = device_index(device);
         if (filtered_wait_us) {
             *filtered_wait_us = 0;
@@ -1375,7 +1378,8 @@ public:
             return std::nullopt;
         }
         return take_device_locked(
-            dev, preferred_region, preferred_tokens, eligible);
+            dev, preferred_region, preferred_tokens, eligible,
+            drain_oldest_region);
     }
 
     // Publish changes to external atomic weight-Bank residency without
@@ -1753,7 +1757,8 @@ private:
             size_t dev,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
             int preferred_tokens = -1,
-            const task_eligibility & eligible = {}) {
+            const task_eligibility & eligible = {},
+            bool drain_oldest_region = false) {
         auto & queue = queues_[dev];
         auto it = queue.end();
         if (preferred_region < regions_.size() && preferred_tokens > 0) {
@@ -1767,12 +1772,30 @@ private:
                 });
         }
         if (it == queue.end()) {
-            it = std::find_if(
-                queue.begin(), queue.end(),
-                [this, &eligible](const auto & task) {
-                    return claimable_locked(task) &&
-                           (!eligible || eligible(task));
-                });
+            if (drain_oldest_region) {
+                // GPU-only: release the active weight Bank as early as
+                // possible, leaving the other Bank's entire Region compute
+                // available to hide the next H2D refill. Never choose a
+                // causally blocked or non-resident task.
+                for (auto candidate = queue.begin();
+                     candidate != queue.end(); ++candidate) {
+                    if (!claimable_locked(*candidate) ||
+                            (eligible && !eligible(*candidate))) {
+                        continue;
+                    }
+                    if (it == queue.end() ||
+                            candidate->region < it->region) {
+                        it = candidate;
+                    }
+                }
+            } else {
+                it = std::find_if(
+                    queue.begin(), queue.end(),
+                    [this, &eligible](const auto & task) {
+                        return claimable_locked(task) &&
+                               (!eligible || eligible(task));
+                    });
+            }
         }
         if (it == queue.end()) {
             return std::nullopt;
