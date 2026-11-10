@@ -313,6 +313,20 @@ class All40Tests(unittest.TestCase):
         self.assertIn('different configuration', changed.stderr)
         self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
 
+    def test_force_mover_default_output_is_isolated(self):
+        args = list(self.common)
+        index = args.index('--out')
+        del args[index:index + 2]
+        cmd = [sys.executable, str(RUNNER), *args,
+               '--force-small-batch-mover', '--limit', '1']
+        proc = subprocess.run(cmd, cwd=self.root, capture_output=True,
+                              text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        forced = list(self.root.glob('32b-*-force-short-mover-all40'))
+        self.assertEqual(len(forced), 1)
+        self.assertTrue((forced[0]/'run-config.json').exists())
+        self.assertFalse((self.root/'32b-g8p6-x128-n1-all40').exists())
+
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
         self.assertEqual(dry.returncode, 0, dry.stderr)
