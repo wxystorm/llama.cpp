@@ -37,6 +37,66 @@ The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1
 
 `-Out` is optional: the existing default configuration keeps `32b-g8p6-x128-n1-all40`, while custom layout/Chunk settings automatically get a deterministic different output directory. When you specify `-Out` explicitly, use a separate directory for a different layout/Chunk; otherwise the existing run signature rejects mixing results. The optional `-AutoPlan` mode is preserved but cannot be combined with manual layout/Chunk options.
 
+## A/B experiment: XG=96 and short-prefill GPU Bank Mover
+
+Previously the CUDA Bank Mover started only when `tokens >= 2*XG`.
+With `XG=96` that means 192 tokens, so the 167-182 token prompts
+would still run in the slower `INACTIVE_SMALL_BATCH` / demand path.
+
+The new **opt-in** `-ForceSmallBatchMover` flag sets
+`LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH=1` in the PC engine,
+waiving the two-full-Chunk gate for **prefill batches with more than one token**.
+One-token decode and layouts with fewer than two GPU Regions retain the
+legacy path. It does not change layer allocation, Chunk sizes, or Planner mode.
+The native Bank Mover still has to finish each prior same-bank Region before
+it can refill the next one. On very short prompts, asynchronous refill may
+be slower due to initial Bank priming or contention; benchmark both modes.
+
+**Rebuild the Windows PC executable first** (the RPC server need not change
+for this PC-side scheduler option):
+
+```powershell
+cmake --build .\build-tensor-v2 --config Release --target llama-completion test-region-ring --parallel 4
+ctest --test-dir .\build-tensor-v2 -C Release -R "^test-region-ring$" --output-on-failure
+```
+
+Try XG=96 with the threshold unchanged, then repeat with the override:
+
+```powershell
+$settings = @{
+  Model     = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
+  Rpc       = "10.39.52.114:50052"
+  PromptDir = "E:\llama\datasets\sharegpt\sharegpt40"
+  Layout    = "G8,P6,G8,P6,G8,P6,G8,P6,G8"
+  Chunk     = 128
+  XG        = 96
+}
+
+# Control: default XG96 threshold, no short-Batch mover.
+.\tools\region-ring-experiments\run_32b_all40.ps1 @settings `
+  -OnlyGroup 128 -Out ".\32b-xg96-mover-off"
+
+# Experiment: allow short Prefill batches to use async GPU Bank refill.
+.\tools\region-ring-experiments\run_32b_all40.ps1 @settings `
+  -OnlyGroup 128 -Out ".\32b-xg96-mover-on" -ForceSmallBatchMover
+```
+
+`-ForceSmallBatchMover` requires fixed mode, streaming on, and at least
+two GPU Regions. The flag is included in the run signature. Reuse the
+**same** parameters and output path to resume; use `-OnlyPrompt` plus
+`-RerunAll` to force rerun one previously successful prompt.
+
+Verification: the `[REGION_RING_GPU_BANK] phase=INIT` log reports
+`mover=CPU_SINGLE` with `override_applied=1` on short prompts.
+The `region_ring` JSONL contains `gpu_bank_force_small_batch`,
+`gpu_bank_small_batch_override_applied`, and `gpu_bank_streaming`; the
+`summary.csv` also includes `bank_refills`, `bank_h2d_ms`,
+`bank_gpu_wait_ms`, `bank_mover_wall_ms`, and `gpu_weight_stage_ms`.
+`bank_refills>0` confirms that an actual refill completed.
+The runner refuses to report PASS (`MOVER_UNVERIFIED` or `MOVER_INACTIVE`)
+if the opt-in flag was ignored by an old build or the requested mover
+did not activate.
+
 **Tiny tail:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the native width adjustment on the actual UBatch token count, separately for each requested stage width. With X=128 a remainder of 1..32 may be coalesced by widening the uniform width slightly (at most 160). For example 513 tokens become `[129,129,129,126]` rather than `[128,128,128,128,1]`. The layout does not change. Check `[REGION_RING_TAIL_COALESCE]` in engine logs for the actual width. `summary.csv` records both the selected/forced `plan_xc/xg/xp` and `runtime_xc/xg/xp` reported by the engine (when available).
 
 ## Restart, retry, rerun
@@ -91,7 +151,7 @@ A run directory has a fixed configuration signature (`run-config.json`), includi
         ...
 ```
 
-A run is **PASS** only with exit code 0, a native `perf` record with prefill data, completed `region_ring` records after the last `measurement_start`, and every reported runtime layout exactly matching the forced 64-layer layout. Otherwise it is marked `FAIL`, `NO_METRICS`, `NO_PERF`, `NO_RING`, `NO_PREFILL`, `INCOMPLETE_RING`, `WRONG_LAYOUT`, `TIMEOUT`, or `INTERRUPTED`. This avoids reporting false success when the process exits normally without real benchmark measurements.
+A run is **PASS** only with exit code 0, a native `perf` record with prefill data, completed `region_ring` records after the last `measurement_start`, and every reported runtime layout exactly matching the forced 64-layer layout. Otherwise it is marked `FAIL`, `NO_METRICS`, `NO_PERF`, `NO_RING`, `NO_PREFILL`, `INCOMPLETE_RING`, `WRONG_LAYOUT`, `MOVER_UNVERIFIED`, `MOVER_INACTIVE`, `TIMEOUT`, or `INTERRUPTED`. This avoids reporting false success when the process exits normally without real benchmark measurements.
 
 The parent script updates `summary.csv` after each attempt. Stop with Ctrl+C and rerun the same command; an interrupted attempt stays in its own folder and will be retried. Do not modify the result files while a benchmark is running.
 
