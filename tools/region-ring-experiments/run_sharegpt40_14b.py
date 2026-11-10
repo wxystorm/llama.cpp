@@ -273,6 +273,9 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     if getattr(args, "htp_only", False):
         # Never let the PC allocate/upload a second copy of Phone weights.
         env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
+    if getattr(args, "preload_gpu_ram", False):
+        # Fault only the PC CUDA layer weight pages into RAM before Prefill.
+        env["LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD"] = "1"
     token_count = (plan or {}).get("plan_tokens",
                     getattr(args, "token_counts", {}).get(prompt.name.lower(), group))
     context = (plan or {}).get("context") or context_for_tokens(
@@ -497,6 +500,8 @@ def main(argv: list[str] | None = None, *,
     ap.add_argument("--layout", default=defaults.get("layout", LAYOUT))
     ap.add_argument("--htp-only", action="store_true",
                     help="experimental phone HTP-only fresh prefill; requires CPU RPC transport, Phone GGUF, no OpenCL and predict=1")
+    ap.add_argument("--preload-gpu-ram", action="store_true",
+                    help="pre-touch PC GPU-only mmap weights at model load (best-effort RAM cache, 2 GiB free reserve)")
     ap.add_argument("--model-layers", type=int,
                     default=defaults.get("model_layers", 40),
                     help="required Transformer depth for forced G/P layout (default 40)")
