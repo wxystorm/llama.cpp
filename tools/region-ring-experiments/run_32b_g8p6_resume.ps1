@@ -11,7 +11,8 @@ param(
     [string] $Out = ".\32b-g8p6-sharegpt40",
     [string] $Exe = "",
     [string] $Tokenizer = "",
-    [ValidateRange(0, 100000)] [int] $Limit = 0,
+    [ValidateRange(0, 100000)] [int] $Limit = 1,
+    [switch] $ContinueOnFail,
     [string] $Rerun = "",
     [switch] $RerunAll,
     [ValidateRange(0, 100000)] [double] $MinTps = 0,
@@ -51,6 +52,7 @@ $callArgs = @(
 if ($PromptDir) { $callArgs += @("--prompt-dir", $PromptDir) }
 if ($Rerun) { $callArgs += @("--rerun", $Rerun) }
 if ($RerunAll) { $callArgs += "--rerun-all" }
+if ($ContinueOnFail) { $callArgs += "--continue-on-fail" }
 if ($Group -gt 0) { $callArgs += @("--group", "$Group") }
 if ($StatusOnly) { $callArgs += "--status-only" }
 if ($MoverPriority) { $callArgs += "--mover-priority" }
