@@ -144,6 +144,12 @@ function ConvertTo-NativeArgument([string]$value) {
 $nativeArgs = ($argsList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
 $stdoutLog = Join-Path $base "output.stdout.txt"
 $stderrLog = Join-Path $base "engine.stderr.log"
+$metricsLog = Join-Path $base "metrics.jsonl"
+# Unlike the JSONL append writer, each standalone benchmark invocation should
+# measure ONLY this run. Never pass on an earlier successful bank timeline.
+if (Test-Path -LiteralPath $metricsLog -PathType Leaf) {
+    Remove-Item -LiteralPath $metricsLog -Force
+}
 $code = 1
 try {
     $engine = Start-Process -FilePath $Exe -ArgumentList $nativeArgs `
