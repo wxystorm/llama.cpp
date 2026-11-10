@@ -477,6 +477,16 @@ def get_args(argv=None):
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
     parser.add_argument("--auto-plan", action="store_true",
                         help="native hardware Profile plus APPLY_WIDE planning per process")
+    parser.add_argument("--layout", default=None,
+                        help="forced 64-layer G/[C]/P topology (default G8,P6 x4 + G8)")
+    parser.add_argument("--chunk", type=int, default=None,
+                        help="common XC/XG/XP Chunk width (default 128)")
+    parser.add_argument("--xc", type=int, default=None,
+                        help="override CPU/transfer Chunk width")
+    parser.add_argument("--xg", type=int, default=None,
+                        help="override PC GPU Chunk width")
+    parser.add_argument("--xp", type=int, default=None,
+                        help="override Phone Chunk width")
     parser.add_argument("--real-stage-profile-csv", type=Path, default=None,
                         help="optional measured Stage CSV for native Planner (needs --auto-plan)")
     parser.add_argument("--batch", type=int, default=2048)
@@ -502,9 +512,25 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
+    if args.auto_plan and any(v is not None for v in
+                              (args.layout, args.chunk, args.xc, args.xg, args.xp)):
+        parser.error("--auto-plan cannot be combined with --layout, --chunk, --xc, "
+                     "--xg or --xp. Use fixed mode for manual allocation.")
+    try:
+        args.layout = normalize_layout(args.layout if args.layout is not None else FIXED_LAYOUT)
+    except ValueError as exc:
+        parser.error(str(exc))
+    args.chunk = CHUNK_TOKENS if args.chunk is None else args.chunk
+    args.xc = args.chunk if args.xc is None else args.xc
+    args.xg = args.chunk if args.xg is None else args.xg
+    args.xp = args.chunk if args.xp is None else args.xp
+    for name in ("chunk", "xc", "xg", "xp"):
+        width = getattr(args, name)
+        if width not in SUPPORTED_CHUNKS:
+            parser.error(f"--{name}={width} unsupported; supported widths: " +
+                         ", ".join(str(x) for x in SUPPORTED_CHUNKS))
     if args.out is None:
-        args.out = Path("32b-auto-plan-n1-all40" if args.auto_plan
-                        else "32b-g8p6-x128-n1-all40")
+        args.out = default_out(args)
     for key in ("exe", "model", "prompt_dir", "out", "repo_root"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
     if args.real_stage_profile_csv is not None:
@@ -557,9 +583,9 @@ def main(argv=None):
     config = {"version": 2, "model": file_id(args.model), "exe": file_id(args.exe),
               "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
               "prompts": decisions, "planner_search": "SKIPPED_FORCED_LAYOUT",
-              "streaming": args.streaming, "fixed_layout": FIXED_LAYOUT,
-              "fixed_xc": CHUNK_TOKENS, "fixed_xg": CHUNK_TOKENS,
-              "fixed_xp": CHUNK_TOKENS, "tiny_tail_coalesce": True,
+              "streaming": args.streaming, "fixed_layout": args.layout,
+              "fixed_xc": args.xc, "fixed_xg": args.xg,
+              "fixed_xp": args.xp, "tiny_tail_coalesce": True,
               "batch": args.batch, "ubatch": args.ubatch, "n_predict": args.n_predict,
               "threads": args.threads, "seed": args.seed, "log_verbosity": args.log_verbosity,
               "no_mmap": args.no_mmap, "min_context": args.min_context,
@@ -595,8 +621,8 @@ def main(argv=None):
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
     else:
-        print(f"[FIXED_RING] layout={FIXED_LAYOUT} XC={CHUNK_TOKENS} "
-              f"XG={CHUNK_TOKENS} XP={CHUNK_TOKENS} profile=SKIPPED "
+        print(f"[FIXED_RING] layout={args.layout} base_chunk={args.chunk} "
+              f"XC={args.xc} XG={args.xg} XP={args.xp} profile=SKIPPED "
               "tail_coalesce=1", flush=True)
     if args.dry_run:
         for group, prompt in selections:
