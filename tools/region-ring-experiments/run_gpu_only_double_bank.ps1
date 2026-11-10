@@ -103,15 +103,61 @@ if (-not (Test-Path -LiteralPath $Model -PathType Leaf)) { throw "Model not foun
 if (-not (Test-Path -LiteralPath $Prompt -PathType Leaf)) { throw "Prompt not found: $Prompt" }
 foreach ($name in $envNames) { [Environment]::SetEnvironmentVariable($name, $null, "Process") }
 foreach ($name in $overrides.Keys) { [Environment]::SetEnvironmentVariable($name, $overrides[$name], "Process") }
+# Windows PowerShell 5.1 treats native stderr as NativeCommandError when
+# ErrorActionPreference=Stop. llama.cpp writes INFO logs to stderr, so invoking
+# the executable with '& ... 2>' can abort the script on a *normal* log line.
+# Start-Process redirects OS handles directly and returns the real exit code.
+# Quote Windows command line arguments correctly, including spaces in paths.
+function ConvertTo-NativeArgument([string]$value) {
+    if ($value.Length -gt 0 -and $value -notmatch '[\s"]') {
+        return $value
+    }
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($ch in $value.ToCharArray()) {
+        if ($ch -eq [char]92) {
+            $slashes++
+            continue
+        }
+        if ($ch -eq [char]34) {
+            [void]$builder.Append([char]92, (2 * $slashes + 1))
+            [void]$builder.Append([char]34)
+        } else {
+            [void]$builder.Append([char]92, $slashes)
+            [void]$builder.Append($ch)
+        }
+        $slashes = 0
+    }
+    [void]$builder.Append([char]92, (2 * $slashes))
+    [void]$builder.Append([char]34)
+    return $builder.ToString()
+}
+$nativeArgs = ($argsList | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+$stdoutLog = Join-Path $base "output.stdout.txt"
+$stderrLog = Join-Path $base "engine.stderr.log"
+$code = 1
 try {
-    & $Exe @argsList 1> (Join-Path $base "output.stdout.txt") 2> (Join-Path $base "engine.stderr.log")
-    $code = $LASTEXITCODE
+    $engine = Start-Process -FilePath $Exe -ArgumentList $nativeArgs `
+        -WorkingDirectory $root -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+    if ($null -eq $engine -or $null -eq $engine.ExitCode) {
+        throw "llama-completion exited without a readable process exit code."
+    }
+    $code = [int]$engine.ExitCode
 } finally {
     foreach ($name in $envNames) {
         [Environment]::SetEnvironmentVariable($name, $before[$name], "Process")
     }
 }
 Write-Host "[GPU_ONLY] engine_exit=$code metrics=$(Join-Path $base 'metrics.jsonl')"
+if ($code -ne 0) {
+    Write-Warning "Inference engine failed with exit code $code. Last stderr lines:"
+    if (Test-Path -LiteralPath $stderrLog -PathType Leaf) {
+        Get-Content -LiteralPath $stderrLog -Tail 50 |
+            ForEach-Object { Write-Host $_ }
+    }
+}
 if ($code -eq 0) {
     & python (Join-Path $PSScriptRoot "verify_gpu_only_double_bank.py") --metrics (Join-Path $base "metrics.jsonl") --regions $cycleCount
     if ($LASTEXITCODE -ne 0) { exit 2 }
