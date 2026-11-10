@@ -1120,6 +1120,25 @@ static void test_gpu_same_bank_lifetime_scheduler() {
 static void test_gpu_weight_two_bank_policy() {
     const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
 
+    // Legacy minimum is two full GPU Chunks. Force only waives that
+    // prefill-size check, not the two-Bank/device or decode constraints.
+    const auto enabled = llama_region_ring_gpu_bank_mover_enabled;
+    check(!enabled(true, 5, 167, 128, false),
+          "legacy XG128 must reject 167-token prefill");
+    check(!enabled(true, 5, 167, 96, false),
+          "legacy XG96 must reject 167-token prefill");
+    check(enabled(true, 5, 192, 96, false),
+          "legacy XG96 must start at its 192-token threshold");
+    check(enabled(true, 5, 167, 96, true) &&
+          enabled(true, 5, 167, 128, true),
+          "small-batch override must start short prefill");
+    check(!enabled(true, 5, 1, 96, true),
+          "override must never start the mover for one-token decode");
+    check(!enabled(true, 1, 167, 96, true) &&
+          !enabled(false, 5, 167, 96, true) &&
+          !enabled(true, 5, 167, 0, true),
+          "override must preserve device, streaming and Chunk guards");
+
     check(llama_region_ring_gpu_weight_bank_for_rank(0) == 0,
           "rank0 must use Bank A");
     check(llama_region_ring_gpu_weight_bank_for_rank(1) == 1,
