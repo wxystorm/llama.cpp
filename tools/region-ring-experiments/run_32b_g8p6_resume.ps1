@@ -2,7 +2,7 @@
 # Run all remaining prompts (stop on the first failure; resume later):
 #   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1
 # Rerun a specific prompt without overwriting the best result:
-#   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1 -Rerun prompt_512_01.txt -Limit 1
+#   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1 -Rerun prompt_512_01.txt
 [CmdletBinding()]
 param(
     [string] $Model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
