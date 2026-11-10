@@ -25,6 +25,7 @@ param(
     [double] $Delay = 2,
     [switch] $NoMmap,
     [switch] $HtpOnly,
+    [switch] $PreloadGpuRam,
     [switch] $DryRun,
     [ValidateSet("model","manifest")][string] $TokenSource = "model",
     [string] $TokenizerExe = "",
@@ -60,6 +61,7 @@ foreach ($name in $Rerun) { $callArgs += @("--rerun", $name) }
 if ($DryRun) { $callArgs += "--dry-run" }
 if ($NoMmap) { $callArgs += "--no-mmap" }
 if ($HtpOnly) { $callArgs += "--htp-only" }
+if ($PreloadGpuRam) { $callArgs += "--preload-gpu-ram" }
 if ($UpdateTokens) { $callArgs += "--update-tokens" }
 if ($TokenizerExe -ne "") { $callArgs += @("--tokenizer-exe", $TokenizerExe) }
 & $python.Source @callArgs
