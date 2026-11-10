@@ -35,7 +35,7 @@ The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1
 
 `-Chunk` gives the uniform default width for XC/XG/XP; `-XC`, `-XG`, `-XP` override individual widths. Example: `-Chunk 128 -XG 64 -XP 96` means `XC=128,XG=64,XP=96`. Only widths supported by the native C++ forced Planner are accepted: `8,12,16,20,24,28,32,40,48,56,64,80,96,112,128,160,192`.
 
-`-Out` is optional: the existing default configuration keeps `32b-g8p6-x128-n1-all40`, while custom layout/Chunk settings automatically get a deterministic different output directory. When you specify `-Out` explicitly, use a separate directory for a different layout/Chunk; otherwise the existing run signature rejects mixing results. The optional `-AutoPlan` mode is preserved but cannot be combined with manual layout/Chunk options.
+`-Out` is optional: the normal default configuration keeps `32b-g8p6-x128-n1-all40`, while custom layout/Chunk or priority/no-mmap/cooldown settings automatically get a deterministic separate output directory. When you specify `-Out` explicitly, use a separate directory for a different layout/Chunk; otherwise the existing run signature rejects mixing results. The optional `-AutoPlan` mode is preserved but cannot be combined with manual layout/Chunk options.
 
 ## A/B experiment: XG=96 and short-prefill GPU Bank Mover
 
@@ -98,6 +98,56 @@ if the opt-in flag was ignored by an old build or the requested mover
 did not activate.
 
 **Tiny tail:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the native width adjustment on the actual UBatch token count, separately for each requested stage width. With X=128 a remainder of 1..32 may be coalesced by widening the uniform width slightly (at most 160). For example 513 tokens become `[129,129,129,126]` rather than `[128,128,128,128,1]`. The layout does not change. Check `[REGION_RING_TAIL_COALESCE]` in engine logs for the actual width. `summary.csv` records both the selected/forced `plan_xc/xg/xp` and `runtime_xc/xg/xp` reported by the engine (when available).
+
+## Cooldown, raised transfer priority, and no-mmap A/B
+
+The runner now **defaults to a 5-second pause between completed Prompt
+runs**. It waits after the last attempt for a Prompt and before the next
+actual Prompt execution (including when the last Prompt failed). It does
+not wait before the first Prompt, after the last Prompt, when skipping
+already-PASS prompts, or between retry attempts.
+Use `-InterPromptDelaySeconds 0` to disable. Retry attempts have a separate
+`-RetryDelaySeconds` (default 5 s).
+
+For the requested XG96 experiment on Windows:
+
+```powershell
+.\tools\region-ring-experiments\run_32b_all40.ps1 `
+  -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
+  -Layout "G8,P6,G8,P6,G8,P6,G8,P6,G8" `
+  -Chunk 128 -XG 96 `
+  -ForceSmallBatchMover `
+  -BoostBankMover -NoMmap `
+  -InterPromptDelaySeconds 5 `
+  -OnlyGroup 128 `
+  -Out ".\32b-xg96-mover-boost-nommap-pause5"
+```
+
+`-BoostBankMover` sets `LLAMA_REGION_RING_PRIORITY_BANK_MOVER=1` **only
+for the PC engine subprocess**; the existing Windows C++ hook gives the
+CPU Bank Mover thread `THREAD_PRIORITY_ABOVE_NORMAL`, not the whole
+process or GPU device. Confirm
+`[REGION_RING_THREAD_PRIORITY] role=BANK_MOVER requested=ABOVE_NORMAL status=PASS`
+in `engine.stderr.log`. It cannot itself increase PCIe bandwidth.
+
+`-NoMmap` passes `--no-mmap` to `llama-completion`: weights are loaded
+into RAM rather than memory-mapped, potentially reducing mmap page-fault
+variance. Ensure sufficient available RAM for the 32B model plus workspaces.
+Each Prompt still runs in a separate engine process, so non-mmap model
+loading can be slower; prefill time and model-load time are different metrics.
+
+The new pause is included in `run-config.json`, and the boosted-thread
+setting and no-mmap choice are also part of the configuration signature.
+Use a **new -Out directory** so new results cannot be merged with old
+ones. Keep the same flags and -Out to resume, or add
+`-OnlyPrompt "prompt_128_06.txt" -RerunAll` to rerun one.
+
+This experiment changes multiple variables (thread priority, mmap policy,
+inter-Prompt cooling), so a throughput improvement would not isolate
+which change helped. For a controlled comparison, hold two fixed and vary
+the third.
 
 ## Restart, retry, rerun
 
