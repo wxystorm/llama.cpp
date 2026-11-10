@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 RUNNER = Path(__file__).with_name('run_32b_all40.py')
@@ -76,7 +77,8 @@ class All40Tests(unittest.TestCase):
         self.common = ['--exe', str(self.exe), '--model', str(self.model),
                        '--rpc', '127.0.0.1:50052', '--prompt-dir', str(prompts),
                        '--repo-root', str(root), '--out', str(self.out),
-                       '--max-retries', '0']
+                       '--max-retries', '0',
+                       '--inter-prompt-delay-seconds', '0']
 
     def invoke(self, *options):
         return subprocess.run([sys.executable, str(RUNNER), *self.common, *options],
@@ -322,7 +324,7 @@ class All40Tests(unittest.TestCase):
         proc = subprocess.run(cmd, cwd=self.root, capture_output=True,
                               text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        forced = list(self.root.glob('32b-*-force-short-mover-all40'))
+        forced = list(self.root.glob('32b-*-force-short-mover*-all40'))
         self.assertEqual(len(forced), 1)
         self.assertTrue((forced[0]/'run-config.json').exists())
         self.assertFalse((self.root/'32b-g8p6-x128-n1-all40').exists())
