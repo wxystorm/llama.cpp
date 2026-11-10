@@ -140,6 +140,10 @@ loading can be slower; prefill time and model-load time are different metrics.
 
 The new pause is included in `run-config.json`, and the boosted-thread
 setting and no-mmap choice are also part of the configuration signature.
+Older results that predate the pause setting can resume with
+`-InterPromptDelaySeconds 0` and otherwise-identical settings; the original
+`run-config.json` stays untouched. The 5-second setting deliberately cannot
+be combined with older zero-pause measurements.
 Use a **new -Out directory** so new results cannot be merged with old
 ones. Keep the same flags and -Out to resume, or add
 `-OnlyPrompt "prompt_128_06.txt" -RerunAll` to rerun one.
