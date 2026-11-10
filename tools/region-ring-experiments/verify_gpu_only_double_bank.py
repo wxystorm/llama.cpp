@@ -16,14 +16,33 @@ def verify(events, regions):
     boundaries = [i for i, e in enumerate(events) if e.get("type") == "measurement_start"]
     if boundaries:
         events = events[boundaries[-1] + 1:]
+    ring_events = [e for e in events if e.get("type") == "region_ring"]
     ring = [
-        e for e in events
-        if e.get("type") == "region_ring"
-        and e.get("gpu_bank_streaming") is True
+        e for e in ring_events
+        if e.get("gpu_bank_streaming") is True
         and e.get("complete") is True and e.get("status") == 0
     ]
     if not ring:
-        raise ValueError("No complete double-bank prefill; check prompt length >= 2*XG")
+        perf = [e for e in events if e.get("type") == "perf"]
+        prefill_tokens = perf[-1].get("prefill_tokens") if perf else None
+        if not ring_events:
+            raise ValueError(
+                "No region_ring events. "
+                f"prefill_tokens={prefill_tokens}, metrics_records={len(events)}. "
+                "Check that -NPredict >= 1 (completion -n 0 skips prompt "
+                "evaluation), and that the GPU-only executor was entered."
+            )
+        examples = ", ".join(
+            f"tokens={e.get('tokens')} streaming={e.get('gpu_bank_streaming')} "
+            f"complete={e.get('complete')} status={e.get('status')}"
+            for e in ring_events[-3:]
+        )
+        raise ValueError(
+            "No complete streaming GPU Bank prefill. "
+            f"prefill_tokens={prefill_tokens}; ring_events={len(ring_events)}; "
+            f"recent=[{examples}]. Requires at least 2*XG tokens in one "
+            "physical ubatch, plus a successful Region Ring execution."
+        )
     prefill = max(ring, key=lambda e: int(e.get("tokens", 0)))
     ubatch = prefill.get("ubatch")
     measured = [e for e in events if e.get("ubatch") == ubatch]
