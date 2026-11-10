@@ -123,7 +123,9 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(config['planner_search'], 'SKIPPED_FORCED_LAYOUT')
         self.assertTrue(config['tiny_tail_coalesce'])
         self.assertEqual(row['layout'], config['fixed_layout'])
-        self.assertEqual(row['context'], 1024)
+        self.assertEqual(row['context'], 256)
+        self.assertEqual(row['command'][row['command'].index('-n') + 1], '1')
+        self.assertEqual(row['command'][row['command'].index('-c') + 1], '256')
 
     def test_wrong_runtime_layout_is_not_a_pass(self):
         (self.root/'behavior.txt').write_text('wrong_layout')
@@ -138,15 +140,38 @@ class All40Tests(unittest.TestCase):
         self.assertIn('cannot override fixed Ring settings', attempt.stderr)
         self.assertFalse(self.out.exists())
 
+    def test_manifest_fallback_contexts_are_compact(self):
+        for name, expected in (
+            ('prompt_128_02.txt', 512),  # upper bound 255 + 1 + 64
+            ('prompt_256_02.txt', 768),  # upper bound 511 + 1 + 64
+            ('prompt_512_02.txt', 1280),
+            ('prompt_1024_02.txt', 2304),
+        ):
+            dry = self.invoke('--only-prompt', name, '--dry-run')
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertIn(f'ctx={expected}', dry.stdout)
+            self.assertIn(' -n 1 ', dry.stdout)
+
+    def test_prediction_and_context_change_do_not_mix_previous_results(self):
+        self.assertEqual(self.invoke('--limit', '1').returncode, 0)
+        old = self.invoke('--limit', '1', '--n-predict', '32')
+        self.assertEqual(old.returncode, 2)
+        self.assertIn('different configuration', old.stderr)
+        old = self.invoke('--limit', '1', '--context-padding', '256')
+        self.assertEqual(old.returncode, 2)
+        self.assertIn('different configuration', old.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
         self.assertEqual(dry.returncode, 0, dry.stderr)
-        self.assertIn('ctx=2304', dry.stdout)
+        self.assertIn('ctx=2048', dry.stdout)
         self.assertFalse(self.out.exists())
         self.assertEqual(self.invoke('--only-prompt','prompt_1024_10.txt').returncode, 0)
         result = self.load('prompt_1024_10.txt')[-1]
         self.assertEqual(result['prompt_tokens_hint'], 1855)
-        self.assertEqual(result['context'], 2304)
+        self.assertEqual(result['context'], 2048)
+        self.assertEqual(result['command'][result['command'].index('-n') + 1], '1')
 
 
 if __name__ == '__main__':
