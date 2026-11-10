@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import csv
 import hashlib
 import json
@@ -295,6 +296,54 @@ def inference_env(args, folder, tokens):
     return env
 
 
+FAILURE_LINE = re.compile(
+    r"(?:\berror\b|\bfail(?:ed|ure)?\b|\breject(?:ed)?\b|"
+    r"\bexception\b|\babort\b|out.of.memory|"
+    r"cuda.*(?:error|alloc)|\bOOM\b|"
+    r"missing|cannot|unsupported|assertion|traceback)",
+    re.IGNORECASE,
+)
+
+
+def failure_report(folder, row):
+    """Show a bounded, actionable engine-log excerpt when a prompt fails.
+
+    Never infer the reason from prefill=None: inspect the engine's stderr and
+    retain the excerpt on disk for comparison with later attempts.
+    """
+    log = folder / "engine.stderr.log"
+    lines = deque(maxlen=45)
+    suspicious = deque(maxlen=18)
+    if log.is_file():
+        with log.open("r", encoding="utf-8", errors="replace") as stream:
+            for original in stream:
+                line = original.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                lines.append(line[-600:])
+                if FAILURE_LINE.search(line):
+                    suspicious.append(line[-600:])
+    parts = [
+        f"[ENGINE_FAIL] prompt={row.get('prompt_file')} "
+        f"status={row.get('status')} exit_code={row.get('exit_code')} "
+        f"prefill={row.get('prefill_tps')}",
+        f"[ENGINE_FAIL] log={log}",
+    ]
+    if suspicious:
+        parts.append("[ENGINE_FAIL] Recent error/reject/failure lines:")
+        parts.extend(suspicious)
+    if lines:
+        parts.append("[ENGINE_FAIL] Last 45 nonempty stderr lines:")
+        parts.extend(lines)
+    else:
+        parts.append("[ENGINE_FAIL] stderr is empty or missing. "
+                     "Inspect exit.json and output.stdout.txt.")
+    report = "\n".join(parts) + "\n"
+    (folder / "failure-summary.txt").write_text(report, encoding="utf-8")
+    print(report, file=sys.stderr, flush=True)
+    return report
+
+
 def run_prompt(args, root, commit, group, prompt, tokens, digest):
     previous = folders_for(args.out, prompt)
     number = max((int(p.name.split("-")[1]) for p in previous), default=0) + 1
@@ -370,8 +419,10 @@ def run_prompt(args, root, commit, group, prompt, tokens, digest):
     old.write_phone_copy_timeline(folder)
     write_json(folder / "result.json", row)
     print(f"  {row['status']}: prefill={row['prefill_tps']} tok/s "
-          f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s",
-          flush=True)
+          f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s "
+          f"exit_code={row['exit_code']}", flush=True)
+    if row["status"] != "PASS":
+        failure_report(folder, row)
     return row
 
 
@@ -443,8 +494,10 @@ def main():
                     help="prompt folder; omitted => use saved sweep-config.json on resume")
     ap.add_argument("--out", type=Path,
                     default=repo / "32b-g8p6-sharegpt40")
-    ap.add_argument("--limit", type=int, default=0,
-                    help="max prompts this invocation; 0 = all pending")
+    ap.add_argument("--limit", type=int, default=1,
+                    help="max prompts this invocation; default 1, 0 = all pending")
+    ap.add_argument("--continue-on-fail", action="store_true",
+                    help="explicit opt-in to continue after an inference failure")
     ap.add_argument("--rerun", default="",
                     help="rerun this exact prompt, e.g. prompt_512_01.txt")
     ap.add_argument("--rerun-all", action="store_true")
@@ -534,6 +587,12 @@ def main():
               f"PASS={passed} PENDING={pending}", flush=True)
         if row["status"] == "INTERRUPTED":
             return 130
+        if row["status"] != "PASS" and not args.continue_on_fail:
+            print("[SWEEP_STOP] Inference failed. Stopping here to avoid "
+                  "repeating the failure on all prompts. "
+                  "See failure-summary.txt in the attempt directory.",
+                  file=sys.stderr, flush=True)
+            return 1
     return 0
 
 
