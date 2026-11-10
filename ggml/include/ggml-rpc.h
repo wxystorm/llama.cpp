@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    29
+#define RPC_PROTO_PATCH_VERSION    30
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -249,6 +249,16 @@ struct ggml_backend_rpc_phone_owned_plan {
 using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
     ggml_backend_t backend,
     const ggml_backend_rpc_phone_owned_plan * plan);
+
+// Patch 30: preload immutable Phone HTP Transformer weights BEFORE Prefill.
+// The PC derives the Region/layer range from its immutable model-owned Plan
+// and sends it once when the inference Context is initialized. No RUN,
+// KV, activation or Chunk Graph is allocated by this operation.
+#define GGML_BACKEND_RPC_PHONE_NPU_WEIGHT_PRELOAD_PROC \
+    "ggml_backend_rpc_phone_npu_weight_preload"
+using ggml_backend_rpc_phone_npu_weight_preload_t = bool (*)(
+    ggml_backend_t backend, uint32_t region,
+    uint32_t first_layer, uint32_t layer_count);
 
 // One-time canonical Decode KV destination binding; no per-Chunk Graph.
 #define GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC \
