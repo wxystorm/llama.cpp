@@ -210,8 +210,7 @@ def ensure_config(args, commit):
     current = stable_config(args, commit)
     previous = read_json(path)
     if previous is None:
-        write_json(path, current)
-    elif previous != current:
+        # Do not overwrite an older sweep\'s summary.csv or attempt folders.\n        if any(args.out.iterdir()):\n            raise RuntimeError(\n                "Output directory contains older results but no sweep-config.json: " +\n                str(args.out) + ". Use a fresh -Out to preserve those results."\n            )\n        write_json(path, current)\n    elif previous != current:
         changed = [key for key in sorted(set(current) | set(previous))
                    if current.get(key) != previous.get(key)]
         raise RuntimeError(
