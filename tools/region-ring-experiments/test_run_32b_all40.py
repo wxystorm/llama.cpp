@@ -28,8 +28,23 @@ if behavior=='wrong_layout' and prompt=='prompt_128_01.txt':
   sys.exit(0)
 if behavior=='timeout' and prompt=='prompt_128_01.txt': time.sleep(2)
 layout=os.environ['LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT']
+xg=int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XG'])
+force=os.environ.get('LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH')=='1'
+tokens=167
+active=(tokens>=2*xg or force) and tokens>1
+ring={'type':'region_ring','complete':1,'status':0,'tokens':tokens,
+      'layout':layout,'xc':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XC']),
+      'xg':xg,'xp':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XP']),
+      'gpu_bank_streaming':active,'gpu_bank_min_tokens':2*xg,
+      'gpu_bank_force_small_batch':force,
+      'gpu_bank_small_batch_override_applied':force and tokens<2*xg and active,
+      'bank_refills':3 if active else 0,
+      'bank_h2d_ms':400 if active else 0,'bank_gpu_wait_ms':120 if active else 0,
+      'bank_mover_wall_ms':500 if active else 0,'gpu_weight_stage_ms':100}
+if behavior=='old_engine': ring.pop('gpu_bank_force_small_batch')
+if behavior=='inactive_mover': ring['gpu_bank_streaming']=False
 with config.open('w') as f:
-  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':layout,'xc':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XC']),'xg':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XG']),'xp':int(os.environ['LLAMA_HYBRID_REGION_RING_FORCE_XP'])}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
+  for x in [{'type':'measurement_start'}, ring, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
     f.write(json.dumps(x)+'\\n')
 '''
 
@@ -227,6 +242,76 @@ class All40Tests(unittest.TestCase):
         r = self.invoke('--layout', 'G8,C0,P56', '--limit', '1')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.load('prompt_128_01.txt')[-1]['layout'], 'G8,P56')
+
+    def test_xg96_force_short_mover_and_metrics(self):
+        out = self.root/'force-short-out'
+        options = ('--out', str(out), '--xg', '96',
+                   '--force-small-batch-mover', '--limit', '1')
+        result = self.invoke(*options)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('[GPU_BANK_FORCE_SHORT] active=True', result.stdout)
+        row = json.loads(next((out/'runs/prompt_128_01').glob('attempt-*/result.json')).read_text())
+        self.assertEqual(row['status'], 'PASS')
+        self.assertTrue(row['gpu_bank_force_small_batch'])
+        self.assertTrue(row['gpu_bank_streaming'])
+        self.assertTrue(row['gpu_bank_small_batch_override_applied'])
+        self.assertEqual(row['gpu_bank_min_tokens'], 192)
+        self.assertEqual(row['bank_refills'], 3)
+        self.assertEqual(row['bank_h2d_ms'], 400)
+        self.assertEqual(row['bank_gpu_wait_ms'], 120)
+        self.assertEqual(row['env_overrides'][
+            'LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH'], '1')
+        self.assertTrue(json.loads((out/'run-config.json').read_text())[
+            'force_small_batch_mover'])
+        with (out/'summary.csv').open(encoding='utf-8-sig') as stream:
+            summary = next(csv.DictReader(stream))
+        self.assertEqual(summary['gpu_bank_streaming'], 'True')
+        self.assertEqual(summary['bank_refills'], '3')
+        # Same settings can force rerun without overwriting attempt-0001.
+        again = self.invoke(*options, '--only-prompt', 'prompt_128_01.txt',
+                            '--rerun-all')
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(len(list((out/'runs/prompt_128_01').glob(
+            'attempt-*/result.json'))), 2)
+
+    def test_xg96_mover_off_stays_on_demand(self):
+        result = self.invoke('--xg', '96', '--limit', '1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.load('prompt_128_01.txt')[-1]
+        self.assertEqual(row['status'], 'PASS')
+        self.assertFalse(row['gpu_bank_streaming'])
+        self.assertEqual(row['gpu_bank_min_tokens'], 192)
+        self.assertEqual(row['bank_refills'], 0)
+        self.assertNotIn('LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH',
+                         row['env_overrides'])
+
+    def test_force_mover_old_engine_or_inactive_rejected(self):
+        (self.root/'behavior.txt').write_text('old_engine')
+        options = ('--xg', '96', '--force-small-batch-mover', '--limit', '1')
+        old = self.invoke(*options)
+        self.assertEqual(old.returncode, 1)
+        self.assertEqual(self.load('prompt_128_01.txt')[-1]['status'],
+                         'MOVER_UNVERIFIED')
+        (self.root/'behavior.txt').write_text('inactive_mover')
+        inactive = self.invoke(*options)
+        self.assertEqual(inactive.returncode, 1)
+        self.assertEqual(self.load('prompt_128_01.txt')[-1]['status'],
+                         'MOVER_INACTIVE')
+
+    def test_force_mover_requires_streaming_and_distinct_config(self):
+        for opts in (('--streaming', 'off'),
+                     ('--auto-plan',),
+                     ('--layout', 'G8,P56')):
+            result = self.invoke('--force-small-batch-mover', *opts,
+                                 '--limit', '1')
+            self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.invoke('--xg', '96', '--limit', '1').returncode, 0)
+        changed = self.invoke('--xg', '96', '--force-small-batch-mover',
+                              '--limit', '1')
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn('different configuration', changed.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
 
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
