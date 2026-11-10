@@ -7099,7 +7099,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const auto next = bank_aware_gpu ?
                         ready.wait_take(
                             device, stages.size(), -1,
-                            bank_is_resident, &bank_queue_wait_us) :
+                            bank_is_resident, &bank_queue_wait_us,
+                            gpu_only_ring) :
                         ready.wait_take(
                             device,
                             prefer_phone_graph ?
