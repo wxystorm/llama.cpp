@@ -142,7 +142,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         if (!ring_tensor) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
-                "reason=REQUIRES_RING_TENSOR\\n");
+                "reason=REQUIRES_RING_TENSOR\n");
             return false;
         }
 
@@ -154,8 +154,10 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                 return false;
             }
             ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            // The streamed GPU Scheduler is CUDA-only. Do not pick an
+            // unrelated Vulkan/OpenCL GPU when more than one backend exists.
             return reg != nullptr &&
-                   ggml_backend_reg_name(reg) != std::string("RPC");
+                   std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
         };
 
         if (params.devices != nullptr) {
@@ -171,7 +173,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             if (count != 1 || cuda_dev == nullptr) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
-                    "reason=EXPLICIT_DEVICE_MUST_BE_SINGLE_LOCAL_GPU\\n");
+                    "reason=EXPLICIT_DEVICE_MUST_BE_SINGLE_LOCAL_GPU\n");
                 return false;
             }
         } else {
@@ -186,13 +188,13 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         if (cuda_dev == nullptr) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
-                "reason=NO_LOCAL_GPU\\n");
+                "reason=NO_LOCAL_GPU\n");
             return false;
         }
         model->devices.push_back({ false, cuda_dev });
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_ONLY_DEVICES] cuda=%s meta=NONE rpc=NONE "
-            "transformer=CUDA bank_mover=CPU status=READY\\n",
+            "transformer=CUDA bank_mover=CPU status=READY\n",
             ggml_backend_dev_name(cuda_dev));
         return true;
     }
