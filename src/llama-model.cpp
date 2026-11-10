@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-rpc.h"
 //新加的
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-backend-impl.h"
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -2183,6 +2185,101 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
+    // Concurrent PC/Phone model loading for HTP-only Region Ring.
+    // The model-owned G/P layout is finalized by load_hparams() before this
+    // function runs. Start sending Phone region weight residency *now*, not
+    // after the PC finishes loading or inside the timed Prefill. The Phone
+    // keeps immutable weights cached between RUNs, but KV/Chunk graphs are
+    // intentionally still registered per request.
+    std::future<bool> phone_early_weights;
+    const char * early_rpc = std::getenv("LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC");
+    const char * htp_only = std::getenv("LLAMA_REGION_RING_PHONE_HTP_ONLY");
+    if (early_rpc && *early_rpc &&
+            htp_only && std::strcmp(htp_only, "1") == 0 &&
+            arch == LLM_ARCH_QWEN3 && !hybrid_ring_plan_layout.empty() &&
+            std::strchr(early_rpc, ',') == nullptr) {
+        struct early_phone_region {
+            uint32_t index;
+            uint32_t begin;
+            uint32_t count;
+        };
+        std::vector<early_phone_region> phone_ranges;
+        const auto regions = llama_region_ring_parse_apply_wide_layout(
+            hybrid_ring_plan_layout, n_layer_all);
+        for (size_t i = 0; i < regions.size(); ++i) {
+            if (regions[i].kind == llama_region_ring_stage_kind::PHONE) {
+                phone_ranges.push_back({
+                    static_cast<uint32_t>(i),
+                    static_cast<uint32_t>(regions[i].layer_begin),
+                    static_cast<uint32_t>(
+                        regions[i].layer_end - regions[i].layer_begin),
+                });
+            }
+        }
+        if (!phone_ranges.empty()) {
+            const std::string endpoint(early_rpc);
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PHONE_EARLY_WEIGHTS] event=START"
+                " phase=PC_MODEL_LOAD phone_regions=%zu endpoint=%s"
+                " execution=CONCURRENT status=RUNNING\n",
+                phone_ranges.size(), endpoint.c_str());
+            phone_early_weights = std::async(std::launch::async,
+                [endpoint, phone_ranges]() -> bool {
+                    const int64_t start_us = ggml_time_us();
+                    // The remote backend is already discovered by --rpc,
+                    // but do not dereference a missing registry on failure.
+                    if (!ggml_backend_rpc_add_server(endpoint.c_str())) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PHONE_EARLY_WEIGHTS] event=FAIL"
+                            " reason=RPC_SERVER_NOT_AVAILABLE\n");
+                        return false;
+                    }
+                    ggml_backend_ptr rpc(
+                        ggml_backend_rpc_init(endpoint.c_str(), 0));
+                    if (!rpc) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PHONE_EARLY_WEIGHTS] event=FAIL"
+                            " reason=RPC_BACKEND_UNAVAILABLE\n");
+                        return false;
+                    }
+                    auto dev = ggml_backend_get_device(rpc.get());
+                    auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    auto preload = reg ? reinterpret_cast<
+                        ggml_backend_rpc_phone_npu_weight_preload_t>(
+                        ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_RPC_PHONE_NPU_WEIGHT_PRELOAD_PROC))
+                        : nullptr;
+                    if (!preload) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PHONE_EARLY_WEIGHTS] event=FAIL"
+                            " reason=REMOTE_PRELOAD_UNSUPPORTED\n");
+                        return false;
+                    }
+                    size_t done = 0;
+                    for (const auto & p : phone_ranges) {
+                        const int64_t region_start_us = ggml_time_us();
+                        const bool ok = preload(
+                            rpc.get(), p.index, p.begin, p.count);
+                        LLAMA_LOG_INFO(
+                            "[REGION_RING_PHONE_EARLY_WEIGHTS] event=REGION"
+                            " region=%u first_layer=%u layers=%u"
+                            " wall_ms=%.3f status=%s\n",
+                            p.index, p.begin, p.count,
+                            (ggml_time_us() - region_start_us) / 1000.0,
+                            ok ? "PASS" : "FAIL");
+                        if (!ok) { return false; }
+                        ++done;
+                    }
+                    LLAMA_LOG_INFO(
+                        "[REGION_RING_PHONE_EARLY_WEIGHTS] event=DONE"
+                        " regions=%zu wall_ms=%.3f"
+                        " phase=PC_MODEL_LOAD status=PASS\n",
+                        done, (ggml_time_us() - start_us) / 1000.0);
+                    return true;
+                });
+        }
+    }
+
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
     for (const auto & dev : devices) {
@@ -2807,6 +2904,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     unsigned(checksum));
             }
         }
+    }
+
+    // Only the immutable Phone weight cache is awaited. First-Prompt KV
+    // and HTP Chunk Graphs are still per-RUN. We wait outside Prefill.
+    if (phone_early_weights.valid()) {
+        const int64_t wait_start_us = ggml_time_us();
+        bool loaded = false;
+        try {
+            loaded = phone_early_weights.get();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PHONE_EARLY_WEIGHTS] event=FAIL"
+                " reason=WORKER_EXCEPTION detail=%s\n", e.what());
+        }
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PHONE_EARLY_WEIGHTS] event=JOIN"
+            " wait_ms=%.3f phase=PC_MODEL_LOAD"
+            " status=%s fallback=RUN_REGISTER_ON_DEMAND\n",
+            (ggml_time_us() - wait_start_us) / 1000.0,
+            loaded ? "PASS" : "FAIL");
     }
 
     if (use_mmap_buffer) {
