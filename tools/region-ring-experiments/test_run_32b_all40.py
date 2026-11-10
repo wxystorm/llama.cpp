@@ -329,6 +329,88 @@ class All40Tests(unittest.TestCase):
         self.assertTrue((forced[0]/'run-config.json').exists())
         self.assertFalse((self.root/'32b-g8p6-x128-n1-all40').exists())
 
+    def test_inter_prompt_cooldown_only_between_executed_prompts(self):
+        options = ('--inter-prompt-delay-seconds', '0.15')
+        begin = time.monotonic()
+        first = self.invoke('--limit', '3', *options)
+        duration = time.monotonic() - begin
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout.count('[INTER_PROMPT_PAUSE]'), 2)
+        self.assertIn('after=prompt_128_01.txt before=prompt_128_02.txt', first.stdout)
+        self.assertIn('after=prompt_128_02.txt before=prompt_128_03.txt', first.stdout)
+        self.assertGreaterEqual(duration, 0.28)
+        self.assertEqual(json.loads((self.out / 'run-config.json').read_text())[
+            'inter_prompt_delay_seconds'], 0.15)
+        # First three PASS prompts skip; one new execution has no pause.
+        resume = self.invoke('--limit', '4', *options)
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertEqual(resume.stdout.count('[INTER_PROMPT_PAUSE]'), 0)
+        self.assertEqual(len(self.load('prompt_128_04.txt')), 1)
+
+    def test_inter_prompt_pause_excludes_retries(self):
+        (self.root / 'behavior.txt').write_text('fail_once')
+        run = self.invoke('--limit', '2', '--max-retries', '1',
+                          '--retry-delay', '0',
+                          '--inter-prompt-delay-seconds', '0.10')
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual([v['status'] for v in self.load('prompt_128_01.txt')],
+                         ['FAIL', 'PASS'])
+        self.assertEqual(run.stdout.count('[INTER_PROMPT_PAUSE]'), 1)
+
+    def test_boost_bank_mover_and_no_mmap_are_signature_safe(self):
+        options = ('--xg', '96', '--force-small-batch-mover',
+                   '--boost-bank-mover', '--no-mmap', '--limit', '1')
+        run = self.invoke(*options)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn('bank_mover_priority=ABOVE_NORMAL', run.stdout)
+        self.assertIn('no_mmap=1', run.stdout)
+        row = self.load('prompt_128_01.txt')[0]
+        self.assertEqual(row['status'], 'PASS')
+        self.assertIn('--no-mmap', row['command'])
+        self.assertEqual(row['env_overrides']['LLAMA_REGION_RING_PRIORITY_BANK_MOVER'],
+                         '1')
+        cfg = json.loads((self.out / 'run-config.json').read_text())
+        self.assertTrue(cfg['no_mmap'])
+        self.assertEqual(cfg['bank_mover_priority'], 'ABOVE_NORMAL')
+        self.assertEqual(cfg['effective_runtime_env'][
+            'LLAMA_REGION_RING_PRIORITY_BANK_MOVER'], '1')
+        mismatch = self.invoke('--xg', '96', '--force-small-batch-mover',
+                               '--no-mmap', '--limit', '1')
+        self.assertEqual(mismatch.returncode, 2)
+        self.assertIn('different configuration', mismatch.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+
+    def test_cooldown_defaults_and_preflight_validation(self):
+        common = list(self.common)
+        i = common.index('--inter-prompt-delay-seconds')
+        del common[i:i + 2]
+        dry = subprocess.run([sys.executable, str(RUNNER), *common,
+                              '--dry-run', '--limit', '2'],
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn('between_prompts=5s', dry.stdout)
+        for invalid in ('-1', 'nan', 'inf'):
+            bad = self.invoke('--inter-prompt-delay-seconds', invalid)
+            self.assertEqual(bad.returncode, 2, (invalid, bad.stderr))
+        priority_override = self.invoke(
+            '--env', 'LLAMA_REGION_RING_PRIORITY_BANK_MOVER=1')
+        self.assertEqual(priority_override.returncode, 2)
+        self.assertFalse(self.out.exists())
+
+    def test_default_boost_nommap_output_separates_from_baseline(self):
+        common = list(self.common)
+        i = common.index('--out')
+        del common[i:i + 2]
+        run = subprocess.run(
+            [sys.executable, str(RUNNER), *common,
+             '--boost-bank-mover', '--no-mmap', '--limit', '1'],
+            cwd=self.root, capture_output=True, text=True, timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        boosted = list(self.root.glob('32b-*-boost-mover-nommap-pause0s-all40'))
+        self.assertEqual(len(boosted), 1)
+        self.assertTrue((boosted[0] / 'run-config.json').exists())
+        self.assertFalse((self.root / '32b-g8p6-x128-n1-all40').exists())
+
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
         self.assertEqual(dry.returncode, 0, dry.stderr)
