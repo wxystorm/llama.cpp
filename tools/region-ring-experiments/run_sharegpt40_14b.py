@@ -273,6 +273,11 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     if getattr(args, "htp_only", False):
         # Never let the PC allocate/upload a second copy of Phone weights.
         env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
+        if not getattr(args, "no_early_htp_weight_preload", False):
+            # Model loading can run on PC/Phone in parallel. The C++ loader
+            # converts the immutable G/P layout to Region/layer ranges.
+            # Do not manually configure Phone model layer IDs.
+            env["LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC"] = args.rpc
     # Make the A/B mode explicit even if the parent shell carries old env.
     # Model loading checks this before timed Prefill begins.
     env["LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD"] = (
@@ -504,6 +509,8 @@ def main(argv: list[str] | None = None, *,
                     help="experimental phone HTP-only fresh prefill; requires CPU RPC transport, Phone GGUF, no OpenCL and predict=1")
     ap.add_argument("--preload-gpu-ram", action="store_true",
                     help="pre-touch PC GPU-only mmap weights at model load (best-effort RAM cache, 2 GiB free reserve)")
+    ap.add_argument("--no-early-htp-weight-preload", action="store_true",
+                    help="A/B: retain original on-demand HTP weight loading during Prefill instead of concurrent PC/Phone model-load prefetch")
     ap.add_argument("--model-layers", type=int,
                     default=defaults.get("model_layers", 40),
                     help="required Transformer depth for forced G/P layout (default 40)")
