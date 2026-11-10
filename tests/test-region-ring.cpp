@@ -1269,6 +1269,46 @@ static void test_gpu_bank_early_drain_priority() {
     check(ready.all_done(), "early-drain left GPU-only READY tasks unfinished");
 }
 
+
+static void test_gpu_bank_eight_region_drain() {
+    // 609 tokens, XG=128, 8xG8: matches the observed 32B shape of 40 GPU
+    // Chunk tasks and six A/B reuses. The mocked mover completes a Bank
+    // upload as soon as the source Region drains, validating all transitions
+    // without a CUDA GPU or a large GGUF.
+    std::vector<llama_region_ring_region> regions;
+    for (int rank = 0; rank < 8; ++rank) {
+        regions.emplace_back(
+            llama_region_ring_device::GPU, rank * 8, (rank + 1) * 8);
+    }
+    llama_region_ring_ready ready(regions, 609, 128, 0, true);
+    std::array<std::atomic<size_t>, 2> resident;
+    resident[0].store(0);
+    resident[1].store(1);
+    const llama_region_ring_ready::task_eligibility eligible =
+        [&](const llama_region_ring_task & task) {
+            return resident[task.region % 2].load(
+                std::memory_order_acquire) == task.region;
+        };
+
+    size_t n_tasks = 0;
+    size_t refills = 0;
+    while (!ready.all_done() && n_tasks < 80) {
+        const auto job = ready.try_take(
+            llama_region_ring_device::GPU, eligible, true);
+        check(job.has_value(), "eight-G Region Bank scheduler stalled");
+        ready.complete(*job);
+        ++n_tasks;
+        if (ready.region_done(job->region) && job->region + 2 < regions.size()) {
+            resident[job->region % 2].store(
+                job->region + 2, std::memory_order_release);
+            ready.notify_external_ready();
+            ++refills;
+        }
+    }
+    check(ready.all_done() && n_tasks == 40 && refills == 6,
+          "eight-G Region scheduler did not finish 40 tasks and six refills");
+}
+
 static void test_gpu_weight_two_bank_policy() {
     const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
 
@@ -1684,6 +1724,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_ready_selection=PASS\n");
         test_gpu_bank_early_drain_priority();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_early_drain_priority=PASS\n");
+        test_gpu_bank_eight_region_drain();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_eight_region_drain=PASS\n");
         test_phone_single_graph_ready_affinity();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_single_graph_ready_affinity=PASS\n");
         test_phone_static_template_shapes();
