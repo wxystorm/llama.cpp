@@ -65,6 +65,10 @@ RESULT_COLUMNS = (
     "ring_complete", "plan_mode", "plan_applied", "plan_source",
     "plan_layout", "plan_baseline_layout", "plan_xc", "plan_xg",
     "plan_xp", "runtime_xc", "runtime_xg", "runtime_xp",
+    "gpu_bank_streaming", "gpu_bank_force_small_batch",
+    "gpu_bank_small_batch_override_applied", "gpu_bank_min_tokens",
+    "bank_refills", "bank_h2d_ms", "bank_gpu_wait_ms",
+    "bank_mover_wall_ms", "gpu_weight_stage_ms",
     "plan_predicted_ms", "plan_baseline_predicted_ms",
     "phone_native_profile_points", "error", "result_file",
 )
@@ -191,7 +195,8 @@ def prompts_in(folder: Path):
 
 def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
                   fixed_layout=FIXED_LAYOUT, xc=CHUNK_TOKENS,
-                  xg=CHUNK_TOKENS, xp=CHUNK_TOKENS):
+                  xg=CHUNK_TOKENS, xp=CHUNK_TOKENS,
+                  force_small_batch_mover=False):
     perf = {}
     ring = []
     planner = {}
@@ -246,6 +251,20 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
     ring_complete = bool(ring) and all(
         bool(item.get("complete")) and item.get("status") == 0 for item in ring
     )
+    prefill_rings = [item for item in ring
+                     if int(item.get("tokens") or 0) > 1]
+    # In opt-in mode, an old executable may silently ignore the new env.
+    # Never call such a run PASS without an explicit runtime acknowledgement.
+    mover_unverified = force_small_batch_mover and (
+        not prefill_rings or any(
+            item.get("gpu_bank_force_small_batch") is not True
+            for item in prefill_rings))
+    mover_inactive = force_small_batch_mover and any(
+        item.get("gpu_bank_streaming") is not True
+        for item in prefill_rings)
+    def stage_sum(field):
+        return round(sum(float(row.get(field) or 0)
+                         for row in prefill_rings), 3)
     if exit_code is None:
         status = "INTERRUPTED"
     elif exit_code == -9:
@@ -262,6 +281,10 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         status = "NO_PREFILL"
     elif not ring_complete:
         status = "INCOMPLETE_RING"
+    elif mover_unverified:
+        status = "MOVER_UNVERIFIED"
+    elif mover_inactive:
+        status = "MOVER_INACTIVE"
     elif auto_plan and (not planner or not isinstance(planner.get("applied"), bool)):
         status = "NO_PLAN"
     elif auto_plan and planner.get("applied") and (
@@ -293,6 +316,20 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         "runtime_xc": ring[0].get("xc") if ring else None,
         "runtime_xg": ring[0].get("xg") if ring else None,
         "runtime_xp": ring[0].get("xp") if ring else None,
+        "gpu_bank_streaming": any(
+            row.get("gpu_bank_streaming") is True for row in prefill_rings),
+        "gpu_bank_force_small_batch": any(
+            row.get("gpu_bank_force_small_batch") is True for row in prefill_rings),
+        "gpu_bank_small_batch_override_applied": any(
+            row.get("gpu_bank_small_batch_override_applied") is True
+            for row in prefill_rings),
+        "gpu_bank_min_tokens": (
+            prefill_rings[0].get("gpu_bank_min_tokens") if prefill_rings else None),
+        "bank_refills": int(stage_sum("bank_refills")),
+        "bank_h2d_ms": stage_sum("bank_h2d_ms"),
+        "bank_gpu_wait_ms": stage_sum("bank_gpu_wait_ms"),
+        "bank_mover_wall_ms": stage_sum("bank_mover_wall_ms"),
+        "gpu_weight_stage_ms": stage_sum("gpu_weight_stage_ms"),
         "plan_predicted_ms": planner.get("predicted_ms") if auto_plan else None,
         "plan_baseline_predicted_ms": planner.get("baseline_predicted_ms") if auto_plan else None,
         "phone_native_profile_points": phone_native_points,
@@ -337,7 +374,8 @@ def write_summary(out: Path, prompts):
     counts = {name: sum(v["status"] == name for v in latest.values())
               for name in ("PASS", "PENDING", "FAIL", "NO_METRICS", "NO_PERF",
                            "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT",
-                           "NO_PLAN", "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED")}
+                           "NO_PLAN", "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED",
+                           "MOVER_UNVERIFIED", "MOVER_INACTIVE")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
                                       "counts": counts, "summary_csv": str(path)})
     return counts
@@ -467,7 +505,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
         elapsed = (time.monotonic() - start) * 1000
         row.update(parse_metrics(trial, code, elapsed, auto_plan=args.auto_plan,
                                  fixed_layout=args.layout, xc=args.xc,
-                                 xg=args.xg, xp=args.xp))
+                                 xg=args.xg, xp=args.xp,
+                                 force_small_batch_mover=args.force_small_batch_mover))
         row["end_time"] = utc_now()
         row["result_file"] = str(result_file)
         save_json(result_file, row)
@@ -687,6 +726,12 @@ def main(argv=None):
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
+                if args.force_small_batch_mover:
+                    print(f"  [GPU_BANK_FORCE_SHORT] active={row.get('gpu_bank_streaming')} "
+                          f"override_applied={row.get('gpu_bank_small_batch_override_applied')} "
+                          f"refills={row.get('bank_refills')} "
+                          f"mover_ms={row.get('bank_mover_wall_ms')} "
+                          f"gpu_wait_ms={row.get('bank_gpu_wait_ms')}", flush=True)
                 if args.auto_plan:
                     print(f"  [PLAN] applied={row.get('plan_applied')} "
                           f"source={row.get('plan_source')} "
