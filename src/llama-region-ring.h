@@ -734,6 +734,28 @@ inline bool llama_region_ring_single_cycle_force_compatible(
 // Legacy fixed layouts and automatic Planner search retain 2-4 cycles.
 inline constexpr int LLAMA_REGION_RING_APPLY_MAX_CYCLES = 8;
 
+// GPU-only regions are consecutive CUDA weight windows; GPU ranks alternate
+// between two fixed physical weight banks (A/B), independently of the CPU
+// staging thread which only moves weights and handles embedding/output.
+inline bool llama_region_ring_gpu_only_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions, int n_layer) {
+    if (regions.size() < 2 ||
+        regions.size() > LLAMA_REGION_RING_APPLY_MAX_CYCLES || n_layer <= 0) {
+        return false;
+    }
+    int next_layer = 0;
+    for (const auto & region : regions) {
+        if (region.device != llama_region_ring_device::GPU ||
+            region.kind != llama_region_ring_stage_kind::GPU ||
+            region.layer_begin != next_layer ||
+            region.layer_end <= next_layer || region.layer_end > n_layer) {
+            return false;
+        }
+        next_layer = region.layer_end;
+    }
+    return next_layer == n_layer;
+}
+
 // The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
 // Ordinary fixed/legacy parsing stays strict and unchanged.
 inline bool llama_region_ring_apply_topology_compatible(
@@ -793,7 +815,8 @@ llama_region_ring_parse_optional_cpu_cycles(
         }
     }
     if (layer != n_layer || regions.empty() ||
-            !llama_region_ring_apply_topology_compatible(regions, n_layer)) {
+            (!llama_region_ring_apply_topology_compatible(regions, n_layer) &&
+             !llama_region_ring_gpu_only_topology_compatible(regions, n_layer))) {
         throw std::runtime_error("invalid forced G,[C],[P] cycle topology");
     }
     return regions;
