@@ -7981,8 +7981,23 @@ bool rpc_server::phone_owned_plan_register(
         ggml_phone_npu_serial::full_region_executor::
             model_load_stats loaded {};
         std::string load_reason;
+        const int64_t weight_begin_us = ggml_time_us();
         const bool resident = child_executor->load_model_layer(
             local_tensor_source, child.layer, load_reason, loaded);
+        GGML_LOG_INFO(
+            "[PHONE_NPU_SESSION] event=WEIGHT_CACHE_LOOKUP"
+            " run=%" PRIu64 " region=%u layer=%u backend=%s"
+            " new_weights=%zu read_ms=%.3f repack_ms=%.3f"
+            " wall_ms=%.3f cache=%s status=%s reason=%s\n",
+            plan.run_id, plan.region, child.layer,
+            phone_npu_name_for_region_layer(
+                plan.region, child.layer - plan.layer),
+            loaded.new_weights, loaded.file_read_ms,
+            loaded.htp_repack_ms,
+            (ggml_time_us() - weight_begin_us) / 1000.0,
+            loaded.new_weights == 0 ? "HIT" : "MISS",
+            resident ? "PASS" : "FAIL",
+            resident ? "NONE" : load_reason.c_str());
         if (!resident) {
             GGML_LOG_WARN(
                 "[PHONE_NPU_SESSION] event=ON_DEMAND_LOAD"
