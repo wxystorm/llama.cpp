@@ -159,7 +159,16 @@ if ($code -ne 0) {
     }
 }
 if ($code -eq 0) {
-    & python (Join-Path $PSScriptRoot "verify_gpu_only_double_bank.py") --metrics (Join-Path $base "metrics.jsonl") --regions $cycleCount
-    if ($LASTEXITCODE -ne 0) { exit 2 }
+    # The Python verifier may report a legitimate failed check via stderr.
+    # Do not let Windows PowerShell 5.1 promote it into a terminating error.
+    $savedErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & python (Join-Path $PSScriptRoot "verify_gpu_only_double_bank.py") --metrics (Join-Path $base "metrics.jsonl") --regions $cycleCount
+        $verifyCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorPreference
+    }
+    if ($verifyCode -ne 0) { exit 2 }
 }
 exit $code
