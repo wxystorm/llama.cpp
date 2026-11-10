@@ -273,9 +273,11 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     if getattr(args, "htp_only", False):
         # Never let the PC allocate/upload a second copy of Phone weights.
         env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
-    if getattr(args, "preload_gpu_ram", False):
-        # Fault only the PC CUDA layer weight pages into RAM before Prefill.
-        env["LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD"] = "1"
+    # Make the A/B mode explicit even if the parent shell carries old env.
+    # Model loading checks this before timed Prefill begins.
+    env["LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD"] = (
+        "1" if getattr(args, "preload_gpu_ram", False) else "0"
+    )
     token_count = (plan or {}).get("plan_tokens",
                     getattr(args, "token_counts", {}).get(prompt.name.lower(), group))
     context = (plan or {}).get("context") or context_for_tokens(
