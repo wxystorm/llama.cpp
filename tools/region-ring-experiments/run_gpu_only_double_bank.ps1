@@ -82,7 +82,7 @@ $overrides = @{
 }
 $argsList = @(
     "-m", [IO.Path]::GetFullPath($Model),
-    "--split-mode", "tensor", "--flash-attn", "on",
+    "--split-mode", "tensor", "-fit", "off", "--flash-attn", "on",
     "-c", "$Context", "-b", "$Batch", "-ub", "$UBatch",
     "-n", "$NPredict", "-t", "$Threads",
     "--no-conversation", "-f", [IO.Path]::GetFullPath($Prompt),
@@ -154,7 +154,12 @@ Write-Host "[GPU_ONLY] engine_exit=$code metrics=$(Join-Path $base 'metrics.json
 if ($code -ne 0) {
     Write-Warning "Inference engine failed with exit code $code. Last stderr lines:"
     if (Test-Path -LiteralPath $stderrLog -PathType Leaf) {
-        Get-Content -LiteralPath $stderrLog -Tail 50 |
+        Get-Content -LiteralPath $stderrLog -Tail 70 |
+            ForEach-Object { Write-Host $_ }
+    }
+    if (Test-Path -LiteralPath $stdoutLog -PathType Leaf) {
+        Write-Host "[GPU_ONLY] Last stdout lines:"
+        Get-Content -LiteralPath $stdoutLog -Tail 30 |
             ForEach-Object { Write-Host $_ }
     }
 }
