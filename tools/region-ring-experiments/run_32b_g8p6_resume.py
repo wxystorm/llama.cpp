@@ -367,6 +367,11 @@ def main():
     ap.add_argument("--no-ram-preload", action="store_true")
     ap.add_argument("--no-trace", action="store_true")
     args = ap.parse_args()
+    # Reuse the existing sweep's telemetry-to-CSV parser unchanged.
+    args.planner = "apply-wide"
+    args.skip_profile = True
+    args.streaming = "on"
+    args.no_mmap = False
     if (args.limit < 0 or args.min_tps < 0 or args.ubatch <= 0 or
             args.batch < args.ubatch or args.predict <= 0 or
             args.min_context <= 0 or args.padding < 0):
