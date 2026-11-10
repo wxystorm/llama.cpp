@@ -1694,6 +1694,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             llama_region_ring_apply_topology_compatible(
                 forced_regions, hparams.n_layer()) ||
             llama_region_ring_single_cycle_force_compatible(
+                forced_regions, hparams.n_layer()) ||
+            llama_region_ring_gpu_only_topology_compatible(
                 forced_regions, hparams.n_layer());
         if (!topology_ok || forced_regions.empty() ||
                 (forced_regions.back().device !=
@@ -1861,8 +1863,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
                         ring_regions, n_layer) :
                 selected_single_cycle ?
                     true :
-                    llama_region_ring_apply_topology_compatible(
-                        ring_regions, n_layer);
+                    (llama_region_ring_apply_topology_compatible(
+                        ring_regions, n_layer) ||
+                     llama_region_ring_gpu_only_topology_compatible(
+                        ring_regions, n_layer));
             const bool ownership_ok = (apply_cgp || apply_wide) ?
                 ((apply_wide || ring_regions.size() == 9) &&
                  selected_topology_ok &&
