@@ -6,7 +6,9 @@ param(
     [Parameter(Mandatory = $true)][string] $Rpc,
     [string] $Exe = "",
     [string] $PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
-    [string] $Out = ".\32b-g8p6-x128-n1-all40",
+    [string] $Out = "",
+    [switch] $AutoPlan,
+    [string] $RealStageProfileCsv = "",
     [ValidateSet("on", "off")][string] $Streaming = "on",
     [int] $Batch = 2048,
     [int] $UBatch = 2048,
@@ -31,6 +33,12 @@ param(
     [string[]] $EnvOverride = @()
 )
 $ErrorActionPreference = "Stop"
+if ([string]::IsNullOrWhiteSpace($Out)) {
+    $Out = if ($AutoPlan) { ".\32b-auto-plan-n1-all40" } else { ".\32b-g8p6-x128-n1-all40" }
+}
+if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv) -and -not $AutoPlan) {
+    throw "-RealStageProfileCsv requires -AutoPlan."
+}
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 if ([string]::IsNullOrWhiteSpace($Exe)) {
     $Exe = Join-Path $repoRoot "build-tensor-v2\bin\Release\llama-completion.exe"
@@ -48,6 +56,10 @@ $arguments = @(
     "--max-retries", "$MaxRetries", "--retry-delay", "$RetryDelaySeconds",
     "--timeout", "$TimeoutSeconds", "--limit", "$Limit"
 )
+if ($AutoPlan) { $arguments += "--auto-plan" }
+if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv)) {
+    $arguments += @("--real-stage-profile-csv", $RealStageProfileCsv)
+}
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($RerunAll) { $arguments += "--rerun-all" }
 if ($RetryFailedOnly) { $arguments += "--retry-failed-only" }
