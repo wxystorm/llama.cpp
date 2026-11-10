@@ -7,7 +7,7 @@
 param(
     [string] $Model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
     [string] $Rpc = "10.39.52.114:50052",
-    [string] $PromptDir = "D:\prima.cpp\prompts",
+    [string] $PromptDir = "",
     [string] $Out = ".\32b-g8p6-sharegpt40",
     [string] $Exe = "",
     [string] $Tokenizer = "",
@@ -40,7 +40,7 @@ if (-not $Tokenizer) {
 $python = (Get-Command python -ErrorAction Stop).Source
 $callArgs = @(
     (Join-Path $PSScriptRoot "run_32b_g8p6_resume.py"),
-    "--model", $Model, "--rpc", $Rpc, "--prompt-dir", $PromptDir,
+    "--model", $Model, "--rpc", $Rpc,
     "--out", $Out, "--exe", $Exe, "--tokenizer", $Tokenizer,
     "--limit", "$Limit", "--min-tps", "$MinTps",
     "--batch", "$Batch", "--ubatch", "$UBatch",
@@ -48,6 +48,7 @@ $callArgs = @(
     "--seed", "$Seed", "--min-context", "$MinContext",
     "--padding", "$ContextPadding", "--log-verbosity", "$LogVerbosity"
 )
+if ($PromptDir) { $callArgs += @("--prompt-dir", $PromptDir) }
 if ($Rerun) { $callArgs += @("--rerun", $Rerun) }
 if ($RerunAll) { $callArgs += "--rerun-all" }
 if ($Group -gt 0) { $callArgs += @("--group", "$Group") }
