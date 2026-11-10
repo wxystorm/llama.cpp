@@ -127,15 +127,24 @@ def default_out(args) -> Path:
     if (args.layout == FIXED_LAYOUT and args.chunk == CHUNK_TOKENS and
             args.xc == CHUNK_TOKENS and args.xg == CHUNK_TOKENS and
             args.xp == CHUNK_TOKENS and args.n_predict == 1 and
-            not args.force_small_batch_mover):
-        return Path("32b-g8p6-x128-n1-all40")  # backward-compatible default
+            not args.force_small_batch_mover and not args.boost_bank_mover and
+            not args.no_mmap and args.inter_prompt_delay_seconds == 5):
+        return Path("32b-g8p6-x128-n1-all40")  # normal-mode default
     slug = args.layout.lower().replace(",", "-")
     if len(slug) > 48:
         slug = slug[:37].rstrip("-") + "-" + hashlib.sha256(
             args.layout.encode("ascii")).hexdigest()[:8]
-    mover = "-force-short-mover" if args.force_small_batch_mover else ""
+    suffix = ""
+    if args.force_small_batch_mover:
+        suffix += "-force-short-mover"
+    if args.boost_bank_mover:
+        suffix += "-boost-mover"
+    if args.no_mmap:
+        suffix += "-nommap"
+    if args.inter_prompt_delay_seconds != 5:
+        suffix += f"-pause{args.inter_prompt_delay_seconds:g}s"
     return Path(f"32b-{slug}-base{args.chunk}-xc{args.xc}-xg{args.xg}"
-                f"-xp{args.xp}-n{args.n_predict}{mover}-all40")
+                f"-xp{args.xp}-n{args.n_predict}{suffix}-all40")
 
 
 def utc_now():
