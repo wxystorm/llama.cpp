@@ -1215,6 +1215,60 @@ static void test_gpu_bank_ready_selection() {
     check(!cancelled_task, "cancel did not wake Bank-filtered GPU Worker");
 }
 
+
+static void test_gpu_bank_early_drain_priority() {
+    // Default FIFO interleaves G0 and G1. Streaming on one physical GPU is
+    // faster when G0 drains as soon as its own chunks are ready: then G2
+    // uploads to Bank A while G1 still has an entire Region to compute.
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::GPU, 0, 1},
+        {llama_region_ring_device::GPU, 1, 2},
+        {llama_region_ring_device::GPU, 2, 3},
+    };
+    llama_region_ring_ready ready(regions, 32, 16, 0, true);
+    std::array<std::atomic<size_t>, 2> resident;
+    resident[0].store(0);
+    resident[1].store(1);
+    const llama_region_ring_ready::task_eligibility eligible =
+        [&](const llama_region_ring_task & task) {
+            return resident[task.region % 2].load(
+                std::memory_order_acquire) == task.region;
+        };
+
+    auto first = ready.try_take(llama_region_ring_device::GPU, eligible, true);
+    check(first && first->region == 0 && first->chunk == 0,
+          "early-drain G0c0 missing");
+    ready.complete(*first);
+
+    // FIFO head is G1c0, but the oldest resident G0c1 is also causally READY.
+    auto next = ready.try_take(llama_region_ring_device::GPU, eligible, true);
+    check(next && next->region == 0 && next->chunk == 1,
+          "early-drain failed to finish Bank A before Bank B");
+    ready.complete(*next);
+    check(ready.region_done(0), "early-drain failed to release Bank A");
+
+    resident[0].store(std::numeric_limits<size_t>::max(),
+                      std::memory_order_release);
+    next = ready.try_take(llama_region_ring_device::GPU, eligible, true);
+    check(next && next->region == 1 && next->chunk == 0,
+          "early-drain failed to continue resident Bank B");
+    ready.complete(*next);
+    next = ready.try_take(llama_region_ring_device::GPU, eligible, true);
+    check(next && next->region == 1 && next->chunk == 1,
+          "G2/A stalled G1/B before upload completion");
+    ready.complete(*next);
+
+    resident[0].store(2, std::memory_order_release);
+    ready.notify_external_ready();
+    for (size_t chunk = 0; chunk < 2; ++chunk) {
+        next = ready.try_take(llama_region_ring_device::GPU, eligible, true);
+        check(next && next->region == 2 && next->chunk == chunk,
+              "early-drain GPU ownership broke G2 chunk ordering");
+        ready.complete(*next);
+    }
+    check(ready.all_done(), "early-drain left GPU-only READY tasks unfinished");
+}
+
 static void test_gpu_weight_two_bank_policy() {
     const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
 
@@ -1628,6 +1682,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_gpu_bank_ready_selection();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_ready_selection=PASS\n");
+        test_gpu_bank_early_drain_priority();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_early_drain_priority=PASS\n");
         test_phone_single_graph_ready_affinity();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_single_graph_ready_affinity=PASS\n");
         test_phone_static_template_shapes();
