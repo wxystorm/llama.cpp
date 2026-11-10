@@ -24,6 +24,7 @@ param(
     [int] $Limit = 0,
     [double] $Delay = 2,
     [switch] $NoMmap,
+    [switch] $HtpOnly,
     [switch] $DryRun,
     [ValidateSet("model","manifest")][string] $TokenSource = "model",
     [string] $TokenizerExe = "",
@@ -58,6 +59,7 @@ foreach ($name in $Only) { $callArgs += @("--only", $name) }
 foreach ($name in $Rerun) { $callArgs += @("--rerun", $name) }
 if ($DryRun) { $callArgs += "--dry-run" }
 if ($NoMmap) { $callArgs += "--no-mmap" }
+if ($HtpOnly) { $callArgs += "--htp-only" }
 if ($UpdateTokens) { $callArgs += "--update-tokens" }
 if ($TokenizerExe -ne "") { $callArgs += @("--tokenizer-exe", $TokenizerExe) }
 & $python.Source @callArgs
