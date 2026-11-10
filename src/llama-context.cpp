@@ -4919,6 +4919,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         has_phone_stage && graphless_requested && ubatch.n_tokens >= 32 &&
         phone_auto_eligible && own_stage_resources &&
         (phone_auto_final_enabled || pc_final_head_enabled);
+    // HTP-only mode is deliberately prefill-only: no PC Phone weights,
+    // no OpenCL Decode KV, and no legacy phone-graph fallback.
+    const char * htp_only_env =
+        std::getenv("LLAMA_REGION_RING_PHONE_HTP_ONLY");
+    const bool htp_only_requested =
+        htp_only_env && std::strcmp(htp_only_env, "1") == 0;
+    const bool phone_htp_only = htp_only_requested && phone_graphless;
+    if (htp_only_requested && !phone_htp_only) {
+        LLAMA_LOG_ERROR(
+            "[PHONE_HTP_ONLY] event=REJECT"
+            " reason=REQUIRES_GRAPHLESS_FRESH_PREFILL"
+            " status=FAIL\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     const char * owned_plan_env =
         std::getenv("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
     const bool owned_plan_requested =
@@ -5784,11 +5799,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 if (!valid) { break; }
                 const uint32_t layer = (uint32_t) stage.layer_begin;
                 ggml_backend_rpc_phone_owned_plan plan {};
-                plan.version = n_phone_layers == 1 ? 2 : 3;
-                // Plan v3 packs contiguous layer count into flags[31:16].
-                // The wire descriptor remains 108 bytes on both endpoints.
-                plan.flags = n_phone_layers == 1 ?
-                    1u : (1u | (uint32_t(n_phone_layers) << 16));
+                // v4 is an explicit HTP-only transport contract. The Phone
+                // registers tasks on Plan receipt without canonical RPC KV.
+                // Versions 2/3 retain the proven OpenCL Decode fallback.
+                plan.version = phone_htp_only ?
+                    ggml_phone_owned::k_htp_only_plan_version :
+                    n_phone_layers == 1 ? 2 : 3;
+                plan.flags = phone_htp_only ?
+                    ggml_phone_owned::flags_for_layers(n_phone_layers) :
+                    n_phone_layers == 1 ?
+                        1u : (1u | (uint32_t(n_phone_layers) << 16));
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
@@ -5826,7 +5846,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_beta_fast = cparams.yarn_beta_fast;
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
                 valid = valid && register_plan(phone_rpc_backend, &plan);
-                if (valid && phone_graphless) {
+                if (valid && phone_htp_only) {
+                    LLAMA_LOG_INFO(
+                        "[PHONE_HTP_ONLY] event=REGION_READY"
+                        " region=%zu layers=%d"
+                        " pc_graph=SKIPPED rpc_kv_bind=SKIPPED"
+                        " opencl_weights=SKIPPED status=READY\n",
+                        r, n_phone_layers);
+                }
+                if (valid && phone_graphless && !phone_htp_only) {
                     for (int sublayer = stage.layer_begin;
                             valid && sublayer < stage.layer_end; ++sublayer) {
                     // Cache storage belongs to the *Meta* outer buffer in
