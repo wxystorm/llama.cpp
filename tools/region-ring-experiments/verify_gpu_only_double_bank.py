@@ -99,16 +99,36 @@ def verify(events, regions):
         overlap = sum(overlaps)
         if overlap > 0:
             verified_overlap += 1
+        prepare_start = event.get("prepare_begin_ms")
+        prepare_end = event.get("prepare_end_ms")
+        prepare_ms = (
+            f"{prepare_end - prepare_start:.3f}"
+            if prepare_start is not None and prepare_end is not None
+            else "UNKNOWN"
+        )
         print(f"[BANK] source=G{source} target=G{target} "
               f"bank={'A' if target % 2 == 0 else 'B'} "
-              f"h2d_ms={end - begin:.3f} overlap_with_G{other}_ms={overlap:.3f}")
+              f"prepare_ms={prepare_ms} "
+              f"h2d_wall_ms={end - begin:.3f} "
+              f"overlap_with_G{other}_ms={overlap:.3f}")
+    def metric(key):
+        value = prefill.get(key)
+        return f"{float(value):.3f}" if value is not None else "UNKNOWN"
+    print(f"[GPU_ONLY_PHASES] bank_prepare_ms={metric('bank_prepare_ms')} "
+          f"bank_stage_cpu_copy_ms={metric('bank_stage_cpu_copy_ms')} "
+          f"bank_h2d_wall_ms={metric('bank_h2d_ms')} "
+          f"bank_mover_wall_ms={metric('bank_mover_wall_ms')} "
+          f"bank_gpu_wait_ms={metric('bank_gpu_wait_ms')}")
+    pipeline = "OVERLAP_MEASURED" if verified_overlap else "NO_OVERLAP_MEASURED"
     print(f"[GPU_ONLY_VERIFY] layout={layout} tokens={prefill['tokens']} "
           f"gpu_tasks={prefill.get('gpu_tasks')} bank_refills={len(refills)} "
           f"overlapped_refills={verified_overlap}/{len(refills)} "
-          f"bank_gpu_wait_ms={prefill.get('bank_gpu_wait_ms')} status=PASS")
+          f"bank_gpu_wait_ms={prefill.get('bank_gpu_wait_ms')} "
+          f"pipeline={pipeline} status=PASS")
     if verified_overlap == 0 and refills:
-        print("[GPU_ONLY_VERIFY] WARNING: no measured H2D/GPU compute overlap; "
-              "mechanism ran, but transfer may be serialized on this system")
+        print("[GPU_ONLY_VERIFY] WARNING: mechanism completed but no host "
+              "timeline H2D/GPU overlap was measured; investigate "
+              "Bank PREPARE serialization, GPU compute duration and H2D speed")
     return {"refills": len(refills), "overlapped_refills": verified_overlap}
 
 
