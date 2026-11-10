@@ -3894,9 +3894,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     std::array<llm_graph_result *, 3> ring_res = {res_use, res_use, res_use};
     // Shared by Bank resource setup and the per-device GPU worker lambda.
     // This must not be scoped only to isolate_device_resources.
+    const bool gpu_only_ring =
+        std::all_of(stages.begin(), stages.end(),
+            [](const llama_hybrid_runtime_stage & stage) {
+                return stage.kind == llama_hybrid_runtime_stage_kind::GPU;
+            });
+    const size_t region_cuda_backend_index = gpu_only_ring ? 0 : 1;
+    const size_t region_cpu_backend_index = gpu_only_ring ? 1 : 2;
     const bool gpu_weight_streaming =
         isolate_device_resources && pc_phone_overlap &&
         model.hybrid_ring_gpu_weight_streaming;
+    if (gpu_only_ring && !gpu_weight_streaming) {
+        LLAMA_LOG_ERROR("[REGION_RING_GPU_ONLY] status=REJECT reason=REQUIRES_WEIGHT_STREAMING\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
 
     // Fixed two-Bank weight streaming. This is not a cache:
     // GPU rank parity chooses the physical Bank permanently.
@@ -3949,12 +3961,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             // GPU Region compute is validated to target CUDA0 only before any
             // split is executed. CPU is a scheduler sentinel, not a compute
             // fallback in this validation mode.
-            const bool topology_ok = backend_ptrs.size() == 3 &&
-                ggml_backend_is_meta(backend_ptrs[0]) &&
-                backend_ptrs[1] != nullptr &&
-                backend_ptrs[2] == backend_cpu &&
-                ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[1])) ==
-                    GGML_BACKEND_DEVICE_TYPE_GPU;
+            const bool topology_ok = gpu_only_ring ?
+                (backend_ptrs.size() == 2 && backend_ptrs[0] != nullptr &&
+                 backend_ptrs[1] == backend_cpu &&
+                 ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[0])) ==
+                     GGML_BACKEND_DEVICE_TYPE_GPU) :
+                (backend_ptrs.size() == 3 &&
+                 ggml_backend_is_meta(backend_ptrs[0]) &&
+                 backend_ptrs[1] != nullptr && backend_ptrs[2] == backend_cpu &&
+                 ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[1])) ==
+                     GGML_BACKEND_DEVICE_TYPE_GPU);
+            if (topology_ok && gpu_only_ring) {
+                LLAMA_LOG_ERROR("[REGION_RING_GPU_ONLY] stages=%zu device=CUDA0 banks=2 cpu_layers=0 phone_layers=0 status=READY\n", stages.size());
+            }
             if (!topology_ok) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PC_PHONE] event=REJECT reason=OUTER_BACKEND_TOPOLOGY\n");
@@ -3964,7 +3983,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
             if (gpu_bank_streaming) {
                 ggml_backend_dev_t cuda_dev =
-                    ggml_backend_get_device(backend_ptrs[1]);
+                    ggml_backend_get_device(backend_ptrs[region_cuda_backend_index]);
                 if (region_ring_cuda_transfer_backend &&
                         ggml_backend_get_device(
                             region_ring_cuda_transfer_backend.get()) != cuda_dev) {
@@ -4008,12 +4027,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             const char * policy = "CONTEXT_SHARED";
             if (pc_phone_overlap) {
                 if (cpu_resource) {
-                    start = 2; // validated outer topology: [Meta, CUDA0, CPU]
+                    start = region_cpu_backend_index; // staging / Head
                     count = 1;
                     scheduler_offload = false;
                     policy = "CPU_ONLY";
                 } else {
-                    start = 1;
+                    start = region_cuda_backend_index;
                     count = 2;
                     scheduler_offload =
                         gpu_weight_streaming ?
@@ -4102,7 +4121,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                          worker.sched.get()) == 2 &&
                      ggml_backend_sched_get_backend(
                          worker.sched.get(), 0) ==
-                         backend_ptrs[1] &&
+                         backend_ptrs[region_cuda_backend_index] &&
                      ggml_backend_sched_get_backend(
                          worker.sched.get(), 1) ==
                          backend_cpu);
@@ -6335,6 +6354,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::mutex gpu_bank_mover_mutex;
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
+        // A lock-free snapshot used ONLY for READY-queue task eligibility.
+        // The authoritative Bank state remains guarded by mover_mutex; the
+        // snapshot prevents the READY lock from nesting the mover lock.
+        constexpr size_t no_gpu_bank_region =
+            std::numeric_limits<size_t>::max();
+        std::array<std::atomic<size_t>, 2> gpu_bank_resident_region;
+        for (size_t bank_index = 0; bank_index < 2; ++bank_index) {
+            const auto & bank = region_ring_worker_resources[bank_index + 1];
+            gpu_bank_resident_region[bank_index].store(
+                gpu_bank_streaming && bank.bank_ready ?
+                    bank.bank_region : no_gpu_bank_region,
+                std::memory_order_relaxed);
+        }
         std::deque<gpu_bank_refill_job> gpu_bank_mover_jobs;
         bool gpu_bank_mover_stop = false;
         bool gpu_bank_mover_failed = false;
@@ -6527,7 +6559,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 for (int split = 0; split < n_splits; ++split) {
                     if (ggml_backend_sched_get_split_backend(
                             bank.sched.get(), split) !=
-                            backend_ptrs[1]) {
+                             backend_ptrs[region_cuda_backend_index]) {
                         return fail_refill(
                             "NON_CUDA_SPLIT", GGML_STATUS_FAILED);
                     }
@@ -6637,6 +6669,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     auto & bank =
                         region_ring_worker_resources[bank_index + 1];
                     bank.bank_ready = false;
+                    gpu_bank_resident_region[bank_index].store(
+                        no_gpu_bank_region, std::memory_order_release);
                     if (ring_trace_enabled) {
                         auto & row = ring_bank_trace_rows[region];
                         row.enqueue_us = ggml_time_us();
@@ -6699,17 +6733,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         bank.bank_region = job.region;
                         ++bank.bank_generation;
                         bank.bank_ready = true;
+                        gpu_bank_resident_region[job.bank_index].store(
+                            job.region, std::memory_order_release);
                     } else {
-                        bank.bank_region =
-                            std::numeric_limits<size_t>::max();
+                        bank.bank_region = no_gpu_bank_region;
                         bank.bank_ready = false;
+                        gpu_bank_resident_region[job.bank_index].store(
+                            no_gpu_bank_region, std::memory_order_release);
                         gpu_bank_mover_failed = true;
                     }
                 }
                 gpu_bank_ready_cv.notify_all();
                 if (!ok) {
+                    // A filtered GPU Worker can be asleep in READY rather
+                    // than on bank_ready_cv; cancellation must wake both.
+                    ready.cancel();
                     break;
                 }
+                ready.notify_external_ready();
             }
             gpu_bank_ready_cv.notify_all();
             LLAMA_LOG_ERROR(
@@ -7034,11 +7075,48 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         dev == (size_t) llama_region_ring_device::PHONE &&
                         previous_phone_region == phone_affinity_region &&
                         previous_phone_tokens == phone_affinity_tokens;
-                    const auto next = ready.wait_take(
-                        device,
-                        prefer_phone_graph ? phone_affinity_region : stages.size(),
-                        prefer_phone_graph ? phone_affinity_tokens : -1);
+                    // A GPU task may be causally READY but its physical Bank
+                    // still belongs to a previous rank. Do not CLAIM and
+                    // block on that task if the other Bank has READY chunks.
+                    // Bank A/B owners are published atomically by the mover.
+                    const bool bank_aware_gpu =
+                        gpu_only_ring && gpu_bank_streaming &&
+                        dev == (size_t) llama_region_ring_device::GPU;
+                    const auto bank_is_resident =
+                        [&](const llama_region_ring_task & candidate) {
+                            if (candidate.region >= gpu_region_rank.size()) {
+                                return false;
+                            }
+                            const int rank = gpu_region_rank[candidate.region];
+                            return rank >= 0 &&
+                                gpu_bank_resident_region[
+                                    llama_region_ring_gpu_weight_bank_for_rank(
+                                        (size_t) rank)].load(
+                                            std::memory_order_acquire) ==
+                                candidate.region;
+                        };
+                    int64_t bank_queue_wait_us = 0;
+                    const auto next = bank_aware_gpu ?
+                        ready.wait_take(
+                            device, stages.size(), -1,
+                            bank_is_resident, &bank_queue_wait_us,
+                            gpu_only_ring) :
+                        ready.wait_take(
+                            device,
+                            prefer_phone_graph ?
+                                phone_affinity_region : stages.size(),
+                            prefer_phone_graph ? phone_affinity_tokens : -1);
                     state.ready_wait_us += ggml_time_us() - wait_begin_us;
+                    // Include queue-side Bank stalls in the original metric.
+                    // Otherwise moving the wait before CLAIM would make
+                    // bank_gpu_wait_ms appear to improve without more compute.
+                    state.weight_bank_wait_us += bank_queue_wait_us;
+                    if (bank_queue_wait_us > 0) {
+                        LLAMA_LOG_INFO(
+                            "[REGION_RING_GPU_BANK] event=READY_QUEUE_WAIT "
+                            "wait_ms=%.3f status=UNBLOCKED\n",
+                            bank_queue_wait_us / 1000.0);
+                    }
                     if (!next) {
                         break; // all done, or cancelled by another worker
                     }
@@ -7496,7 +7574,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                     pc_phone_overlap ? &prepare_gate : nullptr,
                                     &lane_compute_begin_us, &lane_compute_end_us,
                                     pc_phone_overlap && dev == 1 ?
-                                        backend_ptrs[1] : nullptr,
+                                         backend_ptrs[region_cuda_backend_index] : nullptr,
                                     pc_phone_overlap ? (int) dev : -1,
                                     pc_phone_overlap ? &cpu_gate : nullptr,
                                     pc_phone_overlap && dev == 1 ?
@@ -10424,10 +10502,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
             selected_directional ?
                 llama_region_ring_directional_topology_compatible(
                     ring_runtime_regions, model.hparams.n_layer()) :
-            selected_single_cycle ?
-                true :
-                llama_region_ring_apply_topology_compatible(
-                    ring_runtime_regions, model.hparams.n_layer());
+            selected_single_cycle ? true :
+            (llama_region_ring_apply_topology_compatible(
+                 ring_runtime_regions, model.hparams.n_layer()) ||
+             llama_region_ring_gpu_only_topology_compatible(
+                 ring_runtime_regions, model.hparams.n_layer()));
         const bool runtime_shape_ok = (apply_cgp || apply_wide) ?
             ((apply_wide || ring_runtime_regions.size() == 9) &&
              selected_topology_ok &&
@@ -14066,12 +14145,16 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         return false; // No GPU work: neither Bank is needed.
     }
 
+    // No RPC/Meta backend is required for the GPU-only execution path.
+    const bool gpu_only_ring = llama_region_ring_gpu_only_topology_compatible(
+        regions, model.hparams.n_layer());
+    const size_t cuda_index = gpu_only_ring ? 0 : 1;
     auto & bank_a = region_ring_worker_resources[1];
     auto & bank_b = region_ring_worker_resources[2];
     if (!bank_a.sched || !bank_a.res ||
             (initial_banks == 2 && (!bank_b.sched || !bank_b.res)) ||
-            backend_ptrs.size() < 2 ||
-            backend_ptrs[1] == nullptr) {
+            backend_ptrs.size() <= cuda_index ||
+            backend_ptrs[cuda_index] == nullptr) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
             "status=SKIP reason=BANK_RESOURCES_NOT_READY\n");
@@ -14098,7 +14181,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
     }
 
     ggml_backend_dev_t cuda_dev =
-        ggml_backend_get_device(backend_ptrs[1]);
+        ggml_backend_get_device(backend_ptrs[cuda_index]);
     if (region_ring_cuda_transfer_backend &&
             ggml_backend_get_device(
                 region_ring_cuda_transfer_backend.get()) != cuda_dev) {
@@ -14250,7 +14333,7 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             }
             for (int split = 0; split < n_splits; ++split) {
                 if (ggml_backend_sched_get_split_backend(
-                        bank.sched.get(), split) != backend_ptrs[1]) {
+                        bank.sched.get(), split) != backend_ptrs[cuda_index]) {
                         LLAMA_LOG_ERROR(
                         "[REGION_RING_GPU_BANK_LOAD] phase=LOAD_TIME "
                         "rank=%zu region=%zu bank=%c status=FAIL "

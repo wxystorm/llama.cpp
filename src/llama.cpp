@@ -132,6 +132,73 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     const bool ring_tensor =
         params.split_mode == LLAMA_SPLIT_MODE_TENSOR && llama_region_ring_enabled();
 
+    // CUDA-only Region Ring runs the existing CPU->CUDA weight mover but has
+    // no Phone stage. The collaborative Ring requires Meta(CPU,RPC) below;
+    // GPU-only must not attempt to create that Meta backend.
+    const char * gpu_only_raw = std::getenv("LLAMA_REGION_RING_GPU_ONLY");
+    const bool gpu_only_requested =
+        gpu_only_raw != nullptr && std::strcmp(gpu_only_raw, "1") == 0;
+    if (gpu_only_requested) {
+        if (!ring_tensor) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
+                "reason=REQUIRES_RING_TENSOR\n");
+            return false;
+        }
+
+        ggml_backend_dev_t cuda_dev = nullptr;
+        auto local_cuda = [](ggml_backend_dev_t dev) {
+            if (dev == nullptr ||
+                    ggml_backend_dev_type(dev) !=
+                        GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return false;
+            }
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            // The streamed GPU Scheduler is CUDA-only. Do not pick an
+            // unrelated Vulkan/OpenCL GPU when more than one backend exists.
+            return reg != nullptr &&
+                   std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        };
+
+        if (params.devices != nullptr) {
+            // Respect an explicitly selected local GPU, but never allow a
+            // silently ignored secondary device or Phone RPC.
+            size_t count = 0;
+            for (size_t i = 0; params.devices[i] != nullptr; ++i) {
+                ++count;
+                if (local_cuda(params.devices[i])) {
+                    cuda_dev = params.devices[i];
+                }
+            }
+            if (count != 1 || cuda_dev == nullptr) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
+                    "reason=EXPLICIT_DEVICE_MUST_BE_SINGLE_LOCAL_GPU\n");
+                return false;
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (local_cuda(dev)) {
+                    cuda_dev = dev;
+                    break;
+                }
+            }
+        }
+        if (cuda_dev == nullptr) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_ONLY_DEVICES] status=REJECT "
+                "reason=NO_LOCAL_GPU\n");
+            return false;
+        }
+        model->devices.push_back({ false, cuda_dev });
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_ONLY_DEVICES] cuda=%s meta=NONE rpc=NONE "
+            "transformer=CUDA bank_mover=CPU status=READY\n",
+            ggml_backend_dev_name(cuda_dev));
+        return true;
+    }
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {

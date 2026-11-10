@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -734,6 +735,28 @@ inline bool llama_region_ring_single_cycle_force_compatible(
 // Legacy fixed layouts and automatic Planner search retain 2-4 cycles.
 inline constexpr int LLAMA_REGION_RING_APPLY_MAX_CYCLES = 8;
 
+// GPU-only regions are consecutive CUDA weight windows; GPU ranks alternate
+// between two fixed physical weight banks (A/B), independently of the CPU
+// staging thread which only moves weights and handles embedding/output.
+inline bool llama_region_ring_gpu_only_topology_compatible(
+        const std::vector<llama_region_ring_region> & regions, int n_layer) {
+    if (regions.size() < 2 ||
+        regions.size() > LLAMA_REGION_RING_APPLY_MAX_CYCLES || n_layer <= 0) {
+        return false;
+    }
+    int next_layer = 0;
+    for (const auto & region : regions) {
+        if (region.device != llama_region_ring_device::GPU ||
+            region.kind != llama_region_ring_stage_kind::GPU ||
+            region.layer_begin != next_layer ||
+            region.layer_end <= next_layer || region.layer_end > n_layer) {
+            return false;
+        }
+        next_layer = region.layer_end;
+    }
+    return next_layer == n_layer;
+}
+
 // The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
 // Ordinary fixed/legacy parsing stays strict and unchanged.
 inline bool llama_region_ring_apply_topology_compatible(
@@ -793,7 +816,8 @@ llama_region_ring_parse_optional_cpu_cycles(
         }
     }
     if (layer != n_layer || regions.empty() ||
-            !llama_region_ring_apply_topology_compatible(regions, n_layer)) {
+            (!llama_region_ring_apply_topology_compatible(regions, n_layer) &&
+             !llama_region_ring_gpu_only_topology_compatible(regions, n_layer))) {
         throw std::runtime_error("invalid forced G,[C],[P] cycle topology");
     }
     return regions;
@@ -1087,6 +1111,9 @@ class llama_region_ring_ready {
 public:
     using task_event_observer = std::function<void(
         llama_region_ring_task_event, const llama_region_ring_task &)>;
+    // Extra eligibility constraints are checked before CLAIM. This keeps a
+    // not-yet-resident GPU Region queued while the other Bank keeps computing.
+    using task_eligibility = std::function<bool(const llama_region_ring_task &)>;
 
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
@@ -1305,30 +1332,63 @@ public:
     }
 
     std::optional<llama_region_ring_task> try_take(
-            llama_region_ring_device device) {
+            llama_region_ring_device device,
+            const task_eligibility & eligible = {},
+            bool drain_oldest_region = false) {
         const size_t dev = device_index(device);
         std::lock_guard<std::mutex> lock(mutex_);
         return failed_ ?
-            std::nullopt : take_device_locked(dev);
+            std::nullopt : take_device_locked(
+                dev, std::numeric_limits<size_t>::max(), -1, eligible,
+                drain_oldest_region);
     }
 
-    // Optional preference is applied ONLY to already-ready work. Never wait
-    // for a preferred Phone Region while another claimable task exists:
-    // causal FIFO progress and device utilization must stay intact.
+    // Bank eligibility and Phone graph affinity apply only to tasks already
+    // causally READY. A non-resident GPU task stays queued and can be passed.
+    // filtered_wait_us accounts for time causal-ready tasks are present but
+    // all blocked by eligibility (GPU weight Bank not resident).
     std::optional<llama_region_ring_task> wait_take(
             llama_region_ring_device device,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
-            int preferred_tokens = -1) {
+            int preferred_tokens = -1,
+            const task_eligibility & eligible = {},
+            int64_t * filtered_wait_us = nullptr,
+            bool drain_oldest_region = false) {
         const size_t dev = device_index(device);
+        if (filtered_wait_us) {
+            *filtered_wait_us = 0;
+        }
         std::unique_lock<std::mutex> lock(mutex_);
-        cv_.wait(lock, [&] {
-            return failed_ || all_done_locked() ||
-                   has_claimable_locked(dev);
-        });
+        while (!failed_ && !all_done_locked() &&
+               !has_claimable_locked(dev, eligible)) {
+            const bool blocked_on_bank =
+                filtered_wait_us != nullptr && bool(eligible) &&
+                has_claimable_locked(dev);
+            if (blocked_on_bank) {
+                const auto begin = std::chrono::steady_clock::now();
+                cv_.wait(lock);
+                *filtered_wait_us += std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - begin).count();
+            } else {
+                cv_.wait(lock);
+            }
+        }
         if (failed_ || all_done_locked()) {
             return std::nullopt;
         }
-        return take_device_locked(dev, preferred_region, preferred_tokens);
+        return take_device_locked(
+            dev, preferred_region, preferred_tokens, eligible,
+            drain_oldest_region);
+    }
+
+    // Publish changes to external atomic weight-Bank residency without
+    // missing a wakeup between checking the predicate and entering cv_.wait.
+    void notify_external_ready() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+        }
+        cv_.notify_all();
     }
 
     // PC push is allowed as soon as ALL upstream token intervals are
@@ -1681,12 +1741,14 @@ private:
         return true;
     }
 
-    bool has_claimable_locked(size_t dev) const {
+    bool has_claimable_locked(
+            size_t dev, const task_eligibility & eligible = {}) const {
         const auto & queue = queues_[dev];
         return std::any_of(
             queue.begin(), queue.end(),
-            [this](const auto & task) {
-                return claimable_locked(task);
+            [this, &eligible](const auto & task) {
+                return claimable_locked(task) &&
+                       (!eligible || eligible(task));
             });
     }
 
@@ -1694,24 +1756,46 @@ private:
     take_device_locked(
             size_t dev,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
-            int preferred_tokens = -1) {
+            int preferred_tokens = -1,
+            const task_eligibility & eligible = {},
+            bool drain_oldest_region = false) {
         auto & queue = queues_[dev];
         auto it = queue.end();
         if (preferred_region < regions_.size() && preferred_tokens > 0) {
             it = std::find_if(
                 queue.begin(), queue.end(),
-                [this, preferred_region, preferred_tokens](const auto & task) {
+                [this, preferred_region, preferred_tokens, &eligible](const auto & task) {
                     return task.region == preferred_region &&
                            task.n_tokens == preferred_tokens &&
-                           claimable_locked(task);
+                           claimable_locked(task) &&
+                           (!eligible || eligible(task));
                 });
         }
         if (it == queue.end()) {
-            it = std::find_if(
-                queue.begin(), queue.end(),
-                [this](const auto & task) {
-                    return claimable_locked(task);
-                });
+            if (drain_oldest_region) {
+                // GPU-only: release the active weight Bank as early as
+                // possible, leaving the other Bank's entire Region compute
+                // available to hide the next H2D refill. Never choose a
+                // causally blocked or non-resident task.
+                for (auto candidate = queue.begin();
+                     candidate != queue.end(); ++candidate) {
+                    if (!claimable_locked(*candidate) ||
+                            (eligible && !eligible(*candidate))) {
+                        continue;
+                    }
+                    if (it == queue.end() ||
+                            candidate->region < it->region) {
+                        it = candidate;
+                    }
+                }
+            } else {
+                it = std::find_if(
+                    queue.begin(), queue.end(),
+                    [this, &eligible](const auto & task) {
+                        return claimable_locked(task) &&
+                               (!eligible || eligible(task));
+                    });
+            }
         }
         if (it == queue.end()) {
             return std::nullopt;
