@@ -354,19 +354,19 @@ def get_args(argv=None):
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--rpc", required=True)
     parser.add_argument("--prompt-dir", type=Path, default=Path(r"E:\llama\datasets\sharegpt\sharegpt40"))
-    parser.add_argument("--out", type=Path, default=Path("32b-g8p6-x128-all40"))
+    parser.add_argument("--out", type=Path, default=Path("32b-g8p6-x128-n1-all40"))
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=2048)
-    parser.add_argument("--n-predict", type=int, default=32)
+    parser.add_argument("--n-predict", type=int, default=1, help="generated tokens per prompt (default 1 for prefill benchmark)")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log-verbosity", type=int, default=4)
     parser.add_argument("--no-mmap", action="store_true")
-    parser.add_argument("--min-context", type=int, default=1024)
+    parser.add_argument("--min-context", type=int, default=256, help="minimum Context; auto-sized per prompt and 256-aligned")
     parser.add_argument("--max-context", type=int, default=4096)
-    parser.add_argument("--context-padding", type=int, default=256)
+    parser.add_argument("--context-padding", type=int, default=64, help="tokens reserved beyond prompt and generated token")
     parser.add_argument("--max-retries", type=int, default=1,
                         help="extra retries per failed prompt in the current invocation")
     parser.add_argument("--retry-delay", type=float, default=5)
@@ -388,7 +388,7 @@ def get_args(argv=None):
             parser.error(f"{label} does not exist: {path}")
     if args.batch <= 0 or args.ubatch <= 0 or args.ubatch > args.batch:
         parser.error("require --batch >= --ubatch > 0")
-    if args.n_predict < 0 or args.min_context <= 0 or args.context_padding < 0 or args.max_context < args.min_context:
+    if args.n_predict <= 0 or args.min_context <= 0 or args.context_padding < 0 or args.max_context < args.min_context:
         parser.error("invalid prediction/context sizes")
     if args.max_retries < 0 or args.retry_delay < 0 or args.timeout < 0 or args.limit < 0:
         parser.error("invalid retry/timeout/limit")
