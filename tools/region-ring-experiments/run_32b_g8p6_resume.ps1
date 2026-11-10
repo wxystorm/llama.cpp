@@ -1,6 +1,6 @@
 # Qwen3-32B G8/P6 resumable ShareGPT sweep. Always keeps previous best PASS.
 # One pending prompt per call:
-#   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1 -Limit 1
+#   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1
 # Rerun a specific prompt without overwriting the best result:
 #   .\tools\region-ring-experiments\run_32b_g8p6_resume.ps1 -Rerun prompt_512_01.txt -Limit 1
 [CmdletBinding()]
@@ -11,7 +11,7 @@ param(
     [string] $Out = ".\32b-g8p6-sharegpt40",
     [string] $Exe = "",
     [string] $Tokenizer = "",
-    [ValidateRange(0, 100000)] [int] $Limit = 1,
+    [ValidateRange(0, 100000)] [int] $Limit = 0,
     [switch] $ContinueOnFail,
     [string] $Rerun = "",
     [switch] $RerunAll,
