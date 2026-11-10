@@ -111,6 +111,41 @@ memory all count. Track `/proc/meminfo`, per-session
 and model load logs. Reject any overbudget plan rather than swapping or
 assuming that HTP0..HTP3 imply additive physical RAM.
 
+## Optional: PC GPU weight RAM preloading (experimental)
+
+To pre-read the PC's G-layer weights into OS RAM page cache **before**
+timed Prefill, add `-PreloadGpuRam` to the PC 32B PowerShell command:
+
+```powershell
+.\tools\region-ring-experiments\run_sharegpt40_32b.ps1 `
+    -HtpOnly -PreloadGpuRam `
+    -Layout "G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8" `
+    -Only "prompt_512_01" `
+    -Out ".\32b-htp-only-p16-ram-preload" `
+    -Limit 1
+```
+
+This opts into `LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD=1`, which touches
+each 4 KiB mmap page belonging to PC CUDA Transformer weights during
+model initialization. The Phone-owned 16 layers, embedding and LM Head
+are excluded. No new permanent heap copy is allocated. File-backed
+pages may still be evicted, so this is **best-effort** RAM residency.
+
+The implementation checks reported available physical RAM and reserves
+2 GiB for other workloads. It logs either
+`[REGION_RING_PC_RAM_PRELOAD] event=DONE ... mode=MMAP_PAGECACHE`
+or `event=SKIP reason=INSUFFICIENT_AVAILABLE_RAM`.
+
+For A/B, use the **same** Layout/Prompt with `-PreloadGpuRam` omitted
+and a different `-Out` directory, and compare `prefill_ms`,
+`bank_mover_wall_ms`, `bank_h2d_ms`, and `bank_gpu_wait_ms`.
+The preload `wall_ms` is separate startup cost. Alternate run order
+to control for the Windows OS file cache being warmed by the first run.
+
+GPU weight refill currently defaults to direct Host->CUDA upload;
+the old two-slot Pinned staging can be restored independently using
+`GGML_SCHED_WEIGHT_STAGE_PINNED=1` for A/B. Do not vary both switches
+in the same comparison.
 ## Pass criteria
 
 - `[PHONE_HTP_ONLY] event=REGISTER ... opencl_kv=SKIPPED status=READY`
