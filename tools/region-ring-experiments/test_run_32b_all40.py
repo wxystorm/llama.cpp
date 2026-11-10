@@ -411,6 +411,21 @@ class All40Tests(unittest.TestCase):
         self.assertTrue((boosted[0] / 'run-config.json').exists())
         self.assertFalse((self.root / '32b-g8p6-x128-n1-all40').exists())
 
+    def test_previous_no_cooldown_signature_can_resume_at_zero_only(self):
+        self.assertEqual(self.invoke('--limit', '1').returncode, 0)
+        path = self.out / 'run-config.json'
+        legacy = json.loads(path.read_text())
+        legacy.pop('inter_prompt_delay_seconds')
+        path.write_text(json.dumps(legacy))
+        resume = self.invoke('--limit', '2')
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+        self.assertEqual(len(self.load('prompt_128_02.txt')), 1)
+        self.assertNotIn('inter_prompt_delay_seconds', json.loads(path.read_text()))
+        changed = self.invoke('--limit', '2', '--inter-prompt-delay-seconds', '5')
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn('different configuration', changed.stderr)
+
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
         self.assertEqual(dry.returncode, 0, dry.stderr)
