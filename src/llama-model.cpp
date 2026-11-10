@@ -2297,6 +2297,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     };
 }
 
+            const char * htp_only =
+                std::getenv("LLAMA_REGION_RING_PHONE_HTP_ONLY");
+            if (htp_only && std::strcmp(htp_only, "1") == 0 &&
+                    hybrid_mode == llama_hybrid_layer_mode::PHONE_ONLY) {
+                // Only Phone-local HTP uses these tensors. Keep the
+                // canonical GGUF data mapped on PC for metadata/lifetime,
+                // but never place/upload a second copy on RPC/OpenCL.
+                // HTP reads its immutable weights from the Phone GGUF.
+                LLAMA_LOG_INFO(
+                    "[PHONE_HTP_ONLY] event=WEIGHT_PLACEMENT layer=%d"
+                    " pc=CPU_MMAP_METADATA rpc_upload=SKIPPED"
+                    " phone=LOCAL_GGUF status=READY\n", il);
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
             if (meta_dev == nullptr) {
                 throw std::runtime_error(format(
                     "%s: no Meta backend found for hybrid layer %d", __func__, il));
