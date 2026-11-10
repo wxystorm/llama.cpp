@@ -21,9 +21,14 @@ once=(config.parent.parent.parent.parent.parent / ('attempted_'+prompt))
 if behavior=='fail_once' and prompt=='prompt_128_01.txt' and not once.exists():
     once.write_text('1'); sys.exit(1)
 if behavior=='no_metrics' and prompt=='prompt_128_01.txt': sys.exit(0)
+if behavior=='wrong_layout' and prompt=='prompt_128_01.txt':
+  with config.open('w') as f:
+    for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':'G40,P24'}, {'type':'perf','prefill_tokens':167,'prefill_ms':42}]:
+      f.write(json.dumps(x)+'\\n')
+  sys.exit(0)
 if behavior=='timeout' and prompt=='prompt_128_01.txt': time.sleep(2)
 with config.open('w') as f:
-  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':'G40,P24'}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
+  for x in [{'type':'measurement_start'}, {'type':'region_ring','complete':1,'status':0,'layout':'G8,P6,G8,P6,G8,P6,G8,P6,G8'}, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
     f.write(json.dumps(x)+'\\n')
 '''
 
@@ -102,6 +107,36 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(self.invoke('--limit','1','--timeout','0.1').returncode, 1)
         self.assertEqual(self.load('prompt_128_01.txt')[-1]['status'], 'TIMEOUT')
         self.assertTrue((self.out/'runs/prompt_128_01/attempt-0001/engine.stderr.log').exists())
+
+    def test_fixed_ring_and_native_tail_policy(self):
+        self.assertEqual(self.invoke('--limit', '1').returncode, 0)
+        row = self.load('prompt_128_01.txt')[0]
+        env = row['env_overrides']
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_SKIP_PROFILE'], '1')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_PLANNER'], 'apply-wide')
+        self.assertEqual(env['LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT'],
+                         'G8,P6,G8,P6,G8,P6,G8,P6,G8')
+        for flag in ('FORCE_XC', 'FORCE_XG', 'FORCE_XP', 'CHUNK_TOKENS'):
+            self.assertEqual(env['LLAMA_HYBRID_REGION_RING_'+flag], '128')
+        self.assertEqual(env['LLAMA_REGION_RING_COALESCE_TINY_TAIL'], '1')
+        config = json.loads((self.out/'run-config.json').read_text())
+        self.assertEqual(config['planner_search'], 'SKIPPED_FORCED_LAYOUT')
+        self.assertTrue(config['tiny_tail_coalesce'])
+        self.assertEqual(row['layout'], config['fixed_layout'])
+        self.assertEqual(row['context'], 1024)
+
+    def test_wrong_runtime_layout_is_not_a_pass(self):
+        (self.root/'behavior.txt').write_text('wrong_layout')
+        self.assertEqual(self.invoke('--limit', '1').returncode, 1)
+        self.assertEqual(self.load('prompt_128_01.txt')[-1]['status'], 'WRONG_LAYOUT')
+
+    def test_fixed_configuration_cannot_be_overridden(self):
+        for opt in ('--force-layout', '--skip-profile', '--baseline-chunk-tokens'):
+            self.assertNotEqual(self.invoke(opt).returncode, 0)
+        attempt = self.invoke('--env', 'LLAMA_HYBRID_REGION_RING_FORCE_XG=64')
+        self.assertEqual(attempt.returncode, 2)
+        self.assertIn('cannot override fixed Ring settings', attempt.stderr)
+        self.assertFalse(self.out.exists())
 
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
