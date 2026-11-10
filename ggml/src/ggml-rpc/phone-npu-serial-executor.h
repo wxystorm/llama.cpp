@@ -753,6 +753,58 @@ public:
     }
 
 
+    // HTP-only fresh-prefill owns KV for the full RUN. There is no RPC-visible
+    // OpenCL Decode cache, so do not require the legacy canonical KV binding.
+    // The server calls this only after the exact local graphs are precompiled.
+    bool enable_owned_htp_only_prefill(uint64_t run_id, uint32_t region,
+                                      std::string & reason) {
+        reason.clear();
+        auto it = owned_kv_.find({run_id, region});
+        if (it == owned_kv_.end() || it->second->next_chunk != 0 ||
+                it->second->canonical_ctx || it->second->canonical_k ||
+                it->second->canonical_v) {
+            reason = "HTP_ONLY_KV_NOT_PRIVATE_OR_UNPREPARED";
+            return false;
+        }
+        const auto & p = it->second->plan;
+        if (!p.total_tokens || !p.kv_capacity ||
+                p.total_tokens > p.kv_capacity ||
+                !it->second->k || !it->second->v) {
+            reason = "HTP_ONLY_KV_INVALID";
+            return false;
+        }
+        for (uint32_t chunk = 0;
+                chunk < ggml_phone_owned::chunk_count(p); ++chunk) {
+            if (!owned_graphs_.count({run_id, region, chunk})) {
+                reason = "HTP_ONLY_CHUNK_GRAPH_MISSING";
+                return false;
+            }
+        }
+        it->second->htp_only_prefill = true;
+        return true;
+    }
+
+    // Validate every private HTP KV region without exporting it to RPC.
+    bool validate_owned_htp_only_prefill(uint64_t run_id,
+                                         std::string & reason,
+                                         size_t & completed_regions) const {
+        reason.clear();
+        completed_regions = 0;
+        for (const auto & [key, item] : owned_kv_) {
+            if (key.first != run_id || !item->htp_only_prefill) {
+                continue;
+            }
+            if (item->next_chunk !=
+                    ggml_phone_owned::chunk_count(item->plan) ||
+                    !item->k || !item->v) {
+                reason = "HTP_ONLY_PREFILL_INCOMPLETE";
+                return false;
+            }
+            ++completed_regions;
+        }
+        return true;
+    }
+
     // Bind canonical Decode storage once, independently of any PC Graph.
     // Caller holds HTP mutex before the Graph mutex.
     bool bind_owned_decode_kv_storage(
@@ -1041,7 +1093,8 @@ public:
                 g.tokens != std::min<uint32_t>(
                     p.chunk_tokens, p.total_tokens - g.token_begin) ||
                 g.cache_k != state.k || g.cache_v != state.v ||
-                !state.canonical_k || !state.canonical_v) {
+                (!state.htp_only_prefill &&
+                 (!state.canonical_k || !state.canonical_v))) {
             reason = "PHONE_LOCAL_ONLY_KV_FIFO_OR_BINDING_MISMATCH";
             return false;
         }
@@ -1050,7 +1103,10 @@ public:
         // The indices are populated dynamically and are not trustworthy
         // until the OpenCL input graph has been prepared and synchronized.
         const auto & chunk_state = *git->second;
-        if (state.graphless_identity_slots) {
+        if (state.htp_only_prefill) {
+            // Plan v4 accepts only a fresh, identity-mapped prefill. The
+            // HTP-owned F16 KV is the sole authoritative storage.
+        } else if (state.graphless_identity_slots) {
             // The PC allocator validated every physical slot for this
             // immutable fresh UBatch when it bound Decode K/V storage.
             if (!state.canonical_ctx) {
@@ -2566,6 +2622,7 @@ private:
         // PC still owns the underlying physical buffers until RUN END.
         ggml_context_ptr canonical_ctx;
         bool graphless_identity_slots = false;
+        bool htp_only_prefill = false;
         // Legacy mode uses non-owning RPC Graph leaf pointers instead.
         const ggml_tensor * canonical_k = nullptr;
         const ggml_tensor * canonical_v = nullptr;
