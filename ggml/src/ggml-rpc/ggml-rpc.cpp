@@ -5849,20 +5849,28 @@ public:
                 "Region indices in [0,63]");
         }
         if (!phone_npu_serial_regions.empty()) {
+            const char * htp_only_env =
+                std::getenv("GGML_RPC_PHONE_HTP_ONLY");
+            const bool htp_only = htp_only_env != nullptr &&
+                std::strcmp(htp_only_env, "1") == 0;
             if (backends.size() != 1) {
                 throw std::runtime_error(
-                    "Serial NPU requires one RPC-visible GPUOpenCL device");
+                    "Phone NPU requires one RPC-visible transport backend");
             }
-            ggml_backend_dev_t gpu =
+            ggml_backend_dev_t rpc_device =
                 ggml_backend_get_device(backends[0]);
-            const char * gpu_name = ggml_backend_dev_name(gpu);
-            if (gpu_name == nullptr ||
-                    std::strstr(gpu_name, "OpenCL") == nullptr) {
+            const char * rpc_name = ggml_backend_dev_name(rpc_device);
+            if (rpc_name == nullptr ||
+                    (!htp_only && std::strstr(rpc_name, "OpenCL") == nullptr) ||
+                    (htp_only && ggml_backend_dev_type(rpc_device) !=
+                        GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 throw std::runtime_error(
-                    "Serial NPU requires the visible backend to be GPUOpenCL");
+                    htp_only ? "HTP_ONLY requires RPC-visible CPU transport" :
+                               "Serial NPU requires GPUOpenCL transport");
             }
             // GGML_HEXAGON_NDEV selects independent FastRPC sessions.
-            // Keep one RPC-visible GPUOpenCL backend and serial HTP compute.
+            // HTP_ONLY uses a CPU transport endpoint; no OpenCL backend
+            // is initialized or needed for native owned-prefill graphs.
 #if defined(GGML_RPC_WITH_HEXAGON)
             if (ggml_backend_reg_t hexagon_reg =
                     ggml_backend_hexagon_reg()) {
@@ -5916,9 +5924,10 @@ public:
             }
             GGML_LOG_INFO(
                 "[PHONE_NPU_SERIAL] event=BACKEND_INIT sessions=%zu"
-                " regions=%zu rpc_visible=GPUOpenCL status=READY\n",
+                " regions=%zu rpc_visible=%s status=READY\n",
                 phone_npu_executors.size(),
-                phone_npu_serial_regions.size());
+                phone_npu_serial_regions.size(),
+                htp_only ? "CPU_TRANSPORT_HTP_ONLY" : "GPUOpenCL");
             GGML_LOG_INFO(
                 "[PHONE_NPU_SESSION] event=LOCK_POLICY scope=%s"
                 " sessions=%zu compute=SERIAL status=READY\n",
@@ -7646,6 +7655,18 @@ bool rpc_server::phone_owned_plan_register(
     plan.rope_beta_slow = request.rope_beta_slow;
 
     const char * reason = "NONE";
+    const bool htp_only_plan =
+        plan.version == ggml_phone_owned::k_htp_only_plan_version;
+    const char * htp_only_env = std::getenv("GGML_RPC_PHONE_HTP_ONLY");
+    const bool htp_only_server =
+        htp_only_env && std::strcmp(htp_only_env, "1") == 0;
+    if (htp_only_plan != htp_only_server) {
+        GGML_LOG_ERROR(
+            "[PHONE_HTP_ONLY] event=REJECT region=%u"
+            " reason=PLAN_SERVER_MODE_MISMATCH status=FAIL\n",
+            plan.region);
+        return false;
+    }
     if (plan.region >= ggml_phone_owned::k_wire_region_limit ||
             !ggml_phone_owned::validate(plan, reason)) {
         GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
@@ -7870,7 +7891,45 @@ bool rpc_server::phone_owned_plan_register(
         if (!built) { return false; }
         }
     }
-    // Shadow-only: avoid racing the existing Graph and NPU life cycle.
+    // HTP-only plans register their own complete RUN task catalog. No
+    // canonical OpenCL KV buffers or PC-built Graphs are ever bound.
+    if (htp_only_plan) {
+        if (!precompile_requested || !local_only_requested ||
+                !direct_p2c_requested || !direct_input_requested) {
+            GGML_LOG_ERROR(
+                "[PHONE_HTP_ONLY] event=REJECT region=%u"
+                " reason=REQUIRES_GRAPHLESS_DIRECT_HTP status=FAIL\n",
+                plan.region);
+            return false;
+        }
+        const char * native_graphless =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
+        if (!native_graphless || std::strcmp(native_graphless, "1") != 0) {
+            GGML_LOG_ERROR(
+                "[PHONE_HTP_ONLY] event=REJECT region=%u"
+                " reason=GRAPHLESS_REQUIRED status=FAIL\n",
+                plan.region);
+            return false;
+        }
+        for (const auto & child : child_plans) {
+            const size_t index = phone_npu_session_for_region_layer(
+                plan.region, child.layer - plan.layer);
+            if (index >= phone_npu_backend_locks.size()) { return false; }
+            auto locks = phone_npu_lock_sessions({index});
+            auto * executor = phone_npu_executor_for_region_layer(
+                plan.region, child.layer - plan.layer);
+            std::string why;
+            if (!executor || !executor->enable_owned_htp_only_prefill(
+                    plan.run_id, child.region, why)) {
+                GGML_LOG_ERROR(
+                    "[PHONE_HTP_ONLY] event=REJECT region=%u layer=%u"
+                    " reason=%s status=FAIL\n", plan.region, child.layer,
+                    executor ? why.c_str() : "HTP_SESSION_MISSING");
+                return false;
+            }
+        }
+    }
+    // Keep Plan metadata immutable across the full Phone RUN.
     std::lock_guard<std::recursive_mutex> guard(graph_compute_mutex);
     if (!phone_owned_plans.add(plan, reason)) {
         GGML_LOG_ERROR("[PHONE_OWNED_PLAN] event=REJECT run=%" PRIu64
@@ -7893,6 +7952,51 @@ bool rpc_server::phone_owned_plan_register(
                       "SHADOW_PC_BUILT",
                   local_builder_check ? "GRAPH_BUILT" : "OFF",
                   precompile_requested ? "PRECOMPILED" : "OFF");
+    if (htp_only_plan) {
+        // Each Plan registers its own tasks before PC starts the PUSH.
+        // This replaces the legacy PHONE_OWNED_KV_BIND RPC entirely.
+        size_t registered = 0;
+        {
+            std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            const auto region_key = std::make_pair(plan.run_id, plan.region);
+            if (phone_auto_next_chunk.count(region_key)) {
+                return false;
+            }
+            phone_auto_next_chunk.emplace(region_key, 0);
+            for (uint32_t chunk = 0;
+                    chunk < ggml_phone_owned::chunk_count(plan); ++chunk) {
+                const uint64_t begin = uint64_t(chunk) * plan.chunk_tokens;
+                const uint32_t tokens = std::min<uint64_t>(
+                    plan.chunk_tokens, plan.total_tokens - begin);
+                const uint64_t bytes =
+                    uint64_t(tokens) * plan.n_embd * sizeof(float);
+                rpc_msg_phone_auto_task_req desc {};
+                desc.key = {plan.run_id, plan.region, chunk};
+                desc.device = 0;  // CPU transport, never OpenCL compute
+                desc.graph_uid = ggml_phone_owned::owned_task_uid(
+                    plan.region, chunk);
+                desc.input_bytes = bytes;
+                desc.p2c_run_id = plan.p2c_run_id;
+                desc.output_bytes = bytes;
+                desc.token_begin = static_cast<uint32_t>(begin);
+                desc.n_tokens = tokens;
+                auto job = std::make_shared<phone_auto_job>();
+                job->request = desc;
+                job->graphless_owned = true;
+                if (!phone_auto_jobs.emplace(
+                        auto_key(desc.key), std::move(job)).second) {
+                    return false;
+                }
+                ++registered;
+            }
+        }
+        phone_auto_cv.notify_all();
+        GGML_LOG_INFO(
+            "[PHONE_HTP_ONLY] event=REGISTER region=%u layers=%zu"
+            " chunks=%zu kv_owner=HTP rpc_visible=CPU"
+            " opencl_kv=SKIPPED status=READY\n",
+            plan.region, child_plans.size(), registered);
+    }
     return true;
 }
 
