@@ -5802,13 +5802,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 // v4 is an explicit HTP-only transport contract. The Phone
                 // registers tasks on Plan receipt without canonical RPC KV.
                 // Versions 2/3 retain the proven OpenCL Decode fallback.
-                plan.version = phone_htp_only ?
-                    ggml_phone_owned::k_htp_only_plan_version :
-                    n_phone_layers == 1 ? 2 : 3;
-                plan.flags = phone_htp_only ?
-                    ggml_phone_owned::flags_for_layers(n_phone_layers) :
-                    n_phone_layers == 1 ?
-                        1u : (1u | (uint32_t(n_phone_layers) << 16));
+                // The RPC wire descriptor mirrors the Phone-owned Plan
+                // protocol without including the Phone server's private
+                // execution header in the PC model library:
+                //   v2 = one layer, v3 = multiple layers,
+                //   v4 = HTP-only, layer count in flags[31:16].
+                constexpr uint32_t htp_only_wire_version = 4;
+                plan.version = phone_htp_only ? htp_only_wire_version :
+                    n_phone_layers == 1 ? 2u : 3u;
+                plan.flags = (phone_htp_only || n_phone_layers > 1) ?
+                    (1u | (uint32_t(n_phone_layers) << 16)) : 1u;
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
