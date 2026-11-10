@@ -310,19 +310,20 @@ def choose_context(group, hint, args):
 
 def build_process(args, prompt, ctx, estimate, metrics_path):
     env = os.environ.copy()
-    # Never inherit a stale layout/chunk/profile policy from another experiment.
+    # Mode-specific config owns the full Ring layout/profile policy. Clear
+    # stale environment from previous G/C/N/A or fixed experiments.
     for key in PROTECTED_RING_ENV:
         env.pop(key, None)
-    env.pop("LLAMA_HYBRID_REGION_RING_LAYOUT", None)
     env.update({
         "LLAMA_HYBRID_REGION_RING_V1": "1",
         "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
         "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(estimate),
         "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1" if args.streaming == "on" else "0",
         "LLAMA_REGION_RING_METRICS_FILE": str(metrics_path),
-        **FORCED_RING_ENV,
+        **(AUTO_RING_ENV if args.auto_plan else FORCED_RING_ENV),
     })
-    # Additional diagnostics are permitted, but cannot undo the fixed topology.
+    if args.real_stage_profile_csv is not None:
+        env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
     for entry in args.env:
         key, value = entry.split("=", 1)
         env[key] = value
@@ -347,6 +348,7 @@ def execute(args, prompt, group, context, estimate, out: Path):
     command, env = build_process(args, prompt, context, estimate, trial / "metrics.jsonl")
     row = {"prompt": prompt.name, "group": group, "attempt": attempt,
            "context": context, "prompt_tokens_hint": estimate,
+           "plan_mode": "native-auto" if args.auto_plan else "fixed",
            "status": "RUNNING", "start_time": utc_now(), "command": command,
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
@@ -382,7 +384,7 @@ def execute(args, prompt, group, context, estimate, out: Path):
                 code = 127
     finally:
         elapsed = (time.monotonic() - start) * 1000
-        row.update(parse_metrics(trial, code, elapsed))
+        row.update(parse_metrics(trial, code, elapsed, auto_plan=args.auto_plan))
         row["end_time"] = utc_now()
         row["result_file"] = str(result_file)
         save_json(result_file, row)
@@ -395,9 +397,14 @@ def get_args(argv=None):
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--rpc", required=True)
     parser.add_argument("--prompt-dir", type=Path, default=Path(r"E:\llama\datasets\sharegpt\sharegpt40"))
-    parser.add_argument("--out", type=Path, default=Path("32b-g8p6-x128-n1-all40"))
+    parser.add_argument("--out", type=Path, default=None,
+                        help="default result directory depends on --auto-plan")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
+    parser.add_argument("--auto-plan", action="store_true",
+                        help="native hardware Profile plus APPLY_WIDE planning per process")
+    parser.add_argument("--real-stage-profile-csv", type=Path, default=None,
+                        help="optional measured Stage CSV for native Planner (needs --auto-plan)")
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=2048)
     parser.add_argument("--n-predict", type=int, default=1, help="generated tokens per prompt (default 1 for prefill benchmark)")
@@ -421,8 +428,18 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
+    if args.out is None:
+        args.out = Path("32b-auto-plan-n1-all40" if args.auto_plan
+                        else "32b-g8p6-x128-n1-all40")
     for key in ("exe", "model", "prompt_dir", "out", "repo_root"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
+    if args.real_stage_profile_csv is not None:
+        args.real_stage_profile_csv = args.real_stage_profile_csv.expanduser().resolve()
+        if not args.auto_plan:
+            parser.error("--real-stage-profile-csv requires --auto-plan")
+        if not args.real_stage_profile_csv.is_file():
+            parser.error("--real-stage-profile-csv does not exist: " +
+                         str(args.real_stage_profile_csv))
     for label, path, kind in (("--exe", args.exe, "file"), ("--model", args.model, "file"),
                               ("--prompt-dir", args.prompt_dir, "dir"), ("--repo-root", args.repo_root, "dir")):
         if not (path.is_file() if kind == "file" else path.is_dir()):
