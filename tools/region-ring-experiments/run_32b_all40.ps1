@@ -16,6 +16,7 @@ param(
     [string] $RealStageProfileCsv = "",
     [ValidateSet("on", "off")][string] $Streaming = "on",
     [switch] $ForceSmallBatchMover,
+    [switch] $BoostBankMover,
     [int] $Batch = 2048,
     [int] $UBatch = 2048,
     [int] $NPredict = 1,
@@ -28,6 +29,7 @@ param(
     [switch] $NoMmap,
     [ValidateRange(0, 50)][int] $MaxRetries = 1,
     [ValidateRange(0, 3600)][double] $RetryDelaySeconds = 5,
+    [ValidateRange(0, 3600)][double] $InterPromptDelaySeconds = 5,
     [ValidateRange(0, 86400)][double] $TimeoutSeconds = 0,
     [int[]] $OnlyGroup = @(),
     [string[]] $OnlyPrompt = @(),
@@ -57,6 +59,7 @@ $arguments = @(
     "--min-context", "$MinContext", "--max-context", "$MaxContext",
     "--context-padding", "$ContextPadding", "--log-verbosity", "$LogVerbosity",
     "--max-retries", "$MaxRetries", "--retry-delay", "$RetryDelaySeconds",
+    "--inter-prompt-delay-seconds", "$InterPromptDelaySeconds",
     "--timeout", "$TimeoutSeconds", "--limit", "$Limit"
 )
 if (-not [string]::IsNullOrWhiteSpace($Out)) { $arguments += @("--out", $Out) }
@@ -67,6 +70,7 @@ if ($PSBoundParameters.ContainsKey("XG")) { $arguments += @("--xg", "$XG") }
 if ($PSBoundParameters.ContainsKey("XP")) { $arguments += @("--xp", "$XP") }
 if ($AutoPlan) { $arguments += "--auto-plan" }
 if ($ForceSmallBatchMover) { $arguments += "--force-small-batch-mover" }
+if ($BoostBankMover) { $arguments += "--boost-bank-mover" }
 if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv)) {
     $arguments += @("--real-stage-profile-csv", $RealStageProfileCsv)
 }
