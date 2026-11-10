@@ -1,4 +1,4 @@
-# Qwen3-32B ShareGPT40 fixed G8/P6 x4 + G8, 128 Chunk, tiny-tail coalescing.
+# Qwen3-32B ShareGPT40: configurable forced layout/Chunk, safe per-config reruns.
 # Run from any directory with PowerShell 5.1 or 7+ and Python 3.9+.
 [CmdletBinding()]
 param(
@@ -7,6 +7,11 @@ param(
     [string] $Exe = "",
     [string] $PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
     [string] $Out = "",
+    [string] $Layout = "",
+    [int] $Chunk = 128,
+    [int] $XC = 0,
+    [int] $XG = 0,
+    [int] $XP = 0,
     [switch] $AutoPlan,
     [string] $RealStageProfileCsv = "",
     [ValidateSet("on", "off")][string] $Streaming = "on",
@@ -33,9 +38,6 @@ param(
     [string[]] $EnvOverride = @()
 )
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($Out)) {
-    $Out = if ($AutoPlan) { ".\32b-auto-plan-n1-all40" } else { ".\32b-g8p6-x128-n1-all40" }
-}
 if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv) -and -not $AutoPlan) {
     throw "-RealStageProfileCsv requires -AutoPlan."
 }
@@ -47,7 +49,7 @@ $python = Get-Command python -ErrorAction Stop
 $arguments = @(
     (Join-Path $PSScriptRoot "run_32b_all40.py"),
     "--exe", $Exe, "--model", $Model, "--rpc", $Rpc,
-    "--prompt-dir", $PromptDir, "--out", $Out, "--repo-root", $repoRoot,
+    "--prompt-dir", $PromptDir, "--repo-root", $repoRoot,
     "--streaming", $Streaming,
     "--batch", "$Batch", "--ubatch", "$UBatch", "--n-predict", "$NPredict",
     "--threads", "$Threads", "--seed", "$Seed",
@@ -56,6 +58,12 @@ $arguments = @(
     "--max-retries", "$MaxRetries", "--retry-delay", "$RetryDelaySeconds",
     "--timeout", "$TimeoutSeconds", "--limit", "$Limit"
 )
+if (-not [string]::IsNullOrWhiteSpace($Out)) { $arguments += @("--out", $Out) }
+if ($PSBoundParameters.ContainsKey("Layout")) { $arguments += @("--layout", $Layout) }
+if ($PSBoundParameters.ContainsKey("Chunk")) { $arguments += @("--chunk", "$Chunk") }
+if ($PSBoundParameters.ContainsKey("XC")) { $arguments += @("--xc", "$XC") }
+if ($PSBoundParameters.ContainsKey("XG")) { $arguments += @("--xg", "$XG") }
+if ($PSBoundParameters.ContainsKey("XP")) { $arguments += @("--xp", "$XP") }
 if ($AutoPlan) { $arguments += "--auto-plan" }
 if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv)) {
     $arguments += @("--real-stage-profile-csv", $RealStageProfileCsv)
