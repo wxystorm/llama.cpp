@@ -1,0 +1,71 @@
+# Qwen3-32B ShareGPT40: independent resumable sweep
+
+This is a new runner; it does **not** import or call any previous 32B sweep script. It invokes the existing local `llama-completion` executable directly (not the server-client `llama-cli`). Python 3.9+ and a running phone RPC server are required. The benchmark engine must support Region Ring JSONL metrics.
+
+## Windows PowerShell
+
+From the repository root (`E:\llama\llama-tensor-v2` in this example):
+
+```powershell
+.\tools\region-ring-experiments\run_32b_all40.ps1 `
+  -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
+  -Out ".\32b-sharegpt40-all" `
+  -Planner "apply-wide" `
+  -Batch 2048 -UBatch 2048 -NPredict 32 -Threads 8 `
+  -NoMmap
+```
+
+The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1024_10.txt`, with 10 files each in the 128/256/512/1024 groups. Missing files are a preflight error. `manifest.csv` provides per-file token estimates when possible; absent token counts use conservative bin ceilings (255, 511, 1023, 2000). `-c` is rounded to 256 tokens with padding and an initial minimum of 1024 tokens. Runtime-reported prefill token counts, not manifest estimates, are recorded in results. The default maximum context is 4096; override `-MaxContext` for unusually large prompts.
+
+To **use a known fixed layout without profiling**, add `-SkipProfile -ForceLayout "G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8" -ForceXC 128 -ForceXG 128 -ForceXP 128` (this layout is only an example, not a guarantee for all 40 prompts). Otherwise leave these switches out and let the selected planner run. No GPU/phone layer allocation is silently forced by this wrapper.
+
+## Restart, retry, rerun
+
+**Run the exact same command again with the exact same `-Out`** to resume. Successful (`PASS`) prompts are skipped; pending, interrupted and failed prompts are attempted. Existing attempts and logs are never overwritten. `-MaxRetries 1` (default) means up to two attempts per prompt in each invocation; `-RetryDelaySeconds 5` is the retry delay.
+
+Useful controls:
+
+- `-DryRun` prints all planned commands without creating result files.
+- `-Limit 2` runs at most two selected prompts for a smoke test. Omit it later to complete the same 40-prompt result directory.
+- `-OnlyGroup 512` or `-OnlyPrompt prompt_512_01.txt` narrows one invocation, while still preserving the same 40-prompt configuration.
+- `-RetryFailedOnly` skips never-run and successful prompts, targeting only failed/interrupted ones.
+- `-RerunAll` reruns successful prompts too while retaining previous attempts.
+- `-MaxRetries 0` disables automatic retries, useful while debugging.
+- `-TimeoutSeconds 600` bounds an individual engine process, including model load. Default 0 means no timeout.
+- `-StopOnFail` stops after a prompt exhausts its retries; otherwise the sweep continues to other prompts.
+- `-EnvOverride "SOME_FLAG=1"` sets explicit engine environment variables and includes them in the run signature.
+
+A run directory has a fixed configuration signature (`run-config.json`), including model and executable path/size/mtime, prompt hashes, planning flags and relevant inherited runtime environment variables. If any experiment-affecting setting changes, the runner **refuses to mix results**; use a **different `-Out`**. You can safely change only run controls (such as `-Limit`, `-MaxRetries`, `-RerunAll`, or `-RetryFailedOnly`) while resuming.
+
+## Output layout
+
+```text
+32b-sharegpt40-all/
+  run-config.json
+  summary.csv                  # 40 rows, written atomically after each attempt
+  summary.json                 # counts by status
+  .runner.lock                 # OS advisory lock (released even after crash)
+  runs/
+    prompt_512_01/
+      attempt-0001/
+        result.json            # RUNNING then final result
+        metrics.jsonl
+        output.stdout.txt
+        engine.stderr.log
+      attempt-0002/            # created only if retried / rerun
+        ...
+```
+
+A run is **PASS** only with exit code 0, a native `perf` record with prefill data, and completed `region_ring` records after the last `measurement_start`. Otherwise it is marked `FAIL`, `NO_METRICS`, `NO_PERF`, `NO_RING`, `NO_PREFILL`, `INCOMPLETE_RING`, `TIMEOUT`, or `INTERRUPTED`. This avoids reporting false success when the process exits normally without real benchmark measurements.
+
+The parent script updates `summary.csv` after each attempt. Stop with Ctrl+C and rerun the same command; an interrupted attempt stays in its own folder and will be retried. Do not modify the result files while a benchmark is running.
+
+## Tests
+
+```powershell
+python -m unittest discover -s tools/region-ring-experiments -p "test_run_32b_all40.py" -v
+```
+
+The included tests simulate an engine without downloading model weights or contacting the phone. **Actual 32B inference must be tested on the PC/phone hardware.**
