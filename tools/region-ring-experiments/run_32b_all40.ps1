@@ -15,6 +15,7 @@ param(
     [switch] $AutoPlan,
     [string] $RealStageProfileCsv = "",
     [ValidateSet("on", "off")][string] $Streaming = "on",
+    [switch] $ForceSmallBatchMover,
     [int] $Batch = 2048,
     [int] $UBatch = 2048,
     [int] $NPredict = 1,
@@ -65,6 +66,7 @@ if ($PSBoundParameters.ContainsKey("XC")) { $arguments += @("--xc", "$XC") }
 if ($PSBoundParameters.ContainsKey("XG")) { $arguments += @("--xg", "$XG") }
 if ($PSBoundParameters.ContainsKey("XP")) { $arguments += @("--xp", "$XP") }
 if ($AutoPlan) { $arguments += "--auto-plan" }
+if ($ForceSmallBatchMover) { $arguments += "--force-small-batch-mover" }
 if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv)) {
     $arguments += @("--real-stage-profile-csv", $RealStageProfileCsv)
 }
