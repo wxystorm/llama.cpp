@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
@@ -1117,6 +1118,103 @@ static void test_gpu_same_bank_lifetime_scheduler() {
           "rank2/A did not become claimable after rank0 drained");
 }
 
+
+static void test_gpu_bank_ready_selection() {
+    // Replicate the real deadlock-prone FIFO order after G0/A drains:
+    // G2/A (causally ready, but weight upload pending) is enqueued ahead
+    // of G1/B's second chunk. The GPU must execute G1/B first.
+    const std::vector<llama_region_ring_region> regions = {
+        {llama_region_ring_device::GPU, 0, 1},
+        {llama_region_ring_device::GPU, 1, 2},
+        {llama_region_ring_device::GPU, 2, 3},
+    };
+    llama_region_ring_ready ready(regions, 32, 16, 0, true);
+    std::array<std::atomic<size_t>, 2> resident;
+    resident[0].store(0);
+    resident[1].store(1);
+    const llama_region_ring_ready::task_eligibility eligible =
+        [&](const llama_region_ring_task & task) {
+            return resident[task.region % 2].load(
+                std::memory_order_acquire) == task.region;
+        };
+
+    const auto g0c0 = ready.try_take(llama_region_ring_device::GPU, eligible);
+    check(g0c0 && g0c0->region == 0 && g0c0->chunk == 0,
+          "GPU Bank test missing G0c0");
+    ready.complete(*g0c0);
+    const auto g1c0 = ready.try_take(llama_region_ring_device::GPU, eligible);
+    check(g1c0 && g1c0->region == 1 && g1c0->chunk == 0,
+          "GPU Bank test missing G1c0");
+    ready.complete(*g1c0);
+    const auto g0c1 = ready.try_take(llama_region_ring_device::GPU, eligible);
+    check(g0c1 && g0c1->region == 0 && g0c1->chunk == 1,
+          "GPU Bank test missing G0c1");
+    ready.complete(*g0c1);
+
+    // In plain FIFO G2c0 is first here; a Bank-aware claim must skip it.
+    resident[0].store(std::numeric_limits<size_t>::max(),
+                      std::memory_order_release);
+    const auto g1c1 = ready.try_take(llama_region_ring_device::GPU, eligible);
+    check(g1c1 && g1c1->region == 1 && g1c1->chunk == 1,
+          "GPU stopped for unready G2/A instead of running resident G1/B");
+    ready.complete(*g1c1);
+    check(!ready.try_take(llama_region_ring_device::GPU, eligible),
+          "G2/A was claimed before its weight upload completed");
+
+    // Bank mover publishes G2 residency and wakes a blocked GPU Worker.
+    std::optional<llama_region_ring_task> claimed;
+    std::atomic<bool> finished { false };
+    int64_t filtered_wait_us = 0;
+    std::thread waiter([&] {
+        claimed = ready.wait_take(
+            llama_region_ring_device::GPU,
+            std::numeric_limits<size_t>::max(), -1, eligible,
+            &filtered_wait_us);
+        finished.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const bool claimed_early = finished.load(std::memory_order_acquire);
+    resident[0].store(2, std::memory_order_release);
+    ready.notify_external_ready();
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(2);
+    while (!finished.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool woke = finished.load(std::memory_order_acquire);
+    if (!woke) {
+        ready.cancel();
+    }
+    waiter.join();
+    check(!claimed_early, "GPU claimed non-resident Bank while waiting");
+    check(woke && claimed && claimed->region == 2 && claimed->chunk == 0,
+          "GPU was not woken by Bank mover residency notification");
+    check(filtered_wait_us > 0,
+          "GPU Bank wait vanished after moving the wait into READY queue");
+
+    ready.complete(*claimed);
+    const auto g2c1 = ready.try_take(llama_region_ring_device::GPU, eligible);
+    check(g2c1 && g2c1->region == 2 && g2c1->chunk == 1,
+          "GPU Bank filter broke same-Region Chunk progression");
+    ready.complete(*g2c1);
+    check(ready.all_done(), "GPU-only Bank-aware scheduler failed to drain");
+
+    // A failed Bank mover must be able to cancel a filtered blocked worker.
+    llama_region_ring_ready cancelled(regions, 32, 16, 0, true);
+    const llama_region_ring_ready::task_eligibility none =
+        [](const llama_region_ring_task &) { return false; };
+    std::optional<llama_region_ring_task> cancelled_task;
+    std::thread blocked([&] {
+        cancelled_task = cancelled.wait_take(
+            llama_region_ring_device::GPU,
+            std::numeric_limits<size_t>::max(), -1, none);
+    });
+    cancelled.cancel();
+    blocked.join();
+    check(!cancelled_task, "cancel did not wake Bank-filtered GPU Worker");
+}
+
 static void test_gpu_weight_two_bank_policy() {
     const std::array<size_t, 4> gpu_regions = {0, 3, 6, 9};
 
@@ -1528,6 +1626,8 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_same_bank_lifetime_scheduler=PASS\n");
         test_gpu_weight_two_bank_policy();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
+        test_gpu_bank_ready_selection();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpu_bank_ready_selection=PASS\n");
         test_phone_single_graph_ready_affinity();
         std::fprintf(stderr, "[REGION_RING_TEST] phone_single_graph_ready_affinity=PASS\n");
         test_phone_static_template_shapes();
