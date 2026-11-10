@@ -13,6 +13,7 @@ import csv
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -55,6 +56,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV",
     "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
+    "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -443,6 +445,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
     if args.force_small_batch_mover:
         env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
+    if args.boost_bank_mover:
+        # Existing Windows C++ thread-local hook requests ABOVE_NORMAL.
+        # Only the CPU Bank Mover thread is affected, not process priority.
+        env["LLAMA_REGION_RING_PRIORITY_BANK_MOVER"] = "1"
     for entry in args.env:
         key, value = entry.split("=", 1)
         env[key] = value
@@ -472,7 +478,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
                              or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL",
-                                        "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH")
+                                        "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
+                                        "LLAMA_REGION_RING_PRIORITY_BANK_MOVER")
                              or key in [e.split("=", 1)[0] for e in args.env]},
            "error": ""}
     result_file = trial / "result.json"
@@ -546,13 +553,19 @@ def get_args(argv=None):
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log-verbosity", type=int, default=4)
-    parser.add_argument("--no-mmap", action="store_true")
+    parser.add_argument("--no-mmap", action="store_true",
+                        help="load GGUF without mmap (requires sufficient RAM)")
     parser.add_argument("--min-context", type=int, default=256, help="minimum Context; auto-sized per prompt and 256-aligned")
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--context-padding", type=int, default=64, help="tokens reserved beyond prompt and generated token")
     parser.add_argument("--max-retries", type=int, default=1,
                         help="extra retries per failed prompt in the current invocation")
-    parser.add_argument("--retry-delay", type=float, default=5)
+    parser.add_argument("--retry-delay", type=float, default=5,
+                        help="seconds between attempts for the same failed prompt")
+    parser.add_argument("--inter-prompt-delay-seconds", type=float, default=5,
+                        help="seconds between executed prompts (default 5; 0 disables)")
+    parser.add_argument("--boost-bank-mover", action="store_true",
+                        help="raise Windows GPU Bank Mover CPU thread to ABOVE_NORMAL")
     parser.add_argument("--timeout", type=float, default=0, help="seconds; 0 disables")
     parser.add_argument("--only-group", type=int, choices=GROUPS, action="append")
     parser.add_argument("--only-prompt", action="append", default=[])
@@ -604,8 +617,10 @@ def get_args(argv=None):
         parser.error("require --batch >= --ubatch > 0")
     if args.n_predict <= 0 or args.min_context <= 0 or args.context_padding < 0 or args.max_context < args.min_context:
         parser.error("invalid prediction/context sizes")
-    if args.max_retries < 0 or args.retry_delay < 0 or args.timeout < 0 or args.limit < 0:
-        parser.error("invalid retry/timeout/limit")
+    if (args.max_retries < 0 or args.retry_delay < 0 or args.timeout < 0 or
+            args.limit < 0 or args.inter_prompt_delay_seconds < 0 or
+            not math.isfinite(args.inter_prompt_delay_seconds)):
+        parser.error("invalid retry/timeout/limit/inter-prompt delay")
     if not 0 <= args.log_verbosity <= 5:
         parser.error("--log-verbosity must be 0..5")
     if args.retry_failed_only and args.rerun_all:
@@ -646,7 +661,10 @@ def main(argv=None):
               "threads": args.threads, "seed": args.seed, "log_verbosity": args.log_verbosity,
               "no_mmap": args.no_mmap, "min_context": args.min_context,
               "max_context": args.max_context, "context_padding": args.context_padding,
-              "env": sorted(args.env)}
+              "env": sorted(args.env),
+              "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds}
+    if args.boost_bank_mover:
+        config["bank_mover_priority"] = "ABOVE_NORMAL"
     if args.force_small_batch_mover:
         # Do not change the legacy off-mode signature; ON requires a
         # different experiment output and a freshly rebuilt engine.
@@ -684,6 +702,10 @@ def main(argv=None):
         print(f"[FIXED_RING] layout={args.layout} base_chunk={args.chunk} "
               f"XC={args.xc} XG={args.xg} XP={args.xp} profile=SKIPPED "
               f"tail_coalesce=1 force_short_mover={int(args.force_small_batch_mover)}", flush=True)
+    print(f"[RUN_POLICY] between_prompts={args.inter_prompt_delay_seconds:g}s "
+          f"retry_delay={args.retry_delay:g}s "
+          f"bank_mover_priority={'ABOVE_NORMAL' if args.boost_bank_mover else 'DEFAULT'} "
+          f"no_mmap={int(args.no_mmap)}", flush=True)
     if args.dry_run:
         for group, prompt in selections:
             ctx = decisions[prompt.name]["context"]
@@ -705,6 +727,7 @@ def main(argv=None):
             save_json(config_file, config)
         write_summary(args.out, prompts)
         total = len(selections)
+        previous_executed_prompt = None
         for i, (group, prompt) in enumerate(selections, 1):
             previous = all_results(args.out, prompts)[prompt.name]
             if previous["status"] == "PASS" and not args.rerun_all:
@@ -713,6 +736,13 @@ def main(argv=None):
             if args.retry_failed_only and previous["status"] == "PENDING":
                 print(f"[{i}/{total}] SKIP PENDING {prompt.name}", flush=True)
                 continue
+            # Pause once between actual prompts, never before the first run,
+            # between retries, after the last run, or only to skip PASS entries.
+            if previous_executed_prompt is not None and args.inter_prompt_delay_seconds:
+                print(f"[INTER_PROMPT_PAUSE] after={previous_executed_prompt} "
+                      f"before={prompt.name} seconds={args.inter_prompt_delay_seconds:g}",
+                      flush=True)
+                time.sleep(args.inter_prompt_delay_seconds)
             for retry in range(args.max_retries + 1):
                 ctx = decisions[prompt.name]["context"]
                 estimate = decisions[prompt.name]["prompt_tokens_hint"]
@@ -745,6 +775,7 @@ def main(argv=None):
                     break
                 if retry < args.max_retries and args.retry_delay:
                     time.sleep(args.retry_delay)
+            previous_executed_prompt = prompt.name
             if row["status"] != "PASS" and args.stop_on_fail:
                 break
         counts = write_summary(args.out, prompts)
