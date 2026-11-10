@@ -34,11 +34,23 @@ FORCED_RING_ENV = {
     "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE": "0",
     "LLAMA_REGION_RING_COALESCE_TINY_TAIL": "1",
 }
+AUTO_RING_ENV = {
+    # Native C++ profiles devices at model startup and searches APPLY_WIDE.
+    # Forced layout / Chunk parameters must remain unset in auto mode.
+    "LLAMA_HYBRID_REGION_RING_PLANNER": "apply-wide",
+    "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "0",
+    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": str(CHUNK_TOKENS),
+    "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE": "0",
+    "LLAMA_REGION_RING_COALESCE_TINY_TAIL": "1",
+}
 PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_METRICS_FILE",
     "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS",
     "LLAMA_HYBRID_REGION_RING_V1",
     "LLAMA_HYBRID_REGION_RING_EXEC",
+    "LLAMA_HYBRID_REGION_RING_LAYOUT",
+    "LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT",
+    "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -46,7 +58,10 @@ RESULT_COLUMNS = (
     "prompt", "group", "prompt_tokens_hint", "context", "status", "attempt",
     "exit_code", "prefill_tokens", "prefill_ms", "prefill_tps",
     "decode_tokens", "decode_ms", "decode_tps", "wall_ms", "layout",
-    "ring_complete", "error", "result_file",
+    "ring_complete", "plan_mode", "plan_applied", "plan_source",
+    "plan_layout", "plan_baseline_layout", "plan_xc", "plan_xg",
+    "plan_xp", "plan_predicted_ms", "plan_baseline_predicted_ms",
+    "phone_native_profile_points", "error", "result_file",
 )
 
 
@@ -108,9 +123,11 @@ def prompts_in(folder: Path):
     return expected
 
 
-def parse_metrics(folder: Path, exit_code, wall_ms):
+def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False):
     perf = {}
     ring = []
+    planner = {}
+    phone_native_points = 0
     path = folder / "metrics.jsonl"
     if path.exists():
         with path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -122,6 +139,10 @@ def parse_metrics(folder: Path, exit_code, wall_ms):
                 kind = entry.get("type") if isinstance(entry, dict) else None
                 if kind == "perf":
                     perf = entry
+                elif kind == "planner" and entry.get("mode") == "apply-wide":
+                    planner = entry
+                elif kind == "phone_native_profile":
+                    phone_native_points += 1
                 elif kind == "measurement_start":
                     ring.clear()  # discard warmup telemetry
                 elif kind == "region_ring":
@@ -173,9 +194,17 @@ def parse_metrics(folder: Path, exit_code, wall_ms):
         status = "NO_PREFILL"
     elif not ring_complete:
         status = "INCOMPLETE_RING"
-    elif any(item.get("layout") != FIXED_LAYOUT for item in ring):
+    elif auto_plan and (not planner or not isinstance(planner.get("applied"), bool)):
+        status = "NO_PLAN"
+    elif auto_plan and planner.get("applied") and (
+            not planner.get("selected_layout") or
+            any(item.get("layout") != planner["selected_layout"] for item in ring)):
+        status = "PLAN_MISMATCH"
+    elif not auto_plan and any(item.get("layout") != FIXED_LAYOUT for item in ring):
         status = "WRONG_LAYOUT"
     else:
+        # A baseline run can PASS after the planner explicitly decides to
+        # keep it. plan_applied=False is visible in CSV and terminal output.
         status = "PASS"
     return {
         "status": status, "exit_code": exit_code, "wall_ms": round(wall_ms, 3),
@@ -185,6 +214,17 @@ def parse_metrics(folder: Path, exit_code, wall_ms):
         "decode_tps": tps(perf.get("decode_tps"), dec_tokens, dec_ms),
         "ring_complete": ring_complete,
         "layout": ring[0].get("layout", "") if ring else "",
+        "plan_mode": "native-auto" if auto_plan else "fixed",
+        "plan_applied": planner.get("applied") if auto_plan else status == "PASS",
+        "plan_source": planner.get("source", "") if auto_plan else "forced-skip-profile",
+        "plan_layout": planner.get("selected_layout", "") if auto_plan else FIXED_LAYOUT,
+        "plan_baseline_layout": planner.get("baseline_layout", "") if auto_plan else "",
+        "plan_xc": planner.get("xc") if auto_plan else CHUNK_TOKENS,
+        "plan_xg": planner.get("xg") if auto_plan else CHUNK_TOKENS,
+        "plan_xp": planner.get("xp") if auto_plan else CHUNK_TOKENS,
+        "plan_predicted_ms": planner.get("predicted_ms") if auto_plan else None,
+        "plan_baseline_predicted_ms": planner.get("baseline_predicted_ms") if auto_plan else None,
+        "phone_native_profile_points": phone_native_points,
     }
 
 
@@ -225,7 +265,8 @@ def write_summary(out: Path, prompts):
     os.replace(tmp, path)
     counts = {name: sum(v["status"] == name for v in latest.values())
               for name in ("PASS", "PENDING", "FAIL", "NO_METRICS", "NO_PERF",
-                           "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT", "TIMEOUT", "INTERRUPTED")}
+                           "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT",
+                           "NO_PLAN", "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
                                       "counts": counts, "summary_csv": str(path)})
     return counts
