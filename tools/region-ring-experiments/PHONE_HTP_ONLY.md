@@ -32,8 +32,8 @@ OpenCL/HTP Graphless path is unaffected when the new flags are absent.
 
 ## Phone: Termux startup (Qwen3-32B)
 
-For the initial **16 Phone layers** layout `G8,P3,G8,P3,G8,P3,G8,P3,G8,P2,G8,P2`,
-the Phone regions are `1,3,5,7,9,11`.
+For the initial **16 Phone layers** layout `G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8`,
+the Phone regions are `1,3,5,7,9`.
 
 ```sh
 cd ~/phone-381
@@ -43,7 +43,7 @@ export ADSP_LIBRARY_PATH="$PWD/lib"
 export GGML_HEXAGON_NDEV=4
 export GGML_HEXAGON_HOSTBUF=1
 export GGML_RPC_PHONE_HTP_ONLY=1
-export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7,9,11
+export GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7,9
 
 export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
 export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
@@ -72,7 +72,7 @@ HTP-only mode.
     -Rpc "10.39.52.114:50052" `
     -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
     -Out ".\sharegpt40-32b-htp-only-p16" `
-    -Layout "G8,P3,G8,P3,G8,P3,G8,P3,G8,P2,G8,P2" `
+    -Layout "G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8" `
     -HtpOnly `
     -Only "prompt_512_01" `
     -Limit 1
@@ -92,9 +92,16 @@ Only change the Phone `GGML_RPC_PHONE_NPU_SERIAL_REGIONS` **and** PC
 
 | Candidate | PC layout | Phone regions | PC / Phone layers |
 |---|---|---|---|
-| P16 | `G8,P3,G8,P3,G8,P3,G8,P3,G8,P2,G8,P2` | `1,3,5,7,9,11` | 48 / 16 |
+| P16 | `G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8` | `1,3,5,7,9` | 48 / 16 |
 | P24 | `G8,P6,G8,P6,G8,P6,G8,P6,G8` | `1,3,5,7` | 40 / 24 |
-| P32 | `G8,P8,G8,P8,G8,P8,G8,P8` | `1,3,5,7` | 32 / 32 |
+| P32 | `G6,P8,G7,P8,G6,P8,G7,P8,G6` | `1,3,5,7` | 32 / 32 |
+
+The fixed-layout ShareGPT runner requires an odd number of Regions,
+strictly alternating GPU/Phone, **starting and ending with G**, and a
+64-layer sum. P16 has six 8-layer GPU Regions and five Phone Regions
+(P4 + P3 + P3 + P3 + P3), so both GPU Banks peak at eight layers.
+The GPU-last requirement is intentional; do not append a G10 Region just
+to make an invalid GPU/Phone layout pass validation.
 
 Start with P16 and a short Prompt. **15 GiB MemAvailable is not a
 guarantee** that 24 or 32 Phone layers fit: HTP repack, KV, per-layer
