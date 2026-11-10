@@ -379,6 +379,11 @@ def run_prompt(args, root, commit, group, prompt, tokens, digest):
     print(f"[PLAN] {prompt.name}: prompt_tokens={tokens} context={ctx} "
           f"layout={LAYOUT} XC={CHUNK} XG={CHUNK} XP={CHUNK} "
           f"profile=SKIPPED predict={args.predict}", flush=True)
+    if tokens < 2 * CHUNK:
+        print(f"[CHUNK_WARNING] {prompt.name}: model_tokens={tokens} "
+              f"< 2*XC={2 * CHUNK}; GPU Bank streaming uses SMALL_BATCH_DEMAND "
+              f"for this prefill. This is a runtime-path warning, not "
+              f"a confirmed failure cause.", flush=True)
     start = time.perf_counter()
     code, interrupted = 127, False
     with (folder / "output.stdout.txt").open("wb") as stdout, \
