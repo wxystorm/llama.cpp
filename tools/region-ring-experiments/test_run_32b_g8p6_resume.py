@@ -60,6 +60,63 @@ class Resumable32BSweepTests(unittest.TestCase):
             self.assertEqual(prior_runs(out, prompt, "digest", 130)["status"], "LOW_TPS")
             self.assertEqual(prior_runs(out, prompt, "changed", 0)["status"], "FAIL")
 
+    def test_runner_legacy_parser_argument_compatibility(self):
+        # The newer runner must populate every field read by the shared
+        # run_prompt_sweep.result_row() parser, especially n_predict.
+        import argparse
+        from run_32b_g8p6_resume import inference_env
+        from run_32b_g8p6_resume import recover_existing_attempts
+        import run_32b_g8p6_resume as runner
+        source = Path(runner.__file__).read_text(encoding="utf-8")
+        self.assertIn("args.n_predict = args.predict", source)
+        self.assertIn("recover_existing_attempts(args, all_prompts, tokens, commit)",
+                      source)
+
+    def test_parser_crash_recovery_from_saved_metrics(self):
+        import argparse
+        from unittest import mock
+        from run_32b_g8p6_resume import recover_existing_attempts
+        with tempfile.TemporaryDirectory() as temporary:
+            out = Path(temporary)
+            prompts = out / "prompts"
+            prompts.mkdir()
+            prompt = prompts / "prompt_128_01.txt"
+            prompt.write_text("hi", encoding="utf-8")
+            folder = out / "attempts" / prompt.stem / "attempt-0001"
+            folder.mkdir(parents=True)
+            (folder / "config.json").write_text(json.dumps({
+                "prompt_sha256": "digest", "context": 1024, "commit": "old"
+            }), encoding="utf-8")
+            (folder / "metrics.jsonl").write_text(
+                '{"type":"region_ring","complete":true,"status":0}\n'
+                '{"type":"perf","prefill_ms":100,"prefill_tokens":10}\n',
+                encoding="utf-8")
+            args = argparse.Namespace(
+                out=out, predict=1, padding=256, min_context=1024)
+            token_map = {prompt.name: {"sha256": "digest", "tokens": 10}}
+            fake_result = {
+                "status": "PASS", "prefill_tps": 100.0,
+                "prefill_ms": 100.0, "prompt_sha256": "digest",
+            }
+            with mock.patch(
+                "run_32b_g8p6_resume.old.result_row",
+                return_value=fake_result,
+            ), mock.patch(
+                "run_32b_g8p6_resume.old.write_phone_input_push_timeline"
+            ), mock.patch(
+                "run_32b_g8p6_resume.old.write_phone_copy_timeline"
+            ):
+                recover_existing_attempts(
+                    args, [(128, 1, prompt)], token_map, "new"
+                )
+            recovered = json.loads(
+                (folder / "result.json").read_text(encoding="utf-8"))
+            self.assertEqual(recovered["status"], "PASS")
+            self.assertTrue(recovered["recovered"])
+            self.assertFalse(recovered["process_exit_code_verified"])
+            self.assertEqual(prior_runs(out, prompt, "digest", 0)["status"],
+                             "PASS")
+
     def test_interrupted_attempt_is_retryable(self):
         with tempfile.TemporaryDirectory() as temporary:
             out = Path(temporary)
