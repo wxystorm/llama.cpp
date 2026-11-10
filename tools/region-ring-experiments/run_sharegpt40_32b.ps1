@@ -26,6 +26,7 @@ param(
     [switch] $NoMmap,
     [switch] $HtpOnly,
     [switch] $PreloadGpuRam,
+    [switch] $NoEarlyHtpWeightPreload,
     [switch] $DryRun,
     [ValidateSet("model","manifest")][string] $TokenSource = "model",
     [string] $TokenizerExe = "",
@@ -62,6 +63,7 @@ if ($DryRun) { $callArgs += "--dry-run" }
 if ($NoMmap) { $callArgs += "--no-mmap" }
 if ($HtpOnly) { $callArgs += "--htp-only" }
 if ($PreloadGpuRam) { $callArgs += "--preload-gpu-ram" }
+if ($NoEarlyHtpWeightPreload) { $callArgs += "--no-early-htp-weight-preload" }
 if ($UpdateTokens) { $callArgs += "--update-tokens" }
 if ($TokenizerExe -ne "") { $callArgs += @("--tokenizer-exe", $TokenizerExe) }
 & $python.Source @callArgs
