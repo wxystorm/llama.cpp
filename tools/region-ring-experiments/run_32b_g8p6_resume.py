@@ -205,6 +205,23 @@ def stable_config(args, commit):
     }
 
 
+def resolve_prompt_dir(explicit, out):
+    """Reuse the persisted dataset path when resuming without an override.
+
+    An explicit --prompt-dir is always honored and then validated against
+    sweep-config.json, so different datasets cannot silently share results.
+    """
+    if explicit is not None:
+        return explicit.expanduser().resolve()
+    config = read_json(out / "sweep-config.json", {})
+    stored = config.get("prompt_dir")
+    if isinstance(stored, str) and stored.strip():
+        resolved = Path(stored).expanduser().resolve()
+        print(f"[SWEEP] Resuming saved prompt directory: {resolved}", flush=True)
+        return resolved
+    return Path(r"D:\prima.cpp\prompts").resolve()
+
+
 def ensure_config(args, commit):
     path = args.out / "sweep-config.json"
     current = stable_config(args, commit)
@@ -224,10 +241,16 @@ def ensure_config(args, commit):
                    if key != "git_commit"
                    and current.get(key) != previous.get(key)]
         if changed:
+            details = ""
+            if "prompt_dir" in changed:
+                details = (
+                    f" Saved prompt_dir={previous.get('prompt_dir')!r};"
+                    f" supplied prompt_dir={current.get('prompt_dir')!r}."
+                )
             raise RuntimeError(
                 "Existing output configuration differs: "
-                + ", ".join(changed)
-                + ". Use a different -Out to avoid mixing measurements."
+                + ", ".join(changed) + "." + details
+                + " Use a different -Out to avoid mixing measurements."
             )
         if previous.get("git_commit") != current.get("git_commit"):
             print("[SWEEP] git commit changed; continuing with compatible "
@@ -416,8 +439,8 @@ def main():
     ap.add_argument("--exe", type=Path, default=exe_dir / "llama-completion.exe")
     ap.add_argument("--tokenizer", type=Path,
                     default=exe_dir / "llama-tokenize.exe")
-    ap.add_argument("--prompt-dir", type=Path,
-                    default=Path(r"D:\prima.cpp\prompts"))
+    ap.add_argument("--prompt-dir", type=Path, default=None,
+                    help="prompt folder; omitted => use saved sweep-config.json on resume")
     ap.add_argument("--out", type=Path,
                     default=repo / "32b-g8p6-sharegpt40")
     ap.add_argument("--limit", type=int, default=0,
@@ -453,8 +476,9 @@ def main():
         ap.error("invalid limit/tps/batch/context/predict arguments")
     if args.rerun and args.rerun_all:
         ap.error("--rerun and --rerun-all are mutually exclusive")
-    for name in ("model", "exe", "tokenizer", "prompt_dir", "out"):
+    for name in ("model", "exe", "tokenizer", "out"):
         setattr(args, name, getattr(args, name).expanduser().resolve())
+    args.prompt_dir = resolve_prompt_dir(args.prompt_dir, args.out)
     for name in ("model", "exe", "tokenizer"):
         if not getattr(args, name).is_file():
             ap.error(f"--{name} not found: {getattr(args, name)}")
