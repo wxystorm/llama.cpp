@@ -727,8 +727,14 @@ def main(argv=None):
         config_file = args.out / "run-config.json"
         if config_file.is_file():
             old = json.loads(config_file.read_text(encoding="utf-8"))
-            if old != config:
-                differences = [key for key in sorted(set(old) | set(config)) if old.get(key) != config.get(key)]
+            # Before this runner exposed a cooldown, consecutive prompts
+            # ran immediately. Treat the absent field as 0 seconds for
+            # comparison only, preserving old results and their file.
+            old_compatible = dict(old)
+            old_compatible.setdefault("inter_prompt_delay_seconds", 0)
+            if old_compatible != config:
+                differences = [key for key in sorted(set(old_compatible) | set(config))
+                               if old_compatible.get(key) != config.get(key)]
                 raise ValueError("Existing results use a different configuration (" + ", ".join(differences[:10]) + "). Use another --out directory.")
         else:
             if any((args.out / "runs").glob("*/attempt-*/result.json")):
