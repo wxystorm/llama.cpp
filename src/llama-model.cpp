@@ -2708,6 +2708,107 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // Optional prefill-time disk-I/O elimination: warm only PC CUDA
+    // Transformer weights into OS RAM page cache during model loading.
+    // HTP-only Phone layers remain mmap metadata. No extra heap copy is
+    // created, and the OS may still evict pages under memory pressure.
+    const char * ram_preload_env =
+        std::getenv("LLAMA_REGION_RING_PC_GPU_RAM_PRELOAD");
+    if (ram_preload_env && std::strcmp(ram_preload_env, "1") == 0) {
+        if (!ml.use_mmap || !hybrid_ring_gpu_weight_streaming ||
+                pc_layer_backends.empty() || hybrid_layer_modes.empty() ||
+                arch != LLM_ARCH_QWEN3) {
+            LLAMA_LOG_WARN(
+                "[REGION_RING_PC_RAM_PRELOAD] event=SKIP"
+                " reason=REQUIRES_QWEN3_MMAP_GPU_BANKS status=SKIPPED\n");
+        } else {
+            std::vector<const ggml_tensor *> targets;
+            std::vector<bool> chosen_layers(n_layer_all, false);
+            size_t bytes_to_warm = 0;
+            size_t missing = 0;
+            for (const auto & [name, tensor] : tensors_by_name) {
+                if (name.compare(0, 4, "blk.") != 0) {
+                    continue;
+                }
+                char * end = nullptr;
+                const long layer = std::strtol(name.c_str() + 4, &end, 10);
+                if (end == name.c_str() + 4 || *end != '.' ||
+                        layer < 0 || layer >= n_layer_all ||
+                        size_t(layer) >= pc_layer_backends.size()) {
+                    continue;
+                }
+                if (pc_layer_backends[layer] != llama_pc_layer_backend::CUDA ||
+                        hybrid_layer_mode(int(layer)) !=
+                            llama_hybrid_layer_mode::PC_ONLY) {
+                    continue;
+                }
+                if (!tensor || !tensor->data || !tensor->buffer ||
+                        !ggml_backend_buffer_is_host(tensor->buffer)) {
+                    ++missing;
+                    continue;
+                }
+                const size_t size = ggml_nbytes(tensor);
+                if (!size) {
+                    continue;
+                }
+                targets.push_back(tensor);
+                chosen_layers[layer] = true;
+                bytes_to_warm += size;
+            }
+            const size_t layers_to_warm = size_t(std::count(
+                chosen_layers.begin(), chosen_layers.end(), true));
+            size_t free_ram = 0;
+            size_t total_ram = 0;
+            ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+            constexpr size_t reserve_ram = size_t(2048) * 1024 * 1024;
+            if (targets.empty() || missing) {
+                LLAMA_LOG_WARN(
+                    "[REGION_RING_PC_RAM_PRELOAD] event=SKIP"
+                    " reason=INCOMPLETE_GPU_WEIGHT_MAPPING"
+                    " layers=%zu tensors=%zu missing=%zu status=SKIPPED\n",
+                    layers_to_warm, targets.size(), missing);
+            } else if (free_ram &&
+                    (free_ram <= reserve_ram ||
+                     bytes_to_warm > free_ram - reserve_ram)) {
+                LLAMA_LOG_WARN(
+                    "[REGION_RING_PC_RAM_PRELOAD] event=SKIP"
+                    " reason=INSUFFICIENT_AVAILABLE_RAM"
+                    " weight_mib=%.1f free_mib=%.1f"
+                    " reserve_mib=2048 status=SKIPPED\n",
+                    bytes_to_warm / 1048576.0, free_ram / 1048576.0);
+            } else {
+                LLAMA_LOG_INFO(
+                    "[REGION_RING_PC_RAM_PRELOAD] event=BEGIN"
+                    " layers=%zu tensors=%zu weight_mib=%.1f"
+                    " free_mib=%.1f mode=MMAP_PAGECACHE status=RUNNING\n",
+                    layers_to_warm, targets.size(),
+                    bytes_to_warm / 1048576.0, free_ram / 1048576.0);
+                const int64_t start_us = ggml_time_us();
+                uint8_t checksum = 0;
+                for (const ggml_tensor * tensor : targets) {
+                    const volatile uint8_t * data =
+                        static_cast<const volatile uint8_t *>(tensor->data);
+                    const size_t size = ggml_nbytes(tensor);
+                    // Touch one byte per 4 KiB page. The page is read
+                    // before any CUDA Bank refills; no pinned staging copy.
+                    for (size_t offset = 0; offset < size; offset += 4096) {
+                        checksum ^= data[offset];
+                    }
+                    checksum ^= data[size - 1];
+                }
+                LLAMA_LOG_INFO(
+                    "[REGION_RING_PC_RAM_PRELOAD] event=DONE"
+                    " layers=%zu tensors=%zu weight_mib=%.1f"
+                    " wall_ms=%.3f checksum=%u"
+                    " mode=MMAP_PAGECACHE residency=BEST_EFFORT status=PASS\n",
+                    layers_to_warm, targets.size(),
+                    bytes_to_warm / 1048576.0,
+                    (ggml_time_us() - start_us) / 1000.0,
+                    unsigned(checksum));
+            }
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
