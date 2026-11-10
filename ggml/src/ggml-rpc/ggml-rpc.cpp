@@ -1583,6 +1583,7 @@ enum class rpc_socket_role {
     DUPLEX_PROFILE_C2P,
     DUPLEX_PROFILE_P2C,
     PHONE_INPUT_PUSH,
+    PHONE_NPU_EARLY_WEIGHTS,
 };
 
 static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, rpc_socket_role role) {
@@ -1593,6 +1594,9 @@ static std::shared_ptr<socket_t> get_socket_role(const std::string & endpoint, r
     switch (role) {
         case rpc_socket_role::COMPUTE:
             suffix = "_compute";
+            break;
+        case rpc_socket_role::PHONE_NPU_EARLY_WEIGHTS:
+            suffix = "_phone_npu_early_weights";
             break;
         case rpc_socket_role::TRANSFER:
             suffix = "_transfer";
@@ -4330,8 +4334,12 @@ static bool ggml_backend_rpc_phone_npu_weight_preload(
     }
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
     if (!ctx) { return false; }
-    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
-    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 30) {
+    // This runs alongside PC model loading. Never multiplex with the main
+    // COMPUTE socket: that channel can concurrently serve model allocs.
+    auto sock = get_socket_role(
+        ctx->endpoint, rpc_socket_role::PHONE_NPU_EARLY_WEIGHTS);
+    if (!sock || rpc_get_remote_patch(
+            ctx->endpoint + "_phone_npu_early_weights") < 30) {
         return false;
     }
     rpc_msg_phone_npu_weight_preload_req req {};
