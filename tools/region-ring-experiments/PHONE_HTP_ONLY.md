@@ -147,6 +147,9 @@ PC model-load logs:
 Phone log per layer: `[PHONE_NPU_EARLY_WEIGHTS] event=LAYER ...`
 including HTP session, `cache=HIT|MISS`, `read_ms`, and `repack_ms`.
 The 5 Region summaries end in `event=DONE status=PASS`.
+At later `PHONE_OWNED_PLAN` registration, verify 16
+`[PHONE_NPU_SESSION] event=WEIGHT_CACHE_LOOKUP ... cache=HIT`
+records with `new_weights=0` and near-zero `read_ms`/`repack_ms`.
 
 **P16 test (PC RAM page-cache warmup in parallel):**
 
