@@ -21,6 +21,25 @@ import sys
 import time
 
 GROUPS = (128, 256, 512, 1024)
+FIXED_LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"  # 5*G8 + 4*P6 = 64 layers
+CHUNK_TOKENS = 128
+FORCED_RING_ENV = {
+    "LLAMA_HYBRID_REGION_RING_PLANNER": "apply-wide",
+    "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "1",
+    "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": str(CHUNK_TOKENS),
+    "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": FIXED_LAYOUT,
+    "LLAMA_HYBRID_REGION_RING_FORCE_XC": str(CHUNK_TOKENS),
+    "LLAMA_HYBRID_REGION_RING_FORCE_XG": str(CHUNK_TOKENS),
+    "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(CHUNK_TOKENS),
+    "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE": "0",
+    "LLAMA_REGION_RING_COALESCE_TINY_TAIL": "1",
+}
+PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
+    "LLAMA_REGION_RING_METRICS_FILE",
+    "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS",
+    "LLAMA_HYBRID_REGION_RING_V1",
+    "LLAMA_HYBRID_REGION_RING_EXEC",
+}
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
 RESULT_COLUMNS = (
@@ -154,6 +173,8 @@ def parse_metrics(folder: Path, exit_code, wall_ms):
         status = "NO_PREFILL"
     elif not ring_complete:
         status = "INCOMPLETE_RING"
+    elif any(item.get("layout") != FIXED_LAYOUT for item in ring):
+        status = "WRONG_LAYOUT"
     else:
         status = "PASS"
     return {
@@ -204,7 +225,7 @@ def write_summary(out: Path, prompts):
     os.replace(tmp, path)
     counts = {name: sum(v["status"] == name for v in latest.values())
               for name in ("PASS", "PENDING", "FAIL", "NO_METRICS", "NO_PERF",
-                           "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "TIMEOUT", "INTERRUPTED")}
+                           "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT", "TIMEOUT", "INTERRUPTED")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
                                       "counts": counts, "summary_csv": str(path)})
     return counts
@@ -248,29 +269,19 @@ def choose_context(group, hint, args):
 
 def build_process(args, prompt, ctx, estimate, metrics_path):
     env = os.environ.copy()
-    for key in ("LLAMA_HYBRID_REGION_RING_LAYOUT", "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT",
-                "LLAMA_HYBRID_REGION_RING_FORCE_XC", "LLAMA_HYBRID_REGION_RING_FORCE_XG",
-                "LLAMA_HYBRID_REGION_RING_FORCE_XP", "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE",
-                "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS", "LLAMA_REGION_RING_METRICS_FILE"):
+    # Never inherit a stale layout/chunk/profile policy from another experiment.
+    for key in PROTECTED_RING_ENV:
         env.pop(key, None)
+    env.pop("LLAMA_HYBRID_REGION_RING_LAYOUT", None)
     env.update({
         "LLAMA_HYBRID_REGION_RING_V1": "1",
         "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
-        "LLAMA_HYBRID_REGION_RING_PLANNER": args.planner,
-        "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "1" if args.skip_profile else "0",
         "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(estimate),
-        "LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS": str(args.baseline_chunk_tokens),
         "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1" if args.streaming == "on" else "0",
-        "LLAMA_HYBRID_REGION_RING_DUPLEX_PROFILE": "1" if args.duplex_profile == "on" else "0",
         "LLAMA_REGION_RING_METRICS_FILE": str(metrics_path),
+        **FORCED_RING_ENV,
     })
-    if args.force_layout:
-        env.update({
-            "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.force_layout,
-            "LLAMA_HYBRID_REGION_RING_FORCE_XC": str(args.force_xc),
-            "LLAMA_HYBRID_REGION_RING_FORCE_XG": str(args.force_xg),
-            "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.force_xp),
-        })
+    # Additional diagnostics are permitted, but cannot undo the fixed topology.
     for entry in args.env:
         key, value = entry.split("=", 1)
         env[key] = value
@@ -298,7 +309,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
            "status": "RUNNING", "start_time": utc_now(), "command": command,
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
-                             or key == "LLAMA_REGION_RING_METRICS_FILE" or key in [e.split("=", 1)[0] for e in args.env]},
+                             or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL")
+                             or key in [e.split("=", 1)[0] for e in args.env]},
            "error": ""}
     result_file = trial / "result.json"
     save_json(result_file, row)
@@ -342,17 +354,9 @@ def get_args(argv=None):
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--rpc", required=True)
     parser.add_argument("--prompt-dir", type=Path, default=Path(r"E:\llama\datasets\sharegpt\sharegpt40"))
-    parser.add_argument("--out", type=Path, default=Path("32b-all40-results"))
+    parser.add_argument("--out", type=Path, default=Path("32b-g8p6-x128-all40"))
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--planner", default="apply-wide")
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
-    parser.add_argument("--duplex-profile", choices=("on", "off"), default="off")
-    parser.add_argument("--skip-profile", action="store_true")
-    parser.add_argument("--force-layout", default="")
-    parser.add_argument("--force-xc", type=int, default=0)
-    parser.add_argument("--force-xg", type=int, default=0)
-    parser.add_argument("--force-xp", type=int, default=0)
-    parser.add_argument("--baseline-chunk-tokens", type=int, default=64)
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=2048)
     parser.add_argument("--n-predict", type=int, default=32)
@@ -390,16 +394,13 @@ def get_args(argv=None):
         parser.error("invalid retry/timeout/limit")
     if not 0 <= args.log_verbosity <= 5:
         parser.error("--log-verbosity must be 0..5")
-    if args.baseline_chunk_tokens <= 0:
-        parser.error("--baseline-chunk-tokens must be positive")
-    if args.skip_profile and (args.planner != "apply-wide" or not args.force_layout):
-        parser.error("--skip-profile requires --planner apply-wide and --force-layout")
-    if args.force_layout and min(args.force_xc, args.force_xg, args.force_xp) <= 0:
-        parser.error("--force-layout requires positive --force-xc/xg/xp")
     if args.retry_failed_only and args.rerun_all:
         parser.error("--retry-failed-only conflicts with --rerun-all")
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", e, re.DOTALL) for e in args.env):
         parser.error("--env must use NAME=VALUE")
+    forbidden = sorted({entry.split("=", 1)[0] for entry in args.env} & PROTECTED_RING_ENV)
+    if forbidden:
+        parser.error("--env cannot override fixed Ring settings: " + ", ".join(forbidden))
     return args
 
 
@@ -421,13 +422,12 @@ def main(argv=None):
         selections = selections[:args.limit]
     if not selections:
         raise ValueError("No prompts selected")
-    config = {"version": 1, "model": file_id(args.model), "exe": file_id(args.exe),
+    config = {"version": 2, "model": file_id(args.model), "exe": file_id(args.exe),
               "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
-              "prompts": decisions, "planner": args.planner,
-              "streaming": args.streaming, "duplex_profile": args.duplex_profile,
-              "skip_profile": args.skip_profile, "force_layout": args.force_layout,
-              "force_xc": args.force_xc, "force_xg": args.force_xg, "force_xp": args.force_xp,
-              "baseline_chunk_tokens": args.baseline_chunk_tokens,
+              "prompts": decisions, "planner_search": "SKIPPED_FORCED_LAYOUT",
+              "streaming": args.streaming, "fixed_layout": FIXED_LAYOUT,
+              "fixed_xc": CHUNK_TOKENS, "fixed_xg": CHUNK_TOKENS,
+              "fixed_xp": CHUNK_TOKENS, "tiny_tail_coalesce": True,
               "batch": args.batch, "ubatch": args.ubatch, "n_predict": args.n_predict,
               "threads": args.threads, "seed": args.seed, "log_verbosity": args.log_verbosity,
               "no_mmap": args.no_mmap, "min_context": args.min_context,
@@ -443,6 +443,9 @@ def main(argv=None):
         if key.startswith(("LLAMA_", "GGML_", "CUDA_"))
         and key != "LLAMA_REGION_RING_METRICS_FILE"
     }
+    print(f"[FIXED_RING] layout={FIXED_LAYOUT} XC={CHUNK_TOKENS} "
+          f"XG={CHUNK_TOKENS} XP={CHUNK_TOKENS} profile=SKIPPED "
+          "tail_coalesce=1", flush=True)
     if args.dry_run:
         for group, prompt in selections:
             ctx = decisions[prompt.name]["context"]
