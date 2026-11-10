@@ -11,11 +11,11 @@ From the repository root (`E:\llama\llama-tensor-v2` in this example):
   -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
   -Rpc "10.39.52.114:50052" `
   -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
-  -Out ".\32b-g8p6-x128-all40" `
-  -Batch 2048 -UBatch 2048 -NPredict 32 -Threads 8
+  -Out ".\32b-g8p6-x128-n1-all40" `
+  -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8
 ```
 
-The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1024_10.txt`, with 10 files each in the 128/256/512/1024 groups. Missing files are a preflight error. `manifest.csv` provides per-file token estimates when possible; absent token counts use conservative bin ceilings (255, 511, 1023, 2000). `-c` is rounded to 256 tokens with padding and an initial minimum of 1024 tokens. Runtime-reported prefill token counts, not manifest estimates, are recorded in results. The default maximum context is 4096; override `-MaxContext` for unusually large prompts.
+The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1024_10.txt`, with 10 files each in the 128/256/512/1024 groups. Missing files are a preflight error. `manifest.csv` provides per-file token estimates when possible; absent token counts use conservative bin ceilings (255, 511, 1023, 2000). `-c` is computed separately for each prompt as `ceil256(max(256, token_estimate + 1 generated token + 64 padding))` (minimum 256; default padding 64). For example, 167 input tokens receive `-c 256`, and 1855 input tokens receive `-c 2048`. The engine uses `-n 1` by default, so this is a prefill-focused run. Runtime-reported prefill token counts, not manifest estimates, are recorded in results. The default maximum context is 4096; override `-MaxContext` for unusually large prompts.
 
 **Always fixed (no Planner/Profile):** `G8,P6,G8,P6,G8,P6,G8,P6,G8`, with `XC=XG=XP=128` and GPU weight streaming on by default. The native engine requires `LLAMA_HYBRID_REGION_RING_PLANNER=apply-wide` internally to accept a forced layout, but its search path reports `search=SKIPPED reason=FORCED_AB`; no automatic allocation or runtime profile is requested.
 
@@ -23,7 +23,7 @@ The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1
 
 ## Restart, retry, rerun
 
-**Run the exact same command again with the exact same `-Out`** to resume. Successful (`PASS`) prompts are skipped; pending, interrupted and failed prompts are attempted. Existing attempts and logs are never overwritten. `-MaxRetries 1` (default) means up to two attempts per prompt in each invocation; `-RetryDelaySeconds 5` is the retry delay.
+**Changed defaults:** the one-token, compact-context benchmark uses a new output directory (`32b-g8p6-x128-n1-all40`), separate from prior 32-token results. Existing output configured for `-NPredict 32` / `-MinContext 1024` / `-ContextPadding 256` cannot be resumed with these new settings because the signature checks prevent mixing incompatible experiments. Start a new `-Out` once, then **run the exact same command again with that same `-Out`** to resume. Successful (`PASS`) prompts are skipped; pending, interrupted and failed prompts are attempted. Existing attempts and logs are never overwritten. `-MaxRetries 1` (default) means up to two attempts per prompt in each invocation; `-RetryDelaySeconds 5` is the retry delay.
 
 Useful controls:
 
@@ -42,7 +42,7 @@ A run directory has a fixed configuration signature (`run-config.json`), includi
 ## Output layout
 
 ```text
-32b-g8p6-x128-all40/
+32b-g8p6-x128-n1-all40/
   run-config.json
   summary.csv                  # 40 rows, written atomically after each attempt
   summary.json                 # counts by status
