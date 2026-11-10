@@ -111,6 +111,59 @@ memory all count. Track `/proc/meminfo`, per-session
 and model load logs. Reject any overbudget plan rather than swapping or
 assuming that HTP0..HTP3 imply additive physical RAM.
 
+## Concurrent PC/Phone model weight loading (Patch 30)
+
+**Enabled automatically with `-HtpOnly`.** When the PC model loader
+has finalized the model-owned G/P layout, it asynchronously sends
+the Phone Region indices and complete Transformer layer ranges to the
+RPC server. The Phone immediately loads those layers from its local
+GGUF into their correct HTP FastRPC sessions, while the PC **continues
+loading its G-layer model weights and optionally prewarming the PC
+mmap page cache**. There is no additional Phone layer-ID environment
+variable to configure (`GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS` stays
+unset). The existing Phone Region allowlist must still match the PC
+layout, e.g. `GGML_RPC_PHONE_NPU_SERIAL_REGIONS=1,3,5,7,9` for P16.
+
+The PC joins the preload worker **before `load_tensors()` returns**,
+so all of this work is outside the timed Prefill. If early preload
+fails, it reports FAIL and preserves existing on-demand loading during
+Phone-owned Plan registration; it never reports a silent cache hit.
+The Phone keeps these immutable weights resident across RUNs; runtime
+KV, activations and Chunk Graphs remain per-request and are not reused.
+
+Required: rebuild the PC and Phone from the same commit and restart
+the Phone RPC server because the protocol patch changes from 29 to 30.
+On PC, the runner supplies `LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC`
+automatically using its `-Rpc` address. The preload uses a separate
+RPC socket from the normal COMPUTE and PUSH channels.
+
+PC model-load logs:
+
+- `[REGION_RING_PHONE_EARLY_WEIGHTS] event=START ... execution=CONCURRENT`
+- `[REGION_RING_PHONE_EARLY_WEIGHTS] event=REGION ... status=PASS`
+- `[REGION_RING_PHONE_EARLY_WEIGHTS] event=DONE ... status=PASS`
+- `[REGION_RING_PHONE_EARLY_WEIGHTS] event=JOIN ... wait_ms=... status=PASS`
+
+Phone log per layer: `[PHONE_NPU_EARLY_WEIGHTS] event=LAYER ...`
+including HTP session, `cache=HIT|MISS`, `read_ms`, and `repack_ms`.
+The 5 Region summaries end in `event=DONE status=PASS`.
+
+**P16 test (PC RAM page-cache warmup in parallel):**
+
+```powershell
+.\tools\region-ring-experiments\run_sharegpt40_32b.ps1 `
+    -HtpOnly -PreloadGpuRam `
+    -Layout "G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8" `
+    -Only "prompt_512_01" `
+    -Out ".\32b-p16-parallel-weight-load" `
+    -Limit 1
+```
+
+For a controlled A/B test against the previous on-demand mode, add
+`-NoEarlyHtpWeightPreload` and use a **different** `-Out` directory.
+Track model initialization duration separately from `prefill_ms`.
+The expected reduction in Phone-owned Plan registration is a test
+hypothesis, not a measured speedup yet.
 ## Optional: PC GPU weight RAM preloading (experimental)
 
 To pre-read the PC's G-layer weights into OS RAM page cache **before**
