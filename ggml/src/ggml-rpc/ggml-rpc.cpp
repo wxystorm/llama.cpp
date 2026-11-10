@@ -7805,6 +7805,9 @@ bool rpc_server::phone_owned_plan_register(
             "[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE run=%" PRIu64
             " region=%u layer=%u backend=%s chunks=%u graph_nodes=%zu"
             " kv_bytes=%zu graph_storage_bytes=%zu"
+            " graph_logical_bytes=%zu scratch_live_bytes=%zu"
+            " session_scratch_live_bytes=%zu"
+            " session_scratch_peak_bytes=%zu scratch_slots=%u"
             " compile_ms=%.3f cpu_build_ms=%.3f"
             " cpu_relock_wait_ms=%.3f buffer_alloc_ms=%.3f"
             " input_setup_ms=%.3f wall_ms=%.3f"
@@ -7815,6 +7818,9 @@ bool rpc_server::phone_owned_plan_register(
                 plan.region, child.layer - plan.layer),
             stats.chunks,
             stats.graph_nodes, stats.kv_bytes, stats.graph_storage_bytes,
+            stats.graph_logical_storage_bytes, stats.scratch_live_bytes,
+            stats.session_scratch_live_bytes,
+            stats.session_scratch_peak_bytes, stats.scratch_slots,
             stats.precompile_ms, stats.cpu_build_ms,
             stats.cpu_relock_wait_ms, stats.buffer_alloc_ms,
             stats.input_setup_ms,

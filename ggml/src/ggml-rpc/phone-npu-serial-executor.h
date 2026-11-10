@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "ggml-cpp.h"
 #include "ggml-rpc.h"
 #include "phone-qwen3-local-builder.h"
@@ -13,6 +14,7 @@
 #include <limits>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -378,7 +380,14 @@ public:
         uint32_t chunks = 0;
         size_t graph_nodes = 0;
         size_t kv_bytes = 0;
+        // Actual new HTP Graph allocation for this Region.
         size_t graph_storage_bytes = 0;
+        // What per-Chunk allocations would have required without reuse.
+        size_t graph_logical_storage_bytes = 0;
+        size_t scratch_live_bytes = 0;
+        size_t session_scratch_live_bytes = 0;
+        size_t session_scratch_peak_bytes = 0;
+        uint32_t scratch_slots = 0;
         double precompile_ms = 0.0;
         double cpu_build_ms = 0.0;
         double cpu_relock_wait_ms = 0.0;
@@ -501,6 +510,28 @@ public:
             reason = "PHONE_OWNED_HTP_COMPILE_PROC";
             return false;
         }
+        // Each Region computes its Chunks serially on the owning HTP Session.
+        // Reuse a single stable scratch slot for all its fixed-UID graphs.
+        // We deliberately do NOT alias scratch between different Regions:
+        // async registration can precompile a successor while an earlier
+        // Region is executing on the same Session. Weights and KV stay in
+        // their own immutable/per-layer allocations.
+        //
+        // Graphless enables reuse by default; set
+        // GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH=0 for an exact legacy A/B.
+        const char * graphless_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS");
+        const char * reuse_env =
+            std::getenv("GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH");
+        const bool reuse_scratch =
+            graphless_env != nullptr &&
+            std::strcmp(graphless_env, "1") == 0 &&
+            !(reuse_env != nullptr && std::strcmp(reuse_env, "0") == 0);
+        // A fixed Hexagon node cache retains tensor addresses. Never resize
+        // an arena after its first graph has been compiled.
+        constexpr size_t scratch_cap_bytes = size_t(256) * 1024 * 1024;
+        const ggml_backend_buffer_type_t scratch_buft =
+            ggml_backend_get_default_buffer_type(backend_);
         // Holding temporary Graphs through the entire loop ensures a
         // successful HTP compilation never sees prematurely released memory.
         std::vector<std::unique_ptr<owned_chunk_graph>> pending;
@@ -550,11 +581,87 @@ public:
                 break;
             }
             const int64_t alloc_begin_us = ggml_time_us();
-            item->buffer.reset(ggml_backend_alloc_ctx_tensors(
-                item->ctx.get(), backend_));
+            const size_t graph_required_bytes =
+                ggml_backend_alloc_ctx_tensors_from_buft_size(
+                    item->ctx.get(), scratch_buft);
+            if (graph_required_bytes == 0 ||
+                    graph_required_bytes > SIZE_MAX -
+                        graph_required_bytes / 8 - 4096) {
+                reason = "PHONE_OWNED_HTP_GRAPH_SIZE_INVALID";
+                break;
+            }
+            stats.graph_logical_storage_bytes += graph_required_bytes;
+            if (reuse_scratch) {
+                if (!kv->scratch_buffer) {
+                    // Reserve 12.5% for alignment/layout differences; the
+                    // first full Chunk is the worst-case graph in this Plan.
+                    const size_t reserve_bytes =
+                        graph_required_bytes + graph_required_bytes / 8 + 4096;
+                    if (reserve_bytes > scratch_cap_bytes) {
+                        reason = "PHONE_OWNED_HTP_SCRATCH_BUDGET_EXCEEDED";
+                        break;
+                    }
+                    kv->scratch_buffer.reset(
+                        ggml_backend_buft_alloc_buffer(
+                            scratch_buft, reserve_bytes));
+                    if (!kv->scratch_buffer) {
+                        reason = "PHONE_OWNED_HTP_SCRATCH_ALLOC";
+                        break;
+                    }
+                    stats.graph_storage_bytes +=
+                        ggml_backend_buffer_get_size(
+                            kv->scratch_buffer.get());
+                }
+                if (graph_required_bytes >
+                        ggml_backend_buffer_get_size(
+                            kv->scratch_buffer.get())) {
+                    reason = "PHONE_OWNED_HTP_SCRATCH_CAPACITY_CHANGED";
+                    break;
+                }
+                // Replay ggml-alloc's original context allocation order,
+                // restarting its offset for every Chunk. Each Chunk keeps
+                // distinct metadata and a fixed UID, but shares one Region
+                // scratch address. Its side inputs are rebound on compute.
+                ggml_tallocr scratch_alloc =
+                    ggml_tallocr_new(kv->scratch_buffer.get());
+                bool bound = true;
+                for (ggml_tensor * t = ggml_get_first_tensor(item->ctx.get());
+                        t != nullptr;
+                        t = ggml_get_next_tensor(item->ctx.get(), t)) {
+                    ggml_status status = GGML_STATUS_SUCCESS;
+                    if (t->data == nullptr) {
+                        if (t->view_src == nullptr) {
+                            status = ggml_tallocr_alloc(&scratch_alloc, t);
+                        } else if (t->buffer == nullptr) {
+                            status = ggml_backend_view_init(t);
+                        }
+                    } else if (t->view_src != nullptr &&
+                               t->buffer == nullptr) {
+                        status = ggml_backend_view_init(t);
+                    }
+                    if (status != GGML_STATUS_SUCCESS) {
+                        bound = false;
+                        break;
+                    }
+                }
+                if (!bound) {
+                    reason = "PHONE_OWNED_HTP_SCRATCH_BIND_FAILED";
+                    break;
+                }
+                stats.scratch_live_bytes =
+                    ggml_backend_buffer_get_size(kv->scratch_buffer.get());
+                stats.scratch_slots = 1;
+            } else {
+                item->buffer.reset(ggml_backend_alloc_ctx_tensors(
+                    item->ctx.get(), backend_));
+                if (item->buffer) {
+                    stats.graph_storage_bytes +=
+                        ggml_backend_buffer_get_size(item->buffer.get());
+                }
+            }
             stats.buffer_alloc_ms +=
                 (ggml_time_us() - alloc_begin_us) / 1000.0;
-            if (!item->buffer) {
+            if (!reuse_scratch && !item->buffer) {
                 reason = "PHONE_OWNED_HTP_GRAPH_ALLOC";
                 break;
             }
@@ -603,8 +710,6 @@ public:
             }
             ++stats.chunks;
             stats.graph_nodes += ggml_graph_n_nodes(item->built.graph);
-            stats.graph_storage_bytes +=
-                ggml_backend_buffer_get_size(item->buffer.get());
             pending.push_back(std::move(item));
         }
         if (stats.chunks != ggml_phone_owned::chunk_count(plan)) {
@@ -618,6 +723,25 @@ public:
             if (reason.empty()) { reason = "PHONE_OWNED_HTP_PARTIAL"; }
             return false;
         }
+        owned_scratch_live_bytes_ += stats.scratch_live_bytes;
+        owned_scratch_peak_bytes_ = std::max(
+            owned_scratch_peak_bytes_, owned_scratch_live_bytes_);
+        stats.session_scratch_live_bytes = owned_scratch_live_bytes_;
+        stats.session_scratch_peak_bytes = owned_scratch_peak_bytes_;
+        GGML_LOG_INFO(
+            "[PHONE_OWNED_SCRATCH] event=REGION_PREPARED run=%" PRIu64
+            " region=%u chunks=%u logical_mib=%.3f"
+            " allocated_mib=%.3f scratch_live_mib=%.3f"
+            " session_live_mib=%.3f session_peak_mib=%.3f"
+            " scratch_slots=%u budget_mib=256 mode=%s status=PASS\n",
+            plan.run_id, plan.region, stats.chunks,
+            stats.graph_logical_storage_bytes / 1048576.0,
+            stats.graph_storage_bytes / 1048576.0,
+            stats.scratch_live_bytes / 1048576.0,
+            stats.session_scratch_live_bytes / 1048576.0,
+            stats.session_scratch_peak_bytes / 1048576.0,
+            stats.scratch_slots,
+            reuse_scratch ? "REGION_SINGLE_SLOT" : "LEGACY_PER_CHUNK");
         owned_kv_.emplace(key, std::move(kv));
         for (uint32_t chunk = 0; chunk < pending.size(); ++chunk) {
             owned_graphs_.emplace(
@@ -1003,6 +1127,13 @@ public:
         }
 
         const int64_t upload_begin = ggml_time_us();
+        // All fixed Chunk graphs in this Region share one scratch slot.
+        // Positions, KV indices and the full causal mask MUST be restored
+        // immediately before compute, under the existing HTP Session lock.
+        if (state.scratch_buffer &&
+                !refresh_owned_chunk_side_inputs(p, chunk, g, reason)) {
+            return false;
+        }
         ggml_backend_tensor_set(g.input, source, 0, bytes);
         ggml_backend_synchronize(backend_);
         profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
@@ -1117,6 +1248,10 @@ public:
         // Input snapshot read time is accounted at baseline input-copy time,
         // before baseline compute. Do not read the OpenCL source here.
         const int64_t upload_begin = ggml_time_us();
+        if (state.scratch_buffer &&
+                !refresh_owned_chunk_side_inputs(p, chunk, g, reason)) {
+            return false;
+        }
         ggml_backend_tensor_set(g.input, reference_input_snapshot, 0, bytes);
         ggml_backend_synchronize(backend_);
         profile.input_upload_ms = (ggml_time_us() - upload_begin) / 1000.0;
@@ -1356,7 +1491,9 @@ public:
             if (clear) { clear(backend_); }
         }
         owned_graphs_.clear();
-        owned_kv_.clear();
+        owned_kv_.clear();  // Frees Region scratch only after cache/graphs.
+        owned_scratch_live_bytes_ = 0;
+        owned_scratch_peak_bytes_ = 0;
     }
 
     // Capture only immutable weight-source metadata while the RPC graph
@@ -2229,8 +2366,10 @@ public:
             if (clear != nullptr) { clear(backend_); }
         }
         registered_graphs_.clear();
-        owned_graphs_.clear();
-        owned_kv_.clear();
+        owned_graphs_.clear();  // Hexagon cached nodes already invalidated.
+        owned_kv_.clear();      // Shared Region scratch is released here.
+        owned_scratch_live_bytes_ = 0;
+        owned_scratch_peak_bytes_ = 0;
         deferred_kv_.clear();
         for (auto it = persistent_.begin(); it != persistent_.end();) {
             it = it->second->kv ? persistent_.erase(it) : ++it;
@@ -2416,6 +2555,9 @@ private:
     struct owned_layer_kv {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
+        // Region-private scratch outlives all fixed-UID Chunk graph entries.
+        // Never alias immutable weights or persistent F16 KV into this slot.
+        ggml_backend_buffer_ptr scratch_buffer;
         ggml_phone_owned::region_plan plan {};
         uint32_t next_chunk = 0;
         ggml_tensor * k = nullptr;
@@ -2428,6 +2570,50 @@ private:
         const ggml_tensor * canonical_k = nullptr;
         const ggml_tensor * canonical_v = nullptr;
     };
+    // Caller owns the HTP Session lock. Precompile-time side inputs can be
+    // overwritten by subsequent Chunk Graph registrations and executions
+    // after scratch reuse, even though graph nodes retain fixed addresses.
+    bool refresh_owned_chunk_side_inputs(
+            const ggml_phone_owned::region_plan & plan, uint32_t chunk,
+            const ggml_phone_qwen3::graph_result & g,
+            std::string & reason) {
+        if (!g.positions || !g.k_indices || !g.v_indices || !g.mask ||
+                !g.positions->buffer || !g.k_indices->buffer ||
+                !g.v_indices->buffer || !g.mask->buffer) {
+            reason = "PHONE_OWNED_HTP_SIDE_INPUTS_NOT_ALLOCATED";
+            return false;
+        }
+        ggml_phone_qwen3::side_inputs side {};
+        const char * why = "NONE";
+        if (!ggml_phone_qwen3::make_side_inputs(plan, chunk, side, why)) {
+            reason = std::string("PHONE_OWNED_HTP_SIDE_INPUTS:") + why;
+            return false;
+        }
+        const size_t position_bytes =
+            side.positions.size() * sizeof(int32_t);
+        const size_t index_bytes =
+            side.k_indices.size() * sizeof(int64_t);
+        const size_t mask_bytes =
+            side.causal_mask_f16.size() * sizeof(uint16_t);
+        if (side.v_indices.size() != side.k_indices.size() ||
+                ggml_nbytes(g.positions) != position_bytes ||
+                ggml_nbytes(g.k_indices) != index_bytes ||
+                ggml_nbytes(g.v_indices) != index_bytes ||
+                ggml_nbytes(g.mask) != mask_bytes) {
+            reason = "PHONE_OWNED_HTP_SIDE_INPUT_LAYOUT_CHANGED";
+            return false;
+        }
+        ggml_backend_tensor_set(
+            g.positions, side.positions.data(), 0, position_bytes);
+        ggml_backend_tensor_set(
+            g.k_indices, side.k_indices.data(), 0, index_bytes);
+        ggml_backend_tensor_set(
+            g.v_indices, side.v_indices.data(), 0, index_bytes);
+        ggml_backend_tensor_set(
+            g.mask, side.causal_mask_f16.data(), 0, mask_bytes);
+        return true;
+    }
+
     struct owned_chunk_graph {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buffer;
@@ -2442,6 +2628,10 @@ private:
     std::map<std::tuple<uint64_t, uint32_t, uint32_t>,
              std::unique_ptr<owned_chunk_graph>> owned_graphs_;
     uint64_t next_owned_uid_ = 1;
+    // Session-local sum across the distinct Region scratch buffers.
+    // All accesses occur with the executor's owning HTP Session lock held.
+    size_t owned_scratch_live_bytes_ = 0;
+    size_t owned_scratch_peak_bytes_ = 0;
 };
 
 }  // namespace ggml_phone_npu_serial

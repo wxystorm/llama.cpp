@@ -676,3 +676,76 @@ and performance testing confirms the benefit.
    baseline using this new graphless path.
 5. Extend the one-time binding ABI beyond fresh identity slots only after
    parity, device-memory lifetime, and failure/rollback coverage pass.
+
+
+## Phase 10: single-slot Region HTP scratch for long Prompt (Graphless)
+
+The Qwen3-32B 1855-token / XP=128 / six-Phone-Region run previously
+precompiled 15 fixed graphs per Region, each with a separate device buffer.
+The Phone log reported `graph_storage_bytes=1261379840` (~1203 MiB)
+per Region. The fifth Region could register, but the Phone process exited
+before Region 11 finished preparing. A short Prompt succeeded at the same
+2048 context, including XP=32; this suggests a long-Prompt allocation
+pressure issue, but the Android kill reason was not captured.
+
+Phone-local Graphless mode now reuses **one HTP graph scratch allocation per
+physical Region** across all of its fixed-UID Chunk graphs. Every Chunk still
+has independent graph metadata, fixed tensor addresses and the same shared
+persistent KV; model weights and KV are never stored in scratch. Region
+scratch is intentionally **not shared across Regions on the same HTP
+Session**: async precompile of a future Region may overlap compute of a
+previous Region, even when the HTP session lock serializes the device calls.
+
+After the Session mutex is acquired and before each Chunk compute, the
+executor reuploads that Chunk's position tensor, K/V row indices, full
+causal mask and activation. Only the scratch address is reused: cached HTP
+nodes never reference freed or resized buffers. When a run ends, the
+executor clears the Hexagon fixed-graph cache, destroys graph metadata,
+then releases KV and the Region scratch. The same order applies to RUN
+reset. There is a conservative **256 MiB Region-scratch cap**; an unusually
+large graph fails with `PHONE_OWNED_HTP_SCRATCH_BUDGET_EXCEEDED` rather than
+resizing live fixed-node storage.
+
+### Activation, fallback, and evidence
+
+In Graphless mode, shared Region scratch is enabled automatically on
+the Phone. Continue using the existing PC Graphless environment and the
+same Phone HTP/Graphless switches. No RPC protocol changes or PC
+recompilation are required for this particular optimization.
+
+To restore legacy *per-Chunk* allocations for an A/B comparison, set on
+the **Phone** before starting the RPC server:
+
+```sh
+export GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH=0
+```
+
+To re-enable sharing, unset this override and restart the server:
+
+```sh
+unset GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH
+```
+
+The Phone log now reports:
+
+```text
+[PHONE_OWNED_SCRATCH] event=REGION_PREPARED ... chunks=15 logical_mib=... allocated_mib=... scratch_live_mib=... scratch_slots=1 budget_mib=256 mode=REGION_SINGLE_SLOT status=PASS
+[PHONE_QWEN3_LOCAL] event=HTP_PRECOMPILE ... graph_storage_bytes=... graph_logical_bytes=... scratch_live_bytes=... session_scratch_live_bytes=... session_scratch_peak_bytes=... scratch_slots=1 ... status=PASS
+```
+
+Compare `graph_storage_bytes` (new physical allocation for this Region)
+against `graph_logical_bytes` (sum of all independent Chunk graph
+allocations that the legacy path would have required). The physical
+`scratch_live_bytes` should remain bounded for a Region as Chunk count
+increases. `session_scratch_live_bytes` and `session_scratch_peak_bytes`
+sum Region scratch allocations in the assigned HTP Session; these are
+separate from weight, KV and OpenCL allocations. Each Region has its own
+256 MiB cap, so do not interpret these counters as measured Android RSS.
+
+Smoke validation sequence: re-run the known-good short Prompt with
+Context 2048, then the failed 1855-token 32B Prompt with XP=128, both
+with all six HTP Regions configured. Check that all six
+`REGION_PREPARED`, `HTP_PRECOMPILE`, `PHONE_OWNED_KV BIND`, and
+`EXECUTE_ONLY` stages finish. For a process exit, capture Android logcat
+and the real RPC process exit status separately; Phone status=PASS alone
+does not prove that the full 1855-token run completed.
