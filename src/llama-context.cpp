@@ -6354,6 +6354,19 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::mutex gpu_bank_mover_mutex;
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
+        // A lock-free snapshot used ONLY for READY-queue task eligibility.
+        // The authoritative Bank state remains guarded by mover_mutex; the
+        // snapshot prevents the READY lock from nesting the mover lock.
+        constexpr size_t no_gpu_bank_region =
+            std::numeric_limits<size_t>::max();
+        std::array<std::atomic<size_t>, 2> gpu_bank_resident_region;
+        for (size_t bank_index = 0; bank_index < 2; ++bank_index) {
+            const auto & bank = region_ring_worker_resources[bank_index + 1];
+            gpu_bank_resident_region[bank_index].store(
+                gpu_bank_streaming && bank.bank_ready ?
+                    bank.bank_region : no_gpu_bank_region,
+                std::memory_order_relaxed);
+        }
         std::deque<gpu_bank_refill_job> gpu_bank_mover_jobs;
         bool gpu_bank_mover_stop = false;
         bool gpu_bank_mover_failed = false;
@@ -6656,6 +6669,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     auto & bank =
                         region_ring_worker_resources[bank_index + 1];
                     bank.bank_ready = false;
+                    gpu_bank_resident_region[bank_index].store(
+                        no_gpu_bank_region, std::memory_order_release);
                     if (ring_trace_enabled) {
                         auto & row = ring_bank_trace_rows[region];
                         row.enqueue_us = ggml_time_us();
@@ -6718,17 +6733,24 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         bank.bank_region = job.region;
                         ++bank.bank_generation;
                         bank.bank_ready = true;
+                        gpu_bank_resident_region[job.bank_index].store(
+                            job.region, std::memory_order_release);
                     } else {
-                        bank.bank_region =
-                            std::numeric_limits<size_t>::max();
+                        bank.bank_region = no_gpu_bank_region;
                         bank.bank_ready = false;
+                        gpu_bank_resident_region[job.bank_index].store(
+                            no_gpu_bank_region, std::memory_order_release);
                         gpu_bank_mover_failed = true;
                     }
                 }
                 gpu_bank_ready_cv.notify_all();
                 if (!ok) {
+                    // A filtered GPU Worker can be asleep in READY rather
+                    // than on bank_ready_cv; cancellation must wake both.
+                    ready.cancel();
                     break;
                 }
+                ready.notify_external_ready();
             }
             gpu_bank_ready_cv.notify_all();
             LLAMA_LOG_ERROR(
@@ -7053,11 +7075,47 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         dev == (size_t) llama_region_ring_device::PHONE &&
                         previous_phone_region == phone_affinity_region &&
                         previous_phone_tokens == phone_affinity_tokens;
-                    const auto next = ready.wait_take(
-                        device,
-                        prefer_phone_graph ? phone_affinity_region : stages.size(),
-                        prefer_phone_graph ? phone_affinity_tokens : -1);
+                    // A GPU task may be causally READY but its physical Bank
+                    // still belongs to a previous rank. Do not CLAIM and
+                    // block on that task if the other Bank has READY chunks.
+                    // Bank A/B owners are published atomically by the mover.
+                    const bool bank_aware_gpu =
+                        gpu_bank_streaming &&
+                        dev == (size_t) llama_region_ring_device::GPU;
+                    const auto bank_is_resident =
+                        [&](const llama_region_ring_task & candidate) {
+                            if (candidate.region >= gpu_region_rank.size()) {
+                                return false;
+                            }
+                            const int rank = gpu_region_rank[candidate.region];
+                            return rank >= 0 &&
+                                gpu_bank_resident_region[
+                                    llama_region_ring_gpu_weight_bank_for_rank(
+                                        (size_t) rank)].load(
+                                            std::memory_order_acquire) ==
+                                candidate.region;
+                        };
+                    int64_t bank_queue_wait_us = 0;
+                    const auto next = bank_aware_gpu ?
+                        ready.wait_take(
+                            device, stages.size(), -1,
+                            bank_is_resident, &bank_queue_wait_us) :
+                        ready.wait_take(
+                            device,
+                            prefer_phone_graph ?
+                                phone_affinity_region : stages.size(),
+                            prefer_phone_graph ? phone_affinity_tokens : -1);
                     state.ready_wait_us += ggml_time_us() - wait_begin_us;
+                    // Include queue-side Bank stalls in the original metric.
+                    // Otherwise moving the wait before CLAIM would make
+                    // bank_gpu_wait_ms appear to improve without more compute.
+                    state.weight_bank_wait_us += bank_queue_wait_us;
+                    if (bank_queue_wait_us > 0) {
+                        LLAMA_LOG_INFO(
+                            "[REGION_RING_GPU_BANK] event=READY_QUEUE_WAIT "
+                            "wait_ms=%.3f status=UNBLOCKED\n",
+                            bank_queue_wait_us / 1000.0);
+                    }
                     if (!next) {
                         break; // all done, or cancelled by another worker
                     }
