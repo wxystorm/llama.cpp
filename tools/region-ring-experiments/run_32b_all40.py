@@ -54,6 +54,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_HYBRID_REGION_RING_LAYOUT",
     "LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV",
+    "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -125,8 +126,9 @@ def default_out(args) -> Path:
     if len(slug) > 48:
         slug = slug[:37].rstrip("-") + "-" + hashlib.sha256(
             args.layout.encode("ascii")).hexdigest()[:8]
+    mover = "-force-short-mover" if args.force_small_batch_mover else ""
     return Path(f"32b-{slug}-base{args.chunk}-xc{args.xc}-xg{args.xg}"
-                f"-xp{args.xp}-n{args.n_predict}-all40")
+                f"-xp{args.xp}-n{args.n_predict}{mover}-all40")
 
 
 def utc_now():
@@ -400,6 +402,8 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
+    if args.force_small_batch_mover:
+        env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
     for entry in args.env:
         key, value = entry.split("=", 1)
         env[key] = value
@@ -428,7 +432,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
            "status": "RUNNING", "start_time": utc_now(), "command": command,
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
-                             or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL")
+                             or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL",
+                                        "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH")
                              or key in [e.split("=", 1)[0] for e in args.env]},
            "error": ""}
     result_file = trial / "result.json"
@@ -481,6 +486,8 @@ def get_args(argv=None):
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
     parser.add_argument("--auto-plan", action="store_true",
                         help="native hardware Profile plus APPLY_WIDE planning per process")
+    parser.add_argument("--force-small-batch-mover", action="store_true",
+                        help="opt-in: enable GPU Bank Mover on short prefill, without changing decode")
     parser.add_argument("--layout", default=None,
                         help="forced 64-layer G/[C]/P topology (default G8,P6 x4 + G8)")
     parser.add_argument("--chunk", type=int, default=None,
@@ -516,6 +523,8 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
+    if args.force_small_batch_mover and (args.auto_plan or args.streaming != "on"):
+        parser.error("--force-small-batch-mover requires fixed mode and --streaming on")
     if args.auto_plan and any(v is not None for v in
                               (args.layout, args.chunk, args.xc, args.xg, args.xp)):
         parser.error("--auto-plan cannot be combined with --layout, --chunk, --xc, "
@@ -524,6 +533,9 @@ def get_args(argv=None):
         args.layout = normalize_layout(args.layout if args.layout is not None else FIXED_LAYOUT)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.force_small_batch_mover and sum(
+            part.startswith("G") for part in args.layout.split(",")) < 2:
+        parser.error("--force-small-batch-mover requires at least two GPU Regions")
     args.chunk = CHUNK_TOKENS if args.chunk is None else args.chunk
     args.xc = args.chunk if args.xc is None else args.xc
     args.xg = args.chunk if args.xg is None else args.xg
@@ -595,6 +607,10 @@ def main(argv=None):
               "no_mmap": args.no_mmap, "min_context": args.min_context,
               "max_context": args.max_context, "context_padding": args.context_padding,
               "env": sorted(args.env)}
+    if args.force_small_batch_mover:
+        # Do not change the legacy off-mode signature; ON requires a
+        # different experiment output and a freshly rebuilt engine.
+        config["force_small_batch_mover"] = True
     if args.auto_plan:
         # Keep fixed-mode schema 2 intact for previously completed runs.
         # Automatic Profile + Plan has a separate output and signature.
@@ -627,7 +643,7 @@ def main(argv=None):
     else:
         print(f"[FIXED_RING] layout={args.layout} base_chunk={args.chunk} "
               f"XC={args.xc} XG={args.xg} XP={args.xp} profile=SKIPPED "
-              "tail_coalesce=1", flush=True)
+              f"tail_coalesce=1 force_short_mover={int(args.force_small_batch_mover)}", flush=True)
     if args.dry_run:
         for group, prompt in selections:
             ctx = decisions[prompt.name]["context"]
