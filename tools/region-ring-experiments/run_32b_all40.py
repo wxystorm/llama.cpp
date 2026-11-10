@@ -491,6 +491,19 @@ def main(argv=None):
               "no_mmap": args.no_mmap, "min_context": args.min_context,
               "max_context": args.max_context, "context_padding": args.context_padding,
               "env": sorted(args.env)}
+    if args.auto_plan:
+        # Keep fixed-mode schema 2 intact for previously completed runs.
+        # Automatic Profile + Plan has a separate output and signature.
+        config.update({
+            "version": 3, "planning_mode": "native-auto",
+            "planner_search": "NATIVE_APPLY_WIDE",
+            "fixed_layout": None, "fixed_xc": None,
+            "fixed_xg": None, "fixed_xp": None,
+            "real_stage_profile_csv": (
+                {**file_id(args.real_stage_profile_csv),
+                 "sha256": digest(args.real_stage_profile_csv)}
+                if args.real_stage_profile_csv is not None else None),
+        })
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
                                      decisions[first_prompt.name]["context"],
@@ -501,9 +514,16 @@ def main(argv=None):
         if key.startswith(("LLAMA_", "GGML_", "CUDA_"))
         and key != "LLAMA_REGION_RING_METRICS_FILE"
     }
-    print(f"[FIXED_RING] layout={FIXED_LAYOUT} XC={CHUNK_TOKENS} "
-          f"XG={CHUNK_TOKENS} XP={CHUNK_TOKENS} profile=SKIPPED "
-          "tail_coalesce=1", flush=True)
+    if args.auto_plan:
+        print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
+              f"native_profile=PER_PROCESS fixed_layout=OFF "
+              f"baseline_chunk={CHUNK_TOKENS} "
+              f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
+              "tail_coalesce=1", flush=True)
+    else:
+        print(f"[FIXED_RING] layout={FIXED_LAYOUT} XC={CHUNK_TOKENS} "
+              f"XG={CHUNK_TOKENS} XP={CHUNK_TOKENS} profile=SKIPPED "
+              "tail_coalesce=1", flush=True)
     if args.dry_run:
         for group, prompt in selections:
             ctx = decisions[prompt.name]["context"]
@@ -547,6 +567,14 @@ def main(argv=None):
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
+                if args.auto_plan:
+                    print(f"  [PLAN] applied={row.get('plan_applied')} "
+                          f"source={row.get('plan_source')} "
+                          f"chosen={row.get('plan_layout')} "
+                          f"runtime={row.get('layout')} "
+                          f"XC={row.get('plan_xc')} XG={row.get('plan_xg')} "
+                          f"XP={row.get('plan_xp')} "
+                          f"predicted_ms={row.get('plan_predicted_ms')}", flush=True)
                 if row["status"] == "PASS":
                     break
                 if retry < args.max_retries and args.retry_delay:
