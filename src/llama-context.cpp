@@ -3923,10 +3923,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         gpu_bank_chunk_tokens > 0 ?
             2 * gpu_bank_chunk_tokens :
             std::numeric_limits<int>::max();
+    // Opt-in: remove the two-full-GPU-Chunk minimum for short prefill.
+    // Single-token decode stays on the original demand-loading path.
+    const char * gpu_bank_force_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
+    const bool gpu_bank_force_small_batch =
+        gpu_bank_force_env != nullptr &&
+        std::strcmp(gpu_bank_force_env, "1") == 0;
     const bool gpu_bank_streaming =
-        gpu_weight_streaming &&
-        gpu_region_order.size() >= 2 &&
-        (int) ubatch.n_tokens >= gpu_bank_min_tokens;
+        llama_region_ring_gpu_bank_mover_enabled(
+            gpu_weight_streaming, gpu_region_order.size(),
+            (int) ubatch.n_tokens, gpu_bank_chunk_tokens,
+            gpu_bank_force_small_batch);
+    const bool gpu_bank_small_batch_override_applied =
+        gpu_bank_streaming && gpu_bank_force_small_batch &&
+        (int) ubatch.n_tokens < gpu_bank_min_tokens;
 
     if (isolate_device_resources) {
         // The caller reads logits from the canonical Scheduler. Phone-final
@@ -4147,13 +4158,16 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_INFO(
                 "[REGION_RING_GPU_BANK] phase=INIT banks=%zu "
                 "mapping=FIXED_PARITY canonical=CPU destination=CUDA "
-                "mover=%s min_tokens=%d status=READY\n",
+                "mover=%s min_tokens=%d "
+                "force_small_batch=%d override_applied=%d status=READY\n",
                 active_banks,
                 gpu_bank_streaming ? "CPU_SINGLE" :
                 active_banks == 1 ? "SINGLE_BANK_NO_REFILL" :
                 active_banks == 0 ? "NO_GPU_REGION" :
                                     "INACTIVE_SMALL_BATCH",
-                gpu_bank_min_tokens);
+                gpu_bank_min_tokens,
+                gpu_bank_force_small_batch ? 1 : 0,
+                gpu_bank_small_batch_override_applied ? 1 : 0);
         }
 
         if (ring_sched[0] == ring_sched[1] ||
@@ -8695,7 +8709,14 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << "\"pc_phone_overlap_ms\":"
                             << pc_phone_overlap_us / 1000.0 << ","
                             << "\"gpu_bank_streaming\":"
-                            << (gpu_bank_streaming ? "true" : "false");
+                            << (gpu_bank_streaming ? "true" : "false")
+                            << ",\"gpu_bank_min_tokens\":"
+                            << gpu_bank_min_tokens
+                            << ",\"gpu_bank_force_small_batch\":"
+                            << (gpu_bank_force_small_batch ? "true" : "false")
+                            << ",\"gpu_bank_small_batch_override_applied\":"
+                            << (gpu_bank_small_batch_override_applied ?
+                                "true" : "false");
                     static constexpr const char * labels[3] = {
                         "cpu", "gpu", "phone"
                     };
