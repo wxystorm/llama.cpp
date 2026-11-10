@@ -11,15 +11,16 @@ From the repository root (`E:\llama\llama-tensor-v2` in this example):
   -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
   -Rpc "10.39.52.114:50052" `
   -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
-  -Out ".\32b-sharegpt40-all" `
-  -Planner "apply-wide" `
+  -Out ".\32b-g8p6-x128-all40" `
   -Batch 2048 -UBatch 2048 -NPredict 32 -Threads 8 `
   -NoMmap
 ```
 
 The script discovers **exactly 40 files**: `prompt_128_01.txt` through `prompt_1024_10.txt`, with 10 files each in the 128/256/512/1024 groups. Missing files are a preflight error. `manifest.csv` provides per-file token estimates when possible; absent token counts use conservative bin ceilings (255, 511, 1023, 2000). `-c` is rounded to 256 tokens with padding and an initial minimum of 1024 tokens. Runtime-reported prefill token counts, not manifest estimates, are recorded in results. The default maximum context is 4096; override `-MaxContext` for unusually large prompts.
 
-To **use a known fixed layout without profiling**, add `-SkipProfile -ForceLayout "G8,P4,G8,P3,G8,P3,G8,P3,G8,P3,G8" -ForceXC 128 -ForceXG 128 -ForceXP 128` (this layout is only an example, not a guarantee for all 40 prompts). Otherwise leave these switches out and let the selected planner run. No GPU/phone layer allocation is silently forced by this wrapper.
+**Always fixed (no Planner/Profile):** `G8,P6,G8,P6,G8,P6,G8,P6,G8`, with `XC=XG=XP=128` and GPU weight streaming on by default. The native engine requires `LLAMA_HYBRID_REGION_RING_PLANNER=apply-wide` internally to accept a forced layout, but its search path reports `search=SKIPPED reason=FORCED_AB`; no automatic allocation or runtime profile is requested.
+
+**Tiny tail only:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the engine's native `llama_region_ring_coalesced_chunk_width` on the **actual UBatch token count**, not the manifest estimate. If a remainder is between 1 and 32 tokens (<= 128/4), it slightly widens the common Chunk size to remove the tiny final Chunk, capped at 160; otherwise the requested width stays 128. When coalescing triggers, the UBatch uses a slightly widened uniform width. For example, 513 tokens become `[129,129,129,126]` instead of `[128,128,128,128,1]`. See `[REGION_RING_TAIL_COALESCE]` in the engine logs for actual runtime adjustments. No Python-side regrouping or GGUF padding is performed.
 
 ## Restart, retry, rerun
 
@@ -37,12 +38,12 @@ Useful controls:
 - `-StopOnFail` stops after a prompt exhausts its retries; otherwise the sweep continues to other prompts.
 - `-EnvOverride "SOME_FLAG=1"` sets explicit engine environment variables and includes them in the run signature.
 
-A run directory has a fixed configuration signature (`run-config.json`), including model and executable path/size/mtime, prompt hashes, planning flags and relevant inherited runtime environment variables. If any experiment-affecting setting changes, the runner **refuses to mix results**; use a **different `-Out`**. You can safely change only run controls (such as `-Limit`, `-MaxRetries`, `-RerunAll`, or `-RetryFailedOnly`) while resuming.
+A run directory has a fixed configuration signature (`run-config.json`), including model and executable path/size/mtime, prompt hashes, fixed Ring settings and relevant inherited runtime environment variables. If any experiment-affecting setting changes, the runner **refuses to mix results**; use a **different `-Out`**. You can safely change only run controls (such as `-Limit`, `-MaxRetries`, `-RerunAll`, or `-RetryFailedOnly`) while resuming.
 
 ## Output layout
 
 ```text
-32b-sharegpt40-all/
+32b-g8p6-x128-all40/
   run-config.json
   summary.csv                  # 40 rows, written atomically after each attempt
   summary.json                 # counts by status
@@ -58,7 +59,7 @@ A run directory has a fixed configuration signature (`run-config.json`), includi
         ...
 ```
 
-A run is **PASS** only with exit code 0, a native `perf` record with prefill data, and completed `region_ring` records after the last `measurement_start`. Otherwise it is marked `FAIL`, `NO_METRICS`, `NO_PERF`, `NO_RING`, `NO_PREFILL`, `INCOMPLETE_RING`, `TIMEOUT`, or `INTERRUPTED`. This avoids reporting false success when the process exits normally without real benchmark measurements.
+A run is **PASS** only with exit code 0, a native `perf` record with prefill data, completed `region_ring` records after the last `measurement_start`, and every reported runtime layout exactly matching the forced 64-layer layout. Otherwise it is marked `FAIL`, `NO_METRICS`, `NO_PERF`, `NO_RING`, `NO_PREFILL`, `INCOMPLETE_RING`, `WRONG_LAYOUT`, `TIMEOUT`, or `INTERRUPTED`. This avoids reporting false success when the process exits normally without real benchmark measurements.
 
 The parent script updates `summary.csv` after each attempt. Stop with Ctrl+C and rerun the same command; an interrupted attempt stays in its own folder and will be retried. Do not modify the result files while a benchmark is running.
 
