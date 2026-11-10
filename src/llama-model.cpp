@@ -1648,6 +1648,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // Ring placement embedded in hybrid_layer_modes and pc_layer_backends.
     const char * skip_profile_raw =
         std::getenv("LLAMA_HYBRID_REGION_RING_SKIP_PROFILE");
+    const char * gpu_only_raw = std::getenv("LLAMA_REGION_RING_GPU_ONLY");
+    const bool gpu_only_requested =
+        gpu_only_raw != nullptr && std::strcmp(gpu_only_raw, "1") == 0;
+    if (gpu_only_requested &&
+            (skip_profile_raw == nullptr ||
+             std::strcmp(skip_profile_raw, "1") != 0)) {
+        throw std::runtime_error(
+            "GPU_ONLY requires forced APPLY_WIDE layout with SKIP_PROFILE=1");
+    }
     if (skip_profile_raw != nullptr &&
             std::strcmp(skip_profile_raw, "1") == 0) {
         if (!llama_region_ring_enabled() ||
@@ -1690,6 +1699,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         const auto forced_regions =
             llama_region_ring_parse_apply_wide_layout(
                 layout_raw, hparams.n_layer());
+        if (gpu_only_requested &&
+                !llama_region_ring_gpu_only_topology_compatible(
+                    forced_regions, hparams.n_layer())) {
+            throw std::runtime_error(
+                "GPU_ONLY requires 2..8 GPU-only Regions covering the model");
+        }
         const bool topology_ok =
             llama_region_ring_apply_topology_compatible(
                 forced_regions, hparams.n_layer()) ||
