@@ -2165,7 +2165,15 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_staged_async(
     sched->last_weight_cache_hit_bytes = 0;
     staging_owner->last_weight_stage_cpu_copy_us = 0;
     staging_owner->last_weight_stage_chunks = 0;
-    const bool pinned_stage =
+    // Direct source upload is the default for Region Ring GPU Bank refills.
+    // Pinned staging previously added a 128 MiB host allocation and one
+    // explicit CPU memcpy for every byte of streamed weights. With mmap
+    // sources that memcpy can block on page faults and was observed to
+    // dominate refill time. Keep the proven dual-slot path opt-in for A/B.
+    const char * pinned_env = getenv("GGML_SCHED_WEIGHT_STAGE_PINNED");
+    const bool pinned_requested =
+        pinned_env != nullptr && strcmp(pinned_env, "1") == 0;
+    const bool pinned_stage = pinned_requested &&
         ggml_backend_sched_init_weight_stage(
             staging_owner, upload_backend);
 
@@ -2192,9 +2200,11 @@ enum ggml_status ggml_backend_sched_prepare_split_weights_staged_async(
             continue;
         }
 
-        // Canonical weights stay in mmap/pageable host storage. Stage them
-        // through two 64 MiB CUDA-pinned slots so CPU memcpy of the next
-        // block overlaps H2D of the previous block on upload_backend.
+        // Default: pass the stable, immutable mmap/host source pointer
+        // directly to the CUDA upload backend. The CUDA driver may perform
+        // internal staging for pageable memory; lifetime remains valid
+        // until the caller synchronizes upload_backend after the refill.
+        // Opt-in: dual 64 MiB pinned staging slots and event-tracked memcpy.
         if (pinned_stage) {
             ggml_backend_sched_stage_weight_async(
                 staging_owner, upload_backend, input_cpy,
