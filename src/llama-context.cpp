@@ -7080,7 +7080,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     // block on that task if the other Bank has READY chunks.
                     // Bank A/B owners are published atomically by the mover.
                     const bool bank_aware_gpu =
-                        gpu_bank_streaming &&
+                        gpu_only_ring && gpu_bank_streaming &&
                         dev == (size_t) llama_region_ring_device::GPU;
                     const auto bank_is_resident =
                         [&](const llama_region_ring_task & candidate) {
