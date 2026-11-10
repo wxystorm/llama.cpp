@@ -1,4 +1,4 @@
-# Qwen3-32B ShareGPT40: stable --out, safe resume, immutable per-attempt logs.
+# Qwen3-32B ShareGPT40 fixed G8/P6 x4 + G8, 128 Chunk, tiny-tail coalescing.
 # Run from any directory with PowerShell 5.1 or 7+ and Python 3.9+.
 [CmdletBinding()]
 param(
@@ -6,21 +6,13 @@ param(
     [Parameter(Mandatory = $true)][string] $Rpc,
     [string] $Exe = "",
     [string] $PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
-    [string] $Out = ".\32b-all40-results",
-    [string] $Planner = "apply-wide",
+    [string] $Out = ".\32b-g8p6-x128-all40",
     [ValidateSet("on", "off")][string] $Streaming = "on",
-    [ValidateSet("on", "off")][string] $DuplexProfile = "off",
-    [string] $ForceLayout = "",
-    [int] $ForceXC = 0,
-    [int] $ForceXG = 0,
-    [int] $ForceXP = 0,
-    [switch] $SkipProfile,
     [int] $Batch = 2048,
     [int] $UBatch = 2048,
     [int] $NPredict = 32,
     [int] $Threads = 8,
     [int] $Seed = 1234,
-    [int] $BaselineChunkTokens = 64,
     [int] $MinContext = 1024,
     [int] $MaxContext = 4096,
     [int] $ContextPadding = 256,
@@ -48,21 +40,14 @@ $arguments = @(
     (Join-Path $PSScriptRoot "run_32b_all40.py"),
     "--exe", $Exe, "--model", $Model, "--rpc", $Rpc,
     "--prompt-dir", $PromptDir, "--out", $Out, "--repo-root", $repoRoot,
-    "--planner", $Planner, "--streaming", $Streaming,
-    "--duplex-profile", $DuplexProfile,
+    "--streaming", $Streaming,
     "--batch", "$Batch", "--ubatch", "$UBatch", "--n-predict", "$NPredict",
     "--threads", "$Threads", "--seed", "$Seed",
-    "--baseline-chunk-tokens", "$BaselineChunkTokens",
     "--min-context", "$MinContext", "--max-context", "$MaxContext",
     "--context-padding", "$ContextPadding", "--log-verbosity", "$LogVerbosity",
     "--max-retries", "$MaxRetries", "--retry-delay", "$RetryDelaySeconds",
     "--timeout", "$TimeoutSeconds", "--limit", "$Limit"
 )
-if (-not [string]::IsNullOrWhiteSpace($ForceLayout)) {
-    $arguments += @("--force-layout", $ForceLayout, "--force-xc", "$ForceXC",
-                    "--force-xg", "$ForceXG", "--force-xp", "$ForceXP")
-}
-if ($SkipProfile) { $arguments += "--skip-profile" }
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($RerunAll) { $arguments += "--rerun-all" }
 if ($RetryFailedOnly) { $arguments += "--retry-failed-only" }
