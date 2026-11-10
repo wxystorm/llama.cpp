@@ -13,7 +13,7 @@ param(
     [int]$Batch = 2048,
     [int]$UBatch = 2048,
     [int]$Context = 4096,
-    [int]$NPredict = 0,
+    [int]$NPredict = 1,
     [int]$Threads = 8,
     [int]$LogVerbosity = 4,
     [switch]$NoMmap,
@@ -34,8 +34,13 @@ if ($cycleCount -lt 2 -or $cycleCount -gt 8) {
 if ($UBatch -lt (2 * $Chunk) -or $Batch -lt $UBatch) {
     throw "Actual double-bank refill requires -UBatch >= 2 * -Chunk and -Batch >= -UBatch."
 }
-if ($NPredict -ne 0) {
-    Write-Warning "Decode uses the smaller on-demand Bank path; this experiment verifies prefill double-bank streaming."
+# In tools/completion/completion.cpp the main loop does NOT execute when -n 0.
+# Use at least one generated token to force the entire prompt through prefill.
+if ($NPredict -lt 1) {
+    throw "-NPredict must be >= 1. llama-completion -n 0 skips the prompt evaluation loop; no GPU Bank work runs."
+}
+if ($NPredict -gt 1) {
+    Write-Warning "This is a prefill experiment: extra generated tokens add decode time. Prefer -NPredict 1."
 }
 $layoutPieces = @()
 $remaining = $Layers
@@ -92,7 +97,7 @@ $argsList = @(
     "-lv", "$LogVerbosity"
 )
 if ($NoMmap) { $argsList += "--no-mmap" }
-Write-Host "[GPU_ONLY] layout=$layout banks=A/B XG=$Chunk prefill_ubatch=$UBatch"
+Write-Host "[GPU_ONLY] layout=$layout banks=A/B XG=$Chunk prefill_ubatch=$UBatch predict=$NPredict"
 Write-Host "[GPU_ONLY] compute=CUDA0 layers=0..$($Layers - 1); CPU=embedding/head/weight-transfer"
 Write-Host "[GPU_ONLY] engine=$Exe output=$base"
 if ($DryRun) {
