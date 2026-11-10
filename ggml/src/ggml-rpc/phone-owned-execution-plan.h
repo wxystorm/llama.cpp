@@ -15,6 +15,9 @@ namespace ggml_phone_owned {
 
 static constexpr uint32_t k_plan_version = 2;
 static constexpr uint32_t k_multi_plan_version = 3;
+// Fresh prefill: HTP owns all Phone KV and immutable weights. There is no
+// canonical RPC/OpenCL Decode KV binding or PC-built Phone graph.
+static constexpr uint32_t k_htp_only_plan_version = 4;
 static constexpr uint32_t k_layer_count_shift = 16;
 static constexpr uint32_t k_max_phone_layers_per_region = 64;
 static constexpr uint32_t k_wire_region_limit = 64;
@@ -63,7 +66,8 @@ struct region_plan {
 // bits of flags, keeping the 108-byte RPC descriptor ABI unchanged.
 // The lower bits retain the exact v2 Flash-Attention contract.
 inline uint32_t layer_count(const region_plan & p) {
-    return p.version == k_multi_plan_version ?
+    return p.version == k_multi_plan_version ||
+            p.version == k_htp_only_plan_version ?
         p.flags >> k_layer_count_shift : 1;
 }
 inline uint32_t flags_for_layers(uint32_t n_layers) {
@@ -115,7 +119,12 @@ inline bool validate(const region_plan & p, const char * & reason) {
     const bool multi = p.version == k_multi_plan_version &&
         (p.flags & 0xffffu) == k_flag_flash_attn &&
         layers >= 2 && layers <= k_max_phone_layers_per_region;
-    if ((!legacy && !multi) ||
+    // Protocol version 4 is an explicit fail-closed capability contract.
+    // It preserves the wire ABI and supports both P1 and consecutive Pn.
+    const bool htp_only = p.version == k_htp_only_plan_version &&
+        (p.flags & 0xffffu) == k_flag_flash_attn &&
+        layers >= 1 && layers <= k_max_phone_layers_per_region;
+    if ((!legacy && !multi && !htp_only) ||
             p.layer >= 256 || layers > 256 - p.layer ||
             p.rope_type != k_rope_neox ||
             p.kv_type != k_f16) {
