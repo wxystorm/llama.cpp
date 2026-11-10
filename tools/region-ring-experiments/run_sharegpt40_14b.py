@@ -270,6 +270,9 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
         if key.startswith(("LLAMA_HYBRID_REGION_RING_", "LLAMA_REGION_RING_")):
             env.pop(key)
     env.update(RING_ENV)
+    if getattr(args, "htp_only", False):
+        # Never let the PC allocate/upload a second copy of Phone weights.
+        env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
     token_count = (plan or {}).get("plan_tokens",
                     getattr(args, "token_counts", {}).get(prompt.name.lower(), group))
     context = (plan or {}).get("context") or context_for_tokens(
@@ -291,6 +294,10 @@ def run_prompt(args: argparse.Namespace, out: Path, group: int,
     ]
     if not getattr(args, "mmap", False):
         command.append("--no-mmap")
+    if getattr(args, "htp_only", False):
+        # Tiny legacy warmup would otherwise require Phone CPU/RPC graphs,
+        # while the v4 HTP-only path is restricted to fresh large Prefill.
+        command.append("--no-warmup")
     if plan is not None:
         atomic_json(folder / "plan.json", plan)
     atomic_json(folder / "config.json", {
@@ -488,6 +495,8 @@ def main(argv: list[str] | None = None, *,
     ap.add_argument("--prompt-dir", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--layout", default=defaults.get("layout", LAYOUT))
+    ap.add_argument("--htp-only", action="store_true",
+                    help="experimental phone HTP-only fresh prefill; requires CPU RPC transport, Phone GGUF, no OpenCL and predict=1")
     ap.add_argument("--model-layers", type=int,
                     default=defaults.get("model_layers", 40),
                     help="required Transformer depth for forced G/P layout (default 40)")
