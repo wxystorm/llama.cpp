@@ -218,13 +218,20 @@ def ensure_config(args, commit):
             )
         write_json(path, current)
     elif previous != current:
+        # The git commit can advance for a runner-only bugfix. Every attempt
+        # still records its exact commit in its per-attempt config.json.
         changed = [key for key in sorted(set(current) | set(previous))
-                   if current.get(key) != previous.get(key)]
-        raise RuntimeError(
-            "Existing output configuration differs: "
-            + ", ".join(changed)
-            + ". Use a different -Out to avoid mixing measurements."
-        )
+                   if key != "git_commit"
+                   and current.get(key) != previous.get(key)]
+        if changed:
+            raise RuntimeError(
+                "Existing output configuration differs: "
+                + ", ".join(changed)
+                + ". Use a different -Out to avoid mixing measurements."
+            )
+        if previous.get("git_commit") != current.get("git_commit"):
+            print("[SWEEP] git commit changed; continuing with compatible "
+                  "parameters; each attempt records its actual commit", flush=True)
 
 
 def inference_env(args, folder, tokens):
@@ -324,6 +331,12 @@ def run_prompt(args, root, commit, group, prompt, tokens, digest):
         except OSError as error:
             stderr.write(f"LAUNCH_ERROR: {error}\n".encode("utf-8"))
     elapsed = 1000.0 * (time.perf_counter() - start)
+    # Record the child exit status BEFORE parsing telemetry. A parser crash
+    # must never force us to repeat a completed expensive inference.
+    write_json(folder / "exit.json", {
+        "exit_code": code, "interrupted": interrupted,
+        "process_wall_ms": round(elapsed, 3),
+    })
     row = old.result_row(
         args, folder, prompt, group, ctx, code, elapsed, commit
     )
@@ -337,6 +350,60 @@ def run_prompt(args, root, commit, group, prompt, tokens, digest):
           f"({row['prefill_ms']} ms), decode={row['decode_tps']} tok/s",
           flush=True)
     return row
+
+
+def recover_existing_attempts(args, prompts, token_map, commit):
+    """Finish result parsing for a completed inference after a runner crash.
+
+    Older attempts (before exit.json was added) can be recovered only when
+    measured perf plus all ring stages prove a successful inference. Their
+    process exit code remains explicitly marked as unverified.
+    """
+    for group, _, prompt in prompts:
+        digest = token_map[prompt.name]["sha256"]
+        for folder in folders_for(args.out, prompt):
+            if (folder / "result.json").is_file():
+                continue
+            cfg = read_json(folder / "config.json", {})
+            if cfg.get("prompt_sha256") != digest:
+                continue
+            if not (folder / "metrics.jsonl").is_file():
+                continue
+            finished = read_json(folder / "exit.json")
+            if finished is None:
+                # Old runner crashed before it could save the exit code.
+                # Never promote a run to PASS without complete measurement.
+                rows = old.records(folder / "metrics.jsonl")
+                if not any(r.get("type") == "perf" for r in rows):
+                    continue
+                if not any(r.get("type") == "region_ring" for r in rows):
+                    continue
+                code = 0  # Provisional: verified by old.result_row below.
+                unverified_exit = True
+                elapsed = 0
+            else:
+                code = int(finished.get("exit_code", 127))
+                elapsed = float(finished.get("process_wall_ms") or 0)
+                unverified_exit = False
+            ctx = int(cfg.get("context") or context_size(
+                token_map[prompt.name]["tokens"], args.predict,
+                args.padding, args.min_context))
+            row = old.result_row(args, folder, prompt, group, ctx, code,
+                                 elapsed, cfg.get("commit", commit))
+            if unverified_exit and row["status"] != "PASS":
+                continue
+            row["prompt_sha256"] = digest
+            row["recovered"] = True
+            row["process_exit_code_verified"] = not unverified_exit
+            if finished and finished.get("interrupted"):
+                row["status"] = "INTERRUPTED"
+            old.write_phone_input_push_timeline(folder)
+            old.write_phone_copy_timeline(folder)
+            write_json(folder / "result.json", row)
+            note = " (exit code not previously recorded)" if unverified_exit else ""
+            print(f"[RECOVER] {prompt.name} {folder.name}: "
+                  f"{row['status']} prefill={row.get('prefill_tps')} tok/s"
+                  f"{note}", flush=True)
 
 
 def main():
@@ -378,6 +445,8 @@ def main():
     args.skip_profile = True
     args.streaming = "on"
     args.no_mmap = False
+    # The legacy parser reads n_predict, while this runner exposes --predict.
+    args.n_predict = args.predict
     if (args.limit < 0 or args.min_tps < 0 or args.ubatch <= 0 or
             args.batch < args.ubatch or args.predict <= 0 or
             args.min_context <= 0 or args.padding < 0):
@@ -398,6 +467,7 @@ def main():
     commit = old.git_head(repo)
     ensure_config(args, commit)
     tokens = tokens_for_prompts(args, all_prompts)
+    recover_existing_attempts(args, all_prompts, tokens, commit)
     target = args.rerun.lower().removesuffix(".txt")
     if target and not target.startswith("prompt_"):
         target = "prompt_" + target
