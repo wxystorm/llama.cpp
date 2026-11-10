@@ -398,6 +398,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_AUTO_WAIT_CAPTURE,
     RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
     RPC_CMD_PHONE_OWNED_KV_BIND,
+    RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD,
     RPC_CMD_COUNT,
 };
 
@@ -437,6 +438,7 @@ static_assert(RPC_CMD_PHONE_AUTO_WAIT == 51, "RPC_CMD_PHONE_AUTO_WAIT index");
 static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CAPTURE index");
 static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
+static_assert(RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD == 55, "Phone HTP weight preload RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -506,6 +508,16 @@ struct rpc_msg_phone_owned_plan_req {
     float rope_beta_fast = 0;
     float rope_beta_slow = 0;
 };
+// Immutable weight residency only: no RUN state, KV or Chunk graphs.
+// Region IDs are the ordinal positions of P stages in the PC-owned plan.
+struct rpc_msg_phone_npu_weight_preload_req {
+    uint32_t region = 0;
+    uint32_t first_layer = 0;
+    uint32_t layer_count = 0;
+};
+static_assert(sizeof(rpc_msg_phone_npu_weight_preload_req) == 12,
+              "Phone weight preload wire ABI changed");
+
 // One canonical storage binding per Region; no KV payload or host pointer.
 struct rpc_msg_phone_owned_kv_bind_req {
     uint64_t run_id = 0;
@@ -4305,6 +4317,32 @@ static bool ggml_backend_rpc_phone_auto_graph_register(
     return ok;
 }
 
+// Patch 30: PC model-load worker sends immutable Phone layer residency
+// before its own model finishes loading, outside the timed Prefill stage.
+static bool ggml_backend_rpc_phone_npu_weight_preload(
+        ggml_backend_t backend, uint32_t region,
+        uint32_t first_layer, uint32_t layer_count) {
+    if (!backend || !ggml_backend_is_rpc(backend) ||
+            region >= ggml_phone_owned::k_wire_region_limit ||
+            first_layer >= 64 || layer_count == 0 ||
+            layer_count > 64 - first_layer) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 30) {
+        return false;
+    }
+    rpc_msg_phone_npu_weight_preload_req req {};
+    req.region = region;
+    req.first_layer = first_layer;
+    req.layer_count = layer_count;
+    rpc_msg_phone_input_ack rsp {};
+    return send_rpc_cmd(sock, RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD,
+               &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
+}
+
 // A plan is registered once per Phone Region before its individual Chunk
 // graphs. The RPC-visible client remains a simple transport; Phone owns the
 // authoritative validation and registry.
@@ -6073,6 +6111,7 @@ public:
     bool phone_input_push(const std::vector<uint8_t> & input,
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
+    bool phone_npu_weight_preload(const rpc_msg_phone_npu_weight_preload_req & request);
     bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
     bool phone_owned_kv_bind(const rpc_msg_phone_owned_kv_bind_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
@@ -7655,6 +7694,94 @@ bool rpc_server::phone_input_stream_run(
             request.run_id, GGML_RPC_PHONE_INPUT_STREAM_BUDGET_MIB,
             GGML_RPC_PHONE_INPUT_STREAM_MARGIN_MIB);
     }
+    return true;
+}
+
+// Preload immutable Transformer weights into the correct HTP FastRPC
+// sessions. No input RUN or KV cache is allocated here, and the later
+// Phone-owned Plan still performs its per-request graph/KV validation.
+bool rpc_server::phone_npu_weight_preload(
+        const rpc_msg_phone_npu_weight_preload_req & request) {
+    const char * htp_env = std::getenv("GGML_RPC_PHONE_HTP_ONLY");
+    if (!htp_env || std::strcmp(htp_env, "1") != 0 ||
+            request.region >= ggml_phone_owned::k_wire_region_limit ||
+            request.first_layer >= 64 || request.layer_count == 0 ||
+            request.layer_count > 64 - request.first_layer ||
+            !ggml_phone_npu_serial::htp_region(
+                phone_npu_serial_regions, request.region) ||
+            phone_npu_executors.empty() ||
+            !local_tensor_source.get_info || !local_tensor_source.read) {
+        GGML_LOG_ERROR(
+            "[PHONE_NPU_EARLY_WEIGHTS] event=REJECT"
+            " region=%u first_layer=%u layers=%u"
+            " reason=HTP_ONLY_REGION_OR_GGUF_UNAVAILABLE status=FAIL\n",
+            request.region, request.first_layer, request.layer_count);
+        return false;
+    }
+
+    const int64_t start_us = ggml_time_us();
+    GGML_LOG_INFO(
+        "[PHONE_NPU_EARLY_WEIGHTS] event=BEGIN"
+        " region=%u first_layer=%u layers=%u"
+        " phase=MODEL_LOAD status=RUNNING\n",
+        request.region, request.first_layer, request.layer_count);
+
+    size_t total_new_weights = 0;
+    size_t total_new_bytes = 0;
+    double total_read_ms = 0.0;
+    double total_repack_ms = 0.0;
+    for (uint32_t offset = 0; offset < request.layer_count; ++offset) {
+        const size_t session = phone_npu_session_for_region_layer(
+            request.region, offset);
+        if (session >= phone_npu_executors.size()) {
+            GGML_LOG_ERROR(
+                "[PHONE_NPU_EARLY_WEIGHTS] event=FAIL"
+                " region=%u offset=%u reason=HTP_SESSION_MISSING\n",
+                request.region, offset);
+            return false;
+        }
+        auto guards = phone_npu_lock_sessions({session});
+        auto * executor = phone_npu_executors[session].get();
+        ggml_phone_npu_serial::full_region_executor::model_load_stats stats {};
+        std::string reason;
+        const uint32_t layer = request.first_layer + offset;
+        const int64_t layer_start_us = ggml_time_us();
+        const bool ok = executor->load_model_layer(
+            local_tensor_source, layer, reason, stats);
+        const double layer_wall_ms =
+            (ggml_time_us() - layer_start_us) / 1000.0;
+        GGML_LOG_INFO(
+            "[PHONE_NPU_EARLY_WEIGHTS] event=LAYER"
+            " region=%u layer=%u session=%zu backend=%s"
+            " new_weights=%zu bytes=%zu read_ms=%.3f"
+            " repack_ms=%.3f wall_ms=%.3f cache=%s"
+            " status=%s reason=%s\n",
+            request.region, layer, session,
+            phone_npu_names[session].c_str(),
+            stats.new_weights, stats.new_bytes,
+            stats.file_read_ms, stats.htp_repack_ms, layer_wall_ms,
+            stats.new_weights == 0 ? "HIT" : "MISS",
+            ok ? "PASS" : "FAIL",
+            ok ? "NONE" : reason.c_str());
+        if (!ok) {
+            return false;
+        }
+        total_new_weights += stats.new_weights;
+        total_new_bytes += stats.new_bytes;
+        total_read_ms += stats.file_read_ms;
+        total_repack_ms += stats.htp_repack_ms;
+    }
+
+    GGML_LOG_INFO(
+        "[PHONE_NPU_EARLY_WEIGHTS] event=DONE"
+        " region=%u first_layer=%u layers=%u"
+        " new_weights=%zu bytes=%zu read_ms=%.3f"
+        " repack_ms=%.3f wall_ms=%.3f"
+        " phase=MODEL_LOAD residency=HTP status=PASS\n",
+        request.region, request.first_layer, request.layer_count,
+        total_new_weights, total_new_bytes,
+        total_read_ms, total_repack_ms,
+        (ggml_time_us() - start_us) / 1000.0);
     return true;
 }
 
@@ -15128,6 +15255,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD: {
+                rpc_msg_phone_npu_weight_preload_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_npu_weight_preload(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_OWNED_KV_BIND: {
                 rpc_msg_phone_owned_kv_bind_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -15605,6 +15741,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_input_ack response {};
                 response.accepted =
                     server.phone_owned_plan_register(request) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD: {
+                rpc_msg_phone_npu_weight_preload_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_input_ack response {};
+                response.accepted =
+                    server.phone_npu_weight_preload(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
@@ -16763,6 +16908,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_AUTO_GRAPH_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_auto_graph_register);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_NPU_WEIGHT_PRELOAD_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_npu_weight_preload);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_plan_register);
