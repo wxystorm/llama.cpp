@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
+#include <cmath>
 #include <optional>
 #include <string>
 #include <vector>
