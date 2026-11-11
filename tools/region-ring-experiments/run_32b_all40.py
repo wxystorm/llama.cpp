@@ -814,87 +814,17 @@ def require_htp_stage_rows(path: Path) -> int:
     return len(phone)
 
 
-def bootstrap_htp_profile(args, prompts, decisions) -> Path:
-    """One real, uncounted fixed-layout run seeds an HTP-only V0 Profile.
-
-    This runs the already-proven G8/P6/.../G8 execution contract, not the
-    automatic Planner. The new run uses the same NPU session reset/mapping
-    and post-drain HTP measurements as every subsequent Prompt. It never
-    enters runs/ or the PASS counter, and is safely resumable.
-    """
-    base = args.out / "profile-bootstrap" / "v00"
-    csv_path = base / "real-stage-profile.csv"
-    if csv_path.is_file():
-        metadata_path = base / "manifest.json"
-        if not metadata_path.is_file():
-            raise ValueError("V0 profile exists without a manifest; refuse unverified cache")
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if metadata.get("sha256") != digest(csv_path):
-            raise ValueError("V0 HTP Profile digest mismatch; refuse stale cache")
-        count = require_htp_stage_rows(csv_path)
-        print(f"[PROFILE] event=BOOTSTRAP_REUSE version=V0 "
-              f"npu_points={count} csv={csv_path}", flush=True)
-        return csv_path
-
-    selected = next(((g, p) for g, p in prompts if g == 512), prompts[0])
-    group, prompt = selected
-    ctx = decisions[prompt.name]["context"]
-    hint = decisions[prompt.name]["prompt_tokens_hint"]
-    print(f"[PROFILE] event=BOOTSTRAP_FIXED version=V0 "
-          f"prompt={prompt.name} layout={FIXED_LAYOUT} counted=0", flush=True)
-
-    # build_process() selects the existing fixed Ring exactly while all
-    # htp_only Phone-owned configuration stays enabled. No native Phone
-    # RPC CPU profiling is used in the calibration run.
-    was_auto = args.auto_plan
-    was_stage = args.real_stage_profile_csv
-    args.auto_plan = False
-    args.real_stage_profile_csv = None
-    try:
-        result = execute(args, prompt, group, ctx, hint,
-                         base / "calibration", warmup=True)
-    finally:
-        args.auto_plan = was_auto
-        args.real_stage_profile_csv = was_stage
-    if result["status"] != "PASS":
-        raise ValueError(
-            f"HTP V0 bootstrap failed status={result['status']}. "
-            f"Inspect {base / 'calibration' / 'warmup'} / engine.stderr.log; "
-            "Phone requires GGML_RPC_REAL_STAGE_PROFILE=1")
-
-    from build_real_stage_profile import SCHEMA, extract, aggregate
-    attempt = Path(result["result_file"]).parent
-    samples, diagnostic = extract([attempt], None)
-    points = aggregate(samples)
-    npu = sum(p["device"] == "PHONE" for p in points)
-    if npu == 0:
-        raise ValueError(
-            f"V0 fixed inference passed but no matched HTP service samples. "
-            f"Check [REGION_RING_PHONE_PROFILE_PULL] and [REAL_STAGE_PROFILE] "
-            f"in {attempt / 'engine.stderr.log'}; "
-            "Phone needs GGML_RPC_REAL_STAGE_PROFILE=1")
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = csv_path.with_name(csv_path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=SCHEMA)
-        writer.writeheader()
-        writer.writerows(points)
-    os.replace(tmp, csv_path)
-    save_json(base / "manifest.json", {
-        "schema": 1, "version": "V0", "mode": "FIXED_HTP_REAL_CALIBRATION",
-        "source_attempt": str(attempt),
-        "sha256": digest(csv_path),
-        "device_points": {
-            device: sum(p["device"] == device for p in points)
-            for device in ("CPU", "GPU", "PHONE")},
-        "diagnostic": diagnostic})
-    print(f"[PROFILE] event=BOOTSTRAP_READY version=V0 "
-          f"npu_points={npu} csv={csv_path}", flush=True)
-    return csv_path
-
-
 def main(argv=None):
     args = get_args(argv)
+    user_stage_csv = args.real_stage_profile_csv
+    if args.auto_plan and args.htp_only and user_stage_csv is None:
+        # The first C++ startup profiles C/G/N independently before it
+        # searches the Plan. No fixed Ring, V0 prefill or Prompt is run.
+        args.real_stage_profile_csv = (
+            args.out / "independent-profile" / "profile.csv")
+        if not args.dry_run:
+            args.real_stage_profile_csv.parent.mkdir(
+                parents=True, exist_ok=True)
     prompts = prompts_in(args.prompt_dir)
     manifest = read_manifest(args.prompt_dir)
     decisions = {}
@@ -940,7 +870,7 @@ def main(argv=None):
         # Keep fixed-mode schema 2 intact for previously completed runs.
         # Automatic Profile + Plan has a separate output and signature.
         config.update({
-            "version": 3, "planning_mode": "native-auto",
+            "version": 4, "planning_mode": "independent-backend-profile-then-plan",
             **({"rolling_profile_every": args.profile_every,
                 "rolling_phone_log": str(args.phone_profile_log or "")}
                if args.profile_every else {}),
@@ -950,9 +880,10 @@ def main(argv=None):
             "fixed_layout": None, "fixed_xc": None,
             "fixed_xg": None, "fixed_xp": None,
             "real_stage_profile_csv": (
-                {**file_id(args.real_stage_profile_csv),
-                 "sha256": digest(args.real_stage_profile_csv)}
-                if args.real_stage_profile_csv is not None else None),
+                {**file_id(user_stage_csv),
+                 "sha256": digest(user_stage_csv)}
+                if user_stage_csv is not None else
+                "AUTO_INDEPENDENT_G_C_N" if args.htp_only else None),
         })
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
@@ -966,7 +897,7 @@ def main(argv=None):
     }
     if args.auto_plan:
         print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
-              f"native_profile=PER_PROCESS fixed_layout=OFF "
+              f"native_profile=INDEPENDENT_BACKEND_GRID fixed_layout=OFF "
               f"baseline_chunk={CHUNK_TOKENS} "
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
@@ -1014,16 +945,20 @@ def main(argv=None):
                   and not (args.retry_failed_only
                            and latest[prompt.name]["status"] == "PENDING")]
 
-        # V0 must be calibrated with a real Phone HTP RUN. Native RPC CPU
-        # probes cannot seed an HTP-only planner. Once any five Prompt PASS
-        # results exist, immutable rolling epochs take precedence.
-        completed_count = sum(row["status"] == "PASS" for row in latest.values())
         if args.auto_plan and args.htp_only and to_run:
-            if args.real_stage_profile_csv is None and completed_count < args.profile_every:
-                args.real_stage_profile_csv = bootstrap_htp_profile(
-                    args, prompts, decisions)
-            if args.real_stage_profile_csv is not None:
-                require_htp_stage_rows(args.real_stage_profile_csv)
+            independent = args.out / "independent-profile" / "profile.csv"
+            if user_stage_csv is None:
+                if independent.is_file():
+                    count = require_htp_stage_rows(independent)
+                    print(f"[PROFILE] event=INDEPENDENT_REUSE"
+                          f" npu_points={count} csv={independent}", flush=True)
+                else:
+                    print("[PROFILE] event=INDEPENDENT_START"
+                          " grid=C_G_N_x_layers_x_chunks"
+                          " fixed_ring=SKIPPED inference=SKIPPED"
+                          " source=PC_NATIVE_AND_PHONE_RPC_HTP", flush=True)
+            else:
+                require_htp_stage_rows(user_stage_csv)
 
         # One unmeasured representative Prefill per invocation. It is
         # deliberately NOT an entry in runs/, summary.csv or PASS counts.
@@ -1065,9 +1000,8 @@ def main(argv=None):
             print("[WARMUP] event=SKIP reason=NO_MEASURED_WORK", flush=True)
 
         previous_executed_prompt = None
-        # The first epoch uses native independent Profile probes, as in the
-        # verified 32B runner. Once five successful Prompts have produced
-        # genuine Stage traces, snapshot their medians to a versioned CSV.
+        # First Plan consumes independent CPU/CUDA/HTP measurements; only
+        # after 5 PASS results do runtime Stage samples refine this baseline.
         # The C++ E/Memory/Beam/DAG search still runs on EVERY Prompt.
         args.profile_epoch = 0
         initial_stage_csv = args.real_stage_profile_csv
@@ -1104,8 +1038,9 @@ def main(argv=None):
                     if args.profile_epoch != 0:
                         args.profile_epoch = 0
                     if passed == 0:
-                        print("[PROFILE] event=BOOTSTRAP version=V0 "
-                              "source=NATIVE_PROBES", flush=True)
+                        print("[PROFILE] event=BASELINE version=V0"
+                              " source=INDEPENDENT_G_C_N"
+                              " inference_before_plan=0", flush=True)
             # Pause once between actual prompts, never before the first run,
             # between retries, after the last run, or only to skip PASS entries.
             if previous_executed_prompt is not None and args.inter_prompt_delay_seconds:
@@ -1124,6 +1059,21 @@ def main(argv=None):
                     print("\nInterrupted; rerun the same command and --out to resume.", file=sys.stderr)
                     return 130
                 counts = write_summary(args.out, prompts)
+                if (args.auto_plan and args.htp_only and
+                        user_stage_csv is None and
+                        args.profile_epoch == 0):
+                    independent = args.out / "independent-profile" / "profile.csv"
+                    if independent.is_file():
+                        count = require_htp_stage_rows(independent)
+                        if retry == 0 and i == 1:
+                            print(f"[PROFILE] event=INDEPENDENT_READY"
+                                  f" npu_points={count}"
+                                  f" json={independent}.json", flush=True)
+                    elif row["status"] == "PASS":
+                        row["status"] = "FAIL"
+                        row["error"] = "PROFILE_NOT_CREATED"
+                        print("[INDEPENDENT_PROFILE] status=FAIL"
+                              " reason=NO_CALIBRATED_CSV", flush=True)
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
