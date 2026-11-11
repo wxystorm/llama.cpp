@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
@@ -1494,6 +1495,167 @@ static void test_phone_auto_final_output_offsets() {
           "bounded-slot intermediate output address changed");
 }
 
+
+static void test_resource_aware_gpu_bank_skip_and_wakeup() {
+    // G0(A) -> P1 -> G2(B) -> P3 -> G4(A).
+    // G4 becomes READY before G2 chunk 1, but A is reloading while B
+    // remains resident. A blocked queue head must not hold up G2.
+    const std::vector<llama_region_ring_region> regions {
+        {llama_region_ring_device::GPU,   0, 1},
+        {llama_region_ring_device::PHONE, 1, 2},
+        {llama_region_ring_device::GPU,   2, 3},
+        {llama_region_ring_device::PHONE, 3, 4},
+        {llama_region_ring_device::GPU,   4, 5},
+    };
+    llama_region_ring_ready ready(regions, 2, 1, 0, true);
+    const auto g0c0 = ready.try_take(llama_region_ring_device::GPU);
+    check(g0c0 && g0c0->region == 0 && g0c0->chunk == 0,
+          "resource-ready mock missing G0 chunk0");
+    ready.complete(*g0c0);
+    const auto p1c0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p1c0 && p1c0->region == 1, "G0 did not produce P1");
+    ready.complete(*p1c0);
+    const auto g2c0 = ready.wait_take(
+        llama_region_ring_device::GPU, 2, 1);
+    check(g2c0 && g2c0->region == 2 && g2c0->chunk == 0,
+          "GPU Bank B chunk0 not selected for mock");
+    ready.complete(*g2c0);
+    const auto p3c0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p3c0 && p3c0->region == 3, "G2 did not produce P3");
+    ready.complete(*p3c0);
+    // Now G4 chunk0 is READY but cannot CLAIM until G0 completely drains.
+    const auto g0c1 = ready.try_take(llama_region_ring_device::GPU);
+    check(g0c1 && g0c1->region == 0 && g0c1->chunk == 1,
+          "G4 violated previous same-Bank Region lifetime");
+    ready.complete(*g0c1);
+    const auto p1c1 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p1c1 && p1c1->region == 1 && p1c1->chunk == 1,
+          "P1 chunk1 did not become READY");
+    ready.complete(*p1c1);
+
+    std::atomic<bool> bank_a_ready {false};
+    const llama_region_ring_ready::resource_ready_predicate eligible =
+        [&](const llama_region_ring_task & task) {
+            return task.region != 4 ||
+                   bank_a_ready.load(std::memory_order_acquire);
+        };
+    // Legacy queue order was G4c0, then G2c1. Filter must select G2c1.
+    const auto g2c1 = ready.wait_take(
+        llama_region_ring_device::GPU, regions.size(), -1, eligible);
+    check(g2c1 && g2c1->region == 2 && g2c1->chunk == 1,
+          "unready Bank A blocked already-ready Bank B Chunk");
+    ready.complete(*g2c1);
+
+    std::atomic<int> result {0};
+    std::thread waiter([&] {
+        try {
+            auto task = ready.wait_take(
+                llama_region_ring_device::GPU, regions.size(), -1, eligible);
+            if (task && task->region == 4 && task->chunk == 0) {
+                ready.complete(*task);
+                result.store(1);
+            } else {
+                result.store(-1);
+            }
+        } catch (...) {
+            result.store(-2);
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool claimed_too_early = result.load() != 0;
+    bank_a_ready.store(true, std::memory_order_release);
+    ready.notify_external_ready();
+    for (int i = 0; i < 400 && result.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (result.load() == 0) { ready.cancel(); }
+    waiter.join();
+    check(!claimed_too_early,
+          "GPU worker claimed unready Bank before refill notification");
+    check(result.load() == 1,
+          "GPU worker did not wake when Bank A became resident");
+}
+
+static void test_resource_aware_phone_input_skip_and_wakeup() {
+    // A preferred downstream Phone task has its upstream tokens but still
+    // lacks its separately staged PUSH. Prefer the earlier Phone task.
+    const std::vector<llama_region_ring_region> regions {
+        {llama_region_ring_device::PHONE, 0, 1},
+        {llama_region_ring_device::GPU,   1, 2},
+        {llama_region_ring_device::PHONE, 2, 3},
+    };
+    llama_region_ring_ready ready(regions, 2, 1);
+    auto p0c0 = ready.try_take(llama_region_ring_device::PHONE);
+    check(p0c0 && p0c0->region == 0, "Phone startup mock not READY");
+    ready.complete(*p0c0);
+    auto g1c0 = ready.try_take(llama_region_ring_device::GPU);
+    check(g1c0 && g1c0->region == 1, "Phone input mock missing GPU");
+    ready.complete(*g1c0);
+
+    std::atomic<bool> pushed {false};
+    const llama_region_ring_ready::resource_ready_predicate eligible =
+        [&](const llama_region_ring_task & task) {
+            return task.region != 2 ||
+                   pushed.load(std::memory_order_acquire);
+        };
+    // Preferred P2c0 is not PUSH-ready; fall back to resident P0c1.
+    auto p0c1 = ready.wait_take(
+        llama_region_ring_device::PHONE, 2, 1, eligible);
+    check(p0c1 && p0c1->region == 0 && p0c1->chunk == 1,
+          "Phone affinity selected task without staged PUSH");
+    ready.complete(*p0c1);
+
+    std::atomic<int> result {0};
+    std::thread waiter([&] {
+        try {
+            auto task = ready.wait_take(
+                llama_region_ring_device::PHONE, regions.size(), -1, eligible);
+            if (task && task->region == 2 && task->chunk == 0) {
+                ready.complete(*task);
+                result.store(1);
+            } else {
+                result.store(-1);
+            }
+        } catch (...) {
+            result.store(-2);
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool claimed_too_early = result.load() != 0;
+    pushed.store(true, std::memory_order_release);
+    ready.notify_external_ready();
+    for (int i = 0; i < 400 && result.load() == 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (result.load() == 0) { ready.cancel(); }
+    waiter.join();
+    check(!claimed_too_early,
+          "Phone worker claimed Chunk before input PUSH");
+    check(result.load() == 1,
+          "Phone worker did not wake after input PUSH");
+}
+
+static void test_resource_aware_cancellation_wakes_filtered_worker() {
+    llama_region_ring_ready ready(
+        {{llama_region_ring_device::GPU, 0, 1}}, 2, 1);
+    const llama_region_ring_ready::resource_ready_predicate never_ready =
+        [](const llama_region_ring_task &) { return false; };
+    std::atomic<int> result {0};
+    std::thread waiter([&] {
+        try {
+            const auto task = ready.wait_take(
+                llama_region_ring_device::GPU, 1, -1, never_ready);
+            result.store(task ? -1 : 1);
+        } catch (...) {
+            result.store(-2);
+        }
+    });
+    ready.cancel();
+    waiter.join();
+    check(result.load() == 1,
+          "cancel failed to wake worker filtered on unavailable Bank");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1545,6 +1707,12 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] window_failure_wakeup=PASS\n");
         test_gpu_same_bank_lifetime_scheduler();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_same_bank_lifetime_scheduler=PASS\n");
+        test_resource_aware_gpu_bank_skip_and_wakeup();
+        std::fprintf(stderr, "[REGION_RING_TEST] resource_gpu_bank=PASS\n");
+        test_resource_aware_phone_input_skip_and_wakeup();
+        std::fprintf(stderr, "[REGION_RING_TEST] resource_phone_input=PASS\n");
+        test_resource_aware_cancellation_wakes_filtered_worker();
+        std::fprintf(stderr, "[REGION_RING_TEST] resource_cancel=PASS\n");
         test_gpu_weight_two_bank_policy();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_phone_single_graph_ready_affinity();
