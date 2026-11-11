@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <climits>
 #include <fstream>
 #include <limits>
 #include <iterator>
@@ -36,6 +37,19 @@ struct real_stage_point {
     bool terminal = false;
     int samples = 0;
 };
+
+// Phone-owned HTP Graphless prefill materializes its KV tensor as a padded
+// 256-token span. Planner's coarse E uses floor(total_tokens / 2), which
+// can be 127 for a 255-token Prompt while the smallest real HTP measurement
+// is KV=256. Query the *actual padded HTP shape*, not a made-up 127-token
+// graph. Do NOT apply this conversion to CPU/CUDA or legacy Phone RPC paths.
+inline int phone_graphless_profile_kv(int query_tokens, int logical_kv_tokens) {
+    const int needed = std::max(query_tokens, logical_kv_tokens);
+    if (needed <= 0 || needed > INT_MAX - 255) {
+        return 0;
+    }
+    return std::max(256, ((needed + 255) / 256) * 256);
+}
 
 class real_stage_profile {
 public:
