@@ -21,6 +21,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from v2_profile_coordinator import prepare_native_profile
+from run_v2_stage_matrix import sha256
 
 GROUPS = (128, 256, 512, 1024)
 CHUNKS = (32, 48, 56, 64, 80, 96, 112, 128, 160)
@@ -290,8 +291,12 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     config_file = args.out / "run-config.json"
     settings = {"schema": 1, "model": str(args.model),
-                "model_size": args.model.stat().st_size,
-                "exe": str(args.exe), "native_profile_exe": str(args.native_profile_exe),
+                "model_sha256": sha256(args.model),
+                "exe": str(args.exe), "exe_sha256": sha256(args.exe),
+                "native_profile_exe": str(args.native_profile_exe),
+                "native_profile_exe_sha256": sha256(args.native_profile_exe),
+                "prompt_sha256": {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+                                  for _, p in items},
                 "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
                 "profile_every": args.profile_every,
                 "refresh_chunks": list(refresh),
@@ -316,8 +321,9 @@ def main() -> int:
         completed = sum(latest(args.out / "runs" / p.stem).get("status") == "PASS"
                         for _, p in items)
         version = ensure_profile(args, root, args.out, completed)
-        attempts = list((args.out / "runs" / prompt.stem).glob("attempt-*/result.json"))
-        first_attempt = len(attempts) + 1
+        attempt_dirs = list((args.out / "runs" / prompt.stem).glob("attempt-*"))
+        first_attempt = max([int(p.name.split("-")[-1]) for p in attempt_dirs
+                             if re.fullmatch(r"attempt-[0-9]+", p.name)] + [0]) + 1
         row = {}
         for attempt in range(first_attempt, first_attempt + args.max_retries + 1):
             row = run_one(args, root, args.out, group, prompt,
