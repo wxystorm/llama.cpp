@@ -47,7 +47,11 @@ class RollingPlanTests(unittest.TestCase):
             seen = []
             def fake_profile(*a, **kwargs):
                 seen.append((kwargs["force"], kwargs["refresh_chunks"]))
-                return out / "profile" / "stage-profile-v2.csv"
+                folder = out / "profile"
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / "stage-profile-v2.csv").write_text("backend,layers\\nN,1\\n")
+                (folder / "profile.json").write_text('{"schema":2}')
+                return folder / "stage-profile-v2.csv"
             with patch.object(runner, "prepare_native_profile", side_effect=fake_profile):
                 with contextlib.redirect_stdout(io.StringIO()):
                     self.assertEqual(runner.ensure_profile(args, out, out, 0), 0)
