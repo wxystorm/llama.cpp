@@ -129,7 +129,7 @@ class RollingStageProfileTests(unittest.TestCase):
             root = Path(td)
             self.make_baseline(root)
             for i in range(1, 11):
-                self.make_case(root, i, htp=True)
+                self.make_case(root, i, htp=True, gpu_tail=True)
             first, _, _ = profile_snapshot(root, 1, 5)
             second, meta, _ = profile_snapshot(root, 2, 5)
             a = self.phone_rows(first)[1]
