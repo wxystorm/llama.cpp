@@ -270,6 +270,17 @@ public:
         return model_weights_.size();
     }
 
+    // A different Prompt may select different NPU layer ranges. After the
+    // previous RUN has fully drained, discard old fixed graphs/KV before
+    // releasing HTP-repacked weights so 40 independently planned Prompts
+    // cannot accumulate the union of all selected layers in Phone RAM.
+    // Caller holds the HTP session lock and verifies no RUN is active.
+    void reset_model_residency() {
+        reset_kv();
+        persistent_.clear();
+        model_weights_.clear();
+    }
+
     struct local_graph_shadow_stats {
         uint32_t chunks = 0;
         size_t total_nodes = 0;
