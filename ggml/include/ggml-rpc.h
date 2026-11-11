@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    30
+#define RPC_PROTO_PATCH_VERSION    31
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -254,6 +254,24 @@ using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
 // The PC derives the Region/layer range from its immutable model-owned Plan
 // and sends it once when the inference Context is initialized. No RUN,
 // KV, activation or Chunk Graph is allocated by this operation.
+// Patch 31: retrieve HTP Stage service samples after the Phone RUN drains.
+// The user-visible log and rolling Planner consume these, not RPC wall time.
+#define GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_GET_PROC \
+    "ggml_backend_rpc_phone_stage_profile_get"
+struct ggml_rpc_phone_stage_sample {
+    uint32_t region;
+    uint32_t chunk;
+    uint32_t tokens;
+    uint32_t token_begin;
+    float upload_ms;
+    float prepare_ms;
+    float compute_ms;
+};
+using ggml_backend_rpc_phone_stage_profile_get_t = bool (*)(
+    ggml_backend_t backend, uint64_t run_id, uint32_t offset,
+    struct ggml_rpc_phone_stage_sample * samples,
+    uint32_t capacity, uint32_t * received, uint32_t * total);
+
 #define GGML_BACKEND_RPC_PHONE_NPU_WEIGHT_PRELOAD_PROC \
     "ggml_backend_rpc_phone_npu_weight_preload"
 using ggml_backend_rpc_phone_npu_weight_preload_t = bool (*)(
