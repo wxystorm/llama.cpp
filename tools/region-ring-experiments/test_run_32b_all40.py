@@ -444,6 +444,114 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(changed.returncode, 2)
         self.assertIn('different configuration', changed.stderr)
 
+    def test_model_load_preload_then_unmeasured_warmup_and_resume(self):
+        first = self.invoke_new('--limit', '2')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('[WARMUP] event=START', first.stdout)
+        self.assertIn('[WARMUP] event=DONE status=PASS', first.stdout)
+        warm = sorted((self.out / 'warmup').glob('attempt-*/result.json'))
+        self.assertEqual(len(warm), 1)
+        row = json.loads(warm[0].read_text())
+        self.assertTrue(row['warmup'])
+        self.assertEqual(row['early_weights_status'], 'PASS')
+        self.assertEqual(row['early_weights_regions'], 4)
+        self.assertEqual(row['early_weights_wall_ms'], 12.4)
+        self.assertEqual(row['prompt'], 'prompt_128_01.txt')
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+        measured = self.load('prompt_128_01.txt')[0]
+        self.assertEqual(measured['early_weights_status'], 'PASS')
+        self.assertEqual(measured['env_overrides'][
+            'LLAMA_REGION_RING_PHONE_HTP_ONLY'], '1')
+        self.assertEqual(measured['env_overrides'][
+            'LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC'], '127.0.0.1:50052')
+        cfg = json.loads((self.out / 'run-config.json').read_text())
+        self.assertIn('PC_MODEL_LOAD', cfg['phone_weight_preload'])
+        self.assertTrue(cfg['warmup']['enabled'])
+        with (self.out / 'summary.csv').open(encoding='utf-8-sig') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 40)
+        self.assertEqual(sum(r['status'] == 'PASS' for r in rows), 2)
+
+        # A completely finished selection should not warm again.
+        done = self.invoke_new('--limit', '2')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('reason=NO_MEASURED_WORK', done.stdout)
+        self.assertEqual(len(list((self.out / 'warmup').glob(
+            'attempt-*/result.json'))), 1)
+        # Resume with more work: warm up again; phone may have rebooted.
+        resume = self.invoke_new('--limit', '3')
+        self.assertEqual(resume.returncode, 0, resume.stderr)
+        self.assertEqual(len(list((self.out / 'warmup').glob(
+            'attempt-*/result.json'))), 2)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+        self.assertEqual(len(self.load('prompt_128_03.txt')), 1)
+
+    def test_preload_fail_or_missing_ack_prevents_formal_run(self):
+        for behavior, expected in (('preload_fail', 'PRELOAD_FAILED'),
+                                   ('preload_unverified', 'PRELOAD_UNVERIFIED')):
+            with self.subTest(behavior=behavior):
+                (self.root / 'behavior.txt').write_text(behavior)
+                result = self.invoke_new('--limit', '1')
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn('no measured Prompt was started', result.stderr)
+                first = json.loads(next(
+                    (self.out / 'warmup').glob('attempt-*/result.json')).read_text())
+                self.assertEqual(first['status'], expected)
+                self.assertFalse((self.out / 'runs').exists())
+                self.assertEqual(self.load('prompt_128_01.txt'), [])
+                (self.root / 'behavior.txt').unlink()
+                # The failed warm-up must not permanently poison output.
+                if behavior == 'preload_fail':
+                    recovered = self.invoke_new('--limit', '1')
+                    self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                    break
+
+    def test_preload_can_run_without_warmup(self):
+        args = [arg for arg in self.common
+                if arg != '--no-phone-weight-preload']
+        proc = subprocess.run(
+            [sys.executable, str(RUNNER), *args, '--limit', '1'],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.out / 'warmup').exists())
+        self.assertEqual(self.load('prompt_128_01.txt')[0][
+            'early_weights_status'], 'PASS')
+
+    def test_warmup_choice_and_config_isolation(self):
+        out = self.root / 'new-out'
+        proc = self.invoke_new('--out', str(out), '--only-group', '1024',
+                               '--limit', '1', '--warmup-prompt',
+                               'prompt_128_02.txt')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        warm = json.loads(next((out / 'warmup').glob(
+            'attempt-*/result.json')).read_text())
+        self.assertEqual(warm['prompt'], 'prompt_128_02.txt')
+        self.assertTrue((out / 'runs/prompt_1024_01/attempt-0001/result.json').exists())
+        self.assertFalse((out / 'runs/prompt_128_02').exists())
+        self.assertEqual(self.invoke_new(
+            '--out', str(out), '--only-group', '1024', '--limit', '1',
+            '--warmup-prompt', 'prompt_128_01.txt').returncode, 2)
+
+    def test_new_defaults_do_not_mix_with_previous_results(self):
+        self.assertEqual(self.invoke('--limit', '1').returncode, 0)
+        mismatch = self.invoke_new('--limit', '1')
+        self.assertEqual(mismatch.returncode, 2)
+        self.assertIn('different configuration', mismatch.stderr)
+        self.assertEqual(len(self.load('prompt_128_01.txt')), 1)
+        self.assertFalse((self.out / 'warmup').exists())
+
+    def test_preload_flags_require_consistent_mode(self):
+        self.assertEqual(self.invoke_new(
+            '--warmup-prompt', 'unknown.txt').returncode, 2)
+        self.assertEqual(self.invoke_new(
+            '--warmup-prompt', 'prompt_128_02.txt',
+            '--skip-warmup').returncode, 2)
+        self.assertEqual(self.invoke_new(
+            '--env', 'LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC=1').returncode, 2)
+        self.assertEqual(self.invoke_new(
+            '--env', 'LLAMA_REGION_RING_PHONE_HTP_ONLY=1').returncode, 2)
+        self.assertFalse(self.out.exists())
+
     def test_manifest_context_and_dry_run_no_output(self):
         dry = self.invoke('--only-prompt','prompt_1024_10.txt','--dry-run')
         self.assertEqual(dry.returncode, 0, dry.stderr)
