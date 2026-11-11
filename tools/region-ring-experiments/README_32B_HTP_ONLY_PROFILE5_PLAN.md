@@ -136,6 +136,48 @@ Phone server log for `[HTP_INDEPENDENT_PROFILE] reason=...`.
 The *first* independent calibration does not need a completed
 inference or manual Phone log copy.
 
+## 255-token APPLY_WIDE Profile mismatch fix
+
+The observed first-prompt failure showed:
+
+```text
+[REGION_RING_REAL_STAGE_PROFILE] status=LOADED points=60
+[REGION_RING_PLAN_SEARCH] enumerated=413343 profiled=0 reject_memory=378351 reject_profile=34992
+[REGION_RING_PLAN_APPLY] reason=NO_SCOREABLE_RUNTIME_PLAN
+[REGION_RING_PLAN_APPLY] reason=NO_EXECUTABLE_HTP_ONLY_GPU_TAIL
+```
+
+The root cause is the **coarse Planner's logical KV=255/2=127**
+against the independent HTP Profile's minimum **physical padded KV=256**.
+The lower-bound interpolation rejected every memory-feasible remaining
+candidate, then the legacy Phone CPU fallback was intentionally empty.
+Phone-owned HTP queries now map to their actual 256-token-aligned KV
+shape during both E-scoring and DAG simulation. This affects **only
+N/HTP**, not CPU/GPU/normal RPC, and does not change available memory
+or hide missing samples by pretending zero service time.
+
+Also, the HTP-only search no longer refuses a valid GPU-tail candidate
+only because the legacy **Phone-final baseline** is unscoreable.
+The selected tail must **still pass** candidate memory, topology, and
+full-DAG simulation. Unmeasured 1-layer HTP Region extrapolation has a
+nonzero measured-anchor floor. Diagnostic lines now include:
+
+```text
+[REGION_RING_PROFILE_KV] source=PHONE_HTP_GRAPHLESS logical_kv=255 coarse_kv=127 padded_kv=256
+[REGION_RING_HTP_MEMORY_DIAG] geometry=... session_map=... bank_shape=... host_ram=... gpu_vram=... phone_ram=... pass=...
+[REGION_RING_PLAN_BASELINE] ... baseline=UNSCOREABLE action=VERIFY_CANDIDATE_GPU_TAIL
+```
+
+Rebuild the **PC** from this branch. If the Phone is already running
+RPC patch 32 from this independent-Profile branch, its code is unchanged
+by this Planner-only fix. Re-run the **same command and same `-Out`**
+for resume; earlier FAIL/INTERRUPTED attempts do not count as PASS.
+The existing 36 valid HTP baseline points are reused, without another
+cold calibration. Do **not** bypass the memory guard to force selection.
+If no Plan is found, use the new `[PLAN_DIAG]` and
+`[REGION_RING_HTP_MEMORY_DIAG]` breakdown to identify the actual budget
+limiting the search.
+
 ## Limits and verification
 
 The HTP-only 32B branch deliberately does not benchmark Adreno OpenCL
