@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_32b_all40 import build_process, parse_metrics
+from run_32b_all40 import build_process, parse_metrics, verify_independent_profile
 
 
 class HtpOnlyAutoPlanTests(unittest.TestCase):
@@ -42,6 +42,53 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertEqual(env["LLAMA_REGION_RING_PROFILE_GRID"], "full")
             self.assertTrue(env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"].endswith("profile.csv"))
             self.assertNotIn("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT", env)
+
+    def test_standalone_profile_cache_checks_all_backends_and_links(self):
+        import csv
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            csv_file = root / "independent-profile" / "profile.csv"
+            csv_file.parent.mkdir(parents=True)
+            fields = ["device", "layers", "tokens", "kv_tokens",
+                      "setup_ms", "upload_ms", "prepare_ms",
+                      "compute_ms", "terminal", "samples"]
+            rows = [
+                dict(device=device, layers=2, tokens=32, kv_tokens=256,
+                     setup_ms=1, upload_ms=1, prepare_ms=1, compute_ms=4,
+                     terminal=0, samples=2)
+                for device in ("CPU", "GPU", "PHONE")
+            ]
+            with csv_file.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fields)
+                writer.writeheader()
+                writer.writerows(rows)
+            doc = {
+                "schema": 1,
+                "mode": "INDEPENDENT_BACKEND_PROFILE",
+                "backends": {"G": "CUDA", "C": "CPU",
+                             "N": "HTP_STRIPED"},
+                "stage_points": [{"device": row["device"]} for row in rows],
+                "transfers": {
+                    "pc_to_phone": [{"bytes": 100000, "ms": 1.0}],
+                    "snapshot_phone_to_pc": [{"bytes": 100000, "ms": 1.0}],
+                    "gpu_weight_h2d": [{"bytes": 100000, "ms": 1.0}],
+                },
+            }
+            meta = csv_file.with_suffix(".json")
+            with self.assertRaisesRegex(ValueError, "profile.json missing"):
+                verify_independent_profile(csv_file)
+            meta.write_text(json.dumps(doc), encoding="utf-8")
+            self.assertEqual(verify_independent_profile(csv_file), 1)
+            doc["stage_points"] = []
+            meta.write_text(json.dumps(doc), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "does not match Stage CSV"):
+                verify_independent_profile(csv_file)
+            doc["stage_points"] = [
+                {"device": row["device"]} for row in rows]
+            doc["transfers"]["snapshot_phone_to_pc"] = []
+            meta.write_text(json.dumps(doc), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Phone->PC"):
+                verify_independent_profile(csv_file)
 
     def test_preload_count_uses_selected_not_control_layout(self):
         with tempfile.TemporaryDirectory() as td:
