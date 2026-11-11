@@ -11051,7 +11051,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
                 const int depth =
                     base.back().layer_end - base.back().layer_begin;
-                for (int tail = 1; tail <= std::min(4, depth); ++tail) {
+                for (int tail = 1; tail <= std::min(8, depth); ++tail) {
                     auto shape = base;
                     const int tail_begin = model.layers - tail;
                     if (tail == depth) {
