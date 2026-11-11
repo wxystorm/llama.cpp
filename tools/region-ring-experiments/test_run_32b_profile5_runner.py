@@ -17,7 +17,8 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             root = Path(td)
             args = SimpleNamespace(
                 auto_plan=True, htp_only=True, profile_every=5,
-                streaming="on", real_stage_profile_csv=None,
+                profile_grid="full", streaming="on",
+                real_stage_profile_csv=root / "independent-profile" / "profile.csv",
                 force_small_batch_mover=False, phone_weight_preload=True,
                 boost_bank_mover=False, env=[], exe=root / "completion.exe",
                 model=root / "qwen.gguf", rpc="127.0.0.1:50052",
@@ -38,6 +39,8 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertEqual(env["LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW"], "1")
             self.assertEqual(env["LLAMA_REGION_RING_REAL_STAGE_PROFILE"], "1")
             self.assertEqual(env["LLAMA_REGION_RING_TASK_TRACE"], "1")
+            self.assertEqual(env["LLAMA_REGION_RING_PROFILE_GRID"], "full")
+            self.assertTrue(env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"].endswith("profile.csv"))
             self.assertNotIn("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT", env)
 
     def test_preload_count_uses_selected_not_control_layout(self):
