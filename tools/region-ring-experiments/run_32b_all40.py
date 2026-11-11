@@ -824,6 +824,52 @@ def main(argv=None):
             save_json(config_file, config)
         write_summary(args.out, prompts)
         total = len(selections)
+        latest = all_results(args.out, prompts)
+        to_run = [(group, prompt) for group, prompt in selections
+                  if not (latest[prompt.name]["status"] == "PASS"
+                          and not args.rerun_all)
+                  and not (args.retry_failed_only
+                           and latest[prompt.name]["status"] == "PENDING")]
+
+        # One unmeasured representative Prefill per invocation. It is
+        # deliberately NOT an entry in runs/, summary.csv or PASS counts.
+        # Rewarm on resume when work remains: the Phone RPC server may have
+        # been restarted since the previous invocation.
+        if args.warmup and to_run:
+            if args.warmup_prompt is not None:
+                warm_group, warm_prompt = next(
+                    (group, prompt) for group, prompt in prompts
+                    if prompt.name == args.warmup_prompt)
+            else:
+                warm_group, warm_prompt = to_run[0]
+            warm_ctx = decisions[warm_prompt.name]["context"]
+            warm_hint = decisions[warm_prompt.name]["prompt_tokens_hint"]
+            print(f"[WARMUP] event=START prompt={warm_prompt.name}"
+                  f" ctx={warm_ctx} preload={int(args.phone_weight_preload)}"
+                  " counted=0", flush=True)
+            try:
+                warm_result = execute(args, warm_prompt, warm_group,
+                                      warm_ctx, warm_hint, args.out, warmup=True)
+            except KeyboardInterrupt:
+                print("[WARMUP] event=INTERRUPTED counted=0", file=sys.stderr)
+                return 130
+            print(f"[WARMUP] event=DONE status={warm_result['status']}"
+                  f" preload_status={warm_result.get('early_weights_status')}"
+                  f" preload_regions={warm_result.get('early_weights_regions')}"
+                  f" prefill_ms={warm_result.get('prefill_ms')}"
+                  f" counted=0", flush=True)
+            if warm_result["status"] != "PASS":
+                print("[WARMUP] failed; no measured Prompt was started. "
+                      f"See {args.out / 'warmup'} for stderr, metrics and result.json",
+                      file=sys.stderr)
+                return 1
+            if args.inter_prompt_delay_seconds:
+                print(f"[WARMUP_COOLDOWN] seconds={args.inter_prompt_delay_seconds:g}",
+                      flush=True)
+                time.sleep(args.inter_prompt_delay_seconds)
+        elif args.warmup:
+            print("[WARMUP] event=SKIP reason=NO_MEASURED_WORK", flush=True)
+
         previous_executed_prompt = None
         for i, (group, prompt) in enumerate(selections, 1):
             previous = all_results(args.out, prompts)[prompt.name]
