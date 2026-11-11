@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "experiment": "sharegpt40-five-baselines-2026-11-08",
+  "experiment": "sharegpt40-six-baselines-2026-11-11",
   "prepared_on": "2026-11-11",
   "dataset": {
     "name": "ShareGPT40",
@@ -96,6 +96,33 @@
       "ubatch": 256,
       "threads": 8,
       "final_layer_sp": false
+    },
+    {
+      "id": "ours-14b-g9p1",
+      "framework": "ours",
+      "model": "14b",
+      "method": "fixed region-ring (GPU + Phone)",
+      "run_config": "runs/ours-14b-g9p1/run-config.json",
+      "recorded_commit": "3e36c984d4991fbf6f19de72d1e19c8cdcb9a027",
+      "layout": "G9,P1,G9,P1,G9,P1,G10",
+      "planner": "apply-wide",
+      "skip_profile": true,
+      "xc": 128,
+      "xg": 128,
+      "xp": 128,
+      "batch": 2048,
+      "ubatch": 2048,
+      "predict": 1,
+      "threads": 8,
+      "seed": 1234,
+      "no_mmap": true,
+      "gpu_weight_streaming": true,
+      "context_policy": {
+        "fixed": null,
+        "minimum": 1024,
+        "padding": 64,
+        "alignment": 256
+      }
     }
   ],
   "measurements": {

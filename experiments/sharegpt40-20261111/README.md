@@ -1,13 +1,15 @@
 # ShareGPT40 benchmark snapshot (2026-11-11)
 
-Five uploaded benchmark result archives were used to prepare this snapshot. The five runs cover 200 successful prompt-level records, with 10 prompts per group (128, 256, 512, 1024).
+Six experimental runs cover **240 successful prompt-level records**, with 10 prompts in each of four groups (128, 256, 512, 1024). The earlier five runs (200 observations) remain unchanged; the sixth is the fixed-layout 14B region-ring run (`ours-14b-g9p1`).
 
 Files:
-- `config.json`: model, hardware and recorded execution settings.
-- `results.csv`: individual prefill measurements from the original summary CSV files (200 rows).
-- `group-summary.csv`: mean and median prefill latency and throughput (20 groups).
-- `archive-manifest.json`: SHA-256 and original byte size of each source archive.
+- `config.json`: models, hardware and run configurations, including the added run.
+- `results.csv`: normalized prefill measurements, one row per prompt (240 rows).
+- `group-summary.csv`: arithmetic mean and median throughput and latency (24 groups).
+- `archive-manifest.json`: names, SHA-256 hashes and sizes of the six original uploaded ZIP archives.
+- `runs/ours-14b-g9p1/run-config.json`: reproducible runtime settings with local executable/model paths and RPC endpoint replaced by placeholders.
+- `runs/ours-14b-g9p1/per-prompt-details.csv`: 40 measured prompt records, including context, planned tokens, source runtime commit and fixed layout.
 
-This branch records the derived, numeric experiment results. The five original ZIP archives (including verbose logs, per-case planner files and other artifacts) are **not** uploaded to this branch: the available repository connection does not support uploading the local binary ZIP files. Use `archive-manifest.json` to verify archives kept separately.
+The original six ZIP archives contain verbose logs and additional per-prompt artifacts, but **are not stored in this Git branch**. The available GitHub connection supports UTF-8 repository files but cannot directly upload the local binary ZIP. Verify an archive independently using its SHA-256 entry in `archive-manifest.json`.
 
-The group label is a sampling bucket rather than the exact prompt token count. Measurements are the recorded per-run values, and group aggregates are arithmetic means and medians; no pooled TPS is calculated. Runtime parameters differ across Prima (HiGHS), Jupiter (Sequence DP / graph prebuild), and Galaxy (RANK_LOCAL); compare with awareness of distinct setups. The source archive also contains additional per-run details not represented in this concise table.
+Measurements in `results.csv` are from experiment summaries; derived statistics are unweighted means and medians (not pooled throughput). Prompt groups are sampling buckets rather than exact prompt token counts. Runtime setups differ between Prima (HiGHS), Jupiter (Sequence DP), Galaxy (RANK_LOCAL) and the fixed-layout region-ring run, so compare results with their configurations in mind.

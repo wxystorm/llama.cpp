@@ -35,6 +35,13 @@
       "sha256": "10f64222cea9bce6dcf164368d6707f6a84012de2c77839ae0298d4fb513a573",
       "bytes": 204423,
       "runs": 40
+    },
+    {
+      "id": "ours-14b-g9p1",
+      "archive": "我的-14b-数据.zip",
+      "sha256": "0758b72808f3428e3a03108bca2b5976a32827fffdb1117b73b4631f3049974c",
+      "bytes": 1913855,
+      "runs": 40
     }
   ]
 }
