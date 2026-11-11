@@ -1,0 +1,25 @@
+name: HTP-only Real Profile and Planner smoke
+
+on:
+  push:
+    branches:
+      - feat/32b-htp-realprofile-autoplan-20261111
+  workflow_dispatch:
+
+jobs:
+  host-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python regressions
+        run: |
+          python3 -m unittest discover -s tools/region-ring-experiments -p 'test_rolling_real_stage_profile.py' -v
+          python3 -m unittest discover -s tools/region-ring-experiments -p 'test_run_32b_profile5_runner.py' -v
+          python3 -m unittest discover -s tools/region-ring-experiments -p 'test_run_32b_all40.py' -v
+      - name: Configure CPU/RPC build
+        run: cmake -S . -B build-htp-profile -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
+      - name: Compile changed RPC, model, context and Planner
+        run: cmake --build build-htp-profile --target llama-completion test-region-ring-planner --parallel 4
+      - name: C++ Planner regression
+        run: ctest --test-dir build-htp-profile -R '^test-region-ring-planner$' --output-on-failure
