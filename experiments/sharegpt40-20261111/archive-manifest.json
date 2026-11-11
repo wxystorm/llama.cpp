@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "archives": [
+    {
+      "id": "prima-14b",
+      "archive": "prima-14b-数据.zip",
+      "sha256": "df0a5d53987cd2c1e761491cb9d946526a9f72dabd3136d97f9721723c2abda5",
+      "bytes": 265880,
+      "runs": 40
+    },
+    {
+      "id": "prima-32b",
+      "archive": "prima-32b-数据.zip",
+      "sha256": "349533d36e946a1144074dc14f0b49a88e8a9af896eb5cd8fa5ab3e5d8187a93",
+      "bytes": 262705,
+      "runs": 40
+    },
+    {
+      "id": "jupiter-14b",
+      "archive": "jupiter-qwen14b-数据.zip",
+      "sha256": "97aa9c6ba773e879c564daa9f498bb54e1c436e1e30baaea4fc55cd379ada693",
+      "bytes": 7194869,
+      "runs": 40
+    },
+    {
+      "id": "jupiter-32b",
+      "archive": "jupiter-qwen32b-数据.zip",
+      "sha256": "32ceb6bb380330089649af1098dd2a75929093cbf923ac7e2d633f8ace3fa74e",
+      "bytes": 42809022,
+      "runs": 40
+    },
+    {
+      "id": "galaxy-14b",
+      "archive": "galaxy-14b-数据.zip",
+      "sha256": "10f64222cea9bce6dcf164368d6707f6a84012de2c77839ae0298d4fb513a573",
+      "bytes": 204423,
+      "runs": 40
+    }
+  ]
+}

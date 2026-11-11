@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "experiment": "sharegpt40-five-baselines-2026-11-08",
+  "prepared_on": "2026-11-11",
+  "dataset": {
+    "name": "ShareGPT40",
+    "prompt_groups": [
+      128,
+      256,
+      512,
+      1024
+    ],
+    "prompts_per_group": 10,
+    "prompt_ids": "prompt_{group}_{01..10}.txt"
+  },
+  "models": {
+    "14b": "Qwen3-14B-Q4_K_M.gguf",
+    "32b": "Qwen3-32B-Q4_K_M.gguf"
+  },
+  "hardware": {
+    "pc_cpu": "Intel Core Ultra 7 155H",
+    "pc_gpu": "NVIDIA RTX 4050 Laptop GPU 6 GiB",
+    "phone_soc": "Snapdragon 8 Elite"
+  },
+  "runtime_paths": {
+    "model_dir": "${MODEL_DIR}",
+    "prompt_dir": "${PROMPT_DIR}",
+    "rpc_endpoint": "${RPC_ENDPOINT}"
+  },
+  "runs": [
+    {
+      "id": "prima-14b",
+      "framework": "prima.cpp",
+      "model": "14b",
+      "context": 4096,
+      "predict": 32,
+      "batch": 512,
+      "ubatch": 512,
+      "threads": 8,
+      "planner": "HiGHS"
+    },
+    {
+      "id": "prima-32b",
+      "framework": "prima.cpp",
+      "model": "32b",
+      "context": 4096,
+      "predict": 32,
+      "batch": 512,
+      "ubatch": 512,
+      "threads": 8,
+      "planner": "HiGHS"
+    },
+    {
+      "id": "jupiter-14b",
+      "framework": "jupiter",
+      "model": "14b",
+      "method": "Sequence DP",
+      "pc_layers": 24,
+      "context": 2048,
+      "batch": 2048,
+      "ubatch": 128,
+      "graph_prebuild": true,
+      "window": 2,
+      "bench_repeats": 1
+    },
+    {
+      "id": "jupiter-32b",
+      "framework": "jupiter",
+      "model": "32b",
+      "method": "Sequence DP",
+      "pc_layers": 52,
+      "cpu_layers": 40,
+      "pc_gpu_layers": 12,
+      "phone_layers": 12,
+      "context": 2048,
+      "batch": 2048,
+      "ubatch": 128,
+      "graph_prebuild": true,
+      "window": 2,
+      "bench_repeats": 1,
+      "max_rounds": 1,
+      "min_chunk": 96,
+      "max_chunk": 128,
+      "memory_safety_percent": 5
+    },
+    {
+      "id": "galaxy-14b",
+      "framework": "galaxy",
+      "model": "14b",
+      "mode": "Galaxy",
+      "transport": "RANK_LOCAL",
+      "galaxy2_layers": 1,
+      "collective_tile_tokens": 256,
+      "context": 2048,
+      "batch": 512,
+      "ubatch": 256,
+      "threads": 8,
+      "final_layer_sp": false
+    }
+  ],
+  "measurements": {
+    "prefill_ms": "milliseconds",
+    "prefill_tps": "tokens per second",
+    "missing_metric": "Empty not zero"
+  }
+}
