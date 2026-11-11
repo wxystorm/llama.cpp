@@ -9046,22 +9046,38 @@ static bool llama_hybrid_calibrate_independent_ring(
                         layers, tokens, kv);
                     continue; // Never publish an invented HTP cost.
                 }
-                // Includes Phone-host intermediate layer copies; they are
-                // required by the real serial multi-Session Pn executor.
+                // This is serialized Phone Stage SERVICE, not only the
+                // HTP kernel. HTP upload and readback are on the Phone
+                // compute lane and cannot be omitted from DAG service.
+                // Preserve upload/readback separately in profile.json.
+                const double service_ms =
+                    measured.upload_ms + measured.compute_ms +
+                    measured.output_read_ms;
+                if (!std::isfinite(service_ms) ||
+                        service_ms <= 0.0 ||
+                        !std::isfinite(measured.prepare_ms) ||
+                        measured.prepare_ms < 0.0) {
+                    LLAMA_LOG_WARN(
+                        "[INDEPENDENT_PROFILE] status=SKIP_POINT"
+                        " reason=INVALID_HTP_SERVICE_BREAKDOWN"
+                        " layers=%d tokens=%d kv=%d\n",
+                        layers, tokens, kv);
+                    continue;
+                }
                 record("PHONE", layers, tokens, kv,
                        measured.setup_ms, measured.upload_ms,
-                       measured.prepare_ms,
-                       measured.compute_ms + measured.output_read_ms,
+                       measured.prepare_ms, service_ms,
                        measured.output_read_ms, (int) measured.repeats);
                 LLAMA_LOG_INFO(
                     "[INDEPENDENT_PROFILE] status=PASS device=HTP"
                     " layers=%d chunk=%d kv=%d"
                     " upload_ms=%.3f prepare_ms=%.3f"
                     " htp_compute_ms=%.3f output_read_ms=%.3f"
-                    " setup_ms=%.3f\n",
+                    " setup_ms=%.3f service_ms=%.3f\n",
                     layers, tokens, kv, measured.upload_ms,
                     measured.prepare_ms, measured.compute_ms,
-                    measured.output_read_ms, measured.setup_ms);
+                    measured.output_read_ms, measured.setup_ms,
+                    service_ms);
             }
         }
     }
