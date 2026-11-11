@@ -4326,10 +4326,13 @@ static bool ggml_backend_rpc_phone_auto_graph_register(
 static bool ggml_backend_rpc_phone_npu_weight_preload(
         ggml_backend_t backend, uint32_t region,
         uint32_t first_layer, uint32_t layer_count) {
+    const bool reset_request =
+        region == UINT32_MAX && first_layer == 0 && layer_count == 0;
     if (!backend || !ggml_backend_is_rpc(backend) ||
-            region >= ggml_phone_owned::k_wire_region_limit ||
-            first_layer >= 64 || layer_count == 0 ||
-            layer_count > 64 - first_layer) {
+            (!reset_request &&
+             (region >= ggml_phone_owned::k_wire_region_limit ||
+              first_layer >= 64 || layer_count == 0 ||
+              layer_count > 64 - first_layer))) {
         return false;
     }
     auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
@@ -7730,6 +7733,46 @@ bool rpc_server::phone_input_stream_run(
 // Phone-owned Plan still performs its per-request graph/KV validation.
 bool rpc_server::phone_npu_weight_preload(
         const rpc_msg_phone_npu_weight_preload_req & request) {
+    // A single explicit reset RPC precedes the per-Region preload sequence
+    // of each new automatic Plan. Reclaim old HTP weight mappings only at
+    // an idle RUN boundary; otherwise independent Plans would gradually
+    // exhaust shared phone RAM despite valid per-Plan memory budgets.
+    if (phone_npu_plan_controlled && request.region == UINT32_MAX &&
+            request.first_layer == 0 && request.layer_count == 0) {
+        {
+            std::lock_guard<std::mutex> active_guard(phone_input_mutex);
+            if (!phone_input_stream_runs.empty()) {
+                GGML_LOG_ERROR(
+                    "[PHONE_NPU_PLAN] event=RESET status=REJECT"
+                    " reason=RUN_ACTIVE\n");
+                return false;
+            }
+        }
+        auto locks = phone_npu_lock_sessions([&] {
+            std::vector<size_t> ids;
+            for (size_t i = 0; i < phone_npu_executors.size(); ++i) {
+                ids.push_back(i);
+            }
+            return ids;
+        }());
+        std::lock_guard<std::mutex> mapping_guard(
+            phone_npu_plan_mapping_mutex);
+        size_t released = 0;
+        for (auto & exec : phone_npu_executors) {
+            released += exec->model_resident_weights();
+            exec->reset_model_residency();
+        }
+        phone_npu_serial_regions.clear();
+        phone_npu_region_session.clear();
+        phone_npu_region_layer.clear();
+        phone_npu_layer_session.clear();
+        GGML_LOG_INFO(
+            "[PHONE_NPU_PLAN] event=RESET source=PC_PLAN"
+            " sessions=%zu released_weights=%zu"
+            " rpc_visible=CPU status=PASS\n",
+            phone_npu_executors.size(), released);
+        return true;
+    }
     const char * htp_env = std::getenv("GGML_RPC_PHONE_HTP_ONLY");
     if (!htp_env || std::strcmp(htp_env, "1") != 0 ||
             request.region >= ggml_phone_owned::k_wire_region_limit ||
