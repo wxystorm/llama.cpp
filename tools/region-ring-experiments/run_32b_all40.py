@@ -834,6 +834,20 @@ def require_htp_stage_rows(path: Path) -> int:
     return len(phone)
 
 
+def htp_epoch_has_runtime_samples(meta: dict) -> bool:
+    """Independent HTP points do not count as updated Phone service.
+
+    V1 may contain 36 baseline NPU rows even when every Phone RPC timing
+    pull returned zero records. In that case the mixed CPU/GPU-only update
+    must not silently displace a working V0 HTP-only Plan.
+    """
+    diag = meta.get("diagnostic") or {}
+    try:
+        return int(diag.get("phone", 0)) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def verify_independent_profile(path: Path) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
@@ -1081,6 +1095,7 @@ def main(argv=None):
         # The C++ E/Memory/Beam/DAG search still runs on EVERY Prompt.
         args.profile_epoch = 0
         initial_stage_csv = args.real_stage_profile_csv
+        degraded_epochs: set[int] = set()
         for i, (group, prompt) in enumerate(selections, 1):
             previous = all_results(args.out, prompts)[prompt.name]
             if previous["status"] == "PASS" and not args.rerun_all:
@@ -1100,15 +1115,35 @@ def main(argv=None):
                         args.out, epoch, args.profile_every,
                         args.phone_profile_log, initial_stage_csv)
                     require_htp_stage_rows(csv_file)
-                    args.real_stage_profile_csv = csv_file
-                    if args.profile_epoch != epoch:
-                        print(f"[PROFILE] event={'REFRESH' if created else 'REUSE'} "
-                              f"version=V{epoch} completed={passed}"
-                              f" cpu_points={meta['device_points']['CPU']}"
-                              f" gpu_points={meta['device_points']['GPU']}"
-                              f" npu_points={meta['device_points']['PHONE']}"
-                              f" csv={csv_file}", flush=True)
-                    args.profile_epoch = epoch
+                    if args.auto_plan and args.htp_only and (
+                            not htp_epoch_has_runtime_samples(meta) or
+                            epoch in degraded_epochs):
+                        if epoch not in degraded_epochs:
+                            degraded_epochs.add(epoch)
+                            print(
+                                f"[PROFILE] event=FALLBACK"
+                                f" rejected_version=V{epoch} active=V0"
+                                f" reason=NO_MATCHED_PHONE_RUNTIME_SAMPLES"
+                                f" cpu_points={meta['device_points']['CPU']}"
+                                f" gpu_points={meta['device_points']['GPU']}"
+                                f" npu_points={meta['device_points']['PHONE']}"
+                                f" real_phone_samples="
+                                f"{(meta.get('diagnostic') or {}).get('phone', 0)}"
+                                f" immutable_csv={csv_file}", flush=True)
+                        args.real_stage_profile_csv = initial_stage_csv
+                        args.profile_epoch = 0
+                    else:
+                        args.real_stage_profile_csv = csv_file
+                        if args.profile_epoch != epoch:
+                            print(f"[PROFILE] event={'REFRESH' if created else 'REUSE'} "
+                                  f"version=V{epoch} completed={passed}"
+                                  f" cpu_points={meta['device_points']['CPU']}"
+                                  f" gpu_points={meta['device_points']['GPU']}"
+                                  f" npu_points={meta['device_points']['PHONE']}"
+                                  f" real_phone_samples="
+                                  f"{(meta.get('diagnostic') or {}).get('phone', 0)}"
+                                  f" csv={csv_file}", flush=True)
+                        args.profile_epoch = epoch
                 else:
                     args.real_stage_profile_csv = initial_stage_csv
                     if args.profile_epoch != 0:
@@ -1187,6 +1222,25 @@ def main(argv=None):
                             print(f"  {row['plan_profile_kv']}", flush=True)
                 if row["status"] == "PASS":
                     break
+                # A Stage profile is a performance prior, never a license
+                # to discard a proven executable baseline. If an otherwise
+                # complete epoch cannot produce any scoreable GPU-tail
+                # candidate, retry with V0 and record its true provenance.
+                if (args.auto_plan and args.htp_only and
+                        args.profile_epoch > 0 and
+                        retry < args.max_retries and
+                        row.get("plan_reject_reason") in (
+                            "NO_EXECUTABLE_HTP_ONLY_GPU_TAIL",
+                            "NO_SCOREABLE_RUNTIME_PLAN")):
+                    bad_epoch = args.profile_epoch
+                    degraded_epochs.add(bad_epoch)
+                    args.real_stage_profile_csv = initial_stage_csv
+                    args.profile_epoch = 0
+                    print(
+                        f"[PROFILE] event=PLAN_RETRY_FALLBACK"
+                        f" rejected_version=V{bad_epoch} active=V0"
+                        f" reason={row['plan_reject_reason']}"
+                        f" action=RETRY_INDEPENDENT_BASELINE", flush=True)
                 if retry < args.max_retries and args.retry_delay:
                     time.sleep(args.retry_delay)
             previous_executed_prompt = prompt.name
