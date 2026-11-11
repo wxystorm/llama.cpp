@@ -7,7 +7,7 @@ Branch: `feat/32b-gcna-profile5-plan-chunks9-20261111`.
 - The existing E-window, memory lower-bound, 500/200 seed, Beam-16/24, full-DAG and local-refinement Planner is reused. It is **not** replaced by a separate Python Planner.
 - The **automatic Planner** considers exactly nine Chunk widths for XC/XG/XP:
   `32,48,56,64,80,96,112,128,160`. Legacy forced diagnostic values remain valid for other tests; this setting changes the automatic search grid.
-- Native G/C/N/A profiling is bootstrapped once (all nine Chunk widths), and selected Chunk widths are remeasured after every **five successful Prompt runs**. All other previously validated device/model-specific samples are kept. Default refresh widths are `96,128` to cap profiling overhead; override with `-RefreshChunks`.
+- Native G/C/N/A profiling is bootstrapped once at five measured anchor Chunk widths (32,64,96,128,160); the Planner interpolates the other four candidates, and selected anchor widths are remeasured after every **five successful Prompt runs**. All other previously validated device/model-specific samples are kept. Default refresh widths are `96,128` to cap profiling overhead; override with `-RefreshChunks`.
 - All 40 ShareGPT Prompt files are processed independently. Each prompt loads the latest native Profile and runs the existing `apply-wide` search again; the PC-selected Phone NPU Stage layer ranges are installed using model-owned RPC. Adreno is still available as a **fallback** if the Planner chooses it; it is not a required manually configured Phone layer list.
 - Each Prompt has an isolated attempt directory. Terminal output prints `[PROFILE]`, `[PROMPT_PLAN]`, `[PROMPT_RESULT]` including selected layout, runtime layout, XC/XG/XN (the last maps to legacy XP), NPU weight policy when logged, prediction and TPS.
 - Reusing the same `-Out` skips PASS results, retries unfinished/failed prompts, and rejects different model/executable bytes or changed Prompt data. Profile versions and source logs are preserved.
@@ -38,7 +38,7 @@ In PowerShell from the project root, after building `llama-completion` and `regi
 
 Test with `-Limit 2` first. Rerun the **same** command with the same `-Out` to resume; the limiter can be omitted when switching from quick validation to the full sweep. Existing PASS runs are not rerun.
 
-First run: bootstrap the full native G/C/N/A profiling matrix at the nine Chunk widths and matching KV anchors. This can be expensive, especially for a 32B model. Subsequent profile epochs remeasure 96/128 only and keep the other sample rows. Native NPU measurements must pass the parity gate; unsupported shapes are not invented.
+First run: bootstrap the native G/C/N/A profiling matrix at five Chunk anchors (32,64,96,128,160) and matching KV anchors; the Planner still searches all nine requested widths. This can be expensive, especially for a 32B model. Subsequent profile epochs remeasure 96/128 only and keep the other sample rows. Native NPU measurements must pass the parity gate; unsupported shapes are not invented.
 
 A per-Prompt terminal example (illustrative only, NOT a measured result):
 
