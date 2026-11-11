@@ -1331,14 +1331,18 @@ public:
             std::nullopt : take_device_locked(dev);
     }
 
-    // Optional preference is applied ONLY to already-ready work. Never wait
-    // for a preferred Phone Region while another claimable task exists:
-    // causal FIFO progress and device utilization must stay intact.
+    // Select among tasks whose upstream Token intervals, KV predecessor,
+    // Bank lifetime and external resources are ready. The optional drain-first
+    // policy gives the earliest unfinished Region priority on THIS device,
+    // without waiting for that Region when it cannot currently execute.
+    // This preserves cross-device Chunk pipelining and avoids idle workers.
+    // Legacy same-Phone-graph affinity takes precedence only when disabled.
     std::optional<llama_region_ring_task> wait_take(
             llama_region_ring_device device,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
             int preferred_tokens = -1,
-            const resource_ready_predicate & resource_ready = {}) {
+            const resource_ready_predicate & resource_ready = {},
+            bool drain_first_region = false) {
         const size_t dev = device_index(device);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] {
@@ -1349,7 +1353,8 @@ public:
             return std::nullopt;
         }
         return take_device_locked(
-            dev, preferred_region, preferred_tokens, resource_ready);
+            dev, preferred_region, preferred_tokens, resource_ready,
+            drain_first_region);
     }
 
     // An external Bank refill or Phone input PUSH became available. Acquire
@@ -1736,10 +1741,29 @@ private:
             size_t dev,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
             int preferred_tokens = -1,
-            const resource_ready_predicate & resource_ready = {}) {
+            const resource_ready_predicate & resource_ready = {},
+            bool drain_first_region = false) {
         auto & queue = queues_[dev];
         auto it = queue.end();
-        if (preferred_region < regions_.size() && preferred_tokens > 0) {
+        if (drain_first_region) {
+            // Region order is the layer/Cycle order. A later READY Chunk
+            // must not take GPU time away from an earlier executable Region:
+            // draining the earlier Bank creates a longer H2D overlap window
+            // for the next same-Bank Region (G0 -> G2 -> G4).
+            // Critically, do not add a whole-Region completion barrier:
+            // if the earliest Region is waiting for data, Bank or PUSH,
+            // run another eligible Region to keep this worker productive.
+            size_t earliest = regions_.size();
+            for (auto candidate = queue.begin();
+                 candidate != queue.end(); ++candidate) {
+                if (candidate->region < earliest &&
+                        resource_claimable_locked(*candidate, resource_ready)) {
+                    it = candidate;
+                    earliest = candidate->region;
+                }
+            }
+        } else if (preferred_region < regions_.size() &&
+                   preferred_tokens > 0) {
             it = std::find_if(
                 queue.begin(), queue.end(),
                 [this, preferred_region, preferred_tokens,
@@ -1749,7 +1773,7 @@ private:
                            resource_claimable_locked(task, resource_ready);
                 });
         }
-        if (it == queue.end()) {
+        if (it == queue.end() && !drain_first_region) {
             it = std::find_if(
                 queue.begin(), queue.end(),
                 [this, &resource_ready](const auto & task) {
