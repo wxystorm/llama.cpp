@@ -1,6 +1,7 @@
 // Standalone, deterministic Planner DAG tests; no model, CUDA or Phone needed.
 #include "llama-region-ring-planner.h"
 #include "llama-region-ring-real-profile.h"
+#include <algorithm>
 #include <cstdlib>
 #include <fstream>
 #include <cmath>
@@ -2003,10 +2004,48 @@ int main() {
         std::vector<llama_region_ring_region> forty_regions;
         REQUIRE(make_regions(
             forty_result.selected, 40, forty_regions));
-        REQUIRE(forty_regions.size() == 9);
+        REQUIRE(!forty_regions.empty());
+        REQUIRE(forty_regions.front().device == device::GPU);
+        REQUIRE(forty_regions.back().device == device::PHONE);
         REQUIRE(forty_regions.back().layer_end == 40);
         REQUIRE(llama_region_ring_apply_topology_compatible(
             forty_regions, 40));
+
+        // The final fastest DAG can come from the later CPU-optional
+        // search. G/P still form three Cycles; some C stages may be
+        // absent, so the winner need not contain exactly nine Regions.
+        const auto region_count = [&](device d) {
+            return std::count_if(
+                forty_regions.begin(), forty_regions.end(),
+                [d](const llama_region_ring_region & region) {
+                    return region.device == d;
+                });
+        };
+        REQUIRE(region_count(device::GPU) == 3);
+        REQUIRE(region_count(device::PHONE) == 3);
+        REQUIRE(region_count(device::CPU) <= 3);
+        REQUIRE(forty_regions.size() ==
+            (size_t) (6 + region_count(device::CPU)));
+
+        // Still explicitly verify that 40 % 3 != 0 does NOT suppress
+        // the full nine-Region nonuniform Prefix search. Inspect its
+        // own simulated winners rather than requiring the global winner
+        // to retain CPU stages.
+        bool simulated_three_stage_prefix = false;
+        for (const auto & seed : forty_result.first_cycle_seeds) {
+            if (seed.cycles != 3 || seed.simulated == 0 ||
+                    seed.best_layout.empty()) {
+                continue;
+            }
+            const auto regions =
+                llama_region_ring_parse(seed.best_layout, 40);
+            REQUIRE(regions.size() == 9);
+            REQUIRE(regions.back().layer_end == 40);
+            REQUIRE(llama_region_ring_apply_topology_compatible(
+                regions, 40));
+            simulated_three_stage_prefix = true;
+        }
+        REQUIRE(simulated_three_stage_prefix);
     }
 
     // The original uniform control can be entirely memory-infeasible.
