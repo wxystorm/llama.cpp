@@ -1091,6 +1091,11 @@ def main(argv=None):
                     elif row["status"] == "PASS":
                         row["status"] = "FAIL"
                         row["error"] = "PROFILE_NOT_CREATED"
+                        # execute() persists result.json itself. Rewrite it
+                        # too; otherwise resume incorrectly counts this as
+                        # PASS despite lacking a standalone backend Profile.
+                        save_json(Path(row["result_file"]), row)
+                        counts = write_summary(args.out, prompts)
                         print("[INDEPENDENT_PROFILE] status=FAIL"
                               " reason=NO_CALIBRATED_CSV", flush=True)
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
