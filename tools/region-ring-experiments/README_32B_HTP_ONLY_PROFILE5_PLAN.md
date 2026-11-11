@@ -178,6 +178,53 @@ If no Plan is found, use the new `[PLAN_DIAG]` and
 `[REGION_RING_HTP_MEMORY_DIAG]` breakdown to identify the actual budget
 limiting the search.
 
+## V1 with unchanged NPU points: real HTP timeline export fix
+
+A live ShareGPT40 run passed five V0 prompts, then produced:
+
+```text
+[PROFILE] event=REFRESH version=V1 completed=5 cpu_points=17 gpu_points=59 npu_points=36
+[PLAN_DIAG] reason=NO_EXECUTABLE_HTP_ONLY_GPU_TAIL
+```
+
+**Cause of missing Phone calibration:** the RPC post-RUN exporter
+unconditionally required `job.prepared.has_value()`. HTP-only Graphless
+workers intentionally never construct that legacy OpenCL prepared slot:
+they set `job.prepare_done_us` directly after input upload. Therefore
+the Phone ran correctly, but its per-Chunk HTP timestamps were silently
+discarded. This path now exports `upload_begin_us → upload_done_us`,
+`upload_done_us → prepare_done_us`, and
+`compute_begin_us → compute_end_us` for successful HTP jobs without
+requiring the legacy OpenCL prepared slot. The Phone logs a summary:
+
+```text
+[PHONE_STAGE_PROFILE_EXPORT] ... complete=... graphless=... exported=... status=READY
+```
+
+PC `[REGION_RING_PHONE_PROFILE_PULL]` is `PASS` only if it actually
+pulled positive rows; empty or unavailable pulls show `UNAVAILABLE`.
+
+**Fail-safe Profile5 policy:** a Stage epoch with no matched real HTP
+runtime samples (`manifest.json: diagnostic.phone == 0`) is **not**
+used to rank HTP-only Plans, even if its merged CSV still contains the
+independent 36 baseline NPU points. The immutable V1 CSV is retained
+for postmortem; the runner explicitly logs `event=FALLBACK
+rejected_version=V1 active=V0` and executes with the independent
+calibration. If a later epoch with Phone samples still cannot produce
+a scoreable GPU tail, the remaining retry for that Prompt uses V0 and
+logs `event=PLAN_RETRY_FALLBACK`. The output row records the actual
+Profile version, so a V0 fallback is never mislabeled V1.
+
+**Recovery:** rebuild both PC and Phone from this branch and restart
+the Phone server with `GGML_RPC_REAL_STAGE_PROFILE=1`. Continue with
+the **same `-Out` directory**; do not erase V0 or immutable V1.
+Existing five PASS results remain counted. V1 will be bypassed because
+its old manifest has zero Phone runtime samples. After prompts 6–10
+succeed, the V2 epoch can capture fresh post-fix real HTP measurements.
+If `[PHONE_STAGE_PROFILE_EXPORT] exported=0`, inspect
+`missing_timestamps` and whether the Phone environment enabled
+`GGML_RPC_REAL_STAGE_PROFILE`.
+
 ## Limits and verification
 
 The HTP-only 32B branch deliberately does not benchmark Adreno OpenCL
