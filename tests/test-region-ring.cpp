@@ -1746,7 +1746,7 @@ static void test_drain_first_cycle_phone_priority() {
             llama_region_ring_device::PHONE,
             2 /* Graph-affinity would prefer downstream P2 */,
             1, available, drain_first);
-        check(next, "drain-first Phone fixture did not find READY task");
+        check(next.has_value(), "drain-first Phone fixture did not find READY task");
         const size_t selected_region = next->region;
         ready.complete(*next);
         return selected_region;
