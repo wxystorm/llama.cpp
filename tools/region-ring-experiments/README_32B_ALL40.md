@@ -173,6 +173,62 @@ finalized. These choices are in the run-config signature. **Use a new
 results. Existing baseline can still resume with both new stages
 disabled and otherwise-identical parameters.
 
+## Resource-aware Chunk scheduling (GPU Bank and Phone PUSH)
+
+The native threaded Region Ring now keeps the same **Token-interval
+dependency DAG, per-Region KV ordering, and double-Bank lifetime rules**,
+but filters `READY` Chunk claims by their external resource readiness:
+
+- **GPU:** a Chunk is claimable only if its parity Bank currently owns
+  that GPU Region and is ready. If G4 is waiting for Bank A, a queued G2
+  Chunk with resident Bank B can execute first. The Bank Mover signals the
+  READY scheduler after refill completion; failure cancels READY.
+- **Phone:** a Phone Chunk requiring PC->Phone PUSH is claimable only
+  after that exact input PUSH succeeds. It can then run on the existing
+  Phone-owned HTP executor; no new Graph, queue or RPC wire type is added.
+  The PUSH worker signals READY when input is staged.
+- READY is still conditioned on all **overlapping upstream Token
+  intervals** having completed, and prior Chunk KV commits/deferred
+  releases. **There is no whole-Cycle barrier.** The GPU Bank parity
+  lifetime rule still prevents reloading Bank A/B until its previous
+  owning GPU Region has fully drained.
+
+**Default:** enabled when GPU Bank streaming or Phone PUSH is active.
+A/B opt-out: `LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=0`.
+To compare with the prior behavior on the exact same prompt, pass
+`-OnlyPrompt "prompt_1024_01.txt"` and give each variant its own
+`-Out` directory. Example extra flags to append to the existing
+32B launch command:
+
+```powershell
+# New scheduler, including PC-clock Chunk/Bank trace:
+-EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1", "LLAMA_REGION_RING_TASK_TRACE=1" `
+-Out ".\32b-g8p6-resource-aware"
+
+# Legacy scheduler control:
+-EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=0", "LLAMA_REGION_RING_TASK_TRACE=1" `
+-Out ".\32b-g8p6-resource-legacy"
+```
+
+The `region_ring` JSONL record includes
+`resource_aware_chunk_sched`,
+`gpu_resource_deferred_checks` and
+`phone_resource_deferred_checks` (eligibility checks rejected,
+**not unique tasks**). Existing `*_ready_wait_ms` includes waiting for
+DAG tasks **and**, with the new filter, waiting for externally available
+Bank/PUSH resources. The old `bank_gpu_wait_ms` can become nearly zero
+because the GPU now waits *before claiming*, so **do not interpret a
+lower Bank Wait counter alone as a throughput improvement**. Compare
+full Prefill milliseconds / tok/s and the actual Chunk Trace's GPU
+Compute vs Bank H2D overlap instead.
+
+The three scheduler-only C++ regressions in
+`tests/test-region-ring.cpp` cover skipping an unready Bank queue head,
+preferring a Phone task with a completed PUSH, and waking blocked
+workers on resource completion/cancellation. The actual RTX/HTP
+performance and correctness still require running the user's
+machine/phone A/B benchmark.
+
 ## Cooldown, raised transfer priority, and no-mmap A/B
 
 The runner now **defaults to a 5-second pause between completed Prompt
