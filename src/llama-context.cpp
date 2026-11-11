@@ -8789,6 +8789,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << pc_phone_overlap_us / 1000.0 << ","
                             << "\"gpu_bank_streaming\":"
                             << (gpu_bank_streaming ? "true" : "false")
+                            << ",\"resource_aware_chunk_sched\":"
+                            << (resource_aware_chunk_sched ? "true" : "false")
                             << ",\"gpu_bank_min_tokens\":"
                             << gpu_bank_min_tokens
                             << ",\"gpu_bank_force_small_batch\":"
@@ -8809,6 +8811,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         }
                         metrics << ",\"" << base << "_tasks\":"
                                 << w.completed
+                                << ",\"" << base << "_resource_deferred_checks\":"
+                                << w.resource_deferred_checks
                                 << ",\"" << base << "_backend_wall_ms\":"
                                 << w.backend_exec_us / 1000.0
                                 << ",\"" << base << "_compute_range_ms\":"
