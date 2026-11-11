@@ -40,12 +40,16 @@ OpenCL-visible mixed-backend branch).
    reuses the original memory constraints and full DAG simulator.
    Only a valid GPU-tail Plan can be accepted by the automatic HTP-only
    mode. Original fixed-plan and ordinary Planner paths are not changed.
-5. After every **5 completed PASS Prompts**, the runner creates an immutable
-   `profile-epochs/vNN/real-stage-profile.csv` from genuine
-   `region_ring_chunk_trace` CPU/GPU samples and, if supplied, session-matched
-   Phone RPC `REAL_STAGE_PROFILE` logs. Subsequent Prompts pass the newest
-   CSV to the original C++ Planner; all Prompts still call the C++ Planner
-   independently. Failed attempts and Warmup do not advance the epoch.
+5. Before the first automatic Plan, the runner performs **one real, uncounted
+   fixed HTP-only calibration** using the known G8/P6/.../G8 layout.
+   Its actual CPU/GPU/HTP Stage service samples seed `profile-bootstrap/v00/`
+   (V0); the RPC-visible CPU is never treated as HTP compute.
+   After every **5 completed PASS Prompts**, the runner creates an immutable
+   `profile-epochs/vNN/real-stage-profile.csv` using ONLY the last five
+   successful Prompt attempts. Phone HTP samples are returned automatically
+   by RPC after RUN teardown. Subsequent Prompts consume the newest CSV,
+   but each still calls the C++ APPLY_WIDE Planner independently.
+   Failed attempts, calibration, and warmup do not advance an epoch.
 6. Every Prompt prints the selected logical and physical HTP-only layout,
    XC/XG/XN (XN is the old XP), prediction, actual TPS and Profile epoch.
    PASS results and per-attempt traces are stored for resume.
@@ -53,18 +57,30 @@ OpenCL-visible mixed-backend branch).
 ## Important Profile qualification
 
 This builds real Stage CSV snapshots **from actual completed inference**.
-Until five successful Prompts have completed, the C++ native independent
-Profile runs as before. On every subsequent Prompt, native probing remains
-available as a fallback for **unmeasured** layer/Chunk/KV shapes.
+Automatic HTP-only mode **requires real Phone HTP samples**. The initial V0
+fixed-layout calibration is one actual Prompt Prefill on the four HTP
+sessions; it is never included in the measured ShareGPT40 totals.
+The first AutoPlan is not attempted until V0 contains positive Phone compute
+data. V1, V2 and later are rolling five-success windows and reject an epoch
+without Phone HTP samples. Native CPU/CUDA and actual transport probes remain
+available as cost fallbacks where appropriate, but the synthetic RPC CPU
+Graph benchmark is skipped for Phone HTP compute.
 
-Phone HTP timings cannot be measured reliably from PC RPC wall time.
-Without matching Phone-side `[REAL_STAGE_PROFILE] side=PHONE` records, the
-rolling CSV deliberately contains only genuine G/C measurements; Phone costs
-fall back to the prior native Probe. To include HTP rows, use a Phone log
-file continuously synchronized to the PC, passed with `-PhoneProfileLog`.
-This is an optional data source, not a requirement to run the experiment.
-Full automatic Phone-to-PC HTP Profile streaming is not added here; do not
-claim the five-Prompt refresh independently calibrates HTP without it.
+Server-side `GGML_RPC_REAL_STAGE_PROFILE=1` is **required**. Protocol patch
+**31** adds a bounded batch read of verified HTP Chunk service samples after
+RUN END. PC writes session-matched `[REAL_STAGE_PROFILE] side=PHONE
+source=RPC_HTP` records into its own `engine.stderr.log`. No per-Chunk
+RPC messages, no manual Phone log copies, and no Phone Graph benchmark
+masquerading as NPU service time.
+
+For an unmeasured candidate width the real Stage interpolation may apply a
+conservative bounded HTP estimate. This is an estimate from real anchor
+samples, not a direct measurement at every width; monitor predicted-vs-actual
+errors. Graph registration without an actual measured setup value falls back
+to the existing registration estimate rather than being reported as zero.
+
+`-PhoneProfileLog` remains an optional compatibility input for archival
+Phone logs; it is not necessary with the new RPC sample path.
 
 HTP mappings are virtual FastRPC domains, not four independent pools of
 physical RAM. A candidate passing estimated memory constraints can still
@@ -84,6 +100,7 @@ export GGML_HEXAGON_NDEV=4
 export GGML_HEXAGON_HOSTBUF=1
 export GGML_RPC_PHONE_HTP_ONLY=1
 export GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1
+export GGML_RPC_REAL_STAGE_PROFILE=1
 unset GGML_RPC_PHONE_NPU_SERIAL_REGIONS
 unset GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS
 unset GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH
@@ -104,9 +121,13 @@ Startup: four `[PHONE_NPU_SESSION] event=INIT` rows followed by
 `[PHONE_NPU_SERIAL] event=BACKEND_INIT ... rpc_visible=CPU_TRANSPORT_HTP_ONLY`.
 The Region count can initially be 0; PC installs it later.
 
-Each Prompt should produce `[PHONE_NPU_PLAN] event=RESET`, then one
-`[PHONE_NPU_PLAN] event=MAP` per selected N Region, then verified
+Each automatic Prompt should produce `[PHONE_NPU_PLAN] event=RESET`,
+then one `[PHONE_NPU_PLAN] event=MAP` per selected N Region, then verified
 `[PHONE_NPU_EARLY_WEIGHTS] ... status=PASS`.
+PC additionally prints `[REGION_RING_PHONE_PROFILE_PULL] status=PASS`
+after the Phone RUN ends. This requires **PC and Phone both rebuilt from
+the same patch-31 commit**. The fixed V0 calibration precedes the first
+automatic Prompt and saves its own logs under `profile-bootstrap/v00/`.
 
 ## PC launch
 
@@ -124,7 +145,9 @@ cmake --build build-tensor-v2 --config Release --parallel 8 --target llama-compl
   -Limit 2
 ```
 
-First use `-Limit 2` as a smoke test. Once both succeed, re-run
+First use `-Limit 2` as a smoke test. The uncounted V0 fixed HTP calibration
+runs first; its PASS must not be confused with a measured Prompt PASS.
+Once both succeed, re-run
 the same command without `-Limit 2` and with the **same `-Out`** to
 continue. Successful Prompts are skipped, Profile versions are recovered
 from completed-Prompt counts and immutable snapshots. Optional
@@ -142,7 +165,11 @@ Illustrative terminal output (not a measured sample):
 
 The terminal uses `N` for Phone HTP; native C++ internal stages retain the
 legacy label `P`. Every `P` in HTP-only mode is executed on the NPU,
-not Adreno.
+not Adreno. V0 is `FIXED_HTP_REAL_CALIBRATION`, NOT `NATIVE_PROBES`.
+The per-session mapping guard defaults to 3584 MiB/session and may be
+adjusted with `LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB` after measuring
+the actual HTP address mapping. The original aggregate Phone free-memory
+budget still applies because the sessions share physical RAM.
 
 ## Testing and diagnosis
 
