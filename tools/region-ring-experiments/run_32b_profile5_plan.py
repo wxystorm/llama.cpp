@@ -305,6 +305,7 @@ def main() -> int:
     else:
         atomic_json(config_file, settings)
     executed = 0
+    attempted_failed = False
     for group, prompt in items:
         past = latest(args.out / "runs" / prompt.stem)
         if past.get("status") == "PASS":
@@ -330,12 +331,13 @@ def main() -> int:
             if row["status"] == "PASS":
                 break
         executed += 1
+        attempted_failed = attempted_failed or row.get("status") != "PASS"
     save_summary(args.out, items, hints)
     done = sum(latest(args.out / "runs" / p.stem).get("status") == "PASS"
                for _, p in items)
     print(f"[PROFILE5_SUMMARY] PASS={done}/40 remaining={40-done} "
           f"csv={args.out / 'summary.csv'}", flush=True)
-    return 0 if done == 40 or args.limit else 1
+    return 0 if done == 40 or (args.limit and not attempted_failed) else 1
 
 
 if __name__ == "__main__":
