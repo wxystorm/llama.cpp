@@ -545,9 +545,9 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         # Keep the verified CPU-transport Phone model-owned preload path.
         env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
         env["LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC"] = args.rpc
-        if args.auto_plan and args.htp_only:
-            # Strictly reject an unconfigured Phone Region instead of
-            # accidentally executing a CPU RPC graph after a failed preload.
+        if args.htp_only:
+            # Also needed by the unmeasured fixed-layout V0 calibration:
+            # the Phone server starts with zero manually mapped Regions.
             env["LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED"] = "1"
     if args.boost_bank_mover:
         # Existing Windows C++ thread-local hook requests ABOVE_NORMAL.
@@ -797,6 +797,94 @@ def get_args(argv=None):
     return args
 
 
+def require_htp_stage_rows(path: Path) -> int:
+    """Do not confuse RPC-visible CPU profiling with Phone HTP samples."""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            points = list(csv.DictReader(stream))
+    except (OSError, csv.Error) as exc:
+        raise ValueError(f"Cannot read calibrated Stage Profile {path}: {exc}") from exc
+    phone = [p for p in points if p.get("device") == "PHONE"
+             and float(p.get("compute_ms") or 0.0) > 0.0]
+    if not phone:
+        raise ValueError(f"No REAL HTP Stage measurements in {path}; "
+                         "never substitute RPC CPU Profile for HTP compute")
+    return len(phone)
+
+
+def bootstrap_htp_profile(args, prompts, decisions) -> Path:
+    """One real, uncounted fixed-layout run seeds an HTP-only V0 Profile.
+
+    This runs the already-proven G8/P6/.../G8 execution contract, not the
+    automatic Planner. The new run uses the same NPU session reset/mapping
+    and post-drain HTP measurements as every subsequent Prompt. It never
+    enters runs/ or the PASS counter, and is safely resumable.
+    """
+    base = args.out / "profile-bootstrap" / "v00"
+    csv_path = base / "real-stage-profile.csv"
+    if csv_path.is_file():
+        count = require_htp_stage_rows(csv_path)
+        print(f"[PROFILE] event=BOOTSTRAP_REUSE version=V0 "
+              f"npu_points={count} csv={csv_path}", flush=True)
+        return csv_path
+
+    selected = next(((g, p) for g, p in prompts if g == 512), prompts[0])
+    group, prompt = selected
+    ctx = decisions[prompt.name]["context"]
+    hint = decisions[prompt.name]["prompt_tokens_hint"]
+    print(f"[PROFILE] event=BOOTSTRAP_FIXED version=V0 "
+          f"prompt={prompt.name} layout={FIXED_LAYOUT} counted=0", flush=True)
+
+    # build_process() selects the existing fixed Ring exactly while all
+    # htp_only Phone-owned configuration stays enabled. No native Phone
+    # RPC CPU profiling is used in the calibration run.
+    was_auto = args.auto_plan
+    was_stage = args.real_stage_profile_csv
+    args.auto_plan = False
+    args.real_stage_profile_csv = None
+    try:
+        result = execute(args, prompt, group, ctx, hint,
+                         base / "calibration", warmup=True)
+    finally:
+        args.auto_plan = was_auto
+        args.real_stage_profile_csv = was_stage
+    if result["status"] != "PASS":
+        raise ValueError(
+            f"HTP V0 bootstrap failed status={result['status']}. "
+            f"Inspect {base / 'calibration' / 'warmup'} / engine.stderr.log; "
+            "Phone requires GGML_RPC_REAL_STAGE_PROFILE=1")
+
+    from build_real_stage_profile import SCHEMA, extract, aggregate
+    attempt = Path(result["result_file"]).parent
+    samples, diagnostic = extract([attempt], None)
+    points = aggregate(samples)
+    npu = sum(p["device"] == "PHONE" for p in points)
+    if npu == 0:
+        raise ValueError(
+            f"V0 fixed inference passed but no matched HTP service samples. "
+            f"Check [REGION_RING_PHONE_PROFILE_PULL] and [REAL_STAGE_PROFILE] "
+            f"in {attempt / 'engine.stderr.log'}; "
+            "Phone needs GGML_RPC_REAL_STAGE_PROFILE=1")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = csv_path.with_name(csv_path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=SCHEMA)
+        writer.writeheader()
+        writer.writerows(points)
+    os.replace(tmp, csv_path)
+    save_json(base / "manifest.json", {
+        "schema": 1, "version": "V0", "mode": "FIXED_HTP_REAL_CALIBRATION",
+        "source_attempt": str(attempt),
+        "sha256": digest(csv_path),
+        "device_points": {
+            device: sum(p["device"] == device for p in points)
+            for device in ("CPU", "GPU", "PHONE")},
+        "diagnostic": diagnostic})
+    print(f"[PROFILE] event=BOOTSTRAP_READY version=V0 "
+          f"npu_points={npu} csv={csv_path}", flush=True)
+    return csv_path
+
+
 def main(argv=None):
     args = get_args(argv)
     prompts = prompts_in(args.prompt_dir)
@@ -918,6 +1006,20 @@ def main(argv=None):
                   and not (args.retry_failed_only
                            and latest[prompt.name]["status"] == "PENDING")]
 
+        # V0 must be calibrated with a real Phone HTP RUN. Native RPC CPU
+        # probes cannot seed an HTP-only planner. Once any five Prompt PASS
+        # results exist, immutable rolling epochs take precedence.
+        completed_count = sum(row["status"] == "PASS" for row in latest.values())
+        if args.auto_plan and args.htp_only and to_run:
+            if args.real_stage_profile_csv is None and completed_count < args.profile_every:
+                args.real_stage_profile_csv = bootstrap_htp_profile(
+                    args, prompts, decisions)
+            require_htp_stage_rows(args.real_stage_profile_csv
+                if args.real_stage_profile_csv is not None else
+                args.out / "profile-epochs" /
+                f"v{completed_count // args.profile_every:02d}" /
+                "real-stage-profile.csv") if args.real_stage_profile_csv is not None else None
+
         # One unmeasured representative Prefill per invocation. It is
         # deliberately NOT an entry in runs/, summary.csv or PASS counts.
         # Rewarm on resume when work remains: the Phone RPC server may have
@@ -982,6 +1084,7 @@ def main(argv=None):
                     csv_file, meta, created = profile_snapshot(
                         args.out, epoch, args.profile_every,
                         args.phone_profile_log)
+                    require_htp_stage_rows(csv_file)
                     args.real_stage_profile_csv = csv_file
                     if args.profile_epoch != epoch:
                         print(f"[PROFILE] event={'REFRESH' if created else 'REUSE'} "
