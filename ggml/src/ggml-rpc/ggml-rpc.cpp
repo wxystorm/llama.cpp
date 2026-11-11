@@ -4456,11 +4456,35 @@ static bool ggml_backend_rpc_phone_independent_probe(
         return false;
     }
     rpc_msg_phone_independent_probe_req req {};
-    // Both fields are fixed-layout 108-byte wire descriptions. Explicit
-    // serialization, not struct casting, keeps the public API decoupled.
-    static_assert(sizeof(req.plan) == sizeof(*plan),
-                  "HTP plan descriptor public/wire ABI differs");
-    std::memcpy(&req.plan, plan, sizeof(req.plan));
+    // RPC message structs are #pragma pack(1), while public API structs
+    // retain natural alignment (112 versus 108 bytes). A memcpy here
+    // silently shifts fields after the first padding gap and the old
+    // equality static_assert fails at compile time. Serialize explicitly.
+    req.plan.version = plan->version;
+    req.plan.flags = plan->flags;
+    req.plan.run_id = plan->run_id;
+    req.plan.p2c_run_id = plan->p2c_run_id;
+    req.plan.region = plan->region;
+    req.plan.layer = plan->layer;
+    req.plan.total_tokens = plan->total_tokens;
+    req.plan.chunk_tokens = plan->chunk_tokens;
+    req.plan.n_embd = plan->n_embd;
+    req.plan.position_base = plan->position_base;
+    req.plan.kv_capacity = plan->kv_capacity;
+    req.plan.n_heads = plan->n_heads;
+    req.plan.n_heads_kv = plan->n_heads_kv;
+    req.plan.head_dim = plan->head_dim;
+    req.plan.n_kv = plan->n_kv;
+    req.plan.rope_type = plan->rope_type;
+    req.plan.n_ctx_orig = plan->n_ctx_orig;
+    req.plan.kv_type = plan->kv_type;
+    req.plan.rms_norm_eps = plan->rms_norm_eps;
+    req.plan.rope_freq_base = plan->rope_freq_base;
+    req.plan.rope_freq_scale = plan->rope_freq_scale;
+    req.plan.rope_ext_factor = plan->rope_ext_factor;
+    req.plan.rope_attn_factor = plan->rope_attn_factor;
+    req.plan.rope_beta_fast = plan->rope_beta_fast;
+    req.plan.rope_beta_slow = plan->rope_beta_slow;
     req.repeats = repeats;
     req.session = session;
     rpc_msg_phone_independent_probe_rsp rsp {};
