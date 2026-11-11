@@ -36,7 +36,7 @@ def select_profile_dir(root: Path, model: Path, model_hash: str,
 
 def validated_profile(directory: Path, model_sha: str,
                       pc_id: str, profiler_sha: str,
-                      *, required_chunks: tuple[int, ...] = (32, 48, 56, 64, 80, 96, 112, 128, 160),
+                      *, required_chunks: tuple[int, ...] = (32, 64, 96, 128, 160),
                       required_kvs: tuple[int, ...] = (512, 1024)
                       ) -> tuple[bool, str]:
     path = directory / "profile.json"
@@ -127,8 +127,10 @@ def validated_profile(directory: Path, model_sha: str,
         return False, "NATIVE_PROFILE_SHAPES_UNREADABLE"
     if manifest_shapes != csv_shapes:
         return False, "NATIVE_PASS_CSV_MANIFEST_MISMATCH"
-    # The original apply-wide coarse and full-DAG phases can select any
-    # supported chunk/KV combination. A single N1/A1 sample is NOT enough
+    # The Planner searches nine Chunk widths, but five measured anchors
+    # suffice for bounded native interpolation. In particular 160 must be
+    # directly measured: do not extrapolate beyond the 128 sample.
+    # A single N1/A1 sample is NOT enough
     # to declare the cached matrix ready: the rest of the shapes must be
     # measured or the coordinator must resume their independent probes.
     # Only correctness-qualified NPU PASS samples appear in csv_shapes.
@@ -199,7 +201,7 @@ def prepare_native_profile(root: Path, model: Path, rpc: str,
         "--layers-c", "2,4",
         "--layers-n", "1,2,4",
         "--layers-a", "1,2,3,4",
-        "--chunks", "32,48,56,64,80,96,112,128,160",
+        "--chunks", "32,64,96,128,160",
         "--kvs", ",".join(str(kv) for kv in required_kvs),
         "--warmups", "2",
         "--repeats", "5",
