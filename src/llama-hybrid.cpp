@@ -6792,7 +6792,7 @@ bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                               const llama_hybrid_ffn_desc & desc,
                               ggml_backend_t                cpu_backend,
                               ggml_backend_t                phone_backend,
-                              bool htp_only_profile = false) {
+                              bool htp_only_profile) {
     if (cpu_backend == nullptr || phone_backend == nullptr || desc.n_embd <= 0 || desc.n_ff <= 0 ||
         desc.gate_type < 0 || desc.gate_type >= GGML_TYPE_COUNT || desc.up_type < 0 ||
         desc.up_type >= GGML_TYPE_COUNT || desc.down_type < 0 || desc.down_type >= GGML_TYPE_COUNT) {
@@ -7661,7 +7661,7 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
                                     ggml_backend_t                 cpu_backend,
                                     ggml_backend_t                 phone_backend,
                                     ggml_backend_t                 gpu_backend,
-                                    bool htp_only_profile = false) {
+                                    bool htp_only_profile) {
     if (cpu_backend == nullptr || phone_backend == nullptr) {
         LLAMA_LOG_ERROR("%s: CPU/Phone backend missing\n", __func__);
         return false;
@@ -8676,7 +8676,7 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                      ggml_backend_t                 cpu_backend,
                                      ggml_backend_t                 phone_backend,
                                      ggml_backend_t                 gpu_backend,
-                                     bool htp_only_profile = false) {
+                                     bool htp_only_profile) {
     if (cpu_backend == nullptr || phone_backend == nullptr) {
         LLAMA_LOG_ERROR("%s: CPU/Phone backend missing\n", __func__);
         return false;
