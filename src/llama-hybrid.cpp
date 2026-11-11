@@ -8979,14 +8979,12 @@ static bool llama_hybrid_calibrate_independent_ring(
                 if (!llama_hybrid_profile_layer_block_point(
                         attn_desc, ffn_desc, backend.first,
                         layers, tokens, timing)) {
-                    LLAMA_LOG_ERROR(
-                        "[INDEPENDENT_PROFILE] status=REJECT"
-                        " reason=PC_GRAPH_PROBE_FAILED device=%s"
+                    LLAMA_LOG_WARN(
+                        "[INDEPENDENT_PROFILE] status=SKIP_POINT"
+                        " reason=PC_GRAPH_PROBE_UNSUPPORTED_OR_OOM device=%s"
                         " layers=%d tokens=%d\n",
                         backend.second, layers, tokens);
-                    csv.close();
-                    std::remove(temporary.c_str());
-                    return false;
+                    continue; // Unsupported shapes are not zero-cost.
                 }
                 record(backend.second, layers, tokens, tokens, 0, 0,
                        timing.prepare_ms, timing.wall_ms, 0, 1);
@@ -9041,14 +9039,12 @@ static bool llama_hybrid_calibrate_independent_ring(
                         measured.repeats == 0 ||
                         !std::isfinite(measured.compute_ms) ||
                         measured.compute_ms <= 0.0) {
-                    LLAMA_LOG_ERROR(
-                        "[INDEPENDENT_PROFILE] status=REJECT"
-                        " reason=REAL_HTP_PROBE_FAILED"
+                    LLAMA_LOG_WARN(
+                        "[INDEPENDENT_PROFILE] status=SKIP_POINT"
+                        " reason=REAL_HTP_PROBE_UNSUPPORTED_OR_OOM"
                         " layers=%d tokens=%d kv=%d\n",
                         layers, tokens, kv);
-                    csv.close();
-                    std::remove(temporary.c_str());
-                    return false;
+                    continue; // Never publish an invented HTP cost.
                 }
                 // Includes Phone-host intermediate layer copies; they are
                 // required by the real serial multi-Session Pn executor.
@@ -9068,6 +9064,28 @@ static bool llama_hybrid_calibrate_independent_ring(
                     measured.output_read_ms, measured.setup_ms);
             }
         }
+    }
+    // A partial grid is valid only if every backend participating in
+    // the HTP-only 32B Plan has at least one *measured* anchor. A/OFF is
+    // intentionally absent; zero-layer choices need no service probes.
+    const auto count_device = [&](const char * name) {
+        return std::count_if(details.begin(), details.end(),
+                             [name](const point & p) {
+                                 return p.dev == name;
+                             });
+    };
+    if (!count_device("CPU") || (gpu && !count_device("GPU")) ||
+            !count_device("PHONE")) {
+        LLAMA_LOG_ERROR(
+            "[INDEPENDENT_PROFILE] status=REJECT"
+            " reason=REQUIRED_BACKEND_HAS_NO_REAL_SAMPLES"
+            " cpu=%zu gpu=%zu npu=%zu\n",
+            (size_t) count_device("CPU"),
+            (size_t) count_device("GPU"),
+            (size_t) count_device("PHONE"));
+        csv.close();
+        std::remove(temporary.c_str());
+        return false;
     }
     csv.flush();
     if (!csv.good()) {
