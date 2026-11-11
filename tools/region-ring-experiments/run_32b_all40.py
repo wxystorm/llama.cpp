@@ -60,8 +60,6 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
     "LLAMA_REGION_RING_PHONE_HTP_ONLY",
     "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED",
-    "LLAMA_REGION_RING_TASK_TRACE",
-    "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -756,6 +754,12 @@ def get_args(argv=None):
     forbidden = sorted({entry.split("=", 1)[0] for entry in args.env} & PROTECTED_RING_ENV)
     if forbidden:
         parser.error("--env cannot override fixed Ring settings: " + ", ".join(forbidden))
+    if args.profile_every:
+        required = {"LLAMA_REGION_RING_TASK_TRACE",
+                    "LLAMA_REGION_RING_REAL_STAGE_PROFILE"}
+        overrides = dict(entry.split("=", 1) for entry in args.env)
+        if any(overrides.get(key, "1") != "1" for key in required):
+            parser.error("--profile-every requires TASK_TRACE=1 and REAL_STAGE_PROFILE=1")
     return args
 
 
