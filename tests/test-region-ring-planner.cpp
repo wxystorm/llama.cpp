@@ -123,6 +123,67 @@ int main() {
         std::remove(file);
     }
 
+    // 255-token ShareGPT: E-stage logical KV=255/2=127. HTP Graphless
+    // actually reads a minimum 256-token KV span; querying 127
+    // discards every measured Phone anchor and the Planner incorrectly
+    // declares all memory-feasible candidates unprofiled.
+    REQUIRE(phone_graphless_profile_kv(128, 127) == 256);
+    REQUIRE(phone_graphless_profile_kv(160, 127) == 256);
+    REQUIRE(phone_graphless_profile_kv(32, 255) == 256);
+    REQUIRE(phone_graphless_profile_kv(96, 256) == 256);
+    REQUIRE(phone_graphless_profile_kv(96, 257) == 512);
+    REQUIRE(phone_graphless_profile_kv(128, 1030) == 1280);
+    REQUIRE(phone_graphless_profile_kv(128, 2048) == 2048);
+    REQUIRE(phone_graphless_profile_kv(0, 0) == 0);
+    {
+        const char * file = "region-ring-independent-htp-kv-padded.csv";
+        {
+            std::ofstream out(file);
+            out << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                   "prepare_ms,compute_ms,terminal,samples\n";
+            out << "PHONE,4,128,256,2,1,3,24,0,2\n";
+        }
+        real_stage_profile measured;
+        std::string reason;
+        REQUIRE(measured.load(file, reason));
+        double cost = 0.0;
+        REQUIRE(!measured.estimate(
+            device::PHONE, 4, 128, 127, false,
+            real_stage_phase::COMPUTE, cost));
+        REQUIRE(measured.estimate(
+            device::PHONE, 4, 128,
+            phone_graphless_profile_kv(128, 127), false,
+            real_stage_phase::COMPUTE, cost));
+        REQUIRE(std::fabs(cost - 24.0) < 1e-6);
+
+        // Same physical KV should make coarse E scoring possible,
+        // without weakening the memory filter or hiding cost as zero.
+        model coarse = mock_profile();
+        coarse.layers = 64;
+        coarse.tokens = 255;
+        const auto old_compute = coarse.compute_ms;
+        coarse.compute_ms = [&measured, old_compute](
+                device d, int layers, int tokens, int kv, double & ms) {
+            return (d == device::PHONE ?
+                measured.estimate(
+                    d, layers, tokens,
+                    phone_graphless_profile_kv(tokens, kv), false,
+                    real_stage_phase::COMPUTE, ms) :
+                old_compute(d, layers, tokens, kv, ms));
+        };
+        candidate plan {};
+        plan.cycles = 3;
+        plan.g = 4;
+        plan.c = 6;
+        plan.p = 4;
+        plan.xg = 128;
+        plan.xc = 128;
+        plan.xp = 128;
+        REQUIRE(estimate_balance(coarse, plan));
+        REQUIRE(plan.ring_error_max >= 0.0);
+        std::remove(file);
+    }
+
     // A missing Graph setup measurement is NOT a zero-cost HTP setup.
     // Preserve real service measurements but require Planner fallback for
     // registration (otherwise the search favors too many Phone islands).
