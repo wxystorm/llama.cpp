@@ -400,6 +400,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_KV_BIND,
     RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD,
     RPC_CMD_PHONE_STAGE_PROFILE_GET,
+    RPC_CMD_PHONE_INDEPENDENT_PROBE,
     RPC_CMD_COUNT,
 };
 
@@ -441,6 +442,7 @@ static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC com
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
 static_assert(RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD == 55, "Phone HTP weight preload RPC index");
 static_assert(RPC_CMD_PHONE_STAGE_PROFILE_GET == 56, "Phone HTP stage profile RPC index");
+static_assert(RPC_CMD_PHONE_INDEPENDENT_PROBE == 57, "Independent NPU profile RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -539,6 +541,21 @@ static_assert(sizeof(ggml_rpc_phone_stage_sample) == 28,
               "HTP Stage profile sample wire ABI changed");
 static_assert(sizeof(rpc_msg_phone_stage_profile_get_req) == 16,
               "HTP Stage profile request wire ABI changed");
+
+// Patch 32: self-contained benchmark on the existing Phone-owned HTP
+// executor. Never starts INPUT_STREAM or accepts a PC Graph/activation.
+struct rpc_msg_phone_independent_probe_req {
+    rpc_msg_phone_owned_plan_req plan {};
+    uint32_t repeats = 0;
+    uint32_t session = 0;
+};
+struct rpc_msg_phone_independent_probe_rsp {
+    uint8_t accepted = 0;
+    uint8_t reserved[7] {};
+    ggml_rpc_phone_independent_result result {};
+};
+static_assert(sizeof(rpc_msg_phone_independent_probe_req) == 116,
+              "Independent HTP probe request ABI changed");
 
 
 // One canonical storage binding per Region; no KV payload or host pointer.
@@ -4414,6 +4431,43 @@ static bool ggml_backend_rpc_phone_stage_profile_get(
     return true;
 }
 
+// Benchmarks multiple HTP layer depths and Chunk widths without a model
+// inference, PC-built Phone graph or Ring. Called only outside RUN timing.
+static bool ggml_backend_rpc_phone_independent_probe(
+        ggml_backend_t backend, const ggml_backend_rpc_phone_owned_plan * plan,
+        uint32_t repeats, uint32_t session,
+        ggml_rpc_phone_independent_result * result) {
+    if (!backend || !ggml_backend_is_rpc(backend) || !plan || !result ||
+            repeats == 0 || repeats > 5 || session > 3) {
+        return false;
+    }
+    *result = {};
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 32) {
+        GGML_LOG_ERROR("[HTP_INDEPENDENT_PROFILE] status=FAIL"
+                       " reason=RPC_PATCH_32_REQUIRED\n");
+        return false;
+    }
+    rpc_msg_phone_independent_probe_req req {};
+    // Both fields are fixed-layout 108-byte wire descriptions. Explicit
+    // serialization, not struct casting, keeps the public API decoupled.
+    static_assert(sizeof(req.plan) == sizeof(*plan),
+                  "HTP plan descriptor public/wire ABI differs");
+    std::memcpy(&req.plan, plan, sizeof(req.plan));
+    req.repeats = repeats;
+    req.session = session;
+    rpc_msg_phone_independent_probe_rsp rsp {};
+    if (!send_rpc_cmd(sock, RPC_CMD_PHONE_INDEPENDENT_PROBE,
+                      &req, sizeof(req), &rsp, sizeof(rsp)) ||
+            !rsp.accepted || !rsp.result.repeats) {
+        return false;
+    }
+    *result = rsp.result;
+    return true;
+}
+
 // A plan is registered once per Phone Region before its individual Chunk
 // graphs. The RPC-visible client remains a simple transport; Phone owns the
 // authoritative validation and registry.
@@ -6201,6 +6255,9 @@ public:
     bool phone_npu_weight_preload(const rpc_msg_phone_npu_weight_preload_req & request);
     bool phone_stage_profile_get(const rpc_msg_phone_stage_profile_get_req & request,
                                  rpc_msg_phone_stage_profile_get_rsp & response);
+    bool phone_independent_probe(
+        const rpc_msg_phone_independent_probe_req & request,
+        rpc_msg_phone_independent_probe_rsp & response);
     bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
     bool phone_owned_kv_bind(const rpc_msg_phone_owned_kv_bind_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
@@ -7825,6 +7882,184 @@ bool rpc_server::phone_input_stream_run(
 // Preload immutable Transformer weights into the correct HTP FastRPC
 // sessions. No input RUN or KV cache is allocated here, and the later
 // Phone-owned Plan still performs its per-request graph/KV validation.
+// A synthetic HTP-only calibration does not need model-loader iteration,
+// PC/Phone Region placement, or a live Prompt. It uses the same Qwen3
+// Phone-owned Graph/KV/weight code as the runtime. Profiling is serialized
+// against other Phone RUNs and discards all probe-specific residency.
+bool rpc_server::phone_independent_probe(
+        const rpc_msg_phone_independent_probe_req & request,
+        rpc_msg_phone_independent_probe_rsp & response) {
+    response = {};
+    const auto & w = request.plan;
+    const uint32_t depth = w.flags >> ggml_phone_owned::k_layer_count_shift;
+    if (!phone_npu_plan_controlled || phone_npu_executors.empty() ||
+            !local_tensor_source.get_info || !local_tensor_source.read ||
+            request.repeats == 0 || request.repeats > 5 ||
+            request.session >= phone_npu_executors.size() ||
+            depth == 0 || depth > 8 || w.layer >= 64 ||
+            depth > 64 - w.layer || w.total_tokens == 0 ||
+            w.total_tokens > 256 || w.chunk_tokens != w.total_tokens) {
+        GGML_LOG_ERROR("[HTP_INDEPENDENT_PROFILE] status=FAIL"
+                       " reason=UNSUPPORTED_REQUEST_OR_LOCAL_GGUF\n");
+        return false;
+    }
+    ggml_phone_owned::region_plan plan {};
+    plan.version = ggml_phone_owned::k_htp_only_plan_version;
+    plan.flags = ggml_phone_owned::flags_for_layers(depth);
+    plan.region = 0;
+    plan.layer = w.layer;
+    plan.total_tokens = w.total_tokens;
+    plan.chunk_tokens = w.chunk_tokens;
+    plan.n_embd = w.n_embd;
+    plan.position_base = 0;
+    plan.kv_capacity = w.kv_capacity;
+    plan.n_heads = w.n_heads;
+    plan.n_heads_kv = w.n_heads_kv;
+    plan.head_dim = w.head_dim;
+    plan.n_kv = w.n_kv;
+    plan.rope_type = w.rope_type;
+    plan.n_ctx_orig = w.n_ctx_orig;
+    plan.kv_type = w.kv_type;
+    plan.rms_norm_eps = w.rms_norm_eps;
+    plan.rope_freq_base = w.rope_freq_base;
+    plan.rope_freq_scale = w.rope_freq_scale;
+    plan.rope_ext_factor = w.rope_ext_factor;
+    plan.rope_attn_factor = w.rope_attn_factor;
+    plan.rope_beta_fast = w.rope_beta_fast;
+    plan.rope_beta_slow = w.rope_beta_slow;
+    static std::atomic<uint64_t> probe_run_id {
+        (uint64_t(1) << 60)
+    };
+    plan.run_id = probe_run_id.fetch_add(1, std::memory_order_relaxed);
+    plan.p2c_run_id = plan.run_id;
+    const char * validation = "NONE";
+    if (!ggml_phone_owned::validate(plan, validation)) {
+        GGML_LOG_ERROR(
+            "[HTP_INDEPENDENT_PROFILE] status=FAIL reason=%s\n",
+            validation);
+        return false;
+    }
+    // Hold the INPUT session guard for the whole profile: no real RUN can
+    // start while standalone Graph/KV residency is being created.
+    std::unique_lock<std::mutex> input_guard(phone_input_mutex);
+    if (!phone_input_stream_runs.empty()) {
+        GGML_LOG_ERROR("[HTP_INDEPENDENT_PROFILE] status=FAIL"
+                       " reason=REAL_RUN_ACTIVE\n");
+        return false;
+    }
+    auto cleanup = [&]() {
+        for (size_t session = 0; session < phone_npu_executors.size();
+                ++session) {
+            auto locks = phone_npu_lock_sessions({session});
+            phone_npu_executors[session]->release_owned_htp_graphs();
+            phone_npu_executors[session]->reset_model_residency();
+        }
+    };
+    // The production Pn executor stripes consecutive layers across
+    // HTP0..HTP3 and transfers intermediate activation through Phone host.
+    // Use precisely that serial chain, not parallel independent kernels.
+    double setup = 0, upload = 0, prepare = 0, compute = 0;
+    double readback = 0, weight_load = 0;
+    uint32_t completed = 0;
+    bool ok = true;
+    std::string why;
+    for (uint32_t repeat = 0; repeat < request.repeats && ok; ++repeat) {
+        plan.run_id = probe_run_id.fetch_add(1, std::memory_order_relaxed);
+        plan.p2c_run_id = plan.run_id;
+        std::vector<ggml_phone_owned::region_plan> children;
+        children.reserve(depth);
+        for (uint32_t offset = 0; offset < depth && ok; ++offset) {
+            auto child = ggml_phone_owned::single_layer_plan(plan, offset);
+            const size_t session =
+                (request.session + offset) % phone_npu_executors.size();
+            auto locks = phone_npu_lock_sessions({session});
+            auto * executor = phone_npu_executors[session].get();
+            ggml_phone_npu_serial::full_region_executor::model_load_stats load {};
+            const int64_t load_begin_us = ggml_time_us();
+            if (!executor->load_model_layer(
+                    local_tensor_source, child.layer, why, load)) {
+                ok = false;
+                break;
+            }
+            weight_load += (ggml_time_us() - load_begin_us) / 1000.0;
+            ggml_phone_npu_serial::full_region_executor::
+                local_htp_prepare_stats stats {};
+            const int64_t setup_begin_us = ggml_time_us();
+            if (!executor->prepare_owned_htp_graphs(
+                    child, why, stats, &locks.front()) ||
+                    !executor->enable_owned_htp_only_prefill(
+                        child.run_id, child.region, why)) {
+                ok = false;
+                break;
+            }
+            setup += (ggml_time_us() - setup_begin_us) / 1000.0;
+            prepare += stats.input_setup_ms;
+            children.emplace_back(child);
+        }
+        if (ok) {
+            std::vector<float> activation(
+                (size_t) plan.n_embd * plan.total_tokens, 0.015625f);
+            for (uint32_t offset = 0; offset < depth; ++offset) {
+                const size_t session =
+                    (request.session + offset) % phone_npu_executors.size();
+                auto locks = phone_npu_lock_sessions({session});
+                auto * executor = phone_npu_executors[session].get();
+                std::vector<float> output;
+                ggml_phone_npu_serial::full_region_executor::
+                    local_only_profile timing {};
+                if (!executor->run_owned_only_chunk(
+                        plan.run_id, children[offset].region, 0,
+                        nullptr, nullptr, why, timing, &output,
+                        activation.data(), activation.size())) {
+                    ok = false;
+                    break;
+                }
+                upload += timing.input_upload_ms;
+                compute += timing.htp_compute_ms;
+                readback += timing.output_copy_ms;
+                prepare += timing.input_read_ms;
+                activation.swap(output);
+            }
+        }
+        for (size_t session = 0; session < phone_npu_executors.size();
+                ++session) {
+            auto locks = phone_npu_lock_sessions({session});
+            phone_npu_executors[session]->release_owned_htp_graphs();
+        }
+        if (ok) { ++completed; }
+    }
+    cleanup();
+    if (!ok || !completed || !std::isfinite(compute) || compute <= 0) {
+        GGML_LOG_ERROR(
+            "[HTP_INDEPENDENT_PROFILE] status=FAIL layer=%u layers=%u"
+            " tokens=%u kv=%u repeats=%u reason=%s\n",
+            plan.layer, depth, plan.total_tokens, plan.n_kv,
+            completed, why.empty() ? "INCOMPLETE" : why.c_str());
+        return false;
+    }
+    const double scale = 1.0 / completed;
+    response.accepted = 1;
+    response.result.setup_ms = setup * scale;
+    response.result.upload_ms = upload * scale;
+    response.result.prepare_ms = prepare * scale;
+    response.result.compute_ms = compute * scale;
+    response.result.output_read_ms = readback * scale;
+    response.result.weight_load_ms = weight_load * scale;
+    response.result.repeats = completed;
+    response.result.layers = depth;
+    response.result.session = request.session;
+    GGML_LOG_INFO(
+        "[HTP_INDEPENDENT_PROFILE] status=PASS layers=%u chunk=%u"
+        " kv=%u session=%u repeats=%u setup_ms=%.3f"
+        " upload_ms=%.3f prepare_ms=%.3f compute_ms=%.3f"
+        " read_ms=%.3f weight_load_ms=%.3f source=HTP_REAL\n",
+        depth, plan.chunk_tokens, plan.n_kv, request.session, completed,
+        response.result.setup_ms, response.result.upload_ms,
+        response.result.prepare_ms, response.result.compute_ms,
+        response.result.output_read_ms, response.result.weight_load_ms);
+    return true;
+}
+
 bool rpc_server::phone_stage_profile_get(
         const rpc_msg_phone_stage_profile_get_req & request,
         rpc_msg_phone_stage_profile_get_rsp & response) {
@@ -15503,6 +15738,15 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                         !send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_INDEPENDENT_PROBE: {
+                rpc_msg_phone_independent_probe_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_independent_probe_rsp response {};
+                response.accepted =
+                    server.phone_independent_probe(request, response) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_OWNED_KV_BIND: {
                 rpc_msg_phone_owned_kv_bind_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -15998,6 +16242,15 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 rpc_msg_phone_stage_profile_get_rsp response {};
                 if (!server.phone_stage_profile_get(request, response) ||
                         !send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_INDEPENDENT_PROBE: {
+                rpc_msg_phone_independent_probe_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_independent_probe_rsp response {};
+                response.accepted =
+                    server.phone_independent_probe(request, response) ? 1 : 0;
+                if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
             case RPC_CMD_PHONE_OWNED_KV_BIND: {
@@ -17161,6 +17414,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_GET_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_stage_profile_get);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_INDEPENDENT_PROBE_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_independent_probe);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_plan_register);
