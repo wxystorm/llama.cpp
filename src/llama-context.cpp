@@ -8424,7 +8424,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "[REGION_RING_PHONE_PROFILE_PULL] run=%" PRIu64
                 " rows=%u total=%u status=%s\n",
                 phone_input_push_run_id, offset, total,
-                complete_profile ? "PASS" : "UNAVAILABLE");
+                complete_profile && offset > 0 &&
+                    offset == total ? "PASS" : "UNAVAILABLE");
         }
         // Recover abandoned host landing buffers if execution was cancelled
         // while a future Chunk was already staged on Phone.
