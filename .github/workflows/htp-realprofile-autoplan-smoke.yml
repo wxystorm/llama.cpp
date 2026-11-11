@@ -3,7 +3,7 @@ name: HTP-only Real Profile and Planner smoke
 on:
   push:
     branches:
-      - feat/32b-htp-realprofile-autoplan-20261111
+      - feat/32b-independent-backend-profile-20261111
   workflow_dispatch:
 
 jobs:
@@ -16,6 +16,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/region-ring-experiments -p 'test_rolling_real_stage_profile.py' -v
           python3 -m unittest discover -s tools/region-ring-experiments -p 'test_run_32b_profile5_runner.py' -v
+          python3 -m unittest discover -s tools/region-ring-experiments -p 'test_build_real_stage_profile.py' -v
           python3 -m unittest discover -s tools/region-ring-experiments -p 'test_run_32b_all40.py' -v
       - name: Configure CPU/RPC build
         run: cmake -S . -B build-htp-profile -DGGML_RPC=ON -DLLAMA_BUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF
