@@ -36,7 +36,13 @@ def completed_cases(out: Path) -> list[Path]:
                 cases.append(result.parent)
         except (OSError, ValueError):
             pass
-    return cases
+    # Snapshot by actual successful completion order, not by filename:
+    # groups are executed in order but retries/resumes can interleave.
+    def completed_at(folder: Path):
+        result = json.loads((folder / "result.json").read_text(encoding="utf-8"))
+        return (result.get("end_time", ""),
+                str(folder))
+    return sorted(cases, key=completed_at)
 
 
 def snapshot_paths(out: Path, epoch: int) -> tuple[Path, Path]:
@@ -67,12 +73,20 @@ def profile_snapshot(out: Path, epoch: int, every: int,
     # crash and resume can only increase the number of completed cases.
     if len(cases) < expected:
         raise ValueError(f"Need {expected} PASS cases before profile epoch {epoch}")
-    samples, diag = extract(cases, phone_log)
+    # A rolling epoch is exactly the N successful Prompts ending at
+    # the epoch boundary. Never average old epochs into later updates.
+    selected_cases = cases[expected - every:expected]
+    samples, diag = extract(selected_cases, phone_log)
     points = aggregate(samples)
     if not points:
         raise ValueError(
             "No real Stage measurements; enable LLAMA_REGION_RING_TASK_TRACE "
             "and LLAMA_REGION_RING_REAL_STAGE_PROFILE")
+    if not any(row["device"] == "PHONE" and row["compute_ms"] > 0
+               for row in points):
+        raise ValueError(
+            f"Epoch {epoch} has no real Phone HTP service samples; "
+            "refusing RPC CPU proxy or Phone-less rolling Profile")
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     csv_tmp = csv_path.with_name(csv_path.name + ".tmp")
     with csv_tmp.open("w", newline="", encoding="utf-8") as f:
@@ -84,7 +98,8 @@ def profile_snapshot(out: Path, epoch: int, every: int,
     digest = hashlib.sha256(csv_tmp.read_bytes()).hexdigest()
     meta = {
         "schema": 1, "epoch": epoch, "profile_every": every,
-        "passes_at_snapshot": len(cases), "source": "REAL_STAGE_CHUNK",
+        "passes_at_snapshot": expected, "window_prompts": every,
+        "source": "REAL_STAGE_CHUNK",
         "point_count": len(points), "device_points": {
             device: sum(p["device"] == device for p in points)
             for device in ("CPU", "GPU", "PHONE")
