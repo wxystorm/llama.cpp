@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "run_id": "prima-24b",
+  "source_archive": "prima-24b-数据.zip",
+  "source_run_config": "prima-sharegpt40-results-24b/run_config.json",
+  "model": "${MODEL_DIR}/Mistral-Small-3.2-24B-Q6_K.gguf",
+  "model_size_bytes": 19345944704,
+  "executable": "${PRIMA_LLAMA_CLI}",
+  "master": "${MASTER_HOST}",
+  "next": "${PHONE_HOST}",
+  "context": 4096,
+  "predict": 32,
+  "options": [
+    "-b",
+    "512",
+    "-ub",
+    "512",
+    "-t",
+    "8"
+  ],
+  "observed_planner": {
+    "k": 1,
+    "W": 40,
+    "pc_layers": 19,
+    "pc_gpu_layers": 9,
+    "phone_layers": 21,
+    "phone_gpu_layers": 0,
+    "rank_0_assignment": "M4",
+    "rank_1_assignment": "M3"
+  },
+  "planner_note": "The reported layer assignment was observed in all 40 results, not configured as a forced layout.",
+  "count": 40,
+  "status": "PASS",
+  "original_config_signature": "d10ce5e002f3a55d"
+}

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "experiment": "sharegpt40-six-baselines-2026-11-11",
+  "experiment": "sharegpt40-seven-baselines-2026-11-11",
   "prepared_on": "2026-11-11",
   "dataset": {
     "name": "ShareGPT40",
@@ -15,7 +15,8 @@
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
-    "32b": "Qwen3-32B-Q4_K_M.gguf"
+    "32b": "Qwen3-32B-Q4_K_M.gguf",
+    "24b": "Mistral-Small-3.2-24B-Q6_K.gguf"
   },
   "hardware": {
     "pc_cpu": "Intel Core Ultra 7 155H",
@@ -123,6 +124,29 @@
         "padding": 64,
         "alignment": 256
       }
+    },
+    {
+      "id": "prima-24b",
+      "framework": "prima.cpp",
+      "model": "24b",
+      "model_family": "Mistral Small 3.2",
+      "quantization": "Q6_K",
+      "context": 4096,
+      "predict": 32,
+      "batch": 512,
+      "ubatch": 512,
+      "threads": 8,
+      "planner": "HiGHS",
+      "run_config": "runs/prima-24b/run-config.json",
+      "observed_planner": {
+        "k": 1,
+        "W": 40,
+        "pc_layers": 19,
+        "pc_gpu_layers": 9,
+        "phone_layers": 21,
+        "phone_gpu_layers": 0
+      },
+      "runs": 40
     }
   ],
   "measurements": {

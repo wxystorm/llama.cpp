@@ -42,6 +42,13 @@
       "sha256": "0758b72808f3428e3a03108bca2b5976a32827fffdb1117b73b4631f3049974c",
       "bytes": 1913855,
       "runs": 40
+    },
+    {
+      "id": "prima-24b",
+      "archive": "prima-24b-数据.zip",
+      "sha256": "b0ada2ac593c4fe9857254a343f915a2c837c4e432d97cf1be221e94a6bb56a6",
+      "bytes": 273540,
+      "runs": 40
     }
   ]
 }
