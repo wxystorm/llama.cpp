@@ -335,10 +335,30 @@ private:
                 // Never extrapolate CPU/GPU service from a lone depth.
                 return false;
             }
-            // Approximate unmeasured HTP Region widths from a real HTP
-            // sample. A conservative floor prevents unrealistic tiny
-            // Regions from being ranked as zero-cost.
+            // Single-depth HTP anchor: a nonzero service floor accounts
+            // for Graph setup / activation I/O even for a 1-layer Region.
             result *= std::max(0.35, (double) layers / left);
+        }
+        if (d == device::PHONE && layers < *depths.begin()) {
+            // With 2/4/6 calibration depths, ordinary linear
+            // extrapolation can clamp the unmeasured 1-layer cost to 0.
+            // Keep at least a measured fixed-overhead fraction.
+            double min_depth_cost = 0.0;
+            if (!at_depth(*depths.begin(), min_depth_cost)) {
+                return false;
+            }
+            result = std::max(
+                result, min_depth_cost * std::max(
+                    0.35, (double) layers / *depths.begin()));
+        }
+        if (d == device::PHONE && layers > *depths.rbegin()) {
+            // A longer NPU Region must not become cheaper than the
+            // largest measured anchor due to noisy timings.
+            double max_depth_cost = 0.0;
+            if (!at_depth(*depths.rbegin(), max_depth_cost)) {
+                return false;
+            }
+            result = std::max(result, max_depth_cost);
         }
         return std::isfinite(result) && result >= 0.0;
     }
