@@ -208,11 +208,11 @@ these options to the normal `run_32b_all40.ps1` command:
 ```powershell
 # Drain-first Cycle priority:
 -EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1","LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=1","LLAMA_REGION_RING_TASK_TRACE=1" `
--Out ".\\32b-g8p6-drain-first"
+-Out ".\32b-g8p6-drain-first"
 
 # Existing resource-aware FIFO control:
 -EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1","LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=0","LLAMA_REGION_RING_TASK_TRACE=1" `
--Out ".\\32b-g8p6-resource-fifo"
+-Out ".\32b-g8p6-resource-fifo"
 ```
 
 The scheduler-only regressions in `tests/test-region-ring.cpp` verify:
@@ -251,7 +251,7 @@ To compare with the prior behavior on the exact same prompt, pass
 32B launch command:
 
 ```powershell
-# New scheduler, including PC-clock Chunk/Bank trace:
+# Resource-aware scheduling with drain-first Cycle selection (new default):
 -EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1", "LLAMA_REGION_RING_TASK_TRACE=1" `
 -Out ".\32b-g8p6-resource-aware"
 
