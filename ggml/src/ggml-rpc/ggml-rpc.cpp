@@ -5894,11 +5894,22 @@ public:
                 "GGML_RPC_PHONE_NPU_SERIAL_REGIONS expects distinct comma-separated "
                 "Region indices in [0,63]");
         }
-        if (!phone_npu_serial_regions.empty()) {
-            const char * htp_only_env =
-                std::getenv("GGML_RPC_PHONE_HTP_ONLY");
-            const bool htp_only = htp_only_env != nullptr &&
-                std::strcmp(htp_only_env, "1") == 0;
+        const char * htp_only_env =
+            std::getenv("GGML_RPC_PHONE_HTP_ONLY");
+        const bool htp_only = htp_only_env != nullptr &&
+            std::strcmp(htp_only_env, "1") == 0;
+        const char * plan_controlled_env =
+            std::getenv("GGML_RPC_PHONE_NPU_PLAN_CONTROLLED");
+        phone_npu_plan_controlled = plan_controlled_env != nullptr &&
+            std::strcmp(plan_controlled_env, "1") == 0;
+        if (phone_npu_plan_controlled &&
+                (!htp_only || !phone_npu_serial_regions.empty())) {
+            throw std::runtime_error(
+                "NPU_PLAN_CONTROLLED requires HTP_ONLY=1 and no manual "
+                "NPU_SERIAL_REGIONS; PC sends Region/layer mapping by RPC");
+        }
+        if (!phone_npu_serial_regions.empty() ||
+                phone_npu_plan_controlled) {
             if (backends.size() != 1) {
                 throw std::runtime_error(
                     "Phone NPU requires one RPC-visible transport backend");
@@ -5987,6 +5998,11 @@ public:
             // Graph preload path; no RPC protocol or PC model loader change.
             const char * model_layers_env =
                 std::getenv("GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS");
+            if (phone_npu_plan_controlled &&
+                    model_layers_env != nullptr && model_layers_env[0] != '\0') {
+                throw std::runtime_error(
+                    "NPU_PLAN_CONTROLLED forbids manual MODEL_LOAD_LAYERS");
+            }
             if (model_layers_env != nullptr && model_layers_env[0] != '\0') {
                 std::set<uint32_t> model_layers;
                 if (!ggml_phone_npu_serial::parse_regions(
@@ -6411,6 +6427,10 @@ private:
     // Sessions have independent HTP address spaces but share physical RAM.
     // Compute stays serial; do not treat summed virtual mappings as RAM.
     std::set<uint32_t> phone_npu_serial_regions;
+    bool phone_npu_plan_controlled = false;
+    // Dynamic Region mappings are installed only while no Phone RUN is
+    // active, before the PC starts its Phone-owned Plan registration.
+    std::mutex phone_npu_plan_mapping_mutex;
     std::unordered_map<uint32_t, int> phone_npu_region_layer;
     std::unordered_map<uint32_t, size_t> phone_npu_region_session;
     std::unordered_map<uint32_t, size_t> phone_npu_layer_session;
@@ -7715,8 +7735,9 @@ bool rpc_server::phone_npu_weight_preload(
             request.region >= ggml_phone_owned::k_wire_region_limit ||
             request.first_layer >= 64 || request.layer_count == 0 ||
             request.layer_count > 64 - request.first_layer ||
-            !ggml_phone_npu_serial::htp_region(
-                phone_npu_serial_regions, request.region) ||
+            (!phone_npu_plan_controlled &&
+             !ggml_phone_npu_serial::htp_region(
+                 phone_npu_serial_regions, request.region)) ||
             phone_npu_executors.empty() ||
             !local_tensor_source.get_info || !local_tensor_source.read) {
         GGML_LOG_ERROR(
@@ -7727,6 +7748,34 @@ bool rpc_server::phone_npu_weight_preload(
         return false;
     }
 
+    if (phone_npu_plan_controlled) {
+        // The PC transmits the full Region/layer range by existing early
+        // weight RPC, while model loading is still in progress. Keep this
+        // transport and the four private HTP sessions from the 32B baseline.
+        // Do not allow a fresh mapping while a prior RUN is still active.
+        {
+            std::lock_guard<std::mutex> input_guard(phone_input_mutex);
+            if (!phone_input_stream_runs.empty()) {
+                GGML_LOG_ERROR(
+                    "[PHONE_NPU_PLAN] event=MAP status=REJECT"
+                    " region=%u reason=RUN_ACTIVE\n", request.region);
+                return false;
+            }
+        }
+        std::lock_guard<std::mutex> guard(phone_npu_plan_mapping_mutex);
+        if (!phone_npu_serial_regions.count(request.region)) {
+            const size_t index =
+                phone_npu_region_session.size() % phone_npu_executors.size();
+            phone_npu_region_session.emplace(request.region, index);
+            phone_npu_serial_regions.insert(request.region);
+            GGML_LOG_INFO(
+                "[PHONE_NPU_PLAN] event=MAP source=PC_EARLY_WEIGHTS"
+                " region=%u first_layer=%u layers=%u session=%zu"
+                " backend=%s status=PASS\n",
+                request.region, request.first_layer, request.layer_count,
+                index, phone_npu_names[index].c_str());
+        }
+    }
     const int64_t start_us = ggml_time_us();
     GGML_LOG_INFO(
         "[PHONE_NPU_EARLY_WEIGHTS] event=BEGIN"
