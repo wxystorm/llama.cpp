@@ -602,6 +602,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     ring_plan_apply_wide ? selected_xp : chunk_tokens,
                     target_tokens);
             } else {
+                const char * strict_env = std::getenv(
+                    "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+                if (ring_plan_apply_wide && strict_env != nullptr &&
+                        std::strcmp(strict_env, "1") == 0) {
+                    // A Phone-final implicit Ring would be unexecutable by
+                    // the CPU-transport HTP-only prefill contract. If no
+                    // valid GPU-tail Plan survived E/Memory/Beam/DAG, fail
+                    // before loading any model or starting a Phone RUN.
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
+                        " phase=MODEL_LOAD applied=0 status=FAIL"
+                        " reason=NO_EXECUTABLE_HTP_ONLY_GPU_TAIL\n");
+                    return {-1, nullptr};
+                }
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_APPLY] mode=%s "
                     "phase=MODEL_LOAD applied=0 "
