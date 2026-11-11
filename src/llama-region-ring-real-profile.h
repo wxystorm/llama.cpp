@@ -188,7 +188,8 @@ private:
             real_stage_phase phase, double & result) const {
         std::set<int> depths;
         for (const auto & p : points_) {
-            if (p.dev == d && p.terminal == terminal) {
+            if (p.dev == d && p.terminal == terminal &&
+                    (phase != real_stage_phase::SETUP || p.setup_ms > 0.0)) {
                 depths.insert(p.layers);
             }
         }
@@ -202,7 +203,8 @@ private:
             std::set<int> xs;
             for (const auto & p : points_) {
                 if (p.dev == d && p.terminal == terminal &&
-                        p.layers == depth) {
+                        p.layers == depth &&
+                        (phase != real_stage_phase::SETUP || p.setup_ms > 0.0)) {
                     xs.insert(p.tokens);
                 }
             }
@@ -216,7 +218,9 @@ private:
                 const real_stage_point * hi = nullptr;
                 for (const auto & p : points_) {
                     if (p.dev != d || p.terminal != terminal ||
-                            p.layers != depth || p.tokens != x) {
+                            p.layers != depth || p.tokens != x ||
+                            (phase == real_stage_phase::SETUP &&
+                             p.setup_ms <= 0.0)) {
                         continue;
                     }
                     if (p.kv_tokens <= kv_tokens &&
