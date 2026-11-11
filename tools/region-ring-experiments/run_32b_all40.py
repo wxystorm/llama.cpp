@@ -501,7 +501,6 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     env.update({
         "LLAMA_HYBRID_REGION_RING_V1": "1",
         "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
-        "LLAMA_REGION_RING_PROFILE_GRID": getattr(args, "profile_grid", "quick"),
         "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(estimate),
         "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1" if args.streaming == "on" else "0",
         "LLAMA_REGION_RING_METRICS_FILE": str(metrics_path),
@@ -514,6 +513,8 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
             "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.xp),
         }),
     })
+    if args.auto_plan and args.htp_only:
+        env["LLAMA_REGION_RING_PROFILE_GRID"] = args.profile_grid
     if args.htp_only:
         # Preserve the proven 32B Phone-owned autonomous prefill contract.
         # -d CPU is a transport; all Phone Transformer layers run on HTP.
