@@ -8,6 +8,8 @@ param(
     [string]$Out = ".\32b-htp-only-profile5-plan-all40",
     [string]$Exe = "",
     [ValidateRange(1,40)][int]$ProfileEvery = 5,
+    [ValidateSet("quick","full")][string]$ProfileGrid = "quick",
+    [switch]$UpdateProfile,
     [string]$PhoneProfileLog = "",
     [string]$RealStageProfileCsv = "",
     [int]$Batch = 2048,
@@ -32,12 +34,14 @@ $arguments = @(
     "--exe", $Exe, "--model", $Model, "--rpc", $Rpc,
     "--prompt-dir", $PromptDir, "--repo-root", $root, "--out", $Out,
     "--auto-plan", "--htp-only", "--profile-every", "$ProfileEvery",
+    "--profile-grid", $ProfileGrid,
     "--streaming", "on", "--batch", "$Batch", "--ubatch", "$UBatch",
     "--n-predict", "$NPredict", "--threads", "$Threads",
     "--max-retries", "$MaxRetries", "--limit", "$Limit",
     "--log-verbosity", "4", "--context-padding", "256"
 )
 if ($NoMmap) { $arguments += "--no-mmap" }
+if ($UpdateProfile) { $arguments += "--update-profile" }
 if ($StopOnFail) { $arguments += "--stop-on-fail" }
 if ($DryRun) { $arguments += "--dry-run" }
 if ($PhoneProfileLog) { $arguments += @("--phone-profile-log", $PhoneProfileLog) }
