@@ -487,24 +487,28 @@ class All40Tests(unittest.TestCase):
         self.assertEqual(len(self.load('prompt_128_03.txt')), 1)
 
     def test_preload_fail_or_missing_ack_prevents_formal_run(self):
-        for behavior, expected in (('preload_fail', 'PRELOAD_FAILED'),
-                                   ('preload_unverified', 'PRELOAD_UNVERIFIED')):
+        for i, (behavior, expected) in enumerate(
+                (('preload_fail', 'PRELOAD_FAILED'),
+                 ('preload_unverified', 'PRELOAD_UNVERIFIED'))):
             with self.subTest(behavior=behavior):
+                out = self.root / f"preload-error-{i}"
                 (self.root / 'behavior.txt').write_text(behavior)
-                result = self.invoke_new('--limit', '1')
+                result = self.invoke_new('--out', str(out), '--limit', '1')
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn('no measured Prompt was started', result.stderr)
                 first = json.loads(next(
-                    (self.out / 'warmup').glob('attempt-*/result.json')).read_text())
+                    (out / 'warmup').glob('attempt-*/result.json')).read_text())
                 self.assertEqual(first['status'], expected)
-                self.assertFalse((self.out / 'runs').exists())
-                self.assertEqual(self.load('prompt_128_01.txt'), [])
+                self.assertFalse((out / 'runs').exists())
+                self.assertFalse((out / 'summary.csv').read_text().count(
+                    'PRELOAD_FAILED'))
                 (self.root / 'behavior.txt').unlink()
-                # The failed warm-up must not permanently poison output.
-                if behavior == 'preload_fail':
-                    recovered = self.invoke_new('--limit', '1')
-                    self.assertEqual(recovered.returncode, 0, recovered.stderr)
-                    break
+                # A failed warm-up must never poison the run directory.
+                recovered = self.invoke_new('--out', str(out), '--limit', '1')
+                self.assertEqual(recovered.returncode, 0, recovered.stderr)
+                self.assertEqual(len(list((out / 'warmup').glob(
+                    'attempt-*/result.json'))), 2)
+                self.assertTrue((out / 'runs/prompt_128_01').exists())
 
     def test_preload_can_run_without_warmup(self):
         args = [arg for arg in self.common
