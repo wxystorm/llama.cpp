@@ -119,11 +119,11 @@ int main() {
 
     // First-cycle fine X candidates are available to deterministic A/B
     // runs. A subsequent Cycle must keep this selected X triple unchanged.
-    REQUIRE(first_cycle_chunk_candidates.size() == 17);
-    for (int x : {8, 12, 20, 24, 40, 48, 56, 80, 96, 160, 192}) {
+    REQUIRE(first_cycle_chunk_candidates.size() == 9);
+    for (int x : {32, 48, 56, 64, 80, 96, 112, 128, 160}) {
         REQUIRE(first_cycle_chunk_supported(x));
     }
-    for (int x : {7, 18, 36, 256}) {
+    for (int x : {8, 12, 16, 20, 24, 40, 192, 256}) {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
@@ -1012,9 +1012,9 @@ int main() {
         incumbent.g = 3;
         incumbent.c = 1;
         incumbent.p = 2;
-        incumbent.xc = 16;
-        incumbent.xg = 16;
-        incumbent.xp = 32;
+        incumbent.xc = 32;
+        incumbent.xg = 32;
+        incumbent.xp = 48;
         incumbent.concrete_regions = llama_region_ring_parse(
             "G3,C1,P2,G3,C1,P2", 12);
         REQUIRE(estimate_region_ring_balance(
@@ -1025,7 +1025,7 @@ int main() {
         result nearby;
         nearby.top.push_back(incumbent);
         const auto start_key = llama_region_ring_layout_string(
-            incumbent.concrete_regions) + "/16/16/32";
+            incumbent.concrete_regions) + "/32/32/48";
         std::unordered_set<std::string> seen {start_key};
         refine_runtime_local_candidates(local, nearby, seen);
         REQUIRE(nearby.local_anchors > 0);
