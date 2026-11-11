@@ -51,7 +51,8 @@ def snapshot_paths(out: Path, epoch: int) -> tuple[Path, Path]:
 
 
 def profile_snapshot(out: Path, epoch: int, every: int,
-                     phone_log: Optional[Path] = None) -> tuple[Path, dict, bool]:
+                     phone_log: Optional[Path] = None,
+                     independent_csv: Optional[Path] = None) -> tuple[Path, dict, bool]:
     """Build at exactly every N completed PASS runs, persist immutable CSV.
 
     If the snapshot already exists (e.g. resume after a crash), verify and
@@ -60,7 +61,8 @@ def profile_snapshot(out: Path, epoch: int, every: int,
     if epoch < 1 or every < 1:
         raise ValueError("epoch/every must be positive")
     csv_path, meta_path = snapshot_paths(out, epoch)
-    independent = out / "independent-profile" / "profile.csv"
+    independent = (independent_csv if independent_csv is not None else
+                   out / "independent-profile" / "profile.csv")
     if not independent.is_file():
         raise ValueError("Independent backend Profile is missing; "
                          "never generate a rolling snapshot without a G/C/N baseline")
