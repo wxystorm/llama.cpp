@@ -502,6 +502,24 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
             "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.xp),
         }),
     })
+    if args.htp_only:
+        # Preserve the proven 32B Phone-owned autonomous prefill contract.
+        # -d CPU is a transport; all Phone Transformer layers run on HTP.
+        # In particular, HTP_ONLY without GRAPHLESS would be rejected in
+        # llama-context.cpp before the first Chunk.
+        env.update({
+            "LLAMA_HYBRID_REGION_RING_PHONE_RETURN_STREAM": "1",
+            "LLAMA_REGION_RING_PHONE_AUTONOMOUS": "1",
+            "LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL": "1",
+            "LLAMA_REGION_RING_PHONE_INPUT_PUSH": "1",
+            "LLAMA_REGION_RING_PHONE_INPUT_STREAM": "1",
+            "LLAMA_REGION_RING_PHONE_STATIC_TEMPLATES": "1",
+            "LLAMA_REGION_RING_PHONE_GRAPHLESS": "1",
+            "LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW": "1",
+            "LLAMA_REGION_RING_PHONE_PLAN_ASYNC": "1",
+            "LLAMA_REGION_RING_PRIORITY_BANK_MOVER": "1",
+            "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH": "1",
+        })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
     if args.profile_every:
@@ -535,6 +553,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
                "-f", str(prompt), "-lv", str(args.log_verbosity)]
     if args.no_mmap:
         command.append("--no-mmap")
+    if args.htp_only:
+        # Native Qwen3 HTP-only supports fresh prefill only. Avoid an
+        # unmeasured legacy tiny/decode warmup through CPU RPC transport.
+        command.append("--no-warmup")
     return command, env
 
 
