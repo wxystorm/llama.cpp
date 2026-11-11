@@ -1087,7 +1087,7 @@ def main(argv=None):
                         if retry == 0 and i == 1:
                             print(f"[PROFILE] event=INDEPENDENT_READY"
                                   f" npu_points={count}"
-                                  f" json={independent}.json", flush=True)
+                                  f" json={independent.with_suffix('.json')}", flush=True)
                     elif row["status"] == "PASS":
                         row["status"] = "FAIL"
                         row["error"] = "PROFILE_NOT_CREATED"
