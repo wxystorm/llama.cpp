@@ -6791,7 +6791,8 @@ static bool llama_hybrid_profile_ffn_point(const llama_hybrid_ffn_desc & desc,
 bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                               const llama_hybrid_ffn_desc & desc,
                               ggml_backend_t                cpu_backend,
-                              ggml_backend_t                phone_backend) {
+                              ggml_backend_t                phone_backend,
+                              bool htp_only_profile = false) {
     if (cpu_backend == nullptr || phone_backend == nullptr || desc.n_embd <= 0 || desc.n_ff <= 0 ||
         desc.gate_type < 0 || desc.gate_type >= GGML_TYPE_COUNT || desc.up_type < 0 ||
         desc.up_type >= GGML_TYPE_COUNT || desc.down_type < 0 || desc.down_type >= GGML_TYPE_COUNT) {
@@ -6850,6 +6851,9 @@ bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                 " ms=%.3f runtime_bytes=%zu\n",
                 ggml_backend_name(cpu_backend), tokens, cpu_ratio_eff, cpu_local_ff, cpu_ms, cpu_runtime_bytes);
 
+            // The RPC-visible CPU is a transport in HTP-only mode.
+            // Never benchmark its synthetic FFN as if it ran on HTP.
+            if (htp_only_profile) { continue; }
             const float pc_ratio_for_phone = 1.0f - requested_local_ratio;
             const int64_t phone_local_ff = llama_hybrid_ffn_shard_size(desc.n_ff, desc.down_type,
                                                                         pc_ratio_for_phone, 1);
@@ -7656,7 +7660,8 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
                                     const llama_hybrid_attn_desc & desc,
                                     ggml_backend_t                 cpu_backend,
                                     ggml_backend_t                 phone_backend,
-                                    ggml_backend_t                 gpu_backend) {
+                                    ggml_backend_t                 gpu_backend,
+                                    bool htp_only_profile = false) {
     if (cpu_backend == nullptr || phone_backend == nullptr) {
         LLAMA_LOG_ERROR("%s: CPU/Phone backend missing\n", __func__);
         return false;
@@ -7759,8 +7764,9 @@ bool llama_hybrid_profile_attention(llama_hybrid_profile &         profile,
 
     if (!profile_backend(cpu_backend, profile.cpu_attn, &profile.cpu_attn_ms,
                          LLAMA_HYBRID_CPU_LAYER_TOKENS) ||
-        !profile_backend(phone_backend, profile.phone_attn, &profile.phone_attn_ms,
-                         LLAMA_HYBRID_PHONE_LAYER_TOKENS) ||
+        (!htp_only_profile &&
+         !profile_backend(phone_backend, profile.phone_attn, &profile.phone_attn_ms,
+                          LLAMA_HYBRID_PHONE_LAYER_TOKENS)) ||
         (gpu_backend != nullptr &&
          !profile_backend(gpu_backend, profile.gpu_attn, nullptr, LLAMA_HYBRID_GPU_LAYER_TOKENS))) {
         return false;
@@ -8669,7 +8675,8 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                      const llama_hybrid_ffn_desc &  ffn_desc,
                                      ggml_backend_t                 cpu_backend,
                                      ggml_backend_t                 phone_backend,
-                                     ggml_backend_t                 gpu_backend) {
+                                     ggml_backend_t                 gpu_backend,
+                                     bool htp_only_profile = false) {
     if (cpu_backend == nullptr || phone_backend == nullptr) {
         LLAMA_LOG_ERROR("%s: CPU/Phone backend missing\n", __func__);
         return false;
@@ -8729,7 +8736,7 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
     }
 
     for (const int tokens : LLAMA_HYBRID_PHONE_LAYER_TOKENS) {
-        if (tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
+        if (htp_only_profile || tokens <= 0 || tokens > attn_desc.n_ctx_orig) {
             continue;
         }
 
@@ -8797,8 +8804,9 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
     };
 
     if (!find_probe_block(profile.cpu_layer_blocks, false, profile.cpu_full_layer_ms) ||
-        !find_probe_block(profile.phone_layer_blocks, false, profile.phone_full_layer_ms) ||
-        !find_probe_block(profile.phone_layer_blocks, true, profile.phone_full_layer_compute_est_ms)) {
+        (!htp_only_profile &&
+         (!find_probe_block(profile.phone_layer_blocks, false, profile.phone_full_layer_ms) ||
+          !find_probe_block(profile.phone_layer_blocks, true, profile.phone_full_layer_compute_est_ms)))) {
         return false;
     }
     if (gpu_backend != nullptr && !find_probe_block(profile.gpu_layer_blocks, false, profile.gpu_full_layer_ms)) {
@@ -8978,6 +8986,14 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     profile.reference_tokens = LLAMA_HYBRID_REFERENCE_TOKENS;
     profile.probe_chunk_min_tokens = 4;
     profile.profile_block_layers = LLAMA_HYBRID_PROFILE_BLOCK_LAYERS;
+    const char * controlled_env = std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+    const bool htp_only_profile = controlled_env &&
+        std::strcmp(controlled_env, "1") == 0 &&
+        ml.get_arch() == LLM_ARCH_QWEN3 &&
+        std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV") != nullptr;
+    LLAMA_LOG_INFO("[REGION_RING_HTP_PROFILE] mode=%s source=%s\n",
+                   htp_only_profile ? "HTP_ONLY" : "LEGACY",
+                   htp_only_profile ? "REAL_STAGE_CSV" : "NATIVE_RPC_PROBES");
 
     if (!ml.get_hybrid_weight_bytes(
             n_layer,
@@ -8994,7 +9010,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         !llama_hybrid_profile_rpc(
             profile, cpu.get(), phone.get()) ||
         !llama_hybrid_profile_attention(
-            profile, attn_desc, cpu.get(), phone.get(), gpu.get()) ||
+            profile, attn_desc, cpu.get(), phone.get(), gpu.get(), htp_only_profile) ||
         !llama_hybrid_profile_decode_tail(
             profile, output_desc, attn_desc.rms_eps, cpu.get())) {
         LLAMA_LOG_ERROR("%s: common profiling failed\n", __func__);
@@ -9019,10 +9035,10 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
     } else {
         if (!llama_hybrid_profile_ffn(
-                profile, ffn_desc, cpu.get(), phone.get()) ||
+                profile, ffn_desc, cpu.get(), phone.get(), htp_only_profile) ||
             !llama_hybrid_profile_full_layer(
                 profile, attn_desc, ffn_desc,
-                cpu.get(), phone.get(), gpu.get())) {
+                cpu.get(), phone.get(), gpu.get(), htp_only_profile)) {
             LLAMA_LOG_ERROR("%s: dense profiling failed\n", __func__);
             return false;
         }
@@ -9033,7 +9049,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         const bool dense_ring_planner_profile =
             llama_region_ring_enabled() &&
             std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER") != nullptr;
-        if (dense_ring_planner_profile &&
+        if (dense_ring_planner_profile && !htp_only_profile &&
                 !llama_hybrid_profile_phone_blocks(
                     profile, attn_desc, ffn_desc, phone.get())) {
             profile.phone_blocks.clear();
@@ -9515,6 +9531,24 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.phone_register_ms =
             std::max(0.0, profile.rpc_submit_ms) + graph_wire_ms;
+    } else if (flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED")) {
+        // Graphless HTP registration is not an RPC CPU Graph upload.
+        // Runtime Stage samples will override this fixed-cost prior.
+        const double submit = std::max(0.01, profile.rpc_submit_ms);
+        model.phone_register_ms = submit;
+        model.phone_registration_cost = [submit](
+                llama_region_ring_stage_kind kind, int layers,
+                int tokens, bool embedded_directional, double & cost) {
+            GGML_UNUSED(tokens);
+            GGML_UNUSED(embedded_directional);
+            if (kind != llama_region_ring_stage_kind::PHONE || layers <= 0) {
+                return false;
+            }
+            cost = submit * layers;
+            return true;
+        };
+        LLAMA_LOG_INFO("[REGION_RING_PLAN_PHONE_COST] source=HTP_GRAPHLESS"
+                       " cpu_rpc_graph_probe=SKIPPED status=ESTIMATED\n");
     } else {
         size_t single_wire_bytes = 0;
         size_t five_wire_bytes = 0;
