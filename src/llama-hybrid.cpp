@@ -10128,8 +10128,36 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             (long double) profile.kv_bytes_per_token_per_layer *
             (model.kv_start + model.tokens);
 
+        const bool htp_session_guard =
+            flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+        // FastRPC sessions have independent mappings but share physical
+        // Phone RAM. The existing aggregate Phone budget still applies.
+        // This second guard prevents a single round-robin Session from
+        // exceeding a conservative virtual mapping / weight budget.
+        long double htp_session_budget_bytes = 3584.0L * 1048576.0L;
+        if (const char * raw = std::getenv(
+                "LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB")) {
+            char * end = nullptr;
+            const double mib = std::strtod(raw, &end);
+            if (end != raw && *end == '\0' && std::isfinite(mib) &&
+                    mib >= 256.0 && mib <= 4096.0) {
+                htp_session_budget_bytes = (long double) mib * 1048576.0L;
+            } else {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_HTP_MEMORY] status=REJECT"
+                    " reason=INVALID_SESSION_BUDGET value=%s\n", raw);
+                return false;
+            }
+        }
+        if (htp_session_guard) {
+            LLAMA_LOG_INFO("[REGION_RING_HTP_MEMORY] sessions=4"
+                           " per_session_budget_mib=%.1Lf"
+                           " aggregate=PHONE_SHARED_RAM status=GUARDED\n",
+                           htp_session_budget_bytes / 1048576.0L);
+        }
         model.memory_feasible =
-            [&profile, &model, planner_layer_bytes](
+            [&profile, &model, planner_layer_bytes, htp_session_guard,
+             htp_session_budget_bytes](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
@@ -10138,6 +10166,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
 
                 std::array<long double, 3> usage {};
+                std::array<long double, 4> htp_session_usage {};
+                size_t phone_rank = 0;
                 for (const auto & region : regions) {
                     long double region_weight = 0.0L;
                     for (int l = region.layer_begin;
@@ -10148,6 +10178,20 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             (long double)
                                 profile.kv_bytes_per_token_per_layer *
                             (model.kv_start + model.tokens);
+                    }
+
+                    if (htp_session_guard &&
+                            region.device ==
+                                llama_region_ring_device::PHONE) {
+                        const long double kv =
+                            (long double) profile.kv_bytes_per_token_per_layer *
+                            (model.kv_start + model.tokens) *
+                            (region.layer_end - region.layer_begin);
+                        const size_t session = phone_rank++ % htp_session_usage.size();
+                        htp_session_usage[session] += region_weight + kv;
+                        if (htp_session_usage[session] > htp_session_budget_bytes) {
+                            return false;
+                        }
                     }
 
                     if (model.gpu_weight_streaming &&
