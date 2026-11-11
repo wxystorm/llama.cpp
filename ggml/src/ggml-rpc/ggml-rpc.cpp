@@ -7655,27 +7655,53 @@ bool rpc_server::phone_input_stream_run(
             std::vector<ggml_rpc_phone_stage_sample> completed_samples;
             const char * stage_enabled = std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
             const bool collect_stage = stage_enabled && std::strcmp(stage_enabled, "1") == 0;
+            size_t stage_complete_jobs = 0;
+            size_t stage_missing_timestamps = 0;
+            size_t stage_graphless_jobs = 0;
             for (auto it = phone_auto_jobs.begin();
                     it != phone_auto_jobs.end();) {
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
-                    if (collect_stage && job.state == phone_auto_status::COMPLETE &&
-                            job.upload_begin_us > 0 && job.upload_done_us >= job.upload_begin_us &&
+                    if (collect_stage && job.state == phone_auto_status::COMPLETE) {
+                        ++stage_complete_jobs;
+                        // HTP-only Graphless prepares directly from the
+                        // verified Phone-host input; it intentionally never
+                        // creates an OpenCL phone_stage_prepared_input.
+                        // Requiring job.prepared therefore silently lost
+                        // EVERY successful HTP Chunk in Profile5.
+                        const bool owned_prepare = job.graphless_owned &&
+                            job.prepare_done_us > 0 &&
+                            job.upload_done_us > 0 &&
+                            job.prepare_done_us >= job.upload_done_us;
+                        const bool opencl_prepare =
                             job.prepared.has_value() &&
                             job.prepared->prepare_begin_us > 0 &&
-                            job.prepared->prepare_end_us >= job.prepared->prepare_begin_us &&
-                            job.compute_begin_us > 0 && job.compute_end_us > job.compute_begin_us) {
-                        ggml_rpc_phone_stage_sample sample {};
-                        sample.region = job.request.key.region;
-                        sample.chunk = job.request.key.chunk;
-                        sample.tokens = job.request.n_tokens;
-                        sample.token_begin = job.request.token_begin;
-                        sample.upload_ms = (job.upload_done_us - job.upload_begin_us) / 1000.0f;
-                        sample.prepare_ms = (job.prepared->prepare_end_us -
-                                             job.prepared->prepare_begin_us) / 1000.0f;
-                        sample.compute_ms = (job.compute_end_us - job.compute_begin_us) / 1000.0f;
-                        completed_samples.push_back(sample);
+                            job.prepared->prepare_end_us >=
+                                job.prepared->prepare_begin_us;
+                        if (job.graphless_owned) { ++stage_graphless_jobs; }
+                        if (job.upload_begin_us > 0 &&
+                                job.upload_done_us >= job.upload_begin_us &&
+                                (owned_prepare || opencl_prepare) &&
+                                job.compute_begin_us > 0 &&
+                                job.compute_end_us > job.compute_begin_us) {
+                            ggml_rpc_phone_stage_sample sample {};
+                            sample.region = job.request.key.region;
+                            sample.chunk = job.request.key.chunk;
+                            sample.tokens = job.request.n_tokens;
+                            sample.token_begin = job.request.token_begin;
+                            sample.upload_ms =
+                                (job.upload_done_us - job.upload_begin_us) / 1000.0f;
+                            sample.prepare_ms = owned_prepare ?
+                                (job.prepare_done_us - job.upload_done_us) / 1000.0f :
+                                (job.prepared->prepare_end_us -
+                                 job.prepared->prepare_begin_us) / 1000.0f;
+                            sample.compute_ms =
+                                (job.compute_end_us - job.compute_begin_us) / 1000.0f;
+                            completed_samples.push_back(sample);
+                        } else {
+                            ++stage_missing_timestamps;
+                        }
                     }
                     // Opt-in exact phone monotonic timestamps. Emit only
                     // at stream teardown, never in the hot Chunk path.
@@ -7752,7 +7778,10 @@ bool rpc_server::phone_input_stream_run(
                         const double prep_service =
                             job.prepared.has_value() ?
                                 millis(job.prepared->prepare_begin_us,
-                                       job.prepared->prepare_end_us) : -1.0;
+                                       job.prepared->prepare_end_us) :
+                            job.graphless_owned ?
+                                millis(job.upload_done_us,
+                                       job.prepare_done_us) : -1.0;
                         const double post_upload =
                             millis(job.upload_done_us, job.prepare_done_us);
                         GGML_LOG_INFO(
@@ -7824,6 +7853,14 @@ bool rpc_server::phone_input_stream_run(
                 } else { ++it; }
             }
             if (collect_stage) {
+                GGML_LOG_INFO(
+                    "[PHONE_STAGE_PROFILE_EXPORT] run=%" PRIu64
+                    " complete=%zu graphless=%zu exported=%zu"
+                    " missing_timestamps=%zu status=%s\n",
+                    request.run_id, stage_complete_jobs,
+                    stage_graphless_jobs, completed_samples.size(),
+                    stage_missing_timestamps,
+                    completed_samples.empty() ? "EMPTY" : "READY");
                 phone_stage_profile_completed[request.run_id] =
                     std::move(completed_samples);
                 while (phone_stage_profile_completed.size() > 8) {
