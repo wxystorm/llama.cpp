@@ -13,6 +13,10 @@ param(
     [switch]$UpdateProfile,
     [string]$PhoneProfileLog = "",
     [string]$RealStageProfileCsv = "",
+    [string]$ForceLayout = "",
+    [int]$ForceXC = 128,
+    [int]$ForceXG = 128,
+    [int]$ForceXP = 128,
     [int]$Batch = 2048,
     [int]$UBatch = 2048,
     [int]$Threads = 8,
@@ -44,6 +48,18 @@ $arguments = @(
     "--max-retries", "$MaxRetries", "--limit", "$Limit",
     "--log-verbosity", "4", "--context-padding", "256"
 )
+if ($ForceLayout) {
+    $arguments += @(
+        "--force-plan-layout", $ForceLayout,
+        "--force-plan-xc", "$ForceXC",
+        "--force-plan-xg", "$ForceXG",
+        "--force-plan-xp", "$ForceXP"
+    )
+} elseif ($PSBoundParameters.ContainsKey("ForceXC") -or
+          $PSBoundParameters.ContainsKey("ForceXG") -or
+          $PSBoundParameters.ContainsKey("ForceXP")) {
+    throw "-ForceXC/-ForceXG/-ForceXP require -ForceLayout"
+}
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($UpdateProfile) { $arguments += "--update-profile" }
 if ($StopOnFail) { $arguments += "--stop-on-fail" }

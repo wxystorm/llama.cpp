@@ -85,6 +85,38 @@ If the prior calibration is incomplete, omit `-RealStageProfileCsv`
 in a fresh Out and the runner will calibrate exactly once. The existing
 PC native startup fallback probes are distinct from the standalone V0.
 
+## Optional fixed HTP-only layout and Chunk widths
+
+The same `run_32b_profile5_plan.ps1` now accepts `-ForceLayout`,
+`-ForceXC`, `-ForceXG`, and `-ForceXP`. This runs the native APPLY_WIDE
+forced A/B path instead of the automatic layout search, **without**
+disabling the exact DAG checks or per-layer FastRPC Session / Android
+MemAvailable guard. `N` and `P` in `-ForceLayout` both select Phone HTP;
+the runtime receives the canonical `P` notation.
+
+For an initial 32B smoke, use 12 Phone layers (six P2 Regions),
+52 PC CUDA layers and a final GPU tail. The topology is not guaranteed
+to fit every device; the Planner must still pass its live memory check.
+
+```powershell
+.\tools\region-ring-experiments\run_32b_profile5_plan.ps1 `
+  -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
+  -Out ".\32b-fixed-n12" `
+  -RealStageProfileCsv ".\32b-independent-profile-all40-final\independent-profile\profile.csv" `
+  -ForceLayout "G8,N2,G8,N2,G8,N2,G8,N2,G8,N2,G8,N2,G4" `
+  -ForceXC 64 -ForceXG 64 -ForceXP 64 `
+  -ProfileEvery 0 -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8 `
+  -Limit 1 -StopOnFail
+```
+
+Remove `-Limit 1` after smoke PASS. Use the same `-Out` to resume a
+fixed run, or **a new Out** when changing layout/chunk widths. Fixed
+parameters are signed into the run configuration. Omitting
+`-ForceLayout` restores the original automatic Planner. Legacy
+`--layout` is incompatible with HTP-only automatic mode; use the
+new fixed-Plan parameters above.
 ## Exact workflow
 
 1. **Independent Profile**, only when there is no cached baseline or

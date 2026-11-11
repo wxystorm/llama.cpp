@@ -52,6 +52,51 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertFalse(args.warmup)
             self.assertEqual(args.out, out)
 
+    def test_fixed_htp_forced_plan_keeps_v0_and_memory_guards(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "qwen3-32b.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            prompts.mkdir()
+            model.touch()
+            exe.touch()
+            layout = "G8,N2,G8,N2,G8,N2,G8,N2,G8,N2,G8,N2,G4"
+            base = ["--exe", str(exe), "--model", str(model),
+                    "--rpc", "127.0.0.1:50052",
+                    "--prompt-dir", str(prompts), "--repo-root", str(root),
+                    "--auto-plan", "--htp-only"]
+            args = get_args(base + [
+                "--force-plan-layout", layout,
+                "--force-plan-xc", "64", "--force-plan-xg", "64",
+                "--force-plan-xp", "64",
+            ])
+            self.assertEqual(args.force_plan_layout, layout.replace("N", "P"))
+            self.assertEqual((args.force_plan_xc, args.force_plan_xg,
+                              args.force_plan_xp), (64, 64, 64))
+            self.assertEqual(args.profile_every, 0)
+            command, env = build_process(
+                args, root / "prompt_128_01.txt", 512, 167,
+                root / "metrics.jsonl")
+            self.assertIn("--no-warmup", command)
+            self.assertEqual(env["LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED"], "1")
+            self.assertEqual(env["LLAMA_REGION_RING_PHONE_HTP_ONLY"], "1")
+            self.assertEqual(env["LLAMA_HYBRID_REGION_RING_SKIP_PROFILE"], "0")
+            self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT"],
+                             args.force_plan_layout)
+            for key in ("XC", "XG", "XP"):
+                self.assertEqual(env["LLAMA_HYBRID_REGION_RING_FORCE_" + key],
+                                 "64")
+            self.assertNotIn("LLAMA_REGION_RING_REAL_STAGE_PROFILE", env)
+            self.assertNotIn("LLAMA_REGION_RING_TASK_TRACE", env)
+            with self.assertRaises(SystemExit):
+                get_args(base + ["--force-plan-layout", layout,
+                                 "--force-plan-xp", "63"])
+            with self.assertRaises(SystemExit):
+                get_args(base + ["--force-plan-xp", "64"])
+            with self.assertRaises(SystemExit):
+                get_args(base[:-2] + ["--force-plan-layout", layout])
+
     def test_cpu_transport_graphless_plan_environment(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -139,6 +184,8 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
         self.assertIn("[int]$ProfileEvery = 0", script)
         self.assertIn('"--auto-plan", "--htp-only", "--profile-every", "0"', script)
         self.assertIn('if ($ProfileEvery -ne 0)', script)
+        self.assertIn('[string]$ForceLayout = ""', script)
+        self.assertIn('"--force-plan-layout", $ForceLayout', script)
 
     def test_partial_v1_with_36_independent_npu_rows_must_fallback(self):
         # The failing live experiment had 17 C / 59 G / 36 N rows:

@@ -526,6 +526,15 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
             "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.xp),
         }),
     })
+    if args.auto_plan and getattr(args, "force_plan_layout", None):
+        # Native APPLY_WIDE forced A/B still checks exact DAG and
+        # HTP Session/shared physical Android RAM budgets.
+        env.update({
+            "LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT": args.force_plan_layout,
+            "LLAMA_HYBRID_REGION_RING_FORCE_XC": str(args.force_plan_xc),
+            "LLAMA_HYBRID_REGION_RING_FORCE_XG": str(args.force_plan_xg),
+            "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.force_plan_xp),
+        })
     if args.auto_plan and args.htp_only:
         env["LLAMA_REGION_RING_PROFILE_GRID"] = args.profile_grid
     if args.htp_only:
@@ -666,6 +675,15 @@ def get_args(argv=None):
     parser.add_argument("--htp-only", action="store_true",
                         help="with --auto-plan use CPU RPC transport and 4 private HTP sessions; "
                              "Phone must set GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1")
+    parser.add_argument("--force-plan-layout", default=None,
+                        help="optional HTP-only native forced G/[C]/P plan; "
+                             "N is accepted as alias for P, with memory guards")
+    parser.add_argument("--force-plan-xc", type=int, default=None,
+                        help="forced CPU Chunk width (default 128)")
+    parser.add_argument("--force-plan-xg", type=int, default=None,
+                        help="forced PC GPU Chunk width (default 128)")
+    parser.add_argument("--force-plan-xp", type=int, default=None,
+                        help="forced Phone HTP Chunk width (default 128)")
     parser.add_argument("--force-small-batch-mover", action="store_true",
                         help="opt-in: enable GPU Bank Mover on short prefill, without changing decode")
     parser.add_argument("--no-phone-weight-preload", action="store_true",
@@ -749,7 +767,29 @@ def get_args(argv=None):
     if args.auto_plan and any(v is not None for v in
                               (args.layout, args.chunk, args.xc, args.xg, args.xp)):
         parser.error("--auto-plan cannot be combined with --layout, --chunk, --xc, "
-                     "--xg or --xp. Use fixed mode for manual allocation.")
+                     "--xg or --xp. Use --force-plan-layout for HTP-only forcing.")
+    any_force_plan = any(v is not None for v in (
+        args.force_plan_layout, args.force_plan_xc,
+        args.force_plan_xg, args.force_plan_xp))
+    if any_force_plan:
+        if not (args.auto_plan and args.htp_only):
+            parser.error("--force-plan-* requires --auto-plan --htp-only")
+        if not args.force_plan_layout:
+            parser.error("--force-plan-layout is required to force Chunk widths")
+        try:
+            # "N" is an alias for the same Phone physical backend ("P").
+            args.force_plan_layout = normalize_layout(
+                args.force_plan_layout.upper().replace("N", "P"))
+        except ValueError as exc:
+            parser.error("--force-plan-layout: " + str(exc))
+        for key in ("force_plan_xc", "force_plan_xg", "force_plan_xp"):
+            if getattr(args, key) is None:
+                setattr(args, key, CHUNK_TOKENS)
+            width = getattr(args, key)
+            if width not in SUPPORTED_CHUNKS:
+                parser.error("--" + key.replace("_", "-") +
+                             f"={width} unsupported; supported widths: " +
+                             ", ".join(str(x) for x in SUPPORTED_CHUNKS))
     try:
         args.layout = normalize_layout(args.layout if args.layout is not None else FIXED_LAYOUT)
     except ValueError as exc:
@@ -987,7 +1027,15 @@ def main(argv=None):
                if args.profile_every else {}),
             **({"phone_execution": "CPU_TRANSPORT_HTP_ONLY_PLAN_CONTROLLED"}
                if args.htp_only else {}),
-            "planner_search": "NATIVE_APPLY_WIDE",
+            "planner_search": (
+                "NATIVE_APPLY_WIDE_FORCE_HTP"
+                if args.force_plan_layout else "NATIVE_APPLY_WIDE"),
+            **({"forced_htp_plan": {
+                "layout": args.force_plan_layout,
+                "xc": args.force_plan_xc,
+                "xg": args.force_plan_xg,
+                "xp": args.force_plan_xp,
+            }} if args.force_plan_layout else {}),
             "fixed_layout": None, "fixed_xc": None,
             "fixed_xg": None, "fixed_xp": None,
             "real_stage_profile_csv": (
@@ -1011,10 +1059,16 @@ def main(argv=None):
               "plan_per_prompt=1", flush=True)
     if args.auto_plan:
         print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
-              f"native_profile=INDEPENDENT_BACKEND_GRID fixed_layout=OFF "
+              f"native_profile=INDEPENDENT_BACKEND_GRID "
+              f"fixed_layout={args.force_plan_layout or 'OFF'} "
               f"baseline_chunk={CHUNK_TOKENS} "
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
+        if args.force_plan_layout:
+            print(f"[PLAN_FORCE] source=USER layout={args.force_plan_layout} "
+                  f"XC={args.force_plan_xc} XG={args.force_plan_xg} "
+                  f"XP={args.force_plan_xp} mode=HTP_ONLY_GUARDED "
+                  "profile=V0", flush=True)
     else:
         print(f"[FIXED_RING] layout={args.layout} base_chunk={args.chunk} "
               f"XC={args.xc} XG={args.xg} XP={args.xp} profile=SKIPPED "
