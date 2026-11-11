@@ -35,9 +35,15 @@ HTP-only mode has one RPC-visible backend and four *private* HTP sessions.
    `profile.json` contains device stages, preparation, upload, output
    readback, and PC↔Phone/CUDA transfer curves. Each CSV point says
    `device,layers,tokens,kv_tokens,setup_ms,upload_ms,prepare_ms,compute_ms,
-   terminal,samples`. HTP `compute_ms` is serial stage service,
-   including the Phone-host readback between chained NPU layers;
-   the JSON preserves the readback separately.
+   terminal,samples`. HTP `compute_ms` is **total serial Phone Stage
+   service**, including the Phone-host **device upload, HTP kernel compute
+   and output readback** between chained NPU layers. The JSON separately
+   reports `htp_kernel_ms`, `upload_ms`, `output_read_ms`,
+   `upload_mib_s`, `readback_mib_s`, `cold_weight_bytes`,
+   `cold_weight_load_ms`, and effective cold-load MiB/s.
+   Every PC↔Phone or GPU weight transfer curve also includes measured
+   `bytes`, `ms` and calculated `mib_per_s`. The cold HTP load rate
+   includes GGUF read/repack and must **not** be called raw DMA bandwidth.
 3. **Plan** once per Prompt, only *after* independent Profile succeeds:
    E pruning -> memory check -> Beam -> full DAG -> GPU-tail refinement.
    The original `APPLY_WIDE` implementation chooses the layer layout
