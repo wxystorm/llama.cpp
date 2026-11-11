@@ -10135,45 +10135,73 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
             const auto base_compute = model.compute_ms;
             const auto base_prepare = model.prepare_ms;
+            const bool htp_graphless_kv =
+                flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+            const auto measured_kv = [htp_graphless_kv](
+                    llama_region_ring_device d, int tokens, int kv) -> int {
+                return htp_graphless_kv &&
+                        d == llama_region_ring_device::PHONE ?
+                    llama_ring_planner::phone_graphless_profile_kv(
+                        tokens, kv) : kv;
+            };
+            if (htp_graphless_kv) {
+                LLAMA_LOG_INFO(
+                    "[REGION_RING_PROFILE_KV] source=PHONE_HTP_GRAPHLESS"
+                    " logical_kv=%d coarse_kv=%d padded_kv=%d"
+                    " stride=256 status=CALIBRATED_SHAPE\n",
+                    model.tokens, model.kv_start + model.tokens / 2,
+                    llama_ring_planner::phone_graphless_profile_kv(
+                        128, model.kv_start + model.tokens / 2));
+            }
             const auto cost_kind =
                 llama_ring_planner::real_stage_phase::COMPUTE;
             const auto prep_kind =
                 llama_ring_planner::real_stage_phase::PREPARE;
             const auto setup_kind =
                 llama_ring_planner::real_stage_phase::SETUP;
-            model.compute_ms = [measured, base_compute, cost_kind](
+            model.compute_ms = [measured, base_compute, cost_kind, measured_kv](
                     llama_region_ring_device d, int layers, int tokens,
                     int kv, double & ms) {
-                return measured->estimate(
-                        d, layers, tokens, kv, false, cost_kind, ms) ||
+                const int physical_kv = measured_kv(d, tokens, kv);
+                return (physical_kv > 0 &&
+                    measured->estimate(
+                        d, layers, tokens, physical_kv,
+                        false, cost_kind, ms)) ||
                     base_compute(d, layers, tokens, kv, ms);
             };
-            model.prepare_ms = [measured, base_prepare, prep_kind](
+            model.prepare_ms = [measured, base_prepare, prep_kind, measured_kv](
                     llama_region_ring_device d, int layers, int tokens,
                     int kv, double & ms) {
-                return measured->estimate(
-                        d, layers, tokens, kv, false, prep_kind, ms) ||
+                const int physical_kv = measured_kv(d, tokens, kv);
+                return (physical_kv > 0 &&
+                    measured->estimate(
+                        d, layers, tokens, physical_kv,
+                        false, prep_kind, ms)) ||
                     !base_prepare ||
                     base_prepare(d, layers, tokens, kv, ms);
             };
             model.compute_region_ms =
-                [measured, base_compute, cost_kind](
+                [measured, base_compute, cost_kind, measured_kv](
                     llama_region_ring_device d, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
-                    return measured->estimate(
-                            d, end - begin, tokens, kv,
+                    const int physical_kv = measured_kv(d, tokens, kv);
+                    return (physical_kv > 0 &&
+                        measured->estimate(
+                            d, end - begin, tokens, physical_kv,
                             d == llama_region_ring_device::PHONE && terminal,
-                            cost_kind, ms) ||
+                            cost_kind, ms)) ||
                         base_compute(d, end - begin, tokens, kv, ms);
                 };
             model.prepare_region_ms =
-                [measured, base_prepare, prep_kind](
+                [measured, base_prepare, prep_kind, measured_kv](
                     llama_region_ring_device d, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
-                    return measured->estimate(
-                            d, end - begin, tokens, kv,
+                    const int physical_kv = measured_kv(d, tokens, kv);
+                    return (physical_kv > 0 &&
+                        measured->estimate(
+                            d, end - begin, tokens, physical_kv,
                             d == llama_region_ring_device::PHONE && terminal,
-                            prep_kind, ms) ||
+                            prep_kind, ms)) ||
                         !base_prepare ||
                         base_prepare(d, end - begin, tokens, kv, ms);
                 };
@@ -10187,8 +10215,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     // Reuse the corresponding independently calibrated
                     // Graph setup; otherwise keep the nonzero cost prior.
                     const int padded_kv =
-                        std::max(256, ((tokens + 255) / 256) * 256);
-                    if (measured->estimate(
+                        llama_ring_planner::phone_graphless_profile_kv(
+                            tokens, tokens);
+                    if (padded_kv > 0 && measured->estimate(
                             llama_region_ring_device::PHONE, layers,
                             tokens, padded_kv, terminal, setup_kind, ms)) {
                         return true;
