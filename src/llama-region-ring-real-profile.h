@@ -265,7 +265,7 @@ private:
                     // does not prove smaller chunks scale linearly. Charge
                     // at least half of the observed service to avoid
                     // selecting arbitrarily tiny unmeasured shapes for free.
-                    m *= std::max(0.5, (double) tokens / left);
+                    v *= std::max(0.5, (double) tokens / left);
                 } else if ((long long) tokens * 4 < 3LL * left ||
                            (long long) tokens * 4 > 5LL * left) {
                     return false;
