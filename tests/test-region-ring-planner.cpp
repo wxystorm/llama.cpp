@@ -97,10 +97,18 @@ int main() {
             device::CPU, 3, 24, 48, false,
             real_stage_phase::COMPUTE, ms));
         REQUIRE(std::fabs(ms - 8.25) < 1e-6);
+        // A small independent CPU block does NOT calibrate 2K KV.
+        REQUIRE(!measurements.estimate(
+            device::CPU, 2, 16, 2048, false,
+            real_stage_phase::COMPUTE, ms));
         REQUIRE(measurements.estimate(
             device::PHONE, 1, 64, 96, true,
             real_stage_phase::COMPUTE, ms));
         REQUIRE(std::fabs(ms - 44.5) < 1e-6);
+        // NPU long-context extrapolation must be bounded too.
+        REQUIRE(!measurements.estimate(
+            device::PHONE, 1, 64, 4096, true,
+            real_stage_phase::COMPUTE, ms));
         REQUIRE(measurements.estimate(
             device::PHONE, 1, 64, 64, true,
             real_stage_phase::PREPARE, ms));
