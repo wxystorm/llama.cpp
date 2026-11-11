@@ -1101,6 +1101,11 @@ class llama_region_ring_ready {
 public:
     using task_event_observer = std::function<void(
         llama_region_ring_task_event, const llama_region_ring_task &)>;
+    // Optional worker-local eligibility check (e.g. resident GPU Bank or
+    // already staged Phone activation). Evaluated under the READY mutex.
+    // It must not re-enter this scheduler, block, or perform RPC.
+    using resource_ready_predicate =
+        std::function<bool(const llama_region_ring_task &)>;
 
     llama_region_ring_ready(
             const std::vector<llama_region_ring_region> & regions,
@@ -1332,17 +1337,30 @@ public:
     std::optional<llama_region_ring_task> wait_take(
             llama_region_ring_device device,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
-            int preferred_tokens = -1) {
+            int preferred_tokens = -1,
+            const resource_ready_predicate & resource_ready = {}) {
         const size_t dev = device_index(device);
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [&] {
             return failed_ || all_done_locked() ||
-                   has_claimable_locked(dev);
+                   has_claimable_locked(dev, resource_ready);
         });
         if (failed_ || all_done_locked()) {
             return std::nullopt;
         }
-        return take_device_locked(dev, preferred_region, preferred_tokens);
+        return take_device_locked(
+            dev, preferred_region, preferred_tokens, resource_ready);
+    }
+
+    // An external Bank refill or Phone input PUSH became available. Acquire
+    // READY mutex before notifying so that a state change cannot fall between
+    // wait_take()'s predicate check and its atomic unlock-and-sleep. Call
+    // after releasing the Bank/PUSH mutex to avoid inverted lock ordering.
+    void notify_external_ready() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+        }
+        cv_.notify_all();
     }
 
     // PC push is allowed as soon as ALL upstream token intervals are
@@ -1695,12 +1713,21 @@ private:
         return true;
     }
 
-    bool has_claimable_locked(size_t dev) const {
+    bool resource_claimable_locked(
+            const llama_region_ring_task & task,
+            const resource_ready_predicate & resource_ready) const {
+        return claimable_locked(task) &&
+               (!resource_ready || resource_ready(task));
+    }
+
+    bool has_claimable_locked(
+            size_t dev,
+            const resource_ready_predicate & resource_ready = {}) const {
         const auto & queue = queues_[dev];
         return std::any_of(
             queue.begin(), queue.end(),
-            [this](const auto & task) {
-                return claimable_locked(task);
+            [this, &resource_ready](const auto & task) {
+                return resource_claimable_locked(task, resource_ready);
             });
     }
 
@@ -1708,23 +1735,25 @@ private:
     take_device_locked(
             size_t dev,
             size_t preferred_region = std::numeric_limits<size_t>::max(),
-            int preferred_tokens = -1) {
+            int preferred_tokens = -1,
+            const resource_ready_predicate & resource_ready = {}) {
         auto & queue = queues_[dev];
         auto it = queue.end();
         if (preferred_region < regions_.size() && preferred_tokens > 0) {
             it = std::find_if(
                 queue.begin(), queue.end(),
-                [this, preferred_region, preferred_tokens](const auto & task) {
+                [this, preferred_region, preferred_tokens,
+                 &resource_ready](const auto & task) {
                     return task.region == preferred_region &&
                            task.n_tokens == preferred_tokens &&
-                           claimable_locked(task);
+                           resource_claimable_locked(task, resource_ready);
                 });
         }
         if (it == queue.end()) {
             it = std::find_if(
                 queue.begin(), queue.end(),
-                [this](const auto & task) {
-                    return claimable_locked(task);
+                [this, &resource_ready](const auto & task) {
+                    return resource_claimable_locked(task, resource_ready);
                 });
         }
         if (it == queue.end()) {
