@@ -59,6 +59,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
     "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
     "LLAMA_REGION_RING_PHONE_HTP_ONLY",
+    "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -505,10 +506,13 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     if args.force_small_batch_mover:
         env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
     if args.phone_weight_preload:
-        # llama-model.cpp starts region-stripe RPC preload concurrently with
-        # PC tensor loading, joins before Prefill and reuses Phone HTP cache.
+        # Keep the verified CPU-transport Phone model-owned preload path.
         env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
         env["LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC"] = args.rpc
+        if args.auto_plan and args.htp_only:
+            # Strictly reject an unconfigured Phone Region instead of
+            # accidentally executing a CPU RPC graph after a failed preload.
+            env["LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED"] = "1"
     if args.boost_bank_mover:
         # Existing Windows C++ thread-local hook requests ABOVE_NORMAL.
         # Only the CPU Bank Mover thread is affected, not process priority.
@@ -601,6 +605,9 @@ def get_args(argv=None):
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
     parser.add_argument("--auto-plan", action="store_true",
                         help="native hardware Profile plus APPLY_WIDE planning per process")
+    parser.add_argument("--htp-only", action="store_true",
+                        help="with --auto-plan use CPU RPC transport and 4 private HTP sessions; "
+                             "Phone must set GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1")
     parser.add_argument("--force-small-batch-mover", action="store_true",
                         help="opt-in: enable GPU Bank Mover on short prefill, without changing decode")
     parser.add_argument("--no-phone-weight-preload", action="store_true",
@@ -650,6 +657,12 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
+    if args.htp_only and not args.auto_plan:
+        parser.error("--htp-only in this runner requires --auto-plan")
+    if args.htp_only and args.n_predict != 1:
+        parser.error("HTP-only autonomous prefill currently requires --n-predict 1")
+    if args.htp_only and args.no_phone_weight_preload:
+        parser.error("--htp-only auto-plan requires early Phone Region configuration")
     if args.auto_plan and args.warmup_prompt is not None:
         parser.error("--warmup-prompt requires fixed mode")
     if args.skip_warmup and args.warmup_prompt is not None:
@@ -665,7 +678,8 @@ def get_args(argv=None):
     except ValueError as exc:
         parser.error(str(exc))
     has_phone = any(part.startswith("P") for part in args.layout.split(","))
-    args.phone_weight_preload = (not args.auto_plan and has_phone and
+    args.phone_weight_preload = (has_phone and
+                                 (not args.auto_plan or args.htp_only) and
                                  not args.no_phone_weight_preload)
     args.warmup = not args.auto_plan and not args.skip_warmup
     if args.phone_weight_preload and ("," in args.rpc or ":" not in args.rpc):
@@ -767,6 +781,8 @@ def main(argv=None):
         # Automatic Profile + Plan has a separate output and signature.
         config.update({
             "version": 3, "planning_mode": "native-auto",
+            **({"phone_execution": "CPU_TRANSPORT_HTP_ONLY_PLAN_CONTROLLED"}
+               if args.htp_only else {}),
             "planner_search": "NATIVE_APPLY_WIDE",
             "fixed_layout": None, "fixed_xc": None,
             "fixed_xg": None, "fixed_xp": None,
@@ -911,7 +927,10 @@ def main(argv=None):
                           f"mover_ms={row.get('bank_mover_wall_ms')} "
                           f"gpu_wait_ms={row.get('bank_gpu_wait_ms')}", flush=True)
                 if args.auto_plan:
-                    print(f"  [PLAN] applied={row.get('plan_applied')} "
+                    physical = str(row.get("plan_layout") or "").replace("P", "N") \
+                        if args.htp_only else row.get("plan_layout")
+                    print(f"  [PLAN] prompt={prompt.name} applied={row.get('plan_applied')} "
+                          f"physical={physical} transport={'CPU' if args.htp_only else 'RPC'} "
                           f"source={row.get('plan_source')} "
                           f"chosen={row.get('plan_layout')} "
                           f"runtime={row.get('layout')} "
