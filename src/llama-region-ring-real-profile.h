@@ -235,6 +235,27 @@ private:
                 if (lo == nullptr) { lo = hi; }
                 if (hi == nullptr) { hi = lo; }
                 if (lo == nullptr) { return false; }
+                // Independent CPU/CUDA layer-block probes execute with
+                // KV=Chunk. A distant KV is NOT a measured full layer.
+                // Fall back to the independent attention-aware cost model
+                // rather than claiming that a short KV was a 2K KV probe.
+                if (d != device::PHONE &&
+                        ((long long) kv_tokens >
+                            2LL * std::max(lo->kv_tokens, hi->kv_tokens) ||
+                         2LL * kv_tokens <
+                            std::min(lo->kv_tokens, hi->kv_tokens))) {
+                    return false;
+                }
+                // HTP probes explicitly measure 256/512/1024 padded KV.
+                // Extrapolation beyond two anchor widths is unsupported;
+                // the Planner must reject those unsupported shapes.
+                if (d == device::PHONE &&
+                        ((long long) kv_tokens >
+                            2LL * std::max(lo->kv_tokens, hi->kv_tokens) ||
+                         2LL * kv_tokens <
+                            std::min(lo->kv_tokens, hi->kv_tokens))) {
+                    return false;
+                }
                 m = lerp((double) kv_tokens,
                          (double) lo->kv_tokens, metric(*lo, phase),
                          (double) hi->kv_tokens, metric(*hi, phase));
