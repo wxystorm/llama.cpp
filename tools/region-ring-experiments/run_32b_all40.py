@@ -216,7 +216,7 @@ def prompts_in(folder: Path):
 def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
                   fixed_layout=FIXED_LAYOUT, xc=CHUNK_TOKENS,
                   xg=CHUNK_TOKENS, xp=CHUNK_TOKENS,
-                  force_small_batch_mover=False):
+                  force_small_batch_mover=False, phone_weight_preload=False):
     perf = {}
     ring = []
     planner = {}
@@ -251,6 +251,42 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
 
     logs = "\n".join(tail_text(folder / name)
                      for name in ("engine.stderr.log", "output.stdout.txt"))
+
+    # Early HTP weights load happens in the PC model loader, before Prefill.
+    # Read its events from the *full* stderr, not the final 4 MiB log tail:
+    # verbose chunk timelines may be larger and hide model-load messages.
+    early_started = early_done = early_joined = False
+    early_failed = False
+    early_regions = set()
+    early_wall_ms = None
+    expected_phone_regions = sum(
+        stage.startswith("P") for stage in fixed_layout.split(","))
+    early_log = folder / "engine.stderr.log"
+    if phone_weight_preload and early_log.is_file():
+        with early_log.open("r", encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if "[REGION_RING_PHONE_EARLY_WEIGHTS]" not in line:
+                    continue
+                if "event=START" in line:
+                    early_started = True
+                if "event=FAIL" in line or ("event=JOIN" in line and "status=FAIL" in line):
+                    early_failed = True
+                if "event=REGION" in line and "status=PASS" in line:
+                    match = re.search(r"\\bregion=(\\d+)", line)
+                    if match:
+                        early_regions.add(int(match.group(1)))
+                if "event=DONE" in line and "status=PASS" in line:
+                    early_done = True
+                    match = re.search(r"\\bwall_ms=([\\d.]+)", line)
+                    if match:
+                        early_wall_ms = float(match.group(1))
+                if "event=JOIN" in line and "status=PASS" in line:
+                    early_joined = True
+    early_valid = (early_started and early_done and early_joined and
+                   len(early_regions) == expected_phone_regions and
+                   not early_failed)
+    early_status = ("PASS" if early_valid else
+                    "FAIL" if early_failed else "UNVERIFIED") if phone_weight_preload else "OFF"
 
     def last(pattern):
         found = re.findall(pattern, logs, re.IGNORECASE)
@@ -301,6 +337,8 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         status = "NO_PREFILL"
     elif not ring_complete:
         status = "INCOMPLETE_RING"
+    elif phone_weight_preload and not early_valid:
+        status = "PRELOAD_FAILED" if early_failed else "PRELOAD_UNVERIFIED"
     elif mover_unverified:
         status = "MOVER_UNVERIFIED"
     elif mover_inactive:
@@ -353,6 +391,9 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         "plan_predicted_ms": planner.get("predicted_ms") if auto_plan else None,
         "plan_baseline_predicted_ms": planner.get("baseline_predicted_ms") if auto_plan else None,
         "phone_native_profile_points": phone_native_points,
+        "early_weights_status": early_status,
+        "early_weights_regions": len(early_regions),
+        "early_weights_wall_ms": early_wall_ms,
     }
 
 
@@ -395,7 +436,8 @@ def write_summary(out: Path, prompts):
               for name in ("PASS", "PENDING", "FAIL", "NO_METRICS", "NO_PERF",
                            "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT",
                            "NO_PLAN", "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED",
-                           "MOVER_UNVERIFIED", "MOVER_INACTIVE")}
+                           "MOVER_UNVERIFIED", "MOVER_INACTIVE",
+                           "PRELOAD_FAILED", "PRELOAD_UNVERIFIED")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
                                       "counts": counts, "summary_csv": str(path)})
     return counts
@@ -485,8 +527,8 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     return command, env
 
 
-def execute(args, prompt, group, context, estimate, out: Path):
-    folder = out / "runs" / prompt.stem
+def execute(args, prompt, group, context, estimate, out: Path, warmup=False):
+    folder = out / "warmup" if warmup else out / "runs" / prompt.stem
     folder.mkdir(parents=True, exist_ok=True)
     attempt = max((int(p.name.split("-")[-1]) for p in folder.glob("attempt-[0-9]*")
                    if p.is_dir() and p.name.split("-")[-1].isdigit()), default=0) + 1
@@ -496,7 +538,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
     row = {"prompt": prompt.name, "group": group, "attempt": attempt,
            "context": context, "prompt_tokens_hint": estimate,
            "plan_mode": "native-auto" if args.auto_plan else "fixed",
-           "status": "RUNNING", "start_time": utc_now(), "command": command,
+           "status": "RUNNING", "warmup": bool(warmup),
+           "start_time": utc_now(), "command": command,
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
                              or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL",
@@ -538,7 +581,8 @@ def execute(args, prompt, group, context, estimate, out: Path):
         row.update(parse_metrics(trial, code, elapsed, auto_plan=args.auto_plan,
                                  fixed_layout=args.layout, xc=args.xc,
                                  xg=args.xg, xp=args.xp,
-                                 force_small_batch_mover=args.force_small_batch_mover))
+                                 force_small_batch_mover=args.force_small_batch_mover,
+                                 phone_weight_preload=args.phone_weight_preload))
         row["end_time"] = utc_now()
         row["result_file"] = str(result_file)
         save_json(result_file, row)
