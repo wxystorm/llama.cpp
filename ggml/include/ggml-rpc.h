@@ -8,7 +8,7 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    4
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    31
+#define RPC_PROTO_PATCH_VERSION    32
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -256,6 +256,29 @@ using ggml_backend_rpc_phone_owned_plan_register_t = bool (*)(
 // KV, activation or Chunk Graph is allocated by this operation.
 // Patch 31: retrieve HTP Stage service samples after the Phone RUN drains.
 // The user-visible log and rolling Planner consume these, not RPC wall time.
+// Patch 32: standalone HTP backend calibration. The request carries a
+// Qwen3 plan shape, but the Phone creates private synthetic activations,
+// weights, KV and fixed graphs. No Ring, PC KV or Prompt is executed.
+struct ggml_rpc_phone_independent_result {
+    double setup_ms;
+    double upload_ms;
+    double prepare_ms;
+    double compute_ms;
+    double output_read_ms;
+    double weight_load_ms;
+    uint32_t repeats;
+    uint32_t layers;
+    uint32_t session;
+    uint32_t reserved;
+};
+#define GGML_BACKEND_RPC_PHONE_INDEPENDENT_PROBE_PROC \
+    "ggml_backend_rpc_phone_independent_probe"
+using ggml_backend_rpc_phone_independent_probe_t = bool (*)(
+    ggml_backend_t backend,
+    const ggml_backend_rpc_phone_owned_plan * plan,
+    uint32_t repeats, uint32_t session,
+    ggml_rpc_phone_independent_result * result);
+
 #define GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_GET_PROC \
     "ggml_backend_rpc_phone_stage_profile_get"
 struct ggml_rpc_phone_stage_sample {
