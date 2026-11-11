@@ -218,7 +218,8 @@ def prompts_in(folder: Path):
 def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
                   fixed_layout=FIXED_LAYOUT, xc=CHUNK_TOKENS,
                   xg=CHUNK_TOKENS, xp=CHUNK_TOKENS,
-                  force_small_batch_mover=False, phone_weight_preload=False):
+                  force_small_batch_mover=False, phone_weight_preload=False,
+                  htp_only=False):
     perf = {}
     ring = []
     planner = {}
@@ -261,8 +262,15 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
     early_failed = False
     early_regions = set()
     early_wall_ms = None
+    # Auto Plan may choose a different number of NPU Regions every Prompt.
+    # Compare preload acknowledgements with the actual selected layout,
+    # never the forced 32B control layout used in fixed-mode experiments.
+    preload_layout = (
+        planner.get("selected_layout") or
+        (ring[0].get("layout", "") if ring else "")
+        if auto_plan else fixed_layout)
     expected_phone_regions = sum(
-        stage.startswith("P") for stage in fixed_layout.split(","))
+        stage.startswith("P") for stage in preload_layout.split(","))
     early_log = folder / "engine.stderr.log"
     if phone_weight_preload and early_log.is_file():
         with early_log.open("r", encoding="utf-8", errors="replace") as stream:
@@ -347,6 +355,8 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         status = "MOVER_INACTIVE"
     elif auto_plan and (not planner or not isinstance(planner.get("applied"), bool)):
         status = "NO_PLAN"
+    elif auto_plan and htp_only and planner.get("applied") is not True:
+        status = "NO_EXECUTABLE_PLAN"
     elif auto_plan and planner.get("applied") and (
             not planner.get("selected_layout") or
             any(item.get("layout") != planner["selected_layout"] for item in ring)):
@@ -437,7 +447,8 @@ def write_summary(out: Path, prompts):
     counts = {name: sum(v["status"] == name for v in latest.values())
               for name in ("PASS", "PENDING", "FAIL", "NO_METRICS", "NO_PERF",
                            "NO_RING", "NO_PREFILL", "INCOMPLETE_RING", "WRONG_LAYOUT",
-                           "NO_PLAN", "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED",
+                           "NO_PLAN", "NO_EXECUTABLE_PLAN",
+                           "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED",
                            "MOVER_UNVERIFIED", "MOVER_INACTIVE",
                            "PRELOAD_FAILED", "PRELOAD_UNVERIFIED")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
@@ -617,7 +628,8 @@ def execute(args, prompt, group, context, estimate, out: Path, warmup=False):
                                  fixed_layout=args.layout, xc=args.xc,
                                  xg=args.xg, xp=args.xp,
                                  force_small_batch_mover=args.force_small_batch_mover,
-                                 phone_weight_preload=args.phone_weight_preload))
+                                 phone_weight_preload=args.phone_weight_preload,
+                                 htp_only=args.htp_only))
         row["end_time"] = utc_now()
         row["result_file"] = str(result_file)
         save_json(result_file, row)
