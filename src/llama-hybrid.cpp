@@ -8951,6 +8951,8 @@ static bool llama_hybrid_calibrate_independent_ring(
         int layers, tokens, kv_tokens;
         double setup_ms, upload_ms, prepare_ms, compute_ms, output_read_ms;
         int repeats;
+        uint64_t htp_weight_bytes = 0;
+        double htp_weight_load_ms = 0.0;
     };
     std::vector<point> details;
     const auto record = [&](const char * dev, int layers, int tokens,
@@ -9068,6 +9070,8 @@ static bool llama_hybrid_calibrate_independent_ring(
                        measured.setup_ms, measured.upload_ms,
                        measured.prepare_ms, service_ms,
                        measured.output_read_ms, (int) measured.repeats);
+                details.back().htp_weight_bytes = measured.weight_bytes;
+                details.back().htp_weight_load_ms = measured.weight_load_ms;
                 LLAMA_LOG_INFO(
                     "[INDEPENDENT_PROFILE] status=PASS device=HTP"
                     " layers=%d chunk=%d kv=%d"
@@ -9157,7 +9161,30 @@ static bool llama_hybrid_calibrate_independent_ring(
                  << ",\"prepare_ms\":" << p.prepare_ms
                  << ",\"service_ms\":" << p.compute_ms
                  << ",\"output_read_ms\":" << p.output_read_ms
-                 << ",\"samples\":" << p.repeats << '}';
+                 << ",\"samples\":" << p.repeats;
+            if (p.dev == "PHONE") {
+                const double htp_kernel_ms = p.compute_ms -
+                    p.upload_ms - p.output_read_ms;
+                const double activation_mib =
+                    (double) p.layers * p.tokens *
+                    profile.n_embd * sizeof(float) / 1048576.0;
+                const double upload_mib_s = p.upload_ms > 0 ?
+                    activation_mib * 1000.0 / p.upload_ms : 0.0;
+                const double read_mib_s = p.output_read_ms > 0 ?
+                    activation_mib * 1000.0 / p.output_read_ms : 0.0;
+                const double weights_mib = p.htp_weight_bytes / 1048576.0;
+                const double weight_load_mib_s =
+                    p.htp_weight_load_ms > 0 ?
+                        weights_mib * 1000.0 / p.htp_weight_load_ms : 0.0;
+                json << ",\"htp_kernel_ms\":" << htp_kernel_ms
+                     << ",\"input_activation_mib\":" << activation_mib
+                     << ",\"upload_mib_s\":" << upload_mib_s
+                     << ",\"readback_mib_s\":" << read_mib_s
+                     << ",\"cold_weight_bytes\":" << p.htp_weight_bytes
+                     << ",\"cold_weight_load_ms\":" << p.htp_weight_load_ms
+                     << ",\"cold_weight_load_mib_s\":" << weight_load_mib_s;
+            }
+            json << '}';
         }
         json << "],\"transfers\":{";
         const auto write_transfer = [&](const char * name,
@@ -9166,8 +9193,12 @@ static bool llama_hybrid_calibrate_independent_ring(
             json << '\"' << name << "\":[";
             for (size_t i = 0; i < points.size(); ++i) {
                 if (i) { json << ','; }
+                const double mib = points[i].bytes / 1048576.0;
+                const double mib_s = points[i].ms > 0.0 ?
+                    mib * 1000.0 / points[i].ms : 0.0;
                 json << "{\"bytes\":" << points[i].bytes
-                     << ",\"ms\":" << points[i].ms << '}';
+                     << ",\"ms\":" << points[i].ms
+                     << ",\"mib_per_s\":" << mib_s << '}';
             }
             json << ']' << (last ? "" : ",");
         };
