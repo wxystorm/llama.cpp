@@ -99,6 +99,80 @@ did not activate.
 
 **Tiny tail:** `LLAMA_REGION_RING_COALESCE_TINY_TAIL=1` invokes the native width adjustment on the actual UBatch token count, separately for each requested stage width. With X=128 a remainder of 1..32 may be coalesced by widening the uniform width slightly (at most 160). For example 513 tokens become `[129,129,129,126]` rather than `[128,128,128,128,1]`. The layout does not change. Check `[REGION_RING_TAIL_COALESCE]` in engine logs for the actual width. `summary.csv` records both the selected/forced `plan_xc/xg/xp` and `runtime_xc/xg/xp` reported by the engine (when available).
 
+## Preload all Phone HTP weights at model-load time, then warm up
+
+**Fixed Phone Region layouts now default to two separate stages, before
+any measured ShareGPT prompt:**
+
+1. During **PC model loading**, `LLAMA_REGION_RING_PHONE_HTP_ONLY=1`
+   and `LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC=<RPC>` enable the
+   existing prefill-independent RPC command `PHONE_NPU_WEIGHT_PRELOAD`.
+   The finalized `-Layout` determines every Phone Region, the exact
+   Transformer layer IDs and its correct HTP0-3 session assignment.
+   Phone loads/repackages these weights from its **local GGUF** and
+   retains them in its HTP cache. The PC waits for all Region ACKs
+   before Prefill; it fails the benchmark if the complete
+   `START -> REGION* -> DONE -> JOIN` sequence cannot be verified.
+   No manual `GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS` list is needed.
+2. Execute a **warm-up Prefill**, using the first Prompt that would
+   actually be measured (or the `-WarmupPrompt` override), with the
+   same layout and runtime options. It lives under
+   `<Out>\\warmup\\attempt-0001\\`, with its own stdout, stderr,
+   `metrics.jsonl`, `result.json`. It does not enter the 40-Prompt
+   `summary.csv` or PASS counts. A warm-up failure aborts measured
+   runs. The existing between-Prompt pause also applies once after
+   warm-up.
+3. Run measured Prompts. Model-load preload is checked in **every PC
+   process**, but following runs should see resident Phone weights and
+   can reuse them while the Phone RPC Server stays alive. On script
+   resume, warm-up runs again *if* any new measured work remains, since
+   the Phone RPC Server may have restarted between invocations.
+
+For the current Qwen3-32B `G9,P5,G9,P5,G9,P5,G9,P5,G8` layout,
+this means preloading **all 20 assigned Phone HTP Transformer layers**,
+not just the first Region. This does *not* attempt to fit all
+PC CUDA Region weights in 6 GiB VRAM: GPU Bank streaming remains.
+
+```powershell
+git pull --ff-only
+
+.\\tools\\region-ring-experiments\\run_32b_all40.ps1 `
+  -Model "E:\\llama\\models\\Qwen3-32B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\\llama\\datasets\\sharegpt\\sharegpt40" `
+  -Layout "G9,P5,G9,P5,G9,P5,G9,P5,G8" `
+  -Chunk 128 -XG 96 `
+  -ForceSmallBatchMover -BoostBankMover -NoMmap `
+  -InterPromptDelaySeconds 5 -NPredict 1 `
+  -OnlyGroup 1024 `
+  -Out ".\\32b-xg96-early-weights-warmup-1024"
+```
+
+Expected **PC** log in the warm-up:
+`[REGION_RING_PHONE_EARLY_WEIGHTS] event=DONE regions=4 ... status=PASS`
+followed by `event=JOIN ... status=PASS`, and then
+`[WARMUP] event=DONE status=PASS preload_status=PASS preload_regions=4 counted=0`.
+The **Phone** server logs
+`[PHONE_NPU_EARLY_WEIGHTS] event=LAYER ... cache=MISS`
+on its first preload, and subsequent preloads should mostly report
+`cache=HIT`. A `JOIN status=FAIL`, missing ACK, or unsupported
+server must not silently turn a cold first Prompt into a PASS.
+This requires the existing **patch-30-or-newer Phone RPC server and a
+matching PC binary** with the Phone HTP preload function. No new RPC
+wire command was introduced.
+
+The warm-up still exercises per-RUN Graph/KV setup; it does not assume
+those resources can be reused across different PC processes.
+
+To disable stages separately (e.g., for an old baseline):
+`-NoPhoneWeightPreload`, `-SkipWarmup`; optionally select a shorter
+`-WarmupPrompt "prompt_128_01.txt"`. Both stages are disabled in
+`-AutoPlan` mode, where the model-load-time Phone allocation is not
+finalized. These choices are in the run-config signature. **Use a new
+`-Out` directory** instead of mixing with the older first-Prompt-cold
+results. Existing baseline can still resume with both new stages
+disabled and otherwise-identical parameters.
+
 ## Cooldown, raised transfer priority, and no-mmap A/B
 
 The runner now **defaults to a 5-second pause between completed Prompt
