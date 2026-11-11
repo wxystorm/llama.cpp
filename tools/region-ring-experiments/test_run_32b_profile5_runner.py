@@ -10,12 +10,48 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_32b_all40 import (
-    build_process, parse_metrics, verify_independent_profile,
+    build_process, get_args, parse_metrics, verify_independent_profile,
     htp_epoch_has_runtime_samples, profile_once_resume_compatible,
 )
 
 
 class HtpOnlyAutoPlanTests(unittest.TestCase):
+    def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
+        """Regression: the PowerShell entry point pins --profile-every 0.
+
+        A fresh --out directory must pass CLI validation and use only the
+        standalone independent Profile, without a second rolling profile.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            out = root / "new-32b-results"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            args = get_args([
+                "--exe", str(exe),
+                "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompts),
+                "--repo-root", str(root),
+                "--out", str(out),
+                "--auto-plan", "--htp-only",
+                "--profile-grid", "quick",
+                "--profile-every", "0",
+                "--batch", "2048", "--ubatch", "2048",
+                "--n-predict", "1", "--threads", "8",
+                "--stop-on-fail",
+            ])
+            self.assertTrue(args.htp_only)
+            self.assertTrue(args.auto_plan)
+            self.assertEqual(args.profile_every, 0)
+            self.assertTrue(args.phone_weight_preload)
+            self.assertFalse(args.warmup)
+            self.assertEqual(args.out, out)
+
     def test_cpu_transport_graphless_plan_environment(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

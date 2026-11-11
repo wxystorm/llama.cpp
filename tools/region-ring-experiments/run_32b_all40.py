@@ -687,7 +687,8 @@ def get_args(argv=None):
     parser.add_argument("--real-stage-profile-csv", type=Path, default=None,
                         help="optional measured Stage CSV for native Planner (needs --auto-plan)")
     parser.add_argument("--profile-every", type=int, default=0,
-                        help="with --auto-plan --htp-only, refresh real Stage CSV after every N PASS prompts")
+                        help="0 (default): calibrate independent G/C/N baseline once and reuse V0; "
+                             "N>0: legacy rolling real Stage CSV refresh after every N PASS prompts")
     parser.add_argument("--profile-grid", choices=("quick", "full"),
                         default="quick", help="standalone G/C/N depth and Chunk grid")
     parser.add_argument("--update-profile", action="store_true",
@@ -727,8 +728,10 @@ def get_args(argv=None):
         parser.error("--htp-only in this runner requires --auto-plan")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
-    if args.htp_only and args.profile_every == 0:
-        parser.error("--htp-only auto-plan requires --profile-every >= 1")
+    # An independent C/G/N calibration is generated at first model startup
+    # and reused from --out/independent-profile on subsequent prompts.
+    # Rolling runtime-Stage profiling is optional, never a prerequisite
+    # for HTP-only auto-plan. In the one-shot experiment it MUST stay 0.
     if args.profile_every and not (args.auto_plan and args.htp_only):
         parser.error("--profile-every requires --auto-plan --htp-only")
     if args.phone_profile_log is not None and not args.profile_every:
