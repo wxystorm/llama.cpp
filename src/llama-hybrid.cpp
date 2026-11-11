@@ -9204,6 +9204,8 @@ static bool llama_hybrid_calibrate_independent_ring(
         };
         write_transfer("pc_to_phone", profile.pc_to_phone, false);
         write_transfer("phone_to_pc", profile.phone_to_pc, false);
+        write_transfer("snapshot_phone_to_pc",
+                       profile.snapshot_phone_to_pc, false);
         write_transfer("gpu_weight_h2d", profile.gpu_weight_h2d, false);
         write_transfer("gpu_to_pc", profile.gpu_to_pc, true);
         json << "}}\n";
