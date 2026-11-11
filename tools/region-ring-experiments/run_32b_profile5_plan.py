@@ -157,8 +157,17 @@ def ensure_profile(args: argparse.Namespace, root: Path,
             profiler_exe=args.native_profile_exe,
             required_kvs=(512, 1024, 2048, 4096),
             refresh_chunks=tuple(int(v) for v in args.refresh_chunks.split(",")) if refresh else ())
+        # Archive the exact Profile bytes that this epoch's Plans use.
+        # The native cache is refreshed in place; snapshots are immutable.
+        epoch = out / "profile-epochs" / f"v{version:02d}"
+        epoch.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(csv_file, epoch / "stage-profile-v2.csv")
+        manifest_file = csv_file.parent / "profile.json"
+        if manifest_file.is_file():
+            shutil.copy2(manifest_file, epoch / "profile.json")
         state = {"version": version, "refreshed_at": completed,
                  "profile_csv": str(csv_file),
+                 "snapshot_csv": str(epoch / "stage-profile-v2.csv"),
                  "updated_at": datetime.now(timezone.utc).isoformat()}
         atomic_json(state_path, state)
         print(f"[PROFILE] status=PASS version={version} csv={csv_file}", flush=True)
@@ -299,6 +308,7 @@ def main() -> int:
                                   for _, p in items},
                 "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
                 "profile_every": args.profile_every,
+                "profile_dir": str(args.profile_dir),
                 "refresh_chunks": list(refresh),
                 "chunks": list(CHUNKS),
                 "batch": args.batch, "ubatch": args.ubatch,
