@@ -11469,7 +11469,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        if (!forced_ab &&
+        if (!forced_ab && !htp_only_tail_selected &&
                 (identical || improvement_pct < min_gain_pct)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
