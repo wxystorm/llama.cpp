@@ -19,6 +19,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -8911,7 +8912,7 @@ static bool llama_hybrid_calibrate_independent_ring(
     const std::vector<int> depths = full_grid ?
         std::vector<int>{1, 2, 4, 6} : std::vector<int>{2, 4, 6};
     const std::array<int, 4> widths = {32, 64, 96, 128};
-    const std::array<int, 2> kv_spans = {512, 1024};
+    const std::array<int, 3> kv_spans = {256, 512, 1024};
     const int first_layer = std::max(0, profile.n_layer / 2 - 3);
     // First write to a temporary file so a failed HTP point never publishes
     // a partial CSV which a later Prompt may mistakenly trust.
@@ -8949,8 +8950,8 @@ static bool llama_hybrid_calibrate_independent_ring(
     // attention profile handles larger KV anchors, so do not fabricate
     // measurements at KV=512/1024 for these synthetic block graphs.
     for (const auto & backend : std::array<
-             std::pair<ggml_backend_t, const char *>, 2> {{
-                {cpu, "CPU"}, {gpu, "GPU"}}) {
+             std::pair<ggml_backend_t, const char *>, 2>{{
+                {cpu, "CPU"}, {gpu, "GPU"}}}) {
         if (!backend.first) { continue; } // A backend may own zero layers.
         for (int layers : depths) {
             if (layers > profile.n_layer) { continue; }
@@ -9066,7 +9067,14 @@ static bool llama_hybrid_calibrate_independent_ring(
     // Persist machine-readable independent service points, transfer curves,
     // and the actual capabilities. The CSV is directly consumed by the
     // existing C++ Planner; this JSON is the portable Profile artifact.
-    const std::string json_path = std::string(path) + ".json";
+    std::string json_path(path);
+    const size_t csv_suffix = json_path.rfind(".csv");
+    if (csv_suffix != std::string::npos &&
+            csv_suffix + 4 == json_path.size()) {
+        json_path.replace(csv_suffix, 4, ".json");
+    } else {
+        json_path += ".json";
+    }
     std::ofstream json(json_path, std::ios::trunc);
     if (json) {
         json << std::fixed << std::setprecision(6);
