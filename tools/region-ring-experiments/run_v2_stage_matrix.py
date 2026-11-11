@@ -297,6 +297,9 @@ def run_matrix(args: argparse.Namespace) -> int:
     layers = csv_positive(args.layers, "LAYERS")
     chunks = csv_positive(args.chunks, "CHUNKS")
     kvs = csv_positive(args.kvs, "KVS")
+    refresh_chunks = set(csv_positive(args.refresh_chunks, "REFRESH_CHUNKS")) if args.refresh_chunks else set()
+    if refresh_chunks and not args.update:
+        raise ValueError("REFRESH_CHUNKS_REQUIRES_UPDATE")
     backend_layers = {}
     for b in "GCNA":
         spec = getattr(args, "layers_" + b.lower(), "")
@@ -387,7 +390,10 @@ def run_matrix(args: argparse.Namespace) -> int:
                 "transport", "V2_PHONE_PROFILE_SIDECAR")
         key = {**identity, **shape}
         destination = out / f"{backend}-L{n}-X{x}-KV{kv}.json"
-        if not args.update and valid_cached(destination, key,
+        # A rolling refresh reruns only the selected Chunk widths; all other
+        # valid device/model-bound cases remain cached and are exported.
+        refresh_this = args.update and (not refresh_chunks or x in refresh_chunks)
+        if not refresh_this and valid_cached(destination, key,
                                             allow_parity_fail=True):
             cached = json.loads(destination.read_text("utf-8"))
             print(f"[V2_PROFILE_MATRIX] {index}/{len(combinations)} "
@@ -677,6 +683,9 @@ def main() -> int:
     parser.add_argument("--verify-cpu", action="store_true",
                         help="Check G/C/A output against CPU (N is always verified)")
     parser.add_argument("--update", action="store_true")
+    parser.add_argument("--refresh-chunks", default="",
+                        help="With --update, remeasure only these Chunk widths; "
+                             "reuse other cached native stages (empty=all).")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     if (args.warmups < 0 or args.repeats < 1 or args.threads < 1 or
