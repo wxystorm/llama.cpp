@@ -6,11 +6,12 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_32b_all40 import (
     build_process, parse_metrics, verify_independent_profile,
-    htp_epoch_has_runtime_samples,
+    htp_epoch_has_runtime_samples, profile_once_resume_compatible,
 )
 
 
@@ -45,6 +46,63 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertEqual(env["LLAMA_REGION_RING_PROFILE_GRID"], "full")
             self.assertTrue(env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"].endswith("profile.csv"))
             self.assertNotIn("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT", env)
+            # V0-only mode must not inherit rolling telemetry settings,
+            # including when they remain set in the user's shell.
+            args.profile_every = 0
+            with patch.dict("os.environ", {
+                "LLAMA_REGION_RING_REAL_STAGE_PROFILE": "1",
+                "LLAMA_REGION_RING_TASK_TRACE": "1",
+            }):
+                cmd, once_env = build_process(
+                    args, root / "prompt_512_01.txt", 1024, 512,
+                    root / "metrics.jsonl")
+            self.assertIn("--no-warmup", cmd)
+            self.assertNotIn("LLAMA_REGION_RING_REAL_STAGE_PROFILE", once_env)
+            self.assertNotIn("LLAMA_REGION_RING_TASK_TRACE", once_env)
+            self.assertEqual(
+                once_env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"],
+                str(args.real_stage_profile_csv))
+
+    def test_profile5_to_once_resume_accepts_only_policy_change(self):
+        once = {
+            "version": 4,
+            "planning_mode": "independent-backend-profile-then-plan",
+            "phone_execution": "CPU_TRANSPORT_HTP_ONLY_PLAN_CONTROLLED",
+            "real_stage_profile_csv": "AUTO_INDEPENDENT_G_C_N",
+            "model": {"path": "same.gguf", "size": 42},
+            "exe": {"path": "completion.exe", "size": 17},
+            "prompts": {"prompt_128_01.txt": {"sha256": "abc"}},
+            "effective_runtime_env": {
+                "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV": "profile.csv",
+                "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED": "1",
+            },
+        }
+        rolling = json.loads(json.dumps(once))
+        rolling.update(rolling_profile_every=5, rolling_phone_log="")
+        rolling["effective_runtime_env"].update({
+            "LLAMA_REGION_RING_TASK_TRACE": "1",
+            "LLAMA_REGION_RING_REAL_STAGE_PROFILE": "1",
+        })
+        self.assertTrue(profile_once_resume_compatible(rolling, once))
+        self.assertEqual(rolling["rolling_profile_every"], 5)
+        for change in (
+            {"model": {"path": "different.gguf", "size": 42}},
+            {"prompts": {"prompt_128_01.txt": {"sha256": "changed"}}},
+            {"real_stage_profile_csv": "other.csv"},
+        ):
+            mismatched = {**once, **change}
+            self.assertFalse(profile_once_resume_compatible(rolling, mismatched))
+        unknown_env = json.loads(json.dumps(rolling))
+        unknown_env["effective_runtime_env"]["MY_UNRELATED_SETTING"] = "changed"
+        self.assertFalse(profile_once_resume_compatible(unknown_env, once))
+        self.assertFalse(profile_once_resume_compatible(once, rolling))
+
+    def test_official_entrypoint_pins_profile_every_zero(self):
+        script = (Path(__file__).resolve().parent /
+                  "run_32b_profile5_plan.ps1").read_text(encoding="utf-8")
+        self.assertIn("[int]$ProfileEvery = 0", script)
+        self.assertIn('"--auto-plan", "--htp-only", "--profile-every", "0"', script)
+        self.assertIn('if ($ProfileEvery -ne 0)', script)
 
     def test_partial_v1_with_36_independent_npu_rows_must_fallback(self):
         # The failing live experiment had 17 C / 59 G / 36 N rows:

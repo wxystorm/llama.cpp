@@ -1,4 +1,4 @@
-# Qwen3-32B: Independent backend Profile -> APPLY_WIDE -> rolling Profile5
+# Qwen3-32B: single independent backend Profile -> APPLY_WIDE for all prompts
 
 Branch: `feat/32b-independent-backend-profile-20261111`
 
@@ -51,12 +51,18 @@ HTP-only mode has one RPC-visible backend and four *private* HTP sessions.
    weights loaded from the Phone GGUF. The Phone has no manual region
    configuration.
 4. **Inference** using the existing 32B double-bank/HTP-only executor.
-5. **Profile5**: after every five completed PASS Prompts, rebuild
-   `profile-epochs/vNN/real-stage-profile.csv` from the last five real
-   PC/GPU/HTP Stage logs. Only the *same measured shapes* override the
-   baseline; missing backend/chunk/depth samples remain in the
-   independent Profile, **never zero cost**. Epoch manifests are immutable,
-   contain the baseline SHA256 and are verified on resume.
+5. **One-shot Profile (V0 only)**: the first Prompt constructs the G/C/N
+   independent grid if no valid cached baseline exists. Every later Prompt
+   reuses the same `<Out>/independent-profile/profile.csv`. No rolling
+   Profile5, V1/V2 refresh, or runtime Stage override is created. The
+   Planner still searches independently for each Prompt based on its
+   length and memory constraints.
+
+   **Scope:** rolling profiling and the independent G/C/N grid run only
+   once. The existing C++ startup still performs separate native
+   CPU/GPU/transport fallback probes whenever a new `llama-completion`
+   process starts. Eliminating those is a separate C++ caching change;
+   this patch does not change the runtime executor or memory budget.
 
 The standalone Profile grid by default is `quick`: depths 2/4/6,
 Chunks 32/64/96/128; Phone padded KV spans 256/512/1024, two repeats
@@ -105,14 +111,26 @@ cmake --build build-tensor-v2 --config Release --parallel 8 --target llama-compl
   -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
   -Out ".\32b-independent-profile-all40" `
   -ProfileGrid quick `
-  -ProfileEvery 5 `
+  -ProfileEvery 0 `
   -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8 `
   -Limit 2 -StopOnFail
 ```
 
-After the two PASS runs, omit `-Limit 2` to resume all 40. To
-force re-profiling **before any PASS prompt**, add `-UpdateProfile`;
-after PASS data exists, use a new Out to preserve epoch reproducibility.
+After the two PASS runs, omit `-Limit 2` to resume all 40. The old file
+name `run_32b_profile5_plan.ps1` is kept for compatibility, but it
+**always passes `--profile-every 0`**. A legacy `-ProfileEvery 5`
+argument prints a warning and is ignored.
+
+**Resume the existing five-PASS Profile5 directory:** use the same
+`-Out` and other settings. The runner permits a one-way migration only
+when the Profile5 policy and its two telemetry flags are the sole
+differences; it backs up the old config to
+`run-config.profile5-before-once.json`. All PASS results and immutable
+V1 artifacts are preserved, but V1 is never selected, and V2 is not
+created. Other configuration mismatches still fail safely.
+
+To force independent re-profiling **before any PASS prompt**, add
+`-UpdateProfile`; after any PASS, use a fresh `-Out`.
 
 Expected first-startup logs:
 
@@ -126,7 +144,7 @@ Expected first-startup logs:
 [REGION_RING_PLAN_APPLY] ... applied=1
 [PHONE_NPU_PLAN] event=RESET ...
 [PHONE_NPU_PLAN] event=MAP ...
-[REGION_RING_PHONE_PROFILE_PULL] ... status=PASS
+[INDEPENDENT_PROFILE] event=REUSE ... status=READY  # subsequent prompts
 ```
 
 If the HTP probe is rejected, inspect PC
@@ -178,7 +196,7 @@ If no Plan is found, use the new `[PLAN_DIAG]` and
 `[REGION_RING_HTP_MEMORY_DIAG]` breakdown to identify the actual budget
 limiting the search.
 
-## V1 with unchanged NPU points: real HTP timeline export fix
+## Historical issue: V1 missing NPU samples (rolling mode disabled)
 
 A live ShareGPT40 run passed five V0 prompts, then produced:
 
@@ -224,6 +242,12 @@ succeed, the V2 epoch can capture fresh post-fix real HTP measurements.
 If `[PHONE_STAGE_PROFILE_EXPORT] exported=0`, inspect
 `missing_timestamps` and whether the Phone environment enabled
 `GGML_RPC_REAL_STAGE_PROFILE`.
+
+The V1/V2 recovery steps in the historical section above no longer
+apply to the one-shot workflow. Look for
+`[PROFILE] policy=INDEPENDENT_ONCE`,
+`[INDEPENDENT_PROFILE] event=REUSE`, and
+`[PLAN] ... profile=V0`. Old `profile-epochs/` data is audit-only.
 
 ## Limits and verification
 

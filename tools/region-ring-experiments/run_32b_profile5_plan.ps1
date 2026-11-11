@@ -1,5 +1,6 @@
 # Native APPLY_WIDE Planner on the proven 32B CPU-transport / HTP-only
-# backend. Each Prompt re-plans; genuine Stage timings roll every 5 PASS.
+# backend. Each Prompt re-plans using one cached G/C/N Profile (V0).
+# Historical -ProfileEvery is accepted but ignored for safe old-command resume.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Model,
@@ -7,7 +8,7 @@ param(
     [string]$PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
     [string]$Out = ".\32b-htp-only-profile5-plan-all40",
     [string]$Exe = "",
-    [ValidateRange(1,40)][int]$ProfileEvery = 5,
+    [ValidateRange(0,40)][int]$ProfileEvery = 0,
     [ValidateSet("quick","full")][string]$ProfileGrid = "quick",
     [switch]$UpdateProfile,
     [string]$PhoneProfileLog = "",
@@ -29,11 +30,14 @@ if (!$Exe) {
     $Exe = Join-Path $root "build-tensor-v2\bin\Release\llama-completion.exe"
 }
 $python = (Get-Command python -ErrorAction Stop).Source
+if ($ProfileEvery -ne 0) {
+    Write-Warning "Rolling Profile5 is disabled in this entry point. Ignoring -ProfileEvery $ProfileEvery; the independent G/C/N profile is reused for all prompts."
+}
 $arguments = @(
     (Join-Path $PSScriptRoot "run_32b_all40.py"),
     "--exe", $Exe, "--model", $Model, "--rpc", $Rpc,
     "--prompt-dir", $PromptDir, "--repo-root", $root, "--out", $Out,
-    "--auto-plan", "--htp-only", "--profile-every", "$ProfileEvery",
+    "--auto-plan", "--htp-only", "--profile-every", "0",
     "--profile-grid", $ProfileGrid,
     "--streaming", "on", "--batch", "$Batch", "--ubatch", "$UBatch",
     "--n-predict", "$NPredict", "--threads", "$Threads",

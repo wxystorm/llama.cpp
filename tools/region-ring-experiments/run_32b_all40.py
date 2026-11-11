@@ -60,6 +60,9 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
     "LLAMA_REGION_RING_PHONE_HTP_ONLY",
     "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED",
+    # Do not inherit old per-Stage logging from previous Profile5 invocations.
+    "LLAMA_REGION_RING_TASK_TRACE",
+    "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -848,6 +851,34 @@ def htp_epoch_has_runtime_samples(meta: dict) -> bool:
         return False
 
 
+def profile_once_resume_compatible(old: dict, new: dict) -> bool:
+    """Permit a one-way Profile5 -> V0-only switch without redoing PASS prompts.
+
+    Only rolling telemetry/epoch settings may differ. Model, executable,
+    prompts, hardware, independent calibration and all other runtime settings
+    must remain identical; this is NOT a general config compatibility bypass.
+    """
+    if (old.get("planning_mode") != "independent-backend-profile-then-plan" or
+            old.get("phone_execution") != "CPU_TRANSPORT_HTP_ONLY_PLAN_CONTROLLED" or
+            new.get("real_stage_profile_csv") != "AUTO_INDEPENDENT_G_C_N" or
+            "rolling_profile_every" not in old or
+            "rolling_profile_every" in new):
+        return False
+    compatible = dict(old)
+    compatible.pop("rolling_profile_every")
+    compatible.pop("rolling_phone_log", None)
+    env = dict(compatible.get("effective_runtime_env") or {})
+    next_env = new.get("effective_runtime_env") or {}
+    for key in ("LLAMA_REGION_RING_TASK_TRACE",
+                "LLAMA_REGION_RING_REAL_STAGE_PROFILE"):
+        # Profile5 alone sets these flags to 1. A user-controlled difference
+        # is retained so that it cannot be silently migrated.
+        if key in env and key not in next_env and env[key] == "1":
+            env.pop(key)
+    compatible["effective_runtime_env"] = env
+    return compatible == new
+
+
 def verify_independent_profile(path: Path) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
@@ -972,6 +1003,9 @@ def main(argv=None):
         if key.startswith(("LLAMA_", "GGML_", "CUDA_"))
         and key != "LLAMA_REGION_RING_METRICS_FILE"
     }
+    if args.auto_plan and args.htp_only and args.profile_every == 0:
+        print("[PROFILE] policy=INDEPENDENT_ONCE active=V0 rolling=DISABLED "
+              "plan_per_prompt=1", flush=True)
     if args.auto_plan:
         print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
               f"native_profile=INDEPENDENT_BACKEND_GRID fixed_layout=OFF "
@@ -1006,9 +1040,21 @@ def main(argv=None):
             old_compatible = dict(old)
             old_compatible.setdefault("inter_prompt_delay_seconds", 0)
             if old_compatible != config:
-                differences = [key for key in sorted(set(old_compatible) | set(config))
-                               if old_compatible.get(key) != config.get(key)]
-                raise ValueError("Existing results use a different configuration (" + ", ".join(differences[:10]) + "). Use another --out directory.")
+                if profile_once_resume_compatible(old_compatible, config):
+                    # Archive the prior policy without touching successful
+                    # result.json records or immutable epoch files.
+                    backup = args.out / "run-config.profile5-before-once.json"
+                    if not backup.exists():
+                        save_json(backup, old)
+                    save_json(config_file, config)
+                    print("[PROFILE] event=POLICY_MIGRATION"
+                          " from=ROLLING_PROFILE5 to=INDEPENDENT_ONCE"
+                          " active=V0 existing_passes=PRESERVED"
+                          f" prior_config={backup}", flush=True)
+                else:
+                    differences = [key for key in sorted(set(old_compatible) | set(config))
+                                   if old_compatible.get(key) != config.get(key)]
+                    raise ValueError("Existing results use a different configuration (" + ", ".join(differences[:10]) + "). Use another --out directory.")
         else:
             if any((args.out / "runs").glob("*/attempt-*/result.json")):
                 raise ValueError("Existing runs without run-config.json. Use another --out directory.")
