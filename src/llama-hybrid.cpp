@@ -8858,6 +8858,267 @@ bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
     return true;
 }
 
+// A genuine independent Profile: each backend benchmarks a self-contained
+// multi-layer Graph/Chunk, never a fixed G/P Ring or a Prompt. The existing
+// RPC/CUDA transfer probes above measure network and weight movement.
+// HTP timings below are reported by private Phone-owned HTP graphs, not
+// by the RPC-visible CPU transport.
+static bool llama_hybrid_calibrate_independent_ring(
+        const llama_hybrid_profile & profile,
+        const llama_hybrid_attn_desc & attn_desc,
+        const llama_hybrid_ffn_desc & ffn_desc,
+        ggml_backend_t cpu, ggml_backend_t gpu, ggml_backend_t phone,
+        const char * path) {
+    if (!path || !*path || !cpu || !phone || !profile.dense_phone_region_capable) {
+        return false;
+    }
+    {
+        std::ifstream cached(path);
+        if (cached) {
+            bool has_htp = false;
+            std::string row;
+            while (std::getline(cached, row)) {
+                if (row.rfind("PHONE,", 0) == 0) {
+                    has_htp = true;
+                    break;
+                }
+            }
+            if (!has_htp) {
+                LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=REJECT"
+                                " reason=CACHE_MISSING_HTP path=%s\n", path);
+                return false;
+            }
+            LLAMA_LOG_INFO(
+                "[INDEPENDENT_PROFILE] event=REUSE path=%s"
+                " mode=STANDALONE_BACKEND_GRID status=READY\n", path);
+            return true;
+        }
+    }
+
+    const auto phone_probe = reinterpret_cast<
+        ggml_backend_rpc_phone_independent_probe_t>(
+            llama_hybrid_rpc_get_proc_address(
+                phone, GGML_BACKEND_RPC_PHONE_INDEPENDENT_PROBE_PROC));
+    if (!phone_probe) {
+        LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=PHONE_RPC_PATCH_32_REQUIRED\n");
+        return false;
+    }
+    const bool full_grid = [] {
+        const char * grid = std::getenv("LLAMA_REGION_RING_PROFILE_GRID");
+        return grid && std::strcmp(grid, "full") == 0;
+    }();
+    const std::vector<int> depths = full_grid ?
+        std::vector<int>{1, 2, 4, 6} : std::vector<int>{2, 4, 6};
+    const std::array<int, 4> widths = {32, 64, 96, 128};
+    const std::array<int, 2> kv_spans = {512, 1024};
+    const int first_layer = std::max(0, profile.n_layer / 2 - 3);
+    // First write to a temporary file so a failed HTP point never publishes
+    // a partial CSV which a later Prompt may mistakenly trust.
+    const std::string temporary = std::string(path) + ".tmp";
+    std::ofstream csv(temporary, std::ios::trunc);
+    if (!csv) {
+        LLAMA_LOG_ERROR(
+            "[INDEPENDENT_PROFILE] status=REJECT"
+            " reason=CSV_OPEN_FAILED path=%s\n", temporary.c_str());
+        return false;
+    }
+    csv << std::fixed << std::setprecision(6);
+    csv << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+           "prepare_ms,compute_ms,terminal,samples\n";
+    struct point {
+        std::string dev;
+        int layers, tokens, kv_tokens;
+        double setup_ms, upload_ms, prepare_ms, compute_ms, output_read_ms;
+        int repeats;
+    };
+    std::vector<point> details;
+    const auto record = [&](const char * dev, int layers, int tokens,
+                            int kv, double setup, double upload,
+                            double prepare, double compute, double read,
+                            int repetitions) {
+        csv << dev << ',' << layers << ',' << tokens << ',' << kv
+            << ',' << setup << ',' << upload << ','
+            << prepare << ',' << compute << ",0," << repetitions << '\n';
+        details.push_back({dev, layers, tokens, kv,
+                           setup, upload, prepare, compute, read, repetitions});
+    };
+
+    // G/C graph-block timing is directly measured at each (depth, Chunk).
+    // KV=x is the actual graph KV span. The Planner's independent
+    // attention profile handles larger KV anchors, so do not fabricate
+    // measurements at KV=512/1024 for these synthetic block graphs.
+    for (const auto & backend : std::array<
+             std::pair<ggml_backend_t, const char *>, 2> {{
+                {cpu, "CPU"}, {gpu, "GPU"}}) {
+        if (!backend.first) { continue; } // A backend may own zero layers.
+        for (int layers : depths) {
+            if (layers > profile.n_layer) { continue; }
+            for (int tokens : widths) {
+                llama_hybrid_graph_timing timing {};
+                if (!llama_hybrid_profile_layer_block_point(
+                        attn_desc, ffn_desc, backend.first,
+                        layers, tokens, timing)) {
+                    LLAMA_LOG_ERROR(
+                        "[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=PC_GRAPH_PROBE_FAILED device=%s"
+                        " layers=%d tokens=%d\n",
+                        backend.second, layers, tokens);
+                    csv.close();
+                    std::remove(temporary.c_str());
+                    return false;
+                }
+                record(backend.second, layers, tokens, tokens, 0, 0,
+                       timing.prepare_ms, timing.wall_ms, 0, 1);
+                LLAMA_LOG_INFO(
+                    "[INDEPENDENT_PROFILE] status=PASS device=%s"
+                    " layers=%d chunk=%d kv=%d compute_ms=%.3f"
+                    " prepare_ms=%.3f\n",
+                    backend.second, layers, tokens, tokens,
+                    timing.wall_ms, timing.prepare_ms);
+            }
+        }
+    }
+
+    // The NPU's actual execution is serialized across the independent
+    // HTP FastRPC sessions (a consecutive Pn Region is striped), including
+    // intermediate Phone-host activation copies.
+    for (int layers : depths) {
+        if (layers > profile.n_layer ||
+                first_layer + layers > profile.n_layer) { continue; }
+        for (int tokens : widths) {
+            for (int kv : kv_spans) {
+                ggml_backend_rpc_phone_owned_plan plan {};
+                plan.version = 4;
+                plan.flags = 1u | (uint32_t(layers) << 16);
+                plan.run_id = 1;
+                plan.p2c_run_id = 1;
+                plan.region = 0;
+                plan.layer = (uint32_t) first_layer;
+                plan.total_tokens = (uint32_t) tokens;
+                plan.chunk_tokens = (uint32_t) tokens;
+                plan.n_embd = (uint32_t) attn_desc.n_embd;
+                plan.position_base = 0;
+                plan.kv_capacity = (uint32_t) kv;
+                plan.n_heads = (uint32_t) attn_desc.n_head;
+                plan.n_heads_kv = (uint32_t) attn_desc.n_head_kv;
+                plan.head_dim = (uint32_t) (attn_desc.k_dim / attn_desc.n_head_kv);
+                plan.n_kv = (uint32_t) kv;
+                plan.rope_type = (uint32_t) attn_desc.rope_type;
+                plan.n_ctx_orig = (uint32_t) attn_desc.n_ctx_orig;
+                plan.kv_type = (uint32_t) GGML_TYPE_F16;
+                plan.rms_norm_eps = attn_desc.rms_eps;
+                plan.rope_freq_base = attn_desc.freq_base;
+                plan.rope_freq_scale = attn_desc.freq_scale;
+                // Identical to the existing independent Qwen3 full-layer
+                // RoPE probe. No YaRN-specific overrides are inferred.
+                plan.rope_ext_factor = 0.0f;
+                plan.rope_attn_factor = 1.0f;
+                plan.rope_beta_fast = 32.0f;
+                plan.rope_beta_slow = 1.0f;
+                ggml_rpc_phone_independent_result measured {};
+                if (!phone_probe(phone, &plan, 2, 0, &measured) ||
+                        measured.repeats == 0 ||
+                        !std::isfinite(measured.compute_ms) ||
+                        measured.compute_ms <= 0.0) {
+                    LLAMA_LOG_ERROR(
+                        "[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=REAL_HTP_PROBE_FAILED"
+                        " layers=%d tokens=%d kv=%d\n",
+                        layers, tokens, kv);
+                    csv.close();
+                    std::remove(temporary.c_str());
+                    return false;
+                }
+                // Includes Phone-host intermediate layer copies; they are
+                // required by the real serial multi-Session Pn executor.
+                record("PHONE", layers, tokens, kv,
+                       measured.setup_ms, measured.upload_ms,
+                       measured.prepare_ms,
+                       measured.compute_ms + measured.output_read_ms,
+                       measured.output_read_ms, (int) measured.repeats);
+                LLAMA_LOG_INFO(
+                    "[INDEPENDENT_PROFILE] status=PASS device=HTP"
+                    " layers=%d chunk=%d kv=%d"
+                    " upload_ms=%.3f prepare_ms=%.3f"
+                    " htp_compute_ms=%.3f output_read_ms=%.3f"
+                    " setup_ms=%.3f\n",
+                    layers, tokens, kv, measured.upload_ms,
+                    measured.prepare_ms, measured.compute_ms,
+                    measured.output_read_ms, measured.setup_ms);
+            }
+        }
+    }
+    csv.flush();
+    if (!csv.good()) {
+        csv.close();
+        std::remove(temporary.c_str());
+        return false;
+    }
+    csv.close();
+    if (std::rename(temporary.c_str(), path) != 0) {
+        LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=CSV_ATOMIC_RENAME_FAILED path=%s\n", path);
+        std::remove(temporary.c_str());
+        return false;
+    }
+
+    // Persist machine-readable independent service points, transfer curves,
+    // and the actual capabilities. The CSV is directly consumed by the
+    // existing C++ Planner; this JSON is the portable Profile artifact.
+    const std::string json_path = std::string(path) + ".json";
+    std::ofstream json(json_path, std::ios::trunc);
+    if (json) {
+        json << std::fixed << std::setprecision(6);
+        json << "{\"schema\":1,\"mode\":\"INDEPENDENT_BACKEND_PROFILE\","
+             << "\"model\":{\"layers\":" << profile.n_layer
+             << ",\"hidden\":" << profile.n_embd << "},"
+             << "\"backends\":{\"G\":\"CUDA\",\"C\":\"CPU\","
+             << "\"N\":\"HTP_STRIPED\","
+             << "\"A\":\"UNAVAILABLE_IN_HTP_ONLY_MODE\"},"
+             << "\"stage_points\":[";
+        for (size_t i = 0; i < details.size(); ++i) {
+            const auto & p = details[i];
+            if (i) { json << ','; }
+            json << "{\"device\":\"" << p.dev
+                 << "\",\"layers\":" << p.layers
+                 << ",\"tokens\":" << p.tokens
+                 << ",\"kv_tokens\":" << p.kv_tokens
+                 << ",\"setup_ms\":" << p.setup_ms
+                 << ",\"upload_ms\":" << p.upload_ms
+                 << ",\"prepare_ms\":" << p.prepare_ms
+                 << ",\"service_ms\":" << p.compute_ms
+                 << ",\"output_read_ms\":" << p.output_read_ms
+                 << ",\"samples\":" << p.repeats << '}';
+        }
+        json << "],\"transfers\":{";
+        const auto write_transfer = [&](const char * name,
+                const std::vector<llama_hybrid_transfer_point> & points,
+                bool last) {
+            json << '\"' << name << "\":[";
+            for (size_t i = 0; i < points.size(); ++i) {
+                if (i) { json << ','; }
+                json << "{\"bytes\":" << points[i].bytes
+                     << ",\"ms\":" << points[i].ms << '}';
+            }
+            json << ']' << (last ? "" : ",");
+        };
+        write_transfer("pc_to_phone", profile.pc_to_phone, false);
+        write_transfer("phone_to_pc", profile.phone_to_pc, false);
+        write_transfer("gpu_weight_h2d", profile.gpu_weight_h2d, false);
+        write_transfer("gpu_to_pc", profile.gpu_to_pc, true);
+        json << "}}\n";
+    }
+    LLAMA_LOG_INFO(
+        "[INDEPENDENT_PROFILE] event=READY path=%s"
+        " rows=%zu network_c2p=%zu network_p2c=%zu"
+        " gpu_h2d=%zu source=STANDALONE_G_C_N"
+        " phone_rpc_cpu_proxy=SKIPPED status=PASS\n",
+        path, details.size(), profile.pc_to_phone.size(),
+        profile.phone_to_pc.size(), profile.gpu_weight_h2d.size());
+    return true;
+}
+
 bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & params, llama_hybrid_plan & best_plan) {
     llama_hybrid_runtime_plan_clear();
 
@@ -9056,6 +9317,20 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             LLAMA_LOG_WARN(
                 "[HYBRID_PROFILE_DENSE_PHONE_GRAPH] "
                 "status=UNAVAILABLE action=KEEP_FIXED_RING\n");
+        }
+    }
+
+    // HTP-only: calibrate independent backends BEFORE any Plan is searched.
+    // The CSV is generated on the first Prompt and reused on the next ones.
+    if (htp_only_profile) {
+        const char * csv_path =
+            std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV");
+        if (!llama_hybrid_calibrate_independent_ring(
+                profile, attn_desc, ffn_desc,
+                cpu.get(), gpu.get(), phone.get(), csv_path)) {
+            LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=FAIL"
+                            " action=REJECT_AUTO_PLAN\n");
+            return false;
         }
     }
 
