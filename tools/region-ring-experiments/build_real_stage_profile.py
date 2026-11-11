@@ -50,15 +50,24 @@ def profile_lines(path: Path, substring: str) -> list[dict[str, str]]:
 
 
 def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
-    phone = {}
-    if rpc_log is not None:
-        for x in profile_lines(rpc_log, "[REAL_STAGE_PROFILE]"):
-            if x.get("side") == "PHONE" and x.get("phase") == "CHUNK":
-                if x.get("status") == "PASS":
-                    try:
-                        phone[(x["run"], int(x["region"]), int(x["chunk"]))] = x
-                    except (KeyError, ValueError):
-                        pass
+    # Phone's RPC pull is logged into the matching PC attempt. An archived
+    # Phone log remains an optional fallback, never an obligatory copy.
+    def collect_phone(path: Path) -> dict:
+        result = {}
+        for x in profile_lines(path, "[REAL_STAGE_PROFILE]"):
+            if x.get("side") != "PHONE" or x.get("phase") != "CHUNK" or x.get("status") != "PASS":
+                continue
+            try:
+                key = (x["run"], int(x["region"]), int(x["chunk"]))
+                values = [number(x.get(field)) for field in
+                          ("upload_ms", "prepare_ms", "compute_ms")]
+                if all(v is not None and v >= 0 for v in values) and values[2] > 0:
+                    result[key] = x
+            except (KeyError, ValueError, TypeError):
+                pass
+        return result
+
+    phone = collect_phone(rpc_log) if rpc_log is not None else {}
     samples = []
     diag = dict(cases=0, cpu=0, gpu=0, phone=0,
                 phone_missing=0, setup_missing=0, trace_missing=0)
@@ -88,9 +97,11 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
         diag["cases"] += 1
         # Match the PC-run session ID to the Phone autonomous job table;
         # otherwise a stale Phone log could contaminate the Profile.
-        session_lines = profile_lines(case / "engine.stderr.log",
-                                      "[PHONE_AUTO] event=SESSION_READY")
+        log = case / "engine.stderr.log"
+        session_lines = (profile_lines(log, "[PHONE_AUTO] event=SESSION_READY") or
+                         profile_lines(log, "[PHONE_AUTO] event=SESSION_PREPARING"))
         session = session_lines[0].get("run") if session_lines else None
+        local_phone = collect_phone(log)
         setup = {}
         for p in profile_lines(case / "engine.stderr.log",
                                "[REAL_STAGE_PROFILE]"):
@@ -124,26 +135,28 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                     continue
                 s.update(prepare_ms=a, compute_ms=b)
             else:
-                p = phone.get((session, region, chunk))
+                key = (session, region, chunk)
+                p = local_phone.get(key) or phone.get(key)
                 q = setup.get((region, chunk))
                 if p is None:
                     diag["phone_missing"] += 1
                     continue
-                if q is None:
-                    diag["setup_missing"] += 1
-                    continue
-                val = [number(p.get(k)) for k in
+                val = [number(p.get(field)) for field in
                        ("upload_ms", "prepare_ms", "compute_ms")]
-                registration = number(q.get("setup_ms"))
-                if registration is None or any(v is None for v in val):
+                if any(v is None or v < 0 for v in val) or val[2] <= 0:
                     continue
+                # In Graphless HTP mode PC GRAPH_SETUP may be absent.
+                # Preserve measured compute without fabricating setup cost.
+                registration = number(q.get("setup_ms")) if q else None
+                if registration is None:
+                    diag["setup_missing"] += 1
                 try:
-                    kv = int(q.get("kv_tokens", begin + tokens))
-                    terminal = int(q.get("terminal", int(region == final_region)))
+                    kv = int(q.get("kv_tokens", begin + tokens)) if q else begin + tokens
+                    terminal = int(q.get("terminal", int(region == final_region))) if q else int(region == final_region)
                 except ValueError:
                     continue
                 s.update(upload_ms=val[0], prepare_ms=val[1],
-                         compute_ms=val[2], setup_ms=registration,
+                         compute_ms=val[2], setup_ms=registration or 0.0,
                          kv_tokens=kv, terminal=terminal)
             diag[d.lower()] += 1
             samples.append(s)
