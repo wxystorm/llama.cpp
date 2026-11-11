@@ -156,7 +156,9 @@ from completed-Prompt counts and immutable snapshots. Optional
 Illustrative terminal output (not a measured sample):
 
 ```text
-[PROFILE] event=BOOTSTRAP version=V0 source=NATIVE_PROBES
+[PROFILE] event=BOOTSTRAP_FIXED version=V0 prompt=prompt_512_01.txt counted=0
+[REGION_RING_PHONE_PROFILE_PULL] ... rows=... status=PASS
+[PROFILE] event=BOOTSTRAP_READY version=V0 npu_points=... csv=...
 [1/40] RUN prompt_128_01.txt group=128 ctx=...
   PASS: prefill=... tok/s (...) ...
   [PLAN] prompt=prompt_128_01.txt applied=True profile=V0 physical=G8,N4,G8,N3,G... transport=CPU source=htp_gpu_tail chosen=G8,P4,G8,P3,G... XC=64 XG=96 XP=128 predicted_ms=...
@@ -189,7 +191,7 @@ Check the per-Prompt `metrics.jsonl`, `engine.stderr.log` and
   `[PHONE_HTP_ONLY] event=RUN_END ... status=PASS`.
 - PC exit `0` and complete Prefill metrics are required for PASS.
 
-**Verification boundary:** These changes are committed source and host-side
+**Verification boundary:** Changes are committed and CI checks are configured, but successful Windows/Android compilation and Snapdragon end-to-end execution have not been observed here. The host-side tests must be executed, not assumed to pass. Earlier source-only
 tests. They have **not** been compiled on the user's Windows/Android toolchains
 or executed on the Snapdragon device here. Start with the two-Prompt smoke,
 then diagnose the first failing log rather than treating source review alone
