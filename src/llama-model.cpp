@@ -2255,6 +2255,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                             " reason=REMOTE_PRELOAD_UNSUPPORTED\n");
                         return false;
                     }
+                    const char * plan_mode =
+                        std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+                    if (plan_mode != nullptr &&
+                            std::strcmp(plan_mode, "1") == 0) {
+                        // Same RPC procedure, reserved reset descriptor.
+                        // Clear old HTP weight/graph residency before the
+                        // next PC-selected Region list is installed.
+                        if (!preload(rpc.get(), UINT32_MAX, 0, 0)) {
+                            LLAMA_LOG_ERROR(
+                                "[REGION_RING_PHONE_EARLY_WEIGHTS]"
+                                " event=FAIL reason=PHONE_PLAN_EPOCH_RESET\n");
+                            return false;
+                        }
+                    }
                     size_t done = 0;
                     for (const auto & p : phone_ranges) {
                         const int64_t region_start_us = ggml_time_us();
