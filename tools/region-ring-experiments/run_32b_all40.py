@@ -708,6 +708,8 @@ def get_args(argv=None):
         parser.error("--htp-only in this runner requires --auto-plan")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
+    if args.htp_only and args.profile_every == 0:
+        parser.error("--htp-only auto-plan requires --profile-every >= 1")
     if args.profile_every and not (args.auto_plan and args.htp_only):
         parser.error("--profile-every requires --auto-plan --htp-only")
     if args.phone_profile_log is not None and not args.profile_every:
@@ -823,6 +825,12 @@ def bootstrap_htp_profile(args, prompts, decisions) -> Path:
     base = args.out / "profile-bootstrap" / "v00"
     csv_path = base / "real-stage-profile.csv"
     if csv_path.is_file():
+        metadata_path = base / "manifest.json"
+        if not metadata_path.is_file():
+            raise ValueError("V0 profile exists without a manifest; refuse unverified cache")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("sha256") != digest(csv_path):
+            raise ValueError("V0 HTP Profile digest mismatch; refuse stale cache")
         count = require_htp_stage_rows(csv_path)
         print(f"[PROFILE] event=BOOTSTRAP_REUSE version=V0 "
               f"npu_points={count} csv={csv_path}", flush=True)
@@ -1014,11 +1022,8 @@ def main(argv=None):
             if args.real_stage_profile_csv is None and completed_count < args.profile_every:
                 args.real_stage_profile_csv = bootstrap_htp_profile(
                     args, prompts, decisions)
-            require_htp_stage_rows(args.real_stage_profile_csv
-                if args.real_stage_profile_csv is not None else
-                args.out / "profile-epochs" /
-                f"v{completed_count // args.profile_every:02d}" /
-                "real-stage-profile.csv") if args.real_stage_profile_csv is not None else None
+            if args.real_stage_profile_csv is not None:
+                require_htp_stage_rows(args.real_stage_profile_csv)
 
         # One unmeasured representative Prefill per invocation. It is
         # deliberately NOT an entry in runs/, summary.csv or PASS counts.
