@@ -115,6 +115,38 @@ int main() {
         std::remove(file);
     }
 
+    // A missing Graph setup measurement is NOT a zero-cost HTP setup.
+    // Preserve real service measurements but require Planner fallback for
+    // registration (otherwise the search favors too many Phone islands).
+    {
+        const char * file = "region-ring-htp-profile-missing-setup.csv";
+        {
+            std::ofstream out(file);
+            out << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                   "prepare_ms,compute_ms,terminal,samples\n";
+            out << "PHONE,6,128,128,0,2,3,30,0,5\n";
+        }
+        real_stage_profile measured;
+        std::string why;
+        REQUIRE(measured.load(file, why));
+        double ms = 0.0;
+        REQUIRE(!measured.estimate(
+            device::PHONE, 6, 128, 128, false,
+            real_stage_phase::SETUP, ms));
+        REQUIRE(measured.estimate(
+            device::PHONE, 6, 128, 128, false,
+            real_stage_phase::COMPUTE, ms));
+        REQUIRE(std::fabs(ms - 30.0) < 1e-6);
+        REQUIRE(measured.estimate(
+            device::PHONE, 3, 64, 128, false,
+            real_stage_phase::COMPUTE, ms));
+        REQUIRE(ms > 0.0);
+        REQUIRE(!measured.estimate(
+            device::CPU, 3, 64, 128, false,
+            real_stage_phase::COMPUTE, ms));
+        std::remove(file);
+    }
+
     model m = mock_profile();
 
     // First-cycle fine X candidates are available to deterministic A/B
