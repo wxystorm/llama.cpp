@@ -997,7 +997,12 @@ inline bool simulate(const model & m,
                     return reject("DESTINATION_FRAME_TRANSFER_PROFILE_MISSING");
                 }
                 const int edge_id = (int) edges.size();
-                edges.push_back({last_src, dst, lane, ms});
+                edge transfer;
+                transfer.producer = last_src;
+                transfer.consumer = dst;
+                transfer.lane = lane;
+                transfer.duration = ms;
+                edges.push_back(std::move(transfer));
                 edges.back().payload_bytes = bytes;
                 outgoing_edges[(size_t) last_src].push_back(edge_id);
                 ++tasks[(size_t) last_src].outputs;
@@ -1034,7 +1039,12 @@ inline bool simulate(const model & m,
                     return reject("TRANSFER_PROFILE_MISSING");
                 }
                 const int edge_id = (int) edges.size();
-                edges.push_back({src, dst, lane, ms});
+                edge transfer;
+                transfer.producer = src;
+                transfer.consumer = dst;
+                transfer.lane = lane;
+                transfer.duration = ms;
+                edges.push_back(std::move(transfer));
                 edges.back().payload_bytes = bytes;
                 outgoing_edges[(size_t) src].push_back(edge_id);
                 if (a != b) {
