@@ -10490,12 +10490,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "phone_depth=UNRESTRICTED_PREFIX "
             "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
             "handoff=TOKEN_INTERVAL_PAIR_COST "
-            "first_cycle_X=8..192_INTERPOLATED "
+            "first_cycle_X=32..160_INTERPOLATED "
             "later_cycle_X=FIXED_BY_SEED "
             "tail=PREVIEW_ONLY final_owner=PHONE "
             "G=OPEN_BY_BANK_MEMORY gpu_weight_stream=%d "
-            "XC/XG/XP=8,12,16,20,24,28,32,40,48,56,"
-            "64,80,96,112,128,160,192 "
+            "XC/XG/XP=32,48,56,64,80,96,112,128,160 "
             "baseline_ms=%.3f valid=%d\n",
             result.enumerated, result.profiled,
             result.e_window_shortlisted, result.shortlisted,
