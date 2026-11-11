@@ -206,8 +206,9 @@ private:
                     xs.insert(p.tokens);
                 }
             }
-            if (xs.empty() || tokens > *xs.rbegin() * 2 ||
-                    (long long) tokens * 2 < *xs.begin()) {
+            if (xs.empty() ||
+                    tokens > *xs.rbegin() * (d == device::PHONE ? 4 : 2) ||
+                    (long long) tokens * (d == device::PHONE ? 4 : 2) < *xs.begin()) {
                 return false;
             }
             const auto at_tokens = [&](int x, double & m) -> bool {
@@ -255,8 +256,14 @@ private:
                 // A single token-size sample cannot identify fixed overhead.
                 // Keep it only near the measured point, otherwise use the
                 // existing independent Profile as the safer fallback.
-                if ((long long) tokens * 4 < 3LL * left ||
-                        (long long) tokens * 4 > 5LL * left) {
+                if (d == device::PHONE) {
+                    // Bounded prior only: a single calibrated HTP chunk
+                    // does not prove smaller chunks scale linearly. Charge
+                    // at least half of the observed service to avoid
+                    // selecting arbitrarily tiny unmeasured shapes for free.
+                    m *= std::max(0.5, (double) tokens / left);
+                } else if ((long long) tokens * 4 < 3LL * left ||
+                           (long long) tokens * 4 > 5LL * left) {
                     return false;
                 }
             }
@@ -275,7 +282,8 @@ private:
             }
         }
         if (layers > *depths.rbegin() * 2 ||
-                (long long) layers * 2 < *depths.begin()) {
+                (d != device::PHONE &&
+                 (long long) layers * 2 < *depths.begin())) {
             return false;
         }
         double a = 0.0, b = 0.0;
@@ -284,9 +292,14 @@ private:
         }
         result = lerp((double) layers, left, a, right, b);
         if (left == right && layers != left) {
-            // A single depth anchor is not enough to extrapolate arbitrary
-            // Stage widths; preserve the prior model for these candidates.
-            return false;
+            if (d != device::PHONE) {
+                // Never extrapolate CPU/GPU service from a lone depth.
+                return false;
+            }
+            // Approximate unmeasured HTP Region widths from a real HTP
+            // sample. A conservative floor prevents unrealistic tiny
+            // Regions from being ranked as zero-cost.
+            result *= std::max(0.35, (double) layers / left);
         }
         return std::isfinite(result) && result >= 0.0;
     }
