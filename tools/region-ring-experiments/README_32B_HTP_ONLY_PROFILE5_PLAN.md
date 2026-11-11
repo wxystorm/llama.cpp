@@ -117,6 +117,46 @@ parameters are signed into the run configuration. Omitting
 `-ForceLayout` restores the original automatic Planner. Legacy
 `--layout` is incompatible with HTP-only automatic mode; use the
 new fixed-Plan parameters above.
+## Wider Plan shortlist and CPU-optional search
+
+Automatic APPLY_WIDE still uses the one-shot independent Profile V0.
+This revision expands *offline candidate search*, not live device
+profiling. To improve coverage before deriving the final HTP-only GPU
+tail, the first-cycle E reservoir grows from 500 to 640, selected
+first-Cycle seeds from 200 to 256, middle/last Beam width from 16/24
+to 24/32, and the complete full-DAG-scored parent shortlist from
+Top10 to **Top24**. The CPU-optional DAG budget rises from 64 to 96,
+with more diverse three-stage anchors and standalone G/P seeds.
+Consequently, planning CPU time and memory may increase, especially
+for long Prompts; **no** HTP Session, shared Phone RAM, GPU VRAM or
+exact DAG safety constraint is relaxed.
+
+CPU=0 is allowed, but the main six-dimensional first-Cycle Beam still
+starts with nonempty G,C,P stages. After it completes, a second pass
+can merge C into the neighboring G or P and score independent G/P
+layouts. Unlike the prior behavior, independent G/P seeds are **still
+evaluated when the full G/C/P search produces no memory-feasible
+survivor**; CPU=0 no longer depends on winning a three-device plan.
+
+For each first-Cycle seed `(G1,C1,P1,XC,XG,XP)`, subsequent Cycles
+keep `XC/XG/XP` fixed and vary the `(G,C,P)` layer counts subject to
+remaining layers, bounded Cycle-width spread, GPU two-Bank peak and
+terminal Phone/HTP memory feasibility. Each expansion adds service
+cost to accumulated `W_CPU/W_GPU/W_PHONE` and ranks by accumulated
+minimax mismatch plus a small current-Cycle penalty, not by repeating
+the first Cycle. Only full layouts pass the exact Prompt-level DAG.
+The HTP-only final GPU-tail step now checks up to 24 different
+Phone-final parents, shifting 1..8 last Phone layers to the GPU
+and re-checking each resulting layout against all memory/DAG guards.
+
+Review `[REGION_RING_PLAN_SEARCH]` for `first_cycle_selected`,
+`prefix_expanded`, `prefix_completed` and `[REGION_RING_PLAN_CPU_OPTIONAL]`
+for CPU-free candidates. `[REGION_RING_PLAN_HTP_TAIL] event=PARENT_POOL`
+reports parent count. The expanded first-Cycle artifact is named
+`planner-first-cycle-top256.csv`. The final selected runtime layout
+still uses the shortest **predicted full-DAG wall time** among safe
+candidates, not the lowest first-Cycle E.
+
 ## Exact workflow
 
 1. **Independent Profile**, only when there is no cached baseline or

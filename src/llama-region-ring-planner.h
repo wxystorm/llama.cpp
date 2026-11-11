@@ -2808,9 +2808,11 @@ inline bool first_cycle_chunk_supported(int x) {
 inline void search_runtime_cpu_optional(
         const model & m, result & out,
         std::unordered_set<std::string> & scored) {
-    if (out.top.empty() || !m.memory_feasible) { return; }
-    constexpr size_t k_dag_cap = 64;
-    constexpr int k_anchors_per_cycles = 4;
+    // Independent G/P seeds must still run when the 3-device search
+    // produces NO survivors (e.g. every C stage violates memory).
+    if (!m.memory_feasible) { return; }
+    constexpr size_t k_dag_cap = 96;
+    constexpr int k_anchors_per_cycles = 6;
     struct option {
         candidate value;
         double proxy = 0.0;
@@ -2929,7 +2931,7 @@ inline void search_runtime_cpu_optional(
     for (int cycles = 2; cycles <= 4; ++cycles) {
         const int width = m.layers / cycles;
         if (width < 2) { continue; }
-        for (int p = 1; p <= std::min(8, width - 1); ++p) {
+        for (int p = 1; p <= std::min(10, width - 1); ++p) {
             std::vector<llama_region_ring_region> rs;
             int layer = 0;
             for (int k = 0; k < cycles; ++k) {
@@ -3836,12 +3838,14 @@ inline result search_runtime_applicable(
     // squared-length term below is a *soft* preference inside that range.
     // A wide E-first pool is ranked again by absolute service demand before
     // entering the nonuniform search. No additional device Profile is run.
-    constexpr size_t k_first_cycle_e_pool_total = 500;
-    constexpr size_t k_first_seeds_total = 200;
-    constexpr size_t k_seed_geometry_diversity_per_n = 12;
-    constexpr size_t k_seed_chunk_diversity = 36;
-    constexpr size_t k_prefix_beam_per_seed = 16;
-    constexpr size_t k_final_beam_per_seed = 24;
+    // More surviving geometries, Chunk triples and prefix compensations.
+    // All are data-only scoring: no additional CPU/CUDA/HTP calibration.
+    constexpr size_t k_first_cycle_e_pool_total = 640;
+    constexpr size_t k_first_seeds_total = 256;
+    constexpr size_t k_seed_geometry_diversity_per_n = 16;
+    constexpr size_t k_seed_chunk_diversity = 48;
+    constexpr size_t k_prefix_beam_per_seed = 24;
+    constexpr size_t k_final_beam_per_seed = 32;
 
     const auto first_seed_less = [](const first_cycle_seed & a,
                                     const first_cycle_seed & b) {
@@ -4144,7 +4148,7 @@ inline result search_runtime_applicable(
         }
     }
 
-    // Pass 1: E-first screening. Keep a wider set of 500 seeds, with basic
+    // Pass 1: E-first screening. Keep up to 640 seeds, with basic
     // coverage of Cycle counts, first-Cycle geometries and Chunk triples.
     // We do not materialize every six-dimensional candidate: the streaming
     // E window, per-geometry/per-Chunk representatives and bounded E heaps
@@ -4547,7 +4551,7 @@ inline result search_runtime_applicable(
                                 }
                             }
 
-                            // Intermediate Cycles retain Beam=16 by the
+                            // Intermediate Cycles retain Beam=24 by the
                             // cumulative/stage E rank. The last Cycle is
                             // complete: allow a wider pool and rank by both
                             // absolute work and final accumulated E.
@@ -4721,8 +4725,11 @@ inline result search_runtime_applicable(
     if (!out.top.empty()) {
         out.selected = out.top.front();
         out.valid = true;
-        if (out.top.size() > 10) {
-            out.top.resize(10);
+        // HTP-only GPU-tail refinement derives 1..8 tail layers from
+        // these survivors. Keep more complete DAG-safe parents so an
+        // individually fast Phone-final plan does not monopolize selection.
+        if (out.top.size() > 24) {
+            out.top.resize(24);
         }
     }
     return out;

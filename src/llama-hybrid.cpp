@@ -11021,7 +11021,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_CPU_OPTIONAL] mode=APPLY_WIDE "
                 "zero_cpu=ELIGIBLE cycles=2..4 enumerated=%zu "
-                "profiled=%zu simulated=%zu dag_cap=64 "
+                "profiled=%zu simulated=%zu dag_cap=96 "
                 "search=AFTER_LEGACY_LOCAL status=COMPARED\n",
                 result.cpu_optional_enumerated,
                 result.cpu_optional_profiled,
@@ -11045,9 +11045,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "E_margin=%.4f shortlist_floor=%d "
             "filter=E_WIDE_THEN_ABSOLUTE_PLUS_UNIFORM_CONTROL "
             "exact=FULL_PROMPT_EVENT_SIM ranking=SIM_WALL "
-            "uniform_sim_cap=NONE first_e_pool_cap=500 "
-            "first_seeds_total_cap=200 prefix_beam_middle=16 "
-            "prefix_beam_final=24 seed_rank=0.35E_0.65ABS "
+            "uniform_sim_cap=NONE first_e_pool_cap=640 "
+            "first_seeds_total_cap=256 prefix_beam_middle=24 "
+            "prefix_beam_final=32 final_parents_top=24 "
+            "seed_rank=0.35E_0.65ABS "
             "prefix_rank=CUM_E_PLUS_STAGE_E width_spread_pct=25 "
             "phone_depth=UNRESTRICTED_PREFIX "
             "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
@@ -11108,7 +11109,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 const std::string output_file =
                     (split == std::string::npos ? std::string() :
                      metrics_file.substr(0, split + 1)) +
-                    "planner-first-cycle-top200.csv";
+                    "planner-first-cycle-top256.csv";
                 std::ofstream csv(output_file, std::ios::trunc);
                 if (csv) {
                     csv << "rank,selected_by,cycles,first_G,first_C,first_P,"
@@ -11669,6 +11670,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             double fastest = std::numeric_limits<double>::infinity();
             std::string last_reason = "NO_PHONE_FINAL_CANDIDATES";
             std::vector<llama_ring_planner::candidate> parents = result.top;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_HTP_TAIL] event=PARENT_POOL"
+                " parents=%zu cap=24 cpu_optional_simulated=%zu"
+                " action=VERIFY_GPU_TAIL_BY_FULL_DAG\n",
+                parents.size(), result.cpu_optional_simulated);
             if (parents.empty()) {
                 parents.push_back(result.selected);
             }
@@ -12036,7 +12042,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << (model.gpu_memory_budget_bytes / 1048576.0L)
                             << ",\"first_cycle_seed_csv\":\""
                             << (first_cycle_seed_csv_saved ?
-                                "planner-first-cycle-top200.csv" : "")
+                                "planner-first-cycle-top256.csv" : "")
                             << "\""
                             << ",\"prefix_completed\":"
                             << result.prefix_completed

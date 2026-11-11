@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <unordered_set>
 #include <vector>
 using namespace llama_ring_planner;
 #define REQUIRE(expr) do { \
@@ -1184,8 +1185,8 @@ int main() {
         REQUIRE(selected.first_cycle_gpu_pairs_pruned > 0);
         REQUIRE(selected.first_cycle_gpu_shapes_pruned > 0);
         REQUIRE(selected.first_cycle_selected > 0);
-        REQUIRE(selected.first_cycle_selected <= 200);
-        REQUIRE(selected.first_cycle_e_pool <= 500);
+        REQUIRE(selected.first_cycle_selected <= 256);
+        REQUIRE(selected.first_cycle_e_pool <= 640);
         REQUIRE(selected.first_cycle_selected <= selected.first_cycle_e_pool);
         REQUIRE(selected.first_cycle_selected ==
                 selected.first_cycle_seeds.size());
@@ -1944,14 +1945,15 @@ int main() {
             value_profile, value_baseline, 64, 16, 0.50, 0);
         REQUIRE(value_result.valid);
         REQUIRE(value_result.shortlisted == value_result.simulated);
+        REQUIRE(value_result.top.size() <= 24);
         REQUIRE(value_result.throughput_shortlisted <= 6);
         REQUIRE(value_result.throughput_shortlisted ==
                 value_result.throughput_simulated);
         REQUIRE(value_result.local_shortlisted <= 48);
         REQUIRE(value_result.first_cycle_profiled > 0);
         REQUIRE(value_result.first_cycle_selected > 0);
-        REQUIRE(value_result.first_cycle_selected <= 200);
-        REQUIRE(value_result.first_cycle_e_pool <= 500);
+        REQUIRE(value_result.first_cycle_selected <= 256);
+        REQUIRE(value_result.first_cycle_e_pool <= 640);
         REQUIRE(value_result.first_cycle_selected <= value_result.first_cycle_e_pool);
         REQUIRE(value_result.first_cycle_selected ==
                 value_result.first_cycle_seeds.size());
@@ -1972,7 +1974,7 @@ int main() {
             REQUIRE(std::isfinite(seed.first_joint_score));
             REQUIRE(seed.first_joint_score >= 0.0);
             REQUIRE(seed.first_joint_score <= 1.0 + 1e-9);
-            REQUIRE(seed.completed <= 24);
+            REQUIRE(seed.completed <= 32);
             REQUIRE(seed.completed ==
                     seed.duplicates + seed.rejected_memory +
                     seed.rejected_profile + seed.rejected_dag +
@@ -2047,6 +2049,41 @@ int main() {
         }
     }
 
+    // CPU=0 must remain a real search option even when ALL three-device
+    // G/C/P candidates fail the memory callback. Previously the
+    // CPU-optional pass returned immediately when out.top was empty and
+    // never evaluated the independent G/P candidates at all.
+    {
+        model gpu_htp_only = mock_profile();
+        gpu_htp_only.layers = 24;
+        gpu_htp_only.tokens = 64;
+        gpu_htp_only.memory_feasible = [](const candidate & plan) {
+            std::vector<llama_region_ring_region> rs;
+            if (!make_regions(plan, 24, rs)) { return false; }
+            return std::none_of(rs.begin(), rs.end(),
+                [](const llama_region_ring_region & region) {
+                    return region.device == device::CPU;
+                });
+        };
+        const auto baseline = llama_region_ring_parse(
+            "G8,C2,P2,G8,C2,P2", 24);
+        const result cpu_free = search_runtime_applicable(
+            gpu_htp_only, baseline, 64, 8, 0.08, 0);
+        REQUIRE(cpu_free.valid);
+        REQUIRE(cpu_free.cpu_optional_enumerated > 0);
+        REQUIRE(cpu_free.cpu_optional_profiled > 0);
+        REQUIRE(cpu_free.cpu_optional_simulated > 0);
+        REQUIRE(cpu_free.top.size() <= 24);
+        REQUIRE(cpu_free.selected.cpu_optional_seed);
+        std::vector<llama_region_ring_region> selected_rs;
+        REQUIRE(make_regions(cpu_free.selected, 24, selected_rs));
+        REQUIRE(std::none_of(selected_rs.begin(), selected_rs.end(),
+            [](const llama_region_ring_region & region) {
+                return region.device == device::CPU;
+            }));
+        REQUIRE(selected_rs.front().device == device::GPU);
+        REQUIRE(selected_rs.back().device == device::PHONE);
+    }
     // A 40-layer three-Cycle layout has unequal Cycle widths. Its
     // throughput proxy must count total CPU/GPU/Phone work, plus every
     // link, rather than only the average cost of one Cycle.
