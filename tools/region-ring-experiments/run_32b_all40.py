@@ -272,12 +272,12 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
                 if "event=FAIL" in line or ("event=JOIN" in line and "status=FAIL" in line):
                     early_failed = True
                 if "event=REGION" in line and "status=PASS" in line:
-                    match = re.search(r"\\bregion=(\\d+)", line)
+                    match = re.search(r"\bregion=(\d+)", line)
                     if match:
                         early_regions.add(int(match.group(1)))
                 if "event=DONE" in line and "status=PASS" in line:
                     early_done = True
-                    match = re.search(r"\\bwall_ms=([\\d.]+)", line)
+                    match = re.search(r"\bwall_ms=([\d.]+)", line)
                     if match:
                         early_wall_ms = float(match.group(1))
                 if "event=JOIN" in line and "status=PASS" in line:
