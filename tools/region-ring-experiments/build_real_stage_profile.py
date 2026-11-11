@@ -114,6 +114,14 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
         # HTP-only auto plans have a final GPU tail; the last NPU Region
         # is therefore nonterminal even though it is the last Phone one.
         final_region = max((int(t["region"]) for t in traces), default=-1)
+        # Phone Qwen3 Graphless uses one padded KV read span for the
+        # entire UBatch, not the current Chunk's begin+tokens.
+        # Match the span constructed by llama-context.cpp from total
+        # fresh-prefill tokens; avoid misleading long-context anchors.
+        total_tokens = max(
+            (int(t.get("token_begin", 0)) + int(t.get("tokens", 0))
+             for t in traces), default=0)
+        phone_padded_kv = max(256, ((total_tokens + 255) // 256) * 256)
         for t in traces:
             d = t.get("device")
             if d not in ("CPU", "GPU", "PHONE"):
@@ -153,7 +161,7 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                 if registration is None:
                     diag["setup_missing"] += 1
                 try:
-                    kv = int(q.get("kv_tokens", begin + tokens)) if q else begin + tokens
+                    kv = int(q.get("kv_tokens", phone_padded_kv)) if q else phone_padded_kv
                     terminal = int(q.get("terminal", int(region == final_region))) if q else int(region == final_region)
                 except ValueError:
                     continue
