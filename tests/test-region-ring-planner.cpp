@@ -184,6 +184,33 @@ int main() {
         std::remove(file);
     }
 
+    // GPU-tail refinement can leave P1. Extrapolating from HTP2/4/6
+    // must neither clamp P1 cost to zero nor make P8 cheaper than P6.
+    {
+        const char * file = "region-ring-independent-htp-depth-floor.csv";
+        {
+            std::ofstream out(file);
+            out << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                   "prepare_ms,compute_ms,terminal,samples\n";
+            out << "PHONE,2,128,256,2,1,3,20,0,2\n";
+            out << "PHONE,4,128,256,2,1,3,40,0,2\n";
+            out << "PHONE,6,128,256,2,1,3,60,0,2\n";
+        }
+        real_stage_profile measured;
+        std::string reason;
+        REQUIRE(measured.load(file, reason));
+        double cost = 0.0;
+        REQUIRE(measured.estimate(
+            device::PHONE, 1, 128, 256, false,
+            real_stage_phase::COMPUTE, cost));
+        REQUIRE(cost >= 10.0);
+        REQUIRE(measured.estimate(
+            device::PHONE, 8, 128, 256, false,
+            real_stage_phase::COMPUTE, cost));
+        REQUIRE(cost >= 60.0);
+        std::remove(file);
+    }
+
     // A missing Graph setup measurement is NOT a zero-cost HTP setup.
     // Preserve real service measurements but require Planner fallback for
     // registration (otherwise the search favors too many Phone islands).
