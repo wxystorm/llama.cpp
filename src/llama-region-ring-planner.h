@@ -2645,9 +2645,9 @@ inline result search(
         return out;
     }
 
-    const std::array<int,4> x_cpu {16,32,64,128};
-    const std::array<int,4> x_gpu {16,32,64,128};
-    const std::array<int,4> x_phone {16,32,64,128};
+    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
+    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
+    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
     std::vector<candidate> coarse;
 
     for (int n = 2; n <= 4; ++n) {
@@ -2780,9 +2780,8 @@ inline result search(
 }
 
 // Shared fine-Chunk grid for Prefix seeding and local X adjustments.
-static constexpr std::array<int, 17> first_cycle_chunk_candidates {
-    8, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112,
-    128, 160, 192
+static constexpr std::array<int, 9> first_cycle_chunk_candidates {
+    32, 48, 56, 64, 80, 96, 112, 128, 160
 };
 
 inline bool first_cycle_chunk_supported(int x) {
@@ -3431,9 +3430,9 @@ inline result search_runtime_applicable(
             m, baseline_regions, out.baseline) &&
         simulate(m, baseline_regions, out.baseline);
 
-    const std::array<int,4> x_cpu {16,32,64,128};
-    const std::array<int,4> x_gpu {16,32,64,128};
-    const std::array<int,4> x_phone {16,32,64,128};
+    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
+    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
+    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
     std::vector<candidate> coarse;
 
     for (int cycles = 2; cycles <= 4; ++cycles) {
@@ -3937,7 +3936,7 @@ inline result search_runtime_applicable(
         // be greater than the anchor minimum. No seed in the final
         // (E_min + margin) window can be pruned by this preliminary bound.
         std::vector<size_t> anchors;
-        for (int x : {16, 32, 64, 128}) {
+        for (int x : {32, 64, 96, 128}) {
             const auto it = std::find(
                 chunks.begin(), chunks.end(), x);
             if (it != chunks.end() && x <= m.tokens) {
