@@ -91,7 +91,9 @@ class RollingPlanTests(unittest.TestCase):
                     "predicted_ms": 10880.0
                 }), encoding="utf-8")
                 (dest / "engine.stderr.log").write_text(
-                    "[REGION_RING_NPU_MEMORY] policy=STREAMING_2BANK\n",
+                    "[REGION_RING_NPU_MEMORY] policy=STREAMING_2BANK\n"
+                    "[PHONE_MIXED_BACKENDS] region=1 layers=[8,12) backend=HTP0\n"
+                    "[PHONE_MIXED_BACKENDS] region=3 layers=[20,24) backend=GPUOpenCL\n",
                     encoding="utf-8")
                 return SimpleNamespace(returncode=0)
             capture = io.StringIO()
@@ -101,10 +103,12 @@ class RollingPlanTests(unittest.TestCase):
                                             512, prompt, 984, 1, 1)
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["npu_policy"], "STREAMING_2BANK")
+            self.assertEqual(result["physical_layout"], "G8,N4,G8,A4")
             text = capture.getvalue()
             self.assertIn("prompt=prompt_512_09.txt", text)
             self.assertIn("XC=64 XG=96 XN=128", text)
             self.assertIn("npu_weights=STREAMING_2BANK", text)
+            self.assertIn("physical=G8,N4,G8,A4", text)
 
 
 if __name__ == "__main__":
