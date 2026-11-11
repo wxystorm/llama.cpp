@@ -27,7 +27,8 @@ GROUPS = (128, 256, 512, 1024)
 CHUNKS = (32, 48, 56, 64, 80, 96, 112, 128, 160)
 COLUMNS = ("prompt", "group", "tokens_hint", "profile_version",
            "status", "attempt", "prefill_tps", "prefill_ms",
-           "plan_layout", "runtime_layout", "xc", "xg", "xp",
+           "plan_layout", "runtime_layout", "physical_layout",
+           "xc", "xg", "xp",
            "npu_policy", "plan_applied", "predicted_ms", "result_path")
 
 
@@ -123,6 +124,33 @@ def parse_npu_policy(stderr: Path) -> str:
             if "[PHONE_NPU_PLAN]" in line and "event=INSTALL" in line:
                 policy = policy if policy != "NONE" else "PLAN_HTP"
     return policy
+
+
+def physical_layout(runtime: str, stderr: Path) -> str:
+    """Derive concrete N/A from PC's per-Region HTP/OpenCL selection log.
+
+    A legacy P stage remains P if no authoritative backend log exists.
+    Never infer that an unlogged Phone stage executed on the NPU.
+    """
+    if not runtime or not stderr.is_file():
+        return runtime
+    mapping: dict[int, str] = {}
+    with stderr.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if "[PHONE_MIXED_BACKENDS]" not in line:
+                continue
+            match = re.search(r"\\bregion=(\\d+)\\b.*?\\bbackend=(HTP0|GPUOpenCL)\\b", line)
+            if match:
+                mapping[int(match.group(1))] = (
+                    "N" if match.group(2) == "HTP0" else "A")
+    physical = []
+    for region, stage in enumerate(runtime.split(",")):
+        stage = stage.strip()
+        if stage.startswith("P") and region in mapping:
+            physical.append(mapping[region] + stage[1:])
+        else:
+            physical.append(stage)
+    return ",".join(physical)
 
 
 def collect_run(worker_root: Path) -> tuple[dict, Path]:
@@ -227,6 +255,8 @@ def run_one(args: argparse.Namespace, root: Path, out: Path,
         "prefill_ms": raw.get("prefill_ms"),
         "plan_layout": raw.get("plan_layout"),
         "runtime_layout": raw.get("runtime_layout"),
+        "physical_layout": physical_layout(
+            raw.get("runtime_layout") or raw.get("plan_layout", ""), worker_log),
         "xc": raw.get("xc"), "xg": raw.get("xg"), "xp": raw.get("xp"),
         "npu_policy": parse_npu_policy(worker_log),
         "plan_applied": raw.get("plan_applied"),
@@ -238,7 +268,7 @@ def run_one(args: argparse.Namespace, root: Path, out: Path,
         row["status"] = "NO_PLAN"
     print(f"[PROMPT_PLAN] prompt={prompt.name} status={row['status']} "
           f"applied={row['plan_applied']} layout={row['plan_layout']} "
-          f"runtime={row['runtime_layout']} "
+          f"runtime={row['runtime_layout']} physical={row['physical_layout']} "
           f"XC={row['xc']} XG={row['xg']} XN={row['xp']} "
           f"npu_weights={row['npu_policy']} predicted_ms={row['predicted_ms']}",
           flush=True)
