@@ -57,6 +57,8 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV",
     "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
     "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
+    "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
+    "LLAMA_REGION_RING_PHONE_HTP_ONLY",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -72,7 +74,8 @@ RESULT_COLUMNS = (
     "bank_refills", "bank_h2d_ms", "bank_gpu_wait_ms",
     "bank_mover_wall_ms", "gpu_weight_stage_ms",
     "plan_predicted_ms", "plan_baseline_predicted_ms",
-    "phone_native_profile_points", "error", "result_file",
+    "phone_native_profile_points", "early_weights_status",
+    "early_weights_regions", "early_weights_wall_ms", "error", "result_file",
 )
 
 
@@ -128,7 +131,8 @@ def default_out(args) -> Path:
             args.xc == CHUNK_TOKENS and args.xg == CHUNK_TOKENS and
             args.xp == CHUNK_TOKENS and args.n_predict == 1 and
             not args.force_small_batch_mover and not args.boost_bank_mover and
-            not args.no_mmap and args.inter_prompt_delay_seconds == 5):
+            not args.no_mmap and args.inter_prompt_delay_seconds == 5 and
+            not args.phone_weight_preload and not args.warmup):
         return Path("32b-g8p6-x128-n1-all40")  # normal-mode default
     slug = args.layout.lower().replace(",", "-")
     if len(slug) > 48:
@@ -143,6 +147,10 @@ def default_out(args) -> Path:
         suffix += "-nommap"
     if args.inter_prompt_delay_seconds != 5:
         suffix += f"-pause{args.inter_prompt_delay_seconds:g}s"
+    if args.phone_weight_preload:
+        suffix += "-phone-weights"
+    if args.warmup:
+        suffix += "-warmup"
     return Path(f"32b-{slug}-base{args.chunk}-xc{args.xc}-xg{args.xg}"
                 f"-xp{args.xp}-n{args.n_predict}{suffix}-all40")
 
@@ -454,6 +462,11 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
     if args.force_small_batch_mover:
         env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
+    if args.phone_weight_preload:
+        # llama-model.cpp starts region-stripe RPC preload concurrently with
+        # PC tensor loading, joins before Prefill and reuses Phone HTP cache.
+        env["LLAMA_REGION_RING_PHONE_HTP_ONLY"] = "1"
+        env["LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC"] = args.rpc
     if args.boost_bank_mover:
         # Existing Windows C++ thread-local hook requests ABOVE_NORMAL.
         # Only the CPU Bank Mover thread is affected, not process priority.
@@ -488,7 +501,9 @@ def execute(args, prompt, group, context, estimate, out: Path):
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
                              or key in ("LLAMA_REGION_RING_METRICS_FILE", "LLAMA_REGION_RING_COALESCE_TINY_TAIL",
                                         "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
-                                        "LLAMA_REGION_RING_PRIORITY_BANK_MOVER")
+                                        "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
+                                        "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
+                                        "LLAMA_REGION_RING_PHONE_HTP_ONLY")
                              or key in [e.split("=", 1)[0] for e in args.env]},
            "error": ""}
     result_file = trial / "result.json"
@@ -544,6 +559,12 @@ def get_args(argv=None):
                         help="native hardware Profile plus APPLY_WIDE planning per process")
     parser.add_argument("--force-small-batch-mover", action="store_true",
                         help="opt-in: enable GPU Bank Mover on short prefill, without changing decode")
+    parser.add_argument("--no-phone-weight-preload", action="store_true",
+                        help="disable model-load-time HTP preload (enabled for fixed Phone layouts)")
+    parser.add_argument("--skip-warmup", action="store_true",
+                        help="disable one unmeasured warm-up per invocation (enabled in fixed mode)")
+    parser.add_argument("--warmup-prompt", default=None,
+                        help="optional prompt file for unmeasured warm-up; default first scheduled prompt")
     parser.add_argument("--layout", default=None,
                         help="forced 64-layer G/[C]/P topology (default G8,P6 x4 + G8)")
     parser.add_argument("--chunk", type=int, default=None,
@@ -585,6 +606,10 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
+    if args.auto_plan and args.warmup_prompt is not None:
+        parser.error("--warmup-prompt requires fixed mode")
+    if args.skip_warmup and args.warmup_prompt is not None:
+        parser.error("--warmup-prompt cannot be combined with --skip-warmup")
     if args.force_small_batch_mover and (args.auto_plan or args.streaming != "on"):
         parser.error("--force-small-batch-mover requires fixed mode and --streaming on")
     if args.auto_plan and any(v is not None for v in
@@ -595,6 +620,10 @@ def get_args(argv=None):
         args.layout = normalize_layout(args.layout if args.layout is not None else FIXED_LAYOUT)
     except ValueError as exc:
         parser.error(str(exc))
+    has_phone = any(part.startswith("P") for part in args.layout.split(","))
+    args.phone_weight_preload = (not args.auto_plan and has_phone and
+                                 not args.no_phone_weight_preload)
+    args.warmup = not args.auto_plan and not args.skip_warmup
     if args.force_small_batch_mover and sum(
             part.startswith("G") for part in args.layout.split(",")) < 2:
         parser.error("--force-small-batch-mover requires at least two GPU Regions")
@@ -658,6 +687,9 @@ def main(argv=None):
         raise ValueError("Unknown --only-prompt file")
     if args.limit:
         selections = selections[:args.limit]
+    if args.warmup_prompt is not None and args.warmup_prompt not in {
+            p.name for _, p in prompts}:
+        raise ValueError("Unknown --warmup-prompt file")
     if not selections:
         raise ValueError("No prompts selected")
     config = {"version": 2, "model": file_id(args.model), "exe": file_id(args.exe),
@@ -674,6 +706,10 @@ def main(argv=None):
               "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds}
     if args.boost_bank_mover:
         config["bank_mover_priority"] = "ABOVE_NORMAL"
+    if args.phone_weight_preload:
+        config["phone_weight_preload"] = "PC_MODEL_LOAD_RPC_ALL_PHONE_REGIONS"
+    if args.warmup:
+        config["warmup"] = {"enabled": True, "prompt": args.warmup_prompt or "FIRST_SCHEDULED"}
     if args.force_small_batch_mover:
         # Do not change the legacy off-mode signature; ON requires a
         # different experiment output and a freshly rebuilt engine.
@@ -714,7 +750,9 @@ def main(argv=None):
     print(f"[RUN_POLICY] between_prompts={args.inter_prompt_delay_seconds:g}s "
           f"retry_delay={args.retry_delay:g}s "
           f"bank_mover_priority={'ABOVE_NORMAL' if args.boost_bank_mover else 'DEFAULT'} "
-          f"no_mmap={int(args.no_mmap)}", flush=True)
+          f"no_mmap={int(args.no_mmap)} "
+          f"phone_preload={int(args.phone_weight_preload)} "
+          f"warmup={int(args.warmup)}", flush=True)
     if args.dry_run:
         for group, prompt in selections:
             ctx = decisions[prompt.name]["context"]
