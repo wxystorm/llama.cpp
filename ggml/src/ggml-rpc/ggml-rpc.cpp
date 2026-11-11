@@ -399,6 +399,7 @@ enum rpc_cmd {
     RPC_CMD_PHONE_OWNED_PLAN_REGISTER,
     RPC_CMD_PHONE_OWNED_KV_BIND,
     RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD,
+    RPC_CMD_PHONE_STAGE_PROFILE_GET,
     RPC_CMD_COUNT,
 };
 
@@ -439,6 +440,7 @@ static_assert(RPC_CMD_PHONE_AUTO_WAIT_CAPTURE == 52, "RPC_CMD_PHONE_AUTO_WAIT_CA
 static_assert(RPC_CMD_PHONE_OWNED_PLAN_REGISTER == 53, "Phone-owned plan RPC command index");
 static_assert(RPC_CMD_PHONE_OWNED_KV_BIND == 54, "Phone-owned KV bind RPC index");
 static_assert(RPC_CMD_PHONE_NPU_WEIGHT_PRELOAD == 55, "Phone HTP weight preload RPC index");
+static_assert(RPC_CMD_PHONE_STAGE_PROFILE_GET == 56, "Phone HTP stage profile RPC index");
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -517,6 +519,27 @@ struct rpc_msg_phone_npu_weight_preload_req {
 };
 static_assert(sizeof(rpc_msg_phone_npu_weight_preload_req) == 12,
               "Phone weight preload wire ABI changed");
+
+// Fixed-size bounded reply: one RPC per at most 32 completed HTP Chunks.
+// There is no RPC on the hot execution path. Host and Phone must be rebuilt
+// with patch 31. Only successful Phone service measurements are exported.
+struct rpc_msg_phone_stage_profile_get_req {
+    uint64_t run_id = 0;
+    uint32_t offset = 0;
+    uint32_t reserved = 0;
+};
+static constexpr uint32_t k_phone_stage_profile_batch = 32;
+struct rpc_msg_phone_stage_profile_get_rsp {
+    uint64_t run_id = 0;
+    uint32_t count = 0;
+    uint32_t total = 0;
+    ggml_rpc_phone_stage_sample samples[k_phone_stage_profile_batch] {};
+};
+static_assert(sizeof(ggml_rpc_phone_stage_sample) == 28,
+              "HTP Stage profile sample wire ABI changed");
+static_assert(sizeof(rpc_msg_phone_stage_profile_get_req) == 16,
+              "HTP Stage profile request wire ABI changed");
+
 
 // One canonical storage binding per Region; no KV payload or host pointer.
 struct rpc_msg_phone_owned_kv_bind_req {
@@ -4354,6 +4377,43 @@ static bool ggml_backend_rpc_phone_npu_weight_preload(
                &req, sizeof(req), &rsp, sizeof(rsp)) && rsp.accepted != 0;
 }
 
+// Read only the completed server-side measurements. This never triggers
+// computing and is called after the existing stream END acknowledgement.
+static bool ggml_backend_rpc_phone_stage_profile_get(
+        ggml_backend_t backend, uint64_t run_id, uint32_t offset,
+        ggml_rpc_phone_stage_sample * samples, uint32_t capacity,
+        uint32_t * received, uint32_t * total) {
+    if (received) { *received = 0; }
+    if (total) { *total = 0; }
+    if (!backend || !ggml_backend_is_rpc(backend) || !run_id ||
+            !samples || !received || !total ||
+            capacity < k_phone_stage_profile_batch) {
+        return false;
+    }
+    auto * ctx = static_cast<ggml_backend_rpc_context *>(backend->context);
+    if (!ctx) { return false; }
+    auto sock = get_socket_role(ctx->endpoint, rpc_socket_role::COMPUTE);
+    if (!sock || rpc_get_remote_patch(ctx->endpoint + "_compute") < 31) {
+        return false;
+    }
+    rpc_msg_phone_stage_profile_get_req req {};
+    req.run_id = run_id;
+    req.offset = offset;
+    rpc_msg_phone_stage_profile_get_rsp rsp {};
+    if (!send_rpc_cmd(sock, RPC_CMD_PHONE_STAGE_PROFILE_GET,
+                      &req, sizeof(req), &rsp, sizeof(rsp)) ||
+            rsp.run_id != run_id || rsp.count > k_phone_stage_profile_batch ||
+            offset > rsp.total || rsp.count > rsp.total - offset) {
+        return false;
+    }
+    for (uint32_t i = 0; i < rsp.count; ++i) {
+        samples[i] = rsp.samples[i];
+    }
+    *received = rsp.count;
+    *total = rsp.total;
+    return true;
+}
+
 // A plan is registered once per Phone Region before its individual Chunk
 // graphs. The RPC-visible client remains a simple transport; Phone owns the
 // authoritative validation and registry.
@@ -6139,6 +6199,8 @@ public:
                           rpc_msg_phone_input_push_ack & response);
     bool phone_input_stream_run(const rpc_msg_phone_input_stream_run_req & request);
     bool phone_npu_weight_preload(const rpc_msg_phone_npu_weight_preload_req & request);
+    bool phone_stage_profile_get(const rpc_msg_phone_stage_profile_get_req & request,
+                                 rpc_msg_phone_stage_profile_get_rsp & response);
     bool phone_owned_plan_register(const rpc_msg_phone_owned_plan_req & request);
     bool phone_owned_kv_bind(const rpc_msg_phone_owned_kv_bind_req & request);
     bool phone_auto_task_register(const rpc_msg_phone_auto_task_req & request);
@@ -6644,6 +6706,10 @@ private:
     std::mutex phone_auto_mutex;
     std::condition_variable phone_auto_cv;
     std::map<phone_auto_key, std::shared_ptr<phone_auto_job>> phone_auto_jobs;
+    // Completion-side immutable history; bounded to eight recent RUNs.
+    // Protected by phone_auto_mutex, not the HTP backend lock.
+    std::map<uint64_t, std::vector<ggml_rpc_phone_stage_sample>>
+        phone_stage_profile_completed;
     std::map<std::pair<uint64_t, uint32_t>, uint32_t> phone_auto_next_chunk;
     std::thread phone_auto_prepare_thread;
     std::thread phone_auto_compute_thread;
@@ -7500,11 +7566,31 @@ bool rpc_server::phone_input_stream_run(
     if (!request.active) {
         {
             std::lock_guard<std::mutex> lock(phone_auto_mutex);
+            std::vector<ggml_rpc_phone_stage_sample> completed_samples;
+            const char * stage_enabled = std::getenv("GGML_RPC_REAL_STAGE_PROFILE");
+            const bool collect_stage = stage_enabled && std::strcmp(stage_enabled, "1") == 0;
             for (auto it = phone_auto_jobs.begin();
                     it != phone_auto_jobs.end();) {
                 if (std::get<0>(it->first) == request.run_id) {
                     auto & job = *it->second;
                     ++auto_jobs_total;
+                    if (collect_stage && job.state == phone_auto_status::COMPLETE &&
+                            job.upload_begin_us > 0 && job.upload_done_us >= job.upload_begin_us &&
+                            job.prepared.has_value() &&
+                            job.prepared->prepare_begin_us > 0 &&
+                            job.prepared->prepare_end_us >= job.prepared->prepare_begin_us &&
+                            job.compute_begin_us > 0 && job.compute_end_us > job.compute_begin_us) {
+                        ggml_rpc_phone_stage_sample sample {};
+                        sample.region = job.request.key.region;
+                        sample.chunk = job.request.key.chunk;
+                        sample.tokens = job.request.n_tokens;
+                        sample.token_begin = job.request.token_begin;
+                        sample.upload_ms = (job.upload_done_us - job.upload_begin_us) / 1000.0f;
+                        sample.prepare_ms = (job.prepared->prepare_end_us -
+                                             job.prepared->prepare_begin_us) / 1000.0f;
+                        sample.compute_ms = (job.compute_end_us - job.compute_begin_us) / 1000.0f;
+                        completed_samples.push_back(sample);
+                    }
                     // Opt-in exact phone monotonic timestamps. Emit only
                     // at stream teardown, never in the hot Chunk path.
                     // P2C socket times are separately emitted by the sender
@@ -7651,6 +7737,14 @@ bool rpc_server::phone_input_stream_run(
                     ++it;
                 } else { ++it; }
             }
+            if (collect_stage) {
+                phone_stage_profile_completed[request.run_id] =
+                    std::move(completed_samples);
+                while (phone_stage_profile_completed.size() > 8) {
+                    phone_stage_profile_completed.erase(
+                        phone_stage_profile_completed.begin());
+                }
+            }
             // Keep predecessor records alive through overlap accounting.
             for (auto it = phone_auto_jobs.begin();
                     it != phone_auto_jobs.end();) {
@@ -7731,6 +7825,28 @@ bool rpc_server::phone_input_stream_run(
 // Preload immutable Transformer weights into the correct HTP FastRPC
 // sessions. No input RUN or KV cache is allocated here, and the later
 // Phone-owned Plan still performs its per-request graph/KV validation.
+bool rpc_server::phone_stage_profile_get(
+        const rpc_msg_phone_stage_profile_get_req & request,
+        rpc_msg_phone_stage_profile_get_rsp & response) {
+    response = {};
+    response.run_id = request.run_id;
+    if (!request.run_id) { return false; }
+    std::lock_guard<std::mutex> lock(phone_auto_mutex);
+    const auto it = phone_stage_profile_completed.find(request.run_id);
+    if (it == phone_stage_profile_completed.end()) { return false; }
+    const auto & values = it->second;
+    if (values.size() > UINT32_MAX || request.offset > values.size()) {
+        return false;
+    }
+    response.total = static_cast<uint32_t>(values.size());
+    response.count = static_cast<uint32_t>(std::min<size_t>(
+        k_phone_stage_profile_batch, values.size() - request.offset));
+    for (uint32_t i = 0; i < response.count; ++i) {
+        response.samples[i] = values[request.offset + i];
+    }
+    return true;
+}
+
 bool rpc_server::phone_npu_weight_preload(
         const rpc_msg_phone_npu_weight_preload_req & request) {
     // A single explicit reset RPC precedes the per-Region preload sequence
@@ -15379,6 +15495,14 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
+            case RPC_CMD_PHONE_STAGE_PROFILE_GET: {
+                rpc_msg_phone_stage_profile_get_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_stage_profile_get_rsp response {};
+                if (!server.phone_stage_profile_get(request, response) ||
+                        !send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
             case RPC_CMD_PHONE_OWNED_KV_BIND: {
                 rpc_msg_phone_owned_kv_bind_req request {};
                 if (!recv_msg(sock, &request, sizeof(request))) { return; }
@@ -15866,6 +15990,14 @@ static void rpc_serve_client(std::shared_ptr<rpc_server> server_ptr, socket_ptr 
                 response.accepted =
                     server.phone_npu_weight_preload(request) ? 1 : 0;
                 if (!send_msg(sock, &response, sizeof(response))) { return; }
+                break;
+            }
+            case RPC_CMD_PHONE_STAGE_PROFILE_GET: {
+                rpc_msg_phone_stage_profile_get_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) { return; }
+                rpc_msg_phone_stage_profile_get_rsp response {};
+                if (!server.phone_stage_profile_get(request, response) ||
+                        !send_msg(sock, &response, sizeof(response))) { return; }
                 break;
             }
             case RPC_CMD_PHONE_OWNED_KV_BIND: {
@@ -17026,6 +17158,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_NPU_WEIGHT_PRELOAD_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_npu_weight_preload);
+    }
+    if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_GET_PROC) == 0) {
+        return reinterpret_cast<void *>(ggml_backend_rpc_phone_stage_profile_get);
     }
     if (std::strcmp(name, GGML_BACKEND_RPC_PHONE_OWNED_PLAN_REGISTER_PROC) == 0) {
         return reinterpret_cast<void *>(ggml_backend_rpc_phone_owned_plan_register);
