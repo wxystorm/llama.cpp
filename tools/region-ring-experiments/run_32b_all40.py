@@ -302,6 +302,13 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         found = re.findall(pattern, logs, re.IGNORECASE)
         return found[-1] if found else None
 
+    plan_error = last(
+        r"\[REGION_RING_PLAN_APPLY\][^\n]*\breason=([A-Z0-9_]+)")
+    plan_memory_diag = last(
+        r"\[REGION_RING_HTP_MEMORY_DIAG\][^\n]*")
+    plan_profile_kv = last(
+        r"\[REGION_RING_PROFILE_KV\][^\n]*")
+
     pre = last(r"prompt eval time\s*=\s*" + METRIC_RX + r"\s*ms\s*/\s*(\d+)\s*tokens")
     dec = last(r"(?<!prompt )eval time\s*=\s*" + METRIC_RX + r"\s*ms\s*/\s*(\d+)\s*runs")
     pre_ms = perf.get("prefill_ms", float(pre[0]) if pre else None)
@@ -376,6 +383,9 @@ def parse_metrics(folder: Path, exit_code, wall_ms, auto_plan=False,
         "ring_complete": ring_complete,
         "layout": ring[0].get("layout", "") if ring else "",
         "plan_mode": "native-auto" if auto_plan else "fixed",
+        "plan_reject_reason": plan_error if auto_plan else None,
+        "plan_memory_diag": plan_memory_diag if auto_plan else None,
+        "plan_profile_kv": plan_profile_kv if auto_plan else None,
         "plan_applied": planner.get("applied") if auto_plan else status == "PASS",
         "plan_source": planner.get("source", "") if auto_plan else "forced-skip-profile",
         "plan_layout": planner.get("selected_layout", "") if auto_plan else fixed_layout,
@@ -1170,6 +1180,11 @@ def main(argv=None):
                           f"XC={row.get('plan_xc')} XG={row.get('plan_xg')} "
                           f"XP={row.get('plan_xp')} "
                           f"predicted_ms={row.get('plan_predicted_ms')}", flush=True)
+                    if row["status"] != "PASS":
+                        print(f"  [PLAN_DIAG] reason={row.get('plan_reject_reason')}"
+                              f" {row.get('plan_memory_diag') or ''}", flush=True)
+                        if row.get("plan_profile_kv"):
+                            print(f"  {row['plan_profile_kv']}", flush=True)
                 if row["status"] == "PASS":
                     break
                 if retry < args.max_retries and args.retry_delay:
