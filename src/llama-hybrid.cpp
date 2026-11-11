@@ -11118,14 +11118,35 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
+        // HTP-only execution requires a verified GPU-tail plan, not a
+        // scoreable legacy Phone-final control. The old baseline can be
+        // unprofiled or too large for GPU banks. It is only a comparison
+        // reference, never a safety condition. Do not bypass any candidate
+        // memory, topology or exact-DAG verification.
+        const bool htp_gpu_tail_required =
+            flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+        const bool legacy_baseline_valid =
+            result.baseline_valid &&
+            std::isfinite(result.baseline.wall_ms) &&
+            result.baseline.wall_ms > 0.0;
         if (!force_ab_requested &&
-                (!result.valid || !result.baseline_valid ||
-                 !(result.baseline.wall_ms > 0.0))) {
+                (!result.valid ||
+                 (!htp_gpu_tail_required && !legacy_baseline_valid))) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
-                "reason=NO_SCOREABLE_RUNTIME_PLAN "
-                "status=KEEP_BASELINE\n");
+                "reason=%s baseline_valid=%d candidate_valid=%d"
+                " status=KEEP_BASELINE\n",
+                !result.valid ? "NO_SCOREABLE_RUNTIME_PLAN" :
+                    "UNSCOREABLE_LEGACY_BASELINE",
+                legacy_baseline_valid ? 1 : 0,
+                result.valid ? 1 : 0);
             return false;
+        }
+        if (htp_gpu_tail_required && !legacy_baseline_valid) {
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_BASELINE] mode=APPLY_WIDE"
+                " source=HTP_ONLY baseline=UNSCOREABLE"
+                " action=VERIFY_CANDIDATE_GPU_TAIL\n");
         }
 
         for (size_t i = 0; i < result.top.size(); ++i) {
