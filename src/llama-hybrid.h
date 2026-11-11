@@ -521,7 +521,8 @@ LLAMA_API int64_t llama_hybrid_ffn_shard_size(int64_t n_ff, ggml_type down_type,
 LLAMA_API bool llama_hybrid_profile_ffn(llama_hybrid_profile &        profile,
                                         const llama_hybrid_ffn_desc & desc,
                                         ggml_backend_t                cpu_backend,
-                                        ggml_backend_t                phone_backend);
+                                        ggml_backend_t                phone_backend,
+                                        bool htp_only_profile = false);
 
 LLAMA_API bool llama_hybrid_profile_moe_ffn(llama_hybrid_profile &         profile,
                                             const llama_hybrid_moe_desc &  desc,
@@ -540,14 +541,16 @@ LLAMA_API bool llama_hybrid_profile_attention(llama_hybrid_profile &         pro
                                               const llama_hybrid_attn_desc & desc,
                                               ggml_backend_t                 cpu_backend,
                                               ggml_backend_t                 phone_backend,
-                                              ggml_backend_t                 gpu_backend);
+                                              ggml_backend_t                 gpu_backend,
+                                              bool htp_only_profile = false);
 
 LLAMA_API bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
                                                const llama_hybrid_attn_desc & attn_desc,
                                                const llama_hybrid_ffn_desc &  ffn_desc,
                                                ggml_backend_t                 cpu_backend,
                                                ggml_backend_t                 phone_backend,
-                                               ggml_backend_t                 gpu_backend);
+                                               ggml_backend_t                 gpu_backend,
+                                               bool htp_only_profile = false);
 
 LLAMA_API bool llama_hybrid_profile_phone_blocks(llama_hybrid_profile &         profile,
                                                  const llama_hybrid_attn_desc & attn_desc,
