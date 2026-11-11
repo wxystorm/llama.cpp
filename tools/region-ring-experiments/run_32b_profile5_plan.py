@@ -40,6 +40,26 @@ def atomic_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def acquire_runner_lock(out: Path):
+    """Hold a cross-process single-runner lease until program exit."""
+    file = (out / ".runner.lock").open("a+b")
+    if file.seek(0, os.SEEK_END) == 0:
+        file.write(b"x")
+        file.flush()
+    file.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        file.close()
+        raise RuntimeError("PROFILE5_OUTPUT_LOCKED_BY_ANOTHER_RUNNER")
+    return file
+
+
 def expected_prompts(folder: Path) -> list[tuple[int, Path]]:
     items = [(g, folder / f"prompt_{g}_{i:02}.txt")
              for g in GROUPS for i in range(1, 11)]
@@ -328,6 +348,7 @@ def main() -> int:
               f"chunks={CHUNKS}", flush=True)
         return 0
     args.out.mkdir(parents=True, exist_ok=True)
+    run_lock = acquire_runner_lock(args.out)
     config_file = args.out / "run-config.json"
     settings = {"schema": 1, "model": str(args.model),
                 "model_sha256": sha256(args.model),
@@ -383,6 +404,7 @@ def main() -> int:
                for _, p in items)
     print(f"[PROFILE5_SUMMARY] PASS={done}/40 remaining={40-done} "
           f"csv={args.out / 'summary.csv'}", flush=True)
+    run_lock.close()
     return 0 if done == 40 or (args.limit and not attempted_failed) else 1
 
 
