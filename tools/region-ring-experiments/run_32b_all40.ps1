@@ -17,6 +17,9 @@ param(
     [ValidateSet("on", "off")][string] $Streaming = "on",
     [switch] $ForceSmallBatchMover,
     [switch] $BoostBankMover,
+    [switch] $NoPhoneWeightPreload,
+    [switch] $SkipWarmup,
+    [string] $WarmupPrompt = "",
     [int] $Batch = 2048,
     [int] $UBatch = 2048,
     [int] $NPredict = 1,
@@ -71,6 +74,11 @@ if ($PSBoundParameters.ContainsKey("XP")) { $arguments += @("--xp", "$XP") }
 if ($AutoPlan) { $arguments += "--auto-plan" }
 if ($ForceSmallBatchMover) { $arguments += "--force-small-batch-mover" }
 if ($BoostBankMover) { $arguments += "--boost-bank-mover" }
+if ($NoPhoneWeightPreload) { $arguments += "--no-phone-weight-preload" }
+if ($SkipWarmup) { $arguments += "--skip-warmup" }
+if (-not [string]::IsNullOrWhiteSpace($WarmupPrompt)) {
+    $arguments += @("--warmup-prompt", $WarmupPrompt)
+}
 if (-not [string]::IsNullOrWhiteSpace($RealStageProfileCsv)) {
     $arguments += @("--real-stage-profile-csv", $RealStageProfileCsv)
 }
