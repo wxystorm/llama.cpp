@@ -10133,9 +10133,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     int layers, int tokens, bool terminal, double & ms) {
                     // The actual registration callback is preserved as a
                     // fallback when a measured shape is absent.
+                    // Registration builds HTP graphs with padded KV
+                    // metadata (minimum 256), not KV=stage Chunk length.
+                    // Reuse the corresponding independently calibrated
+                    // Graph setup; otherwise keep the nonzero cost prior.
+                    const int padded_kv =
+                        std::max(256, ((tokens + 255) / 256) * 256);
                     if (measured->estimate(
                             llama_region_ring_device::PHONE, layers,
-                            tokens, tokens, terminal, setup_kind, ms)) {
+                            tokens, padded_kv, terminal, setup_kind, ms)) {
                         return true;
                     }
                     return llama_ring_planner::phone_registration_cost(
