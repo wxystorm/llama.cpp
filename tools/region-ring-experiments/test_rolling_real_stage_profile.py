@@ -24,7 +24,7 @@ class RollingStageProfileTests(unittest.TestCase):
             for d, depth, tokens, kv, compute in (
                     ("CPU", 2, 32, 32, 4.0),
                     ("GPU", 2, 32, 32, 2.0),
-                    ("PHONE", 4, 96, 96, 50.0),
+                    ("PHONE", 4, 96, 256, 50.0),
                     ("PHONE", 2, 64, 256, 25.0)):
                 writer.writerow(dict(device=d, layers=depth,
                                      tokens=tokens, kv_tokens=kv,
@@ -108,7 +108,8 @@ class RollingStageProfileTests(unittest.TestCase):
             self.assertAlmostEqual(float(phone[1]["compute_ms"]), 33.0)
             self.assertEqual(phone[1]["terminal"], "0")
             self.assertEqual(phone[1]["samples"], "5")
-            first_sha = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+            good_snapshot = csv_path.read_bytes()
+            first_sha = hashlib.sha256(good_snapshot).hexdigest()
             again, meta2, created2 = profile_snapshot(root, 1, 5)
             self.assertFalse(created2)
             self.assertEqual(again, csv_path)
@@ -118,7 +119,7 @@ class RollingStageProfileTests(unittest.TestCase):
                 profile_snapshot(root, 1, 5)
             # Restore profile and verify that a changed independent baseline
             # also invalidates a persisted epoch.
-            csv_path.write_bytes(again.read_bytes())
+            csv_path.write_bytes(good_snapshot)
             baseline.write_text("stale", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "positive service measurements"):
                 profile_snapshot(root, 1, 5)
