@@ -10904,8 +10904,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
+        const char * htp_plan_env =
+            std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+        const bool htp_only_auto = !forced_ab &&
+            htp_plan_env != nullptr &&
+            std::strcmp(htp_plan_env, "1") == 0;
         bool boundary_tensor_selected = false;
-        if (!forced_ab && !best.cpu_optional_seed) {
+        if (!forced_ab && !best.cpu_optional_seed && !htp_only_auto) {
             // The new Full-Frame Sender and directional Tensor return workers
             // are mutually exclusive runtime modes; do not score impossible
             // directional refiner candidates while the Full stream is on.
@@ -11021,6 +11026,91 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
+        bool htp_only_tail_selected = false;
+        if (htp_only_auto) {
+            // Preserve the proven CPU-transport HTP-only execution contract:
+            // Phone-only transformer layers followed by a PC GPU tail/head.
+            // Reuse E/Memory/Beam survivors and the full DAG score, rather
+            // than creating an independent NPU/Adreno search.
+            auto tail_model = model;
+            tail_model.phone_autonomous_final = false;
+            double fastest = std::numeric_limits<double>::infinity();
+            std::string last_reason = "NO_PHONE_FINAL_CANDIDATES";
+            std::vector<llama_ring_planner::candidate> parents = result.top;
+            if (parents.empty()) {
+                parents.push_back(result.selected);
+            }
+            for (const auto & parent : parents) {
+                std::vector<llama_region_ring_region> base;
+                if (!llama_ring_planner::make_regions(
+                        parent, model.layers, base) ||
+                        base.size() < 3 ||
+                        base.back().device !=
+                            llama_region_ring_device::PHONE) {
+                    continue;
+                }
+                const int depth =
+                    base.back().layer_end - base.back().layer_begin;
+                for (int tail = 1; tail <= std::min(4, depth); ++tail) {
+                    auto shape = base;
+                    const int tail_begin = model.layers - tail;
+                    if (tail == depth) {
+                        shape.pop_back();
+                    } else {
+                        shape.back().layer_end = tail_begin;
+                    }
+                    shape.emplace_back(
+                        llama_region_ring_device::GPU,
+                        tail_begin, model.layers);
+                    if (!llama_region_ring_apply_topology_compatible(
+                            shape, model.layers) ||
+                            std::none_of(shape.begin(), shape.end(),
+                                [](const auto & region) {
+                                    return region.device ==
+                                        llama_region_ring_device::PHONE;
+                                })) {
+                        continue;
+                    }
+                    auto candidate = parent;
+                    candidate.concrete_regions = shape;
+                    if ((tail_model.memory_feasible &&
+                         !tail_model.memory_feasible(candidate)) ||
+                        (tail_model.region_memory_feasible &&
+                         !tail_model.region_memory_feasible(shape))) {
+                        last_reason = "MEMORY_BUDGET";
+                        continue;
+                    }
+                    std::string reason;
+                    if (!llama_ring_planner::simulate(
+                            tail_model, shape, candidate, &reason)) {
+                        last_reason = reason.empty() ?
+                            "DAG_PROFILE" : reason;
+                        continue;
+                    }
+                    if (candidate.wall_ms < fastest) {
+                        fastest = candidate.wall_ms;
+                        best = std::move(candidate);
+                        best_regions = std::move(shape);
+                        htp_only_tail_selected = true;
+                    }
+                }
+            }
+            if (!htp_only_tail_selected) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_HTP_TAIL] status=REJECT"
+                    " reason=%s action=NO_UNVERIFIED_PHONE_FINAL\n",
+                    last_reason.c_str());
+                return false;
+            }
+            model.phone_autonomous_final = false;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_HTP_TAIL] status=PASS"
+                " layout=%s predicted_ms=%.3f"
+                " rank=FULL_PROMPT_DAG rpc_visible=CPU\n",
+                llama_region_ring_layout_string(best_regions).c_str(),
+                best.wall_ms);
+        }
+
         const bool best_has_directional =
             llama_region_ring_has_directional_stages(best_regions);
         const bool best_topology_ok =
@@ -11033,7 +11123,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 llama_region_ring_apply_topology_compatible(
                     best_regions, model.layers);
         if (!best_topology_ok ||
-                (!forced_ab &&
+                (!forced_ab && !htp_only_tail_selected &&
                  best_regions.back().device !=
                      llama_region_ring_device::PHONE) ||
                 best.tail_c != 0 || best.tail_g != 0) {
@@ -11170,6 +11260,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
             forced_ab ? "FORCED_AB" :
+            htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
             best.cpu_optional_seed ? "AUTO_RUNTIME_V2_CPU_OPTIONAL" :
@@ -11198,6 +11289,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 std::ofstream metrics(metrics_path, std::ios::app);
                 if (metrics) {
                     const bool accepted = forced_ab ||
+                        htp_only_tail_selected ||
                         (!identical && improvement_pct >= min_gain_pct);
                     metrics << std::fixed << std::setprecision(4)
                             << "{\"type\":\"planner\","
@@ -11205,6 +11297,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "\"mode\":\"apply-wide\","
                             << "\"source\":\""
                             << (forced_ab ? "forced" :
+                                htp_only_tail_selected ? "htp_gpu_tail" :
                                 boundary_tensor_selected ? "tensor" :
                                 best.local_refined ?
                                     (best.local_from_prefix ?
@@ -11398,6 +11491,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "layout=%s XC=%d XG=%d XP=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
             forced_ab ? "FORCED_AB" :
+            htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
             best.cpu_optional_seed ? "AUTO_RUNTIME_V2_CPU_OPTIONAL" :
