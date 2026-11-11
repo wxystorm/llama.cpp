@@ -110,8 +110,10 @@ def extract(cases: list[Path], rpc_log: Path | None) -> tuple[list[dict], dict]:
                     setup[(int(p["region"]), int(p["chunk"]))] = p
                 except (KeyError, ValueError):
                     continue
-        final_region = max((int(t["region"]) for t in traces
-                            if t.get("device") == "PHONE"), default=-1)
+        # PHONE is terminal only if the *whole* plan ends on Phone.
+        # HTP-only auto plans have a final GPU tail; the last NPU Region
+        # is therefore nonterminal even though it is the last Phone one.
+        final_region = max((int(t["region"]) for t in traces), default=-1)
         for t in traces:
             d = t.get("device")
             if d not in ("CPU", "GPU", "PHONE"):
