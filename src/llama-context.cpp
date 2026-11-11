@@ -8378,6 +8378,54 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             LLAMA_LOG_ERROR("[PHONE_INPUT_STREAM] event=END status=FAIL\n");
             ready.cancel();
         }
+        // The Phone has fully drained its HTP jobs and stored immutable
+        // per-Chunk service samples. Read them only here, after RUN END,
+        // never on the hot Chunk path. The PC-run ID matches the Phone's.
+        if (stage_profile_enabled && phone_htp_only &&
+                phone_input_stream_enabled) {
+            auto * profile_dev = ggml_backend_get_device(phone_rpc_backend);
+            auto * profile_reg = profile_dev ?
+                ggml_backend_dev_backend_reg(profile_dev) : nullptr;
+            auto profile_get = profile_reg ?
+                reinterpret_cast<ggml_backend_rpc_phone_stage_profile_get_t>(
+                    ggml_backend_reg_get_proc_address(
+                        profile_reg, GGML_BACKEND_RPC_PHONE_STAGE_PROFILE_GET_PROC)) :
+                nullptr;
+            bool complete_profile = profile_get != nullptr;
+            uint32_t offset = 0;
+            uint32_t total = 0;
+            while (complete_profile) {
+                std::array<ggml_rpc_phone_stage_sample, 32> samples {};
+                uint32_t count = 0;
+                if (!profile_get(phone_rpc_backend, phone_input_push_run_id,
+                                 offset, samples.data(), (uint32_t) samples.size(),
+                                 &count, &total) ||
+                        count > samples.size() || offset + count > total ||
+                        (count == 0 && offset < total)) {
+                    complete_profile = false;
+                    break;
+                }
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto & p = samples[i];
+                    LLAMA_LOG_INFO(
+                        "[REAL_STAGE_PROFILE] side=PHONE phase=CHUNK"
+                        " source=RPC_HTP run=%" PRIu64
+                        " region=%u chunk=%u tokens=%u token_begin=%u"
+                        " upload_ms=%.3f prepare_ms=%.3f compute_ms=%.3f"
+                        " status=PASS\n",
+                        phone_input_push_run_id, p.region, p.chunk,
+                        p.tokens, p.token_begin, p.upload_ms,
+                        p.prepare_ms, p.compute_ms);
+                }
+                offset += count;
+                if (offset == total) { break; }
+            }
+            LLAMA_LOG_INFO(
+                "[REGION_RING_PHONE_PROFILE_PULL] run=%" PRIu64
+                " rows=%u total=%u status=%s\n",
+                phone_input_push_run_id, offset, total,
+                complete_profile ? "PASS" : "UNAVAILABLE");
+        }
         // Recover abandoned host landing buffers if execution was cancelled
         // while a future Chunk was already staged on Phone.
         if (phone_input_push_enabled) {
