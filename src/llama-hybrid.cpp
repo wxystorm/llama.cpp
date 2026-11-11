@@ -8889,6 +8889,25 @@ static bool llama_hybrid_calibrate_independent_ring(
                                 " reason=CACHE_MISSING_HTP path=%s\n", path);
                 return false;
             }
+            const std::string csv_path(path);
+            if (csv_path.find("independent-profile") != std::string::npos) {
+                std::string json_path = csv_path;
+                const auto suffix = json_path.rfind(".csv");
+                if (suffix != std::string::npos &&
+                        suffix + 4 == json_path.size()) {
+                    json_path.replace(suffix, 4, ".json");
+                } else {
+                    json_path += ".json";
+                }
+                std::ifstream saved(json_path);
+                if (!saved) {
+                    LLAMA_LOG_ERROR(
+                        "[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=CACHE_JSON_MISSING path=%s\n",
+                        json_path.c_str());
+                    return false;
+                }
+            }
             LLAMA_LOG_INFO(
                 "[INDEPENDENT_PROFILE] event=REUSE path=%s"
                 " mode=STANDALONE_BACKEND_GRID status=READY\n", path);
@@ -9075,8 +9094,15 @@ static bool llama_hybrid_calibrate_independent_ring(
     } else {
         json_path += ".json";
     }
-    std::ofstream json(json_path, std::ios::trunc);
-    if (json) {
+    const std::string json_tmp = json_path + ".tmp";
+    std::ofstream json(json_tmp, std::ios::trunc);
+    if (!json) {
+        LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=FAIL"
+                        " reason=JSON_OPEN_FAILED path=%s\n", json_tmp.c_str());
+        std::remove(path);
+        return false;
+    }
+    {
         json << std::fixed << std::setprecision(6);
         json << "{\"schema\":1,\"mode\":\"INDEPENDENT_BACKEND_PROFILE\","
              << "\"model\":{\"layers\":" << profile.n_layer
@@ -9116,6 +9142,17 @@ static bool llama_hybrid_calibrate_independent_ring(
         write_transfer("gpu_weight_h2d", profile.gpu_weight_h2d, false);
         write_transfer("gpu_to_pc", profile.gpu_to_pc, true);
         json << "}}\n";
+    }
+    json.flush();
+    const bool json_ok = json.good();
+    json.close();
+    if (!json_ok || std::rename(json_tmp.c_str(), json_path.c_str()) != 0) {
+        LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=FAIL"
+                        " reason=JSON_WRITE_OR_RENAME_FAILED path=%s\n",
+                        json_path.c_str());
+        std::remove(json_tmp.c_str());
+        std::remove(path);
+        return false;
     }
     LLAMA_LOG_INFO(
         "[INDEPENDENT_PROFILE] event=READY path=%s"
