@@ -1041,7 +1041,7 @@ def main(argv=None):
                 if epoch >= 1:
                     csv_file, meta, created = profile_snapshot(
                         args.out, epoch, args.profile_every,
-                        args.phone_profile_log)
+                        args.phone_profile_log, initial_stage_csv)
                     require_htp_stage_rows(csv_file)
                     args.real_stage_profile_csv = csv_file
                     if args.profile_epoch != epoch:
