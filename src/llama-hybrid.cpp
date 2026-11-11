@@ -10504,6 +10504,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     const bool have_layer_weights =
         profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
         weight_fallback != 0;
+    // Aggregate all memory callback outcomes without writing per-candidate
+    // logs in the hot search loop. They are calls, not unique layouts.
+    auto htp_memory_diag = std::make_shared<std::array<size_t, 7>>();
+    htp_memory_diag->fill(0);
     if (have_layer_weights) {
         const auto planner_layer_bytes =
             [&profile, weight_fallback](int l) -> size_t {
@@ -10579,11 +10583,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes, htp_session_guard,
-             htp_session_budget_bytes](
+             htp_session_budget_bytes, htp_memory_diag](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
                         candidate, model.layers, regions)) {
+                    ++(*htp_memory_diag)[0]; // invalid geometry
                     return false;
                 }
 
@@ -10612,6 +10617,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         const size_t session = phone_rank++ % htp_session_usage.size();
                         htp_session_usage[session] += region_weight + kv;
                         if (htp_session_usage[session] > htp_session_budget_bytes) {
+                            ++(*htp_memory_diag)[1]; // one HTP mapping
                             return false;
                         }
                     }
@@ -10633,6 +10639,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     std::array<size_t, 2> bank_peaks {};
                     if (!llama_ring_planner::gpu_weight_bank_peaks(
                             model, regions, bank_peaks)) {
+                        ++(*htp_memory_diag)[2]; // invalid bank geometry
                         return false;
                     }
                     usage[(size_t) llama_region_ring_device::GPU] +=
@@ -10671,9 +10678,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             usage[i] >
                                 (long double) free_bytes[i] *
                                 fraction[i]) {
+                        ++(*htp_memory_diag)[3 + i];
                         return false;
                     }
                 }
+                ++(*htp_memory_diag)[6];
                 return true;
 
             };
@@ -11020,6 +11029,17 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             model.gpu_weight_streaming ? 1 : 0,
             result.baseline_valid ? result.baseline.wall_ms : -1.0,
             result.valid ? 1 : 0);
+        }
+
+        if (flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED")) {
+            const auto & d = *htp_memory_diag;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_HTP_MEMORY_DIAG] geometry=%zu"
+                " session_map=%zu bank_shape=%zu"
+                " host_ram=%zu gpu_vram=%zu phone_ram=%zu"
+                " pass=%zu source=CANDIDATE_MEMORY_CALLBACK"
+                " status=COUNTED\n",
+                d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
         }
 
         // Experiment-only artifact: a single small CSV after planning has
