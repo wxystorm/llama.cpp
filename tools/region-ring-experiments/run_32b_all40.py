@@ -812,12 +812,53 @@ def require_htp_stage_rows(path: Path) -> int:
             points = list(csv.DictReader(stream))
     except (OSError, csv.Error) as exc:
         raise ValueError(f"Cannot read calibrated Stage Profile {path}: {exc}") from exc
-    phone = [p for p in points if p.get("device") == "PHONE"
-             and float(p.get("compute_ms") or 0.0) > 0.0]
+    try:
+        phone = [p for p in points if p.get("device") == "PHONE"
+                 and math.isfinite(float(p.get("compute_ms") or 0.0))
+                 and float(p.get("compute_ms") or 0.0) > 0.0]
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid numeric Stage Profile values in {path}") from exc
     if not phone:
         raise ValueError(f"No REAL HTP Stage measurements in {path}; "
                          "never substitute RPC CPU Profile for HTP compute")
     return len(phone)
+
+
+def verify_independent_profile(path: Path) -> int:
+    """Fail closed on stale/truncated standalone calibration artifacts.
+
+    A rolling epoch CSV is not a standalone Profile; validate the native
+    profile.json only for the initial independent G/C/N baseline.
+    """
+    npu_points = require_htp_stage_rows(path)
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        points = list(csv.DictReader(stream))
+    for backend in ("CPU", "GPU", "PHONE"):
+        if not any(p.get("device") == backend and
+                   math.isfinite(float(p.get("compute_ms") or 0.0)) and
+                   float(p.get("compute_ms") or 0.0) > 0.0 for p in points):
+            raise ValueError(f"Independent Profile missing measured {backend} "
+                             f"backend points: {path}")
+    json_path = path.with_suffix(".json")
+    try:
+        metadata = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Independent profile.json missing or invalid: "
+                         f"{json_path}") from exc
+    if (metadata.get("schema") != 1 or
+            metadata.get("mode") != "INDEPENDENT_BACKEND_PROFILE" or
+            metadata.get("backends", {}).get("N") != "HTP_STRIPED" or
+            len(metadata.get("stage_points", [])) != len(points)):
+        raise ValueError(f"Independent profile.json does not match Stage CSV: "
+                         f"{json_path}")
+    network = metadata.get("transfers", {})
+    for direction in ("pc_to_phone", "phone_to_pc", "gpu_weight_h2d"):
+        values = network.get(direction, [])
+        if not any(int(v.get("bytes", 0)) > 0 and
+                   0 < float(v.get("ms", 0)) < math.inf for v in values):
+            raise ValueError(f"Independent Profile has no measured {direction} "
+                             f"transport/H2D curve: {json_path}")
+    return npu_points
 
 
 def main(argv=None):
@@ -969,7 +1010,7 @@ def main(argv=None):
                       " source=INDEPENDENT_BACKEND_GRID", flush=True)
             if user_stage_csv is None:
                 if independent.is_file():
-                    count = require_htp_stage_rows(independent)
+                    count = verify_independent_profile(independent)
                     print(f"[PROFILE] event=INDEPENDENT_REUSE"
                           f" npu_points={count} csv={independent}", flush=True)
                 else:
@@ -1083,22 +1124,26 @@ def main(argv=None):
                         user_stage_csv is None and
                         args.profile_epoch == 0):
                     independent = args.out / "independent-profile" / "profile.csv"
-                    if independent.is_file():
-                        count = require_htp_stage_rows(independent)
+                    profile_error = None
+                    try:
+                        count = verify_independent_profile(independent)
+                    except (OSError, ValueError, TypeError) as exc:
+                        profile_error = str(exc)
+                    if profile_error is None:
                         if retry == 0 and i == 1:
                             print(f"[PROFILE] event=INDEPENDENT_READY"
                                   f" npu_points={count}"
                                   f" json={independent.with_suffix('.json')}", flush=True)
                     elif row["status"] == "PASS":
                         row["status"] = "FAIL"
-                        row["error"] = "PROFILE_NOT_CREATED"
+                        row["error"] = f"INDEPENDENT_PROFILE_INVALID: {profile_error}"
                         # execute() persists result.json itself. Rewrite it
                         # too; otherwise resume incorrectly counts this as
-                        # PASS despite lacking a standalone backend Profile.
+                        # PASS despite invalid standalone Profile data.
                         save_json(Path(row["result_file"]), row)
                         counts = write_summary(args.out, prompts)
                         print("[INDEPENDENT_PROFILE] status=FAIL"
-                              " reason=NO_CALIBRATED_CSV", flush=True)
+                              f" reason={profile_error}", flush=True)
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
