@@ -1656,6 +1656,110 @@ static void test_resource_aware_cancellation_wakes_filtered_worker() {
           "cancel failed to wake worker filtered on unavailable Bank");
 }
 
+
+static void test_drain_first_cycle_gpu_priority() {
+    // A/G0 -> Phone -> B/G2 -> Phone -> C/G4. Simulate an older B Chunk
+    // entering GPU READY before a later A Chunk. Strict FIFO would run B,
+    // delaying A's Bank release; drain-first must complete A first.
+    const std::vector<llama_region_ring_region> regions {
+        {llama_region_ring_device::GPU,   0, 1},
+        {llama_region_ring_device::PHONE, 1, 2},
+        {llama_region_ring_device::GPU,   2, 3},
+        {llama_region_ring_device::PHONE, 3, 4},
+        {llama_region_ring_device::GPU,   4, 5},
+    };
+    auto select_next = [&](bool drain_first,
+                           bool bank_a_available) -> size_t {
+        llama_region_ring_ready ready(regions, 3, 1, 0, true);
+        auto a0 = ready.try_take(llama_region_ring_device::GPU);
+        check(a0 && a0->region == 0 && a0->chunk == 0,
+              "drain-first GPU fixture missing A0");
+        ready.complete(*a0);
+        auto a1 = ready.try_take(llama_region_ring_device::GPU);
+        check(a1 && a1->region == 0 && a1->chunk == 1,
+              "drain-first GPU fixture missing A1");
+        auto p0 = ready.try_take(llama_region_ring_device::PHONE);
+        check(p0 && p0->region == 1 && p0->chunk == 0,
+              "drain-first GPU fixture missing Phone0");
+        ready.complete(*p0); // B0 READY while A1 is in flight
+        ready.complete(*a1); // A2 READY later than B0
+        check(ready.queue_size(llama_region_ring_device::GPU) == 2,
+              "drain-first GPU fixture did not produce competing tasks");
+
+        const llama_region_ring_ready::resource_ready_predicate available =
+            [&](const llama_region_ring_task & task) {
+                return task.region != 0 || bank_a_available;
+            };
+        const auto selected = ready.wait_take(
+            llama_region_ring_device::GPU, regions.size(), -1,
+            available, drain_first);
+        check(selected && selected->chunk <= 2,
+              "drain-first GPU fixture failed to CLAIM a Chunk");
+        const size_t selected_region = selected->region;
+        ready.complete(*selected);
+        if (drain_first && bank_a_available) {
+            check(ready.region_done(0),
+                  "drain-first did not release Bank A before B finishes");
+            check(!ready.region_done(2),
+                  "drain-first completed B before the oldest GPU Region");
+        }
+        return selected_region;
+    };
+
+    check(select_next(false, true) == 2,
+          "legacy FIFO did not select earlier-enqueued B Chunk");
+    check(select_next(true, true) == 0,
+          "drain-first did not prioritize oldest executable A Cycle");
+    check(select_next(true, false) == 2,
+          "drain-first stalled instead of using resident B Bank");
+}
+
+static void test_drain_first_cycle_phone_priority() {
+    // P0 produces G1 -> P2. P2 Chunk0 reaches READY before a later P0
+    // Chunk; drain-first must prioritize P0 unless its input is missing.
+    const std::vector<llama_region_ring_region> regions {
+        {llama_region_ring_device::PHONE, 0, 1},
+        {llama_region_ring_device::GPU,   1, 2},
+        {llama_region_ring_device::PHONE, 2, 3},
+    };
+    auto select_next = [&](bool drain_first,
+                           bool first_phone_input_ready) -> size_t {
+        llama_region_ring_ready ready(regions, 3, 1);
+        auto p0 = ready.try_take(llama_region_ring_device::PHONE);
+        check(p0 && p0->region == 0 && p0->chunk == 0,
+              "drain-first Phone fixture missing P0 Chunk0");
+        ready.complete(*p0);
+        auto p1 = ready.try_take(llama_region_ring_device::PHONE);
+        check(p1 && p1->region == 0 && p1->chunk == 1,
+              "drain-first Phone fixture missing P0 Chunk1");
+        auto gpu = ready.try_take(llama_region_ring_device::GPU);
+        check(gpu && gpu->region == 1 && gpu->chunk == 0,
+              "drain-first Phone fixture missing GPU Chunk0");
+        ready.complete(*gpu); // downstream Phone P2c0 READY
+        ready.complete(*p1); // upstream Phone P0c2 READY later
+
+        const llama_region_ring_ready::resource_ready_predicate available =
+            [&](const llama_region_ring_task & task) {
+                return task.region != 0 || first_phone_input_ready;
+            };
+        const auto next = ready.wait_take(
+            llama_region_ring_device::PHONE,
+            2 /* Graph-affinity would prefer downstream P2 */,
+            1, available, drain_first);
+        check(next, "drain-first Phone fixture did not find READY task");
+        const size_t selected_region = next->region;
+        ready.complete(*next);
+        return selected_region;
+    };
+
+    check(select_next(false, true) == 2,
+          "legacy Phone affinity unexpectedly ignored downstream P2");
+    check(select_next(true, true) == 0,
+          "drain-first Phone scheduling failed to prioritize upstream P0");
+    check(select_next(true, false) == 2,
+          "drain-first Phone scheduling stalled on unavailable input");
+}
+
 static void test_pc_phone_overlap_intervals() {
     const std::vector<std::pair<int64_t, int64_t>> pc {
         {0, 20}, {30, 60}, {70, 90}
@@ -1713,6 +1817,10 @@ int main() {
         std::fprintf(stderr, "[REGION_RING_TEST] resource_phone_input=PASS\n");
         test_resource_aware_cancellation_wakes_filtered_worker();
         std::fprintf(stderr, "[REGION_RING_TEST] resource_cancel=PASS\n");
+        test_drain_first_cycle_gpu_priority();
+        std::fprintf(stderr, "[REGION_RING_TEST] drain_first_gpu=PASS\n");
+        test_drain_first_cycle_phone_priority();
+        std::fprintf(stderr, "[REGION_RING_TEST] drain_first_phone=PASS\n");
         test_gpu_weight_two_bank_policy();
         std::fprintf(stderr, "[REGION_RING_TEST] gpu_weight_two_bank_policy=PASS\n");
         test_phone_single_graph_ready_affinity();
