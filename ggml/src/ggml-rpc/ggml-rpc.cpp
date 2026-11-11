@@ -15170,6 +15170,47 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     response.free_mem = free;
     response.total_mem = total;
 
+    if (phone_npu_plan_controlled) {
+        // HTP_ONLY exposes CPU strictly as the RPC transport. On Android,
+        // ggml's CPU backend reported free == total (15113 MiB in the
+        // observed crash), not the physical RAM available to four
+        // independent HTP Sessions plus their repacked weights and Graphs.
+        // Return the kernel's actual MemAvailable with the unchanged RPC
+        // response format, and fail closed if unavailable. The PC Planner
+        // applies its own safety fraction to this live snapshot.
+        uint64_t mem_total_kib = 0;
+        uint64_t mem_available_kib = 0;
+#if defined(__linux__)
+        std::ifstream meminfo("/proc/meminfo");
+        std::string name;
+        std::string unit;
+        uint64_t kib = 0;
+        while (meminfo >> name >> kib >> unit) {
+            if (unit != "kB") { continue; }
+            if (name == "MemTotal:") { mem_total_kib = kib; }
+            if (name == "MemAvailable:") { mem_available_kib = kib; }
+            if (mem_total_kib != 0 && mem_available_kib != 0) { break; }
+        }
+#endif
+        if (mem_total_kib == 0 || mem_available_kib == 0 ||
+                mem_available_kib > mem_total_kib ||
+                mem_total_kib > UINT64_MAX / 1024) {
+            GGML_LOG_ERROR(
+                "[RPC_PHONE_PHYSICAL_MEMORY] status=REJECT"
+                " reason=PROC_MEMAVAILABLE_UNAVAILABLE"
+                " action=DO_NOT_TRUST_CPU_FREE_EQUALS_TOTAL\n");
+            return false;
+        }
+        response.free_mem = mem_available_kib * 1024;
+        response.total_mem = mem_total_kib * 1024;
+        GGML_LOG_INFO(
+            "[RPC_PHONE_PHYSICAL_MEMORY] source=PROC_MEMAVAILABLE"
+            " free_mib=%.1f total_mib=%.1f"
+            " shared_sessions=4 status=MEASURED\n",
+            response.free_mem / 1048576.0,
+            response.total_mem / 1048576.0);
+    }
+
     const double mib = 1024.0 * 1024.0;
     printf(
         "[RPC_DEVICE_MEMORY] device=%u backend=%s description=%s "

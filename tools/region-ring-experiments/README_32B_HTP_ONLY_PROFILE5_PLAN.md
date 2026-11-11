@@ -20,6 +20,71 @@ The general G/C/N/A scheme may omit any backend, including A. Do not
 misidentify the RPC-visible CPU transport as NPU compute. The standalone
 HTP-only mode has one RPC-visible backend and four *private* HTP sessions.
 
+## Crash guard: real Phone shared RAM and per-layer HTP Session memory
+
+The previously selected layout `G7,N9,G9,N7,G7,N9,G8,N1,G7` assigned
+26 Qwen3-32B layers to the Phone. Its four Region preloads finished,
+and the first three NPU Regions executed, but the Phone log stopped
+after HTP3's last Layer 56 weight cache hit, before its Graphless
+precompile result. The log **does not prove** whether Android low-memory
+killer, FastRPC mapping exhaustion, or an HTP driver fault terminated it.
+
+The Planner now validates each candidate using the Phone's real
+`MemAvailable` from `/proc/meminfo` (exposed by HTP-only RPC CPU
+transport). If the snapshot cannot be read, automatic HTP planning
+**fails closed**, rather than assuming `free == total`. This is a
+runtime memory snapshot, not a guarantee against Android memory
+pressure changing later.
+
+The model follows the Phone runtime's actual mapping: each NPU Region
+starts at the next HTP Session; each consecutive layer advances to the
+next session round-robin. Weights include a conservative 15% repack
+margin. Each **individual Phone layer** reserves persistent F16 KV,
+Graphless scratch sized from the actual Prompt's maximum Chunk and
+model dimensions, plus per-Session and shared staging headroom.
+The measured crash at Chunk 167 used 121.195 MiB scratch *per layer*;
+the conservative analytical estimate is about 144 MiB. The observed
+HTP op-batch virtual mapping limit was 3200 MiB per Session, so the
+default allowed estimate is **2880 MiB per Session**, not the previous
+3584 MiB. You may reduce this with
+`LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB` (256–3200); raising beyond
+3200 is intentionally rejected in this hardware-specific experimental
+mode. These are still estimates, not queried HTP allocator statistics.
+
+`[REGION_RING_HTP_MEMORY]` logs the current physical/shared capacity
+and `[REGION_RING_HTP_MEMORY_SELECTED]` logs the selected layout's
+per-Session layer counts and estimated memory usage. A candidate that
+fails either budget is rejected and Planner continues its usual search:
+no fixed NPU-layer cap and no modification to Profile V0.
+
+**Both PC and Phone must be rebuilt from the same new commit.** This
+change affects the Phone RPC `GET_DEVICE_MEMORY` response semantics.
+Restart the Phone server using the existing
+`GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1` / `-d CPU` HTP-only setup.
+
+After rebuilding, use a **fresh `-Out`** to keep benchmark executable
+identities and old results reproducible. To avoid calibrating a second
+time, reuse the already completed standalone V0 as an explicit CSV:
+
+```powershell
+.\tools\region-ring-experiments\run_32b_profile5_plan.ps1 `
+  -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
+  -Out ".\32b-htp-memory-guard-all40" `
+  -RealStageProfileCsv ".\32b-independent-profile-all40-final\independent-profile\profile.csv" `
+  -ProfileEvery 0 -ProfileGrid quick `
+  -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8 `
+  -Limit 1 -StopOnFail
+```
+
+The CSV and neighboring JSON must both be present and contain the
+previous successful G/C/N independent calibration. After smoke PASS,
+omit `-Limit 1` to run all remaining prompts in the same new Out.
+If the prior calibration is incomplete, omit `-RealStageProfileCsv`
+in a fresh Out and the runner will calibrate exactly once. The existing
+PC native startup fallback probes are distinct from the standalone V0.
+
 ## Exact workflow
 
 1. **Independent Profile**, only when there is no cached baseline or

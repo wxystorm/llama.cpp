@@ -1,6 +1,7 @@
 // Standalone, deterministic Planner DAG tests; no model, CUDA or Phone needed.
 #include "llama-region-ring-planner.h"
 #include "llama-region-ring-real-profile.h"
+#include "llama-region-ring-htp-memory.h"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -56,6 +57,106 @@ static model mock_profile() {
 }
 
 int main() {
+    // The crash's selected 32B layout had 26 Phone layers across
+    // N9,N7,N9,N1. The RPC server assigns a starting HTP Session to each
+    // Region and then stripes consecutive LAYERS, not whole Regions.
+    // Reproduce [HTP0..3] = [6,6,7,7]; a 3200 MiB HTP vmem with a 10%
+    // mapping margin must reject this 167-token plan *before* Phone preload.
+    {
+        htp_memory_limits limits;
+        limits.tokens = 167;
+        limits.xp = 192;
+        limits.n_embd = 5120;
+        limits.n_ff = 25600;
+        limits.kv_bytes_per_token_per_layer = 4096;
+        limits.shared_budget_bytes = 14000.0L * HTP_MEMORY_MIB;
+        const auto layer_bytes = [](int) {
+            return (size_t) 295 * 1024 * 1024;
+        };
+        const std::vector<llama_region_ring_region> failing = {
+            {device::GPU,   0,  7},
+            {device::PHONE, 7, 16},
+            {device::GPU,  16, 25},
+            {device::PHONE,25, 32},
+            {device::GPU,  32, 39},
+            {device::PHONE,39, 48},
+            {device::GPU,  48, 56},
+            {device::PHONE,56, 57},
+            {device::GPU,  57, 64},
+        };
+        htp_memory_usage failed_usage;
+        REQUIRE(!htp_plan_memory_feasible(
+            failing, limits, layer_bytes, &failed_usage));
+        REQUIRE(failed_usage.reject ==
+                htp_memory_reject::SESSION_MAPPING);
+        REQUIRE(failed_usage.phone_layers == 26);
+        REQUIRE(failed_usage.session_layers ==
+                (std::array<int, 4>{{6, 6, 7, 7}}));
+        // The old model assumed one Region owned one Session. A *single*
+        // N9 is actually spread over 3+2+2+2 HTP layers, and must not be
+        // excluded for the wrong per-Region weight concentration.
+        const std::vector<llama_region_ring_region> one_region = {
+            {device::GPU, 0, 7}, {device::PHONE, 7, 16},
+            {device::GPU, 16, 64},
+        };
+        htp_memory_usage one_usage;
+        REQUIRE(htp_plan_memory_feasible(
+            one_region, limits, layer_bytes, &one_usage));
+        REQUIRE(one_usage.session_layers ==
+                (std::array<int, 4>{{3, 2, 2, 2}}));
+
+        // A smaller four-Region plan should remain feasible, even though
+        // the bigger 26-layer plan is excluded by session capacity.
+        const std::vector<llama_region_ring_region> safe = {
+            {device::GPU,   0,  8},
+            {device::PHONE, 8, 12},
+            {device::GPU,  12, 20},
+            {device::PHONE,20, 24},
+            {device::GPU,  24, 32},
+            {device::PHONE,32, 36},
+            {device::GPU,  36, 44},
+            {device::PHONE,44, 48},
+            {device::GPU,  48, 64},
+        };
+        htp_memory_usage safe_usage;
+        REQUIRE(htp_plan_memory_feasible(
+            safe, limits, layer_bytes, &safe_usage));
+        REQUIRE(safe_usage.phone_layers == 16);
+        REQUIRE(safe_usage.session_layers ==
+                (std::array<int, 4>{{4, 4, 4, 4}}));
+        // The actual observed Graphless scratch was 121.195 MiB at 167
+        // tokens. Preserve a conservative per-layer scratch upper bound.
+        REQUIRE(safe_usage.scratch_bytes_per_layer >
+                121.195L * HTP_MEMORY_MIB);
+        htp_memory_limits short_prompt = limits;
+        short_prompt.tokens = 128;
+        htp_memory_usage short_usage;
+        REQUIRE(htp_plan_memory_feasible(
+            safe, short_prompt, layer_bytes, &short_usage));
+        REQUIRE(short_usage.scratch_bytes_per_layer <
+                safe_usage.scratch_bytes_per_layer);
+
+        // Four HTP mappings still draw from ONE Android MemAvailable budget.
+        htp_memory_limits tight_phone = limits;
+        tight_phone.shared_budget_bytes = 4000.0L * HTP_MEMORY_MIB;
+        htp_memory_usage tight_usage;
+        REQUIRE(!htp_plan_memory_feasible(
+            safe, tight_phone, layer_bytes, &tight_usage));
+        REQUIRE(tight_usage.reject == htp_memory_reject::SHARED_RAM);
+        // A plan with zero Phone layers must not reserve phantom HTP RAM.
+        const std::vector<llama_region_ring_region> gpu_only = {
+            {device::GPU, 0, 64},
+        };
+        htp_memory_usage empty_usage;
+        REQUIRE(htp_plan_memory_feasible(
+            gpu_only, limits, layer_bytes, &empty_usage));
+        REQUIRE(empty_usage.shared_total_bytes == 0.0L);
+        REQUIRE(empty_usage.phone_layers == 0);
+        // A missing weight size must fail closed, never enter with 0 cost.
+        REQUIRE(!htp_plan_memory_feasible(
+            safe, limits, [](int) { return size_t(0); }));
+    }
+
     // Tiny-tail coalescence must remain a uniform Phone-compatible width,
     // even though logically it removes one very small final Chunk.
     REQUIRE(llama_region_ring_coalesced_chunk_width(512, 128) == 128);

@@ -3,6 +3,7 @@
 #include "llama-hybrid-profile-cpu-threadpool.h"
 #include "llama-region-ring.h"
 #include "llama-region-ring-planner.h"
+#include "llama-region-ring-htp-memory.h"
 #include "llama-region-ring-real-profile.h"
 
 #include "../ggml/src/ggml-impl.h"
@@ -10508,6 +10509,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     // logs in the hot search loop. They are calls, not unique layouts.
     auto htp_memory_diag = std::make_shared<std::array<size_t, 7>>();
     htp_memory_diag->fill(0);
+    const bool htp_session_guard =
+        flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+    llama_ring_planner::htp_memory_limits htp_limits;
     if (have_layer_weights) {
         const auto planner_layer_bytes =
             [&profile, weight_fallback](int l) -> size_t {
@@ -10554,36 +10558,66 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             (long double) profile.kv_bytes_per_token_per_layer *
             (model.kv_start + model.tokens);
 
-        const bool htp_session_guard =
-            flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
-        // FastRPC sessions have independent mappings but share physical
-        // Phone RAM. The existing aggregate Phone budget still applies.
-        // This second guard prevents a single round-robin Session from
-        // exceeding a conservative virtual mapping / weight budget.
-        long double htp_session_budget_bytes = 3584.0L * 1048576.0L;
-        if (const char * raw = std::getenv(
-                "LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB")) {
-            char * end = nullptr;
-            const double mib = std::strtod(raw, &end);
-            if (end != raw && *end == '\0' && std::isfinite(mib) &&
-                    mib >= 256.0 && mib <= 4096.0) {
-                htp_session_budget_bytes = (long double) mib * 1048576.0L;
-            } else {
+        // Actual HTP RPC runtime: a Region chooses a starting FastRPC
+        // Session, then stripes EACH layer across HTP0..HTP3. Four virtual
+        // address spaces still share physical Android RAM.
+        // The observed HTP op batching vmem is 3200 MiB per Session.
+        // Leave 10% unmapped headroom and reserve Graphless scratch for
+        // every layer, not merely once per Phone Region.
+        long double htp_session_budget_bytes = 2880.0L * 1048576.0L;
+        if (htp_session_guard) {
+            if (!have_layer_weights || profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_HTP_MEMORY] status=REJECT"
-                    " reason=INVALID_SESSION_BUDGET value=%s\n", raw);
+                    " reason=HTP_WEIGHT_OR_PHYSICAL_RAM_UNAVAILABLE\n");
                 return false;
             }
+            if (const char * raw = std::getenv(
+                    "LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB")) {
+                char * end = nullptr;
+                const double mib = std::strtod(raw, &end);
+                if (end != raw && *end == '\0' && std::isfinite(mib) &&
+                        mib >= 256.0 && mib <= 3200.0) {
+                    htp_session_budget_bytes =
+                        (long double) mib * 1048576.0L;
+                } else {
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_HTP_MEMORY] status=REJECT"
+                        " reason=INVALID_SESSION_BUDGET value=%s"
+                        " max_mib=3200\n", raw);
+                    return false;
+                }
+            }
         }
+        htp_limits.session_budget_bytes = htp_session_budget_bytes;
+        // The phone server returns /proc/meminfo MemAvailable, NOT a
+        // fabricated free=total report from its CPU transport backend.
+        htp_limits.shared_budget_bytes =
+            (long double) profile.phone_free_mem * 0.85L;
+        htp_limits.tokens = model.tokens;
+        htp_limits.kv_start = model.kv_start;
+        htp_limits.n_embd = model.hidden;
+        htp_limits.n_ff = profile.n_ff;
+        htp_limits.kv_bytes_per_token_per_layer =
+            (long double) profile.kv_bytes_per_token_per_layer;
         if (htp_session_guard) {
-            LLAMA_LOG_INFO("[REGION_RING_HTP_MEMORY] sessions=4"
-                           " per_session_budget_mib=%.1Lf"
-                           " aggregate=PHONE_SHARED_RAM status=GUARDED\n",
-                           htp_session_budget_bytes / 1048576.0L);
+            LLAMA_LOG_INFO(
+                "[REGION_RING_HTP_MEMORY] sessions=4"
+                " per_session_budget_mib=%.1Lf"
+                " session_vmem_observed_mib=3200"
+                " phone_memavailable_mib=%.1f"
+                " shared_budget_mib=%.1Lf"
+                " weight_factor=%.2Lf"
+                " scratch=PER_LAYER_QWEN3_F32_BOUND"
+                " aggregate=PHONE_SHARED_RAM status=GUARDED\n",
+                htp_limits.session_budget_bytes / 1048576.0L,
+                profile.phone_free_mem / 1048576.0,
+                htp_limits.shared_budget_bytes / 1048576.0L,
+                htp_limits.weight_allocation_factor);
         }
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes, htp_session_guard,
-             htp_session_budget_bytes, htp_memory_diag](
+             htp_limits, htp_memory_diag](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
@@ -10593,32 +10627,19 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
 
                 std::array<long double, 3> usage {};
-                std::array<long double, 4> htp_session_usage {};
-                size_t phone_rank = 0;
                 for (const auto & region : regions) {
                     long double region_weight = 0.0L;
                     for (int l = region.layer_begin;
                             l < region.layer_end; ++l) {
                         region_weight +=
                             (long double) planner_layer_bytes(l);
-                        usage[(size_t) region.device] +=
-                            (long double)
-                                profile.kv_bytes_per_token_per_layer *
-                            (model.kv_start + model.tokens);
-                    }
-
-                    if (htp_session_guard &&
-                            region.device ==
-                                llama_region_ring_device::PHONE) {
-                        const long double kv =
-                            (long double) profile.kv_bytes_per_token_per_layer *
-                            (model.kv_start + model.tokens) *
-                            (region.layer_end - region.layer_begin);
-                        const size_t session = phone_rank++ % htp_session_usage.size();
-                        htp_session_usage[session] += region_weight + kv;
-                        if (htp_session_usage[session] > htp_session_budget_bytes) {
-                            ++(*htp_memory_diag)[1]; // one HTP mapping
-                            return false;
+                        if (!htp_session_guard ||
+                                region.device !=
+                                    llama_region_ring_device::PHONE) {
+                            usage[(size_t) region.device] +=
+                                (long double)
+                                    profile.kv_bytes_per_token_per_layer *
+                                (model.kv_start + model.tokens);
                         }
                     }
 
@@ -10630,9 +10651,41 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         // simultaneously resident in VRAM.
                         usage[(size_t) llama_region_ring_device::CPU] +=
                             region_weight;
-                    } else {
+                    } else if (!htp_session_guard ||
+                            region.device !=
+                                llama_region_ring_device::PHONE) {
+                        // HTP repacked weights/KV/scratch are added from the
+                        // actual per-LAYER session mapping below.
                         usage[(size_t) region.device] += region_weight;
                     }
+                }
+
+                if (htp_session_guard) {
+                    auto limits = htp_limits;
+                    limits.xp = candidate.xp;
+                    llama_ring_planner::htp_memory_usage htp_usage;
+                    const bool fits = llama_ring_planner::
+                        htp_plan_memory_feasible(
+                            regions, limits, planner_layer_bytes,
+                            &htp_usage);
+                    if (!fits) {
+                        switch (htp_usage.reject) {
+                            case llama_ring_planner::htp_memory_reject::
+                                    SESSION_MAPPING:
+                                ++(*htp_memory_diag)[1];
+                                break;
+                            case llama_ring_planner::htp_memory_reject::
+                                    SHARED_RAM:
+                                ++(*htp_memory_diag)[5];
+                                break;
+                            default:
+                                ++(*htp_memory_diag)[0];
+                                break;
+                        }
+                        return false;
+                    }
+                    usage[(size_t) llama_region_ring_device::PHONE] +=
+                        htp_usage.shared_total_bytes;
                 }
 
                 if (model.gpu_weight_streaming) {
@@ -10696,7 +10749,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             profile.layer_mirrored_bytes.size() ==
                 (size_t) profile.n_layer;
         if (have_directional_weight_split &&
-                directional_ratio_ok) {
+                directional_ratio_ok && !htp_session_guard) {
             boundary_memory_feasible =
                 [&profile, &model, c2p_pc_ratio, p2c_pc_ratio](
                     const std::vector<
@@ -11414,6 +11467,44 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "reason=SELECTED_RUNTIME_LAYOUT_BUILD_FAILED "
                 "status=KEEP_BASELINE\n");
             return false;
+        }
+
+        if (htp_session_guard) {
+            auto limits = htp_limits;
+            limits.xp = best.xp;
+            llama_ring_planner::htp_memory_usage selected_memory;
+            const auto layer_bytes = [&profile, weight_fallback](int l) {
+                return profile.layer_weight_bytes.size() ==
+                        (size_t) profile.n_layer ?
+                    profile.layer_weight_bytes[(size_t) l] :
+                    weight_fallback;
+            };
+            if (!llama_ring_planner::htp_plan_memory_feasible(
+                    best_regions, limits, layer_bytes, &selected_memory)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_HTP_MEMORY_SELECTED] status=REJECT"
+                    " reason=SELECTED_PLAN_EXCEEDS_SESSION_OR_SHARED_BUDGET\n");
+                return false;
+            }
+            const auto & u = selected_memory;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_HTP_MEMORY_SELECTED] status=ESTIMATED"
+                " phone_layers=%d session_layers=%d,%d,%d,%d"
+                " session_total_mib=%.1Lf,%.1Lf,%.1Lf,%.1Lf"
+                " scratch_per_layer_mib=%.1Lf"
+                " phone_total_mib=%.1Lf phone_budget_mib=%.1Lf"
+                " session_budget_mib=%.1Lf\n",
+                u.phone_layers,
+                u.session_layers[0], u.session_layers[1],
+                u.session_layers[2], u.session_layers[3],
+                u.session_total_bytes[0] / 1048576.0L,
+                u.session_total_bytes[1] / 1048576.0L,
+                u.session_total_bytes[2] / 1048576.0L,
+                u.session_total_bytes[3] / 1048576.0L,
+                u.scratch_bytes_per_layer / 1048576.0L,
+                u.shared_total_bytes / 1048576.0L,
+                limits.shared_budget_bytes / 1048576.0L,
+                limits.session_budget_bytes / 1048576.0L);
         }
 
         // First-Cycle minimax seeds are expanded using prefix load, not
