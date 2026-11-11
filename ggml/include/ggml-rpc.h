@@ -270,6 +270,9 @@ struct ggml_rpc_phone_independent_result {
     uint32_t layers;
     uint32_t session;
     uint32_t reserved;
+    // Cold local-GGUF to HTP residency for the first repeat. This is
+    // device-resident weight size, not network transfer bytes.
+    uint64_t weight_bytes;
 };
 #define GGML_BACKEND_RPC_PHONE_INDEPENDENT_PROBE_PROC \
     "ggml_backend_rpc_phone_independent_probe"
