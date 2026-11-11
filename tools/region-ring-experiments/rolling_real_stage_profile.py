@@ -19,15 +19,21 @@ from build_real_stage_profile import SCHEMA, extract, aggregate
 
 
 def completed_cases(out: Path) -> list[Path]:
+    # One latest PASS per distinct Prompt, matching the main runner's
+    # successful-Prompt counter. An earlier PASS followed by an interrupted
+    # rerun does not count twice or contaminate the current Profile.
     cases = []
-    for trial in sorted((out / "runs").glob("*/attempt-*")):
-        result = trial / "result.json"
-        metrics = trial / "metrics.jsonl"
-        if not result.is_file() or not metrics.is_file():
+    for prompt_dir in sorted((out / "runs").glob("prompt_*")):
+        trials = sorted(prompt_dir.glob("attempt-*/result.json"))
+        if not trials:
+            continue
+        result = trials[-1]
+        metrics = result.parent / "metrics.jsonl"
+        if not metrics.is_file():
             continue
         try:
             if json.loads(result.read_text(encoding="utf-8")).get("status") == "PASS":
-                cases.append(trial)
+                cases.append(result.parent)
         except (OSError, ValueError):
             pass
     return cases
