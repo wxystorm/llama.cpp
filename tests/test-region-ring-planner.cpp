@@ -172,9 +172,9 @@ int main() {
                 old_compute(d, layers, tokens, kv, ms));
         };
         candidate plan {};
-        plan.cycles = 3;
+        plan.cycles = 4;
         plan.g = 4;
-        plan.c = 6;
+        plan.c = 8;
         plan.p = 4;
         plan.xg = 128;
         plan.xc = 128;
