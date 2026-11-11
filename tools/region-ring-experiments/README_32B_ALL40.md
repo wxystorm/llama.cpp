@@ -117,7 +117,7 @@ any measured ShareGPT prompt:**
 2. Execute a **warm-up Prefill**, using the first Prompt that would
    actually be measured (or the `-WarmupPrompt` override), with the
    same layout and runtime options. It lives under
-   `<Out>\\warmup\\attempt-0001\\`, with its own stdout, stderr,
+   `<Out>\warmup\attempt-0001\`, with its own stdout, stderr,
    `metrics.jsonl`, `result.json`. It does not enter the 40-Prompt
    `summary.csv` or PASS counts. A warm-up failure aborts measured
    runs. The existing between-Prompt pause also applies once after
@@ -136,16 +136,16 @@ PC CUDA Region weights in 6 GiB VRAM: GPU Bank streaming remains.
 ```powershell
 git pull --ff-only
 
-.\\tools\\region-ring-experiments\\run_32b_all40.ps1 `
-  -Model "E:\\llama\\models\\Qwen3-32B-Q4_K_M.gguf" `
+.\tools\region-ring-experiments\run_32b_all40.ps1 `
+  -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
   -Rpc "10.39.52.114:50052" `
-  -PromptDir "E:\\llama\\datasets\\sharegpt\\sharegpt40" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
   -Layout "G9,P5,G9,P5,G9,P5,G9,P5,G8" `
   -Chunk 128 -XG 96 `
   -ForceSmallBatchMover -BoostBankMover -NoMmap `
   -InterPromptDelaySeconds 5 -NPredict 1 `
   -OnlyGroup 1024 `
-  -Out ".\\32b-xg96-early-weights-warmup-1024"
+  -Out ".\32b-xg96-early-weights-warmup-1024"
 ```
 
 Expected **PC** log in the warm-up:
