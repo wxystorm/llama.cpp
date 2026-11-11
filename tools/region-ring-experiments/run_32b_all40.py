@@ -501,6 +501,7 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     env.update({
         "LLAMA_HYBRID_REGION_RING_V1": "1",
         "LLAMA_HYBRID_REGION_RING_EXEC": "fifo-pc-phone",
+        "LLAMA_REGION_RING_PROFILE_GRID": getattr(args, "profile_grid", "quick"),
         "LLAMA_HYBRID_REGION_RING_PLAN_TOKENS": str(estimate),
         "LLAMA_HYBRID_REGION_RING_GPU_WEIGHT_STREAM": "1" if args.streaming == "on" else "0",
         "LLAMA_REGION_RING_METRICS_FILE": str(metrics_path),
@@ -673,6 +674,10 @@ def get_args(argv=None):
                         help="optional measured Stage CSV for native Planner (needs --auto-plan)")
     parser.add_argument("--profile-every", type=int, default=0,
                         help="with --auto-plan --htp-only, refresh real Stage CSV after every N PASS prompts")
+    parser.add_argument("--profile-grid", choices=("quick", "full"),
+                        default="quick", help="standalone G/C/N depth and Chunk grid")
+    parser.add_argument("--update-profile", action="store_true",
+                        help="force independent backend reprofiling before the first PASS Prompt")
     parser.add_argument("--phone-profile-log", type=Path, default=None,
                         help="optional Phone RPC trace file for verified HTP stage samples")
     parser.add_argument("--batch", type=int, default=2048)
@@ -871,6 +876,7 @@ def main(argv=None):
         # Automatic Profile + Plan has a separate output and signature.
         config.update({
             "version": 4, "planning_mode": "independent-backend-profile-then-plan",
+            "independent_grid": args.profile_grid,
             **({"rolling_profile_every": args.profile_every,
                 "rolling_phone_log": str(args.phone_profile_log or "")}
                if args.profile_every else {}),
@@ -947,6 +953,19 @@ def main(argv=None):
 
         if args.auto_plan and args.htp_only and to_run:
             independent = args.out / "independent-profile" / "profile.csv"
+            if args.update_profile:
+                if sum(row["status"] == "PASS" for row in latest.values()) != 0:
+                    raise ValueError("--update-profile after a successful Prompt "
+                                     "requires a fresh --out directory so immutable "
+                                     "Profile epochs and Plan results stay comparable")
+                if user_stage_csv is not None:
+                    raise ValueError("--update-profile conflicts with an explicit "
+                                     "--real-stage-profile-csv")
+                for stale in (independent,
+                              independent.with_suffix(".json")):
+                    stale.unlink(missing_ok=True)
+                print("[PROFILE] event=FORCE_UPDATE"
+                      " source=INDEPENDENT_BACKEND_GRID", flush=True)
             if user_stage_csv is None:
                 if independent.is_file():
                     count = require_htp_stage_rows(independent)
