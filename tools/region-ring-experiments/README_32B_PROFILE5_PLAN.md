@@ -9,7 +9,7 @@ Branch: `feat/32b-gcna-profile5-plan-chunks9-20261111`.
   `32,48,56,64,80,96,112,128,160`. Legacy forced diagnostic values remain valid for other tests; this setting changes the automatic search grid.
 - Native G/C/N/A profiling is bootstrapped once at five measured anchor Chunk widths (32,64,96,128,160); the Planner interpolates the other four candidates, and selected anchor widths are remeasured after every **five successful Prompt runs**. All other previously validated device/model-specific samples are kept. Default refresh widths are `96,128` to cap profiling overhead; override with `-RefreshChunks`.
 - All 40 ShareGPT Prompt files are processed independently. Each prompt loads the latest native Profile and runs the existing `apply-wide` search again; the PC-selected Phone NPU Stage layer ranges are installed using model-owned RPC. Adreno is still available as a **fallback** if the Planner chooses it; it is not a required manually configured Phone layer list.
-- Each Prompt has an isolated attempt directory. Terminal output prints `[PROFILE]`, `[PROMPT_PLAN]`, `[PROMPT_RESULT]` including selected layout, runtime layout, XC/XG/XN (the last maps to legacy XP), NPU weight policy when logged, prediction and TPS.
+- Each Prompt has an isolated attempt directory. Terminal output prints `[PROFILE]`, `[PROMPT_PLAN]`, `[PROMPT_RESULT]` including selected logical layout, actual G/C/N/A physical layout (from PC backend logs), XC/XG/XN (the last maps to legacy XP), NPU weight policy when logged, prediction and TPS.
 - Reusing the same `-Out` skips PASS results, retries unfinished/failed prompts, and rejects different model/executable bytes or changed Prompt data. Profile versions and source logs are preserved.
 
 ## Requirements
@@ -45,7 +45,7 @@ A per-Prompt terminal example (illustrative only, NOT a measured result):
 ```text
 [PROFILE] event=REFRESH version=1 completed=5 chunks=32,48,56,64,80,96,112,128,160 refresh_chunks=96,128
 [PROMPT] event=PLAN_AND_RUN prompt=prompt_512_06.txt tokens_hint=... profile=V1 attempt=1
-[PROMPT_PLAN] prompt=prompt_512_06.txt status=PASS applied=True layout=... runtime=... XC=... XG=... XN=... npu_weights=RESIDENT predicted_ms=...
+[PROMPT_PLAN] prompt=prompt_512_06.txt status=PASS applied=True layout=... runtime=... physical=... XC=... XG=... XN=... npu_weights=RESIDENT predicted_ms=...
 [PROMPT_RESULT] prompt=prompt_512_06.txt prefill=... tok/s prefill_ms=... attempt=1
 ```
 
