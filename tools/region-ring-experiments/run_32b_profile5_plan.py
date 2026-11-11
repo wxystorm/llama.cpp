@@ -139,7 +139,7 @@ def physical_layout(runtime: str, stderr: Path) -> str:
         for line in stream:
             if "[PHONE_MIXED_BACKENDS]" not in line:
                 continue
-            match = re.search(r"\\bregion=(\\d+)\\b.*?\\bbackend=(HTP0|GPUOpenCL)\\b", line)
+            match = re.search(r"\bregion=(\d+)\b.*?\bbackend=(HTP0|GPUOpenCL)\b", line)
             if match:
                 mapping[int(match.group(1))] = (
                     "N" if match.group(2) == "HTP0" else "A")
