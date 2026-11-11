@@ -2924,6 +2924,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             " status=%s fallback=RUN_REGISTER_ON_DEMAND\n",
             (ggml_time_us() - wait_start_us) / 1000.0,
             loaded ? "PASS" : "FAIL");
+        const char * plan_controlled =
+            std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+        if (!loaded && plan_controlled != nullptr &&
+                std::strcmp(plan_controlled, "1") == 0) {
+            // Automatic Phone allocation is only safe when the Phone has
+            // acknowledged every selected Region and HTP weight range.
+            // Legacy fixed-layout runs keep their prior fallback behavior.
+            throw std::runtime_error(
+                "Automatic HTP-only Plan early weight/Region configuration "
+                "failed: refusing unconfigured Phone execution");
+        }
     }
 
     if (use_mmap_buffer) {
