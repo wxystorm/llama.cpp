@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_32b_all40 import build_process, parse_metrics, verify_independent_profile
+from run_32b_all40 import (
+    build_process, parse_metrics, verify_independent_profile,
+    htp_epoch_has_runtime_samples,
+)
 
 
 class HtpOnlyAutoPlanTests(unittest.TestCase):
@@ -42,6 +45,23 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertEqual(env["LLAMA_REGION_RING_PROFILE_GRID"], "full")
             self.assertTrue(env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"].endswith("profile.csv"))
             self.assertNotIn("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT", env)
+
+    def test_partial_v1_with_36_independent_npu_rows_must_fallback(self):
+        # The failing live experiment had 17 C / 59 G / 36 N rows:
+        # 36 N were the unchanged independent baseline. The epoch contains
+        # zero actual Phone Stage samples and must not displace a working V0.
+        v1 = {
+            "device_points": {"CPU": 17, "GPU": 59, "PHONE": 36},
+            "diagnostic": {
+                "cases": 5, "cpu": 48, "gpu": 96,
+                "phone": 0, "phone_missing": 12
+            }
+        }
+        self.assertFalse(htp_epoch_has_runtime_samples(v1))
+        v1["diagnostic"]["phone"] = 8
+        self.assertTrue(htp_epoch_has_runtime_samples(v1))
+        self.assertFalse(htp_epoch_has_runtime_samples(
+            {"device_points": {"PHONE": 36}}))
 
     def test_standalone_profile_cache_checks_all_backends_and_links(self):
         import csv
