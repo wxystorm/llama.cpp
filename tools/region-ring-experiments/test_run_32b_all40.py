@@ -16,9 +16,10 @@ import json,os,pathlib,sys,time
 args=sys.argv
 prompt=pathlib.Path(args[args.index('-f')+1]).name
 config=pathlib.Path(os.environ['LLAMA_REGION_RING_METRICS_FILE'])
-mode=(config.parent.parent.parent.parent.parent / 'behavior.txt')
+root=config.parent.parent.parent.parent if config.parent.parent.name=='warmup' else config.parent.parent.parent.parent.parent
+mode=root / 'behavior.txt'
 behavior=mode.read_text() if mode.exists() else ''
-once=(config.parent.parent.parent.parent.parent / ('attempted_'+prompt))
+once=root / ('attempted_'+prompt)
 if behavior=='fail_once' and prompt=='prompt_128_01.txt' and not once.exists():
     once.write_text('1'); sys.exit(1)
 if behavior=='no_metrics' and prompt=='prompt_128_01.txt': sys.exit(0)
@@ -44,6 +45,16 @@ ring={'type':'region_ring','complete':1,'status':0,'tokens':tokens,
       'bank_mover_wall_ms':500 if active else 0,'gpu_weight_stage_ms':100}
 if behavior=='old_engine': ring.pop('gpu_bank_force_small_batch')
 if behavior=='inactive_mover': ring['gpu_bank_streaming']=False
+if os.environ.get('LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC'):
+  print('[REGION_RING_PHONE_EARLY_WEIGHTS] event=START phase=PC_MODEL_LOAD phone_regions=4 status=RUNNING', file=sys.stderr)
+  if behavior=='preload_fail':
+    print('[REGION_RING_PHONE_EARLY_WEIGHTS] event=FAIL reason=REMOTE_PRELOAD_UNSUPPORTED', file=sys.stderr)
+    print('[REGION_RING_PHONE_EARLY_WEIGHTS] event=JOIN phase=PC_MODEL_LOAD status=FAIL', file=sys.stderr)
+  elif behavior!='preload_unverified':
+    for r in (1,3,5,7):
+      print(f'[REGION_RING_PHONE_EARLY_WEIGHTS] event=REGION region={r} first_layer={r} layers=5 wall_ms=4 status=PASS', file=sys.stderr)
+    print('[REGION_RING_PHONE_EARLY_WEIGHTS] event=DONE regions=4 wall_ms=12.4 phase=PC_MODEL_LOAD status=PASS', file=sys.stderr)
+    print('[REGION_RING_PHONE_EARLY_WEIGHTS] event=JOIN phase=PC_MODEL_LOAD status=PASS', file=sys.stderr)
 with config.open('w') as f:
   for x in [{'type':'measurement_start'}, ring, {'type':'perf','prefill_tokens':167,'prefill_ms':42,'prefill_tps':3976.2}]:
     f.write(json.dumps(x)+'\\n')
@@ -78,10 +89,17 @@ class All40Tests(unittest.TestCase):
                        '--rpc', '127.0.0.1:50052', '--prompt-dir', str(prompts),
                        '--repo-root', str(root), '--out', str(self.out),
                        '--max-retries', '0',
-                       '--inter-prompt-delay-seconds', '0']
+                       '--inter-prompt-delay-seconds', '0',
+                       '--no-phone-weight-preload', '--skip-warmup']
 
     def invoke(self, *options):
         return subprocess.run([sys.executable, str(RUNNER), *self.common, *options],
+                              capture_output=True, text=True, timeout=30)
+
+    def invoke_new(self, *options):
+        common = [arg for arg in self.common
+                  if arg not in ('--no-phone-weight-preload', '--skip-warmup')]
+        return subprocess.run([sys.executable, str(RUNNER), *common, *options],
                               capture_output=True, text=True, timeout=30)
 
     def load(self, name):
