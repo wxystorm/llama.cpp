@@ -60,6 +60,8 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC",
     "LLAMA_REGION_RING_PHONE_HTP_ONLY",
     "LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED",
+    "LLAMA_REGION_RING_TASK_TRACE",
+    "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -76,7 +78,8 @@ RESULT_COLUMNS = (
     "bank_mover_wall_ms", "gpu_weight_stage_ms",
     "plan_predicted_ms", "plan_baseline_predicted_ms",
     "phone_native_profile_points", "early_weights_status",
-    "early_weights_regions", "early_weights_wall_ms", "error", "result_file",
+    "early_weights_regions", "early_weights_wall_ms",
+    "profile_epoch", "profile_stage_csv", "error", "result_file",
 )
 
 
@@ -503,6 +506,12 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
+    if args.profile_every:
+        # Genuine per-Stage timestamps, not reconstructed from Prefill TPS.
+        # The CPU/GPU rows feed rolling CSV; Phone only if authoritative
+        # session-matched RPC logs are also supplied.
+        env["LLAMA_REGION_RING_TASK_TRACE"] = "1"
+        env["LLAMA_REGION_RING_REAL_STAGE_PROFILE"] = "1"
     if args.force_small_batch_mover:
         env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
     if args.phone_weight_preload:
@@ -543,6 +552,8 @@ def execute(args, prompt, group, context, estimate, out: Path, warmup=False):
            "context": context, "prompt_tokens_hint": estimate,
            "plan_mode": "native-auto" if args.auto_plan else "fixed",
            "status": "RUNNING", "warmup": bool(warmup),
+           "profile_epoch": getattr(args, "profile_epoch", 0),
+           "profile_stage_csv": str(args.real_stage_profile_csv or ""),
            "start_time": utc_now(), "command": command,
            "env_overrides": {key: val for key, val in env.items()
                              if key.startswith("LLAMA_HYBRID_REGION_RING_")
@@ -628,6 +639,10 @@ def get_args(argv=None):
                         help="override Phone Chunk width")
     parser.add_argument("--real-stage-profile-csv", type=Path, default=None,
                         help="optional measured Stage CSV for native Planner (needs --auto-plan)")
+    parser.add_argument("--profile-every", type=int, default=0,
+                        help="with --auto-plan --htp-only, refresh real Stage CSV after every N PASS prompts")
+    parser.add_argument("--phone-profile-log", type=Path, default=None,
+                        help="optional Phone RPC trace file for verified HTP stage samples")
     parser.add_argument("--batch", type=int, default=2048)
     parser.add_argument("--ubatch", type=int, default=2048)
     parser.add_argument("--n-predict", type=int, default=1, help="generated tokens per prompt (default 1 for prefill benchmark)")
@@ -659,6 +674,12 @@ def get_args(argv=None):
     args = parser.parse_args(argv)
     if args.htp_only and not args.auto_plan:
         parser.error("--htp-only in this runner requires --auto-plan")
+    if args.profile_every < 0:
+        parser.error("--profile-every must be nonnegative")
+    if args.profile_every and not (args.auto_plan and args.htp_only):
+        parser.error("--profile-every requires --auto-plan --htp-only")
+    if args.phone_profile_log is not None and not args.profile_every:
+        parser.error("--phone-profile-log requires --profile-every")
     if args.htp_only and args.n_predict != 1:
         parser.error("HTP-only autonomous prefill currently requires --n-predict 1")
     if args.htp_only and args.no_phone_weight_preload:
@@ -702,6 +723,11 @@ def get_args(argv=None):
         args.out = default_out(args)
     for key in ("exe", "model", "prompt_dir", "out", "repo_root"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
+    if args.phone_profile_log is not None:
+        args.phone_profile_log = args.phone_profile_log.expanduser().resolve()
+        if not args.phone_profile_log.is_file():
+            parser.error("--phone-profile-log does not exist: " +
+                         str(args.phone_profile_log))
     if args.real_stage_profile_csv is not None:
         args.real_stage_profile_csv = args.real_stage_profile_csv.expanduser().resolve()
         if not args.auto_plan:
@@ -781,6 +807,9 @@ def main(argv=None):
         # Automatic Profile + Plan has a separate output and signature.
         config.update({
             "version": 3, "planning_mode": "native-auto",
+            **({"rolling_profile_every": args.profile_every,
+                "rolling_phone_log": str(args.phone_profile_log or "")}
+               if args.profile_every else {}),
             **({"phone_execution": "CPU_TRANSPORT_HTP_ONLY_PLAN_CONTROLLED"}
                if args.htp_only else {}),
             "planner_search": "NATIVE_APPLY_WIDE",
@@ -891,6 +920,12 @@ def main(argv=None):
             print("[WARMUP] event=SKIP reason=NO_MEASURED_WORK", flush=True)
 
         previous_executed_prompt = None
+        # The first epoch uses native independent Profile probes, as in the
+        # verified 32B runner. Once five successful Prompts have produced
+        # genuine Stage traces, snapshot their medians to a versioned CSV.
+        # The C++ E/Memory/Beam/DAG search still runs on EVERY Prompt.
+        args.profile_epoch = 0
+        initial_stage_csv = args.real_stage_profile_csv
         for i, (group, prompt) in enumerate(selections, 1):
             previous = all_results(args.out, prompts)[prompt.name]
             if previous["status"] == "PASS" and not args.rerun_all:
@@ -899,6 +934,32 @@ def main(argv=None):
             if args.retry_failed_only and previous["status"] == "PENDING":
                 print(f"[{i}/{total}] SKIP PENDING {prompt.name}", flush=True)
                 continue
+            if args.profile_every:
+                from rolling_real_stage_profile import profile_snapshot
+                passed = sum(
+                    record["status"] == "PASS"
+                    for record in all_results(args.out, prompts).values())
+                epoch = passed // args.profile_every
+                if epoch >= 1:
+                    csv_file, meta, created = profile_snapshot(
+                        args.out, epoch, args.profile_every,
+                        args.phone_profile_log)
+                    args.real_stage_profile_csv = csv_file
+                    if args.profile_epoch != epoch:
+                        print(f"[PROFILE] event={'REFRESH' if created else 'REUSE'} "
+                              f"version=V{epoch} completed={passed}"
+                              f" cpu_points={meta['device_points']['CPU']}"
+                              f" gpu_points={meta['device_points']['GPU']}"
+                              f" npu_points={meta['device_points']['PHONE']}"
+                              f" csv={csv_file}", flush=True)
+                    args.profile_epoch = epoch
+                else:
+                    args.real_stage_profile_csv = initial_stage_csv
+                    if args.profile_epoch != 0:
+                        args.profile_epoch = 0
+                    if passed == 0:
+                        print("[PROFILE] event=BOOTSTRAP version=V0 "
+                              "source=NATIVE_PROBES", flush=True)
             # Pause once between actual prompts, never before the first run,
             # between retries, after the last run, or only to skip PASS entries.
             if previous_executed_prompt is not None and args.inter_prompt_delay_seconds:
@@ -930,6 +991,7 @@ def main(argv=None):
                     physical = str(row.get("plan_layout") or "").replace("P", "N") \
                         if args.htp_only else row.get("plan_layout")
                     print(f"  [PLAN] prompt={prompt.name} applied={row.get('plan_applied')} "
+                          f"profile=V{row.get('profile_epoch', 0)} "
                           f"physical={physical} transport={'CPU' if args.htp_only else 'RPC'} "
                           f"source={row.get('plan_source')} "
                           f"chosen={row.get('plan_layout')} "
