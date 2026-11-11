@@ -1,198 +1,148 @@
-# 32B rolling real Stage Profile + automatic Plan on the proven HTP-only architecture
+# Qwen3-32B: Independent backend Profile -> APPLY_WIDE -> rolling Profile5
 
-Branch: `feat/32b-htp-only-profile5-autoplan-20261111`, **based on**
-`feat/32b-sharegpt40-clean-resume-20261110` (NOT on GCNA's
-OpenCL-visible mixed-backend branch).
+Branch: `feat/32b-independent-backend-profile-20261111`
 
-## What remains unchanged
+This replaces the incorrect fixed-layout V0 bootstrap. **There is NO
+`G8,P6,...` inference in the initial Profile.** The original HTP-only
+Phone executor, PC GPU double banks, priority Bank Mover, verified C2P
+streaming, Phone-owned P2C, and Drain-first DAG are unchanged.
 
-- Phone RPC is exposed as **`-d CPU`**, acting only as an RPC transport.
-  Adreno/OpenCL is **not** required or used for Phone Transformer compute.
-- HTP0..HTP3 are private multi-session NPU executors. They own immutable
-  Qwen3 layer weights, per-request KV and local HTP Graphs. GPU double-bank
-  streaming, PC/Phone input PUSH, P2C and **resource-aware Drain-first**
-  remain the existing 32B runtime paths.
-- C++ APPLY_WIDE still performs E-value/pruning, real memory limits,
-  prefix Beam, full-Prompt DAG, and local refinement. Its automatic Chunk
-  candidates (XC/XG/XP) are now EXACTLY:
-  **32, 48, 56, 64, 80, 96, 112, 128, 160**.
-- The verified *fixed* 32B experiment commands remain available and do not
-  opt into dynamic Phone mapping or rolling Profile.
+## Device meanings
 
-## What's new
+| Logical label | Physical backend | Standalone calibration |
+| --- | --- | --- |
+| G | PC CUDA | real full-layer graph; GPU weight H2D |
+| C | PC CPU | real full-layer graph |
+| N / P | Snapdragon HTP0..HTP3 | native Phone-owned HTP graph, striped by layer |
+| A | Phone Adreno OpenCL | unavailable in **this HTP-only mode**, zero layers |
 
-1. `GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1` with
-   `GGML_RPC_PHONE_HTP_ONLY=1`: startup initializes four independent HTP
-   sessions with **no manual NPU_SERIAL_REGIONS**, while still requiring a
-   single RPC-visible CPU backend. This is NOT the GCNA mixed GPU mode.
-2. In automatic HTP-only mode, model load calls the existing weight-preload
-   RPC on a separate socket to transmit each PC-selected Phone Region's
-   exact contiguous layer range. This installs the Region -> HTP session
-   mapping **before Phone-owned Plan registration**.
-3. Before each new Plan, a reserved `PHONE_NPU_WEIGHT_PRELOAD` reset
-   descriptor clears the previous Plan's idle-session Graph/KV/HTP weight
-   residency, then all selected NPU weights are reloaded from Phone's GGUF.
-   This prevents unbounded accumulation across differently planned Prompts.
-   It is outside the measured Prefill, but setup time remains important.
-   Reset is explicitly rejected if an existing Phone RUN is still active.
-4. An HTP-only-specific **post-Beam GPU tail check** tests 1..4 final GPU
-   layers split from existing Phone-final candidates. Every candidate
-   reuses the original memory constraints and full DAG simulator.
-   Only a valid GPU-tail Plan can be accepted by the automatic HTP-only
-   mode. Original fixed-plan and ordinary Planner paths are not changed.
-5. Before the first automatic Plan, the runner performs **one real, uncounted
-   fixed HTP-only calibration** using the known G8/P6/.../G8 layout.
-   Its actual CPU/GPU/HTP Stage service samples seed `profile-bootstrap/v00/`
-   (V0); the RPC-visible CPU is never treated as HTP compute.
-   After every **5 completed PASS Prompts**, the runner creates an immutable
-   `profile-epochs/vNN/real-stage-profile.csv` using ONLY the last five
-   successful Prompt attempts. Phone HTP samples are returned automatically
-   by RPC after RUN teardown. Subsequent Prompts consume the newest CSV,
-   but each still calls the C++ APPLY_WIDE Planner independently.
-   Failed attempts, calibration, and warmup do not advance an epoch.
-6. Every Prompt prints the selected logical and physical HTP-only layout,
-   XC/XG/XN (XN is the old XP), prediction, actual TPS and Profile epoch.
-   PASS results and per-attempt traces are stored for resume.
+The general G/C/N/A scheme may omit any backend, including A. Do not
+misidentify the RPC-visible CPU transport as NPU compute. The standalone
+HTP-only mode has one RPC-visible backend and four *private* HTP sessions.
 
-## Important Profile qualification
+## Exact workflow
 
-This builds real Stage CSV snapshots **from actual completed inference**.
-Automatic HTP-only mode **requires real Phone HTP samples**. The initial V0
-fixed-layout calibration is one actual Prompt Prefill on the four HTP
-sessions; it is never included in the measured ShareGPT40 totals.
-The first AutoPlan is not attempted until V0 contains positive Phone compute
-data. V1, V2 and later are rolling five-success windows and reject an epoch
-without Phone HTP samples. Native CPU/CUDA and actual transport probes remain
-available as cost fallbacks where appropriate, but the synthetic RPC CPU
-Graph benchmark is skipped for Phone HTP compute.
+1. **Independent Profile**, only when there is no cached baseline or
+   `-UpdateProfile` is specified. C++ model-load startup runs the actual
+   `llama_hybrid_profile_gpu_transfer` and
+   `llama_hybrid_profile_rpc` transport probes, then independently
+   evaluates CPU/CUDA graph blocks and Phone-native HTP Graphs. A Phone
+   RPC command performs **real HTP compute** against its local GGUF,
+   private KV and synthetic activations. It never starts a Prompt,
+   allocates a production Ring or builds a PC Phone Graph.
+2. **Persist baseline** under `<Out>/independent-profile/`:
+   `profile.csv` is read by the unchanged APPLY_WIDE C++ Planner;
+   `profile.json` contains device stages, preparation, upload, output
+   readback, and PC↔Phone/CUDA transfer curves. Each CSV point says
+   `device,layers,tokens,kv_tokens,setup_ms,upload_ms,prepare_ms,compute_ms,
+   terminal,samples`. HTP `compute_ms` is serial stage service,
+   including the Phone-host readback between chained NPU layers;
+   the JSON preserves the readback separately.
+3. **Plan** once per Prompt, only *after* independent Profile succeeds:
+   E pruning -> memory check -> Beam -> full DAG -> GPU-tail refinement.
+   The original `APPLY_WIDE` implementation chooses the layer layout
+   and XC/XG/XP; all Phone Regions are dynamically mapped to HTP and
+   weights loaded from the Phone GGUF. The Phone has no manual region
+   configuration.
+4. **Inference** using the existing 32B double-bank/HTP-only executor.
+5. **Profile5**: after every five completed PASS Prompts, rebuild
+   `profile-epochs/vNN/real-stage-profile.csv` from the last five real
+   PC/GPU/HTP Stage logs. Only the *same measured shapes* override the
+   baseline; missing backend/chunk/depth samples remain in the
+   independent Profile, **never zero cost**. Epoch manifests are immutable,
+   contain the baseline SHA256 and are verified on resume.
 
-Server-side `GGML_RPC_REAL_STAGE_PROFILE=1` is **required**. Protocol patch
-**31** adds a bounded batch read of verified HTP Chunk service samples after
-RUN END. PC writes session-matched `[REAL_STAGE_PROFILE] side=PHONE
-source=RPC_HTP` records into its own `engine.stderr.log`. No per-Chunk
-RPC messages, no manual Phone log copies, and no Phone Graph benchmark
-masquerading as NPU service time.
+The standalone Profile grid by default is `quick`: depths 2/4/6,
+Chunks 32/64/96/128; Phone padded KV spans 256/512/1024, two repeats
+per HTP point. `full` additionally probes 1 layer. A CPU/GPU block's
+KV=x is truly measured; longer contexts are covered by independent
+attention probes/fallback, *not fabricated by renaming the short-KV
+measurement*. No fixed pipeline inference is used for calibration.
 
-For an unmeasured candidate width the real Stage interpolation may apply a
-conservative bounded HTP estimate. This is an estimate from real anchor
-samples, not a direct measurement at every width; monitor predicted-vs-actual
-errors. Graph registration without an actual measured setup value falls back
-to the existing registration estimate rather than being reported as zero.
+## PC and Phone must have RPC protocol patch 32
 
-`-PhoneProfileLog` remains an optional compatibility input for archival
-Phone logs; it is not necessary with the new RPC sample path.
+Update both binaries from the **same commit**. Phone stays on
+`-d CPU`, as in the previous HTP-only setup. Do not turn on OpenCL for
+the HTP-only experiment. Keep your original working Phone env and add:
 
-HTP mappings are virtual FastRPC domains, not four independent pools of
-physical RAM. A candidate passing estimated memory constraints can still
-fail real HTP weight allocation or Graph precompilation; fail closed, inspect
-logs, and do not relabel the result PASS.
-
-## Phone startup (Termux)
-
-Build **both** PC and Android from this branch, install the same GGUF on
-Phone, and start the existing RPC server as follows (not `-d GPUOpenCL`):
-
-```sh
-cd ~/phone-381
-export LD_LIBRARY_PATH="$PWD/lib:$PWD/bin:${LD_LIBRARY_PATH:-}"
-export ADSP_LIBRARY_PATH="$PWD/lib"
+```bash
 export GGML_HEXAGON_NDEV=4
-export GGML_HEXAGON_HOSTBUF=1
 export GGML_RPC_PHONE_HTP_ONLY=1
 export GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1
 export GGML_RPC_REAL_STAGE_PROFILE=1
 unset GGML_RPC_PHONE_NPU_SERIAL_REGIONS
 unset GGML_RPC_PHONE_NPU_MODEL_LOAD_LAYERS
-unset GGML_RPC_PHONE_QWEN3_SHARED_SCRATCH
-export GGML_RPC_PHONE_QWEN3_LOCAL_HTP_PRECOMPILE=1
-export GGML_RPC_PHONE_QWEN3_LOCAL_ONLY=1
-export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_INPUT=1
-export GGML_RPC_PHONE_QWEN3_LOCAL_DIRECT_P2C=1
-export GGML_RPC_PHONE_QWEN3_LOCAL_GRAPHLESS=1
-
-./bin/ggml-rpc-server -H 0.0.0.0 -p 50052 -d CPU \
-  -m "$HOME/models/Qwen3-32B-Q4_K_M.gguf" 2>&1 | tee phone-profile5.log
 ```
 
-The RPC port should be accessible **only on a trusted local network**.
-This experimental server does not authenticate remote clients.
+The Phone server must have a locally accessible matching Qwen3-32B
+GGUF (the existing `-m` startup option), because the NPU independent
+probe loads real model layers directly from that GGUF.
 
-Startup: four `[PHONE_NPU_SESSION] event=INIT` rows followed by
-`[PHONE_NPU_SERIAL] event=BACKEND_INIT ... rpc_visible=CPU_TRANSPORT_HTP_ONLY`.
-The Region count can initially be 0; PC installs it later.
+The PC loads the same model for shape metadata and the independent
+CPU/CUDA probes. Do **not** set `LLAMA_HYBRID_REGION_RING_SKIP_PROFILE=1`
+or a forced G/P layout in the automatic mode.
 
-Each automatic Prompt should produce `[PHONE_NPU_PLAN] event=RESET`,
-then one `[PHONE_NPU_PLAN] event=MAP` per selected N Region, then verified
-`[PHONE_NPU_EARLY_WEIGHTS] ... status=PASS`.
-PC additionally prints `[REGION_RING_PHONE_PROFILE_PULL] status=PASS`
-after the Phone RUN ends. This requires **PC and Phone both rebuilt from
-the same patch-31 commit**. The fixed V0 calibration precedes the first
-automatic Prompt and saves its own logs under `profile-bootstrap/v00/`.
+## Launch smoke test (PowerShell)
 
-## PC launch
+Use a **new Out directory**: the old V0 run configuration and artifacts
+must not be mixed with the independent backend calibration.
 
 ```powershell
-git switch feat/32b-htp-only-profile5-autoplan-20261111
+git fetch origin
+git switch feat/32b-independent-backend-profile-20261111
+git pull --ff-only
 cmake --build build-tensor-v2 --config Release --parallel 8 --target llama-completion test-region-ring-planner
 
 .\tools\region-ring-experiments\run_32b_profile5_plan.ps1 `
   -Model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
   -Rpc "10.39.52.114:50052" `
   -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
-  -Out ".\32b-htp-only-profile5-plan-all40" `
+  -Out ".\32b-independent-profile-all40" `
+  -ProfileGrid quick `
   -ProfileEvery 5 `
   -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8 `
-  -Limit 2
+  -Limit 2 -StopOnFail
 ```
 
-First use `-Limit 2` as a smoke test. The uncounted V0 fixed HTP calibration
-runs first; its PASS must not be confused with a measured Prompt PASS.
-Once both succeed, re-run
-the same command without `-Limit 2` and with the **same `-Out`** to
-continue. Successful Prompts are skipped, Profile versions are recovered
-from completed-Prompt counts and immutable snapshots. Optional
-`-NoMmap` requires enough PC RAM.
+After the two PASS runs, omit `-Limit 2` to resume all 40. To
+force re-profiling **before any PASS prompt**, add `-UpdateProfile`;
+after PASS data exists, use a new Out to preserve epoch reproducibility.
 
-Illustrative terminal output (not a measured sample):
+Expected first-startup logs:
 
 ```text
-[PROFILE] event=BOOTSTRAP_FIXED version=V0 prompt=prompt_512_01.txt counted=0
-[REGION_RING_PHONE_PROFILE_PULL] ... rows=... status=PASS
-[PROFILE] event=BOOTSTRAP_READY version=V0 npu_points=... csv=...
-[1/40] RUN prompt_128_01.txt group=128 ctx=...
-  PASS: prefill=... tok/s (...) ...
-  [PLAN] prompt=prompt_128_01.txt applied=True profile=V0 physical=G8,N4,G8,N3,G... transport=CPU source=htp_gpu_tail chosen=G8,P4,G8,P3,G... XC=64 XG=96 XP=128 predicted_ms=...
-[PROFILE] event=REFRESH version=V1 completed=5 cpu_points=... gpu_points=... npu_points=... csv=...
+[PROFILE] event=INDEPENDENT_START ... fixed_ring=SKIPPED
+[INDEPENDENT_PROFILE] ... device=CPU layers=... chunk=... status=PASS
+[INDEPENDENT_PROFILE] ... device=GPU layers=... chunk=... status=PASS
+[HTP_INDEPENDENT_PROFILE] ... layers=... chunk=... status=PASS
+[INDEPENDENT_PROFILE] ... device=HTP layers=... chunk=... status=PASS
+[INDEPENDENT_PROFILE] event=READY ... source=STANDALONE_G_C_N
+[REGION_RING_PLAN_APPLY] ... applied=1
+[PHONE_NPU_PLAN] event=RESET ...
+[PHONE_NPU_PLAN] event=MAP ...
+[REGION_RING_PHONE_PROFILE_PULL] ... status=PASS
 ```
 
-The terminal uses `N` for Phone HTP; native C++ internal stages retain the
-legacy label `P`. Every `P` in HTP-only mode is executed on the NPU,
-not Adreno. V0 is `FIXED_HTP_REAL_CALIBRATION`, NOT `NATIVE_PROBES`.
-The per-session mapping guard defaults to 3584 MiB/session and may be
-adjusted with `LLAMA_REGION_RING_HTP_SESSION_BUDGET_MIB` after measuring
-the actual HTP address mapping. The original aggregate Phone free-memory
-budget still applies because the sessions share physical RAM.
+If the HTP probe is rejected, inspect PC
+`runs/<prompt>/attempt-*/engine.stderr.log` for
+`[INDEPENDENT_PROFILE] reason=REAL_HTP_PROBE_FAILED`; inspect the
+Phone server log for `[HTP_INDEPENDENT_PROFILE] reason=...`.
+The *first* independent calibration does not need a completed
+inference or manual Phone log copy.
 
-## Testing and diagnosis
+## Limits and verification
 
-```powershell
-python -m unittest discover -s tools/region-ring-experiments -p "test_rolling_real_stage_profile.py" -v
-python -m unittest discover -s tools/region-ring-experiments -p "test_run_32b_all40.py" -v
-ctest --test-dir build-tensor-v2 -C Release --output-on-failure -R "test-region-ring-planner|test-region-ring$"
-```
+The HTP-only 32B branch deliberately does not benchmark Adreno OpenCL
+as A, or use A in automatic Plans. The general GCNA mixed-backend
+Profile can add an independent Adreno probe later. GPU-tail selection
+still refines existing Beam candidates; it is not a globally exhaustive
+search. Model-load native CPU/GPU and transport profiling occurs
+per process, although the expensive independent depth/Chunk grid is
+cached once.
 
-Check the per-Prompt `metrics.jsonl`, `engine.stderr.log` and
-`result.json`. Critical milestones:
-
-- `[REGION_RING_PLAN_SEARCH] ...` must appear per Prompt.
-- `[REGION_RING_PLAN_HTP_TAIL] status=PASS` must identify the GPU-tail plan.
-- `[REGION_RING_PLAN_APPLY] ... applied=1` and matching weight placement.
-- `[PHONE_NPU_PLAN] event=RESET/MAP`, `[PHONE_HTP_ONLY] event=REGISTER`,
-  `[PHONE_HTP_ONLY] event=RUN_END ... status=PASS`.
-- PC exit `0` and complete Prefill metrics are required for PASS.
-
-**Verification boundary:** Changes are committed and CI checks are configured, but successful Windows/Android compilation and Snapdragon end-to-end execution have not been observed here. The host-side tests must be executed, not assumed to pass. Earlier source-only
-tests. They have **not** been compiled on the user's Windows/Android toolchains
-or executed on the Snapdragon device here. Start with the two-Prompt smoke,
-then diagnose the first failing log rather than treating source review alone
-as proof that arbitrary auto Plans run.
+The new RPC path and C++ model-load integration require a **fresh
+Windows and Android compile** followed by an actual phone-device PASS.
+No performance or end-to-end hardware correctness is asserted by
+these source commits alone. See
+`.github/workflows/htp-realprofile-autoplan-smoke.yml` for
+host C++ and Python regression jobs.
