@@ -668,6 +668,10 @@ def get_args(argv=None):
     args.phone_weight_preload = (not args.auto_plan and has_phone and
                                  not args.no_phone_weight_preload)
     args.warmup = not args.auto_plan and not args.skip_warmup
+    if args.phone_weight_preload and ("," in args.rpc or ":" not in args.rpc):
+        parser.error("Phone model-load preload requires one --rpc host:port endpoint")
+    if args.phone_weight_preload and args.log_verbosity < 4:
+        parser.error("Phone model-load preload verification requires --log-verbosity >= 4")
     if args.force_small_batch_mover and sum(
             part.startswith("G") for part in args.layout.split(",")) < 2:
         parser.error("--force-small-batch-mover requires at least two GPU Regions")
