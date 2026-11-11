@@ -6364,6 +6364,23 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             resource_aware_chunk_sched && gpu_bank_streaming ? 1 : 0,
             resource_aware_chunk_sched && phone_input_push_enabled ? 1 : 0);
 
+        // Drain the earliest runnable Region first on each device. This
+        // frees the previous GPU Bank sooner, while the next GPU Region's
+        // compute can hide the refill for the Region after that. Never wait
+        // for an unavailable earlier Region; use later ready work instead.
+        // Independent switch for A/B against resource-aware FIFO.
+        const char * drain_first_env =
+            std::getenv("LLAMA_REGION_RING_DRAIN_FIRST_CYCLE");
+        const bool drain_first_cycle =
+            drain_first_env == nullptr ?
+                resource_aware_chunk_sched :
+                std::strcmp(drain_first_env, "0") != 0;
+        LLAMA_LOG_INFO(
+            "[REGION_RING_CYCLE_SCHED] mode=%s"
+            " rule=EARLIEST_EXECUTABLE_REGION"
+            " fallback=LATER_READY no_cycle_barrier=1 status=READY\n",
+            drain_first_cycle ? "DRAIN_FIRST" : "FIFO");
+
         std::mutex gpu_bank_mover_mutex;
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
@@ -7125,7 +7142,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         device,
                         prefer_phone_graph ? phone_affinity_region : stages.size(),
                         prefer_phone_graph ? phone_affinity_tokens : -1,
-                        resource_ready);
+                        resource_ready,
+                        drain_first_cycle);
                     state.ready_wait_us += ggml_time_us() - wait_begin_us;
                     if (!next) {
                         break; // all done, or cancelled by another worker
@@ -8791,6 +8809,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << (gpu_bank_streaming ? "true" : "false")
                             << ",\"resource_aware_chunk_sched\":"
                             << (resource_aware_chunk_sched ? "true" : "false")
+                            << ",\"drain_first_cycle\":"
+                            << (drain_first_cycle ? "true" : "false")
                             << ",\"gpu_bank_min_tokens\":"
                             << gpu_bank_min_tokens
                             << ",\"gpu_bank_force_small_batch\":"
