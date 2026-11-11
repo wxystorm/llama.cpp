@@ -554,6 +554,10 @@ class All40Tests(unittest.TestCase):
             '--env', 'LLAMA_REGION_RING_PHONE_EARLY_WEIGHT_RPC=1').returncode, 2)
         self.assertEqual(self.invoke_new(
             '--env', 'LLAMA_REGION_RING_PHONE_HTP_ONLY=1').returncode, 2)
+        self.assertEqual(self.invoke_new(
+            '--log-verbosity', '3').returncode, 2)
+        self.assertEqual(self.invoke_new(
+            '--rpc', '127.0.0.1:50052,127.0.0.1:50053').returncode, 2)
         self.assertFalse(self.out.exists())
 
     def test_manifest_context_and_dry_run_no_output(self):
