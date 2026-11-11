@@ -173,6 +173,56 @@ finalized. These choices are in the run-config signature. **Use a new
 results. Existing baseline can still resume with both new stages
 disabled and otherwise-identical parameters.
 
+## Drain-first Cycle scheduling: finish the earliest executable Cycle
+
+For a fixed Ring such as `G0,P1,G2,P3,G4,P5,G6,P7,G8`, the PC GPU
+worker now **prioritizes Chunks of the earliest unfinished runnable GPU
+Region**, and the Phone worker independently prioritizes the earliest
+runnable Phone Region. This gives G0 priority over G2 when both can run,
+draining G0's Bank A earlier so G4's weights can transfer while G2
+computes on Bank B. The same principle applies to G2/G4/G6 and later
+Regions.
+
+The choice is made **between Chunks**, not during a running Chunk; it
+does not preempt kernels. It never delays a runnable downstream Chunk
+just because the earliest Region is waiting for upstream Token intervals,
+HTP input PUSH, an unavailable GPU Bank, or KV order. Instead it picks
+the earliest **eligible** Region to avoid idle workers. Both GPU and
+Phone continue to publish each completed Chunk to downstream immediately:
+**there is no whole-Cycle barrier** and no change to HTP graphs or RPC.
+The resource-aware eligibility filter and same-Bank lifetime constraints
+remain in force.
+
+**Default:** drain-first is enabled when resource-aware scheduling is
+enabled. Override independently using
+`LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=1` (drain-first) or
+`LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=0` (resource-aware FIFO).
+The PC log prints
+`[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST|FIFO ...`; the
+`region_ring` JSONL record adds `drain_first_cycle`.
+
+With the **same** `-Layout`, `-Chunk`, `-XG`, model, warm-up and
+network conditions, compare the two strategies by appending one of
+these options to the normal `run_32b_all40.ps1` command:
+
+```powershell
+# Drain-first Cycle priority:
+-EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1","LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=1","LLAMA_REGION_RING_TASK_TRACE=1" `
+-Out ".\\32b-g8p6-drain-first"
+
+# Existing resource-aware FIFO control:
+-EnvOverride "LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED=1","LLAMA_REGION_RING_DRAIN_FIRST_CYCLE=0","LLAMA_REGION_RING_TASK_TRACE=1" `
+-Out ".\\32b-g8p6-resource-fifo"
+```
+
+The scheduler-only regressions in `tests/test-region-ring.cpp` verify:
+(1) older G2 READY is skipped for a later-enqueued G0 Chunk;
+(2) if G0 is ineligible, G2 is allowed to execute; (3) the same
+upstream-first policy applies to Phone even with graph affinity;
+(4) legacy FIFO/affinity behavior remains available. Performance
+improvement must be established from whole-Prefill time plus the
+GPU Compute/H2D overlap and Phone trace, not just the Bank Wait counter.
+
 ## Resource-aware Chunk scheduling (GPU Bank and Phone PUSH)
 
 The native threaded Region Ring now keeps the same **Token-interval
