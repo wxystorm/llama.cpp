@@ -5526,6 +5526,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         struct ring_worker_state {
             size_t          completed       = 0;
             int64_t         ready_wait_us   = 0;
+            // Rejected eligibility checks, not distinct tasks.
+            size_t          resource_deferred_checks = 0;
             int64_t         backend_wait_us = 0;
             int64_t         prepare_wait_us = 0;
             int64_t         cpu_wait_us     = 0;
@@ -6346,6 +6348,22 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             size_t upload_bytes = 0;
         };
 
+        // Keep existing Token/KV DAG; filter claims on actual external
+        // resource availability. Set =0 to reproduce legacy A/B behavior.
+        const char * resource_sched_env =
+            std::getenv("LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED");
+        const bool resource_aware_chunk_sched =
+            (gpu_bank_streaming || phone_input_push_enabled) &&
+            (resource_sched_env == nullptr ||
+             std::strcmp(resource_sched_env, "0") != 0);
+        LLAMA_LOG_INFO(
+            "[REGION_RING_RESOURCE_SCHED] enabled=%d bank_aware=%d"
+            " phone_push_aware=%d selection=SKIP_UNREADY"
+            " dependency=TOKEN_INTERVAL status=READY\n",
+            resource_aware_chunk_sched ? 1 : 0,
+            resource_aware_chunk_sched && gpu_bank_streaming ? 1 : 0,
+            resource_aware_chunk_sched && phone_input_push_enabled ? 1 : 0);
+
         std::mutex gpu_bank_mover_mutex;
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
@@ -6722,7 +6740,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 }
                 gpu_bank_ready_cv.notify_all();
                 if (!ok) {
+                    // Bank-aware workers wait on READY, not Bank CV.
+                    ready.cancel();
                     break;
+                }
+                if (resource_aware_chunk_sched) {
+                    // Notify only after releasing gpu_bank_mover_mutex.
+                    ready.notify_external_ready();
                 }
             }
             gpu_bank_ready_cv.notify_all();
@@ -7015,6 +7039,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         phone_push_cv.notify_all();
                         break;
                     }
+                    if (resource_aware_chunk_sched) {
+                        // A staged input makes an already-READY Phone task
+                        // eligible without blocking its worker on PUSH.
+                        ready.notify_external_ready();
+                    }
                 }
             } catch (...) {
                 ready.cancel();
@@ -7033,6 +7062,50 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             const char * name = llama_region_ring_device_name(device);
             bool worker_apply_mctx = false; // canonical KV ubatch was applied once above
             std::optional<llama_region_ring_task> active_task;
+            // Filtering happens under READY mutex; access the Bank/PUSH
+            // state only with its own short-lived lock. In particular do
+            // not wait for a Bank or RPC inside this predicate.
+            llama_region_ring_ready::resource_ready_predicate resource_ready;
+            if (resource_aware_chunk_sched &&
+                    dev == (size_t) llama_region_ring_device::GPU &&
+                    gpu_bank_streaming) {
+                resource_ready = [&](const llama_region_ring_task & candidate) {
+                    const int rank =
+                        candidate.region < gpu_region_rank.size() ?
+                            gpu_region_rank[candidate.region] : -1;
+                    if (rank < 0) {
+                        return true; // preserve existing invalid-rank failure
+                    }
+                    const size_t bank_index =
+                        llama_region_ring_gpu_weight_bank_for_rank(
+                            (size_t) rank);
+                    std::lock_guard<std::mutex> lock(gpu_bank_mover_mutex);
+                    const auto & bank =
+                        region_ring_worker_resources[bank_index + 1];
+                    const bool available = gpu_bank_mover_failed ||
+                        (bank.bank_ready &&
+                         bank.bank_region == candidate.region);
+                    if (!available) { ++state.resource_deferred_checks; }
+                    return available;
+                };
+            } else if (resource_aware_chunk_sched &&
+                    dev == (size_t) llama_region_ring_device::PHONE &&
+                    phone_input_push_enabled) {
+                resource_ready = [&](const llama_region_ring_task & candidate) {
+                    if (candidate.region == 0 ||
+                            stages[candidate.region].kind !=
+                                llama_hybrid_runtime_stage_kind::PHONE) {
+                        return true;
+                    }
+                    std::lock_guard<std::mutex> lock(phone_push_mutex);
+                    const bool available =
+                        candidate.chunk <
+                            phone_push_state[candidate.region].size() &&
+                        phone_push_state[candidate.region][candidate.chunk] == 1;
+                    if (!available) { ++state.resource_deferred_checks; }
+                    return available;
+                };
+            }
             size_t previous_phone_region = stages.size();
             int previous_phone_tokens = -1;
             LLAMA_LOG_INFO(
@@ -7051,7 +7124,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     const auto next = ready.wait_take(
                         device,
                         prefer_phone_graph ? phone_affinity_region : stages.size(),
-                        prefer_phone_graph ? phone_affinity_tokens : -1);
+                        prefer_phone_graph ? phone_affinity_tokens : -1,
+                        resource_ready);
                     state.ready_wait_us += ggml_time_us() - wait_begin_us;
                     if (!next) {
                         break; // all done, or cancelled by another worker
@@ -7313,16 +7387,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     if (pushed_phone_input) {
                         const int64_t begin_wait_us = ggml_time_us();
                         std::unique_lock<std::mutex> lock(phone_push_mutex);
-                        // A failed upstream task may cancel READY without
-                        // changing the push status. Check cancellation on the
-                        // timeout path so the Worker cannot hang on failure.
-                        while (phone_push_state[task.region][task.chunk] == 0 &&
-                                !ready.failed()) {
+                        // READY filtering locks READY -> PUSH. Avoid the
+                        // opposite lock order when checking cancellation.
+                        while (phone_push_state[task.region][task.chunk] == 0) {
                             phone_push_cv.wait_for(
                                 lock, std::chrono::milliseconds(20));
+                            lock.unlock();
+                            const bool cancelled = ready.failed();
+                            lock.lock();
+                            if (cancelled) { break; }
                         }
+                        const bool pushed =
+                            phone_push_state[task.region][task.chunk] == 1;
+                        lock.unlock();
                         phone_push_wait_us += ggml_time_us() - begin_wait_us;
-                        if (phone_push_state[task.region][task.chunk] != 1) {
+                        if (!pushed) {
                             throw std::runtime_error("Phone input PUSH failed or was cancelled");
                         }
                     }
