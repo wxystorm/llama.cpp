@@ -852,12 +852,17 @@ def verify_independent_profile(path: Path) -> int:
         raise ValueError(f"Independent profile.json does not match Stage CSV: "
                          f"{json_path}")
     network = metadata.get("transfers", {})
-    for direction in ("pc_to_phone", "phone_to_pc", "gpu_weight_h2d"):
+    def valid_curve(direction):
         values = network.get(direction, [])
-        if not any(int(v.get("bytes", 0)) > 0 and
-                   0 < float(v.get("ms", 0)) < math.inf for v in values):
-            raise ValueError(f"Independent Profile has no measured {direction} "
-                             f"transport/H2D curve: {json_path}")
+        return any(int(v.get("bytes", 0)) > 0 and
+                   0 < float(v.get("ms", 0)) < math.inf for v in values)
+    if not valid_curve("pc_to_phone") or not valid_curve("gpu_weight_h2d"):
+        raise ValueError(f"Independent Profile missing PC->Phone or GPU H2D "
+                         f"transfer curve: {json_path}")
+    if not (valid_curve("phone_to_pc") or
+            valid_curve("snapshot_phone_to_pc")):
+        raise ValueError(f"Independent Profile missing Phone->PC "
+                         f"return curve: {json_path}")
     return npu_points
 
 
