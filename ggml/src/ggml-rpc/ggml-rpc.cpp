@@ -557,6 +557,10 @@ struct rpc_msg_phone_independent_probe_rsp {
 };
 static_assert(sizeof(rpc_msg_phone_independent_probe_req) == 116,
               "Independent HTP probe request ABI changed");
+static_assert(sizeof(ggml_rpc_phone_independent_result) == 72,
+              "Independent HTP performance and weight-size ABI changed");
+static_assert(sizeof(rpc_msg_phone_independent_probe_rsp) == 80,
+              "Independent HTP performance response ABI changed");
 
 
 // One canonical storage binding per Region; no KV payload or host pointer.
@@ -7961,6 +7965,7 @@ bool rpc_server::phone_independent_probe(
     // Use precisely that serial chain, not parallel independent kernels.
     double setup = 0, upload = 0, prepare = 0, compute = 0;
     double readback = 0, weight_load = 0;
+    uint64_t weight_bytes = 0;
     uint32_t completed = 0;
     bool ok = true;
     std::string why;
@@ -7982,7 +7987,12 @@ bool rpc_server::phone_independent_probe(
                 ok = false;
                 break;
             }
-            weight_load += (ggml_time_us() - load_begin_us) / 1000.0;
+            // Cold residency is a one-time model-loading cost, not a
+            // per-Chunk service cost. Warm repeats keep weights resident.
+            if (repeat == 0) {
+                weight_load += (ggml_time_us() - load_begin_us) / 1000.0;
+                weight_bytes += load.new_bytes;
+            }
             ggml_phone_npu_serial::full_region_executor::
                 local_htp_prepare_stats stats {};
             const int64_t setup_begin_us = ggml_time_us();
@@ -8045,7 +8055,8 @@ bool rpc_server::phone_independent_probe(
     response.result.prepare_ms = prepare * scale;
     response.result.compute_ms = compute * scale;
     response.result.output_read_ms = readback * scale;
-    response.result.weight_load_ms = weight_load * scale;
+    response.result.weight_load_ms = weight_load;
+    response.result.weight_bytes = weight_bytes;
     response.result.repeats = completed;
     response.result.layers = depth;
     response.result.session = request.session;
@@ -8053,11 +8064,13 @@ bool rpc_server::phone_independent_probe(
         "[HTP_INDEPENDENT_PROFILE] status=PASS layers=%u chunk=%u"
         " kv=%u session=%u repeats=%u setup_ms=%.3f"
         " upload_ms=%.3f prepare_ms=%.3f compute_ms=%.3f"
-        " read_ms=%.3f weight_load_ms=%.3f source=HTP_REAL\n",
+        " read_ms=%.3f weight_load_ms=%.3f weight_bytes=%" PRIu64
+        " source=HTP_REAL\n",
         depth, plan.chunk_tokens, plan.n_kv, request.session, completed,
         response.result.setup_ms, response.result.upload_ms,
         response.result.prepare_ms, response.result.compute_ms,
-        response.result.output_read_ms, response.result.weight_load_ms);
+        response.result.output_read_ms, response.result.weight_load_ms,
+        response.result.weight_bytes);
     return true;
 }
 
