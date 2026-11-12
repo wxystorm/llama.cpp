@@ -10,8 +10,11 @@
 #include <string>
 #include <vector>
 
-// Phone-local, metadata-only Qwen3 single-Layer graph builder. This copies
-// the operator order from src/models/qwen3.cpp and the standard flash-attn
+// Phone-local, metadata-only Dense Qwen3 / Llama single-layer graph builder.
+// Qwen3 uses per-head Q/K RMSNorm before NeoX RoPE; Llama/Mistral uses
+// normal RoPE without those weights. The same FA, KV and SwiGLU paths follow.
+// This copies the supported operations from src/models/qwen3.cpp,
+// src/models/llama.cpp and the standard flash-attn
 // KV path in src/llama-graph.cpp and src/llama-kv-cache.cpp.
 // The Graph has no input/storage bindings until a separate HTP allocation
 // phase. Merely building it does NOT make a Chunk executable.
@@ -29,6 +32,14 @@ struct layer_weights {
     ggml_tensor * ffn_down = nullptr;
     ggml_tensor * q_norm = nullptr;
     ggml_tensor * k_norm = nullptr;
+    // Optional dense Llama affine biases (Qwen3 normally omits them).
+    ggml_tensor * wq_b = nullptr;
+    ggml_tensor * wk_b = nullptr;
+    ggml_tensor * wv_b = nullptr;
+    ggml_tensor * wo_b = nullptr;
+    ggml_tensor * ffn_gate_b = nullptr;
+    ggml_tensor * ffn_up_b = nullptr;
+    ggml_tensor * ffn_down_b = nullptr;
 };
 
 struct graph_result {
@@ -100,20 +111,32 @@ inline bool validate_weights(const ggml_phone_owned::region_plan & p,
         return t && t->ne[0] == n0 && t->ne[1] == n1 &&
             t->ne[2] == 1 && t->ne[3] == 1;
     };
+    const bool llama_dense = ggml_phone_owned::is_llama_dense(p);
+    const bool qk_norm_ok = llama_dense ?
+        (w.q_norm == nullptr && w.k_norm == nullptr) :
+        (vec(w.q_norm, p.head_dim) && vec(w.k_norm, p.head_dim));
     if (!vec(w.attn_norm, d) || !mat(w.wq, d, hq) ||
             !mat(w.wk, d, hk) || !mat(w.wv, d, hk) ||
             !mat(w.wo, hq, d) || !vec(w.ffn_norm, d) ||
-            !vec(w.q_norm, p.head_dim) ||
-            !vec(w.k_norm, p.head_dim)) {
-        reason = "QWEN3_ATTENTION_WEIGHT_LAYOUT";
+            !qk_norm_ok ||
+            (w.wq_b && !vec(w.wq_b, hq)) ||
+            (w.wk_b && !vec(w.wk_b, hk)) ||
+            (w.wv_b && !vec(w.wv_b, hk)) ||
+            (w.wo_b && !vec(w.wo_b, d))) {
+        reason = llama_dense ? "LLAMA_ATTENTION_WEIGHT_LAYOUT" :
+                               "QWEN3_ATTENTION_WEIGHT_LAYOUT";
         return false;
     }
     const int64_t n_ff = w.ffn_gate ? w.ffn_gate->ne[1] : 0;
     if (n_ff <= 0 || n_ff > 131072 ||
             !mat(w.ffn_gate, d, n_ff) ||
             !mat(w.ffn_up, d, n_ff) ||
-            !mat(w.ffn_down, n_ff, d)) {
-        reason = "QWEN3_FFN_WEIGHT_LAYOUT";
+            !mat(w.ffn_down, n_ff, d) ||
+            (w.ffn_gate_b && !vec(w.ffn_gate_b, n_ff)) ||
+            (w.ffn_up_b && !vec(w.ffn_up_b, n_ff)) ||
+            (w.ffn_down_b && !vec(w.ffn_down_b, d))) {
+        reason = llama_dense ? "LLAMA_FFN_WEIGHT_LAYOUT" :
+                               "QWEN3_FFN_WEIGHT_LAYOUT";
         return false;
     }
     reason = "NONE";
@@ -212,18 +235,27 @@ inline bool build_graph(ggml_context * ctx,
         ggml_set_name(t, name);
     };
 
-    // Qwen3: RMSNorm -> QKV matmuls -> per-head Q/K RMSNorm -> NeoX RoPE.
+    // Qwen3: RMSNorm -> QKV -> per-head Q/K RMSNorm -> NeoX RoPE.
+    // Llama: RMSNorm -> QKV (optional projection bias) -> normal RoPE.
     ggml_tensor * x_norm = ggml_mul(ctx,
         ggml_rms_norm(ctx, input, p.rms_norm_eps), w.attn_norm);
     mark(x_norm, "attn_norm");
+    ggml_tensor * q_proj = ggml_mul_mat(ctx, w.wq, x_norm);
+    ggml_tensor * k_proj = ggml_mul_mat(ctx, w.wk, x_norm);
+    ggml_tensor * v_proj = ggml_mul_mat(ctx, w.wv, x_norm);
+    if (w.wq_b) { q_proj = ggml_add(ctx, q_proj, w.wq_b); }
+    if (w.wk_b) { k_proj = ggml_add(ctx, k_proj, w.wk_b); }
+    if (w.wv_b) { v_proj = ggml_add(ctx, v_proj, w.wv_b); }
     ggml_tensor * q = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wq, x_norm), p.head_dim, p.n_heads, tokens);
+        q_proj, p.head_dim, p.n_heads, tokens);
     ggml_tensor * k = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wk, x_norm), p.head_dim, p.n_heads_kv, tokens);
+        k_proj, p.head_dim, p.n_heads_kv, tokens);
     ggml_tensor * v = ggml_reshape_3d(ctx,
-        ggml_mul_mat(ctx, w.wv, x_norm), p.head_dim, p.n_heads_kv, tokens);
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, p.rms_norm_eps), w.q_norm);
-    k = ggml_mul(ctx, ggml_rms_norm(ctx, k, p.rms_norm_eps), w.k_norm);
+        v_proj, p.head_dim, p.n_heads_kv, tokens);
+    if (!ggml_phone_owned::is_llama_dense(p)) {
+        q = ggml_mul(ctx, ggml_rms_norm(ctx, q, p.rms_norm_eps), w.q_norm);
+        k = ggml_mul(ctx, ggml_rms_norm(ctx, k, p.rms_norm_eps), w.k_norm);
+    }
     q = ggml_rope_ext(ctx, q, pos, nullptr, p.head_dim, p.rope_type,
                        p.n_ctx_orig, p.rope_freq_base, p.rope_freq_scale,
                        p.rope_ext_factor, p.rope_attn_factor,
@@ -275,6 +307,7 @@ inline bool build_graph(ggml_context * ctx,
     // n_embd (Qwen3-32B uses 8192 Q features vs 5120 hidden features).
     attn = ggml_reshape_2d(ctx, attn, attn_width, tokens);
     ggml_tensor * attn_out = ggml_mul_mat(ctx, w.wo, attn);
+    if (w.wo_b) { attn_out = ggml_add(ctx, attn_out, w.wo_b); }
     mark(attn_out, "attn_out");
     ggml_tensor * ffn_inp = ggml_add(ctx, attn_out, input);
     mark(ffn_inp, "ffn_inp");
@@ -283,12 +316,15 @@ inline bool build_graph(ggml_context * ctx,
         ggml_rms_norm(ctx, ffn_inp, p.rms_norm_eps), w.ffn_norm);
     mark(ffn_norm, "ffn_norm");
     ggml_tensor * up = ggml_mul_mat(ctx, w.ffn_up, ffn_norm);
+    if (w.ffn_up_b) { up = ggml_add(ctx, up, w.ffn_up_b); }
     mark(up, "ffn_up");
     ggml_tensor * gate = ggml_mul_mat(ctx, w.ffn_gate, ffn_norm);
+    if (w.ffn_gate_b) { gate = ggml_add(ctx, gate, w.ffn_gate_b); }
     mark(gate, "ffn_gate");
     ggml_tensor * glu = ggml_swiglu_split(ctx, gate, up);
     mark(glu, "ffn_swiglu");
     ggml_tensor * ffn = ggml_mul_mat(ctx, w.ffn_down, glu);
+    if (w.ffn_down_b) { ffn = ggml_add(ctx, ffn, w.ffn_down_b); }
     mark(ffn, "ffn_down");
     ggml_tensor * result = ggml_add(ctx, ffn, ffn_inp);
     mark(result, "ffn_out");
