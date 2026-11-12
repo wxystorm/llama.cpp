@@ -8873,7 +8873,9 @@ static bool llama_hybrid_calibrate_independent_ring(
         const llama_hybrid_ffn_desc & ffn_desc,
         ggml_backend_t cpu, ggml_backend_t gpu, ggml_backend_t phone,
         const char * path) {
-    if (!path || !*path || !cpu || !phone || !profile.dense_phone_region_capable) {
+    // Independent HTP full-layer profiling is supported by Qwen3 and
+    // Llama; the Qwen3-only directional fusion flag is not a prerequisite.
+    if (!path || !*path || !cpu || !phone || profile.is_moe) {
         return false;
     }
     {
@@ -9354,10 +9356,11 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
-    // Dense Llama/Mistral shares the independent G/C/N profile contract;
-    // the Phone-only graph builder handles its Normal RoPE separately.
+    // This bit denotes Qwen3's fused directional Phone island only.
+    // Llama's full-layer HTP support is advertised by htp_only_profile;
+    // never claim Qwen3's unrelated directional fusion is available.
     profile.dense_phone_region_capable =
-        ml.get_arch() == LLM_ARCH_QWEN3 || ml.get_arch() == LLM_ARCH_LLAMA;
+        ml.get_arch() == LLM_ARCH_QWEN3;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
         moe_desc.n_embd : ffn_desc.n_embd);
