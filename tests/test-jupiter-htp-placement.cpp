@@ -62,6 +62,40 @@ int main() {
     // For fewer layers than devices, use only the needed prefix of sessions.
     validate({320, 350}, 430, {600, 900, 800, 800});
 
+    // Equal global/4 quotas can reject a valid asymmetric layout. A Phone
+    // global 6900 budget with four 200-byte reserves leaves 6100 charge
+    // bytes, while each independent Session can hold up to 1900 charge.
+    // Eight layers + output require 5700 charge, fitting [2,2,2,2].
+    const std::vector<uint64_t> uneven_layers(8, 650);
+    assert(infeasible(uneven_layers, 500, {1525, 1525, 1525, 1525}));
+    const auto uneven = jupiter_htp::partition_global_budget(
+        uneven_layers, 500, {2100, 2100, 2100, 2100}, 6900, 200);
+    assert(uneven.ends.size() == 4);
+    assert(uneven.ends.back() == 8);
+    uint64_t used_total = 0;
+    for (const auto bytes : uneven.used_bytes) {
+        assert(bytes + 200 <= 2100);
+        used_total += bytes + 200;
+    }
+    assert(used_total == 6500);
+    assert(used_total <= 6900);
+    bool global_rejected = false;
+    try {
+        (void) jupiter_htp::partition_global_budget(
+            uneven_layers, 500, {2100, 2100, 2100, 2100}, 6400, 200);
+    } catch (const std::runtime_error &) {
+        global_rejected = true;
+    }
+    assert(global_rejected);
+    bool session_rejected = false;
+    try {
+        (void) jupiter_htp::partition_global_budget(
+            uneven_layers, 500, {100, 2100, 2100, 2100}, 6900, 200);
+    } catch (const std::runtime_error &) {
+        session_rejected = true;
+    }
+    assert(session_rejected);
+
     // Must not accidentally overcommit the total weight+KV or the output.
     assert(infeasible({800,800,800,800}, 600, {1000,1000,1000,1000}));
     assert(infeasible({200,200}, 900, {1000,1000}));
