@@ -111,3 +111,28 @@ and independently check numerical parity.
     python -m unittest test_refine_sequence_q test_run_sharegpt40_dp -v
 
 No hardware test has yet confirmed the full cross-session pipeline.
+
+## Qwen3-32B Q4_K_M (64 repeating layers)
+
+The ShareGPT40 driver now reads architecture.block_count from the GGUF
+metadata instead of assuming 40. It accepts --model-layers 64 for explicit
+validation, although this flag is optional when the model exists. Keep
+the Phone RPC server's --model path synchronized with the PC model,
+so local GGUF tensor offsets and weights refer to the same exact 32B file.
+
+Suggested incremental layouts, for PC RTX 4050 6GiB and four HTP sessions:
+
+| CPU | CUDA | Phone HTP0..3 | --pc-layers | --cpu-layers |
+| ---: | ---: | ---: | ---: | ---: |
+| 40 | 16 | 8 | 56 | 40 |
+| 36 | 16 | 12 | 52 | 36 |
+| 32 | 16 | 16 | 48 | 32 |
+| 30 | 16 | 18 | 46 | 30 |
+
+These are candidates, NOT verified limits. The per-session packed
+weights, output head, KV and actual runtime buffers are checked before
+a layout is accepted. Start with --groups 128 --limit 1, inspect the
+JUPITER_HTP_SESSION and JUPITER_HTP_RUNTIME_MEMORY logs, then increase
+Phone layers and finally run the full set of 40 prompts. Use a new
+--out-dir for each model/layout. If CUDA OOMs at 16 layers, increase
+--cpu-layers to 38 for --pc-layers 52 (CUDA14 + Phone12).
