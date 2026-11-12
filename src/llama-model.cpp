@@ -1489,7 +1489,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 jupiter_plan_file     ? "PAPER_DP" :
                                         "DEFAULT_HALF";
 
-        if (jupiter_cpu_layers > 0) {
+        if (jupiter_active_sessions > 1) {
+            std::string phone_devices;
+            for (size_t i = 0; i < jupiter_active_sessions; ++i) {
+                if (!phone_devices.empty()) {
+                    phone_devices += ",";
+                }
+                phone_devices += ggml_backend_dev_name(jupiter_phone_session_devs[i]);
+            }
+            LLAMA_LOG_INFO(
+                    "[JUPITER_STAGE_PLAN] mode=%s cpu_layers=0..%d "
+                    "pc_gpu_layers=%d..%d phone_layers=%d..%d "
+                    "phone_devices=%s output_device=%s physical_stages=%zu "
+                    "jupiter_q_stages=%d\n",
+                    plan_source, jupiter_cpu_layers - 1,
+                    jupiter_cpu_layers, jupiter_pc_layers - 1,
+                    jupiter_pc_layers, n_layer_all - 1,
+                    phone_devices.c_str(),
+                    ggml_backend_dev_name(jupiter_phone_session_devs[jupiter_active_sessions - 1]),
+                    jupiter_active_sessions + 1 + (jupiter_cpu_layers > 0 ? 1 : 0),
+                    jupiter_cpu_layers > 0 ? 3 : 2);
+        } else if (jupiter_cpu_layers > 0) {
             LLAMA_LOG_INFO(
                     "[JUPITER_STAGE_PLAN] mode=%s cpu_device=%s cpu_layers=0..%d "
                     "pc_device=%s pc_gpu_layers=%d..%d phone_device=%s "
