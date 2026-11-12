@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Experimental direct HTP0 RPC server for Jupiter 14B on Android/Termux.
+# Experimental HTP0..HTP3 multi-session RPC server for Jupiter 14B on Android/Termux.
 # Usage: LLAMA_JUPITER_PHONE_BIN_ROOT="$HOME/jupiter-phone" \
 #        bash tools/jupiter/start_phone_htp.sh /path/to/Qwen3-14B-Q4_K_M.gguf [port]
 set -euo pipefail
@@ -30,16 +30,27 @@ if [ ! -x "$server" ]; then
     exit 2
 fi
 
-# Keep this first direct RPC experiment to one HTP session.
-# The 1 GiB allocation cap is a per-buffer limit, NOT total HTP memory.
-export GGML_HEXAGON_NDEV="${GGML_HEXAGON_NDEV:-1}"
+# Expose four independent FastRPC HTP sessions by default (HTP0..HTP3).
+# Each session maps the SAME physical HTP; this is not four NPUs.
+# The 1 GiB allocation cap is per buffer, NOT the total model memory.
+export GGML_HEXAGON_NDEV="${GGML_HEXAGON_NDEV:-4}"
 export GGML_HEXAGON_HOSTBUF="${GGML_HEXAGON_HOSTBUF:-1}"
 export GGML_HEXAGON_MBUF="${GGML_HEXAGON_MBUF:-1024}"
 export GGML_HEXAGON_VMEM="${GGML_HEXAGON_VMEM:-3072}"
-if [ "$GGML_HEXAGON_NDEV" != "1" ]; then
-    echo "This prototype requires GGML_HEXAGON_NDEV=1" >&2
-    exit 2
-fi
+case "$GGML_HEXAGON_NDEV" in
+    1|2|3|4) ;;
+    *) echo "GGML_HEXAGON_NDEV must be one of 1,2,3,4" >&2; exit 2 ;;
+esac
+
+# Match the exact RPC device list to the number of FastRPC sessions.
+# RPC device indices correspond to HTP0, HTP1, ... in this order.
+devices=""
+for ((i = 0; i < GGML_HEXAGON_NDEV; i++)); do
+    if [ -n "$devices" ]; then
+        devices="$devices,"
+    fi
+    devices="${devices}HTP$i"
+done
 case "$GGML_HEXAGON_MBUF" in
     ""|*[!0-9]*)
         echo "GGML_HEXAGON_MBUF must be an integer in [1,1024] MiB" >&2
@@ -72,8 +83,9 @@ if [ ! -f "$root/lib/libggml-htp-v79.so" ]; then
     echo "[JUPITER_PHONE_HTP] warning: v79 DSP skel missing: $root/lib/libggml-htp-v79.so" >&2
 fi
 echo "[JUPITER_PHONE_HTP] adsp_library_path=$ADSP_LIBRARY_PATH"
-echo "[JUPITER_PHONE_HTP] backend=HTP0 rpc=0.0.0.0:$port model=$model"
-echo "[JUPITER_PHONE_HTP] mbuf_mib=$GGML_HEXAGON_MBUF vmem_mib=$GGML_HEXAGON_VMEM"
+echo "[JUPITER_PHONE_HTP] devices=$devices sessions=$GGML_HEXAGON_NDEV rpc=0.0.0.0:$port model=$model"
+echo "[JUPITER_PHONE_HTP] mbuf_mib_per_buffer=$GGML_HEXAGON_MBUF vmem_mib_per_session=$GGML_HEXAGON_VMEM"
 echo "[JUPITER_PHONE_HTP] status=EXPERIMENTAL_NOT_PARITY_VERIFIED"
-echo "[JUPITER_PHONE_HTP] verify that the RPC device list shows HTP0"
-exec "$server" --device HTP0 --host 0.0.0.0 --port "$port" --model "$model"
+echo "[JUPITER_PHONE_HTP] note=four_sessions_do_not_combine_memory_automatically"
+echo "[JUPITER_PHONE_HTP] verify RPC Devices shows every session: $devices"
+exec "$server" --device "$devices" --host 0.0.0.0 --port "$port" --model "$model"
