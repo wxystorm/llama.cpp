@@ -9013,7 +9013,10 @@ static bool llama_hybrid_calibrate_independent_ring(
             for (int kv : kv_spans) {
                 ggml_backend_rpc_phone_owned_plan plan {};
                 plan.version = 4;
-                plan.flags = 1u | (uint32_t(layers) << 16);
+                // The 108-byte RPC descriptor uses bit 1 to select Llama's
+                // Normal-RoPE math; the original Qwen3 bit pattern is kept.
+                plan.flags = (attn_desc.rope_type == LLAMA_ROPE_TYPE_NORM ?
+                    3u : 1u) | (uint32_t(layers) << 16);
                 plan.run_id = 1;
                 plan.p2c_run_id = 1;
                 plan.region = 0;
@@ -9351,8 +9354,10 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
+    // Dense Llama/Mistral shares the independent G/C/N profile contract;
+    // the Phone-only graph builder handles its Normal RoPE separately.
     profile.dense_phone_region_capable =
-        ml.get_arch() == LLM_ARCH_QWEN3;
+        ml.get_arch() == LLM_ARCH_QWEN3 || ml.get_arch() == LLM_ARCH_LLAMA;
     profile.n_layer = n_layer;
     profile.n_embd = (int) (is_qwen3_moe ?
         moe_desc.n_embd : ffn_desc.n_embd);
@@ -9365,7 +9370,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     const char * controlled_env = std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
     const bool htp_only_profile = controlled_env &&
         std::strcmp(controlled_env, "1") == 0 &&
-        ml.get_arch() == LLM_ARCH_QWEN3 &&
+        (ml.get_arch() == LLM_ARCH_QWEN3 ||
+         ml.get_arch() == LLM_ARCH_LLAMA) &&
         std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV") != nullptr;
     LLAMA_LOG_INFO("[REGION_RING_HTP_PROFILE] mode=%s source=%s\n",
                    htp_only_profile ? "HTP_ONLY" : "LEGACY",
