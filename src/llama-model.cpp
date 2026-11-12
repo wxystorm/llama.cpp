@@ -1295,6 +1295,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     std::vector<uint64_t> jupiter_phone_session_total_budgets;
     std::vector<uint64_t> jupiter_phone_session_reserves;
     size_t jupiter_active_sessions = 1;
+    uint64_t jupiter_htp_global_budget_bytes = 0;
 
     if (jupiter_prefill) {
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
@@ -1381,15 +1382,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (kv_element_bytes > 4) {
                 throw std::runtime_error("LLAMA_JUPITER_HTP_KV_ELEMENT_BYTES must be 1..4");
             }
-            const uint64_t session_total_mib = std::min(
-                per_session_mib, global_mib / jupiter_active_sessions);
-            if (session_total_mib <= reserve_mib) {
+            // GGML_HEXAGON_VMEM is a per-HTP-session cap. Global Phone
+            // physical RAM is shared, not split into NDEV equal quotas.
+            // Assign memory according to actual contiguous layer charges.
+            const uint64_t session_total_mib = per_session_mib;
+            if (session_total_mib <= reserve_mib ||
+                    global_mib <= reserve_mib * jupiter_active_sessions) {
                 throw std::runtime_error(format(
-                    "HTP_SESSION_MEMORY_INFEASIBLE: session_total=%llu MiB <= reserve=%llu MiB",
-                    (unsigned long long) session_total_mib, (unsigned long long) reserve_mib));
+                    "HTP_SESSION_MEMORY_INFEASIBLE: vmem=%llu global=%llu "
+                    "reserve=%llu active=%zu MiB",
+                    (unsigned long long) per_session_mib,
+                    (unsigned long long) global_mib,
+                    (unsigned long long) reserve_mib,
+                    jupiter_active_sessions));
             }
             const uint64_t mib = 1024ULL*1024ULL;
+            jupiter_htp_global_budget_bytes = global_mib*mib;
             const uint64_t capacity_bytes = (session_total_mib - reserve_mib)*mib;
+            const uint64_t global_charge_cap_bytes =
+                (global_mib - reserve_mib*jupiter_active_sessions)*mib;
             ggml_backend_buffer_type_t phone_buft = ggml_backend_dev_buffer_type(jupiter_phone_session_devs.front());
             const uint64_t alignment = ggml_backend_buft_get_alignment(phone_buft);
             if (alignment == 0) {
@@ -1442,8 +1453,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
                 charges[i] = weights[i] + kv[i];
             }
-            const std::vector<uint64_t> capacities(jupiter_active_sessions, capacity_bytes);
-            const auto plan = jupiter_htp::partition_contiguous(charges, output_bytes, capacities);
+            const uint64_t total_layer_bytes =
+                std::accumulate(charges.begin(), charges.end(), uint64_t(0));
+            const uint64_t total_charge_bytes = total_layer_bytes + output_bytes;
+            LLAMA_LOG_INFO(
+                "[JUPITER_HTP_BUDGET] phone_layers=%d sessions=%zu "
+                "layer_weight_kv_mib=%.2f output_mib=%.2f "
+                "required_charge_mib=%.2f global_charge_cap_mib=%.2f "
+                "session_charge_cap_mib=%.2f global_limit_mib=%llu "
+                "session_vmem_mib=%llu reserve_each_mib=%llu status=%s\n",
+                n_phone_layers, jupiter_active_sessions,
+                total_layer_bytes/static_cast<double>(mib),
+                output_bytes/static_cast<double>(mib),
+                total_charge_bytes/static_cast<double>(mib),
+                global_charge_cap_bytes/static_cast<double>(mib),
+                capacity_bytes/static_cast<double>(mib),
+                (unsigned long long) global_mib,
+                (unsigned long long) per_session_mib,
+                (unsigned long long) reserve_mib,
+                total_charge_bytes <= global_charge_cap_bytes ?
+                    "CHECK_PARTITION" : "GLOBAL_OVER_BUDGET");
+            const std::vector<uint64_t> session_limits(
+                jupiter_active_sessions, session_total_mib*mib);
+            jupiter_htp::placement plan;
+            try {
+                plan = jupiter_htp::partition_global_budget(
+                    charges, output_bytes, session_limits,
+                    global_mib*mib, reserve_mib*mib);
+            } catch (const std::exception & exc) {
+                const uint64_t max_layer_charge =
+                    *std::max_element(charges.begin(), charges.end());
+                LLAMA_LOG_ERROR(
+                    "[JUPITER_HTP_SESSION_PLAN] status=REJECT reason=%s "
+                    "max_layer_charge_mib=%.2f output_mib=%.2f "
+                    "session_charge_cap_mib=%.2f\n",
+                    exc.what(), max_layer_charge/static_cast<double>(mib),
+                    output_bytes/static_cast<double>(mib),
+                    capacity_bytes/static_cast<double>(mib));
+                throw;
+            }
             jupiter_phone_session_ends = plan.ends;
 
             LLAMA_LOG_INFO(
@@ -1908,6 +1956,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // has split contexts into its <= 1 GiB buffers. Reject if padded weights
     // + estimated KV + the reserved graph/workspace exceed the Session cap.
     if (jupiter_prefill && !jupiter_phone_session_ends.empty()) {
+        uint64_t aggregate_actual_bytes = 0;
         for (size_t k = 0; k < jupiter_active_sessions; ++k) {
             uint64_t allocated = 0;
             for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
@@ -1938,6 +1987,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     "estimated KV + reserve exceed configured budget; increase "
                     "LLAMA_JUPITER_PC_LAYERS or revise Phone memory caps", k));
             }
+            aggregate_actual_bytes += total;
+        }
+        LLAMA_LOG_INFO(
+            "[JUPITER_HTP_GLOBAL_MEMORY] actual_weight_kv_reserve_mib=%.2f "
+            "global_budget_mib=%.2f status=%s\n",
+            aggregate_actual_bytes/(1024.0*1024.0),
+            jupiter_htp_global_budget_bytes/(1024.0*1024.0),
+            aggregate_actual_bytes <= jupiter_htp_global_budget_bytes ?
+                "FIT" : "OVER_BUDGET");
+        if (aggregate_actual_bytes > jupiter_htp_global_budget_bytes) {
+            throw std::runtime_error(
+                "JUPITER_HTP_GLOBAL_MEMORY_OVER_BUDGET: total real Phone "
+                "weight allocations + KV estimates + session reserves "
+                "exceed the global Phone memory budget");
         }
     }
 
