@@ -306,6 +306,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     base_env = os.environ.copy()
+    base_env["LLAMA_JUPITER_HTP_CONTEXT_TOKENS"] = str(args.context)
     base_env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(args.pc_layers),
