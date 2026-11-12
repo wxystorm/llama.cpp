@@ -19,6 +19,10 @@
 #include <regex>
 #include <queue>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <vector>
 
 #ifdef _WIN32
 #    include <sal.h>
@@ -78,6 +82,23 @@ static int opt_opqueue  = 16;   // max number of pending batches
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
+static bool opt_k14_diag = false; // opt-in layer-14 K matmul diagnostic
+static bool opt_k14_sentinel = false; // destructive diagnostic, M=1 only
+static bool opt_k14_force_input_flush = false; // opt-in K14 DSP input cache experiment
+// Reuse the already-deployed DSP K14 diagnostic op flags for K13 only when
+// explicitly requested. The DSP checks the flags and opcode, not weight name.
+static bool opt_k13_diag = false;
+static bool opt_k13_force_input_flush = false;
+// Exact per-weight QKV diagnostic targets; a force target also enables a
+// probe target. Both reuse deployed DSP K14 flags: host library only.
+static std::unordered_set<std::string> opt_qkv_probe_weights;
+static std::unordered_set<std::string> opt_qkv_force_input_flush_weights;
+static bool opt_kv14_set_rows_diag = false; // opt-in layer-14 K cache SET_ROWS source trace
+static bool opt_kv14_set_rows_force_input_flush = false; // opt-in K cache write source flush
+static bool opt_set_rows_host_input_sync = false; // opt-in generic externally staged SET_ROWS coherency
+static bool opt_set_rows_sync_timing = false; // opt-in per-SET_ROWS DSP flush timing
+static bool opt_qkv_audit = false; // opt-in per-batch QKV DSP execution acknowledgement
+static bool opt_linear_audit = false; // opt-in per-batch attn output/FFN MatMul execution acknowledgement
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -102,6 +123,188 @@ static const char * status_to_str(uint32_t status) {
 }
 
 // ** debug helpers
+
+// Targeted layer-14 K-projection fingerprints from host-visible Hexagon buffers.
+// This does not inspect the DSP's internal VTCM / DMA data.
+static uint64_t ggml_hexagon_k14_fnv64(const void * data, size_t size) {
+    const auto * bytes = static_cast<const uint8_t *>(data);
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
+static const char * ggml_hexagon_k14_kernel_name(int32_t kernel) {
+    switch (kernel) {
+        case HTP_MM_KERNEL_HMX_2D:               return "HMX_2D";
+        case HTP_MM_KERNEL_HMX_F16_BATCHED:      return "HMX_F16_BATCHED";
+        case HTP_MM_KERNEL_HVX_QUANT_BLOCK:      return "HVX_QUANT_BLOCK";
+        case HTP_MM_KERNEL_HVX_QUANT_ROW:        return "HVX_QUANT_ROW";
+        case HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT:   return "HVX_QUANT_ROW_FLAT";
+        default:                                 return "OTHER";
+    }
+}
+
+// Returns the host-visible fingerprint if available. This is deliberately
+// read-only: the diagnostic must not modify model execution or memory contents.
+static bool ggml_hexagon_k14_dump_tensor(
+        const char * phase, const char * role, uint64_t seq,
+        const ggml_tensor * tensor, uint64_t * digest_out = nullptr) {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr ||
+        !ggml_is_contiguous(tensor)) {
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s status=SKIP reason=NO_CONTIGUOUS_BUFFER\n",
+                      seq, phase, role);
+        return false;
+    }
+    const size_t bytes = ggml_nbytes(tensor);
+    if (bytes == 0 || bytes > (8u << 20)) {
+        GGML_LOG_WARN("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s status=SKIP bytes=%zu\n",
+                      seq, phase, role, bytes);
+        return false;
+    }
+    // Q4_0 get_tensor reconstructs the original logical GGUF weight layout.
+    // For F32, the backend copies the host-visible shared allocation.
+    std::vector<uint8_t> readback(bytes);
+    ggml_backend_tensor_get(tensor, readback.data(), 0, bytes);
+    const uint64_t digest = ggml_hexagon_k14_fnv64(readback.data(), bytes);
+    if (digest_out != nullptr) {
+        *digest_out = digest;
+    }
+    if (tensor->type == GGML_TYPE_F32) {
+        const size_t count = bytes / sizeof(float);
+        float sample0 = 0.0f, sample1 = 0.0f;
+        if (count > 0) memcpy(&sample0, readback.data(), sizeof(float));
+        if (count > 1) memcpy(&sample1, readback.data() + sizeof(float), sizeof(float));
+        size_t nonfinite = 0;
+        for (size_t i = 0; i < count; ++i) {
+            float value;
+            memcpy(&value, readback.data() + i * sizeof(float), sizeof(float));
+            if (!std::isfinite(value)) ++nonfinite;
+        }
+        GGML_LOG_INFO("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s view=HOST_SHARED name=%s type=%s"
+                      " ne0=%" PRId64 " ne1=%" PRId64
+                      " bytes=%zu fnv64=%016" PRIx64
+                      " nonfinite=%zu sample0=%.9g sample1=%.9g\n",
+                      seq, phase, role, tensor->name, ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], bytes, digest,
+                      nonfinite, sample0, sample1);
+    } else {
+        GGML_LOG_INFO("[HEX_K14_TENSOR] seq=%" PRIu64
+                      " phase=%s role=%s view=HOST_SHARED name=%s type=%s"
+                      " ne0=%" PRId64 " ne1=%" PRId64
+                      " bytes=%zu fnv64=%016" PRIx64 " encoding=LOGICAL\n",
+                      seq, phase, role, tensor->name, ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], bytes, digest);
+    }
+    return true;
+}
+
+
+// Debug-only sentinel poisoning for standalone, single-token K14 matmul.
+// The output is overwritten before HTP execution, never in normal execution.
+// The experiment intentionally perturbs memory/cache state; it is not a fix.
+static bool ggml_hexagon_k14_sentinel_write(
+        ggml_tensor * output, const ggml_tensor * input,
+        const ggml_tensor * weight, uint64_t seq,
+        float * sentinel_value, uint64_t * sentinel_hash) {
+    const int64_t count = output ? ggml_nelements(output) : 0;
+    const size_t bytes = output ? ggml_nbytes(output) : 0;
+    if (output == nullptr || output->type != GGML_TYPE_F32 ||
+        output->buffer == nullptr || output->data == nullptr ||
+        output->ne[1] != 1 || !ggml_is_contiguous(output) ||
+        count <= 0 || bytes > (1u << 20) ||
+        static_cast<size_t>(count) * sizeof(float) != bytes) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                      " reason=UNSUPPORTED_OUTPUT\n", seq);
+        return false;
+    }
+
+    // Avoid corrupting either matmul operand if a graph unexpectedly aliases
+    // output and input storage.
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (!a || !b || !a->data || !b->data) {
+            return false;
+        }
+        const uintptr_t aa = reinterpret_cast<uintptr_t>(a->data);
+        const uintptr_t bb = reinterpret_cast<uintptr_t>(b->data);
+        const size_t na = ggml_nbytes(a);
+        const size_t nb = ggml_nbytes(b);
+        return aa <= UINTPTR_MAX - na && bb <= UINTPTR_MAX - nb &&
+               aa < bb + nb && bb < aa + na;
+    };
+    if (overlaps(output, input) || overlaps(output, weight)) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                      " reason=ALIASED_OPERAND\n", seq);
+        return false;
+    }
+
+    // Exact F32 integers far outside the expected K projection range.
+    const float value = -16384.0f - static_cast<float>(seq % 4096);
+    std::vector<float> fill(static_cast<size_t>(count), value);
+    const uint64_t expected = ggml_hexagon_k14_fnv64(fill.data(), bytes);
+
+    ggml_backend_tensor_set(output, fill.data(), 0, bytes);
+
+    // Confirm the sentinel is visible via the very same backend readback path
+    // used by the existing BEFORE and POST diagnostics.
+    uint64_t observed = 0;
+    const bool readable = ggml_hexagon_k14_dump_tensor(
+        "SENTINEL", "output", seq, output, &observed);
+    const bool verified = readable && observed == expected;
+    GGML_LOG_INFO("[HEX_K14_SENTINEL] stage=WRITE seq=%" PRIu64
+                  " value=%.1f elements=%" PRId64
+                  " expected_fnv64=%016" PRIx64 " observed_fnv64=%016" PRIx64
+                  " verified=%d view=HOST_SHARED\n",
+                  seq, value, count, expected, observed, verified ? 1 : 0);
+
+    *sentinel_value = value;
+    *sentinel_hash = expected;
+    return verified;
+}
+
+static void ggml_hexagon_k14_sentinel_check(
+        const ggml_tensor * output, uint64_t seq, float value,
+        uint64_t original_hash, uint64_t sentinel_hash, uint64_t after_hash) {
+    if (!output || output->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(output) || output->buffer == nullptr ||
+        output->data == nullptr) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                      " status=SKIP reason=UNSUPPORTED_OUTPUT\n", seq);
+        return;
+    }
+    const size_t bytes = ggml_nbytes(output);
+    if (bytes == 0 || bytes > (1u << 20) || bytes % sizeof(float) != 0) {
+        GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                      " status=SKIP bytes=%zu\n", seq, bytes);
+        return;
+    }
+    std::vector<uint8_t> data(bytes);
+    ggml_backend_tensor_get(output, data.data(), 0, bytes);
+    size_t survivors = 0;
+    for (size_t i = 0; i < bytes / sizeof(float); i++) {
+        float observed;
+        memcpy(&observed, data.data() + i * sizeof(float), sizeof(float));
+        if (observed == value) {
+            ++survivors;
+        }
+    }
+    const size_t total = bytes / sizeof(float);
+    GGML_LOG_INFO("[HEX_K14_SENTINEL] stage=RESULT seq=%" PRIu64
+                  " value=%.1f survivors=%zu total=%zu"
+                  " original_fnv64=%016" PRIx64
+                  " sentinel_fnv64=%016" PRIx64
+                  " after_fnv64=%016" PRIx64
+                  " untouched=%d restored_original=%d view=HOST_SHARED\n",
+                  seq, value, survivors, total, original_hash,
+                  sentinel_hash, after_hash,
+                  after_hash == sentinel_hash ? 1 : 0,
+                  after_hash == original_hash ? 1 : 0);
+}
 
 static void ggml_hexagon_dump_op_exec(const std::string &sess_name, const htp_opnode & node, const uint32_t req_flags) {
     if (!opt_verbose) return;
@@ -164,7 +367,18 @@ static void ggml_hexagon_dump_op_prof(const std::string &sess_name, const htp_op
 static inline bool ggml_hexagon_is_repack_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
            type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ||
-           type == GGML_TYPE_MXFP4;
+           type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q6_K ||
+           type == GGML_TYPE_Q4_K;
+}
+
+static inline size_t ggml_hexagon_tiled_row_size(enum ggml_type type, int64_t ne0) {
+    if (type == GGML_TYPE_Q6_K) {
+        return (size_t) (ne0 / 32) * (HTP_MM_WEIGHT_TILE_SIZE_Q6_K / 32);
+    }
+    if (type == GGML_TYPE_Q4_K) {
+        return (size_t) (ne0 / 32) * (HTP_MM_WEIGHT_TILE_SIZE_Q4_1 / 32);
+    }
+    return ggml_row_size(type, ne0);
 }
 
 static inline bool ggml_hexagon_is_hmx_weight_type(enum ggml_type type) {
@@ -241,6 +455,11 @@ struct ggml_hexagon_session {
         uint64_t uid = 0;
         std::vector<htp_opnode> htp_nodes;
     } cached_graph;
+
+    // Dedicated plans for stable, per-Chunk HTP graphs. They retain tensor
+    // metadata pointers, so the RPC owner MUST clear this cache before
+    // releasing its fixed-graph contexts, KV, or activation arenas.
+    std::unordered_map<uint64_t, std::vector<htp_opnode>> fixed_graph_cache;
 
     ggml_hexagon_session(int dev_id, ggml_backend_dev_t dev) noexcept(false);
     ~ggml_hexagon_session() noexcept(true);
@@ -867,6 +1086,369 @@ static void repack_tiled_mxfp4(void * data, const ggml_tensor * t, size_t size) 
     }
 }
 
+// unsigned 6-bit value (0..63) of element e of a Q6_K block, same bit layout as dequantize_row_q6_K
+static inline uint8_t q6_K_get_quant(const block_q6_K * b, int e) {
+    const int c = e / 128;
+    const int w = e % 128;
+    const int g = w / 32;
+    const int l = w % 32;
+    const uint8_t * ql = b->ql + c * 64;
+    const uint8_t * qh = b->qh + c * 32;
+    uint8_t lo, hi;
+    switch (g) {
+        case 0:  lo = ql[l]      & 0xF; hi = (qh[l] >> 0) & 3; break;
+        case 1:  lo = ql[l + 32] & 0xF; hi = (qh[l] >> 2) & 3; break;
+        case 2:  lo = ql[l]      >> 4;  hi = (qh[l] >> 4) & 3; break;
+        default: lo = ql[l + 32] >> 4;  hi = (qh[l] >> 6) & 3; break;
+    }
+    return (uint8_t) (lo | (hi << 4));
+}
+
+// tile layout: see HTP_MM_WEIGHT_TILE_SIZE_Q6_K in htp/matmul-ops.h
+static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
+    const block_q6_K * src_matrix = (const block_q6_K *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    GGML_ASSERT(ne0 % QK_K == 0);
+
+    const int n_col_tiles = ne1_padded / 32;
+    const int n_k_tiles   = ne0_padded / 32;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+
+    const int64_t sb_per_row = ne0 / QK_K;
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            const block_q6_K * src_slice = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
+            uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            memset(matrix_dst, 0, matrix_size);  // padding rows and the OR-ed nibbles below need zeroed tiles
+
+            for (int64_t r = 0; r < ne1; r++) {
+                const int ct  = (int) (r / 32);
+                const int row = (int) (r % 32);
+                const block_q6_K * src_row = src_slice + r * sb_per_row;
+
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    const int kt_local = kt % 8;  // k-tile within the super-block
+                    const block_q6_K * b = &src_row[kt / 8];
+                    const float d = GGML_FP16_TO_FP32(b->d);
+
+                    uint8_t * tile = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                    uint8_t * lo_pl = tile;
+                    uint8_t * hi_pl = tile + 512;
+                    ggml_half * sc_pl = (ggml_half *) (tile + 768);
+
+                    for (int lk = 0; lk < 32; lk++) {
+                        const uint8_t q6 = q6_K_get_quant(b, kt_local * 32 + lk);
+                        const int g   = lk >> 2;
+                        const int pos = row * 4 + (lk & 3);
+                        lo_pl[(g >> 1) * 128 + pos] |= (uint8_t) ((q6 & 0xF) << ((g & 1) * 4));
+                        hi_pl[(g >> 2) * 128 + pos] |= (uint8_t) ((q6 >> 4) << ((g & 3) * 2));
+                    }
+                    for (int sub = 0; sub < 2; sub++) {
+                        sc_pl[sub * 32 + row] = GGML_FP32_TO_FP16(d * (float) b->scales[kt_local * 2 + sub]);
+                    }
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
+// Reverse of repack_q6_K_tiled. Unpacks quants losslessly and normalizes sub-block scales. Read-back only.
+static void repack_tiled_q6_K(void * data, const ggml_tensor * t, size_t size) {
+    block_q6_K * dst_matrix = (block_q6_K *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    GGML_ASSERT(ne0 % QK_K == 0);
+
+    const int n_col_tiles = ne1_padded / 32;
+    const int n_k_tiles   = ne0_padded / 32;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q6_K;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+
+    const int64_t sb_per_row = ne0 / QK_K;
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            block_q6_K *    dst_slice  = dst_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
+            const uint8_t * matrix_src = (const uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            for (int64_t r = 0; r < ne1; r++) {
+                const int ct  = (int) (r / 32);
+                const int row = (int) (r % 32);
+                block_q6_K * dst_row = dst_slice + r * sb_per_row;
+
+                for (int64_t sb = 0; sb < sb_per_row; sb++) {
+                    block_q6_K * b = &dst_row[sb];
+                    memset(b, 0, sizeof(block_q6_K));
+
+                    float sub_scales[16];
+                    for (int kt_local = 0; kt_local < 8; kt_local++) {
+                        const int kt = sb * 8 + kt_local;
+                        const uint8_t *   tile  = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                        const uint8_t *   lo_pl = tile;
+                        const uint8_t *   hi_pl = tile + 512;
+                        const ggml_half * sc_pl = (const ggml_half *) (tile + 768);
+
+                        const int c = kt_local / 4;
+                        const int g = kt_local % 4;
+                        uint8_t * ql = b->ql + c * 64;
+                        uint8_t * qh = b->qh + c * 32;
+
+                        for (int lk = 0; lk < 32; lk++) {
+                            const int g_tile = lk >> 2;
+                            const int pos    = row * 4 + (lk & 3);
+                            const uint8_t lo = (lo_pl[(g_tile >> 1) * 128 + pos] >> ((g_tile & 1) * 4)) & 0xF;
+                            const uint8_t hi = (hi_pl[(g_tile >> 2) * 128 + pos] >> ((g_tile & 3) * 2)) & 3;
+
+                            switch (g) {
+                                case 0:
+                                    ql[lk]      |= lo;
+                                    qh[lk]      |= (hi << 0);
+                                    break;
+                                case 1:
+                                    ql[lk + 32] |= lo;
+                                    qh[lk]      |= (hi << 2);
+                                    break;
+                                case 2:
+                                    ql[lk]      |= (lo << 4);
+                                    qh[lk]      |= (hi << 4);
+                                    break;
+                                default:
+                                    ql[lk + 32] |= (lo << 4);
+                                    qh[lk]      |= (hi << 6);
+                                    break;
+                            }
+                        }
+
+                        for (int sub = 0; sub < 2; sub++) {
+                            sub_scales[kt_local * 2 + sub] = GGML_FP16_TO_FP32(sc_pl[sub * 32 + row]);
+                        }
+                    }
+
+                    float max_abs_scale = 0.0f;
+                    for (int s = 0; s < 16; s++) {
+                        float abs_scale = fabsf(sub_scales[s]);
+                        if (abs_scale > max_abs_scale) {
+                            max_abs_scale = abs_scale;
+                        }
+                    }
+
+                    if (max_abs_scale == 0.0f) {
+                        b->d = GGML_FP32_TO_FP16(0.0f);
+                        memset(b->scales, 0, sizeof(b->scales));
+                    } else {
+                        float d_flt = max_abs_scale / 127.0f;
+                        b->d = GGML_FP32_TO_FP16(d_flt);
+                        float d_actual = GGML_FP16_TO_FP32(b->d);
+                        float inv_d = (d_actual != 0.0f) ? (1.0f / d_actual) : 0.0f;
+                        for (int s = 0; s < 16; s++) {
+                            int sc = (int) roundf(sub_scales[s] * inv_d);
+                            b->scales[s] = (int8_t) (std::max)(-128, (std::min)(127, sc));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
+static inline void get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >>  4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+// tile layout: see HTP_MM_WEIGHT_TILE_SIZE_Q4_1 in htp/matmul-ops.h
+static void repack_q4_K_tiled(ggml_tensor * t, const void * data, size_t size) {
+    const block_q4_K * src_matrix = (const block_q4_K *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    GGML_ASSERT(ne0 % QK_K == 0);
+
+    const int n_col_tiles = ne1_padded / 32;
+    const int n_k_tiles   = ne0_padded / 32;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+
+    const int64_t sb_per_row = ne0 / QK_K;
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            const block_q4_K * src_slice = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
+            uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            memset(matrix_dst, 0, matrix_size);
+
+            for (int64_t r = 0; r < ne1; r++) {
+                const int ct  = (int) (r / 32);
+                const int row = (int) (r % 32);
+                const block_q4_K * src_row = src_slice + r * sb_per_row;
+
+                for (int kt = 0; kt < n_k_tiles; kt++) {
+                    const int kt_local = kt % 8;
+                    const block_q4_K * b = &src_row[kt / 8];
+                    const float d = GGML_FP16_TO_FP32(b->d);
+                    const float dmin = GGML_FP16_TO_FP32(b->dmin);
+
+                    uint8_t * tile_dst = matrix_dst + ((size_t) ct * n_k_tiles + kt) * tile_size;
+
+                    uint8_t sc, m;
+                    get_scale_min_k4(kt_local, b->scales, &sc, &m);
+
+                    const float D = d * (float) sc;
+                    const float M = -dmin * (float) m;
+
+                    const uint8_t * qs_sub = b->qs + (kt_local / 2) * 32;
+                    const int shift = (kt_local & 1) ? 4 : 0;
+
+                    for (int cp = 0; cp < 16; cp++) {
+                        const uint8_t q0 = (qs_sub[2 * cp + 0] >> shift) & 0x0F;
+                        const uint8_t q1 = (qs_sub[2 * cp + 1] >> shift) & 0x0F;
+                        tile_dst[cp * 32 + row] = (uint8_t) ((q1 << 4) | q0);
+                    }
+
+                    ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
+                    scale_dst[2 * row + 0] = GGML_FP32_TO_FP16(D);
+                    scale_dst[2 * row + 1] = GGML_FP32_TO_FP16(M);
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
+// Reverse of repack_q4_K_tiled. Unpacks quants and normalizes scales/mins. Read-back only.
+static void repack_tiled_q4_K(void * data, const ggml_tensor * t, size_t size) {
+    block_q4_K * dst_matrix = (block_q4_K *) data;
+    int64_t ne0 = t->ne[0];
+    int64_t ne1 = t->ne[1];
+    int64_t ne2 = t->ne[2];
+    int64_t ne3 = t->ne[3];
+    int64_t ne0_padded = hex_round_up(ne0, 32);
+    int64_t ne1_padded = hex_round_up(ne1, 32);
+
+    GGML_ASSERT(ne0 % QK_K == 0);
+
+    const int n_col_tiles = ne1_padded / 32;
+    const int n_k_tiles   = ne0_padded / 32;
+    const size_t tile_size   = HTP_MM_WEIGHT_TILE_SIZE_Q4_1;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * tile_size;
+
+    const int64_t sb_per_row = ne0 / QK_K;
+
+    for (int i3 = 0; i3 < ne3; i3++) {
+        for (int i2 = 0; i2 < ne2; i2++) {
+            block_q4_K * dst_slice = dst_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
+            const uint8_t * matrix_src = (const uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            for (int64_t r = 0; r < ne1; r++) {
+                const int ct  = (int) (r / 32);
+                const int row = (int) (r % 32);
+                block_q4_K * dst_row = dst_slice + r * sb_per_row;
+
+                for (int64_t sb = 0; sb < sb_per_row; sb++) {
+                    block_q4_K * b = &dst_row[sb];
+                    memset(b, 0, sizeof(block_q4_K));
+
+                    float sub_scales[8];
+                    float sub_mins[8];
+
+                    for (int kt_local = 0; kt_local < 8; kt_local++) {
+                        const int kt = sb * 8 + kt_local;
+                        const uint8_t * tile_src = matrix_src + ((size_t) ct * n_k_tiles + kt) * tile_size;
+                        const ggml_half * scale_src = (const ggml_half *) (tile_src + 512);
+
+                        uint8_t * qs_sub = b->qs + (kt_local / 2) * 32;
+                        const int shift = (kt_local & 1) ? 4 : 0;
+
+                        for (int cp = 0; cp < 16; cp++) {
+                            const uint8_t val = tile_src[cp * 32 + row];
+                            const uint8_t q0 = val & 0x0F;
+                            const uint8_t q1 = val >> 4;
+                            qs_sub[2 * cp + 0] |= (uint8_t) (q0 << shift);
+                            qs_sub[2 * cp + 1] |= (uint8_t) (q1 << shift);
+                        }
+
+                        const float D = GGML_FP16_TO_FP32(scale_src[2 * row + 0]);
+                        const float M = GGML_FP16_TO_FP32(scale_src[2 * row + 1]);
+                        sub_scales[kt_local] = (D > 0.0f) ? D : 0.0f;
+                        sub_mins[kt_local]   = (-M > 0.0f) ? -M : 0.0f;
+                    }
+
+                    float max_scale = 0.0f;
+                    float max_min   = 0.0f;
+                    for (int j = 0; j < 8; j++) {
+                        if (sub_scales[j] > max_scale) max_scale = sub_scales[j];
+                        if (sub_mins[j]   > max_min)   max_min   = sub_mins[j];
+                    }
+
+                    float inv_scale = 0.0f;
+                    if (max_scale > 0.0f) {
+                        b->d = GGML_FP32_TO_FP16(max_scale / 63.0f);
+                        const float d_actual = GGML_FP16_TO_FP32(b->d);
+                        inv_scale = (d_actual > 0.0f) ? (1.0f / d_actual) : 0.0f;
+                    } else {
+                        b->d = GGML_FP32_TO_FP16(0.0f);
+                    }
+
+                    float inv_min = 0.0f;
+                    if (max_min > 0.0f) {
+                        b->dmin = GGML_FP32_TO_FP16(max_min / 63.0f);
+                        const float dmin_actual = GGML_FP16_TO_FP32(b->dmin);
+                        inv_min = (dmin_actual > 0.0f) ? (1.0f / dmin_actual) : 0.0f;
+                    } else {
+                        b->dmin = GGML_FP32_TO_FP16(0.0f);
+                    }
+
+                    for (int j = 0; j < 8; j++) {
+                        uint8_t ls = (uint8_t) roundf(inv_scale * sub_scales[j]);
+                        uint8_t lm = (uint8_t) roundf(inv_min * sub_mins[j]);
+                        ls = (std::min)((uint8_t) 63, ls);
+                        lm = (std::min)((uint8_t) 63, lm);
+                        if (j < 4) {
+                            b->scales[j]     = ls;
+                            b->scales[j + 4] = lm;
+                        } else {
+                            b->scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                            b->scales[j - 4] |= ((ls >> 4) << 6);
+                            b->scales[j - 0] |= ((lm >> 4) << 6);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    GGML_UNUSED(size);
+}
+
 static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                    ggml_tensor *         tensor,
                                                    const void *          data,
@@ -890,6 +1472,12 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             repack_q4_1_tiled(tensor, data, size);
             break;
 
+        case GGML_TYPE_Q4_K:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_q4_K_tiled(tensor, data, size);
+            break;
+
         case GGML_TYPE_Q8_0:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
@@ -909,9 +1497,34 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             repack_mxfp4_tiled(tensor, data, size);
             break;
 
+        case GGML_TYPE_Q6_K:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_q6_K_tiled(tensor, data, size);
+            break;
+
         default:
             memcpy((char *) tensor->data + offset, data, size);
             break;
+    }
+
+    // Confirm the Q4_0 tiling step round-trips the original K14 weight bytes.
+    if (opt_k14_diag && tensor->type == GGML_TYPE_Q4_0 &&
+        strcmp(tensor->name, "blk.14.attn_k.weight") == 0 &&
+        offset == 0 && size == ggml_nbytes(tensor)) {
+        std::vector<uint8_t> logical(size);
+        repack_tiled_q4_0(logical.data(), tensor, size);
+        const size_t first_bad = std::mismatch(
+            static_cast<const uint8_t *>(data),
+            static_cast<const uint8_t *>(data) + size,
+            logical.data()).first - static_cast<const uint8_t *>(data);
+        GGML_LOG_INFO("[HEX_K14_WEIGHT_LOAD] name=%s bytes=%zu"
+                      " raw_fnv64=%016" PRIx64 " roundtrip_fnv64=%016" PRIx64
+                      " roundtrip=%s first_bad=%zu\n",
+                      tensor->name, size,
+                      ggml_hexagon_k14_fnv64(data, size),
+                      ggml_hexagon_k14_fnv64(logical.data(), size),
+                      first_bad == size ? "OK" : "MISMATCH", first_bad);
     }
 }
 
@@ -938,6 +1551,12 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             repack_tiled_q4_1(data, tensor, size);
             break;
 
+        case GGML_TYPE_Q4_K:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_tiled_q4_K(data, tensor, size);
+            break;
+
         case GGML_TYPE_Q8_0:
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
@@ -954,6 +1573,12 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
             GGML_ASSERT(offset == 0);
             GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
             repack_tiled_mxfp4(data, tensor, size);
+            break;
+
+        case GGML_TYPE_Q6_K:
+            GGML_ASSERT(offset == 0);
+            GGML_ASSERT(offset + size <= ggml_nbytes(tensor));
+            repack_tiled_q6_K(data, tensor, size);
             break;
 
         default:
@@ -1031,12 +1656,12 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    if (t->type == GGML_TYPE_Q4_0 || t->type == GGML_TYPE_Q4_1 || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_IQ4_NL || t->type == GGML_TYPE_MXFP4) {
+    if (ggml_hexagon_is_repack_type(t->type)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
         int64_t ne2 = t->ne[2];
         int64_t ne3 = t->ne[3];
-        return ggml_row_size(t->type, ne0) * ne1 * ne2 * ne3;
+        return ggml_hexagon_tiled_row_size(t->type, ne0) * ne1 * ne2 * ne3;
     }
     return ggml_nbytes(t);
 }
@@ -1178,11 +1803,12 @@ struct ggml_hexagon_opbatch {
             ne0 = hex_round_up(ne0, 32);
             ne1 = hex_round_up(ne1, 32);
         }
-        int64_t nb1 = is_repack ? ggml_row_size(t->type, ne0) : t->nb[1];
+        int64_t nb1 = is_repack ? (int64_t) ggml_hexagon_tiled_row_size(t->type, ne0) : t->nb[1];
         int64_t nb2 = is_repack ? nb1 * ne1 : t->nb[2];
         int64_t nb3 = is_repack ? nb2 * t->ne[2] : t->nb[3];
 
-        return (h->ne[0] == ne0) && (h->ne[1] == ne1) && (h->ne[2] == t->ne[2]) && (h->ne[3] == t->ne[3]) &&
+        return (h->type == t->type) &&
+               (h->ne[0] == ne0) && (h->ne[1] == ne1) && (h->ne[2] == t->ne[2]) && (h->ne[3] == t->ne[3]) &&
                (h->nb[0] == t->nb[0]) && (h->nb[1] == nb1) && (h->nb[2] == nb2) && (h->nb[3] == nb3);
     }
 
@@ -1224,7 +1850,7 @@ struct ggml_hexagon_opbatch {
             h.ne[3] = t->ne[3];
 
             h.nb[0] = t->nb[0];
-            h.nb[1] = ggml_row_size(t->type, h.ne[0]);
+            h.nb[1] = ggml_hexagon_tiled_row_size(t->type, h.ne[0]);
             h.nb[2] = h.nb[1] * h.ne[1];
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
@@ -1236,7 +1862,11 @@ struct ggml_hexagon_opbatch {
         }
 
         h.flags = 0;
-        if (ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        // Match the upstream Hexagon coherency model: RPC/host-staged
+        // activations may arrive on buffers whose usage is ANY. Only explicit
+        // WEIGHTS are immutable inputs; every other tensor participates in
+        // compute cache maintenance.
+        if (ggml_backend_buffer_get_usage(t->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             h.flags |= HTP_TENSOR_COMPUTE;
         }
 
@@ -1296,6 +1926,91 @@ struct ggml_hexagon_opbatch {
         memcpy(o.kernel_params, node.kernel_params,   sizeof(o.kernel_params));
         o.opcode = node.opcode;
         o.flags  = 0;
+        o.pad[0] = 0;
+        o.pad[1] = 0;
+
+        // Per-weight QKV probes reuse the existing K14 diagnostic/flush flags.
+        // The deployed DSP decides only by opcode and flags, not the tensor name.
+        if ((opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) &&
+            node.diag_k14_seq != 0 && node.opcode == HTP_OP_MUL_MAT &&
+            node.node != nullptr && node.node->src[0] != nullptr) {
+            const char * weight_name = node.node->src[0]->name;
+            const bool is_k13 = opt_k13_diag &&
+                                 strcmp(weight_name, "blk.13.attn_k.weight") == 0;
+            const bool is_k14 = opt_k14_diag &&
+                                 strcmp(weight_name, "blk.14.attn_k.weight") == 0;
+            const bool selected_qkv =
+                    opt_qkv_probe_weights.count(weight_name) != 0;
+            if (is_k13 || is_k14 || selected_qkv) {
+                o.flags |= HTP_OPFLAGS_DIAG_K14;
+                o.pad[0] = static_cast<uint16_t>(node.diag_k14_seq & 0xffffu);
+                o.pad[1] = static_cast<uint16_t>(node.diag_k14_seq >> 16);
+                const bool force_flush =
+                        (is_k13 && opt_k13_force_input_flush) ||
+                        (is_k14 && opt_k14_force_input_flush) ||
+                        opt_qkv_force_input_flush_weights.count(weight_name) != 0;
+                if (force_flush) {
+                    o.flags |= HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH;
+                }
+                if (selected_qkv) {
+                    GGML_LOG_INFO("[HEX_QKV_INPUT_PROBE] stage=HTP_TAG"
+                                  " seq=%u weight=%s flags=0x%x force_flush=%d\n",
+                                  node.diag_k14_seq, weight_name,
+                                  (unsigned) o.flags, force_flush ? 1 : 0);
+                } else if (is_k13) {
+                    GGML_LOG_INFO("[HEX_K13_INPUT_PROBE] stage=HTP_TAG"
+                                  " seq=%u weight=%s flags=0x%x force_flush=%d\n",
+                                  node.diag_k14_seq, weight_name,
+                                  (unsigned) o.flags,
+                                  opt_k13_force_input_flush ? 1 : 0);
+                }
+            }
+        }
+
+        // The SET_ROWS ggml tensor is a view of cache_k_l14. Its src[0]
+        // contains F32 values, src[1] indices, and src[2] the F16 cache.
+        // The DSP has no tensor names, so tag this exact operation on host.
+        if (opt_kv14_set_rows_diag && node.opcode == HTP_OP_SET_ROWS &&
+            node.node != nullptr && node.node->src[0] != nullptr &&
+            node.node->src[1] != nullptr && node.node->src[2] != nullptr &&
+            strncmp(node.node->src[2]->name, "cache_k_l14", sizeof("cache_k_l14") - 1) == 0) {
+            o.flags |= HTP_OPFLAGS_DIAG_KV14_SET_ROWS;
+            if (opt_kv14_set_rows_force_input_flush) {
+                o.flags |= HTP_OPFLAGS_KV14_SET_ROWS_FORCE_INPUT_FLUSH;
+            }
+        }
+
+        // Phase-1 coherency fix: generalize the known-good K14 experiment
+        // to every SET_ROWS op, without relying on tensor names. Input tensors
+        // on buffers with usage != COMPUTE may have been updated by RPC / the
+        // Android CPU since the DSP cached their previous contents. Usage is
+        // a placement hint, not a cache-coherency marker.
+        //
+        // Do not sync the destination cache (src[2]); it is in/out storage
+        // whose DSP-side contents must be preserved.
+        if (opt_set_rows_host_input_sync && node.opcode == HTP_OP_SET_ROWS &&
+            node.node != nullptr && node.node->src[0] != nullptr &&
+            node.node->src[1] != nullptr &&
+            node.node->src[0]->type == GGML_TYPE_F32 &&
+            (node.node->src[1]->type == GGML_TYPE_I32 ||
+             node.node->src[1]->type == GGML_TYPE_I64)) {
+            o.flags |= HTP_OPFLAGS_SYNC_SET_ROWS_HOST_INPUT;
+            if (opt_set_rows_sync_timing) {
+                o.flags |= HTP_OPFLAGS_PROFILE_SET_ROWS_SYNC;
+            }
+
+            const char * cache_name = node.node->src[2] ? node.node->src[2]->name : "(none)";
+            if (opt_verbose || strncmp(cache_name, "cache_k_l14", sizeof("cache_k_l14") - 1) == 0) {
+                GGML_LOG_INFO("[HEX_SET_ROWS_HOST_SYNC_TAG] cache=%s values=%s"
+                              " width=%" PRId64 " rows=%" PRId64
+                              " values_usage=%d idx_usage=%d op_flags=0x%x\n",
+                              cache_name, node.node->src[0]->name,
+                              node.node->src[0]->ne[0], node.node->src[0]->ne[1],
+                              (int) ggml_backend_buffer_get_usage(node.node->src[0]->buffer),
+                              (int) ggml_backend_buffer_get_usage(node.node->src[1]->buffer),
+                              (unsigned) o.flags);
+            }
+        }
 
         if (!(opt_opstage & HTP_OPSTAGE_COMPUTE)) {
             o.flags |= HTP_OPFLAGS_SKIP_COMPUTE;
@@ -1311,6 +2026,35 @@ struct ggml_hexagon_opbatch {
         auto outputs = node.get_outputs();
         for (unsigned int i=0; i < HTP_OP_MAX_OUTPUTS; i++) {
             o.dst[i] = (i < outputs.size() && outputs[i]) ? add_tensor(outputs[i]) : 0xffff;
+        }
+
+        if ((o.flags & HTP_OPFLAGS_DIAG_KV14_SET_ROWS) != 0 &&
+            o.src[0] != 0xffff && o.src[1] != 0xffff) {
+            const htp_tensor & values = h_tens[o.src[0]];
+            const htp_tensor & idxs   = h_tens[o.src[1]];
+            GGML_LOG_WARN("[HEX_KV14_SET_ROWS_TAG] cache=%s values=%s"
+                          " rows=%u width=%u bytes=%u values_flags=0x%x"
+                          " idx_type=%u idx_bytes=%u op_flags=0x%x\n",
+                          node.node->src[2]->name, node.node->src[0]->name,
+                          (unsigned) values.ne[1], (unsigned) values.ne[0],
+                          (unsigned) values.size, (unsigned) values.flags,
+                          (unsigned) idxs.type, (unsigned) idxs.size, (unsigned) o.flags);
+        }
+
+        if ((o.flags & HTP_OPFLAGS_DIAG_K14) &&
+            o.src[1] != 0xffff && o.dst[0] != 0xffff) {
+            const htp_tensor & input = h_tens[o.src[1]];
+            const htp_tensor & output = h_tens[o.dst[0]];
+            GGML_LOG_INFO("[HEX_K14_DSP_TAG] seq=%u op_flags=0x%x"
+                          " input_flags=0x%x output_flags=0x%x"
+                          " input_bytes=%u output_bytes=%u"
+                          " input_bi=%u output_bi=%u"
+                          " input_offset=%u output_offset=%u"
+                          " force_input_flush_requested=%d\n",
+                          node.diag_k14_seq, o.flags, input.flags, output.flags,
+                          input.size, output.size, (unsigned) input.bi,
+                          (unsigned) output.bi, input.data, output.data,
+                          (o.flags & HTP_OPFLAGS_K14_FORCE_INPUT_FLUSH) ? 1 : 0);
         }
     }
 };
@@ -1437,6 +2181,218 @@ struct ggml_hexagon_opqueue {
 
         done.push(rsp.id);
 
+        // The DSP optionally returns four K14 fingerprints in n_traces[]
+        // when profiling is disabled. The magic/sequence are in rsp.pad.
+        // No FARF forwarding or logcat access is required.
+        if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
+            uint32_t magic = 0, seq = 0;
+            memcpy(&magic, rsp.pad, sizeof(magic));
+            memcpy(&seq, rsp.pad + sizeof(magic), sizeof(seq));
+            const auto & batch_nodes = op_cache[rsp.id];
+            const auto probe_for_seq = [&](uint32_t requested_seq) {
+                return std::find_if(batch_nodes.begin(), batch_nodes.end(),
+                    [&](const htp_opnode & node) {
+                        return node.diag_k14_seq == requested_seq && node.node != nullptr &&
+                               node.node->src[0] != nullptr;
+                    });
+            };
+            const auto result_probe = probe_for_seq(seq);
+            const char * reply_weight =
+                    result_probe == batch_nodes.end() ? "(unmatched)" :
+                    result_probe->node->src[0]->name;
+            const bool response_is_k13 =
+                    strcmp(reply_weight, "blk.13.attn_k.weight") == 0 &&
+                    opt_k13_diag;
+            const bool response_is_k14 =
+                    strcmp(reply_weight, "blk.14.attn_k.weight") == 0 &&
+                    opt_k14_diag;
+            const bool response_is_qkv =
+                    opt_qkv_probe_weights.count(reply_weight) != 0;
+            const bool requested_force =
+                    (response_is_k13 && opt_k13_force_input_flush) ||
+                    (response_is_k14 && opt_k14_force_input_flush) ||
+                    opt_qkv_force_input_flush_weights.count(reply_weight) != 0;
+            // Legacy K14 DSP reply stores only one probe per batch.
+            // Multiple tagged MatMuls can execute correctly even though
+            // the response only acknowledges the last diagnostic probe.
+            size_t tagged_in_batch = 0;
+            for (const auto & op : batch_nodes) {
+                if (op.diag_k14_seq != 0) {
+                    ++tagged_in_batch;
+                }
+            }
+            if (tagged_in_batch > 1 && (opt_k13_diag || !opt_qkv_probe_weights.empty())) {
+                GGML_LOG_WARN("[HEX_QKV_DSP_PROBE] batch_id=%u"
+                              " status=MULTIPLE_TAGGED_OPS count=%zu"
+                              " note=last_probe_only_in_batch_response\n",
+                              rsp.id, tagged_in_batch);
+            }
+            if (magic == 0x4b313444u && opt_profile == 0) {
+                // Low four bits remain the fingerprint-valid mask. Bit 4 is
+                // an acknowledgement written only after the DSP flush call.
+                const uint32_t valid = rsp.n_traces[10] & 0x0fu;
+                const bool force_ack = (rsp.n_traces[10] & 0x10u) != 0;
+                const uint64_t input_hash = (uint64_t(rsp.n_traces[1]) << 32) | rsp.n_traces[0];
+                const uint64_t pre_hash   = (uint64_t(rsp.n_traces[3]) << 32) | rsp.n_traces[2];
+                const uint64_t post_hash  = (uint64_t(rsp.n_traces[5]) << 32) | rsp.n_traces[4];
+                const uint64_t flush_hash = (uint64_t(rsp.n_traces[7]) << 32) | rsp.n_traces[6];
+                const char * probe_tag = response_is_qkv ?
+                        "[HEX_QKV_DSP_PROBE]" :
+                        (response_is_k13 ? "[HEX_K13_DSP_PROBE]" :
+                         "[HEX_K14_DSP_PROBE]");
+                GGML_LOG_INFO("%s seq=%u weight=%s batch_id=%u status=%s"
+                              " input_flags=0x%x exec_status=%u valid_mask=0x%x"
+                              " force_input_flush_requested=%d force_input_flush_ack=%d"
+                              " input_fnv64=%016" PRIx64
+                              " output_pre_fnv64=%016" PRIx64
+                              " output_post_fnv64=%016" PRIx64
+                              " output_flush_fnv64=%016" PRIx64 "\n",
+                              probe_tag, seq, reply_weight, rsp.id, status_to_str(rsp.status),
+                              rsp.n_traces[8], rsp.n_traces[9], valid,
+                              requested_force ? 1 : 0,
+                              force_ack ? 1 : 0,
+                              input_hash, pre_hash, post_hash, flush_hash);
+                if (requested_force && !force_ack) {
+                    GGML_LOG_WARN("%s weight=%s seq=%u"
+                                  " status=NO_DSP_ACK"
+                                  " (check DSP library version and input tensor validity)\n",
+                                  response_is_qkv ? "[HEX_QKV_INPUT_FORCE_FLUSH]" :
+                                  (response_is_k13 ? "[HEX_K13_INPUT_FORCE_FLUSH]" :
+                                                     "[HEX_K14_INPUT_FORCE_FLUSH]"),
+                                  reply_weight, seq);
+                }
+            } else if (opt_profile == 0) {
+                bool has_target = false;
+                for (const auto & op : batch_nodes) {
+                    if (op.diag_k14_seq != 0) { has_target = true; break; }
+                }
+                if (has_target) {
+                    GGML_LOG_WARN("[HEX_MM_DSP_PROBE] batch_id=%u status=MISSING"
+                                  " magic=0x%08x reason=DSP_PROBE_NOT_RETURNED"
+                                  " (check DSP library deployment)\n", rsp.id, magic);
+                }
+            }
+        }
+
+        // Correctness-only audit: report Q/K/V weight MatMul operations
+        // carried by a completed HTP batch. The DSP batch ACK proves that
+        // the batch returned OK, but not that each tensor matches CPU values.
+        // A separate PC tensor dump comparison provides numerical evidence.
+        if (opt_qkv_audit) {
+            const auto & completed_ops = op_cache[rsp.id];
+            for (const auto & queued : completed_ops) {
+                // Audit remote KV-cache writes separately from Q/K/V projection
+                // MatMuls, including layers other than K14. Batch ACK is
+                // necessary but not sufficient evidence of correct KV values.
+                if (queued.opcode == HTP_OP_SET_ROWS && queued.node != nullptr &&
+                    queued.node->src[0] != nullptr && queued.node->src[2] != nullptr) {
+                    const ggml_tensor * values = queued.node->src[0];
+                    const ggml_tensor * cache  = queued.node->src[2];
+                    if (strncmp(cache->name, "cache_k_l", 9) == 0 ||
+                        strncmp(cache->name, "cache_v_l", 9) == 0) {
+                        GGML_LOG_INFO("[HEX_KV_AUDIT] session=%s batch_id=%u"
+                                      " batch_status=%s cache=%s values=%s"
+                                      " values_bytes=%zu compute_enabled=%d\n",
+                                      shm_buf->sess->c_name(), rsp.id,
+                                      status_to_str(rsp.status), cache->name,
+                                      values->name, ggml_nbytes(values),
+                                      (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+                    }
+                }
+                if (queued.opcode != HTP_OP_MUL_MAT &&
+                    queued.opcode != HTP_OP_MUL_MAT_ADD &&
+                    queued.opcode != HTP_OP_MUL_MAT_QKV) {
+                    continue;
+                }
+                const ggml_tensor * output = queued.node;
+                const ggml_tensor * weight = output ? output->src[0] : nullptr;
+                if (weight == nullptr) {
+                    continue;
+                }
+                const char * name = weight->name;
+                if (strncmp(name, "blk.", 4) != 0) {
+                    continue;
+                }
+                const char * attn = strstr(name + 4, ".attn_");
+                if (attn == nullptr ||
+                    (strcmp(attn, ".attn_q.weight") != 0 &&
+                     strcmp(attn, ".attn_k.weight") != 0 &&
+                     strcmp(attn, ".attn_v.weight") != 0)) {
+                    continue;
+                }
+                GGML_LOG_INFO("[HEX_QKV_AUDIT] session=%s batch_id=%u"
+                              " batch_status=%s weight=%s output=%s"
+                              " opcode=%u opstage=%u compute_enabled=%d\n",
+                              shm_buf->sess->c_name(), rsp.id,
+                              status_to_str(rsp.status), name,
+                              output->name, (unsigned) queued.opcode,
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            }
+        }
+
+        // Correctness-only audit of newly enabled attention-output and FFN
+        // weight MatMul kernels. Only a finished HTP batch gets a record.
+        // No DSP protocol change; does not imply exact result equality.
+        if (opt_linear_audit) {
+            const auto & completed_ops = op_cache[rsp.id];
+            for (const auto & queued : completed_ops) {
+                if (queued.opcode != HTP_OP_MUL_MAT &&
+                    queued.opcode != HTP_OP_MUL_MAT_ADD &&
+                    queued.opcode != HTP_OP_MUL_MAT_QKV) {
+                    continue;
+                }
+                const ggml_tensor * output = queued.node;
+                const ggml_tensor * weight = output ? output->src[0] : nullptr;
+                if (weight == nullptr || strncmp(weight->name, "blk.", 4) != 0) {
+                    continue;
+                }
+                // Compare whole suffixes so unrelated weights are not counted.
+                const char * suffix = strchr(weight->name + 4, '.');
+                if (suffix == nullptr ||
+                    (strcmp(suffix, ".attn_output.weight") != 0 &&
+                     strcmp(suffix, ".ffn_gate.weight") != 0 &&
+                     strcmp(suffix, ".ffn_up.weight") != 0 &&
+                     strcmp(suffix, ".ffn_down.weight") != 0)) {
+                    continue;
+                }
+                GGML_LOG_INFO("[HEX_LINEAR_AUDIT] session=%s batch_id=%u"
+                              " batch_status=%s weight=%s output=%s"
+                              " opcode=%u opstage=%u compute_enabled=%d\n",
+                              shm_buf->sess->c_name(), rsp.id,
+                              status_to_str(rsp.status), weight->name,
+                              output->name, (unsigned) queued.opcode,
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            }
+        }
+
+        // Report the real DSP batch acknowledgement for the K14 matmul.
+        // This is a batch-level status, not proof that the output was updated.
+        if (opt_k14_diag) {
+            const auto & completed_ops = op_cache[rsp.id];
+            size_t k14_count = 0;
+            for (const auto & op : completed_ops) {
+                const ggml_tensor * tensor = op.node;
+                if (op.opcode == HTP_OP_MUL_MAT && tensor != nullptr &&
+                    tensor->src[0] != nullptr &&
+                    strcmp(tensor->src[0]->name, "blk.14.attn_k.weight") == 0) {
+                    ++k14_count;
+                }
+            }
+            if (k14_count > 0) {
+                GGML_LOG_INFO("[HEX_K14_DSP_RESPONSE] batch_id=%u"
+                              " status_code=%u status=%s queued_ops=%zu response_ops=%u"
+                              " k14_ops=%zu elapsed_us=%" PRIu64
+                              " opstage=%u compute_enabled=%d\n",
+                              rsp.id, (unsigned) rsp.status, status_to_str(rsp.status),
+                              completed_ops.size(), rsp.n_ops, k14_count,
+                              ggml_time_us() - start_usec[rsp.id],
+                              (unsigned) opt_opstage,
+                              (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            }
+        }
+
         const size_t b_size = sizeof(htp_buf_desc)  * rsp.n_bufs;
         const size_t t_size = sizeof(htp_tensor)    * rsp.n_tensors;
         const size_t o_size = sizeof(htp_op_desc)   * rsp.n_ops;
@@ -1485,8 +2441,28 @@ struct ggml_hexagon_opqueue {
                 }
             }
 
+            uint64_t sync_us = 0;
+            uint64_t sync_bytes = 0;
+            uint64_t sync_calls = 0;
+            uint64_t global_flush_calls = 0;
+            uint64_t set_rows_total_us = 0;
+            uint32_t set_rows_ops = 0;
+
             for (uint32_t i = 0; i < rsp.n_ops; i++) {
                 htp_usec += pd[i].usecs;
+
+                if (opt_set_rows_sync_timing &&
+                    ops[i].opcode == HTP_OP_SET_ROWS &&
+                    (pd[i].sync_input_calls != 0 ||
+                     pd[i].sync_input_bytes != 0 ||
+                     pd[i].sync_global_flush_calls != 0)) {
+                    ++set_rows_ops;
+                    set_rows_total_us += pd[i].usecs;
+                    sync_us += pd[i].sync_input_us;
+                    sync_bytes += pd[i].sync_input_bytes;
+                    sync_calls += pd[i].sync_input_calls;
+                    global_flush_calls += pd[i].sync_global_flush_calls;
+                }
 
                 ggml_hexagon_dump_op_prof(shm_buf->sess->name, ops[i], pd[i]);
 
@@ -1512,6 +2488,19 @@ struct ggml_hexagon_opqueue {
                         }
                     }
                 }
+            }
+
+            if (opt_set_rows_sync_timing && set_rows_ops > 0) {
+                GGML_LOG_INFO("[HEX_SET_ROWS_SYNC_PROFILE]"
+                              " batch_id=%u set_rows_ops=%u"
+                              " flush_calls=%" PRIu64 " flush_bytes=%" PRIu64
+                              " flush_us=%" PRIu64 " global_flushes=%" PRIu64
+                              " set_rows_total_us=%" PRIu64
+                              " dsp_ops_total_us=%u batch_wall_us=%" PRIu64
+                              " note=profiling_overhead_included\n",
+                              rsp.id, set_rows_ops,
+                              sync_calls, sync_bytes, sync_us, global_flush_calls,
+                              set_rows_total_us, htp_usec, batch_usec);
             }
 
             char evt_str[256] = "";
@@ -2349,7 +3338,7 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     kparams->n_act_threads = act_threads_selected;
     kparams->tile_size = htp_mm_get_weight_tile_size(wtype);
     kparams->aligned_tile_size = aligned_tile_size;
-    kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+    kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
     kparams->vtcm_size = vtcm_size;
     kparams->vtcm_src0_size = 0;
     kparams->vtcm_src1_size = 0;
@@ -2393,7 +3382,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 
         if (is_matmul_id) {
             kparams->kernel_type   = (src1_nrows < (int) sess->n_threads) ? HTP_MM_KERNEL_HVX_QUANT_BLOCK : HTP_MM_KERNEL_HVX_QUANT_ROW;
-            kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+            kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
 
             struct htp_mm_hvx_vtcm_layout L;
             uint32_t max_prefetch = (src1_nrows > HTP_MM_HMX_MIN_NROWS) ? 2 : 16;
@@ -2422,7 +3411,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
         } else {
             bool try_tiled = (k_align && opt_mm_select >= 2);
             if (try_tiled) {
-                kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+                kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
                 if (src1_nrows < (int)sess->n_threads) {
                     kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_BLOCK;
                 } else {
@@ -2463,7 +3452,7 @@ static void ggml_hexagon_precompute_hvx_mm_params(
 
             // Flat HVX fallback
             {
-                kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
+                kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
                 kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
 
                 struct htp_mm_hvx_vtcm_layout L;
@@ -2682,7 +3671,7 @@ static void ggml_hexagon_precompute_fused_qkv_params(
 
     const int ne10 = src1->ne[0];
     const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    const size_t src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+    const size_t src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
     const size_t src0_row_size = src0->nb[1];
 
     uint32_t best_n_prefetch = 16;
@@ -2723,7 +3712,7 @@ static void ggml_hexagon_precompute_fused_qkv_params(
         kparams->n_prefetch     = best_n_prefetch;
     } else {
         kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
-        size_t flat_src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
+        size_t flat_src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
 
         htp_mm_hvx_vtcm_layout_build(
             &L, HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, wtype, ne10, src1_nrows, sess->n_threads,
@@ -2752,7 +3741,7 @@ static void ggml_hexagon_precompute_fused_ffn_params(
 
     const int ne10 = src1->ne[0];
     const int src1_nrows = src1->ne[1] * src1->ne[2] * src1->ne[3];
-    const size_t src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
+    const size_t src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_tiled_row_size(ne10) : htp_mm_q8_0_tiled_row_size(ne10);
     const size_t src0_row_size = src0->nb[1];
 
     uint32_t best_n_prefetch = 16;
@@ -2792,7 +3781,7 @@ static void ggml_hexagon_precompute_fused_ffn_params(
         kparams->n_prefetch     = best_n_prefetch;
     } else {
         kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
-        size_t flat_src1_row_size = (wtype == GGML_TYPE_Q4_1) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
+        size_t flat_src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
 
         htp_mm_hvx_vtcm_layout_build(
             &L, HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT, wtype, ne10, src1_nrows, sess->n_threads,
@@ -2825,7 +3814,9 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-            if (src0->ne[0] % 32) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            if (src0->ne[0] % ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) ? QK_K : 32)) {
                 return false;
             }
 
@@ -2895,7 +3886,9 @@ static bool ggml_hexagon_supported_mul_mat_id(const struct ggml_hexagon_session 
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
-            if ((src0->ne[0] % 32)) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q6_K:
+            if (src0->ne[0] % ((src0->type == GGML_TYPE_Q4_K || src0->type == GGML_TYPE_Q6_K) ? QK_K : 32)) {
                 return false;
             }
 
@@ -3415,6 +4408,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_RMS_NORM:        return HTP_OP_RMS_NORM;
         case GGML_OP_CONCAT:          return HTP_OP_CONCAT;
         case GGML_OP_SCALE:           return HTP_OP_SCALE;
+        case GGML_OP_CLAMP:           return HTP_OP_CLAMP;
         case GGML_OP_SQR:             return HTP_OP_SQR;
         case GGML_OP_SQRT:            return HTP_OP_SQRT;
         case GGML_OP_SOFT_MAX:        return HTP_OP_SOFTMAX;
@@ -3483,7 +4477,9 @@ static bool mm_is_hmx_eligible(const ggml_tensor * t) {
 static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     if (!t || t->op != GGML_OP_MUL_MAT)   return false;
     if (t->src[1]->type != GGML_TYPE_F32) return false;
-    return ggml_is_quantized(t->src[0]->type) && !mm_is_hmx_eligible(t);
+    return ggml_is_quantized(t->src[0]->type) &&
+           t->src[0]->type != GGML_TYPE_Q6_K &&
+           !mm_is_hmx_eligible(t);
 }
 
 static bool is_mergeable_mul_mat_pair(const ggml_tensor * n1, const ggml_tensor * n2) {
@@ -3610,6 +4606,68 @@ static bool try_fuse_node(const ggml_hexagon_session * sess, const ggml_cgraph *
     return false;
 }
 
+static std::vector<htp_opnode> ggml_hexagon_build_nodes(
+        ggml_hexagon_session * sess, ggml_cgraph * graph) {
+    std::vector<htp_opnode> computed_nodes;
+    computed_nodes.reserve(graph->n_nodes);
+
+    // Fuse and finalize
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * n = graph->nodes[i];
+        if (!op_is_compute(n)) {
+            continue;
+        }
+
+        if (try_fuse_node(sess, graph, i, computed_nodes)) {
+            continue;
+        }
+
+        htp_opnode node(n, {}, HTP_OP_INVALID);
+        node.opcode = op_remap_to_htp(n);
+        if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
+            ggml_hexagon_precompute_matmul_params(sess,
+                node.node->src[0], node.node->src[1], node.node,
+                (struct htp_mm_kernel_params *)node.kernel_params
+            );
+        } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
+            ggml_hexagon_precompute_flash_attn_params(sess,
+                node.node,
+                (struct htp_fa_kernel_params *)node.kernel_params
+            );
+        } else if (htp_op_is_unary(node.opcode)) {
+            auto inputs = node.get_inputs();
+            const struct ggml_tensor * src0 = inputs[0];
+            const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
+            ggml_hexagon_precompute_unary_params(sess,
+                node.opcode, src0, src1, node.dst(),
+                (struct htp_unary_kernel_params *)node.kernel_params
+            );
+        }
+        computed_nodes.push_back(std::move(node));
+    }
+
+    return computed_nodes;
+}
+
+static bool ggml_backend_hexagon_precompile_fixed_graph(
+        ggml_backend_t backend, ggml_cgraph * graph) {
+    if (backend == nullptr || graph == nullptr ||
+            (graph->uid & (UINT64_C(1) << 63)) == 0 ||
+            graph->n_nodes <= 0) {
+        return false;
+    }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (sess->fixed_graph_cache.count(graph->uid) != 0) {
+        return true;
+    }
+    if (sess->fixed_graph_cache.size() >= 256) {
+        return false;
+    }
+    auto nodes = ggml_hexagon_build_nodes(sess, graph);
+    sess->fixed_graph_cache.emplace(graph->uid, std::move(nodes));
+    return true;
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -3618,49 +4676,29 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     const std::vector<htp_opnode> * nodes_ptr = nullptr;
     std::vector<htp_opnode> computed_nodes;
 
-    // Check for cache hit
-    bool cache_hit = (graph->uid != 0 && sess->cached_graph.uid == graph->uid);
-    if (cache_hit) {
+    // The high bit marks stable fixed-Chunk HTP graphs. Unlike the normal
+    // single-entry cache, these plans must coexist for all registered
+    // Region/Chunk UIDs. Every graph keeps its own fixed tensor addresses.
+    const bool fixed_uid = (graph->uid & (UINT64_C(1) << 63)) != 0;
+    const auto fixed = fixed_uid ?
+        sess->fixed_graph_cache.find(graph->uid) :
+        sess->fixed_graph_cache.end();
+    const bool fixed_hit = fixed != sess->fixed_graph_cache.end();
+    const bool cache_hit = fixed_hit ||
+        (!fixed_uid && graph->uid != 0 &&
+         sess->cached_graph.uid == graph->uid);
+    if (fixed_hit) {
+        nodes_ptr = &fixed->second;
+    } else if (cache_hit) {
         nodes_ptr = &sess->cached_graph.htp_nodes;
     } else {
-        computed_nodes.reserve(graph->n_nodes);
+        computed_nodes = ggml_hexagon_build_nodes(sess, graph);
 
-        // Fuse and finalize
-        for (int i = 0; i < graph->n_nodes; ++i) {
-            ggml_tensor * n = graph->nodes[i];
-            if (!op_is_compute(n)) {
-                continue;
-            }
-
-            if (try_fuse_node(sess, graph, i, computed_nodes)) {
-                continue;
-            }
-
-            htp_opnode node(n, {}, HTP_OP_INVALID);
-            node.opcode = op_remap_to_htp(n);
-            if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID) {
-                ggml_hexagon_precompute_matmul_params(sess,
-                    node.node->src[0], node.node->src[1], node.node,
-                    (struct htp_mm_kernel_params *)node.kernel_params
-                );
-            } else if (node.opcode == HTP_OP_FLASH_ATTN_EXT) {
-                ggml_hexagon_precompute_flash_attn_params(sess,
-                    node.node,
-                    (struct htp_fa_kernel_params *)node.kernel_params
-                );
-            } else if (htp_op_is_unary(node.opcode)) {
-                auto inputs = node.get_inputs();
-                const struct ggml_tensor * src0 = inputs[0];
-                const struct ggml_tensor * src1 = inputs.size() > 1 ? inputs[1] : nullptr;
-                ggml_hexagon_precompute_unary_params(sess,
-                    node.opcode, src0, src1, node.dst(),
-                    (struct htp_unary_kernel_params *)node.kernel_params
-                );
-            }
-            computed_nodes.push_back(std::move(node));
-        }
-
-        if (graph->uid != 0) {
+        if (fixed_uid && sess->fixed_graph_cache.size() < 256) {
+            const auto inserted = sess->fixed_graph_cache.emplace(
+                graph->uid, std::move(computed_nodes));
+            nodes_ptr = &inserted.first->second;
+        } else if (!fixed_uid && graph->uid != 0) {
             sess->cached_graph.uid = graph->uid;
             sess->cached_graph.htp_nodes = std::move(computed_nodes);
             nodes_ptr = &sess->cached_graph.htp_nodes;
@@ -3668,16 +4706,144 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             nodes_ptr = &computed_nodes;
         }
     }
+    if (fixed_uid &&
+            std::getenv("GGML_HEXAGON_FIXED_GRAPH_CACHE_TRACE") != nullptr) {
+        GGML_LOG_INFO(
+            "[HEXAGON_FIXED_GRAPH_CACHE] uid=%" PRIu64
+            " hit=%d entries=%zu nodes=%zu\n",
+            graph->uid, fixed_hit ? 1 : 0,
+            sess->fixed_graph_cache.size(), nodes_ptr->size());
+    }
+
+    // Observe only the K14 matmul, including cached graphs. Keep OPFUSION=0
+    // while diagnosing to avoid a fused QKV op replacing the standalone matmul.
+    struct k14_diag_entry {
+        const ggml_tensor * output;
+        uint64_t seq;
+        bool is_k13;
+        bool is_qkv;
+        uint64_t before_fnv64;
+        bool before_valid;
+        bool sentinel_applied;
+        uint64_t original_fnv64;
+        uint64_t sentinel_fnv64;
+        float sentinel_value;
+    };
+    std::vector<k14_diag_entry> k14_entries;
+    if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
+        static std::atomic<uint64_t> k14_seq{0};
+        for (const auto & node : *nodes_ptr) {
+            ggml_tensor * matmul = node.node;
+            if (node.opcode != HTP_OP_MUL_MAT || matmul == nullptr ||
+                matmul->src[0] == nullptr || matmul->src[1] == nullptr) {
+                continue;
+            }
+            const bool is_k13 = opt_k13_diag &&
+                    strcmp(matmul->src[0]->name, "blk.13.attn_k.weight") == 0;
+            const bool is_k14 = opt_k14_diag &&
+                    strcmp(matmul->src[0]->name, "blk.14.attn_k.weight") == 0;
+            const bool is_qkv =
+                    opt_qkv_probe_weights.count(matmul->src[0]->name) != 0;
+            if (!is_k13 && !is_k14 && !is_qkv) {
+                continue;
+            }
+            const ggml_tensor * weight = matmul->src[0];
+            const ggml_tensor * input  = matmul->src[1];
+            const uint64_t seq = k14_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto * mm = reinterpret_cast<const htp_mm_kernel_params *>(node.kernel_params);
+            GGML_LOG_INFO("%s seq=%" PRIu64 " graph_uid=%" PRIu64 " cache_hit=%d"
+                          " input=%s weight=%s output=%s"
+                          " m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                          " weight_type=%s kernel=%s kernel_id=%d"
+                          " hvx_threads=%u hmx=%u kernel_threads=%d"
+                          " n_prefetch=%d src1_row_size=%d vtcm=%d repacked=%d"
+                          " opstage=%u compute_enabled=%d\n",
+                          is_qkv ? "[HEX_QKV_PLAN]" :
+                          (is_k13 ? "[HEX_K13_PLAN]" : "[HEX_K14_PLAN]"),
+                          seq, graph->uid, cache_hit ? 1 : 0,
+                          input->name, weight->name, matmul->name,
+                          input->ne[1], weight->ne[1], weight->ne[0],
+                          ggml_type_name(weight->type),
+                          ggml_hexagon_k14_kernel_name(mm->kernel_type), mm->kernel_type,
+                          sess->n_threads, sess->n_hmx, mm->n_threads,
+                          mm->n_prefetch, mm->src1_row_size, mm->vtcm_size,
+                          ggml_backend_buffer_is_hexagon_repack(weight->buffer) ? 1 : 0,
+                          (unsigned) opt_opstage,
+                          (opt_opstage & HTP_OPSTAGE_COMPUTE) != 0 ? 1 : 0);
+            ggml_hexagon_k14_dump_tensor("PRE", "weight", seq, weight);
+            ggml_hexagon_k14_dump_tensor("PRE", "input", seq, input);
+            uint64_t original_fnv64 = 0;
+            uint64_t sentinel_fnv64 = 0;
+            float sentinel_value = 0.0f;
+            bool sentinel_applied = false;
+            if (is_k14 && opt_k14_sentinel && matmul->ne[1] == 1) {
+                ggml_hexagon_k14_dump_tensor(
+                    "BEFORE_ORIGINAL", "output", seq, matmul, &original_fnv64);
+                if (nodes_ptr->size() != 1) {
+                    GGML_LOG_WARN("[HEX_K14_SENTINEL] stage=SKIP seq=%" PRIu64
+                                  " reason=NOT_STANDALONE ops=%zu\n",
+                                  seq, nodes_ptr->size());
+                } else {
+                    sentinel_applied = ggml_hexagon_k14_sentinel_write(
+                        matmul, input, weight, seq,
+                        &sentinel_value, &sentinel_fnv64);
+                }
+            }
+            uint64_t before_fnv64 = 0;
+            const bool before_valid = ggml_hexagon_k14_dump_tensor(
+                "BEFORE", "output", seq, matmul, &before_fnv64);
+            k14_entries.push_back({ matmul, seq, is_k13, is_qkv, before_fnv64,
+                                    before_valid, sentinel_applied, original_fnv64,
+                                    sentinel_fnv64, sentinel_value });
+        }
+    }
 
     // Queue and execute
     if (opt_opstage & HTP_OPSTAGE_QUEUE) {
         for (const auto & node : *nodes_ptr) {
+            if (opt_k14_diag || opt_k13_diag || !opt_qkv_probe_weights.empty()) {
+                const auto it = std::find_if(
+                    k14_entries.begin(), k14_entries.end(),
+                    [&](const k14_diag_entry & e) { return e.output == node.node; });
+                if (it != k14_entries.end()) {
+                    // Tag the enqueue copy rather than mutating cached graph nodes.
+                    htp_opnode tagged_node = node;
+                    tagged_node.diag_k14_seq = static_cast<uint32_t>(it->seq);
+                    sess->enqueue_op(tagged_node);
+                    continue;
+                }
+            }
             sess->enqueue_op(node);
         }
     }
 
     // Wait until all pending ops complete
     sess->flush();
+
+    for (const auto & entry : k14_entries) {
+        uint64_t after_fnv64 = 0;
+        const bool after_valid = ggml_hexagon_k14_dump_tensor(
+            "POST", "output", entry.seq, entry.output, &after_fnv64);
+        const bool can_compare = entry.before_valid && after_valid;
+        GGML_LOG_INFO("%s seq=%" PRIu64
+                      " m=%" PRId64 " output_data=%p output_buffer=%p"
+                      " before_valid=%d after_valid=%d"
+                      " before_fnv64=%016" PRIx64 " after_fnv64=%016" PRIx64
+                      " changed=%d view=HOST_SHARED\n",
+                      entry.is_qkv ? "[HEX_QKV_OUTPUT_DELTA]" :
+                      (entry.is_k13 ? "[HEX_K13_OUTPUT_DELTA]" :
+                                      "[HEX_K14_OUTPUT_DELTA]"),
+                      entry.seq, entry.output->ne[1],
+                      entry.output->data, (void *) entry.output->buffer,
+                      entry.before_valid ? 1 : 0, after_valid ? 1 : 0,
+                      entry.before_fnv64, after_fnv64,
+                      can_compare ? (entry.before_fnv64 != after_fnv64 ? 1 : 0) : -1);
+        if (entry.sentinel_applied && after_valid) {
+            ggml_hexagon_k14_sentinel_check(
+                entry.output, entry.seq, entry.sentinel_value,
+                entry.original_fnv64, entry.sentinel_fnv64, after_fnv64);
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4060,6 +5226,7 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_L2_NORM:
         case GGML_OP_RMS_NORM:
         case GGML_OP_SCALE:
+        case GGML_OP_CLAMP:
             supp = ggml_hexagon_supported_unary(sess, op);
             break;
 
@@ -4286,7 +5453,25 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
     return &hreg->devices[index];
 }
 
+static void ggml_backend_hexagon_clear_fixed_graph_cache(
+        ggml_backend_t backend) {
+    if (backend == nullptr) { return; }
+    auto * sess = static_cast<ggml_hexagon_session *>(backend->context);
+    if (sess == nullptr) { return; }
+    sess->fixed_graph_cache.clear();
+    sess->cached_graph.uid = 0;
+    sess->cached_graph.htp_nodes.clear();
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_hexagon_clear_fixed_graph_cache") == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_hexagon_clear_fixed_graph_cache);
+    }
+    if (strcmp(name, "ggml_backend_hexagon_precompile_fixed_graph") == 0) {
+        return reinterpret_cast<void *>(
+            ggml_backend_hexagon_precompile_fixed_graph);
+    }
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
         return (void *) fct;
@@ -4327,6 +5512,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_IQ4_NL == (unsigned int) GGML_TYPE_IQ4_NL,
                   "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_Q4_K == (unsigned int) GGML_TYPE_Q4_K,
+                  "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_Q6_K == (unsigned int) GGML_TYPE_Q6_K,
+                  "please update hexagon_type to match ggml_type");
 
     const char * str_verbose  = getenv("GGML_HEXAGON_VERBOSE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
@@ -4335,6 +5524,19 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+    const char * str_k14_diag = getenv("GGML_HEXAGON_K14_DIAG");
+    const char * str_k14_sentinel = getenv("GGML_HEXAGON_K14_SENTINEL");
+    const char * str_k14_force_input_flush = getenv("GGML_HEXAGON_K14_FORCE_INPUT_FLUSH");
+    const char * str_k13_diag = getenv("GGML_HEXAGON_K13_DIAG");
+    const char * str_k13_force_input_flush = getenv("GGML_HEXAGON_K13_FORCE_INPUT_FLUSH");
+    const char * str_qkv_probe_weights = getenv("GGML_HEXAGON_QKV_PROBE_WEIGHTS");
+    const char * str_qkv_force_weights = getenv("GGML_HEXAGON_QKV_FORCE_INPUT_FLUSH_WEIGHTS");
+    const char * str_kv14_set_rows_diag = getenv("GGML_HEXAGON_KV14_SET_ROWS_DIAG");
+    const char * str_kv14_set_rows_force_input_flush = getenv("GGML_HEXAGON_KV14_SET_ROWS_FORCE_INPUT_FLUSH");
+    const char * str_set_rows_host_input_sync = getenv("GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC");
+    const char * str_set_rows_sync_timing = getenv("GGML_HEXAGON_SET_ROWS_SYNC_TIMING");
+    const char * str_qkv_audit = getenv("GGML_HEXAGON_QKV_AUDIT");
+    const char * str_linear_audit = getenv("GGML_HEXAGON_LINEAR_AUDIT");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
@@ -4379,6 +5581,102 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 128);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+    opt_k14_force_input_flush = str_k14_force_input_flush != nullptr &&
+                                strcmp(str_k14_force_input_flush, "1") == 0;
+    // Force-flush automatically enables K14 tagging so the DSP receives the
+    // flag even if GGML_HEXAGON_K14_DIAG was not set independently.
+    opt_k14_diag = opt_k14_force_input_flush ||
+                   (str_k14_diag != nullptr && strcmp(str_k14_diag, "0") != 0);
+    opt_k13_force_input_flush = str_k13_force_input_flush != nullptr &&
+                                strcmp(str_k13_force_input_flush, "1") == 0;
+    opt_k13_diag = opt_k13_force_input_flush ||
+                   (str_k13_diag != nullptr && strcmp(str_k13_diag, "1") == 0);
+    if (opt_k13_diag) {
+        GGML_LOG_WARN("[HEX_K13_INPUT_PROBE] enabled=1"
+                      " weight=blk.13.attn_k.weight force_input_flush=%d"
+                      " note=reuses_K14_DSP_diag_flags_without_ABI_change\n",
+                      opt_k13_force_input_flush ? 1 : 0);
+    }
+    // A force target also receives the same diagnostic probes as a probe-only
+    // target. The only intended A/B difference is the additional DSP flush.
+    opt_qkv_probe_weights.clear();
+    opt_qkv_force_input_flush_weights.clear();
+    static const std::regex qkv_weight_name_re(
+            R"(blk\.[0-9]+\.attn_[qkv]\.weight)");
+    auto parse_qkv_names = [&](const char * raw, const char * var_name,
+                               std::unordered_set<std::string> & out) {
+        if (raw == nullptr || raw[0] == '\0') {
+            return;
+        }
+        std::stringstream stream(raw);
+        std::string name;
+        while (std::getline(stream, name, ',')) {
+            const size_t first = name.find_first_not_of(" \t");
+            if (first == std::string::npos) {
+                continue;
+            }
+            const size_t last = name.find_last_not_of(" \t");
+            name = name.substr(first, last - first + 1);
+            if (!std::regex_match(name, qkv_weight_name_re)) {
+                GGML_LOG_WARN("[HEX_QKV_PROBE_CONFIG] status=SKIP"
+                              " env=%s invalid_weight=%s\n", var_name, name.c_str());
+                continue;
+            }
+            out.insert(name);
+        }
+    };
+    parse_qkv_names(str_qkv_probe_weights, "GGML_HEXAGON_QKV_PROBE_WEIGHTS",
+                    opt_qkv_probe_weights);
+    parse_qkv_names(str_qkv_force_weights, "GGML_HEXAGON_QKV_FORCE_INPUT_FLUSH_WEIGHTS",
+                    opt_qkv_force_input_flush_weights);
+    for (const auto & name : opt_qkv_force_input_flush_weights) {
+        opt_qkv_probe_weights.insert(name);
+    }
+    for (const auto & name : opt_qkv_probe_weights) {
+        GGML_LOG_WARN("[HEX_QKV_PROBE_CONFIG] weight=%s probe=1 force_flush=%d"
+                      " note=reuses_existing_K14_DSP_flags\n", name.c_str(),
+                      opt_qkv_force_input_flush_weights.count(name) != 0 ? 1 : 0);
+    }
+    opt_k14_sentinel = opt_k14_diag && str_k14_sentinel != nullptr &&
+                       strcmp(str_k14_sentinel, "1") == 0;
+
+    opt_kv14_set_rows_force_input_flush = str_kv14_set_rows_force_input_flush != nullptr &&
+                                          strcmp(str_kv14_set_rows_force_input_flush, "1") == 0;
+    opt_kv14_set_rows_diag = opt_kv14_set_rows_force_input_flush ||
+                             (str_kv14_set_rows_diag != nullptr &&
+                              strcmp(str_kv14_set_rows_diag, "1") == 0);
+    opt_set_rows_host_input_sync = str_set_rows_host_input_sync != nullptr &&
+                                   strcmp(str_set_rows_host_input_sync, "1") == 0;
+    opt_set_rows_sync_timing = str_set_rows_sync_timing != nullptr &&
+                               strcmp(str_set_rows_sync_timing, "1") == 0;
+    opt_qkv_audit = str_qkv_audit != nullptr &&
+                    strcmp(str_qkv_audit, "1") == 0;
+    if (opt_qkv_audit) {
+        GGML_LOG_WARN("[HEX_QKV_AUDIT] enabled=1"
+                      " note=per_batch_HTP_ack_not_per_op_output_validation\n");
+    }
+    opt_linear_audit = str_linear_audit != nullptr &&
+                       strcmp(str_linear_audit, "1") == 0;
+    if (opt_linear_audit) {
+        GGML_LOG_WARN("[HEX_LINEAR_AUDIT] enabled=1"
+                      " scope=attn_output,ffn_gate,ffn_up,ffn_down"
+                      " note=HTP_batch_ack_not_matmul_numerical_proof\n");
+    }
+    if (opt_set_rows_host_input_sync) {
+        GGML_LOG_WARN("[HEX_SET_ROWS_HOST_INPUT_SYNC] enabled=1"
+                      " scope=all_SET_ROWS_external_F32_values_and_indices"
+                      " max_source_bytes=16777216 experimental=1\n");
+    }
+    if (opt_kv14_set_rows_diag) {
+        GGML_LOG_WARN("[HEX_KV14_SET_ROWS_DIAG] enabled=1 scope=cache_k_l14"
+                      " force_input_flush=%d diagnostic_only=1\n",
+                      opt_kv14_set_rows_force_input_flush ? 1 : 0);
+    }
+    if (opt_k14_force_input_flush) {
+        GGML_LOG_WARN("[HEX_K14_INPUT_FORCE_FLUSH] enabled=1"
+                      " scope=K14_MUL_MAT_SRC1 mode=DSP_CLEAN_INVALIDATE"
+                      " diagnostic_only=1\n");
+    }
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
@@ -4414,6 +5712,18 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
     }
 
+    if (opt_set_rows_sync_timing) {
+        if (!opt_set_rows_host_input_sync || opt_profile != 1) {
+            GGML_LOG_WARN("[HEX_SET_ROWS_SYNC_TIMING] status=DISABLED"
+                          " requires=GGML_HEXAGON_SET_ROWS_HOST_INPUT_SYNC=1"
+                          ",GGML_HEXAGON_PROFILE=1\n");
+            opt_set_rows_sync_timing = false;
+        } else {
+            GGML_LOG_WARN("[HEX_SET_ROWS_SYNC_TIMING] enabled=1"
+                          " profiling=basic measurement=extra_DSP_input_flush"
+                          " changes_timing=1\n");
+        }
+    }
     reg->context = new ggml_hexagon_registry(reg);
 }
 
