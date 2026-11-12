@@ -102,6 +102,14 @@ class QProfile:
     def __init__(self, rows: Sequence[dict], metric: str = "latency_ms",
                  require_cpu: bool = False):
         grouped_stage: Dict[Tuple[int, int, str], List[float]] = {}
+        grouped_rpc_inputs: Dict[Tuple[int, int, str], List[float]] = {}
+        requested_htp = int(os.environ.get("LLAMA_JUPITER_HTP_SESSIONS", "1"))
+        self.required_rpc_stages = int(
+            os.environ.get("LLAMA_JUPITER_HTP_ACTIVE_SESSIONS", str(requested_htp))
+        )
+        if not 1 <= self.required_rpc_stages <= 4:
+            raise ValueError("invalid LLAMA_JUPITER_HTP_ACTIVE_SESSIONS")
+        self.htp_aggregate = requested_htp > 1
         for row in rows:
             x = int(row["x"])
             y = int(row["y"])
@@ -113,14 +121,46 @@ class QProfile:
             if not math.isfinite(t) or t < 0:
                 raise ValueError(f"invalid {metric}={t} for q({x},{y})")
             stage = (row.get("device") or row.get("stage") or "stage").strip()
-            grouped_stage.setdefault((x, y, stage), []).append(t)
+            key = (x, y, stage)
+            grouped_stage.setdefault(key, []).append(t)
+            if self.htp_aggregate and metric == "compute_ms" and stage.startswith("RPC"):
+                input_ms = float(row.get("input_ms", "nan"))
+                if not math.isfinite(input_ms) or input_ms < 0:
+                    raise ValueError("multi-HTP q profile requires per-RPC input_ms")
+                grouped_rpc_inputs.setdefault(key, []).append(input_ms)
 
         if not grouped_stage:
             raise ValueError("q profile is empty")
 
         per_xy: Dict[Tuple[int, int], List[float]] = {}
-        for (x, y, _stage), samples in grouped_stage.items():
-            per_xy.setdefault((x, y), []).append(statistics.median(samples))
+        phone_samples: Dict[Tuple[int, int], List[Tuple[str, float, float]]] = {}
+        for (x, y, stage), samples in grouped_stage.items():
+            median = statistics.median(samples)
+            key = (x, y)
+            if self.htp_aggregate and stage.startswith("RPC"):
+                input_median = statistics.median(grouped_rpc_inputs[(x, y, stage)]) \
+                    if metric == "compute_ms" else 0.0
+                phone_samples.setdefault(key, []).append((stage, median, input_median))
+            else:
+                per_xy.setdefault(key, []).append(median)
+
+        if self.htp_aggregate:
+            for key, samples in phone_samples.items():
+                # Treat all Phone HTP sessions as one *serial* Phone superstage.
+                # The HTP sessions share a physical accelerator. For
+                # compute_ms, include the internal HTP-to-HTP input copies,
+                # but exclude the first PC->Phone input (as in Jupiter's
+                # original compute-only q measurement).
+                ordered = sorted(
+                    samples, key=lambda item: (
+                        int(item[0][3:]) if item[0][3:].isdigit() else 1 << 30,
+                        item[0]
+                    )
+                )
+                service_ms = sum(item[1] for item in ordered)
+                if metric == "compute_ms":
+                    service_ms += sum(item[2] for item in ordered[1:])
+                per_xy.setdefault(key, []).append(service_ms)
 
         self.values = {key: max(timings) for key, timings in per_xy.items()}
         # Treat a point as measured when its PC accelerator and phone RPC
@@ -150,10 +190,12 @@ class QProfile:
         has_phone = any(s.startswith("RPC") for s in stages)
         has_pc = any(not s.startswith("RPC") and not s.startswith("CPU") for s in stages)
         has_cpu = any(s.startswith("CPU") for s in stages)
+        observed_rpc = sum(stage.startswith("RPC") for stage in stages)
         return (
             (not self.require_phone or has_phone)
             and (not self.require_pc_accel or has_pc)
             and (not self.require_cpu or has_cpu)
+            and (not self.htp_aggregate or observed_rpc >= self.required_rpc_stages)
         )
 
     def sample_status(self, x: int, y: int) -> str:
