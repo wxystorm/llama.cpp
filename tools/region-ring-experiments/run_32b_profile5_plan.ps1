@@ -12,6 +12,7 @@ param(
     [ValidateRange(0,40)][int]$ProfileEvery = 0,
     [ValidateSet("quick","full")][string]$ProfileGrid = "quick",
     [switch]$UpdateProfile,
+    [switch]$TraceTasks,
     [string]$PhoneProfileLog = "",
     [string]$RealStageProfileCsv = "",
     [string]$ForceLayout = "",
@@ -63,6 +64,7 @@ if ($ForceLayout) {
 }
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($UpdateProfile) { $arguments += "--update-profile" }
+if ($TraceTasks) { $arguments += "--trace-tasks" }
 if ($StopOnFail) { $arguments += "--stop-on-fail" }
 if ($DryRun) { $arguments += "--dry-run" }
 if ($PhoneProfileLog) { $arguments += @("--phone-profile-log", $PhoneProfileLog) }
