@@ -1290,6 +1290,13 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
     rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
     rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
+    // Jupiter HTP prototype: Q4_K and Q6_K weights may be padded and
+    // repacked into tiled Hexagon layouts. Never use plain ggml_nbytes()
+    // for remote allocation of these tensors; ask the selected Phone
+    // backend for its actual required size. This also works for OpenCL.
+    rpc_get |= tensor->view_src == nullptr &&
+               (tensor->type == GGML_TYPE_Q4_K ||
+                tensor->type == GGML_TYPE_Q6_K);
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
