@@ -2566,7 +2566,52 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     LOG_DBG("[%s] src->buffer: %p, dst->buffer: %p\n",
             __func__, (void*) src->buffer, (void*) dst->buffer);
 
-    response.result = ggml_backend_buffer_copy_tensor(src, dst);
+    if (!ggml_are_same_layout(src, dst)) {
+        GGML_LOG_ERROR("[%s] cross-device tensor copy requires identical layouts\n", __func__);
+        return false;
+    }
+
+    // The Hexagon HTP buffer does not implement cpy_tensor. Returning false
+    // here makes the PC client read the activation over TCP and send it back
+    // to the other HTP session. For nonquantized activations, stage through
+    // the Phone RPC process's host memory instead; no network transfer.
+    if (ggml_backend_buffer_copy_tensor(src, dst)) {
+        response.result = 1;
+        return true;
+    }
+    if (ggml_is_quantized(src->type)) {
+        // Quantized weights may use backend-specific tiled formats. Keep the
+        // existing generic fallback instead of silently copying raw tiles.
+        response.result = 0;
+        return true;
+    }
+    const uint64_t t0 = ggml_time_us();
+    constexpr size_t staging_limit = 1U << 20;
+    const size_t staging_bytes = std::min(static_cast<size_t>(src_size), staging_limit);
+    try {
+        std::vector<uint8_t> staging(staging_bytes);
+        for (size_t offset = 0; offset < src_size; offset += staging_bytes) {
+            const size_t chunk = std::min(staging_bytes, static_cast<size_t>(src_size) - offset);
+            ggml_backend_tensor_get(src, staging.data(), offset, chunk);
+            ggml_backend_tensor_set(dst, staging.data(), offset, chunk);
+        }
+    } catch (const std::exception & exc) {
+        GGML_LOG_ERROR("[JUPITER_HTP_SESSION_COPY] status=FAILED bytes=%" PRIu64 " why=%s\n",
+                       src_size, exc.what());
+        return false;
+    }
+    response.result = 1;
+    const char * copy_trace = std::getenv("LLAMA_JUPITER_HTP_COPY_TRACE");
+    if (copy_trace && std::atoi(copy_trace) != 0) {
+        const auto * src_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+        const auto * dst_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+        GGML_LOG_INFO("[JUPITER_HTP_SESSION_COPY] status=PASS path=PHONE_HOST_STAGING "
+                      "src=%s dst=%s type=%s bytes=%" PRIu64 " wall_ms=%.3f\n",
+                      src_dev ? ggml_backend_dev_name(src_dev) : "unknown",
+                      dst_dev ? ggml_backend_dev_name(dst_dev) : "unknown",
+                      ggml_type_name(src->type), src_size,
+                      (ggml_time_us() - t0)/1000.0);
+    }
     return true;
 }
 
