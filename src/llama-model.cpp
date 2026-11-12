@@ -1698,9 +1698,9 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (!topology_ok || forced_regions.empty() ||
                 (forced_regions.back().device !=
                     llama_region_ring_device::PHONE &&
-                 arch != LLM_ARCH_QWEN3)) {
+                 arch != LLM_ARCH_QWEN3 && arch != LLM_ARCH_LLAMA)) {
             throw std::runtime_error(
-                "SKIP_PROFILE requires a valid layout; PC-final requires Qwen3");
+                "SKIP_PROFILE requires a valid layout; PC-final requires Qwen3 or Llama");
         }
         llama_hybrid_runtime_plan_clear();
         hybrid_ring_plan_layout =
@@ -2196,7 +2196,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const char * htp_only = std::getenv("LLAMA_REGION_RING_PHONE_HTP_ONLY");
     if (early_rpc && *early_rpc &&
             htp_only && std::strcmp(htp_only, "1") == 0 &&
-            arch == LLM_ARCH_QWEN3 && !hybrid_ring_plan_layout.empty() &&
+            (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_LLAMA) &&
+            !hybrid_ring_plan_layout.empty() &&
             std::strchr(early_rpc, ',') == nullptr) {
         struct early_phone_region {
             uint32_t index;
@@ -2471,13 +2472,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         std::getenv("LLAMA_REGION_RING_PHONE_AUTONOMOUS_FINAL");
     const bool phone_final_pc_head =
         llama_region_ring_enabled() &&
-        arch == LLM_ARCH_QWEN3 &&
+        (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_LLAMA) &&
         !hybrid_layer_modes.empty() &&
         hybrid_layer_modes.back() == llama_hybrid_layer_mode::PHONE_ONLY &&
         phone_final_output_env != nullptr &&
         std::strcmp(phone_final_output_env, "1") == 0;
     const bool pc_terminal_head =
-        llama_region_ring_enabled() && arch == LLM_ARCH_QWEN3 &&
+        llama_region_ring_enabled() &&
+        (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_LLAMA) &&
         !hybrid_layer_modes.empty() &&
         hybrid_layer_modes.back() == llama_hybrid_layer_mode::PC_ONLY;
     if (phone_final_pc_head || pc_terminal_head) {
@@ -2828,10 +2830,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (ram_preload_env && std::strcmp(ram_preload_env, "1") == 0) {
         if (!ml.use_mmap || !hybrid_ring_gpu_weight_streaming ||
                 pc_layer_backends.empty() || hybrid_layer_modes.empty() ||
-                arch != LLM_ARCH_QWEN3) {
+                (arch != LLM_ARCH_QWEN3 && arch != LLM_ARCH_LLAMA)) {
             LLAMA_LOG_WARN(
                 "[REGION_RING_PC_RAM_PRELOAD] event=SKIP"
-                " reason=REQUIRES_QWEN3_MMAP_GPU_BANKS status=SKIPPED\n");
+                " reason=REQUIRES_DENSE_LLAMA_OR_QWEN3_MMAP_GPU_BANKS status=SKIPPED\n");
         } else {
             std::vector<const ggml_tensor *> targets;
             std::vector<bool> chosen_layers(n_layer_all, false);
