@@ -8,6 +8,7 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 #include "llama-jupiter.h"
+#include "jupiter-htp-placement.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -33,6 +34,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <regex>
@@ -1287,6 +1289,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ggml_backend_dev_t jupiter_pc_dev = nullptr;
     ggml_backend_dev_t jupiter_phone_dev = nullptr;
+    std::vector<ggml_backend_dev_t> jupiter_phone_session_devs;
+    std::vector<size_t> jupiter_phone_session_ends;
+    size_t jupiter_active_sessions = 1;
 
     if (jupiter_prefill) {
         if (split_mode != LLAMA_SPLIT_MODE_LAYER) {
@@ -1310,9 +1315,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_t dev = dev_info.dev;
             const char * name = ggml_backend_dev_name(dev);
             const bool is_rpc = name != nullptr && std::strncmp(name, "RPC", 3) == 0;
-            if (is_rpc && jupiter_phone_dev == nullptr) {
-                jupiter_phone_dev = dev;
-            } else if (!is_rpc && jupiter_pc_dev == nullptr) {
+            if (is_rpc) {
+                jupiter_phone_session_devs.push_back(dev);
+                if (jupiter_phone_dev == nullptr) {
+                    jupiter_phone_dev = dev;
+                }
+            } else if (jupiter_pc_dev == nullptr) {
                 const auto type = ggml_backend_dev_type(dev);
                 if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
                     jupiter_pc_dev = dev;
@@ -1322,6 +1330,152 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if (jupiter_pc_dev == nullptr || jupiter_phone_dev == nullptr) {
             throw std::runtime_error("LLAMA_JUPITER_PREFILL requires one local GPU and one RPC device");
+        }
+
+        // Multi-session is opt-in: a four-device Phone RPC server must not
+        // silently change the established single-HTP Jupiter baseline.
+        // The two/three-stage DP still measures PC vs aggregate Phone suffix;
+        // the graph scheduler owns each separate RPC device internally.
+        auto jupiter_env_mib = [](const char * key, uint64_t fallback) -> uint64_t {
+            const char * text = std::getenv(key);
+            if (text == nullptr || text[0] == '\0') {
+                return fallback;
+            }
+            char * end = nullptr;
+            const unsigned long long value = std::strtoull(text, &end, 10);
+            if (end == text || *end != '\0' || value < 1 || value > 1048576) {
+                throw std::runtime_error(format("invalid %s='%s': expected a positive integer", key, text));
+            }
+            return static_cast<uint64_t>(value);
+        };
+        const size_t requested_sessions = static_cast<size_t>(
+            jupiter_env_mib("LLAMA_JUPITER_HTP_SESSIONS", 1));
+        if (requested_sessions > 4) {
+            throw std::runtime_error("Jupiter HTP requires 1..4 sessions");
+        }
+        if (requested_sessions > jupiter_phone_session_devs.size()) {
+            throw std::runtime_error(format(
+                "LLAMA_JUPITER_HTP_SESSIONS=%zu but only %zu RPC devices are visible; "
+                "start Phone with GGML_HEXAGON_NDEV=%zu and --device HTP0,...",
+                requested_sessions, jupiter_phone_session_devs.size(), requested_sessions));
+        }
+
+        if (requested_sessions > 1) {
+            const char * endpoint = ggml_backend_dev_description(jupiter_phone_session_devs[0]);
+            for (size_t k = 1; k < requested_sessions; ++k) {
+                if (std::strcmp(endpoint,
+                                ggml_backend_dev_description(jupiter_phone_session_devs[k])) != 0) {
+                    throw std::runtime_error("HTP multi-session placement requires RPC0..RPCn on one Phone endpoint");
+                }
+            }
+            const int n_phone_layers = n_layer_all - jupiter_pc_layers;
+            jupiter_active_sessions = std::min(requested_sessions, static_cast<size_t>(n_phone_layers));
+            const uint64_t global_mib = jupiter_env_mib("LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB", 8192);
+            const uint64_t per_session_mib = jupiter_env_mib("LLAMA_JUPITER_HTP_SESSION_VMEM_MIB", 3072);
+            const uint64_t reserve_mib = jupiter_env_mib("LLAMA_JUPITER_HTP_RESERVE_MIB", 512);
+            const uint64_t context_tokens = jupiter_env_mib("LLAMA_JUPITER_HTP_CONTEXT_TOKENS", 4096);
+            const uint64_t kv_element_bytes = jupiter_env_mib("LLAMA_JUPITER_HTP_KV_ELEMENT_BYTES", 2);
+            if (kv_element_bytes > 4) {
+                throw std::runtime_error("LLAMA_JUPITER_HTP_KV_ELEMENT_BYTES must be 1..4");
+            }
+            const uint64_t session_total_mib = std::min(
+                per_session_mib, global_mib / jupiter_active_sessions);
+            if (session_total_mib <= reserve_mib) {
+                throw std::runtime_error(format(
+                    "HTP_SESSION_MEMORY_INFEASIBLE: session_total=%llu MiB <= reserve=%llu MiB",
+                    (unsigned long long) session_total_mib, (unsigned long long) reserve_mib));
+            }
+            const uint64_t mib = 1024ULL*1024ULL;
+            const uint64_t capacity_bytes = (session_total_mib - reserve_mib)*mib;
+            const auto * phone_buft = ggml_backend_dev_buffer_type(jupiter_phone_session_devs.front());
+            const uint64_t alignment = ggml_backend_buft_get_alignment(phone_buft);
+            if (alignment == 0) {
+                throw std::runtime_error("HTP backend reported zero buffer alignment");
+            }
+            std::vector<uint64_t> weights(n_phone_layers, 0);
+            std::vector<uint64_t> kv(n_phone_layers, 0);
+            for (int layer = jupiter_pc_layers; layer < n_layer_all; ++layer) {
+                const uint64_t dimensions =
+                    static_cast<uint64_t>(hparams.n_embd_k_gqa(layer)) +
+                    static_cast<uint64_t>(hparams.n_embd_v_gqa(layer));
+                // The model is loaded before Context/KV tensors exist.
+                // Charge an explicit F16-style KV estimate; the reserve
+                // covers graph, activation and FastRPC temporary mappings.
+                kv[layer - jupiter_pc_layers] =
+                    context_tokens*dimensions*kv_element_bytes;
+            }
+            const bool has_output = ml.get_tensor_meta("output.weight") != nullptr;
+            uint64_t output_bytes = 0;
+            size_t counted_tensors = 0;
+            auto padded_alloc = [&](const ggml_tensor * tensor) -> uint64_t {
+                const uint64_t actual = ggml_backend_buft_get_alloc_size(phone_buft, tensor);
+                if (actual > UINT64_MAX - alignment) {
+                    throw std::runtime_error("HTP weight allocation size overflow");
+                }
+                return ((actual + alignment - 1)/alignment)*alignment;
+            };
+            for (const auto & [name, weight] : ml.weights_map) {
+                if (name.rfind("blk.", 0) == 0) {
+                    char * end = nullptr;
+                    const long index = std::strtol(name.c_str() + 4, &end, 10);
+                    if (end != name.c_str() + 4 && end != nullptr && *end == '.' &&
+                        index >= jupiter_pc_layers && index < n_layer_all) {
+                        weights[index - jupiter_pc_layers] += padded_alloc(weight.tensor);
+                        counted_tensors++;
+                    }
+                } else if (name.rfind("output.", 0) == 0 ||
+                           name.rfind("output_norm.", 0) == 0 ||
+                           (!has_output && name == "token_embd.weight")) {
+                    output_bytes += padded_alloc(weight.tensor);
+                    counted_tensors++;
+                }
+            }
+            std::vector<uint64_t> charges(n_phone_layers, 0);
+            for (int i = 0; i < n_phone_layers; ++i) {
+                if (weights[i] == 0) {
+                    throw std::runtime_error(format(
+                        "HTP_MEMORY_PROFILE_MISSING: no GGUF weights found for Phone layer %d",
+                        jupiter_pc_layers + i));
+                }
+                charges[i] = weights[i] + kv[i];
+            }
+            const std::vector<uint64_t> capacities(jupiter_active_sessions, capacity_bytes);
+            const auto plan = jupiter_htp::partition_contiguous(charges, output_bytes, capacities);
+            jupiter_phone_session_ends = plan.ends;
+
+            LLAMA_LOG_INFO(
+                "[JUPITER_HTP_SESSION_PLAN] status=READY requested=%zu active=%zu "
+                "phone_layers=%d..%d context=%llu global_mib=%llu "
+                "session_vmem_mib=%llu reserve_mib=%llu "
+                "session_weight_kv_budget_mib=%llu tensor_count=%zu output_mib=%.2f "
+                "objective=max_utilization:%.4f\n",
+                requested_sessions, jupiter_active_sessions, jupiter_pc_layers, n_layer_all - 1,
+                (unsigned long long) context_tokens, (unsigned long long) global_mib,
+                (unsigned long long) per_session_mib, (unsigned long long) reserve_mib,
+                (unsigned long long) (capacity_bytes/mib), counted_tensors,
+                output_bytes/static_cast<double>(mib), plan.max_utilization);
+            size_t begin = 0;
+            for (size_t k = 0; k < jupiter_active_sessions; ++k) {
+                const size_t end = plan.ends[k];
+                uint64_t weight_bytes = k + 1 == jupiter_active_sessions ? output_bytes : 0;
+                uint64_t kv_bytes = 0;
+                for (size_t i = begin; i < end; ++i) {
+                    weight_bytes += weights[i];
+                    kv_bytes += kv[i];
+                }
+                LLAMA_LOG_INFO(
+                    "[JUPITER_HTP_SESSION] rank=%zu device=%s layer=%zu..%zu "
+                    "weight_mib=%.2f kv_mib=%.2f reserve_mib=%llu "
+                    "total_mib=%.2f session_limit_mib=%llu status=FIT\n",
+                    k, ggml_backend_dev_name(jupiter_phone_session_devs[k]),
+                    static_cast<size_t>(jupiter_pc_layers) + begin,
+                    static_cast<size_t>(jupiter_pc_layers) + end - 1,
+                    weight_bytes/static_cast<double>(mib), kv_bytes/static_cast<double>(mib),
+                    (unsigned long long) reserve_mib,
+                    (weight_bytes + kv_bytes + reserve_mib*mib)/static_cast<double>(mib),
+                    (unsigned long long) session_total_mib);
+                begin = end;
+            }
         }
 
         const char * plan_source =
@@ -1389,13 +1543,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if (jupiter_prefill) {
             const bool on_cpu = il < jupiter_cpu_layers;
+            const bool on_pc_gpu = !on_cpu && il < jupiter_pc_layers;
+            size_t session_index = 0;
+            if (!on_cpu && !on_pc_gpu && !jupiter_phone_session_ends.empty()) {
+                const size_t relative = il == n_layer_all ?
+                    static_cast<size_t>(n_layer_all - jupiter_pc_layers - 1) :
+                    static_cast<size_t>(il - jupiter_pc_layers);
+                session_index = std::upper_bound(
+                    jupiter_phone_session_ends.begin(),
+                    jupiter_phone_session_ends.end(), relative) -
+                    jupiter_phone_session_ends.begin();
+                if (session_index >= jupiter_active_sessions) {
+                    throw std::runtime_error("Jupiter HTP session layer index overflow");
+                }
+            }
             ggml_backend_dev_t dev = on_cpu ? cpu_dev :
-                    (il < jupiter_pc_layers ? jupiter_pc_dev : jupiter_phone_dev);
-            const char * stage = on_cpu ? "PC_CPU" :
-                    (il < jupiter_pc_layers ? "PC_GPU" : "PHONE");
+                (on_pc_gpu ? jupiter_pc_dev :
+                    jupiter_phone_session_devs[session_index]);
+            const std::string stage = on_cpu ? "PC_CPU" :
+                (on_pc_gpu ? "PC_GPU" :
+                    jupiter_active_sessions == 1 ? "PHONE" :
+                    "PHONE_HTP" + std::to_string(session_index));
             LLAMA_LOG_INFO(
                     "[JUPITER_STAGE_LAYER] layer=%d stage=%s device=%s output=%d\n",
-                    il, stage, ggml_backend_dev_name(dev), il == n_layer_all ? 1 : 0);
+                    il, stage.c_str(), ggml_backend_dev_name(dev), il == n_layer_all ? 1 : 0);
             return on_cpu ?
                     llama_model::impl::layer_dev{cpu_dev, &pimpl->cpu_buft_list} :
                     llama_model::impl::layer_dev{dev, &pimpl->gpu_buft_list.at(dev)};
