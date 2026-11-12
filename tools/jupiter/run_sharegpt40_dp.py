@@ -176,6 +176,9 @@ def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
     if args.htp_sessions > 1:
         identity.update({
             "htp_sessions": args.htp_sessions,
+            # Preserve fingerprints of older 40-layer HTP runs.
+            **({"model_layers": args.model_layers}
+               if getattr(args, "model_layers", 40) not in (None, 40) else {}),
             "htp_global_budget_mib": args.htp_global_budget_mib,
             "htp_session_vmem_mib": args.htp_session_vmem_mib,
             "htp_reserve_mib": args.htp_reserve_mib,
@@ -537,8 +540,14 @@ def main() -> int:
     # Child stages (token probe, q-profile, DP verification and Prefill)
     # inherit one placement policy with the actual model's repeating-layer
     # count, not the Qwen3-14B-only constant of 40.
-    if args.model_layers is None and Path(args.model).is_file():
-        args.model_layers = gguf_layer_count(Path(args.model))
+    if Path(args.model).is_file():
+        detected_layers = gguf_layer_count(Path(args.model))
+        if args.model_layers is None:
+            args.model_layers = detected_layers
+        elif args.model_layers != detected_layers:
+            raise ValueError(
+                f"--model-layers={args.model_layers} disagrees with "
+                f"GGUF block_count={detected_layers} in {args.model}")
     if args.model_layers is not None and (
             args.model_layers < 2 or not 0 < args.pc_layers < args.model_layers):
         raise ValueError(
