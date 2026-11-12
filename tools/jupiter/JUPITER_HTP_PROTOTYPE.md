@@ -124,6 +124,40 @@ but first confirm 32 CUDA layers plus compute buffers fit actual PC VRAM.
 Jupiter does **not** use the Region Ring double-bank GPU weight streaming
 path. Even successful HTP offload does not make PC32 CUDA memory fit.
 
+## FastRPC HTP0 open error 0x80000406
+
+If startup prints `ggml-hex: failed to open session 0 : error 0x80000406`,
+the problem occurs in `htp_iface_open()` **before** model loading, graph
+setup, or any HTP weight upload. The subsequent `GGML_ASSERT(device)`
+is only a consequence of backend initialization returning no HTP device.
+
+The launcher now pins `ADSP_LIBRARY_PATH` to a **single absolute
+directory**, `$LLAMA_JUPITER_PHONE_BIN_ROOT/lib`, matching the previously
+working startup configuration. The earlier launcher concatenated directories
+using colon notation, which is appropriate for `LD_LIBRARY_PATH` but not
+reliably interpreted by Qualcomm's FastRPC DSP search logic. Replacing the
+script alone requires no C++ rebuild.
+
+Check the v79 skel and re-test:
+
+```sh
+cd "$HOME/jupiter-htp"
+ls -lh lib/libggml-htp-v79.so
+bash -n tools/jupiter/start_phone_htp.sh
+bash tools/jupiter/start_phone_htp.sh \
+    "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 10140
+```
+
+The log now prints `adsp_library_path=...`. If the error persists,
+check `LD_LIBRARY_PATH` for inherited `/vendor/lib64` entries and compare
+a clean Termux path `$PWD/lib:$PWD/bin:$PREFIX/lib` on a new run.
+Some Android SoCs lose access to the vendor DSP HAL when the entire
+vendor library directory is forced to the front of the linker path.
+Capture full Android logs for DSP library loader errors such as
+`dlerror`, `signature verify`, `libggml-htp-v79.so` and `adsprpc`.
+The code `0x80000406` alone cannot tell whether the issue is a missing
+skel, an incompatible DSP binary or a signing/loader problem.
+
 ## Debugging a Phone SIGSEGV during GGUF weight upload
 
 Observed: the Phone `ggml-rpc-server` exits with 139 (SIGSEGV), during
