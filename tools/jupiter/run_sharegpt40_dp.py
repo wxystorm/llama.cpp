@@ -342,7 +342,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--exe", default=r".\build-jupiter\bin\Release\llama-cli.exe")
     p.add_argument("--model", default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
     p.add_argument("--rpc", default="10.39.52.114:10139")
-    p.add_argument("--pc-layers", type=int, default=24)
+    p.add_argument("--pc-layers", type=int, default=32,
+                   help="PC layers for Qwen3-14B (default: 32, Phone: 8)")
     p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--min-chunk", type=int, default=96,
                    help="preferred lower bound b; reduce only if no legal partition")
