@@ -55,6 +55,12 @@ class ShareGPT40DPTests(unittest.TestCase):
         self.assertEqual(args.groups, "128,256,512,1024")
         self.assertEqual(args.pc_layers, 32)
         self.assertEqual(args.cpu_layers, 0)
+        self.assertEqual(args.context_policy, "group")
+        self.assertIsNone(args.context)
+        self.assertEqual(args.batch, 2048)
+        self.assertEqual(args.ubatch, 128)
+        self.assertEqual(parser().parse_args(["--context-policy", "auto"]).context_policy,
+                         "auto")
         self.assertFalse(args.budgeted_refine)
         self.assertFalse(args.only_incomplete)
 
