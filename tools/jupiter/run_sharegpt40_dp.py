@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import re
 import statistics
+import struct
 import sys
 
 from jupiter_context import (context_for_group, context_for_tokens,
@@ -45,6 +46,75 @@ FIELDS = [
     "final_plan", "error",
 ]
 NAME_RE = re.compile(r"^prompt_(\d+)_(\d+)\.txt$", re.IGNORECASE)
+
+# GGUF v2/v3 metadata is stored before the tensor data. Read only the
+# architecture.block_count field rather than deriving layer count from the
+# model filename or assuming the 14B model's 40 layers.
+_GGUF_SCALAR_SIZES = {
+    0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1,
+    10: 8, 11: 8, 12: 8,
+}
+
+
+def gguf_layer_count(model: Path) -> int:
+    """Read *.block_count from GGUF metadata without loading weights."""
+    def read_exact(stream, length: int) -> bytes:
+        data = stream.read(length)
+        if len(data) != length:
+            raise ValueError(f"truncated GGUF metadata: {model}")
+        return data
+
+    def read_u64(stream) -> int:
+        return struct.unpack("<Q", read_exact(stream, 8))[0]
+
+    def skip_value(stream, field_type: int) -> None:
+        if field_type in _GGUF_SCALAR_SIZES:
+            read_exact(stream, _GGUF_SCALAR_SIZES[field_type])
+        elif field_type == 8:  # STRING
+            length = read_u64(stream)
+            if length > model.stat().st_size - stream.tell():
+                raise ValueError(f"invalid GGUF string length: {model}")
+            stream.seek(length, 1)
+        elif field_type == 9:  # ARRAY
+            element_type = struct.unpack("<I", read_exact(stream, 4))[0]
+            length = read_u64(stream)
+            if element_type in _GGUF_SCALAR_SIZES:
+                bytes_to_skip = length * _GGUF_SCALAR_SIZES[element_type]
+                if bytes_to_skip > model.stat().st_size - stream.tell():
+                    raise ValueError(f"invalid GGUF array length: {model}")
+                stream.seek(bytes_to_skip, 1)
+            elif element_type == 8:
+                for _ in range(length):
+                    skip_value(stream, element_type)
+            else:
+                raise ValueError(f"unsupported GGUF array metadata type {element_type}")
+        else:
+            raise ValueError(f"unsupported GGUF metadata type {field_type}")
+
+    with model.open("rb") as stream:
+        if read_exact(stream, 4) != b"GGUF":
+            raise ValueError(f"not a GGUF model: {model}")
+        version = struct.unpack("<I", read_exact(stream, 4))[0]
+        if version not in (2, 3):
+            raise ValueError(f"unsupported GGUF version {version}: {model}")
+        _tensor_count = read_u64(stream)
+        metadata_count = read_u64(stream)
+        for _ in range(metadata_count):
+            key_length = read_u64(stream)
+            if key_length > 4096:
+                raise ValueError(f"invalid GGUF metadata key length: {model}")
+            key = read_exact(stream, key_length).decode("utf-8")
+            field_type = struct.unpack("<I", read_exact(stream, 4))[0]
+            if key.endswith(".block_count"):
+                if field_type not in (2, 4, 10):
+                    raise ValueError(f"non-integer GGUF block_count ({field_type}): {model}")
+                size = _GGUF_SCALAR_SIZES[field_type]
+                count = int.from_bytes(read_exact(stream, size), "little")
+                if not 1 <= count <= 4096:
+                    raise ValueError(f"invalid GGUF block_count={count}: {model}")
+                return count
+            skip_value(stream, field_type)
+    raise ValueError(f"missing architecture.block_count GGUF metadata: {model}")
 
 
 def discover(folder: Path, groups: list[int]) -> list[tuple[int, Path]]:
@@ -377,7 +447,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
     p.add_argument("--rpc", default="10.39.52.114:10139")
     p.add_argument("--pc-layers", type=int, default=32,
-                   help="PC layers for Qwen3-14B (default: 32, Phone: 8)")
+                   help="total CPU + CUDA layers on PC; remaining layers go to Phone")
+    p.add_argument("--model-layers", type=int, default=None,
+                   help="override GGUF architecture.block_count; normally read automatically")
     p.add_argument("--cpu-layers", type=int, default=0)
     p.add_argument("--htp-sessions", type=int, choices=(1, 2, 3, 4), default=1,
                    help="HTP FastRPC sessions for contiguous Phone layer placement; "
@@ -463,14 +535,24 @@ def main() -> int:
         raise ValueError("no matching prompt_NN_XX.txt files found")
 
     # Child stages (token probe, q-profile, DP verification and Prefill)
-    # inherit a single explicit placement policy from this runner.
+    # inherit one placement policy with the actual model's repeating-layer
+    # count, not the Qwen3-14B-only constant of 40.
+    if args.model_layers is None and Path(args.model).is_file():
+        args.model_layers = gguf_layer_count(Path(args.model))
+    if args.model_layers is not None and (
+            args.model_layers < 2 or not 0 < args.pc_layers < args.model_layers):
+        raise ValueError(
+            f"invalid --pc-layers {args.pc_layers} for "
+            f"--model-layers {args.model_layers}; leave Phone at least one layer")
     os.environ["LLAMA_JUPITER_HTP_SESSIONS"] = str(args.htp_sessions)
-    # The ShareGPT40 Jupiter HTP prototype targets Qwen3-14B (40 layers).
-    # A session with no assigned layers is not a measured Phone stage.
-    active_sessions = min(args.htp_sessions, 40 - args.pc_layers)
-    if active_sessions < 1:
-        raise ValueError("--pc-layers must leave at least one Phone layer")
-    os.environ["LLAMA_JUPITER_HTP_ACTIVE_SESSIONS"] = str(active_sessions)
+    active_sessions = (min(args.htp_sessions, args.model_layers - args.pc_layers)
+                       if args.model_layers is not None else 0)
+    if not args.dry_run and active_sessions < 1:
+        raise ValueError("--model must exist or --model-layers must be supplied")
+    if active_sessions > 0:
+        os.environ["LLAMA_JUPITER_HTP_ACTIVE_SESSIONS"] = str(active_sessions)
+    else:
+        os.environ.pop("LLAMA_JUPITER_HTP_ACTIVE_SESSIONS", None)
     os.environ["LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB"] = str(args.htp_global_budget_mib)
     os.environ["LLAMA_JUPITER_HTP_SESSION_VMEM_MIB"] = str(args.htp_session_vmem_mib)
     os.environ["LLAMA_JUPITER_HTP_RESERVE_MIB"] = str(args.htp_reserve_mib)
@@ -485,7 +567,8 @@ def main() -> int:
           f"bench_repeats={args.bench_repeats} "
           f"graph_prebuild={int(args.graph_prebuild)} "
           f"context_policy={('FIXED' if args.context is not None else args.context_policy.upper())} "
-          f"n_predict=1 pc_layers={args.pc_layers} cpu_layers={args.cpu_layers} "
+          f"n_predict=1 model_layers={args.model_layers or 'UNKNOWN'} "
+          f"pc_layers={args.pc_layers} cpu_layers={args.cpu_layers} "
           f"htp_sessions={args.htp_sessions} htp_global_budget_mib={args.htp_global_budget_mib} "
           f"htp_session_vmem_mib={args.htp_session_vmem_mib}",
           flush=True)
