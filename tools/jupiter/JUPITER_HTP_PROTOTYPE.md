@@ -1,6 +1,6 @@
 # Jupiter Qwen3-14B on Phone Hexagon/HTP — direct RPC prototype
 
-**Status: experimental, not yet hardware validated.** Do not report the
+**Status: experimental. Single-session inference has passed one user smoke test; four-session placement is not yet hardware validated.** Do not report the
 results as a verified NPU baseline until all runtime and parity checks below
 have passed on the actual PC + Snapdragon 8 Elite. This prototype deliberately
 lives on `feat/jupiter-htp-direct-rpc-20261112`; the normal Jupiter GPU
@@ -88,14 +88,15 @@ A 3 GiB VMEM setting per session does not automatically mean 12 GiB of
 physically usable memory. Actual combined mappings are limited by phone RAM,
 driver quotas, live allocations and session overhead.
 
-**The Jupiter PC model placement still selects the first RPC device
-(`RPC0`) for all Phone suffix layers.** All four sessions are available
-over RPC, but *opening them alone does not distribute model weights,
-KV, or Graph execution across HTP1..3*. That requires a separate
-session-aware layer partition and memory budget change. Keep the currently
-passing 40-layer model layout and `--pc-layers/--cpu-layers` unchanged until
-four-session initialization is validated. After that, add cross-session
-weight placement and compare its correctness/performance.
+**Cross-session allocation is now implemented behind the opt-in HTP flag.**
+The PC partitions the Phone suffix into contiguous RPC0..RPC3 regions using
+actual Hexagon physical weight sizes plus KV and per-session memory budgets.
+The output head goes on the final active session, and Phone-local staging
+transfers intermediate activations between Sessions. The single-session
+configuration remains the baseline/default. See
+[JUPITER_HTP_MULTISESSION.md](./JUPITER_HTP_MULTISESSION.md) for build,
+allocation controls, smoke test and formal 40-prompt usage. Hardware
+correctness and resource limits must still be validated.
 
 ## Hexagon SDK 6.6 CMake configure fix
 
@@ -127,28 +128,13 @@ the Hexagon backend also requires the Qualcomm Hexagon SDK
 installation procedure from the Region Ring Phone NPU build; the ordinary
 Termux-only CMake configuration is not necessarily sufficient.
 
-The repository now includes `.gitattributes` rules forcing `*.sh` and
-`*.py` to LF on checkout, including Windows/WSL worktrees with
-`core.autocrlf=true`. This prevents the Termux errors
-`set: pipefa: invalid option name` and `syntax error near unexpected token
+The repository includes .gitattributes rules to keep Shell and Python
+scripts LF on Windows/WSL checkout. Verify the Termux launcher with
+bash -n before packaging. For four Session placement use the separate
+multi-session guide linked above.
 
-
-```sh
-cd "$HOME/jupiter-phone"
-export LLAMA_JUPITER_PHONE_BIN_ROOT="$PWD"
-export GGML_HEXAGON_NDEV=1
-export LLAMA_JUPITER_TIMELINE=1   # diagnostic only; disable for formal timing
-bash tools/jupiter/start_phone_htp.sh \
-  "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 10140 \
-  2>&1 | tee jupiter-phone-htp.log
-```
-
-On startup, **confirm** the device list contains `HTP0: Hexagon`. If the
-server reports `No devices found`, do not silently use `GPUOpenCL`;
-fix the Phone HTP build/vendor driver before measuring.
-
-The RPC server is not authenticated. Bind only on a trusted private
-network and never expose the port to the public Internet.
+The Phone RPC service is unauthenticated. Bind only on a trusted private
+network, not to the public Internet.
 
 ## PC: first single-prompt smoke test
 
@@ -361,9 +347,9 @@ When diagnostics finish, `unset GGML_RPC_HTP_WEIGHT_DIAG` and
   `get_memory()`. The fixed Jupiter layer cut does not itself rely on
   that estimate, but Quick8 auto-memory planning requires a proper
   HTP-specific budget (or explicit `--phone-free-mib`).
-- This is direct HTP0 RPC, not the Region Ring private HTP serial executor:
-  its weight residency, graph builder, and numerical behavior are
-  potentially different.
+- This is direct HTP0..HTP3 RPC with distinct backend allocations,
+  not the Region Ring private HTP serial executor. Its weight residency,
+  graph builder, and numerical behavior must be validated independently.
 - A full 8-layer Phone HTP suffix must be checked against the ~3 GiB
   VMEM budget, **including** weights, graph buffers and KV, not only
   per-buffer limits. If it fails, reduce Phone layers or implement a
