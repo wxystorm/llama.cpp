@@ -138,8 +138,10 @@ class QProfile:
             median = statistics.median(samples)
             key = (x, y)
             if self.htp_aggregate and stage.startswith("RPC"):
-                input_median = statistics.median(grouped_rpc_inputs[(x, y, stage)]) \
+                input_median = (
+                    statistics.median(grouped_rpc_inputs[(x, y, stage)])
                     if metric == "compute_ms" else 0.0
+                )
                 phone_samples.setdefault(key, []).append((stage, median, input_median))
             else:
                 per_xy.setdefault(key, []).append(median)
