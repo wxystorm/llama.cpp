@@ -10522,6 +10522,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     htp_memory_diag->fill(0);
     const bool htp_session_guard =
         flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+    // Resolve FORCE once, before constructing any estimated memory guards.
+    // This also permits forced execution when the free-RAM sample is absent.
+    const auto forced_value_present = [](const char * key) {
+        const char * raw = std::getenv(key);
+        return raw != nullptr && *raw != '\0';
+    };
+    const bool force_ab_requested =
+        wide_apply && selected_layout != nullptr &&
+        (forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XC") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XG") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XP"));
     llama_ring_planner::htp_memory_limits htp_limits;
     if (have_layer_weights) {
         const auto planner_layer_bytes =
@@ -10576,7 +10588,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // Leave 10% unmapped headroom and reserve Graphless scratch for
         // every layer, not merely once per Phone Region.
         long double htp_session_budget_bytes = 2880.0L * 1048576.0L;
-        if (htp_session_guard) {
+        if (htp_session_guard && !force_ab_requested) {
             if (!have_layer_weights || profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_HTP_MEMORY] status=REJECT"
@@ -10611,7 +10623,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         htp_limits.n_ff = profile.n_ff;
         htp_limits.kv_bytes_per_token_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer;
-        if (htp_session_guard) {
+        if (htp_session_guard && !force_ab_requested) {
             LLAMA_LOG_INFO(
                 "[REGION_RING_HTP_MEMORY] sessions=4"
                 " per_session_budget_mib=%.1Lf"
@@ -10936,20 +10948,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
     if (wide_apply && selected_layout != nullptr) {
-        // Explicit layout + XC/XG/XP is an execution request, not an
-        // automatic memory-fit recommendation. Keep topology, profile and DAG
-        // validation, but never reject user-forced layouts on estimated RAM,
-        // GPU Bank or HTP memory budgets. Actual backend allocations still
-        // report failures at runtime.
-        const auto forced_value_present = [](const char * key) {
-            const char * raw = std::getenv(key);
-            return raw != nullptr && *raw != '\0';
-        };
-        const bool force_ab_requested =
-            forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT") ||
-            forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XC") ||
-            forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XG") ||
-            forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XP");
+        // Forced layouts keep topology, profile and DAG validation, but do
+        // not reject on estimated RAM, GPU Bank or HTP memory budgets.
+        // Actual backend allocations can still fail at runtime.
         if (model.gpu_weight_streaming &&
                 profile.gpu_weight_h2d.size() < 2) {
             // No prompt H2D is needed for the first one/two GPU Regions.
@@ -11015,8 +11016,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // through the remaining Cycles before full Prompt simulation.
         constexpr int wide_min_simulations = 64;
         // A forced A/B must never depend on a successful or expensive
-        // automatic search. It is checked independently against memory,
-        // profiles and the exact full-prompt event DAG below.
+        // automatic search. Only topology, profiles and the exact full-prompt
+        // event DAG are enforced for a user-forced layout.
         llama_ring_planner::result result;
         if (force_ab_requested) {
             // Baseline is diagnostic only in forced mode. If its profile
@@ -11454,7 +11455,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // Even with all three devices present, one G->C->P pass
                 // has no P->G return boundary. E=max(e1,e2,e3) measures
                 // a repeating ring, not this pipeline. Force A/B ranking
-                // therefore uses only memory guards and the full event DAG.
+                // therefore uses the full event DAG without an E-score.
                 forced.ring_error = {-1.0, -1.0, -1.0};
                 forced.ring_error_max = -1.0;
                 forced.ring_error_mean = -1.0;
