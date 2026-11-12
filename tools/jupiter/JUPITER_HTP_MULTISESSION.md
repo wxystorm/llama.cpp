@@ -87,6 +87,7 @@ Look for these log markers:
 - JUPITER_HTP_SESSION_PLAN status=READY active=4
 - JUPITER_HTP_SESSION rank=0..3 status=FIT
 - JUPITER_HTP_MEMORY rank=0..3 status=FIT
+- JUPITER_HTP_RUNTIME_MEMORY actual model/KV/compute per Session status=FIT
 - JUPITER_STAGE_LAYER stage=PHONE_HTP0/1/2/3
 - JUPITER_STAGE_PLAN output_device=RPC3
 - JUPITER_STAGE_PROFILE backend=RPC0/1/2/3 in calibration
