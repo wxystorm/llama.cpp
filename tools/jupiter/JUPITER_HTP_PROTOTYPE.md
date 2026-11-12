@@ -121,6 +121,73 @@ but first confirm 32 CUDA layers plus compute buffers fit actual PC VRAM.
 Jupiter does **not** use the Region Ring double-bank GPU weight streaming
 path. Even successful HTP offload does not make PC32 CUDA memory fit.
 
+## Debugging a Phone SIGSEGV during GGUF weight upload
+
+Observed: the Phone `ggml-rpc-server` exits with 139 (SIGSEGV), during
+`blk.34.attn_output.weight`, before the first Graph. The Windows client then
+hits `failed to load tensor ... from local RPC model file` and exits by
+`GGML_ABORT` (0xc0000409). The Windows status is downstream, not evidence
+of a separate PC failure.
+
+The Phone RPC loader originally validated only the *logical* GGUF
+`ggml_nbytes()` tensor range. However Q4_K/Q6_K are repacked into larger
+Hexagon tiling layouts, and an incorrectly sized remote allocation can
+overflow the end of an HTP buffer. The prototype now checks the backend's
+physical allocation size before writing, and optionally emits phase markers.
+These checks diagnose or reject unsafe layouts; they do **not** establish the
+original SIGSEGV's root cause without reproducing on hardware.
+
+Rebuild/redeploy the **Phone binary and libggml-hexagon.so** from the updated
+experimental branch (PC binary need not be rebuilt for these diagnostics as
+the RPC wire format is unchanged). On Termux:
+
+```bash
+cd "$HOME/jupiter-htp"
+export LLAMA_JUPITER_PHONE_BIN_ROOT="$PWD"
+export GGML_RPC_HTP_WEIGHT_DIAG=1
+export GGML_HEXAGON_DIAG_TENSOR=blk.34.attn_output.weight
+set +e
+bash tools/jupiter/start_phone_htp.sh \
+    "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 10140 \
+    2>&1 | tee jupiter-phone-htp-diagnostic.log
+rc=${PIPESTATUS[0]}
+echo "PHONE_EXIT_CODE=$rc"
+```
+
+Inspect the last diagnostics:
+
+```bash
+grep -E 'JUPITER_HTP_WEIGHT|JUPITER_HEX_REPACK|PHYSICAL_BUFFER_OOB' \
+    jupiter-phone-htp-diagnostic.log | tail -n 80
+```
+
+Interpretation:
+
+- `phase=REJECT reason=PHYSICAL_BUFFER_OOB`: a real mismatch between
+  remote packed weight allocation size and its containing HTP buffer.
+- `phase=READ_BEGIN` without `READ_DONE`: crash inside the local GGUF read.
+- `phase=SET_BEGIN` without `SET_DONE`: crash inside the backend repacker
+  or mapped weight buffer. `JUPITER_HEX_REPACK` progress shows whether it
+  reached the zeroing step or a particular matrix row.
+- `SET_DONE` then SIGSEGV: inspect the next tensor and buffer metadata;
+  a previous overwrite remains possible.
+
+Also capture Android's native crash report immediately after the event:
+
+```powershell
+adb logcat -b crash -d -v threadtime
+```
+
+Look for the `ggml-rpc-server` faulting PC/frame, `SEGV_MAPERR` or
+`SEGV_ACCERR`. Symbolization with the matching **unstripped** ARM64 build
+libraries/binary is needed to distinguish an HTP repack write from a driver
+mapping or `memcpy` failure. SIGSEGV (139) is not equivalent to the usual
+OOM SIGKILL (137), even if memory pressure remains a possible contributing
+factor.
+
+When diagnostics finish, `unset GGML_RPC_HTP_WEIGHT_DIAG` and
+`unset GGML_HEXAGON_DIAG_TENSOR` to restore normal benchmark behavior.
+
 ## Required checks before claiming an NPU result
 
 1. Phone startup log shows `HTP0` (never `GPUOpenCL`).
