@@ -100,4 +100,53 @@ inline placement partition_contiguous(
     return result;
 }
 
+
+// A Phone RAM budget is shared by all sessions, whereas HTP VMEM is
+// configured PER session. Never divide the global budget evenly by NDEV:
+// contiguous layers and a large final output head require uneven placement.
+// Reserve graph/KV-related headroom before charging the model and KV estimates.
+inline placement partition_global_budget(
+    const std::vector<uint64_t> & layers,
+    uint64_t output_bytes,
+    const std::vector<uint64_t> & per_session_limit_bytes,
+    uint64_t global_limit_bytes,
+    uint64_t reserve_each_bytes) {
+    if (layers.empty() || per_session_limit_bytes.empty()) {
+        throw std::invalid_argument("HTP global partition requires layers and sessions");
+    }
+    const size_t active = std::min(layers.size(), per_session_limit_bytes.size());
+    if (reserve_each_bytes > UINT64_MAX / active) {
+        throw std::invalid_argument("HTP session reserves overflow");
+    }
+    const uint64_t total_reserve = reserve_each_bytes * active;
+    if (global_limit_bytes <= total_reserve) {
+        throw std::runtime_error(
+            "HTP_SESSION_GLOBAL_MEMORY_INFEASIBLE: global memory budget "
+            "does not cover all session reserves");
+    }
+    std::vector<uint64_t> capacities;
+    capacities.reserve(active);
+    for (size_t k = 0; k < active; ++k) {
+        if (per_session_limit_bytes[k] <= reserve_each_bytes) {
+            throw std::runtime_error(
+                "HTP_SESSION_MEMORY_INFEASIBLE: per-session VMEM budget "
+                "does not cover its reserve");
+        }
+        capacities.push_back(per_session_limit_bytes[k] - reserve_each_bytes);
+    }
+    uint64_t required = output_bytes;
+    for (const auto bytes : layers) {
+        if (required > UINT64_MAX - bytes) {
+            throw std::invalid_argument("HTP model+KV memory sum overflow");
+        }
+        required += bytes;
+    }
+    if (required > global_limit_bytes - total_reserve) {
+        throw std::runtime_error(
+            "HTP_SESSION_GLOBAL_MEMORY_INFEASIBLE: total HTP weights + KV "
+            "+ output + reserves exceed global Phone memory budget");
+    }
+    return partition_contiguous(layers, output_bytes, capacities);
+}
+
 } // namespace jupiter_htp
