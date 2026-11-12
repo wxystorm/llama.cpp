@@ -14,7 +14,11 @@ A minimax memory planner uses GGUF weight metadata with the REMOTE
 Hexagon physical allocation size, not the smaller raw quantized GGUF
 size. It budgets per-layer KV and a per-session workspace reserve.
 An additional check accounts for actual allocated GGML weight buffers.
-An infeasible layout is rejected before reading weights.
+Global Phone RAM and per-session VMEM are independent constraints: the
+Phone budget is NOT split into four equal quotas. Contiguous regions
+are allowed to consume asymmetric per-session amounts while obeying
+both the global physical-memory limit and every individual Session
+VMEM mapping cap. An infeasible layout is rejected before reading weights.
 
 For cross-HTP activations, the Phone RPC process stages non-quantized
 activations in <=1 MiB host chunks rather than sending them back to
@@ -39,9 +43,18 @@ It sets the context-aware KV budget for every child calibration and
 benchmark process. The default --htp-sessions 1 preserves the old
 one-session comparison. Four sessions must be explicitly selected.
 
-For four sessions, the nominal per-session weight+KV budget is:
-min(3072,8192/4)-512 = 1536 MiB. This does NOT guarantee that
-the driver can map or retain all those buffers; verify on hardware.
+For four sessions with the default caps:
+- Per HTP weight+KV ceiling: 3072-512 = 2560 MiB
+- Four HTPs' combined weight+KV ceiling: 8192-4*512 = 6144 MiB
+- Each Session may take a different portion of those 6144 MiB
+- The final Session must also fit the LM/output head.
+
+A Session cannot use 2560 MiB merely because that is its individual
+ceiling: the shared 6144 MiB model+KV budget still applies. The
+allocator logs JUPITER_HTP_BUDGET before solving and separately logs
+JUPITER_HTP_GLOBAL_MEMORY and JUPITER_HTP_RUNTIME_GLOBAL after
+allocations. This is a conservative estimate, not evidence that the
+Android driver will successfully retain all these mappings.
 
 ## Build / deploy
 
@@ -86,8 +99,11 @@ Look for these log markers:
 
 - JUPITER_HTP_SESSION_PLAN status=READY active=4
 - JUPITER_HTP_SESSION rank=0..3 status=FIT
+- JUPITER_HTP_BUDGET: total model+KV+head vs global shared RAM cap
 - JUPITER_HTP_MEMORY rank=0..3 status=FIT
+- JUPITER_HTP_GLOBAL_MEMORY status=FIT
 - JUPITER_HTP_RUNTIME_MEMORY actual model/KV/compute per Session status=FIT
+- JUPITER_HTP_RUNTIME_GLOBAL status=FIT
 - JUPITER_STAGE_LAYER stage=PHONE_HTP0/1/2/3
 - JUPITER_STAGE_PLAN output_device=RPC3
 - JUPITER_STAGE_PROFILE backend=RPC0/1/2/3 in calibration
