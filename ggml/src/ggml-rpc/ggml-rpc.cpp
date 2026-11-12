@@ -1318,6 +1318,20 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
         RPC_STATUS_ASSERT(status);
 
+        // When investigating HTP tiled-weight allocations, verify that the
+        // Windows client really asks the Phone for the physical size. An old
+        // Jupiter executable would silently use raw ggml_nbytes() for Q4_K.
+        const char * trace = std::getenv("GGML_RPC_HTP_ALLOC_TRACE");
+        if (trace != nullptr && trace[0] != '\0' &&
+            std::strstr(tensor->name, trace) != nullptr) {
+            GGML_LOG_INFO("[JUPITER_RPC_ALLOC] side=CLIENT tensor='%s' type=%s "
+                          "logical_bytes=%zu remote_alloc_bytes=%" PRIu64 " "
+                          "endpoint=%s device=%u\n",
+                          tensor->name, ggml_type_name(tensor->type),
+                          ggml_nbytes(tensor), response.alloc_size,
+                          buft_ctx->endpoint.c_str(), buft_ctx->device);
+        }
+
         return response.alloc_size;
     }
 
@@ -2165,6 +2179,16 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     }
 
     response.alloc_size = ggml_backend_buft_get_alloc_size(buft, tensor);
+
+    const char * trace = std::getenv("GGML_RPC_HTP_ALLOC_TRACE");
+    if (trace != nullptr && trace[0] != '\0' &&
+        std::strstr(tensor->name, trace) != nullptr) {
+        GGML_LOG_INFO("[JUPITER_RPC_ALLOC] side=PHONE tensor='%s' type=%s "
+                      "logical_bytes=%zu physical_bytes=%" PRIu64 " "
+                      "device=%u\n",
+                      tensor->name, ggml_type_name(tensor->type),
+                      ggml_nbytes(tensor), response.alloc_size, dev_id);
+    }
 
     return true;
 }
