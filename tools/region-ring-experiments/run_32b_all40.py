@@ -591,6 +591,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
+    if getattr(args, "trace_tasks", False):
+        # Protected from inherited environment, but set explicitly for an
+        # isolated diagnostic run. Emitted after workers drain.
+        env["LLAMA_REGION_RING_TASK_TRACE"] = "1"
     if args.profile_every:
         # Genuine per-Stage timestamps, not reconstructed from Prefill TPS.
         # The CPU/GPU rows feed rolling CSV; Phone only if authoritative
@@ -743,6 +747,8 @@ def get_args(argv=None):
     parser.add_argument("--profile-every", type=int, default=0,
                         help="0 (default): calibrate independent G/C/N baseline once and reuse V0; "
                              "N>0: legacy rolling real Stage CSV refresh after every N PASS prompts")
+    parser.add_argument("--trace-tasks", action="store_true",
+                        help="diagnostic-only PC-clock Region/Chunk timeline; distinct run config")
     parser.add_argument("--profile-grid", choices=("quick", "full"),
                         default="quick", help="standalone G/C/N depth and Chunk grid")
     parser.add_argument("--update-profile", action="store_true",
@@ -1051,6 +1057,8 @@ def main(argv=None):
     # only a nondefault model depth creates a new configuration key.
     if args.model_layers != MODEL_LAYERS:
         config["model_layers"] = args.model_layers
+    if getattr(args, "trace_tasks", False):
+        config["diagnostic_task_trace"] = True
     if args.boost_bank_mover:
         config["bank_mover_priority"] = "ABOVE_NORMAL"
     if args.phone_weight_preload:
