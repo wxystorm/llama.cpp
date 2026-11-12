@@ -1229,45 +1229,58 @@ a genuinely new experiment in a different `--out-dir`. Do **not** delete
 The one-shot `--memory-check-only` mode still reports the current *newly
 optimal* split rather than resuming an existing output directory.
 
-## ShareGPT40 Qwen3-14B: automatic context and single-token Prefill
+## ShareGPT40 Qwen3-14B: reference group contexts, PC32/Phone8, one output token
 
-Both `run_sharegpt40_dp.py` (all 40 prompts) and `run_sharegpt_quick8.py`
-(first two in each group) now default to the Region Ring 14B context policy:
-count each input with `llama-tokenize` for the selected GGUF, then choose
-`max(1024, ceil((prompt_tokens + 1 + 64) / 256) * 256)`.
-The GGUF counts are cached in `prompt-tokens.json` and invalidated when a
-prompt, model or tokenizer changes. The runtime token probe remains authoritative
-for Jupiter's DP partition. Formal benchmarks, probes, and calibration CLI
-commands already pass `-n 1`, so one token is generated after Prefill.
+The 40-prompt comparison defaults to the **exact per-group contexts from the
+reference run log**, rather than the earlier individually tokenized context
+policy. All ten prompts of a group use the same context:
 
-The per-prompt effective `--batch` is `min(2048, selected_context)`; the
-`--ubatch` stays 128. The largest selected context is used only to make the
-quick8 memory split conservative. All stage3/benchmark invocations for a
-single prompt use the same effective context and batch. Each DP case stores
-the effective settings in its identity, and the aggregate CSV includes context.
-A mismatch between tokenizer estimates and runtime tokens that exceeds the
-reserved space fails explicitly instead of silently truncating the input.
+| ShareGPT group | Context (-c) | Effective Batch (-b) | UBatch (-ub) |
+|---|---:|---:|---:|
+| 128 | 512 | 512 | 128 |
+| 256 | 768 | 768 | 128 |
+| 512 | 1280 | 1280 | 128 |
+| 1024 | 2304 | 2048 | 128 |
 
-Run all 40 prompts (the provided directory must contain all four groups).
-The default Qwen3-14B placement is PC 32 layers / Phone 8 layers;
-use `--pc-layers N` to override. Make sure the 32 PC layers fit local VRAM
-before launching a full sweep:
+The overall batch request is 2048, but the effective per-prompt batch is
+`min(2048, context)` because Jupiter requires `ubatch <= batch <= context`.
+The prefill token probe, Stage-3 q(x,y) calibration/DP, and formal benchmark
+receive the same selected context and effective batch for each prompt.
+All underlying CLI phases already use `-n 1` (one generated token).
+
+The full ShareGPT40 DP runner defaults to **PC CUDA 32 layers / Phone RPC 8
+layers** for Qwen3-14B (`--pc-layers 32 --cpu-layers 0`). Device memory
+is not guaranteed by the split: check the PC GPU's weight/workspace/KV
+capacity before relying on a full 40-prompt run.
+
+Run all 40 prompts on Windows PowerShell:
 
 ```powershell
 python .\tools\jupiter\run_sharegpt40_dp.py `
   --exe ".\build-jupiter\bin\Release\llama-cli.exe" `
   --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
   --rpc "10.39.52.114:10139" `
-  --pc-layers 32 `
+  --pc-layers 32 --cpu-layers 0 `
   --prompts-dir "E:\llama\datasets\sharegpt\sharegpt40" `
-  --out-dir ".\jupiter-14b-auto-context" `
+  --out-dir ".\jupiter-14b-pc32-group-context" `
   --resume --only-incomplete
 ```
 
-Add `--context 2048` to keep the old fixed-context behavior, or use
-`--min-context 4096` to force a higher minimum while keeping auto sizing.
-Set `--tokenizer-exe` explicitly if `llama-tokenize.exe` is not beside
-`llama-cli.exe`. For quick8, use `run_sharegpt_quick8.py --per-group 2`
-with the same model, RPC and output options. Do not resume an existing
-fixed-context experiment into a new auto-context output directory; use a
-new output directory for a changed experiment policy.
+By default `--context-policy group` is used. For the former GGUF-tokenized
+per-prompt rule, select `--context-policy auto` (minimum 1024, plus one
+prediction and 64 safety tokens, rounded to 256); auto mode requires
+`llama-tokenize` beside `llama-cli` or `--tokenizer-exe PATH`.
+`--context N` overrides either policy and fixes the same context for
+every prompt. A group-context run fails explicitly if the actual runtime
+token count plus the safety margin does not fit; it never silently truncates.
+
+Use a **new --out-dir** when switching from the old per-prompt auto policy
+or a different PC/Phone split. `dp-results.csv` records the actual context
+and each case's identity contains context and effective batch; `--resume
+--only-incomplete` verifies those identities before reusing PASS results.
+
+`run_sharegpt_quick8.py` also defaults to `--context-policy group`, using
+the largest selected group context for its memory feasibility estimate,
+but still applies the exact group value to each downstream DP case. Quick8
+retains its independent memory-based layer split by default; pass
+`--pc-layers 32` to request a 32-layer PC boundary (subject to budget).
