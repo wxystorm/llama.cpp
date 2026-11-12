@@ -24,7 +24,8 @@ import re
 import statistics
 import sys
 
-from jupiter_context import context_for_tokens, model_token_counts, tokenizer_path
+from jupiter_context import (context_for_group, context_for_tokens,
+                             model_token_counts, tokenizer_path)
 from min_chunk_profile import partition_feasible
 from run_prefill_bench import read_plan
 from run_prompt_suite import (
@@ -236,13 +237,18 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
         row["actual_tokens"] = tokens
         if tokens > args.batch or tokens > args.context:
             raise ValueError(f"N={tokens} exceeds batch/context ({args.batch}/{args.context})")
-        if getattr(args, "auto_context", False):
+        if (getattr(args, "auto_context", False)
+                or getattr(args, "group_context", False)):
             required = tokens + 1 + args.context_padding
             if required > args.context:
+                policy = ("GGUF auto" if getattr(args, "auto_context", False)
+                          else f"group={group} reference")
                 raise ValueError(
                     f"runtime probe N={tokens} needs context >= {required} "
-                    f"but GGUF tokenizer selected {args.context}; "
-                    "check tokenizer/CLI formatting and rerun with --context")
+                    f"with {args.context_padding} safety tokens, but "
+                    f"{policy} context is {args.context}. "
+                    "Use --context N or --context-policy auto; "
+                    "do not silently truncate the prompt.")
         minimum = feasible_min_chunk(tokens, args.min_chunk, args.max_chunk)
         row["min_chunk"] = minimum
         row["max_chunk"] = args.max_chunk
@@ -350,7 +356,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--batch", type=int, default=2048)
     p.add_argument("--context", type=int, default=None,
-                   help="fixed context override; default: per-prompt GGUF-tokenized automatic context")
+                   help="fixed context override (takes precedence over context-policy)")
+    p.add_argument("--context-policy", choices=("group", "auto"), default="group",
+                   help="group (default): 128=512, 256=768, 512=1280, "
+                        "1024=2304, matching reference logs; "
+                        "auto: tokenize each prompt and calculate context")
     p.add_argument("--min-context", type=int, default=1024)
     p.add_argument("--context-padding", type=int, default=64)
     p.add_argument("--tokenizer-exe", default=None,
@@ -398,6 +408,9 @@ def main() -> int:
         raise ValueError("--groups must be comma-separated integers") from exc
     if not groups or len(set(groups)) != len(groups):
         raise ValueError("--groups must contain distinct integers")
+    if args.context is None and args.context_policy == "group":
+        for group in groups:
+            context_for_group(group)  # fail early if an unsupported group is requested
     prompts = discover(Path(args.prompts_dir), groups)
     if args.limit is not None:
         if args.limit < 1:
@@ -415,8 +428,9 @@ def main() -> int:
           f"refine_repeats={args.refine_repeats} "
           f"bench_repeats={args.bench_repeats} "
           f"graph_prebuild={int(args.graph_prebuild)} "
-          f"context_policy={'AUTO' if args.context is None else 'FIXED'} "
-          f"n_predict=1", flush=True)
+          f"context_policy={('FIXED' if args.context is not None else args.context_policy.upper())} "
+          f"n_predict=1 pc_layers={args.pc_layers} cpu_layers={args.cpu_layers}",
+          flush=True)
 
     if args.dry_run:
         for group, prompt in prompts:
@@ -429,7 +443,8 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     # Count with the same GGUF tokenizer used by Region Ring. The actual
     # Jupiter prefill probe below remains the authoritative DP token count.
-    args.auto_context = args.context is None
+    args.auto_context = args.context is None and args.context_policy == "auto"
+    args.group_context = args.context is None and args.context_policy == "group"
     counts = (model_token_counts(
         args.model, tokenizer_path(args.exe, args.tokenizer_exe),
         [prompt for _, prompt in prompts], out / "prompt-tokens.json")
@@ -438,15 +453,22 @@ def main() -> int:
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
         case_args = argparse.Namespace(**vars(args))
-        if args.auto_context:
+        if args.group_context:
+            case_args.context = context_for_group(group)
+        elif args.auto_context:
             count = counts[prompt.name.lower()]
             case_args.context = context_for_tokens(
                 count, minimum=args.min_context, padding=args.context_padding)
-            case_args.batch = min(args.batch, case_args.context)
-            print(f"[JUPITER_CONTEXT] prompt={prompt.name} "
-                  f"gguf_tokens={count} context={case_args.context} "
-                  f"batch={case_args.batch} predict=1 padding={args.context_padding}",
-                  flush=True)
+        # Jupiter requires ubatch <= batch <= context. Retain the requested
+        # global batch limit for longer prompts while fitting short groups.
+        case_args.batch = min(args.batch, case_args.context)
+        detail = (f" gguf_tokens={counts[prompt.name.lower()]}"
+                  if args.auto_context else "")
+        print(f"[JUPITER_CONTEXT] prompt={prompt.name} group={group} "
+              f"policy={('FIXED' if args.context is not None else args.context_policy.upper())}"
+              f"{detail} context={case_args.context} batch={case_args.batch} "
+              f"ubatch={case_args.ubatch} predict=1",
+              flush=True)
         previous = old_rows.get(prompt.name)
         if previous and previous.get("status") == "PASS":
             # CSV alone is insufficient: do not skip a PASS measured with
