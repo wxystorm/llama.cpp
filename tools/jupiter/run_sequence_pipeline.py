@@ -188,6 +188,7 @@ def verify_runtime(args: argparse.Namespace, plan: Path, chunks: list[int],
     log_path = output / "verify-runtime.log"
     prompt = Path(args.prompt_file).read_text(encoding="utf-8-sig").rstrip("\r\n")
     env = os.environ.copy()
+    env["LLAMA_JUPITER_HTP_CONTEXT_TOKENS"] = str(args.context)
     env.update({
         "LLAMA_JUPITER_PREFILL": "1",
         "LLAMA_JUPITER_PC_LAYERS": str(pc_layers),
