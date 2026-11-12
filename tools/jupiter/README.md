@@ -1228,3 +1228,42 @@ a genuinely new experiment in a different `--out-dir`. Do **not** delete
 
 The one-shot `--memory-check-only` mode still reports the current *newly
 optimal* split rather than resuming an existing output directory.
+
+## ShareGPT40 Qwen3-14B: automatic context and single-token Prefill
+
+Both `run_sharegpt40_dp.py` (all 40 prompts) and `run_sharegpt_quick8.py`
+(first two in each group) now default to the Region Ring 14B context policy:
+count each input with `llama-tokenize` for the selected GGUF, then choose
+`max(1024, ceil((prompt_tokens + 1 + 64) / 256) * 256)`.
+The GGUF counts are cached in `prompt-tokens.json` and invalidated when a
+prompt, model or tokenizer changes. The runtime token probe remains authoritative
+for Jupiter's DP partition. Formal benchmarks, probes, and calibration CLI
+commands already pass `-n 1`, so one token is generated after Prefill.
+
+The per-prompt effective `--batch` is `min(2048, selected_context)`; the
+`--ubatch` stays 128. The largest selected context is used only to make the
+quick8 memory split conservative. All stage3/benchmark invocations for a
+single prompt use the same effective context and batch. Each DP case stores
+the effective settings in its identity, and the aggregate CSV includes context.
+A mismatch between tokenizer estimates and runtime tokens that exceeds the
+reserved space fails explicitly instead of silently truncating the input.
+
+Run all 40 prompts (the provided directory must contain all four groups):
+
+```powershell
+python .\tools\jupiter\run_sharegpt40_dp.py `
+  --exe ".\build-jupiter\bin\Release\llama-cli.exe" `
+  --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
+  --rpc "10.39.52.114:10139" `
+  --prompts-dir "E:\llama\datasets\sharegpt\sharegpt40" `
+  --out-dir ".\jupiter-14b-auto-context" `
+  --resume --only-incomplete
+```
+
+Add `--context 2048` to keep the old fixed-context behavior, or use
+`--min-context 4096` to force a higher minimum while keeping auto sizing.
+Set `--tokenizer-exe` explicitly if `llama-tokenize.exe` is not beside
+`llama-cli.exe`. For quick8, use `run_sharegpt_quick8.py --per-group 2`
+with the same model, RPC and output options. Do not resume an existing
+fixed-context experiment into a new auto-context output directory; use a
+new output directory for a changed experiment policy.
