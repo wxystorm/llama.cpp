@@ -52,6 +52,32 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertFalse(args.warmup)
             self.assertEqual(args.out, out)
 
+    def test_diagnostic_trace_requires_explicit_switch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistral24b.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--model-layers", "40", "--prompt-dir", str(prompts),
+                "--repo-root", str(root), "--auto-plan", "--htp-only"
+            ]
+            default = get_args(base)
+            _, default_env = build_process(
+                default, prompts / "prompt_128_01.txt", 512, 173,
+                root / "default.jsonl")
+            self.assertNotIn("LLAMA_REGION_RING_TASK_TRACE", default_env)
+            diagnostic = get_args(base + ["--trace-tasks"])
+            _, diagnostic_env = build_process(
+                diagnostic, prompts / "prompt_128_01.txt", 512, 173,
+                root / "diagnostic.jsonl")
+            self.assertEqual(diagnostic_env["LLAMA_REGION_RING_TASK_TRACE"], "1")
+
     def test_mistral_small_40_layer_auto_plan_and_forced_layout(self):
         from run_32b_all40 import (default_layout_for_layers,
                                    normalize_layout)
