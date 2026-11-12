@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 
+from jupiter_context import context_for_tokens, model_token_counts, tokenizer_path
 from jupiter_memory_partition import (
     DeviceMemory, GIB, MIB, pc_cpu_memory, pc_gpu_memory, phone_rpc_memory,
     plan_memory_split, read_gguf_weights,
@@ -110,7 +111,11 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--ubatch", type=int, default=128)
     p.add_argument("--batch", type=int, default=2048)
-    p.add_argument("--context", type=int, default=2048)
+    p.add_argument("--context", type=int, default=None,
+                   help="fixed context override; default auto per prompt")
+    p.add_argument("--min-context", type=int, default=1024)
+    p.add_argument("--context-padding", type=int, default=64)
+    p.add_argument("--tokenizer-exe", default=None)
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--window", type=int, default=2)
     p.add_argument("--q-repeats", type=int, default=1)
@@ -153,6 +158,8 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
             "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
             "ubatch": args.ubatch, "batch": args.batch,
             "context": args.context, "threads": args.threads,
+            "min_context": args.min_context,
+            "context_padding": args.context_padding,
             "window": args.window, "q_repeats": args.q_repeats,
             "refine_repeats": args.refine_repeats,
             "bench_repeats": args.bench_repeats,
@@ -288,7 +295,7 @@ def choose_layers_by_memory(args: argparse.Namespace,
         cpu_layers_override=(pinned_split[0] if pinned_split else None),
         cpu=cpu,
         cpu_reserve_mib=args.cpu_reserve_mib,
-        context=args.context,
+        context=getattr(args, "memory_context", args.context),
         ubatch=args.ubatch,
         window=args.window,
         graph_prebuild=args.graph_prebuild,
@@ -434,7 +441,9 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
         "--min-chunk", str(args.min_chunk),
         "--max-chunk", str(args.max_chunk),
         "--ubatch", str(args.ubatch), "--batch", str(args.batch),
-        "--context", str(args.context), "--threads", str(args.threads),
+        "--threads", str(args.threads),
+        "--min-context", str(args.min_context),
+        "--context-padding", str(args.context_padding),
         "--window", str(args.window),
         "--q-repeats", str(args.q_repeats),
         "--refine-repeats", str(args.refine_repeats),
@@ -442,6 +451,10 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
         "--max-rounds", str(args.max_rounds),
         "--resume", "--only-incomplete",
     ]
+    if args.context is not None:
+        cmd.extend(["--context", str(args.context)])
+    if args.tokenizer_exe is not None:
+        cmd.extend(["--tokenizer-exe", str(args.tokenizer_exe)])
     if args.graph_prebuild:
         cmd.append("--graph-prebuild")
     if getattr(args, "limit", None) is not None:
@@ -456,7 +469,8 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
 def main() -> int:
     args = make_parser().parse_args()
     if not (0 < args.min_chunk <= args.max_chunk <= args.ubatch <= args.batch
-            <= args.context):
+            and (args.context is None or args.batch <= args.context)
+            and args.min_context >= args.ubatch and args.context_padding >= 0):
         raise ValueError("require 0 < min-chunk <= max-chunk <= ubatch <= batch <= context")
     if (min(args.threads, args.window, args.q_repeats, args.refine_repeats,
             args.bench_repeats, args.max_rounds) < 1
@@ -491,6 +505,19 @@ def main() -> int:
         return 0
     if not Path(args.model).is_file():
         raise ValueError(f"--model not found: {args.model}")
+    if args.context is None:
+        counts = model_token_counts(
+            args.model, tokenizer_path(args.exe, args.tokenizer_exe),
+            [Path(entry["source"]) for entry in picked],
+            out / "prompt-tokens.json", persist=not args.memory_check_only)
+        max_context = max(context_for_tokens(
+            counts[entry["prompt"].lower()], minimum=args.min_context,
+            padding=args.context_padding) for entry in picked)
+        args.memory_context = max_context
+        print(f"[JUPITER_MEMORY_CONTEXT] auto_max={max_context} "
+              f"selected={len(picked)}", flush=True)
+    else:
+        args.memory_context = args.context
     if not args.memory_check_only and not Path(args.exe).is_file():
         raise ValueError(f"--exe not found: {args.exe}")
     pinned = None
