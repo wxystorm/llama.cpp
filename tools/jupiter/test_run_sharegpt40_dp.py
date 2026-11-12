@@ -10,8 +10,8 @@ import tempfile
 import unittest
 
 from run_sharegpt40_dp import (
-    benchmark_ready, discover, existing_rows, feasible_min_chunk,
-    parser, save_results, stage3_ready,
+    benchmark_ready, case_args_for_prompt, discover, existing_rows,
+    feasible_min_chunk, parser, save_results, stage3_ready,
 )
 
 
@@ -63,6 +63,34 @@ class ShareGPT40DPTests(unittest.TestCase):
                          "auto")
         self.assertFalse(args.budgeted_refine)
         self.assertFalse(args.only_incomplete)
+
+    def test_reference_group_context_and_batch_match_uploaded_log(self):
+        args = parser().parse_args([])
+        args.group_context = True
+        args.auto_context = False
+        for group, context, batch in (
+            (128, 512, 512), (256, 768, 768),
+            (512, 1280, 1280), (1024, 2304, 2048),
+        ):
+            selected = case_args_for_prompt(
+                args, group, Path(f"prompt_{group}_01.txt"), {})
+            self.assertEqual((selected.context, selected.batch, selected.ubatch),
+                             (context, batch, 128))
+            self.assertEqual(selected.pc_layers, 32)
+
+        # The legacy per-prompt policy is still available by opt-in.
+        args.group_context = False
+        args.auto_context = True
+        auto = case_args_for_prompt(
+            args, 128, Path("prompt_128_01.txt"),
+            {"prompt_128_01.txt": 167})
+        self.assertEqual((auto.context, auto.batch), (1024, 1024))
+
+        # An explicit context always overrides the policy.
+        args.auto_context = False
+        args.context = 2048
+        fixed = case_args_for_prompt(args, 128, Path("prompt_128_01.txt"), {})
+        self.assertEqual((fixed.context, fixed.batch), (2048, 2048))
 
     def test_stage3_resume_requires_explicit_fixed_verified_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
