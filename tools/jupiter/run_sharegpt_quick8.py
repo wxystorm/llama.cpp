@@ -453,7 +453,7 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
     ]
     if args.context is not None:
         cmd.extend(["--context", str(args.context)])
-    if args.tokenizer_exe is not None:
+    if getattr(args, "tokenizer_exe", None) is not None:
         cmd.extend(["--tokenizer-exe", str(args.tokenizer_exe)])
     if args.graph_prebuild:
         cmd.append("--graph-prebuild")
