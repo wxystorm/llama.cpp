@@ -39,6 +39,26 @@ max-buffer-size to split large weight contexts into multiple buffers.
 This addresses the single-buffer *size* limit but does not prove that
 the total weight+KV+graph working set fits the HTP address-space budget.
 
+## Hexagon SDK 6.6 CMake configure fix
+
+For Android ARM64, the Qualcomm SDK's `hexagon_fun.cmake` expects
+`PREBUILT_LIB_DIR=android_aarch64`. Otherwise lines 99-106 may print
+`string sub-command FIND requires 3 or 4 parameters` during configuration.
+This prototype branch now supplies that default in
+`ggml/src/ggml-hexagon/CMakeLists.txt` before the SDK is included, while
+respecting explicit overrides.
+
+For an already-created CMake build directory, reconfigure:
+
+```sh
+cmake -S . -B build-jupiter-htp-android \
+  -DPREBUILT_LIB_DIR=android_aarch64
+cmake --build build-jupiter-htp-android --parallel 8
+```
+
+The early `HAVE_DOTPROD - Failed`, `HAVE_SVE - Failed`, etc. lines are
+nonfatal optional CPU feature probes, not this SDK failure.
+
 ## Android/Phone setup
 
 Build the Android Phone RPC server **from this prototype branch**, with both
