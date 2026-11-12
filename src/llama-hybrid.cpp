@@ -66,6 +66,8 @@ static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES = 
 static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION            = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT = 0.90;
 static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION           = 0.90;
+// Region Ring GPU Bank search uses the full reported free VRAM, with no 10% reservation.
+static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 1.0L;
 
 static double llama_hybrid_phone_memory_fraction() {
     const char * value = std::getenv("LLAMA_HYBRID_PHONE_MEMORY_FRACTION");
@@ -10553,7 +10555,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // The Planner applies this budget to E seeds and every Beam prefix.
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
-            (long double) profile.gpu_free_mem * 0.90L;
+            (long double) profile.gpu_free_mem * LLAMA_REGION_RING_GPU_MEMORY_FRACTION;
         model.gpu_kv_bytes_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer *
             (model.kv_start + model.tokens);
@@ -10736,7 +10738,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     profile.phone_free_mem
                 };
                 const long double fraction[] = {
-                    0.85L, 0.90L, 0.90L};
+                    0.85L, LLAMA_REGION_RING_GPU_MEMORY_FRACTION, 0.90L};
                 for (size_t i = 0; i < 3; ++i) {
                     if (free_bytes[i] != 0 &&
                             usage[i] >
@@ -10881,7 +10883,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         profile.phone_free_mem
                     };
                     const long double fraction[] = {
-                        0.85L, 0.90L, 0.90L};
+                        0.85L, LLAMA_REGION_RING_GPU_MEMORY_FRACTION, 0.90L};
                     for (size_t i = 0; i < 3; ++i) {
                         if (free_bytes[i] != 0 &&
                                 usage[i] >
