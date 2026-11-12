@@ -11134,7 +11134,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                            "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
                            "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
                            "gpu_bank0_min_mib,gpu_bank1_min_mib,"
-                           "gpu_single_bank_capacity_mib,"
+                           "gpu_bank_A_capacity_min_mib,"
+                           "gpu_bank_B_capacity_min_mib,"
                            "gpu_kv_min_mib,gpu_peak_min_mib,"
                            "gpu_full_possible_min_mib,gpu_budget_mib,"
                            "prefix_gpu_pruned,prefix_full_memory_pruned,"
@@ -11164,6 +11165,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << (seed.gpu_bank0_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_bank1_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_single_bank_capacity_bytes /
+                                1048576.0L) << ","
+                            << (seed.gpu_bank1_capacity_bytes /
                                 1048576.0L) << ","
                             << (seed.gpu_kv_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_peak_min_bytes / 1048576.0L) << ","
@@ -11414,10 +11417,88 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // Cycle widths for deterministic APPLY_WIDE A/B checks.
             forced.concrete_regions = forced_regions;
 
-            if ((model.memory_feasible &&
-                    !model.memory_feasible(forced)) ||
-                    (model.region_memory_feasible &&
-                     !model.region_memory_feasible(forced_regions))) {
+            const bool force_candidate_mem_ok =
+                !model.memory_feasible || model.memory_feasible(forced);
+            const bool force_region_mem_ok =
+                force_candidate_mem_ok &&
+                (!model.region_memory_feasible ||
+                 model.region_memory_feasible(forced_regions));
+            if (!force_candidate_mem_ok || !force_region_mem_ok) {
+                // The normal HTP_MEMORY_DIAG is printed BEFORE the force
+                // callback runs. Print its actual counters at failure time;
+                // zero counts there are NOT proof a forced Plan was legal.
+                const auto & d = *htp_memory_diag;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_FORCE_MEMORY] status=REJECT"
+                    " candidate_memory=%d region_memory=%d"
+                    " geometry=%zu session_map=%zu bank_shape=%zu"
+                    " host_ram=%zu gpu_vram=%zu phone_ram=%zu pass=%zu"
+                    " phase=FORCED_PLAN\n",
+                    force_candidate_mem_ok ? 1 : 0,
+                    force_region_mem_ok ? 1 : 0,
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
+                if (model.gpu_weight_streaming) {
+                    long double cap = 0.0L;
+                    std::array<size_t, 2> bank_peaks {};
+                    std::array<long double, 2> bank_capacities {};
+                    const bool banks_fit =
+                        llama_ring_planner::gpu_streamed_banks_fit(
+                            model, forced_regions, force_xg, &cap,
+                            &bank_peaks, &bank_capacities);
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_FORCE_BANK] status=%s"
+                        " bank_A_peak_mib=%.1f bank_B_peak_mib=%.1f"
+                        " bank_A_capacity_mib=%.1Lf"
+                        " bank_B_capacity_mib=%.1Lf"
+                        " basis=DYNAMIC_OTHER_BANK_RESIDUAL"
+                        " rule=PEAK_A_PLUS_PEAK_B_PLUS_KV_SCRATCH_LT_BUDGET\n",
+                        banks_fit ? "PASS" : "REJECT",
+                        bank_peaks[0] / 1048576.0,
+                        bank_peaks[1] / 1048576.0,
+                        bank_capacities[0] / 1048576.0L,
+                        bank_capacities[1] / 1048576.0L);
+                }
+                if (htp_session_guard) {
+                    auto limits = htp_limits;
+                    limits.xp = force_xp;
+                    llama_ring_planner::htp_memory_usage u;
+                    const auto layer_bytes = [&profile, weight_fallback](int l) {
+                        return profile.layer_weight_bytes.size() ==
+                                (size_t) profile.n_layer ?
+                            profile.layer_weight_bytes[(size_t) l] :
+                            weight_fallback;
+                    };
+                    const bool htp_ok =
+                        llama_ring_planner::htp_plan_memory_feasible(
+                            forced_regions, limits, layer_bytes, &u);
+                    const char * htp_reason =
+                        u.reject == llama_ring_planner::htp_memory_reject::
+                                SESSION_MAPPING ? "SESSION_MAPPING" :
+                        u.reject == llama_ring_planner::htp_memory_reject::
+                                SHARED_RAM ? "SHARED_RAM" :
+                        u.reject == llama_ring_planner::htp_memory_reject::
+                                NONE ? "NONE" : "INVALID";
+                    LLAMA_LOG_ERROR(
+                        "[REGION_RING_PLAN_FORCE_HTP] status=%s"
+                        " reason=%s phone_layers=%d"
+                        " session_layers=%d,%d,%d,%d"
+                        " session_total_mib=%.1Lf,%.1Lf,%.1Lf,%.1Lf"
+                        " scratch_per_layer_mib=%.1Lf"
+                        " shared_total_mib=%.1Lf shared_budget_mib=%.1Lf"
+                        " session_budget_mib=%.1Lf\n",
+                        htp_ok ? "PASS" : "REJECT", htp_reason,
+                        u.phone_layers, u.session_layers[0],
+                        u.session_layers[1], u.session_layers[2],
+                        u.session_layers[3],
+                        u.session_total_bytes[0] / 1048576.0L,
+                        u.session_total_bytes[1] / 1048576.0L,
+                        u.session_total_bytes[2] / 1048576.0L,
+                        u.session_total_bytes[3] / 1048576.0L,
+                        u.scratch_bytes_per_layer / 1048576.0L,
+                        u.shared_total_bytes / 1048576.0L,
+                        limits.shared_budget_bytes / 1048576.0L,
+                        limits.session_budget_bytes / 1048576.0L);
+                }
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
                     "status=REJECT reason=MEMORY_BUDGET "
@@ -11492,9 +11573,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (model.gpu_weight_streaming) {
             long double capacity = 0.0L;
             std::array<size_t, 2> peaks {};
+            std::array<long double, 2> bank_capacities {};
             const bool bank_ok = llama_ring_planner::
                 gpu_streamed_banks_fit(
-                    model, best_regions, best.xg, &capacity, &peaks);
+                    model, best_regions, best.xg, &capacity, &peaks,
+                    &bank_capacities);
             size_t first_weight_bytes = 0;
             const bool first_weight_known =
                 !best_regions.empty() &&
@@ -11511,14 +11594,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "[REGION_RING_GPU_BANK_GUARD] status=%s"
                 " first_gpu_region_mib=%.1Lf"
                 " bank_A_peak_mib=%.1f bank_B_peak_mib=%.1f"
-                " one_bank_capacity_mib=%.1Lf"
-                " basis=GPU_90PCT_MINUS_FULL_KV_SCRATCH_HALVED"
-                " rule=EACH_BANK_PEAK_STRICTLY_LESS\n",
+                " bank_A_capacity_mib=%.1Lf"
+                " bank_B_capacity_mib=%.1Lf"
+                " basis=DYNAMIC_OTHER_BANK_RESIDUAL"
+                " rule=PEAK_A_PLUS_PEAK_B_PLUS_KV_SCRATCH_LT_BUDGET\n",
                 bank_ok ? "PASS" : "REJECT",
                 first_weight_mib,
                 peaks[0] / 1048576.0,
                 peaks[1] / 1048576.0,
-                capacity / 1048576.0L);
+                bank_capacities[0] / 1048576.0L,
+                bank_capacities[1] / 1048576.0L);
             if (!bank_ok || !first_weight_known) { return false; }
         }
         if (htp_session_guard) {

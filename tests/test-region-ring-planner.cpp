@@ -1104,7 +1104,7 @@ int main() {
         REQUIRE(completed.gpu_kv_min_bytes == 120.0L);
         REQUIRE(completed.total_min_bytes == 1420.0L);
         REQUIRE(completed.bank0_bytes < completed.single_bank_capacity_bytes);
-        REQUIRE(completed.bank1_bytes < completed.single_bank_capacity_bytes);
+        REQUIRE(completed.bank1_bytes < completed.bank1_capacity_bytes);
         bank.gpu_memory_budget_bytes = 1350.0L;
         REQUIRE(gpu_prefix_memory_feasible(bank, first, 4, 16));
         REQUIRE(!gpu_prefix_memory_feasible(bank, all, 4, 16));
@@ -1160,8 +1160,10 @@ int main() {
         REQUIRE(min_complete.total_min_bytes < 1700.0L);
     }
 
-    // A first G Region can fit TOTAL streamed VRAM yet exceed Bank A.
-    // Reject before E and at full-layout guard; equality also rejects.
+    // Two CUDA Bank schedulers reserve their actual unequal weight peaks,
+    // NOT 50% of the available VRAM each. A 600+300+90 layout must PASS
+    // with budget=1100 even though Bank A exceeds the fake half limit.
+    // Reject only once the full peak sum plus GPU KV reaches the budget.
     {
         model strict = mock_profile();
         strict.layers = 16;
@@ -1185,27 +1187,65 @@ int main() {
                 9 * strict.gpu_kv_bytes_per_layer <
                 strict.gpu_memory_budget_bytes);
         long double bank_capacity = 0.0L;
-        REQUIRE(!gpu_streamed_banks_fit(
-            strict, complete, 16, &bank_capacity));
-        REQUIRE(bank_capacity == 505.0L);
+        std::array<long double, 2> capacities {};
+        REQUIRE(gpu_streamed_banks_fit(
+            strict, complete, 16, &bank_capacity, nullptr,
+            &capacities));
+        REQUIRE(bank_capacity == 710.0L);
+        REQUIRE(capacities[0] == 710.0L);
+        REQUIRE(capacities[1] == 410.0L);
+        REQUIRE(peaks[0] > (strict.gpu_memory_budget_bytes -
+                            9 * strict.gpu_kv_bytes_per_layer) / 2.0L);
         const std::vector<llama_region_ring_region> prefix {
             {device::GPU, 0, 6}, {device::CPU, 6, 7},
             {device::PHONE, 7, 8}
         };
-        REQUIRE(!gpu_prefix_memory_feasible(
+        REQUIRE(gpu_prefix_memory_feasible(
             strict, prefix, 2, 16));
-        // Exactly one Bank's capacity is still REJECTED.
-        strict.gpu_memory_budget_bytes = 1290.0L;
+        // Exact total occupancy equals the budget: reject strictly.
+        strict.gpu_memory_budget_bytes = 990.0L;
         REQUIRE(!gpu_streamed_banks_fit(
             strict, complete, 16, &bank_capacity));
         REQUIRE(bank_capacity == 600.0L);
-        strict.gpu_memory_budget_bytes = 1291.0L;
+        strict.gpu_memory_budget_bytes = 991.0L;
         REQUIRE(gpu_streamed_banks_fit(
             strict, complete, 16, &bank_capacity));
-        REQUIRE(bank_capacity == 600.5L);
+        REQUIRE(bank_capacity == 601.0L);
         strict.gpu_memory_budget_bytes = 0.0L;
         REQUIRE(!gpu_streamed_banks_fit(strict, complete, 16));
         REQUIRE(!gpu_prefix_memory_feasible(strict, prefix, 2, 16));
+    }
+
+    // Bank A can exceed half the nominal weight-VRAM headroom when
+    // Bank B is smaller; dynamic caches need only fit in aggregate.
+    {
+        model asym = mock_profile();
+        asym.layers = 16;
+        asym.slot_pool = 0;
+        asym.gpu_weight_streaming = true;
+        asym.gpu_kv_bytes_per_layer = 16.0L;
+        asym.gpu_memory_budget_bytes = 5000.0L;
+        asym.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) { return false; }
+                // 8-layer Region A=2400; 7-layer Region B=2100.
+                bytes = (size_t) (end - begin) * 300;
+                return true;
+            };
+        const auto shape = llama_region_ring_parse_apply_wide_layout(
+            "G8,P1,G7", 16);
+        std::array<size_t, 2> peaks {};
+        std::array<long double, 2> caps {};
+        REQUIRE(gpu_streamed_banks_fit(
+            asym, shape, 128, nullptr, &peaks, &caps));
+        REQUIRE(peaks[0] == 2400 && peaks[1] == 2100);
+        REQUIRE(caps[0] == 5000.0L - 15 * 16 - 2100);
+        REQUIRE(caps[1] == 5000.0L - 15 * 16 - 2400);
+        REQUIRE(peaks[0] >
+            (asym.gpu_memory_budget_bytes - 15 * 16) / 2.0L);
+        REQUIRE(peaks[0] < caps[0] && peaks[1] < caps[1]);
+        asym.gpu_memory_budget_bytes = 4740.0L;
+        REQUIRE(!gpu_streamed_banks_fit(asym, shape, 128));
     }
 
     // Later Cycles are minor tweaks to the first allocation. CPU=0
@@ -1277,7 +1317,7 @@ int main() {
             REQUIRE(seed.gpu_bank0_min_bytes <
                     seed.gpu_single_bank_capacity_bytes);
             REQUIRE(seed.gpu_bank1_min_bytes <
-                    seed.gpu_single_bank_capacity_bytes);
+                    seed.gpu_bank1_capacity_bytes);
             REQUIRE(seed.gpu_full_possible_min_bytes <=
                     seed.gpu_budget_bytes);
             REQUIRE(seed.gpu_full_possible_min_bytes >=

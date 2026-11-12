@@ -610,10 +610,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     // the CPU-transport HTP-only prefill contract. If no
                     // valid GPU-tail Plan survived E/Memory/Beam/DAG, fail
                     // before loading any model or starting a Phone RUN.
+                    // A user-forced APPLY_WIDE Plan does not go through
+                    // the automatic GPU-tail search. Do not erase its
+                    // specific FORCE rejection reason with an unrelated
+                    // NO_EXECUTABLE_HTP_ONLY_GPU_TAIL message.
+                    const char * force_layout =
+                        std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
+                    const bool forced =
+                        force_layout != nullptr && *force_layout != '\0';
                     LLAMA_LOG_ERROR(
                         "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
                         " phase=MODEL_LOAD applied=0 status=FAIL"
-                        " reason=NO_EXECUTABLE_HTP_ONLY_GPU_TAIL\n");
+                        " reason=%s\n",
+                        forced ? "FORCED_PLAN_REJECTED_SEE_PLAN_FORCE" :
+                            "NO_EXECUTABLE_HTP_ONLY_GPU_TAIL");
                     return {-1, nullptr};
                 }
                 LLAMA_LOG_ERROR(

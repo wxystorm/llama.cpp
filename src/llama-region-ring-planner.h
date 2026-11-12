@@ -382,18 +382,24 @@ inline bool gpu_weight_bank_peaks(
     return true;
 }
 
-// Two equal-capacity CUDA weight Banks share one physical GPU budget.
-// KV/scratch are not Bank capacity: they must be reserved BEFORE dividing
-// the remaining VRAM equally between Bank A and Bank B.
-// Use the actual total GPU layers for a complete Plan and a proven minimum
-// GPU-layer count for a prefix; a 0/unknown budget fails closed on streaming.
+// Bank A and Bank B are INDEPENDENT weight-cache schedulers with dynamic
+// allocation. The old "GPU free / 2" limit was a false hard constraint:
+// a 2500 MiB Bank A and a 2200 MiB Bank B can coexist if their combined
+// peaks plus GPU KV/scratch fit in the actual CUDA budget.
+// "One Bank capacity" means the remaining GPU budget AFTER reserving
+// the OTHER Bank, GPU KV and scratch; it is not an equal partition.
+// Use complete GPU layer count for a final Plan and an optimistic
+// minimum for a prefix. Unknown streaming budgets fail closed.
 inline long double gpu_streamed_single_bank_capacity_bytes(
-        const model & m, int total_gpu_layers, int xg) {
+        const model & m, int total_gpu_layers, int xg,
+        long double other_bank_peak_bytes = 0.0L) {
     if (!m.gpu_weight_streaming || m.gpu_memory_budget_bytes <= 0.0L ||
             total_gpu_layers < 0 || xg <= 0 ||
             !std::isfinite(m.gpu_memory_budget_bytes) ||
             !std::isfinite(m.gpu_kv_bytes_per_layer) ||
-            m.gpu_kv_bytes_per_layer < 0.0L) {
+            m.gpu_kv_bytes_per_layer < 0.0L ||
+            !std::isfinite(other_bank_peak_bytes) ||
+            other_bank_peak_bytes < 0.0L) {
         return 0.0L;
     }
     const long double gpu_kv =
@@ -402,16 +408,18 @@ inline long double gpu_streamed_single_bank_capacity_bytes(
         (long double) m.slot_pool * xg * m.hidden *
             sizeof(float) * 3 : 0.0L;
     const long double available =
-        m.gpu_memory_budget_bytes - gpu_kv - scratch;
+        m.gpu_memory_budget_bytes - gpu_kv - scratch -
+        other_bank_peak_bytes;
     return std::isfinite(available) && available > 0.0L ?
-        available / 2.0L : 0.0L;
+        available : 0.0L;
 }
 
 inline bool gpu_streamed_banks_fit(
         const model & m,
         const std::vector<llama_region_ring_region> & regions,
         int xg, long double * bank_capacity_bytes = nullptr,
-        std::array<size_t, 2> * bank_peaks_bytes = nullptr) {
+        std::array<size_t, 2> * bank_peaks_bytes = nullptr,
+        std::array<long double, 2> * bank_capacities_bytes = nullptr) {
     if (!m.gpu_weight_streaming) { return true; }
     if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     int gpu_layers = 0;
@@ -421,15 +429,22 @@ inline bool gpu_streamed_banks_fit(
             gpu_layers += r.layer_end - r.layer_begin;
         }
     }
-    const long double capacity =
-        gpu_streamed_single_bank_capacity_bytes(m, gpu_layers, xg);
     std::array<size_t, 2> peaks {};
     const bool known = gpu_weight_bank_peaks(m, regions, peaks);
-    if (bank_capacity_bytes) { *bank_capacity_bytes = capacity; }
+    const std::array<long double, 2> capacities {{
+        gpu_streamed_single_bank_capacity_bytes(
+            m, gpu_layers, xg, (long double) peaks[1]),
+        gpu_streamed_single_bank_capacity_bytes(
+            m, gpu_layers, xg, (long double) peaks[0]),
+    }};
+    // Historical optional scalar output now means the dynamically
+    // available Bank A capacity after accounting for Bank B.
+    if (bank_capacity_bytes) { *bank_capacity_bytes = capacities[0]; }
     if (bank_peaks_bytes) { *bank_peaks_bytes = peaks; }
-    return known && capacity > 0.0L &&
-        (long double) peaks[0] < capacity &&
-        (long double) peaks[1] < capacity;
+    if (bank_capacities_bytes) { *bank_capacities_bytes = capacities; }
+    return known && capacities[0] > 0.0L && capacities[1] > 0.0L &&
+        (long double) peaks[0] < capacities[0] &&
+        (long double) peaks[1] < capacities[1];
 }
 
 // A safe GPU-memory lower bound for a prefix of completed G/C/P Cycles.
@@ -448,7 +463,10 @@ struct gpu_prefix_memory_bound {
     long double scratch_bytes = 0.0L;
     long double total_min_bytes = 0.0L;
     long double budget_bytes = 0.0L;
+    // Bank A/B residual capacities after the OTHER currently known
+    // Bank peak. For an incomplete prefix these are optimistic bounds.
     long double single_bank_capacity_bytes = 0.0L;
+    long double bank1_capacity_bytes = 0.0L;
 };
 
 inline bool gpu_prefix_memory_feasible(
@@ -533,12 +551,15 @@ inline bool gpu_prefix_memory_feasible(
             unstreamed_weights) +
         estimate.gpu_kv_min_bytes + estimate.scratch_bytes;
     if (m.gpu_weight_streaming) {
-        // Prefix KV is a LOWER bound; if one Bank fails with even this
-        // optimistic available capacity, no completion can become legal.
+        // Prefix KV / future GPU Region sizes are LOWER bounds.
+        // Do not invent an equal Bank split: each scheduler can have
+        // a different dynamically allocated weight-cache footprint.
         const long double remain = estimate.budget_bytes -
             estimate.gpu_kv_min_bytes - estimate.scratch_bytes;
-        estimate.single_bank_capacity_bytes = remain > 0.0L ?
-            remain / 2.0L : 0.0L;
+        estimate.single_bank_capacity_bytes =
+            std::max(0.0L, remain - estimate.bank1_bytes);
+        estimate.bank1_capacity_bytes =
+            std::max(0.0L, remain - estimate.bank0_bytes);
     }
     if (bound) {
         *bound = estimate;
@@ -547,8 +568,9 @@ inline bool gpu_prefix_memory_feasible(
         estimate.total_min_bytes <= estimate.budget_bytes &&
         (!m.gpu_weight_streaming ||
          (estimate.single_bank_capacity_bytes > 0.0L &&
+          estimate.bank1_capacity_bytes > 0.0L &&
           estimate.bank0_bytes < estimate.single_bank_capacity_bytes &&
-          estimate.bank1_bytes < estimate.single_bank_capacity_bytes));
+          estimate.bank1_bytes < estimate.bank1_capacity_bytes));
 }
 
 // Exact minimum GPU VRAM required by any legal completion of a first
@@ -586,10 +608,12 @@ inline bool gpu_minimum_complete_first_cycle_memory(
     const long double gpu_kv_floor =
         std::max(0.0L, m.gpu_kv_bytes_per_layer) *
         (first_g + n_cycles - 1);
-    // Lower bound for one Bank before choosing XG (scratch excluded).
-    // An overfull first Bank can never be repaired by future Cycles.
+    // An overfull first Bank cannot be rescued by later Cycles.
+    // Before the next Bank's exact geometry is chosen, reserve the
+    // optimistic KV floor only; DFS below accounts for the second
+    // Bank's guaranteed first layer. Never halve the whole VRAM budget.
     const long double optimistic_bank_capacity =
-        (m.gpu_memory_budget_bytes - gpu_kv_floor) / 2.0L;
+        m.gpu_memory_budget_bytes - gpu_kv_floor;
     if (m.gpu_weight_streaming &&
             (optimistic_bank_capacity <= 0.0L ||
              (long double) first_weight >= optimistic_bank_capacity)) {
@@ -603,15 +627,17 @@ inline bool gpu_minimum_complete_first_cycle_memory(
                long double bank0, long double bank1,
                long double unstreamed) {
         if (completed == n_cycles) {
-            if (begin != m.layers ||
-                    (m.gpu_weight_streaming &&
-                     (bank0 >= optimistic_bank_capacity ||
-                      bank1 >= optimistic_bank_capacity))) {
+            if (begin != m.layers) {
                 return;
             }
             const long double bytes =
                 (m.gpu_weight_streaming ? bank0 + bank1 :
                  unstreamed) + gpu_kv_floor;
+            if ((m.gpu_weight_streaming &&
+                     bytes >= m.gpu_memory_budget_bytes) ||
+                    bytes >= best.total_min_bytes) {
+                return;
+            }
             if (bytes < best.total_min_bytes) {
                 best.bank0_bytes = m.gpu_weight_streaming ? bank0 : 0.0L;
                 best.bank1_bytes = m.gpu_weight_streaming ? bank1 : 0.0L;
@@ -669,8 +695,7 @@ inline bool gpu_minimum_complete_first_cycle_memory(
             if (gpu_lower > best.budget_bytes ||
                     gpu_lower >= best.total_min_bytes ||
                     (m.gpu_weight_streaming &&
-                     (b0 >= optimistic_bank_capacity ||
-                      b1 >= optimistic_bank_capacity))) {
+                     gpu_lower >= best.budget_bytes)) {
                 continue;
             }
             walk(completed + 1, begin + width,
@@ -2656,7 +2681,8 @@ struct first_cycle_seed_record {
     std::array<double, 3> first_handoff_mspt {};
     long double gpu_bank0_min_bytes = 0.0L;
     long double gpu_bank1_min_bytes = 0.0L;
-    long double gpu_single_bank_capacity_bytes = 0.0L;
+    long double gpu_single_bank_capacity_bytes = 0.0L; // Bank A, after B reserve
+    long double gpu_bank1_capacity_bytes = 0.0L;
     long double gpu_kv_min_bytes = 0.0L;
     long double gpu_peak_min_bytes = 0.0L;
     // Best achievable full-GPU-only footprint over legal later widths,
@@ -4072,17 +4098,23 @@ inline result search_runtime_applicable(
                 gpu_minimum_complete_first_cycle_memory(
                     m, shape.g, shape.c, shape.p, n_cycles,
                     width_low, width_high, spread, min_full_gpu);
-            // G1 runs in Bank A. The initial Region weight allocation
-            // must FIT ONE BANK by itself, not merely fit in the total
-            // BankA+BankB VRAM budget. Reserve even the MINIMUM possible
-            // future GPU KV and this XG's slot scratch before halving VRAM.
+            // G1 runs in Bank A. The first later GPU Region starts at
+            // shape.width and must occupy Bank B. Reserve at least THAT
+            // layer's weight for B before testing Bank A's headroom.
+            // The completed full-Plan gate checks BOTH exact Bank peaks.
             size_t first_gpu_weight = 0;
+            size_t future_bank_min_weight = 0;
             const bool first_weight_known =
                 !m.gpu_weight_streaming ||
                 (m.gpu_region_weight_bytes &&
+                 shape.width < m.layers &&
                  m.gpu_region_weight_bytes(
                      0, shape.g, first_gpu_weight) &&
-                 first_gpu_weight > 0);
+                 first_gpu_weight > 0 &&
+                 m.gpu_region_weight_bytes(
+                     shape.width, shape.width + 1,
+                     future_bank_min_weight) &&
+                 future_bank_min_weight > 0);
             bool any_gpu_xg = false;
             for (size_t gi = 0; gi < n_x; ++gi) {
                 if (chunks[gi] > m.tokens) {
@@ -4095,7 +4127,8 @@ inline result search_runtime_applicable(
                 const long double one_bank_capacity =
                     m.gpu_weight_streaming ?
                     gpu_streamed_single_bank_capacity_bytes(
-                        m, shape.g + n_cycles - 1, chunks[gi]) : 0.0L;
+                        m, shape.g + n_cycles - 1, chunks[gi],
+                        (long double) future_bank_min_weight) : 0.0L;
                 const bool first_bank_ok =
                     !m.gpu_weight_streaming ||
                     (first_weight_known && one_bank_capacity > 0.0L &&
@@ -4553,6 +4586,8 @@ inline result search_runtime_applicable(
             trace.gpu_bank1_min_bytes = bound.bank1_bytes;
             trace.gpu_single_bank_capacity_bytes =
                 bound.single_bank_capacity_bytes;
+            trace.gpu_bank1_capacity_bytes =
+                bound.bank1_capacity_bytes;
             trace.gpu_kv_min_bytes = bound.gpu_kv_min_bytes;
             trace.gpu_peak_min_bytes = bound.total_min_bytes;
             trace.gpu_budget_bytes = bound.budget_bytes;

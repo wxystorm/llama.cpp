@@ -149,51 +149,75 @@ can make 3–4 Cycles faster. If `NO_EXECUTABLE_HTP_ONLY_GPU_TAIL`
 persists, consult the `HTP_MEMORY_DIAG` counters: adding a search
 geometry cannot bypass the hardware memory budgets.
 
-## First-Cycle single-Bank hard limit and later-Cycle micro-adjustments
+## Asymmetric GPU Bank capacity and later-Cycle micro-adjustments
 
-This Planner rule applies to automatic APPLY_WIDE search. It is now
-**illegal** for any first GPU Region to have a weight footprint that
-fits total CUDA VRAM but exceeds the capacity of a **single** streaming
-Bank. The capacity used for a complete Plan is
+The CUDA runtime uses **two independent weight-cache schedulers** and
+allocates each cache to the actual streamed GPU Region weight peak.
+Bank A and Bank B are *not* equal-sized static partitions of VRAM.
+This was verified against the older working
+`feat/32b-g8p6-resumable-sweep-20261110` runtime: rank 0 uses Bank A,
+rank 1 Bank B, and a drained bank is refilled for rank + 2.
 
-`B_one = (0.90 * measured_GPU_free - GPU_KV(full_plan) - GPU_slot_scratch) / 2`
+The earlier Planner rule `(0.9*GPU_free - KV - scratch)/2` per Bank
+was therefore over-restrictive and could reject previously working
+unequal-size layouts. The corrected complete-Plan safety condition is:
 
-and the strict test is `max_weight_region(Bank_A) < B_one` AND
-`max_weight_region(Bank_B) < B_one`. In particular,
-`weight(G1) < B_one`. No equal-capacity boundary is accepted.
-The first-Cycle E prefilter also rejects oversize G1 **before**
-ranking, using an optimistic minimum future-GPU KV reservation;
-the terminal Beam and full Plan recompute actual GPU-layer KV and
-the two Bank maxima. If the streaming CUDA budget/weights are unknown,
-the candidate is rejected instead of skipping the Bank safety check.
-The older aggregate two-Bank peak and GPU KV checks remain enabled.
+`BankA_weight_peak + BankB_weight_peak + GPU_KV + slot_scratch < 0.9*measured_GPU_free`
 
-**Later Cycle changes are micro-adjustments**, not a new unconstrained
-layer split. With first-cycle counts `(G1,C1,P1)`, each later Cycle
-must satisfy `|Gi-G1| <= 2`, `|Ci-C1| <= 2`,
+Equivalently, the *dynamic* available capacity for Bank A is
+`0.9*GPU_free - KV - scratch - BankB_weight_peak`, and vice versa.
+The first GPU Region `G1` must still fit a **single** Bank A. Before
+the second GPU Region is known, the first-Cycle E prefilter reserves
+at least one real weight layer for the future Bank B and the optimistic
+GPU KV floor. All later prefixes/complete layouts recheck the two
+actual alternating Bank peaks. Missing VRAM/weight data fails closed.
+This is a conservative VRAM estimate, not a CUDA allocation guarantee.
+
+**Later Cycle changes remain micro-adjustments**, not an unconstrained
+redistribution: for first-Cycle counts `(G1,C1,P1)`, each later Cycle
+must obey `|Gi-G1| <= 2`, `|Ci-C1| <= 2`,
 `|Pi-P1| <= 2`, and
-`|(Gi+Ci+Pi)-(G1+C1+P1)| <= 3` layers. The same `XC/XG/XP`
-and accumulated workload E/Beam scoring remain in use. The CPU-optional
-G/P pass also obeys this rule; C=0 is legal. Local refinement,
-uniform candidates, and the final Top24 are gated too. HTP-only
-GPU-tail is a **separate final head/tail** and is not counted as
-a fifth/full Cycle in this rule.
+`|(Gi+Ci+Pi)-(G1+C1+P1)| <= 3` layers. CPU=0 stays legal
+via the CPU-optional search; XC/XG/XP are retained from the first
+Cycle. The final GPU-tail is a separate head/tail, not another full
+Cycle in this micro-adjustment rule.
 
-The independent G/C/N Profile V0 is unchanged. In
-`planner-first-cycle-top256.csv`, the new
-`gpu_single_bank_capacity_mib` column shows the early optimistic
-one-Bank maximum. Inspect `[REGION_RING_PLAN_SEARCH]` for
-`gpu_first_one_bank_pruned` and `prefix_micro_pruned`.
-`[REGION_RING_GPU_BANK_GUARD]` reports the final selected Plan's
-first GPU Region, Bank A/B weight peaks, and exact single-Bank
-capacity. A manually forced layout keeps its exact requested stages
-(no automatic micro-adjustment), but it **still must pass** the
-full two-Bank memory hard constraint and DAG checks.
+The first-Cycle CSV `planner-first-cycle-top256.csv` reports
+`gpu_bank_A_capacity_min_mib` and `gpu_bank_B_capacity_min_mib`,
+both **optimistic** while only the first Cycle is known. The selected
+Plan logs `[REGION_RING_GPU_BANK_GUARD]` with the exact estimates
+`bank_A_peak_mib`, `bank_B_peak_mib`,
+`bank_A_capacity_mib`, `bank_B_capacity_mib`.
+Automatic and manually forced Plans both retain the full GPU/HTP
+memory guards and DAG verification. Old successful measurements on
+`XG=96` cannot prove `XG=128` will fit the *current* free VRAM.
 
-The Bank limit is a conservative VRAM accounting rule built from
-weight bytes, GPU KV and slot scratch; it is **not** a direct query
-of a hardware-exposed CUDA Bank size. Physical CUDA allocation or WDDM
-pressure can still cause runtime failure, so validate real execution.
+## Diagnosing forced HTP-only Plan rejections
+
+With `-ForceLayout`, native APPLY_WIDE skips E/Beam and evaluates
+only that exact layout. The runner's `[PLAN_FORCE] source=USER` is
+an **input acknowledgment**, not acceptance. The native decision is
+`[REGION_RING_PLAN_FORCE] status=ACCEPT` or
+`status=REJECT reason=...`.
+
+The old model-loader text `NO_EXECUTABLE_HTP_ONLY_GPU_TAIL` was generic,
+even on forced failure. The PC loader now prints
+`FORCED_PLAN_REJECTED_SEE_PLAN_FORCE` and the Python runner prefers
+the actual native `REGION_RING_PLAN_FORCE` reason. When memory rejects,
+`[REGION_RING_PLAN_FORCE_MEMORY]` prints the **post-callback** counts:
+`session_map`, `host_ram`, `gpu_vram`, `phone_ram`.
+`[REGION_RING_PLAN_FORCE_BANK]` shows both dynamic Bank headrooms,
+and `[REGION_RING_PLAN_FORCE_HTP]` shows per-session HTP layers,
+persisted scratch and shared RAM. These are diagnostics only and
+do **not** bypass any HTP allocation limits.
+
+Important: the ordinary `[REGION_RING_HTP_MEMORY_DIAG]` counters were
+printed **before** forced evaluation. All zero counts there do not
+establish memory feasibility; the new `FORCE_MEMORY` event is authoritative.
+A forced G9/P5 layout can pass the corrected asymmetric GPU criterion
+yet still be rejected by HTP Session/Android MemAvailable budgets.
+The previous 20-layer HTP memory estimate remains conservative until
+device-runtime memory observations validate it.
 
 ## Wider Plan shortlist and CPU-optional search
 

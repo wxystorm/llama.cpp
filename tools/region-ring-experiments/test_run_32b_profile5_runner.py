@@ -251,6 +251,65 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Phone->PC"):
                 verify_independent_profile(csv_file)
 
+    def test_forced_plan_rejection_prefers_native_reason_over_generic_tail(self):
+        # The original regression: Python displays FORCE_LAYOUT, but
+        # llama.cpp emits a generic HTP-only error after forced rejection.
+        # Initial zero HTP counters were printed *before* evaluating it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "engine.stderr.log").write_text("\n".join((
+                "[REGION_RING_HTP_MEMORY_DIAG] geometry=0 session_map=0"
+                " bank_shape=0 host_ram=0 gpu_vram=0 phone_ram=0"
+                " pass=0 source=CANDIDATE_MEMORY_CALLBACK status=COUNTED",
+                "[REGION_RING_PLAN_FORCE_MEMORY] status=REJECT"
+                " candidate_memory=0 region_memory=0 geometry=0"
+                " session_map=0 bank_shape=0 host_ram=0 gpu_vram=1"
+                " phone_ram=0 pass=0 phase=FORCED_PLAN",
+                "[REGION_RING_PLAN_FORCE_BANK] status=REJECT"
+                " bank_A_peak_mib=2500.0 bank_B_peak_mib=2500.0"
+                " bank_A_capacity_mib=2400.0 bank_B_capacity_mib=2400.0",
+                "[REGION_RING_PLAN_FORCE_HTP] status=REJECT"
+                " reason=SHARED_RAM phone_layers=20 shared_total_mib=9100.0"
+                " shared_budget_mib=8078.9",
+                "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE"
+                " status=REJECT reason=MEMORY_BUDGET"
+                " layout=G9,P5,G9,P5,G9,P5,G9,P5,G8"
+                " XC=128 XG=128 XP=128",
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
+                " phase=MODEL_LOAD applied=0 status=FAIL"
+                " reason=NO_EXECUTABLE_HTP_ONLY_GPU_TAIL",
+            )), encoding="utf-8")
+            row = parse_metrics(
+                root, 1, 150.0, auto_plan=True, htp_only=True)
+            self.assertEqual(row["status"], "FAIL")
+            self.assertEqual(row["plan_reject_reason"], "MEMORY_BUDGET")
+            self.assertIn("status=REJECT reason=MEMORY_BUDGET",
+                          row["plan_force_reject"])
+            self.assertIn("gpu_vram=1", row["plan_force_memory_diag"])
+            self.assertIn("bank_A_capacity_mib=2400",
+                          row["plan_force_bank_diag"])
+            self.assertIn("reason=SHARED_RAM",
+                          row["plan_force_htp_diag"])
+            self.assertIn("shared_total_mib=9100.0",
+                          row["plan_force_htp_diag"])
+            self.assertIn("pass=0", row["plan_memory_diag"])
+
+    def test_forced_plan_dag_failure_is_not_misreported_as_gpu_tail(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "engine.stderr.log").write_text("\n".join((
+                "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE status=REJECT"
+                " reason=PROFILE_OR_DAG_BALANCE"
+                " layout=G9,P5,G9,P5,G9,P5,G9,P5,G8",
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
+                " applied=0 reason=FORCED_PLAN_REJECTED_SEE_PLAN_FORCE",
+            )), encoding="utf-8")
+            row = parse_metrics(
+                root, 1, 100.0, auto_plan=True, htp_only=True)
+            self.assertEqual(row["plan_reject_reason"],
+                             "PROFILE_OR_DAG_BALANCE")
+            self.assertIsNone(row["plan_force_memory_diag"])
+
     def test_preload_count_uses_selected_not_control_layout(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
