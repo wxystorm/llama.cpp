@@ -1,0 +1,8 @@
+# Keep Linux/Android scripts LF even when checked out from Windows or WSL
+# with core.autocrlf enabled. In particular, Termux Bash cannot parse CRLF
+# shell scripts reliably.
+*.sh      text eol=lf
+*.bash    text eol=lf
+*.py      text eol=lf
+*.cmake   text eol=lf
+CMakeLists.txt text eol=lf
