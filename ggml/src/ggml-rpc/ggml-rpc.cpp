@@ -1290,13 +1290,11 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
     // ref: https://github.com/ggml-org/llama.cpp/pull/15966
     rpc_get |= tensor->op == GGML_OP_FLASH_ATTN_EXT;
     rpc_get |= tensor->op == GGML_OP_MUL_MAT_ID;
-    // Jupiter HTP prototype: Q4_K and Q6_K weights may be padded and
-    // repacked into tiled Hexagon layouts. Never use plain ggml_nbytes()
-    // for remote allocation of these tensors; ask the selected Phone
-    // backend for its actual required size. This also works for OpenCL.
-    rpc_get |= tensor->view_src == nullptr &&
-               (tensor->type == GGML_TYPE_Q4_K ||
-                tensor->type == GGML_TYPE_Q6_K);
+    // All quantized weights may use a backend-specific physical layout
+    // (Hexagon tiles Q4_0/Q4_1/Q4_K/Q6_K/Q8_0/IQ4_NL/MXFP4).
+    // Always ask the remote backend for its exact allocation footprint.
+    // The old "ne0 % 512" heuristic silently underallocated some weights.
+    rpc_get |= tensor->view_src == nullptr && ggml_is_quantized(tensor->type);
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
@@ -2984,15 +2982,20 @@ bool rpc_server::set_tensor_from_local_file(
     // The raw GGUF tensor size is NOT the physical write footprint.
     // Validate against the real backend allocation before repacking, so
     // a bad RPC allocation fails as a protocol error instead of SIGSEGV.
-    const bool tiled_quant = tensor->type == GGML_TYPE_Q4_K ||
-                             tensor->type == GGML_TYPE_Q6_K;
+    const bool tiled_quant = tensor->type == GGML_TYPE_Q4_0 ||
+                             tensor->type == GGML_TYPE_Q4_1 ||
+                             tensor->type == GGML_TYPE_Q4_K ||
+                             tensor->type == GGML_TYPE_Q6_K ||
+                             tensor->type == GGML_TYPE_Q8_0 ||
+                             tensor->type == GGML_TYPE_IQ4_NL ||
+                             tensor->type == GGML_TYPE_MXFP4;
     const bool weight_diag = std::getenv("GGML_RPC_HTP_WEIGHT_DIAG") != nullptr;
     const uintptr_t buffer_base =
         reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(tensor->buffer));
     const uintptr_t tensor_data = reinterpret_cast<uintptr_t>(tensor->data);
     const uint64_t buffer_bytes =
         static_cast<uint64_t>(ggml_backend_buffer_get_size(tensor->buffer));
-    const uint64_t required_bytes = tiled_quant ?
+    const uint64_t required_bytes = ggml_is_quantized(tensor->type) ?
         static_cast<uint64_t>(ggml_backend_buft_get_alloc_size(
             ggml_backend_buffer_get_type(tensor->buffer), tensor)) :
         tensor_nbytes;
