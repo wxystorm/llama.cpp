@@ -1,4 +1,6 @@
 // Standalone, deterministic Planner DAG tests; no model, CUDA or Phone needed.
+// Use orderly nonzero exit on REQUIRE failures: Windows std::abort() may map
+// to 0xc0000409 and hide the failing assertion in CTest's output capture.
 #include "llama-region-ring-planner.h"
 #include "llama-region-ring-real-profile.h"
 #include "llama-region-ring-htp-memory.h"
@@ -15,7 +17,8 @@ using namespace llama_ring_planner;
     if (!(expr)) { \
         std::fprintf(stderr, "REGION_RING_PLANNER_TEST_FAIL line=%d expr=%s\n", \
                      __LINE__, #expr); \
-        std::abort(); \
+        std::fflush(stderr); \
+        std::exit(EXIT_FAILURE); \
     } \
 } while (0)
 
