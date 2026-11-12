@@ -3805,11 +3805,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         stages.begin(), stages.end(), [](const auto & stage) {
             return stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
         });
-    // PC-final stages publish l_out for a canonical CPU-only Qwen3 Head.
+    // PC-final stages publish l_out for a canonical CPU-only dense Llama/Qwen3 Head.
     // The legacy Phone-final graph still owns the caller's logits otherwise.
     const bool pc_final_head_enabled =
         !terminal_phone && !directional_runtime &&
-        model.arch == LLM_ARCH_QWEN3;
+        (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_LLAMA);
     if (!terminal_phone && !pc_final_head_enabled) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PC_FINAL_HEAD] event=REJECT "
@@ -4917,11 +4917,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens > 1 && stages.size() > 2 &&
         ggml_backend_is_meta(backend_ptrs[0]) &&
         ggml_backend_meta_n_backends(backend_ptrs[0]) == 2;
-    // The terminal Phone region may publish l_out autonomously; only Qwen3
-    // currently supports the separate zero-layer PC Output Head graph.
+    // The terminal Phone region may publish l_out autonomously. Both dense
+    // Qwen3 and Llama have a dedicated zero-layer PC Output Head graph.
     const bool phone_auto_final_enabled =
         phone_auto_final_requested && phone_auto_eligible &&
-        model.arch == LLM_ARCH_QWEN3;
+        (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_LLAMA);
     // Graphless only changes the full Prefill path; tiny/decode retain
     // their normal PC graphs. PC must explicitly opt in independently of
     // the Phone server's matching GRAPHLESS switch.
@@ -5775,13 +5775,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC)) :
                 nullptr;
+            const bool owned_qwen3 = model.arch == LLM_ARCH_QWEN3 &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+            const bool owned_llama = model.arch == LLM_ARCH_LLAMA &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NORM &&
+                !model.hparams.use_kq_norm &&
+                (model.hparams.f_attention_scale == 0.0f ||
+                 std::fabs(model.hparams.f_attention_scale -
+                    1.0f / std::sqrt(float(model.hparams.n_embd_head_k(0)))) <
+                    1.0e-6f);
             bool valid = register_plan != nullptr &&
                 phone_stream_run_id != 0 &&
-                model.arch == LLM_ARCH_QWEN3 &&
+                (owned_qwen3 || owned_llama) &&
                 ubatch.pos != nullptr && ubatch.pos[0] == 0 &&
                 cparams.n_ctx >= ubatch.n_tokens &&
-                cparams.flash_attn &&
-                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+                cparams.flash_attn;
             // The actual KV allocator, not RoPE positions, proves the
             // fresh physical slot assignment before any remote execution.
             if (valid && phone_graphless) {
@@ -5826,8 +5834,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 constexpr uint32_t htp_only_wire_version = 4;
                 plan.version = phone_htp_only ? htp_only_wire_version :
                     n_phone_layers == 1 ? 2u : 3u;
+                const uint32_t dense_arch_flags = owned_llama ? 3u : 1u;
                 plan.flags = (phone_htp_only || n_phone_layers > 1) ?
-                    (1u | (uint32_t(n_phone_layers) << 16)) : 1u;
+                    (dense_arch_flags | (uint32_t(n_phone_layers) << 16)) :
+                    dense_arch_flags;
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
@@ -5848,7 +5858,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     valid = model.hparams.n_head(l) == plan.n_heads &&
                         model.hparams.n_head_kv(l) == plan.n_heads_kv &&
                         model.hparams.n_embd_head_k(l) == plan.head_dim &&
-                        model.hparams.n_embd_head_v(l) == plan.head_dim;
+                        model.hparams.n_embd_head_v(l) == plan.head_dim &&
+                        model.hparams.n_rot(l) == plan.head_dim &&
+                        (!owned_llama ||
+                         (model.layers[l].rope_freqs == nullptr &&
+                          model.layers[l].rope_long == nullptr &&
+                          model.layers[l].rope_short == nullptr));
                 }
                 const uint64_t padded_kv =
                     (uint64_t(ubatch.n_tokens) + 255) / 256 * 256;
@@ -8607,7 +8622,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
         // The terminal Phone/CPU/GPU Region published l_out to the host.
-        // Perform the canonical Qwen3 PC-only Head after workers drain.
+        // Perform the canonical dense Llama/Qwen3 PC-only Head after workers drain.
         int64_t phone_final_head_us = 0;
         if ((phone_auto_final_enabled || pc_final_head_enabled) &&
                 ret == GGML_STATUS_SUCCESS &&
