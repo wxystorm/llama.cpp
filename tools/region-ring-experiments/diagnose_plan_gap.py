@@ -70,6 +70,20 @@ def last_log_fields(path, tag):
     return result
 
 
+def read_refills(path):
+    """Read one log pass, retaining the Bank Mover's real per-refill timing."""
+    refills = []
+    if not path.is_file():
+        return refills
+    with path.open(encoding="utf-8", errors="replace") as file:
+        for line in file:
+            if "[REGION_RING_GPU_BANK_MOVER]" not in line or "event=REFILL_DONE" not in line:
+                continue
+            fields = dict(re.findall(r"\b([a-zA-Z_]\w*)=([^\s]+)", line))
+            refills.append(fields)
+    return refills
+
+
 def pair_elapsed(row, start, end):
     first, last = number(row.get(start)), number(row.get(end))
     return last - first if first is not None and last is not None and last >= first else None
@@ -102,6 +116,7 @@ def inspect(out, prompt, attempt, profile_json=None):
     planned = last_log_fields(log, "REGION_RING_PLAN_SELECTED")
     modeled = last_log_fields(log, "REGION_RING_PLAN_P2C_MODEL")
     transfer = last_log_fields(log, "REGION_RING_PLAN_TRANSFER_DIAG")
+    refills = read_refills(log)
 
     predicted = number(planner.get("predicted_ms"))
     if predicted is None:
@@ -144,10 +159,34 @@ def inspect(out, prompt, attempt, profile_json=None):
           f"  streaming={ring.get('gpu_bank_streaming', 'N/A')}")
     if ring.get("gpu_bank_force_small_batch"):
         print("  NOTE: small-batch bank mover override enabled")
+    modeled_h2d = number(planned.get("weight_h2d_total"))
+    observed_h2d = number(ring.get("bank_h2d_ms"))
+    if modeled_h2d and observed_h2d:
+        print(f"  H2D observed/model ratio = {observed_h2d / modeled_h2d:.2f}x")
+    print("  H2D Profile: pre-touched PINNED_DOUBLE buffer, no GGUF faults.")
+    print("  Runtime default: DIRECT_PAGEABLE/mmap unless")
+    print("    GGML_SCHED_WEIGHT_STAGE_PINNED=1 is explicitly set.")
+    if number(ring.get("bank_stage_cpu_copy_ms")) == 0:
+        print("  stage_cpu_copy_ms=0: consistent with DIRECT_PAGEABLE path.")
+    if refills:
+        print("  Region  Bank  upload_mib  H2D_ms  MiB/s  prepare_ms")
+        for row in refills:
+            mib = number(row.get("upload_mib"))
+            ms = number(row.get("h2d_ms"))
+            speed = mib * 1000 / ms if mib is not None and ms and ms > 0 else None
+            print(f"  {row.get('region', '?'):>6}  {row.get('bank', '?'):>4}"
+                  f"  {(f'{mib:.1f}' if mib is not None else 'N/A'):>10}"
+                  f"  {(f'{ms:.1f}' if ms is not None else 'N/A'):>6}"
+                  f"  {(f'{speed:.1f}' if speed is not None else 'N/A'):>7}"
+                  f"  {row.get('prepare_ms', 'N/A')}")
+    else:
+        print("  Per-refill REFILL_DONE logs: unavailable")
 
     print("\n3. Device lanes -- busy and waits are overlapping demands")
     for dev in ("cpu", "gpu", "phone"):
-        print(f"  [{dev.upper()}] tasks={ring.get(dev + '_tasks', 'N/A')}")
+        print(f"  [{dev.upper()}] tasks={ring.get(dev + '_tasks', 'N/A')}"
+              f" resource_deferred_checks="
+              f"{ring.get(dev + '_resource_deferred_checks', 'N/A')}")
         for label, suffix in [
             ("backend wall", "backend_wall_ms"),
             ("compute range", "compute_range_ms"),
@@ -159,6 +198,11 @@ def inspect(out, prompt, attempt, profile_json=None):
             ("READY wait", "ready_wait_ms"),
         ]:
             value_line("    " + label, ring.get(dev + "_" + suffix))
+    print("  READY wait includes scheduler waits; resource-aware Bank"
+          " deferrals happen BEFORE GPU tasks are claimed.")
+    if number(ring.get("phone_tasks")) == 0 and "P" in layout:
+        print("  PHONE tasks=0 may reflect autonomous HTP streaming:"
+              " it does NOT prove Phone/NPU compute time is zero.")
     print("\n4. Transfers and setup (not directly additive)")
     for label, key in [
         ("Embedding", "embedding_ms"),
@@ -249,6 +293,13 @@ def inspect(out, prompt, attempt, profile_json=None):
               " but do not subtract as if their semantics were identical.")
     if missing_comb:
         print("  * NPU Profile lacks exact depth/chunk anchors for chosen layout.")
+    if modeled_h2d and observed_h2d and observed_h2d > modeled_h2d * 2:
+        print("  * Major H2D model/runtime mismatch: PINNED_DOUBLE synthetic"
+              " vs actual pageable GGUF uploads. Check mmap cold pages,"
+              " CUDA synchronization and per-refill MiB/s.")
+    if number(ring.get("gpu_resource_deferred_checks")):
+        print("  * GPU Bank availability is filtered before claim;"
+              " the negligible bank_wait_ms excludes this scheduler delay.")
     if prefill is not None and ring_wall is not None and prefill - ring_wall > 250:
         print("  * Significant time lies outside the measured Ring wall.")
     if not timeline:
