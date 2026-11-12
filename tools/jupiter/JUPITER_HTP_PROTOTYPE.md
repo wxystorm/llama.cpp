@@ -124,6 +124,54 @@ but first confirm 32 CUDA layers plus compute buffers fit actual PC VRAM.
 Jupiter does **not** use the Region Ring double-bank GPU weight streaming
 path. Even successful HTP offload does not make PC32 CUDA memory fit.
 
+## Q4_K packed-weight PHYSICAL_BUFFER_OOB on PC-to-Phone RPC
+
+Observed with Qwen3-14B Q4_K_M and 8 Phone layers:
+
+```
+[JUPITER_HTP_WEIGHT] phase=REJECT reason=PHYSICAL_BUFFER_OOB
+name='blk.34.attn_output.weight' type=q4_K
+required=16384000 remaining=14771200
+```
+
+This is a **real allocation contract mismatch**, not a request to disable
+the safety check. The Phone Hexagon repacker needs 16,384,000 bytes for that
+weight; only 14,771,200 bytes remain at its remote address. The logical GGUF
+size is 14,745,600 bytes. The original Jupiter **Windows client** queries
+the Phone for some quantized tensors only if `ne[0] % 512 != 0`, so this
+Q4_K tensor can silently be allocated using `ggml_nbytes()`. The HTP
+prototype branch extends `ggml_backend_rpc_buffer_type_get_alloc_size()`
+on **PC** to query Q4_K and Q6_K unconditionally for non-views.
+
+**Important: rebuild the Windows PC `llama-cli.exe` from this HTP
+prototype branch, not only the Android Phone binary.** The Phone's new
+bounds check prevents a crash, but does not change the offsets/sizes
+already assigned by an older Windows executable.
+
+From Windows PowerShell in the Jupiter checkout:
+
+```powershell
+git fetch origin
+git switch feat/jupiter-htp-direct-rpc-20261112
+git pull --ff-only
+cmake --build .\build-jupiter --config Release --target llama-cli --parallel 8
+$env:GGML_RPC_HTP_ALLOC_TRACE = "blk.34.attn_output.weight"
+# Start the previous single-prompt Jupiter smoke run with this PC environment.
+```
+
+The RPC client now logs `[JUPITER_RPC_ALLOC] side=CLIENT` with both
+`logical_bytes=14745600` and `remote_alloc_bytes=16384000`
+for that weight when its requested filter matches. If this marker is
+**missing**, check whether the PC process really uses the rebuilt executable
+and loads the matching `ggml-rpc` DLL. On Windows, ensure the Release
+build's `bin/Release` executable and DLLs came from the same HTP branch.
+The Phone backend can independently log `side=PHONE` using the same
+`GGML_RPC_HTP_ALLOC_TRACE` variable after a Phone rebuild, but that is
+not required for the **PC allocation fix**.
+
+After a successful rerun, `Remove-Item Env:GGML_RPC_HTP_ALLOC_TRACE`
+in PowerShell to disable the client diagnostics.
+
 ## FastRPC HTP0 open error 0x80000406
 
 If startup prints `ggml-hex: failed to open session 0 : error 0x80000406`,
