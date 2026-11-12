@@ -23,7 +23,11 @@ static constexpr uint32_t k_max_phone_layers_per_region = 64;
 static constexpr uint32_t k_wire_region_limit = 64;
 static constexpr uint32_t k_internal_region_base = k_wire_region_limit;
 static constexpr uint32_t k_flag_flash_attn = 1;
-static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX
+// Low flag bits identify the Dense Transformer math without changing the
+// existing RPC descriptor size. Legacy Qwen3 plans keep exactly flags=1.
+static constexpr uint32_t k_flag_llama_dense = 1u << 1;
+static constexpr uint32_t k_rope_norm = 0; // GGML_ROPE_TYPE_NORM (Llama/Mistral)
+static constexpr uint32_t k_rope_neox = 2; // GGML_ROPE_TYPE_NEOX (Qwen3)
 static constexpr uint32_t k_f16 = 1;      // GGML_TYPE_F16
 static constexpr uint32_t k_slots = 2;
 static constexpr uint32_t k_max_regions =
@@ -70,9 +74,13 @@ inline uint32_t layer_count(const region_plan & p) {
             p.version == k_htp_only_plan_version ?
         p.flags >> k_layer_count_shift : 1;
 }
-inline uint32_t flags_for_layers(uint32_t n_layers) {
+inline uint32_t flags_for_layers(uint32_t n_layers, bool llama_dense = false) {
     return k_flag_flash_attn |
+        (llama_dense ? k_flag_llama_dense : 0u) |
         (n_layers << k_layer_count_shift);
+}
+inline bool is_llama_dense(const region_plan & p) {
+    return (p.flags & k_flag_llama_dense) != 0;
 }
 inline uint32_t internal_layer_region(
         const region_plan & parent, uint32_t offset) {
@@ -84,7 +92,7 @@ inline region_plan single_layer_plan(
         const region_plan & parent, uint32_t offset) {
     region_plan child = parent;
     child.version = k_plan_version;
-    child.flags = k_flag_flash_attn;
+    child.flags = parent.flags & 0xffffu; // preserve the architecture for Pn children
     child.region = internal_layer_region(parent, offset);
     child.layer = parent.layer + offset;
     return child;
@@ -114,21 +122,24 @@ inline bool equal(const region_plan & a, const region_plan & b) {
 inline bool validate(const region_plan & p, const char * & reason) {
     reason = "NONE";
     const uint32_t layers = layer_count(p);
+    const uint32_t lower_flags = p.flags & 0xffffu;
+    const bool valid_arch_flags = lower_flags == k_flag_flash_attn ||
+        lower_flags == (k_flag_flash_attn | k_flag_llama_dense);
     const bool legacy = p.version == k_plan_version &&
-        p.flags == k_flag_flash_attn;
+        p.flags == lower_flags && valid_arch_flags;
     const bool multi = p.version == k_multi_plan_version &&
-        (p.flags & 0xffffu) == k_flag_flash_attn &&
+        valid_arch_flags &&
         layers >= 2 && layers <= k_max_phone_layers_per_region;
     // Protocol version 4 is an explicit fail-closed capability contract.
     // It preserves the wire ABI and supports both P1 and consecutive Pn.
     const bool htp_only = p.version == k_htp_only_plan_version &&
-        (p.flags & 0xffffu) == k_flag_flash_attn &&
+        valid_arch_flags &&
         layers >= 1 && layers <= k_max_phone_layers_per_region;
     if ((!legacy && !multi && !htp_only) ||
             p.layer >= 256 || layers > 256 - p.layer ||
-            p.rope_type != k_rope_neox ||
+            p.rope_type != (is_llama_dense(p) ? k_rope_norm : k_rope_neox) ||
             p.kv_type != k_f16) {
-        reason = "UNSUPPORTED_QWEN3_PLAN_OR_FORMAT";
+        reason = "UNSUPPORTED_DENSE_PLAN_OR_FORMAT";
         return false;
     }
     if (!p.run_id || !p.p2c_run_id ||
