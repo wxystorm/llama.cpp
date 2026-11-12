@@ -455,6 +455,79 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        // The model loader checked packed GGUF weights + estimated KV prior
+        // to allocating runtime state. Now verify the REAL per-HTP buffers,
+        // including KV and scheduler compute graph workspace. Four sessions
+        // share physical RAM; do not treat 4 x VMEM as guaranteed free RAM.
+        const char * htp_multi_env = std::getenv("LLAMA_JUPITER_HTP_SESSIONS");
+        if (htp_multi_env && std::atoi(htp_multi_env) > 1) {
+            std::unordered_set<ggml_backend_dev_t> used_htp_devices;
+            for (uint32_t il = 0; il < model.hparams.n_layer_all; ++il) {
+                auto * dev = model.dev_layer(il);
+                const char * name = dev ? ggml_backend_dev_name(dev) : nullptr;
+                if (name && std::strncmp(name, "RPC", 3) == 0) {
+                    used_htp_devices.insert(dev);
+                }
+            }
+            if (used_htp_devices.empty()) {
+                throw std::runtime_error("Jupiter HTP runtime has no assigned Phone layers");
+            }
+            auto mib_setting = [](const char * name, uint64_t fallback) {
+                const char * value = std::getenv(name);
+                if (!value || !value[0]) {
+                    return fallback;
+                }
+                char * end = nullptr;
+                const unsigned long long parsed = std::strtoull(value, &end, 10);
+                if (end == value || *end != '\0' || parsed == 0 || parsed > 1048576) {
+                    throw std::runtime_error(std::string("invalid HTP memory setting: ") + name);
+                }
+                return static_cast<uint64_t>(parsed);
+            };
+            const uint64_t global_mib = mib_setting("LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB", 8192);
+            const uint64_t session_mib = mib_setting("LLAMA_JUPITER_HTP_SESSION_VMEM_MIB", 3072);
+            const uint64_t limit_mib = std::min(session_mib,
+                                    global_mib / used_htp_devices.size());
+            if (limit_mib == 0) {
+                throw std::runtime_error("Jupiter HTP runtime memory limit is zero");
+            }
+            const uint64_t limit_bytes = limit_mib * 1024ULL * 1024ULL;
+            const auto breakdown = memory_breakdown();
+            struct usage { uint64_t model = 0, kv = 0, compute = 0; };
+            std::map<ggml_backend_dev_t, usage> sessions;
+            for (ggml_backend_dev_t dev : used_htp_devices) {
+                sessions.emplace(dev, usage{});
+            }
+            for (const auto & [buft, details] : breakdown) {
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                auto it = sessions.find(dev);
+                if (it != sessions.end()) {
+                    it->second.model += details.model;
+                    it->second.kv += details.context;
+                    it->second.compute += details.compute;
+                }
+            }
+            for (const auto & [dev, bytes] : sessions) {
+                const uint64_t total = bytes.model + bytes.kv + bytes.compute;
+                LLAMA_LOG_INFO(
+                    "[JUPITER_HTP_RUNTIME_MEMORY] device=%s "
+                    "model_mib=%.2f actual_kv_mib=%.2f compute_mib=%.2f "
+                    "total_mib=%.2f limit_mib=%llu status=%s\n",
+                    ggml_backend_dev_name(dev),
+                    bytes.model / (1024.0 * 1024.0),
+                    bytes.kv / (1024.0 * 1024.0),
+                    bytes.compute / (1024.0 * 1024.0),
+                    total / (1024.0 * 1024.0),
+                    (unsigned long long) limit_mib,
+                    total <= limit_bytes ? "FIT" : "OVER_BUDGET");
+                if (total > limit_bytes) {
+                    throw std::runtime_error(
+                        "JUPITER_HTP_RUNTIME_OVER_BUDGET: real model+KV+compute "
+                        "buffers exceed per-session limit");
+                }
+            }
+        }
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
