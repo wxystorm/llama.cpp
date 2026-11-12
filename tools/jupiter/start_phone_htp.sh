@@ -40,11 +40,29 @@ if [ "$GGML_HEXAGON_NDEV" != "1" ]; then
     echo "This prototype requires GGML_HEXAGON_NDEV=1" >&2
     exit 2
 fi
+case "$GGML_HEXAGON_MBUF" in
+    ""|*[!0-9]*)
+        echo "GGML_HEXAGON_MBUF must be an integer in [1,1024] MiB" >&2
+        exit 2
+        ;;
+esac
 if [ "$GGML_HEXAGON_MBUF" -gt 1024 ] || [ "$GGML_HEXAGON_MBUF" -lt 1 ]; then
     echo "Set GGML_HEXAGON_MBUF in [1,1024] MiB for this device" >&2
     exit 2
 fi
+case "$GGML_HEXAGON_VMEM" in
+    ""|*[!0-9]*)
+        echo "GGML_HEXAGON_VMEM must be a positive integer in MiB" >&2
+        exit 2
+        ;;
+esac
+if [ "$GGML_HEXAGON_VMEM" -lt 1 ]; then
+    echo "GGML_HEXAGON_VMEM must be a positive integer in MiB" >&2
+    exit 2
+fi
 
+# ADSP_LIBRARY_PATH is used by the FastRPC loader to find the v79 skel.
+export ADSP_LIBRARY_PATH="$root/lib:$root/bin:${ADSP_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="$root/lib:$root/bin:${LD_LIBRARY_PATH:-}"
 echo "[JUPITER_PHONE_HTP] backend=HTP0 rpc=0.0.0.0:$port model=$model"
 echo "[JUPITER_PHONE_HTP] mbuf_mib=$GGML_HEXAGON_MBUF vmem_mib=$GGML_HEXAGON_VMEM"
