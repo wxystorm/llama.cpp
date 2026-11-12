@@ -436,14 +436,6 @@ def main() -> int:
     old_rows = existing_rows(out / "dp-results.csv") if args.only_incomplete else {}
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
-        previous = old_rows.get(prompt.name)
-        if previous and previous.get("status") == "PASS":
-            rows.append(previous)
-            print(f"[JUPITER_SHAREGPT40_DP_SKIP] {index}/{len(prompts)} "
-                  f"prompt={prompt.name} reason=EXISTING_PASS", flush=True)
-            continue
-        print(f"\n[JUPITER_SHAREGPT40_DP_CASE] {index}/{len(prompts)} "
-              f"group={group} prompt={prompt.name}", flush=True)
         case_args = argparse.Namespace(**vars(args))
         if args.auto_context:
             count = counts[prompt.name.lower()]
@@ -454,6 +446,25 @@ def main() -> int:
                   f"gguf_tokens={count} context={case_args.context} "
                   f"batch={case_args.batch} predict=1 padding={args.context_padding}",
                   flush=True)
+        previous = old_rows.get(prompt.name)
+        if previous and previous.get("status") == "PASS":
+            # CSV alone is insufficient: do not skip a PASS measured with
+            # another context/batch/prompt hash or executable.
+            saved_case = Path(previous.get("case_dir") or "")
+            config_path = saved_case / "configuration.json"
+            try:
+                stored_identity = json.loads(config_path.read_text(encoding="utf-8"))
+                compatible = stored_identity == case_key(group, prompt, case_args)
+            except (OSError, ValueError, TypeError):
+                compatible = False
+            if compatible:
+                rows.append(previous)
+                print(f"[JUPITER_SHAREGPT40_DP_SKIP] {index}/{len(prompts)} "
+                      f"prompt={prompt.name} reason=VERIFIED_EXISTING_PASS",
+                      flush=True)
+                continue
+        print(f"\n[JUPITER_SHAREGPT40_DP_CASE] {index}/{len(prompts)} "
+              f"group={group} prompt={prompt.name}", flush=True)
         row = run_case(group, prompt, out, case_args)
         rows.append(row)
         save_results(out, rows, args)
