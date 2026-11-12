@@ -19,6 +19,15 @@ endif()
 
 message(STATUS "hexagon: using ${HEXAGON_SDK_ROOT} and ${HEXAGON_TOOLS_ROOT} for building libggml-htp skels")
 
+# Hexagon SDK 6.6's hexagon_fun.cmake expects PREBUILT_LIB_DIR
+# during the Android host (AP) CMake configure. Without it the SDK's
+# unquoted string(FIND ...) calls fail before the DSP skels are built.
+# Keep explicit -DPREBUILT_LIB_DIR overrides from other toolchains.
+if (CMAKE_SYSTEM_NAME STREQUAL "Android" AND
+    (NOT DEFINED PREBUILT_LIB_DIR OR "${PREBUILT_LIB_DIR}" STREQUAL ""))
+    set(PREBUILT_LIB_DIR "android_aarch64" CACHE STRING
+        "Hexagon SDK host-side prebuilt library platform" FORCE)
+endif()
 include(${HEXAGON_SDK_ROOT}/build/cmake/hexagon_fun.cmake)
 include(ExternalProject)
 
