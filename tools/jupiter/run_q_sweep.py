@@ -494,6 +494,7 @@ def main() -> int:
         return 0
 
     base_env = os.environ.copy()
+    base_env["LLAMA_JUPITER_HTP_CONTEXT_TOKENS"] = str(args.context)
     base_env["LLAMA_JUPITER_PREFILL"] = "1"
     base_env["LLAMA_JUPITER_PC_LAYERS"] = str(args.pc_layers)
     base_env["LLAMA_JUPITER_CPU_LAYERS"] = str(args.cpu_layers)
