@@ -53,6 +53,8 @@ class ShareGPT40DPTests(unittest.TestCase):
         self.assertEqual(args.q_repeats, 1)
         self.assertFalse(args.graph_prebuild)
         self.assertEqual(args.groups, "128,256,512,1024")
+        self.assertEqual(args.pc_layers, 32)
+        self.assertEqual(args.cpu_layers, 0)
         self.assertFalse(args.budgeted_refine)
         self.assertFalse(args.only_incomplete)
 
