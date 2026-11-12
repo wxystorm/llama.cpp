@@ -1127,7 +1127,7 @@ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
     // progress through the repack, before the model graph is constructed.
     const char * diag_filter = std::getenv("GGML_HEXAGON_DIAG_TENSOR");
     const bool diag_target = diag_filter && diag_filter[0] &&
-                             std::strstr(t->name, diag_filter) != nullptr;
+                             strstr(t->name, diag_filter) != nullptr;
     if (diag_target) {
         GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=BEGIN tensor=%s type=%s "
                       "ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
@@ -1334,7 +1334,7 @@ static void repack_q4_K_tiled(ggml_tensor * t, const void * data, size_t size) {
     // progress through the repack, before the model graph is constructed.
     const char * diag_filter = std::getenv("GGML_HEXAGON_DIAG_TENSOR");
     const bool diag_target = diag_filter && diag_filter[0] &&
-                             std::strstr(t->name, diag_filter) != nullptr;
+                             strstr(t->name, diag_filter) != nullptr;
     if (diag_target) {
         GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=BEGIN tensor=%s type=%s "
                       "ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
