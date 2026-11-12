@@ -1,3 +1,7 @@
+// Keep assertions active even for Release CTest builds.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include "../src/jupiter-htp-placement.h"
 
 #include <cassert>
