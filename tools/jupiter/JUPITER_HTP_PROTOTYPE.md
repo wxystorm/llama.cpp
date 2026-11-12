@@ -15,7 +15,8 @@ The original Jupiter scheduling policy is preserved:
 - Qwen3-14B-Q4_K_M, one output token (`-n 1`), reference contexts:
   group 128 => 512, group 256 => 768, group 512 => 1280, group 1024 => 2304
 - The target comparison uses PC boundary 32 / Phone suffix 8 (L32–L39)
-- The Phone RPC server exposes **HTP0**, rather than GPUOpenCL
+- The Phone RPC server exposes **HTP0..HTP3** by default; model partitioning
+  across them is separately enabled with --htp-sessions 4
 
 This is **whole-layer Phone NPU offload**, NOT the Region Ring autonomous
 Phone-owned execution pipeline. It uses Jupiter's existing RPC Graph upload,
@@ -336,9 +337,9 @@ When diagnostics finish, `unset GGML_RPC_HTP_WEIGHT_DIAG` and
 
 ## Known limitations / next engineering work
 
-- No Phone HTP hardware test or full Android rebuild has been performed
-  while preparing this branch. Kernel build integration and correctness
-  remain unverified.
+- A single HTP0 Qwen3-14B smoke run has passed on the user's hardware.
+  Four-session model/graph execution, logits parity, and performance remain
+  unverified until the new Android/PC binaries are rebuilt and tested.
 - RPC currently advertises all remote ops as supported. If HTP rejects
   a Qwen3 op, the RPC Graph may fail rather than gracefully route it
   to Phone GPU. A backend-capability handshake and fail-closed validation
@@ -350,10 +351,10 @@ When diagnostics finish, `unset GGML_RPC_HTP_WEIGHT_DIAG` and
 - This is direct HTP0..HTP3 RPC with distinct backend allocations,
   not the Region Ring private HTP serial executor. Its weight residency,
   graph builder, and numerical behavior must be validated independently.
-- A full 8-layer Phone HTP suffix must be checked against the ~3 GiB
-  VMEM budget, **including** weights, graph buffers and KV, not only
-  per-buffer limits. If it fails, reduce Phone layers or implement a
-  planned CPU/GPU/HTP spill/streaming design as separate work.
+- With 4 FastRPC sessions, each has its own configured VMEM mapping limit
+  but shares the same physical HTP and Phone RAM. The new planner checks
+  physical weights, KV estimates, and actual runtime graph allocations.
+  Android driver mapping failures still require hardware investigation.
 in\\r'` caused by a CRLF/corrupted copied script.
 
 After pulling the branch, refresh the launcher from Git and validate it
