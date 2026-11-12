@@ -5,13 +5,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import struct
 from pathlib import Path
 import tempfile
 import unittest
 
 from run_sharegpt40_dp import (
     benchmark_ready, case_args_for_prompt, case_key, discover, existing_rows,
-    feasible_min_chunk, parser, save_results, stage3_ready,
+    feasible_min_chunk, gguf_layer_count, parser, save_results, stage3_ready,
 )
 
 
@@ -32,6 +33,35 @@ class ShareGPT40DPTests(unittest.TestCase):
                  "prompt_256_01.txt", "prompt_512_10.txt",
                  "prompt_1024_03.txt"],
             )
+
+    def test_gguf_layer_count_supports_40_and_64_layers(self):
+        def kv(key: str, field_type: int, encoded: bytes) -> bytes:
+            name = key.encode("utf-8")
+            return (struct.pack("<Q", len(name)) + name +
+                    struct.pack("<I", field_type) + encoded)
+
+        def gguf_string(value: str) -> bytes:
+            encoded = value.encode("utf-8")
+            return struct.pack("<Q", len(encoded)) + encoded
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for layers in (40, 64):
+                path = root / f"qwen3-{layers}-layer.gguf"
+                # Skip over normal GGUF string and array metadata first.
+                fields = [
+                    kv("general.architecture", 8, gguf_string("qwen3")),
+                    kv("tokenizer.ggml.tokens", 9, struct.pack("<IQ", 8, 2) +
+                       gguf_string("abc") + gguf_string("def")),
+                    kv("qwen3.block_count", 4, struct.pack("<I", layers)),
+                ]
+                path.write_bytes(b"GGUF" + struct.pack("<IQQ", 3, 0, len(fields))
+                                 + b"".join(fields))
+                self.assertEqual(gguf_layer_count(path), layers)
+            invalid = root / "invalid.gguf"
+            invalid.write_bytes(b"invalid")
+            with self.assertRaises(ValueError):
+                gguf_layer_count(invalid)
 
     def test_adaptive_min_chunk_keeps_every_length_feasible(self):
         for total in range(60, 1501):
