@@ -1035,8 +1035,7 @@ def main(argv=None):
         raise ValueError("Unknown --warmup-prompt file")
     if not selections:
         raise ValueError("No prompts selected")
-    config = {"version": 2, "model_layers": args.model_layers,
-              "model": file_id(args.model), "exe": file_id(args.exe),
+    config = {"version": 2, "model": file_id(args.model), "exe": file_id(args.exe),
               "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
               "prompts": decisions, "planner_search": "SKIPPED_FORCED_LAYOUT",
               "streaming": args.streaming, "fixed_layout": args.layout,
@@ -1048,6 +1047,10 @@ def main(argv=None):
               "max_context": args.max_context, "context_padding": args.context_padding,
               "env": sorted(args.env),
               "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds}
+    # Preserve the original 64-layer run-config byte-for-byte for resume;
+    # only a nondefault model depth creates a new configuration key.
+    if args.model_layers != MODEL_LAYERS:
+        config["model_layers"] = args.model_layers
     if args.boost_bank_mover:
         config["bank_mover_priority"] = "ABOVE_NORMAL"
     if args.phone_weight_preload:
