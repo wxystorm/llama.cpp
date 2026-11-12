@@ -117,6 +117,38 @@ parameters are signed into the run configuration. Omitting
 `-ForceLayout` restores the original automatic Planner. Legacy
 `--layout` is incompatible with HTP-only automatic mode; use the
 new fixed-Plan parameters above.
+## Five-Cycle automatic search (64-layer Qwen3-32B)
+
+The native **HTP-only APPLY_WIDE automatic Planner** now searches
+**2, 3, 4, or 5** full Phone-final G/[C]/P Cycles, rather than
+2–4. This is **not** a new calibration step; the existing one-shot
+independent G/C/N Profile V0 remains the sole input. A 64-layer model
+can therefore explore about 12–13 layers per Cycle, which can reduce
+the first GPU Region weight peak without assuming all Regions have
+identical layer counts.
+
+All downstream structures are 5-Cycle safe: first-Cycle E scoring,
+per-Cycle prefix service/error traces, the GPU minimum-completion
+memory guard, middle/final Beam, diversity quotas, local refinement,
+CPU-optional (including C=0) seeds, full-Prompt DAG, and final GPU-tail
+candidate selection. The first GPU Region must still fit strictly
+below **one** Bank's available VRAM (after reserving KV/scratch), and
+later device counts remain within ±2 layers and total Cycle width
+within ±3 layers of the first Cycle. HTP Session and shared Phone
+memory safety checks are unchanged. Final selection still minimizes
+the predicted full-Prompt DAG wall time, not the number of Cycles.
+
+The legacy research-only WIDE_PREVIEW and legacy strict-layout
+parser keep their original 2–4 Cycle bounds. Manual APPLY_WIDE
+`-ForceLayout` already supports up to 8 Cycles and is unaffected.
+The log fields `cycles=2..5` and
+`[REGION_RING_PLAN_CPU_OPTIONAL] ... cycles=2..5` verify the new
+automatic candidate range. A fifth Cycle is only an *option*, not
+forced; extra Phone Region graph overhead and cross-device handoffs
+can make 3–4 Cycles faster. If `NO_EXECUTABLE_HTP_ONLY_GPU_TAIL`
+persists, consult the `HTP_MEMORY_DIAG` counters: adding a search
+geometry cannot bypass the hardware memory budgets.
+
 ## First-Cycle single-Bank hard limit and later-Cycle micro-adjustments
 
 This Planner rule applies to automatic APPLY_WIDE search. It is now

@@ -11031,7 +11031,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 1, wide_e_margin, wide_min_simulations);
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_CPU_OPTIONAL] mode=APPLY_WIDE "
-                "zero_cpu=ELIGIBLE cycles=2..4 enumerated=%zu "
+                "zero_cpu=ELIGIBLE cycles=2..5 enumerated=%zu "
                 "profiled=%zu simulated=%zu dag_cap=96 "
                 "search=AFTER_LEGACY_LOCAL status=COMPARED\n",
                 result.cpu_optional_enumerated,
@@ -11065,7 +11065,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "prefix_rank=CUM_E_PLUS_STAGE_E "
             "later_dev_delta_max=2 later_cycle_width_delta_max=3 "
             "phone_depth=UNRESTRICTED_PREFIX "
-            "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
+            "cycles=2..5 shape=PREFIX_LOAD_COMPENSATION "
             "handoff=TOKEN_INTERVAL_PAIR_COST "
             "first_cycle_X=32..160_INTERPOLATED "
             "later_cycle_X=FIXED_BY_SEED "

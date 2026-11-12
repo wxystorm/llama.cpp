@@ -24,6 +24,12 @@ namespace llama_ring_planner {
 
 using device = llama_region_ring_device;
 
+// Automatic APPLY_WIDE searches 2..5 full G/[C]/P cycles. Legacy
+// preview/fixed-topology modes keep their historical limits.
+// Keep all per-Cycle traces and diversity reservoirs sized from this.
+static constexpr int k_runtime_min_cycles = 2;
+static constexpr int k_runtime_max_cycles = 5;
+
 struct candidate {
     int cycles = 0;
     int c = 0;
@@ -48,8 +54,8 @@ struct candidate {
     bool local_refined = false;
     bool local_from_prefix = false;
     bool local_from_throughput = false;
-    std::array<double, 4> prefix_error {};
-    std::array<std::array<double, 3>, 4> prefix_service {};
+    std::array<double, k_runtime_max_cycles> prefix_error {};
+    std::array<std::array<double, 3>, k_runtime_max_cycles> prefix_service {};
     double balance = 0.0;
     double coarse_ms = 0.0;
     double wall_ms = 0.0;
@@ -458,7 +464,7 @@ inline bool gpu_prefix_memory_feasible(
         return !m.gpu_weight_streaming; // Streaming must never bypass its Bank limit.
     }
     if (!m.gpu_region_weight_bytes || total_cycles < 2 ||
-            total_cycles > 4 || xg <= 0 || prefix.empty() ||
+            total_cycles > k_runtime_max_cycles || xg <= 0 || prefix.empty() ||
             prefix.back().layer_end > m.layers ||
             prefix.back().device != device::PHONE ||
             prefix.size() % 3 != 0) {
@@ -563,7 +569,7 @@ inline bool gpu_minimum_complete_first_cycle_memory(
         return true;
     }
     if (!m.gpu_region_weight_bytes || n_cycles < 2 ||
-            n_cycles > 4 || first_g < 1 || first_c < 1 ||
+            n_cycles > k_runtime_max_cycles || first_g < 1 || first_c < 1 ||
             first_p < 1 || width_spread < 0) {
         return false;
     }
@@ -3002,10 +3008,11 @@ inline void search_runtime_cpu_optional(
     std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
         return out.top[a].wall_ms < out.top[b].wall_ms;
     });
-    std::array<int, 5> anchors_per_cycle {};
+    std::array<int, k_runtime_max_cycles + 1> anchors_per_cycle {};
     for (size_t idx : order) {
         const auto & base = out.top[idx];
-        if (base.cycles < 2 || base.cycles > 4 ||
+        if (base.cycles < k_runtime_min_cycles ||
+                base.cycles > k_runtime_max_cycles ||
                 anchors_per_cycle[(size_t) base.cycles] >= k_anchors_per_cycles) {
             continue;
         }
@@ -3065,7 +3072,7 @@ inline void search_runtime_cpu_optional(
     // Independent CPU-free seeds ensure G/P can win even if all three-lane
     // E-optimal anchors are poor G/P starting points. Limit geometry/chunks;
     // the exact DAG evaluates only a bounded, diverse shortlist below.
-    for (int cycles = 2; cycles <= 4; ++cycles) {
+    for (int cycles = k_runtime_min_cycles; cycles <= k_runtime_max_cycles; ++cycles) {
         const int width = m.layers / cycles;
         if (width < 2) { continue; }
         for (int p = 1; p <= std::min(10, width - 1); ++p) {
@@ -3111,7 +3118,7 @@ inline void search_runtime_cpu_optional(
         taken[i] = 1;
     };
     // Reserve coverage across Cycle counts and full-/partial-CPU removal.
-    for (int cycles = 2; cycles <= 4; ++cycles) {
+    for (int cycles = k_runtime_min_cycles; cycles <= k_runtime_max_cycles; ++cycles) {
         for (int no_cpu = 0; no_cpu < 2; ++no_cpu) {
             for (size_t i = 0; i < proposals.size(); ++i) {
                 if (proposals[i].value.cycles == cycles &&
@@ -3202,7 +3209,7 @@ inline void refine_runtime_local_candidates(
         // and per search origin. Also keep a few different Chunk triples.
         std::vector<candidate> anchors;
         std::unordered_set<std::string> anchor_keys;
-        std::array<std::array<bool, 4>, 5> covered {};
+        std::array<std::array<bool, 4>, k_runtime_max_cycles + 1> covered {};
         const auto family = [](const candidate & c) {
             return c.local_refined ? 3 :
                 c.prefix_cycles > 0 ? 2 :
@@ -3216,7 +3223,8 @@ inline void refine_runtime_local_candidates(
         };
         for (size_t idx : order) {
             const auto & c = out.top[idx];
-            if (c.cycles < 2 || c.cycles > 4 ||
+            if (c.cycles < k_runtime_min_cycles ||
+                    c.cycles > k_runtime_max_cycles ||
                     !std::isfinite(c.wall_ms)) {
                 continue;
             }
@@ -3236,7 +3244,8 @@ inline void refine_runtime_local_candidates(
                 break;
             }
             const auto & c = out.top[idx];
-            if (c.cycles < 2 || c.cycles > 4) {
+            if (c.cycles < k_runtime_min_cycles ||
+                    c.cycles > k_runtime_max_cycles) {
                 continue;
             }
             const std::string chunk_key = std::to_string(c.xc) + "/" +
@@ -3585,7 +3594,7 @@ inline result search_runtime_applicable(
     const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
     std::vector<candidate> coarse;
 
-    for (int cycles = 2; cycles <= 4; ++cycles) {
+    for (int cycles = k_runtime_min_cycles; cycles <= k_runtime_max_cycles; ++cycles) {
         const int width = m.layers / cycles;
         const int remainder = m.layers % cycles;
         if (width < 4) {
@@ -3796,7 +3805,7 @@ inline result search_runtime_applicable(
             throughput_seen.insert(key);
         }
     }
-    for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+    for (int n_cycles = k_runtime_min_cycles; n_cycles <= k_runtime_max_cycles; ++n_cycles) {
         size_t attempted = 0;
         std::unordered_set<std::string> chosen_chunks;
         for (size_t i : throughput_order) {
@@ -3964,8 +3973,8 @@ inline result search_runtime_applicable(
     struct prefix_state {
         std::vector<llama_region_ring_region> regions;
         std::array<double, 3> load {};
-        std::array<double, 4> prefix_error {};
-        std::array<std::array<double, 3>, 4> prefix_service {};
+        std::array<double, k_runtime_max_cycles> prefix_error {};
+        std::array<std::array<double, 3>, k_runtime_max_cycles> prefix_service {};
         double prefix_e_sum = 0.0;
         double width_variance = 0.0;
         double absolute_proxy_ms = std::numeric_limits<double>::infinity();
@@ -4004,7 +4013,7 @@ inline result search_runtime_applicable(
     };
     std::vector<first_cycle_seed> all_first_cycle_seeds;
 
-    for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+    for (int n_cycles = k_runtime_min_cycles; n_cycles <= k_runtime_max_cycles; ++n_cycles) {
         const int avg_low = m.layers / n_cycles;
         const int avg_high =
             (m.layers + n_cycles - 1) / n_cycles;
@@ -4335,7 +4344,7 @@ inline result search_runtime_applicable(
         all_first_cycle_seeds.size(), (uint8_t) 0);
     std::unordered_set<std::string> e_pool_shapes;
     std::unordered_set<std::string> e_pool_chunks;
-    std::array<size_t, 5> e_pool_distinct_shapes {};
+    std::array<size_t, k_runtime_max_cycles + 1> e_pool_distinct_shapes {};
     const auto take_e_pool = [&](size_t index) {
         if (e_pool_indices.size() >= k_first_cycle_e_pool_total ||
                 e_pool_taken[index]) {
@@ -4349,7 +4358,7 @@ inline result search_runtime_applicable(
         }
         e_pool_chunks.insert(chunk_key(v));
     };
-    for (int n = 2; n <= 4; ++n) {
+    for (int n = k_runtime_min_cycles; n <= k_runtime_max_cycles; ++n) {
         for (size_t i = 0; i < all_first_cycle_seeds.size(); ++i) {
             if (all_first_cycle_seeds[i].cycles == n) {
                 take_e_pool(i);
@@ -4357,7 +4366,7 @@ inline result search_runtime_applicable(
             }
         }
     }
-    for (int n = 2; n <= 4; ++n) {
+    for (int n = k_runtime_min_cycles; n <= k_runtime_max_cycles; ++n) {
         for (size_t i = 0; i < all_first_cycle_seeds.size() &&
                 e_pool_distinct_shapes[(size_t) n] <
                     k_seed_geometry_diversity_per_n; ++i) {
@@ -4449,7 +4458,7 @@ inline result search_runtime_applicable(
         std::unordered_set<size_t> chosen_indices;
         std::unordered_set<std::string> chosen_shapes;
         std::unordered_set<std::string> chosen_chunks;
-        std::array<size_t, 5> distinct_shapes_per_cycle {};
+        std::array<size_t, k_runtime_max_cycles + 1> distinct_shapes_per_cycle {};
         const auto choose = [&](size_t i, const char * reason) {
             if (chosen.size() >= k_first_seeds_total ||
                     !chosen_indices.insert(i).second) {
@@ -4466,7 +4475,7 @@ inline result search_runtime_applicable(
 
         // Never lose the best-E and best-absolute seeds for a feasible Cycle
         // count, even when their combined score is mediocre.
-        for (int n = 2; n <= 4; ++n) {
+        for (int n = k_runtime_min_cycles; n <= k_runtime_max_cycles; ++n) {
             for (size_t i : by_e) {
                 if (e_pool[i].cycles == n) {
                     choose(i, "CYCLE_BEST_E");
@@ -4480,7 +4489,7 @@ inline result search_runtime_applicable(
                 }
             }
         }
-        for (int n = 2; n <= 4; ++n) {
+        for (int n = k_runtime_min_cycles; n <= k_runtime_max_cycles; ++n) {
             for (size_t i : by_joint) {
                 if (chosen.size() >= k_first_seeds_total ||
                         distinct_shapes_per_cycle[(size_t) n] >=

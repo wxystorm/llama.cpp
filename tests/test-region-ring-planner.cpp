@@ -362,7 +362,7 @@ int main() {
     }
 
     // Forced APPLY_WIDE A/B may test one logical G/C/P pass without
-    // broadening the automatic Planner's 2..4-Cycle search contract.
+    // broadening the automatic Planner's 2..5-Cycle search contract.
     {
         bool strict_rejected = false;
         try {
@@ -1512,7 +1512,8 @@ int main() {
 
         double brute_min = std::numeric_limits<double>::infinity();
         const int kv = small.kv_start + small.tokens / 2;
-        for (int n_cycles = 2; n_cycles <= 4; ++n_cycles) {
+        for (int n_cycles = k_runtime_min_cycles;
+                n_cycles <= k_runtime_max_cycles; ++n_cycles) {
             const int avg_low = small.layers / n_cycles;
             const int avg_high =
                 (small.layers + n_cycles - 1) / n_cycles;
@@ -2208,6 +2209,51 @@ int main() {
             }));
     }
 
+    // Fifth Cycle must be a REAL executable APPLY_WIDE candidate.
+    // Reject all 2/3/4-Cycle layouts to prove the fifth Cycle survives
+    // uniform search, per-Cycle arrays, CPU-optional expansion, final
+    // full-Prompt DAG ranking and the final Top24 truncation.
+    {
+        model five = mock_profile();
+        five.layers = 64;
+        five.tokens = 64;
+        five.memory_feasible = [](const candidate & c) {
+            return c.cycles == k_runtime_max_cycles;
+        };
+        const auto base = llama_region_ring_parse(
+            "G8,C4,P4,G8,C4,P4,G8,C4,P4,G8,C4,P4", 64);
+        const result found = search_runtime_applicable(
+            five, base, 64, 12, 0.20, 0);
+        REQUIRE(found.valid);
+        REQUIRE(found.selected.cycles == k_runtime_max_cycles);
+        REQUIRE(found.first_cycle_selected > 0);
+        REQUIRE(found.top.size() <= 24);
+        REQUIRE(std::any_of(found.first_cycle_seeds.begin(),
+                found.first_cycle_seeds.end(),
+                [](const first_cycle_seed_record & seed) {
+                    return seed.cycles == k_runtime_max_cycles;
+                }));
+        std::vector<llama_region_ring_region> regions;
+        REQUIRE(make_regions(found.selected, five.layers, regions));
+        REQUIRE(llama_region_ring_apply_topology_compatible(
+            regions, five.layers));
+        REQUIRE(runtime_cycle_micro_adjusted(regions));
+        REQUIRE(std::count_if(regions.begin(), regions.end(),
+            [](const llama_region_ring_region & r) {
+                return r.device == device::GPU;
+            }) == k_runtime_max_cycles);
+        REQUIRE(std::count_if(regions.begin(), regions.end(),
+            [](const llama_region_ring_region & r) {
+                return r.device == device::PHONE;
+            }) == k_runtime_max_cycles);
+        REQUIRE(regions.back().layer_end == five.layers);
+        REQUIRE(found.selected.wall_ms > 0.0);
+        if (found.selected.prefix_cycles > 0) {
+            REQUIRE(found.selected.prefix_cycles == k_runtime_max_cycles);
+            REQUIRE(std::isfinite(found.selected.prefix_error[4]));
+        }
+    }
+
     // Unlike the old repeated-width APPLY_WIDE, 40 layers may form three
     // unequal Cycles. The seed search must not discard 40 % 3 != 0.
     {
@@ -2303,7 +2349,7 @@ int main() {
             REQUIRE(result.selected.prefix_cycles == 0);
         } else {
             REQUIRE(result.selected.prefix_cycles >= 2);
-            REQUIRE(result.selected.prefix_cycles <= 4);
+            REQUIRE(result.selected.prefix_cycles <= k_runtime_max_cycles);
             const int final_prefix =
                 result.selected.prefix_cycles - 1;
             REQUIRE(std::fabs(

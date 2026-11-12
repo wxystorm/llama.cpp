@@ -745,7 +745,7 @@ inline bool llama_region_ring_single_cycle_force_compatible(
 
 // Forced APPLY_WIDE may use up to eight G -> [C] -> [P] cycles,
 // including CPU-free G7,P1 x8 and PC-only G7,C1 x8 on Qwen3-32B.
-// Legacy fixed layouts and automatic Planner search retain 2-4 cycles.
+// Legacy strict fixed layouts retain 2-4 cycles; APPLY_WIDE automatic Planner searches 2-5.
 inline constexpr int LLAMA_REGION_RING_APPLY_MAX_CYCLES = 8;
 
 // The wider APPLY mode accepts G,P cycles and explicitly omitted C0 stages.
@@ -849,7 +849,7 @@ inline bool llama_region_ring_apply_topology_compatible(
     // Phone Region in each completed cycle. A final GPU-only tail is
     // permitted after at least one completed cycle. All intervals must
     // be exact, contiguous and nonempty.
-    // The automatic Planner still searches only 2..4 Phone-final cycles.
+    // The automatic APPLY_WIDE Planner searches 2..5 Phone-final cycles.
     size_t i = 0;
     int layer = 0;
     int cycles = 0;
