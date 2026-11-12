@@ -1248,13 +1248,17 @@ the effective settings in its identity, and the aggregate CSV includes context.
 A mismatch between tokenizer estimates and runtime tokens that exceeds the
 reserved space fails explicitly instead of silently truncating the input.
 
-Run all 40 prompts (the provided directory must contain all four groups):
+Run all 40 prompts (the provided directory must contain all four groups).
+The default Qwen3-14B placement is PC 32 layers / Phone 8 layers;
+use `--pc-layers N` to override. Make sure the 32 PC layers fit local VRAM
+before launching a full sweep:
 
 ```powershell
 python .\tools\jupiter\run_sharegpt40_dp.py `
   --exe ".\build-jupiter\bin\Release\llama-cli.exe" `
   --model "E:\llama\models\Qwen3-14B-Q4_K_M.gguf" `
   --rpc "10.39.52.114:10139" `
+  --pc-layers 32 `
   --prompts-dir "E:\llama\datasets\sharegpt\sharegpt40" `
   --out-dir ".\jupiter-14b-auto-context" `
   --resume --only-incomplete
