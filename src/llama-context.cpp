@@ -488,9 +488,10 @@ llama_context::llama_context(
             };
             const uint64_t global_mib = mib_setting("LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB", 8192);
             const uint64_t session_mib = mib_setting("LLAMA_JUPITER_HTP_SESSION_VMEM_MIB", 3072);
-            const uint64_t limit_mib = std::min(session_mib,
-                                    global_mib / used_htp_devices.size());
-            if (limit_mib == 0) {
+            // Per-session VMEM is independent of the global Phone budget.
+            // Never hard-split global RAM evenly among the sessions.
+            const uint64_t limit_mib = session_mib;
+            if (global_mib == 0 || limit_mib == 0) {
                 throw std::runtime_error("Jupiter HTP runtime memory limit is zero");
             }
             const uint64_t limit_bytes = limit_mib * 1024ULL * 1024ULL;
@@ -509,8 +510,10 @@ llama_context::llama_context(
                     it->second.compute += details.compute;
                 }
             }
+            uint64_t aggregate_actual_bytes = 0;
             for (const auto & [dev, bytes] : sessions) {
                 const uint64_t total = bytes.model + bytes.kv + bytes.compute;
+                aggregate_actual_bytes += total;
                 LLAMA_LOG_INFO(
                     "[JUPITER_HTP_RUNTIME_MEMORY] device=%s "
                     "model_mib=%.2f actual_kv_mib=%.2f compute_mib=%.2f "
@@ -525,8 +528,20 @@ llama_context::llama_context(
                 if (total > limit_bytes) {
                     throw std::runtime_error(
                         "JUPITER_HTP_RUNTIME_OVER_BUDGET: real model+KV+compute "
-                        "buffers exceed per-session limit");
+                        "buffers exceed per-session VMEM limit");
                 }
+            }
+            const uint64_t global_limit_bytes = global_mib*1024ULL*1024ULL;
+            LLAMA_LOG_INFO(
+                "[JUPITER_HTP_RUNTIME_GLOBAL] actual_model_kv_compute_mib=%.2f "
+                "global_budget_mib=%llu status=%s\n",
+                aggregate_actual_bytes/(1024.0*1024.0),
+                (unsigned long long) global_mib,
+                aggregate_actual_bytes <= global_limit_bytes ? "FIT" : "OVER_BUDGET");
+            if (aggregate_actual_bytes > global_limit_bytes) {
+                throw std::runtime_error(
+                    "JUPITER_HTP_RUNTIME_GLOBAL_OVER_BUDGET: sum of real "
+                    "model+KV+compute buffers exceeds global Phone budget");
             }
         }
 
