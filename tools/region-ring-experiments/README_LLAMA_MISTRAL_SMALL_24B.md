@@ -170,3 +170,58 @@ workers drain. The analysis prints per-Region prepare/compute/bank-wait
 totals; those totals overlap and **must not be summed** into a predicted
 critical path. Comparing the two runs is diagnostic, not official
 benchmarking or a numerical correctness proof.
+
+
+## 7. Pinpoint a 10x GPU H2D prediction error
+
+The independent `gpu_weight_h2d` calibration times a pre-touched,
+pinned, double-slot synthetic buffer. The current GPU Bank Mover instead
+defaults to direct transfers from pageable / mmap-backed GGUF weight
+pointers. Its `bank_h2d_ms` includes CPU-side host return/synchronization
+for that path, and cold OS file pages can affect first-use latency.
+`bank_stage_cpu_copy_ms=0` is consistent with direct mode; it does not
+prove that the driver performed no implicit staging.
+
+Because `LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED` defaults to
+`SKIP_UNREADY` in GPU streaming, the scheduler avoids claiming GPU tasks
+whose Bank is unavailable. The resulting delay falls mainly in GPU
+`ready_wait_ms` / `gpu_resource_deferred_checks`, NOT the later
+`bank_gpu_wait_ms`. Do not classify `bank_gpu_wait_ms=0` as fully
+hidden H2D.
+
+The updated `diagnose_plan_gap.py` displays every
+`[REGION_RING_GPU_BANK_MOVER] event=REFILL_DONE`, including weight MiB,
+H2D milliseconds, effective MiB/s and scheduler deferrals. Analyze
+existing logs **before** any new run:
+
+```powershell
+python .\tools\region-ring-experiments\diagnose_plan_gap.py `
+  --out ".\mistral24b-q6k-htp-v0" --prompt prompt_128_01.txt
+```
+
+To isolate copy-path effects, keep the same *forced* 40-layer layout,
+Chunk widths and standalone V0 Profile, and write a DIFFERENT output
+directory. Add the following option to the diagnostic command above
+(the full forced test command in Section 6):
+
+```powershell
+  -Out ".\mistral24b-q6k-pinned-diagnostic" `
+  -EnvOverride "GGML_SCHED_WEIGHT_STAGE_PINNED=1" `
+  -TraceTasks
+```
+
+This requests two pinned 64 MiB staging slots, consuming about 128 MiB
+extra host memory. It may be slower with cold mmap because explicit
+host memcpy can trigger file page faults, so compare per-refill
+times/throughput rather than one total TPS result. Repeat the
+DIRECT vs PINNED A/B after warming OS file cache, ideally alternating
+order, and do not blend the data into the original benchmark output.
+A `-NoMmap` check may eliminate mmap page faults but can require
+roughly the full GGUF model size of available PC RAM and should not
+be the first test on a memory-constrained laptop.
+
+A hardware-informed Planner correction should use a measurement of
+the **actual chosen runtime copy mode** under comparable paging/thermal
+conditions. Do not multiply every H2D curve by 10.5 from one cold
+prefill: the transfer work overlaps GPU computation, so that ratio
+is NOT a wall-time correction factor.
