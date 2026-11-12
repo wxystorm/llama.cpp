@@ -1123,14 +1123,41 @@ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
 
     const int64_t sb_per_row = ne0 / QK_K;
 
+    // Opt-in diagnostic for the 14B HTP weight-load SIGSEGV. This tracks
+    // progress through the repack, before the model graph is constructed.
+    const char * diag_filter = std::getenv("GGML_HEXAGON_DIAG_TENSOR");
+    const bool diag_target = diag_filter && diag_filter[0] &&
+                             std::strstr(t->name, diag_filter) != nullptr;
+    if (diag_target) {
+        GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=BEGIN tensor=%s type=%s "
+                      "ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                      " raw_bytes=%zu matrix_bytes=%zu data=%p target=%p\n",
+                      t->name, ggml_type_name(t->type), ne0, ne1, ne2, ne3,
+                      size, matrix_size, data, t->data);
+    }
+
     for (int i3 = 0; i3 < ne3; i3++) {
         for (int i2 = 0; i2 < ne2; i2++) {
             const block_q6_K * src_slice = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
             uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
 
-            memset(matrix_dst, 0, matrix_size);  // padding rows and the OR-ed nibbles below need zeroed tiles
+            if (diag_target) {
+                GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ZERO_BEGIN tensor=%s "
+                              "slice=%d,%d dst=%p bytes=%zu\n",
+                              t->name, i3, i2, matrix_dst, matrix_size);
+            }
+            memset(matrix_dst, 0, matrix_size);
+            if (diag_target) {
+                GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ZERO_DONE tensor=%s "
+                              "slice=%d,%d\n", t->name, i3, i2);
+            }  // padding rows and the OR-ed nibbles below need zeroed tiles
 
             for (int64_t r = 0; r < ne1; r++) {
+                if (diag_target && (r % 128 == 0)) {
+                    GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ROW tensor=%s "
+                                  "slice=%d,%d row=%" PRId64 "/%" PRId64 "\n",
+                                  t->name, i3, i2, r, ne1);
+                }
                 const int ct  = (int) (r / 32);
                 const int row = (int) (r % 32);
                 const block_q6_K * src_row = src_slice + r * sb_per_row;
@@ -1158,6 +1185,11 @@ static void repack_q6_K_tiled(ggml_tensor * t, const void * data, size_t size) {
                 }
             }
         }
+    }
+
+    if (diag_target) {
+        GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=DONE tensor=%s type=%s\n",
+                      t->name, ggml_type_name(t->type));
     }
 
     GGML_UNUSED(size);
@@ -1298,14 +1330,41 @@ static void repack_q4_K_tiled(ggml_tensor * t, const void * data, size_t size) {
 
     const int64_t sb_per_row = ne0 / QK_K;
 
+    // Opt-in diagnostic for the 14B HTP weight-load SIGSEGV. This tracks
+    // progress through the repack, before the model graph is constructed.
+    const char * diag_filter = std::getenv("GGML_HEXAGON_DIAG_TENSOR");
+    const bool diag_target = diag_filter && diag_filter[0] &&
+                             std::strstr(t->name, diag_filter) != nullptr;
+    if (diag_target) {
+        GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=BEGIN tensor=%s type=%s "
+                      "ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                      " raw_bytes=%zu matrix_bytes=%zu data=%p target=%p\n",
+                      t->name, ggml_type_name(t->type), ne0, ne1, ne2, ne3,
+                      size, matrix_size, data, t->data);
+    }
+
     for (int i3 = 0; i3 < ne3; i3++) {
         for (int i2 = 0; i2 < ne2; i2++) {
             const block_q4_K * src_slice = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
             uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
 
+            if (diag_target) {
+                GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ZERO_BEGIN tensor=%s "
+                              "slice=%d,%d dst=%p bytes=%zu\n",
+                              t->name, i3, i2, matrix_dst, matrix_size);
+            }
             memset(matrix_dst, 0, matrix_size);
+            if (diag_target) {
+                GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ZERO_DONE tensor=%s "
+                              "slice=%d,%d\n", t->name, i3, i2);
+            }
 
             for (int64_t r = 0; r < ne1; r++) {
+                if (diag_target && (r % 128 == 0)) {
+                    GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=ROW tensor=%s "
+                                  "slice=%d,%d row=%" PRId64 "/%" PRId64 "\n",
+                                  t->name, i3, i2, r, ne1);
+                }
                 const int ct  = (int) (r / 32);
                 const int row = (int) (r % 32);
                 const block_q4_K * src_row = src_slice + r * sb_per_row;
@@ -1339,6 +1398,11 @@ static void repack_q4_K_tiled(ggml_tensor * t, const void * data, size_t size) {
                 }
             }
         }
+    }
+
+    if (diag_target) {
+        GGML_LOG_INFO("[JUPITER_HEX_REPACK] phase=DONE tensor=%s type=%s\n",
+                      t->name, ggml_type_name(t->type));
     }
 
     GGML_UNUSED(size);
