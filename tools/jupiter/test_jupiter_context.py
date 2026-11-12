@@ -8,10 +8,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from jupiter_context import context_for_tokens, model_token_counts, tokenizer_path
+from jupiter_context import (context_for_group, context_for_tokens,
+                             model_token_counts, tokenizer_path)
 
 
 class JupiterContextTests(unittest.TestCase):
+    def test_reference_group_context_matches_40_prompt_log(self):
+        for group, expected in ((128, 512), (256, 768),
+                                (512, 1280), (1024, 2304)):
+            self.assertEqual(context_for_group(group), expected)
+        with self.assertRaisesRegex(ValueError, "no reference context"):
+            context_for_group(2048)
+
     def test_matches_region_ring_context_policy(self):
         self.assertEqual(context_for_tokens(167), 1024)
         self.assertEqual(context_for_tokens(587), 1024)
