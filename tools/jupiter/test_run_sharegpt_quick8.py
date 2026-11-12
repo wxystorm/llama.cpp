@@ -53,11 +53,20 @@ class JupiterQuickCPUStageTests(unittest.TestCase):
                              str(plan.pc_layers))
             self.assertIn("--budgeted-refine", command)
             self.assertIn("--graph-prebuild", command)
+            self.assertEqual(command[command.index("--context-policy") + 1],
+                             "group")
             args.limit = 1
             args.fail_fast = True
             smoke = build_command(args, Path(temp), Path(temp))
             self.assertEqual(smoke[smoke.index("--limit") + 1], "1")
             self.assertIn("--fail-fast", smoke)
+    def test_quick8_uses_reference_context_policy_by_default(self):
+        args = make_parser().parse_args([])
+        self.assertEqual(args.context_policy, "group")
+        self.assertIsNone(args.context)
+        self.assertEqual(make_parser().parse_args(
+            ["--context-policy", "auto"]).context_policy, "auto")
+
     def test_resume_pins_original_layers_despite_memory_budget_changes(self):
         selected = [{"prompt": "prompt_128_01.txt", "sha256": "abc"}]
         previous_args = make_parser().parse_args([])
