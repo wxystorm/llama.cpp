@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from run_sharegpt40_dp import (
-    benchmark_ready, case_args_for_prompt, discover, existing_rows,
+    benchmark_ready, case_args_for_prompt, case_key, discover, existing_rows,
     feasible_min_chunk, parser, save_results, stage3_ready,
 )
 
@@ -63,6 +63,36 @@ class ShareGPT40DPTests(unittest.TestCase):
                          "auto")
         self.assertFalse(args.budgeted_refine)
         self.assertFalse(args.only_incomplete)
+
+    def test_four_session_options_and_resume_identity(self):
+        defaults = parser().parse_args([])
+        self.assertEqual(defaults.htp_sessions, 1)
+        self.assertEqual(defaults.htp_global_budget_mib, 8192)
+        self.assertEqual(defaults.htp_session_vmem_mib, 3072)
+        self.assertEqual(defaults.htp_reserve_mib, 512)
+        sessions = parser().parse_args([
+            "--htp-sessions", "4", "--htp-global-budget-mib", "8192",
+            "--htp-session-vmem-mib", "3072", "--htp-reserve-mib", "512"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt_128_01.txt"
+            exe = root / "llama-cli.exe"
+            model = root / "model.gguf"
+            for item in (prompt, exe, model):
+                item.write_bytes(b"test")
+            defaults.exe = sessions.exe = str(exe)
+            defaults.model = sessions.model = str(model)
+            defaults.context = sessions.context = 512
+            legacy = case_key(128, prompt, defaults)
+            multi = case_key(128, prompt, sessions)
+            self.assertNotIn("htp_sessions", legacy)
+            self.assertEqual(multi["htp_sessions"], 4)
+            self.assertEqual(multi["htp_session_vmem_mib"], 3072)
+            self.assertNotEqual(legacy, multi)
+            sessions.htp_global_budget_mib = 9000
+            self.assertNotEqual(multi, case_key(128, prompt, sessions))
+        with self.assertRaises(SystemExit):
+            parser().parse_args(["--htp-sessions", "5"])
 
     def test_reference_group_context_and_batch_match_uploaded_log(self):
         args = parser().parse_args([])
