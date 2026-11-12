@@ -14,6 +14,21 @@ CONTEXT_PADDING = 64
 CONTEXT_ALIGN = 256
 N_PREDICT = 1
 
+# Exact context values observed in the reference 40-prompt sweep.
+# These are group labels, not a formula using actual prompt token counts.
+SHAREGPT40_GROUP_CONTEXT = {128: 512, 256: 768, 512: 1280, 1024: 2304}
+
+
+def context_for_group(group: int) -> int:
+    """Use the same fixed context for every prompt in a ShareGPT40 group."""
+    try:
+        return SHAREGPT40_GROUP_CONTEXT[group]
+    except KeyError as exc:
+        raise ValueError(
+            f"no reference context for group {group}; use --context N "
+            "or --context-policy auto for other groups"
+        ) from exc
+
 
 def context_for_tokens(token_count: int, predict: int = N_PREDICT,
                        minimum: int = MIN_CONTEXT,
