@@ -122,3 +122,51 @@ python -m unittest discover -s tools/region-ring-experiments -p "test_run_32b_pr
 
 This document records implementation and test commands, not a claim that
 the user's PC/Phone have already passed execution.
+
+
+## 6. Diagnose first-Prefill prediction gap (NOT a benchmark)
+
+The DAG `predicted_ms` is a modeled makespan, not a measured kernel
+duration. Before interpreting a large gap, compare actual Ring wall vs
+prefill wall, GPU Bank H2D and exposed GPU waits, Phone push/return and
+the **PC final output head**. The GPU-tail DAG currently does not score
+the extra PC final head; do not assume that omission explains the entire
+gap. A Profile with only a few HTP points can extrapolate P1/P3, even
+when a real larger-depth NPU sample exists.
+
+Analyze the original first attempt without any re-run or mutation:
+
+```powershell
+python .\tools\region-ring-experiments\diagnose_plan_gap.py `
+  --out ".\mistral24b-q6k-htp-v0" --prompt prompt_128_01.txt
+```
+
+If no Chunk trace was captured in the original run, collect one
+**separate diagnostic** with the *same* forced layout and old V0 source
+from that run (do not replace original `-Out`):
+
+```powershell
+.\tools\region-ring-experiments\run_32b_profile5_plan.ps1 `
+  -ModelLayers 40 `
+  -Model "E:\llama\models\mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q6_K.gguf" `
+  -Rpc "10.39.52.114:50052" `
+  -PromptDir "E:\llama\datasets\sharegpt\sharegpt40" `
+  -Out ".\mistral24b-q6k-trace-only" `
+  -RealStageProfileCsv ".\mistral24b-q6k-htp-v0\independent-profile\profile.csv" `
+  -ForceLayout "G5,N4,G6,N2,G5,N3,G6,N2,G5,N1,G1" `
+  -ForceXC 32 -ForceXG 32 -ForceXP 32 `
+  -TraceTasks -ProfileGrid quick `
+  -Batch 2048 -UBatch 2048 -NPredict 1 -Threads 8 `
+  -Limit 1 -StopOnFail
+
+python .\tools\region-ring-experiments\diagnose_plan_gap.py `
+  --out ".\mistral24b-q6k-trace-only" `
+  --profile-json ".\mistral24b-q6k-htp-v0\independent-profile\profile.json"
+```
+
+The new flag `-TraceTasks` enables an opt-in PC-clock
+`region_ring_chunk_trace` timeline, which is serialized only after the
+workers drain. The analysis prints per-Region prepare/compute/bank-wait
+totals; those totals overlap and **must not be summed** into a predicted
+critical path. Comparing the two runs is diagnostic, not official
+benchmarking or a numerical correctness proof.
