@@ -1291,6 +1291,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ggml_backend_dev_t jupiter_phone_dev = nullptr;
     std::vector<ggml_backend_dev_t> jupiter_phone_session_devs;
     std::vector<size_t> jupiter_phone_session_ends;
+    std::vector<uint64_t> jupiter_phone_session_kv_estimates;
+    std::vector<uint64_t> jupiter_phone_session_total_budgets;
+    std::vector<uint64_t> jupiter_phone_session_reserves;
     size_t jupiter_active_sessions = 1;
 
     if (jupiter_prefill) {
@@ -1463,6 +1466,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     weight_bytes += weights[i];
                     kv_bytes += kv[i];
                 }
+                jupiter_phone_session_kv_estimates.push_back(kv_bytes);
+                jupiter_phone_session_total_budgets.push_back(session_total_mib*mib);
+                jupiter_phone_session_reserves.push_back(reserve_mib*mib);
                 LLAMA_LOG_INFO(
                     "[JUPITER_HTP_SESSION] rank=%zu device=%s layer=%zu..%zu "
                     "weight_mib=%.2f kv_mib=%.2f reserve_mib=%llu "
@@ -1876,6 +1882,43 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
+    }
+
+    // Verify actual RPC weight buffer allocations after the GGML allocator
+    // has split contexts into its <= 1 GiB buffers. Reject if padded weights
+    // + estimated KV + the reserved graph/workspace exceed the Session cap.
+    if (jupiter_prefill && !jupiter_phone_session_ends.empty()) {
+        for (size_t k = 0; k < jupiter_active_sessions; ++k) {
+            uint64_t allocated = 0;
+            for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+                GGML_UNUSED(ctx);
+                for (const auto & buf : bufs) {
+                    const auto * buft = ggml_backend_buffer_get_type(buf.get());
+                    if (ggml_backend_buft_get_device(buft) == jupiter_phone_session_devs[k]) {
+                        allocated += ggml_backend_buffer_get_size(buf.get());
+                    }
+                }
+            }
+            const uint64_t total = allocated + jupiter_phone_session_kv_estimates[k] +
+                                   jupiter_phone_session_reserves[k];
+            LLAMA_LOG_INFO(
+                "[JUPITER_HTP_MEMORY] rank=%zu device=%s actual_weight_mib=%.2f "
+                "estimated_kv_mib=%.2f reserve_mib=%.2f total_mib=%.2f "
+                "budget_mib=%.2f status=%s\n",
+                k, ggml_backend_dev_name(jupiter_phone_session_devs[k]),
+                allocated/(1024.0*1024.0),
+                jupiter_phone_session_kv_estimates[k]/(1024.0*1024.0),
+                jupiter_phone_session_reserves[k]/(1024.0*1024.0),
+                total/(1024.0*1024.0),
+                jupiter_phone_session_total_budgets[k]/(1024.0*1024.0),
+                total <= jupiter_phone_session_total_budgets[k] ? "FIT" : "OVER_BUDGET");
+            if (total > jupiter_phone_session_total_budgets[k]) {
+                throw std::runtime_error(format(
+                    "JUPITER_HTP_MEMORY_OVER_BUDGET: RPC session %zu actual weights + "
+                    "estimated KV + reserve exceed configured budget; increase "
+                    "LLAMA_JUPITER_PC_LAYERS or revise Phone memory caps", k));
+            }
+        }
     }
 
     if (llama_supports_gpu_offload()) {
