@@ -52,6 +52,55 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertFalse(args.warmup)
             self.assertEqual(args.out, out)
 
+    def test_mistral_small_40_layer_auto_plan_and_forced_layout(self):
+        from run_32b_all40 import (default_layout_for_layers,
+                                   normalize_layout)
+        self.assertEqual(normalize_layout(default_layout_for_layers(40), 40),
+                         "G4,C5,P1,G4,C5,P1,G4,C5,P1,G4,C5,P1")
+        self.assertEqual(normalize_layout(
+            "G4,C5,P1,G4,C5,P1,G4,C5,P1,G4,C5,P1", 40),
+            default_layout_for_layers(40))
+        with self.assertRaisesRegex(ValueError, "exactly 40 layers"):
+            normalize_layout(default_layout_for_layers(64), 40)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q6_K.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--model-layers", "40",
+                "--prompt-dir", str(prompts), "--repo-root", str(root),
+                "--auto-plan", "--htp-only", "--profile-every", "0",
+            ]
+            auto = get_args(base)
+            self.assertEqual(auto.model_layers, 40)
+            self.assertEqual(auto.layout, default_layout_for_layers(40))
+            self.assertTrue(auto.phone_weight_preload)
+            self.assertFalse(auto.warmup)
+            command, env = build_process(
+                auto, prompts / "prompt_128_01.txt", 512, 167,
+                root / "metrics.jsonl")
+            self.assertIn("--no-warmup", command)
+            self.assertEqual(env["LLAMA_HYBRID_REGION_RING_PLANNER"],
+                             "apply-wide")
+            forced = get_args(base + [
+                "--force-plan-layout", "G4,C5,N1,G4,C5,N1,G4,C5,N1,G4,C5,N1",
+                "--force-plan-xc", "64",
+                "--force-plan-xg", "64",
+                "--force-plan-xp", "64",
+            ])
+            self.assertEqual(forced.force_plan_layout,
+                             default_layout_for_layers(40))
+            with self.assertRaises(SystemExit):
+                get_args(base + [
+                    "--force-plan-layout", default_layout_for_layers(64)])
+
     def test_fixed_htp_forced_plan_keeps_v0_and_memory_guards(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
