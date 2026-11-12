@@ -137,9 +137,10 @@ physical allocation size before writing, and optionally emits phase markers.
 These checks diagnose or reject unsafe layouts; they do **not** establish the
 original SIGSEGV's root cause without reproducing on hardware.
 
-Rebuild/redeploy the **Phone binary and libggml-hexagon.so** from the updated
-experimental branch (PC binary need not be rebuilt for these diagnostics as
-the RPC wire format is unchanged). On Termux:
+Rebuild/redeploy the **entire Android `bin/` and `lib/` outputs** from the updated
+experimental branch (not only the RPC executable: the changed code may be in
+`libggml-rpc.so` and `libggml-hexagon.so`). The PC binary need not be rebuilt
+for these diagnostics, because the RPC wire format is unchanged. On Termux:
 
 ```bash
 cd "$HOME/jupiter-htp"
