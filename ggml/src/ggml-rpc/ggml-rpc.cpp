@@ -2601,8 +2601,8 @@ bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_co
     response.result = 1;
     const char * copy_trace = std::getenv("LLAMA_JUPITER_HTP_COPY_TRACE");
     if (copy_trace && std::atoi(copy_trace) != 0) {
-        const auto * src_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
-        const auto * dst_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
+        ggml_backend_dev_t src_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src->buffer));
+        ggml_backend_dev_t dst_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(dst->buffer));
         GGML_LOG_INFO("[JUPITER_HTP_SESSION_COPY] status=PASS path=PHONE_HOST_STAGING "
                       "src=%s dst=%s type=%s bytes=%" PRIu64 " wall_ms=%.3f\n",
                       src_dev ? ggml_backend_dev_name(src_dev) : "unknown",
