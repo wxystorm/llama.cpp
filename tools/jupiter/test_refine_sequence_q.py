@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from jupiter_planner import (
@@ -39,6 +41,37 @@ class JupiterInterpolationTests(unittest.TestCase):
         self.assertAlmostEqual(profile.q(64, 64), 200.0)
         self.assertEqual(profile.sample_status(64, 64), "INTERP_Y")
         self.assertFalse(profile.is_measured(64, 64))
+
+    def test_multi_htp_q_aggregates_phone_compute_and_internal_copies(self) -> None:
+        measured = [
+            row(128, 0, 100, "CUDA0"),
+            row(128, 0, 25, "RPC0"),
+            row(128, 0, 35, "RPC1"),
+            row(128, 0, 55, "RPC2"),
+            row(128, 0, 65, "RPC3"),
+        ]
+        # Keep the first C2P transfer excluded from compute-only q,
+        # but include Phone-local HTP0->1->2->3 transfers: 5+7+11 ms.
+        for sample, copied in zip(measured[1:], (10, 5, 7, 11)):
+            sample["input_ms"] = str(copied)
+        with patch.dict(os.environ, {
+            "LLAMA_JUPITER_HTP_SESSIONS": "4",
+            "LLAMA_JUPITER_HTP_ACTIVE_SESSIONS": "4",
+        }):
+            profile = QProfile(measured, metric="compute_ms")
+            self.assertTrue(profile.is_measured(128, 0))
+            self.assertAlmostEqual(profile.q(128, 0), 25 + 35 + 55 + 65 + 5 + 7 + 11)
+
+            missing = QProfile(measured[:-1], metric="compute_ms")
+            self.assertFalse(missing.is_measured(128, 0))
+
+        # In legacy one-session mode the original maximum-stage q remains.
+        with patch.dict(os.environ, {
+            "LLAMA_JUPITER_HTP_SESSIONS": "1",
+            "LLAMA_JUPITER_HTP_ACTIVE_SESSIONS": "1",
+        }):
+            legacy = QProfile(measured, metric="compute_ms")
+            self.assertEqual(legacy.q(128, 0), 100)
 
     def test_missing_128_token_profile_cannot_reuse_48_token_cost(self) -> None:
         profile = QProfile([
