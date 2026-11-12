@@ -16,7 +16,8 @@ import shutil
 import subprocess
 import sys
 
-from jupiter_context import context_for_tokens, model_token_counts, tokenizer_path
+from jupiter_context import (context_for_group, context_for_tokens,
+                             model_token_counts, tokenizer_path)
 from jupiter_memory_partition import (
     DeviceMemory, GIB, MIB, pc_cpu_memory, pc_gpu_memory, phone_rpc_memory,
     plan_memory_split, read_gguf_weights,
@@ -112,7 +113,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--ubatch", type=int, default=128)
     p.add_argument("--batch", type=int, default=2048)
     p.add_argument("--context", type=int, default=None,
-                   help="fixed context override; default auto per prompt")
+                   help="fixed context override; default uses reference group contexts")
+    p.add_argument("--context-policy", choices=("group", "auto"), default="group",
+                   help="group (default): 512/768/1280/2304 by ShareGPT group; "
+                        "auto: per-prompt GGUF tokenization")
     p.add_argument("--min-context", type=int, default=1024)
     p.add_argument("--context-padding", type=int, default=64)
     p.add_argument("--tokenizer-exe", default=None)
@@ -158,6 +162,7 @@ def make_identity(args: argparse.Namespace, picked: list[dict]) -> dict:
             "min_chunk": args.min_chunk, "max_chunk": args.max_chunk,
             "ubatch": args.ubatch, "batch": args.batch,
             "context": args.context, "threads": args.threads,
+            "context_policy": getattr(args, "context_policy", "group"),
             "min_context": getattr(args, "min_context", 1024),
             "context_padding": getattr(args, "context_padding", 64),
             "window": args.window, "q_repeats": args.q_repeats,
@@ -444,6 +449,7 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
         "--threads", str(args.threads),
         "--min-context", str(getattr(args, "min_context", 1024)),
         "--context-padding", str(getattr(args, "context_padding", 64)),
+        "--context-policy", str(getattr(args, "context_policy", "group")),
         "--window", str(args.window),
         "--q-repeats", str(args.q_repeats),
         "--refine-repeats", str(args.refine_repeats),
@@ -469,7 +475,7 @@ def build_command(args: argparse.Namespace, prompt_dir: Path, out: Path) -> list
 def main() -> int:
     args = make_parser().parse_args()
     if not (0 < args.min_chunk <= args.max_chunk <= args.ubatch <= args.batch
-            and (args.context is None or args.batch <= args.context)
+            and (args.context is None or args.ubatch <= args.context)
             and args.min_context >= args.ubatch and args.context_padding >= 0):
         raise ValueError("require 0 < min-chunk <= max-chunk <= ubatch <= batch <= context")
     if (min(args.threads, args.window, args.q_repeats, args.refine_repeats,
@@ -506,16 +512,22 @@ def main() -> int:
     if not Path(args.model).is_file():
         raise ValueError(f"--model not found: {args.model}")
     if args.context is None:
-        counts = model_token_counts(
-            args.model, tokenizer_path(args.exe, args.tokenizer_exe),
-            [Path(entry["source"]) for entry in picked],
-            out / "prompt-tokens.json", persist=not args.memory_check_only)
-        max_context = max(context_for_tokens(
-            counts[entry["prompt"].lower()], minimum=args.min_context,
-            padding=args.context_padding) for entry in picked)
-        args.memory_context = max_context
-        print(f"[JUPITER_MEMORY_CONTEXT] auto_max={max_context} "
-              f"selected={len(picked)}", flush=True)
+        if args.context_policy == "group":
+            # Budget for the largest group context; the downstream DP runner
+            # still applies each group's exact reference context individually.
+            args.memory_context = max(context_for_group(
+                int(entry["group"])) for entry in picked)
+        else:
+            counts = model_token_counts(
+                args.model, tokenizer_path(args.exe, args.tokenizer_exe),
+                [Path(entry["source"]) for entry in picked],
+                out / "prompt-tokens.json", persist=not args.memory_check_only)
+            args.memory_context = max(context_for_tokens(
+                counts[entry["prompt"].lower()], minimum=args.min_context,
+                padding=args.context_padding) for entry in picked)
+        print(f"[JUPITER_MEMORY_CONTEXT] policy={args.context_policy.upper()} "
+              f"max={args.memory_context} selected={len(picked)}",
+              flush=True)
     else:
         args.memory_context = args.context
     if not args.memory_check_only and not Path(args.exe).is_file():
