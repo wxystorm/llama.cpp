@@ -61,9 +61,17 @@ if [ "$GGML_HEXAGON_VMEM" -lt 1 ]; then
     exit 2
 fi
 
-# ADSP_LIBRARY_PATH is used by the FastRPC loader to find the v79 skel.
-export ADSP_LIBRARY_PATH="$root/lib:$root/bin:${ADSP_LIBRARY_PATH:-}"
+# FastRPC searches this directory for libggml-htp-v79.so (DSP skel).
+# Keep this a single absolute directory path. In particular, DO NOT
+# concatenate LD_LIBRARY_PATH's colon-separated entries here: some
+# Qualcomm FastRPC loaders interpret ADSP_LIBRARY_PATH differently and
+# fail htp_iface_open() with 0x80000406.
+export ADSP_LIBRARY_PATH="$root/lib"
 export LD_LIBRARY_PATH="$root/lib:$root/bin:${LD_LIBRARY_PATH:-}"
+if [ ! -f "$root/lib/libggml-htp-v79.so" ]; then
+    echo "[JUPITER_PHONE_HTP] warning: v79 DSP skel missing: $root/lib/libggml-htp-v79.so" >&2
+fi
+echo "[JUPITER_PHONE_HTP] adsp_library_path=$ADSP_LIBRARY_PATH"
 echo "[JUPITER_PHONE_HTP] backend=HTP0 rpc=0.0.0.0:$port model=$model"
 echo "[JUPITER_PHONE_HTP] mbuf_mib=$GGML_HEXAGON_MBUF vmem_mib=$GGML_HEXAGON_VMEM"
 echo "[JUPITER_PHONE_HTP] status=EXPERIMENTAL_NOT_PARITY_VERIFIED"
