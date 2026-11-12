@@ -1390,7 +1390,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             const uint64_t mib = 1024ULL*1024ULL;
             const uint64_t capacity_bytes = (session_total_mib - reserve_mib)*mib;
-            const auto * phone_buft = ggml_backend_dev_buffer_type(jupiter_phone_session_devs.front());
+            ggml_backend_buffer_type_t phone_buft = ggml_backend_dev_buffer_type(jupiter_phone_session_devs.front());
             const uint64_t alignment = ggml_backend_buft_get_alignment(phone_buft);
             if (alignment == 0) {
                 throw std::runtime_error("HTP backend reported zero buffer alignment");
@@ -1913,7 +1913,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
                 GGML_UNUSED(ctx);
                 for (const auto & buf : bufs) {
-                    const auto * buft = ggml_backend_buffer_get_type(buf.get());
+                    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
                     if (ggml_backend_buft_get_device(buft) == jupiter_phone_session_devs[k]) {
                         allocated += ggml_backend_buffer_get_size(buf.get());
                     }
