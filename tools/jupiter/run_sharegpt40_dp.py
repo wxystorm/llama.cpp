@@ -68,6 +68,23 @@ def feasible_min_chunk(total: int, preferred: int, maximum: int) -> int:
     raise ValueError(f"no legal partition for N={total} max_chunk={maximum}")
 
 
+def case_args_for_prompt(args: argparse.Namespace, group: int, prompt: Path,
+                         counts: dict[str, int]) -> argparse.Namespace:
+    """Select the actual context and valid effective batch for a single case."""
+    case_args = argparse.Namespace(**vars(args))
+    if getattr(args, "group_context", False):
+        case_args.context = context_for_group(group)
+    elif getattr(args, "auto_context", False):
+        token_count = counts[prompt.name.lower()]
+        case_args.context = context_for_tokens(
+            token_count, minimum=args.min_context, padding=args.context_padding)
+    if case_args.context is None or case_args.context < args.ubatch:
+        raise ValueError(f"invalid context for {prompt.name}: {case_args.context}")
+    # Jupiter requires ubatch <= batch <= context; keep 2048 for long prompts.
+    case_args.batch = min(args.batch, case_args.context)
+    return case_args
+
+
 def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
     identity = {
         "group": group, "prompt": str(prompt),
@@ -452,16 +469,7 @@ def main() -> int:
     old_rows = existing_rows(out / "dp-results.csv") if args.only_incomplete else {}
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
-        case_args = argparse.Namespace(**vars(args))
-        if args.group_context:
-            case_args.context = context_for_group(group)
-        elif args.auto_context:
-            count = counts[prompt.name.lower()]
-            case_args.context = context_for_tokens(
-                count, minimum=args.min_context, padding=args.context_padding)
-        # Jupiter requires ubatch <= batch <= context. Retain the requested
-        # global batch limit for longer prompts while fitting short groups.
-        case_args.batch = min(args.batch, case_args.context)
+        case_args = case_args_for_prompt(args, group, prompt, counts)
         detail = (f" gguf_tokens={counts[prompt.name.lower()]}"
                   if args.auto_context else "")
         print(f"[JUPITER_CONTEXT] prompt={prompt.name} group={group} "
