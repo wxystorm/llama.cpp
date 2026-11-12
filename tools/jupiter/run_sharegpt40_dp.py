@@ -24,6 +24,7 @@ import re
 import statistics
 import sys
 
+from jupiter_context import context_for_tokens, model_token_counts, tokenizer_path
 from min_chunk_profile import partition_feasible
 from run_prefill_bench import read_plan
 from run_prompt_suite import (
@@ -36,7 +37,7 @@ from run_prompt_suite import (
 
 
 FIELDS = [
-    "group", "prompt", "actual_tokens", "min_chunk", "max_chunk",
+    "group", "prompt", "actual_tokens", "context", "min_chunk", "max_chunk",
     "dp_chunks", "chunk_count", "prefill_ms", "prefill_tok_s",
     "bench_repeats", "graph_prebuild", "refinement_policy", "status", "case_dir",
     "final_plan", "error",
@@ -228,12 +229,20 @@ def run_case(group: int, prompt: Path, root: Path, args: argparse.Namespace) -> 
         "case_dir": str(case), "final_plan": str(case / "final.plan"),
     }
     try:
+        row["context"] = args.context
         tokens, source = probe_tokens(
             args, prompt, args.pc_layers, case / "token-probe.log", args.resume
         )
         row["actual_tokens"] = tokens
         if tokens > args.batch or tokens > args.context:
             raise ValueError(f"N={tokens} exceeds batch/context ({args.batch}/{args.context})")
+        if getattr(args, "auto_context", False):
+            required = tokens + 1 + args.context_padding
+            if required > args.context:
+                raise ValueError(
+                    f"runtime probe N={tokens} needs context >= {required} "
+                    f"but GGUF tokenizer selected {args.context}; "
+                    "check tokenizer/CLI formatting and rerun with --context")
         minimum = feasible_min_chunk(tokens, args.min_chunk, args.max_chunk)
         row["min_chunk"] = minimum
         row["max_chunk"] = args.max_chunk
@@ -339,7 +348,12 @@ def parser() -> argparse.ArgumentParser:
                    help="preferred lower bound b; reduce only if no legal partition")
     p.add_argument("--max-chunk", type=int, default=128)
     p.add_argument("--batch", type=int, default=2048)
-    p.add_argument("--context", type=int, default=2048)
+    p.add_argument("--context", type=int, default=None,
+                   help="fixed context override; default: per-prompt GGUF-tokenized automatic context")
+    p.add_argument("--min-context", type=int, default=1024)
+    p.add_argument("--context-padding", type=int, default=64)
+    p.add_argument("--tokenizer-exe", default=None,
+                   help="llama-tokenize path; default: next to --exe")
     p.add_argument("--ubatch", type=int, default=128)
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--window", type=int, default=2)
@@ -371,7 +385,9 @@ def main() -> int:
             or args.cpu_layers >= args.pc_layers or args.min_chunk <= 0 or args.max_chunk <= 0
             or args.min_chunk > args.max_chunk
             or args.max_chunk > args.ubatch or args.ubatch > args.batch
-            or args.batch > args.context or args.q_repeats < 1
+            or (args.context is not None and args.context < args.ubatch)
+            or args.min_context < args.ubatch or args.context_padding < 0
+            or args.q_repeats < 1
             or args.refine_repeats < 1 or args.bench_repeats < 1
             or args.max_rounds < 1 or args.window < 1):
         raise ValueError("invalid devices/chunk/batch/repeats configuration")
@@ -397,7 +413,9 @@ def main() -> int:
           f"modes=dp q_repeats={args.q_repeats} "
           f"refine_repeats={args.refine_repeats} "
           f"bench_repeats={args.bench_repeats} "
-          f"graph_prebuild={int(args.graph_prebuild)}", flush=True)
+          f"graph_prebuild={int(args.graph_prebuild)} "
+          f"context_policy={'AUTO' if args.context is None else 'FIXED'} "
+          f"n_predict=1", flush=True)
 
     if args.dry_run:
         for group, prompt in prompts:
@@ -408,6 +426,13 @@ def main() -> int:
             raise ValueError(f"{key} not found: {getattr(args, key)}")
     out = Path(args.out_dir).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    # Count with the same GGUF tokenizer used by Region Ring. The actual
+    # Jupiter prefill probe below remains the authoritative DP token count.
+    args.auto_context = args.context is None
+    counts = (model_token_counts(
+        args.model, tokenizer_path(args.exe, args.tokenizer_exe),
+        [prompt for _, prompt in prompts], out / "prompt-tokens.json")
+        if args.auto_context else {})
     old_rows = existing_rows(out / "dp-results.csv") if args.only_incomplete else {}
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
@@ -419,7 +444,17 @@ def main() -> int:
             continue
         print(f"\n[JUPITER_SHAREGPT40_DP_CASE] {index}/{len(prompts)} "
               f"group={group} prompt={prompt.name}", flush=True)
-        row = run_case(group, prompt, out, args)
+        case_args = argparse.Namespace(**vars(args))
+        if args.auto_context:
+            count = counts[prompt.name.lower()]
+            case_args.context = context_for_tokens(
+                count, minimum=args.min_context, padding=args.context_padding)
+            case_args.batch = min(args.batch, case_args.context)
+            print(f"[JUPITER_CONTEXT] prompt={prompt.name} "
+                  f"gguf_tokens={count} context={case_args.context} "
+                  f"batch={case_args.batch} predict=1 padding={args.context_padding}",
+                  flush=True)
+        row = run_case(group, prompt, out, case_args)
         rows.append(row)
         save_results(out, rows, args)
         if row["status"] != "PASS" and args.fail_fast:
