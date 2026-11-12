@@ -5474,17 +5474,24 @@ ggml_hexagon_registry::ggml_hexagon_registry(ggml_backend_reg_t reg) {
 
     GGML_LOG_INFO("ggml-hex: Hexagon Arch version v%d\n", opt_arch);
 
-    // Create devices / sessions
+    // Create devices / sessions. A failed session must not leave a NULL
+    // device in the public registry: ggml_backend_dev_count() enumerates
+    // [0, count), and a NULL entry causes GGML_ASSERT(device) on startup.
+    // Preserve the HTPn names of successfully opened sessions.
+    size_t opened = 0;
     for (size_t i = 0; i < opt_ndev; i++) {
         devices[i].iface = ggml_backend_hexagon_device_i;
         devices[i].reg   = reg;
+        devices[i].context = nullptr;
         try {
             devices[i].context = new ggml_hexagon_session(i, &devices[i]);
+            opened++;
         } catch (const std::exception & exc) {
-            GGML_LOG_ERROR("ggml-hex: failed to create device/session %zu\n", i);
+            GGML_LOG_ERROR("ggml-hex: failed to create device/session %zu: %s\n", i, exc.what());
             devices[i].context = nullptr;
         }
     }
+    GGML_LOG_INFO("ggml-hex: HTP sessions opened=%zu requested=%zu\n", opened, opt_ndev);
 }
 
 ggml_hexagon_registry::~ggml_hexagon_registry() {
@@ -5503,18 +5510,35 @@ static const char * ggml_backend_hexagon_reg_get_name(ggml_backend_reg_t reg) {
 }
 
 static size_t ggml_backend_hexagon_reg_get_device_count(ggml_backend_reg_t reg) {
-    return opt_ndev;
-    GGML_UNUSED(reg);
+    auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
+    if (!hreg) {
+        return 0;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < opt_ndev; ++i) {
+        if (hreg->devices[i].context != nullptr) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     auto hreg = static_cast<ggml_hexagon_registry *>(reg->context);
-
-    if (index >= opt_ndev || !hreg->devices[index].context) {
+    if (!hreg) {
         return nullptr;
     }
-
-    return &hreg->devices[index];
+    // Expose a dense registry over only the successfully opened sessions,
+    // without renumbering their HTP0..HTP3 physical FastRPC identities.
+    for (size_t i = 0; i < opt_ndev; ++i) {
+        if (hreg->devices[i].context != nullptr) {
+            if (index == 0) {
+                return &hreg->devices[i];
+            }
+            --index;
+        }
+    }
+    return nullptr;
 }
 
 static void ggml_backend_hexagon_clear_fixed_graph_cache(
