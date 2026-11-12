@@ -465,6 +465,12 @@ def main() -> int:
     # Child stages (token probe, q-profile, DP verification and Prefill)
     # inherit a single explicit placement policy from this runner.
     os.environ["LLAMA_JUPITER_HTP_SESSIONS"] = str(args.htp_sessions)
+    # The ShareGPT40 Jupiter HTP prototype targets Qwen3-14B (40 layers).
+    # A session with no assigned layers is not a measured Phone stage.
+    active_sessions = min(args.htp_sessions, 40 - args.pc_layers)
+    if active_sessions < 1:
+        raise ValueError("--pc-layers must leave at least one Phone layer")
+    os.environ["LLAMA_JUPITER_HTP_ACTIVE_SESSIONS"] = str(active_sessions)
     os.environ["LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB"] = str(args.htp_global_budget_mib)
     os.environ["LLAMA_JUPITER_HTP_SESSION_VMEM_MIB"] = str(args.htp_session_vmem_mib)
     os.environ["LLAMA_JUPITER_HTP_RESERVE_MIB"] = str(args.htp_reserve_mib)
