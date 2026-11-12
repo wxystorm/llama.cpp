@@ -19,6 +19,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import statistics
@@ -100,6 +101,16 @@ def case_key(group: int, prompt: Path, args: argparse.Namespace) -> dict:
         "refine_repeats": args.refine_repeats,
         "graph_prebuild": args.graph_prebuild,
     }
+    # HTP session topology and budgets change model placement; a PASS
+    # from an earlier 1-session benchmark must never be reused for 4.
+    if args.htp_sessions > 1:
+        identity.update({
+            "htp_sessions": args.htp_sessions,
+            "htp_global_budget_mib": args.htp_global_budget_mib,
+            "htp_session_vmem_mib": args.htp_session_vmem_mib,
+            "htp_reserve_mib": args.htp_reserve_mib,
+            "htp_kv_element_bytes": args.htp_kv_element_bytes,
+        })
     # Preserve legacy two-device case hashes for CPU=0 resumes.
     if args.cpu_layers:
         identity["cpu_layers"] = args.cpu_layers
@@ -368,6 +379,17 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--pc-layers", type=int, default=32,
                    help="PC layers for Qwen3-14B (default: 32, Phone: 8)")
     p.add_argument("--cpu-layers", type=int, default=0)
+    p.add_argument("--htp-sessions", type=int, choices=(1, 2, 3, 4), default=1,
+                   help="HTP FastRPC sessions for contiguous Phone layer placement; "
+                        "default 1 preserves the original Jupiter baseline")
+    p.add_argument("--htp-global-budget-mib", type=int, default=8192,
+                   help="global Phone budget across active HTP sessions (MiB)")
+    p.add_argument("--htp-session-vmem-mib", type=int, default=3072,
+                   help="per-session VMEM allocation budget (MiB)")
+    p.add_argument("--htp-reserve-mib", type=int, default=512,
+                   help="reserve per session for KV/graphs/activation overhead (MiB)")
+    p.add_argument("--htp-kv-element-bytes", type=int, choices=(1, 2, 4), default=2,
+                   help="bytes per K or V element for conservative KV planning")
     p.add_argument("--min-chunk", type=int, default=96,
                    help="preferred lower bound b; reduce only if no legal partition")
     p.add_argument("--max-chunk", type=int, default=128)
@@ -417,7 +439,11 @@ def main() -> int:
             or args.min_context < args.ubatch or args.context_padding < 0
             or args.q_repeats < 1
             or args.refine_repeats < 1 or args.bench_repeats < 1
-            or args.max_rounds < 1 or args.window < 1):
+            or args.max_rounds < 1 or args.window < 1
+            or args.htp_global_budget_mib < 1
+            or args.htp_session_vmem_mib < 1
+            or args.htp_reserve_mib < 1
+            or args.htp_session_vmem_mib <= args.htp_reserve_mib):
         raise ValueError("invalid devices/chunk/batch/repeats configuration")
     try:
         groups = [int(x.strip()) for x in args.groups.split(",")]
@@ -436,6 +462,13 @@ def main() -> int:
     if not prompts:
         raise ValueError("no matching prompt_NN_XX.txt files found")
 
+    # Child stages (token probe, q-profile, DP verification and Prefill)
+    # inherit a single explicit placement policy from this runner.
+    os.environ["LLAMA_JUPITER_HTP_SESSIONS"] = str(args.htp_sessions)
+    os.environ["LLAMA_JUPITER_HTP_GLOBAL_BUDGET_MIB"] = str(args.htp_global_budget_mib)
+    os.environ["LLAMA_JUPITER_HTP_SESSION_VMEM_MIB"] = str(args.htp_session_vmem_mib)
+    os.environ["LLAMA_JUPITER_HTP_RESERVE_MIB"] = str(args.htp_reserve_mib)
+    os.environ["LLAMA_JUPITER_HTP_KV_ELEMENT_BYTES"] = str(args.htp_kv_element_bytes)
     for group in groups:
         count = sum(1 for g, _ in prompts if g == group)
         print(f"[JUPITER_SHAREGPT40_DP_GROUP] group={group} prompts={count}",
@@ -446,7 +479,9 @@ def main() -> int:
           f"bench_repeats={args.bench_repeats} "
           f"graph_prebuild={int(args.graph_prebuild)} "
           f"context_policy={('FIXED' if args.context is not None else args.context_policy.upper())} "
-          f"n_predict=1 pc_layers={args.pc_layers} cpu_layers={args.cpu_layers}",
+          f"n_predict=1 pc_layers={args.pc_layers} cpu_layers={args.cpu_layers} "
+          f"htp_sessions={args.htp_sessions} htp_global_budget_mib={args.htp_global_budget_mib} "
+          f"htp_session_vmem_mib={args.htp_session_vmem_mib}",
           flush=True)
 
     if args.dry_run:
@@ -470,6 +505,7 @@ def main() -> int:
     rows: list[dict] = []
     for index, (group, prompt) in enumerate(prompts, 1):
         case_args = case_args_for_prompt(args, group, prompt, counts)
+        os.environ["LLAMA_JUPITER_HTP_CONTEXT_TOKENS"] = str(case_args.context)
         detail = (f" gguf_tokens={counts[prompt.name.lower()]}"
                   if args.auto_context else "")
         print(f"[JUPITER_CONTEXT] prompt={prompt.name} group={group} "
