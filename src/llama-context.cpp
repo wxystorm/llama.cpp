@@ -15,8 +15,10 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
