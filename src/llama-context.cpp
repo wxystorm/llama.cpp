@@ -3919,12 +3919,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const int gpu_bank_chunk_tokens =
         !gpu_region_order.empty() ?
             stages[gpu_region_order.front()].macro_tokens : 0;
+    // Require two actual GPU Chunks, even when the second is partial.
+    // Keep the one-Chunk demand path and the explicit override for A/B.
     const int gpu_bank_min_tokens =
-        gpu_bank_chunk_tokens > 0 ?
-            2 * gpu_bank_chunk_tokens :
+        gpu_bank_chunk_tokens > 0 &&
+        gpu_bank_chunk_tokens < std::numeric_limits<int>::max() ?
+            gpu_bank_chunk_tokens + 1 :
             std::numeric_limits<int>::max();
-    // Opt-in: remove the two-full-GPU-Chunk minimum for short prefill.
-    // Single-token decode stays on the original demand-loading path.
+    // The explicit override may also test a one-Chunk prefill, but
+    // single-token decode always stays on demand loading.
     const char * gpu_bank_force_env =
         std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
     const bool gpu_bank_force_small_batch =
