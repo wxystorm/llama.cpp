@@ -30,14 +30,72 @@ Graph Recompute and KV scheduling. No HTP/GPU intraphone fallback is added.
    for Q4_K and Q6_K tensor buffers rather than blindly using the original
    `ggml_nbytes()`. The Phone backend may require padded/repacked weight
    storage.
-3. Added `start_phone_htp.sh` to force exactly one visible RPC backend,
-   `HTP0`, on port 10140, with a single HTP session and conservative
-   `GGML_HEXAGON_MBUF=1024`, `GGML_HEXAGON_VMEM=3072` MiB.
+3. Added `start_phone_htp.sh` to expose four FastRPC sessions by default,
+   `HTP0,HTP1,HTP2,HTP3`, on a single RPC port (10140).
+   Set `GGML_HEXAGON_NDEV=1` to return to the proven single-session path.
+   `GGML_HEXAGON_MBUF=1024` MiB is a per-buffer limit and
+   `GGML_HEXAGON_VMEM=3072` MiB is configured per session.
 
 **Important:** The generic GGML allocator uses each backend's reported
 max-buffer-size to split large weight contexts into multiple buffers.
 This addresses the single-buffer *size* limit but does not prove that
 the total weight+KV+graph working set fits the HTP address-space budget.
+
+## Enabling four FastRPC sessions (HTP0..HTP3)
+
+The Phone Hexagon backend already implements `GGML_HEXAGON_NDEV` and per-device
+FastRPC session reservation. The RPC server accepts the comma-separated
+`--device` list. Jupiter's Phone launcher now defaults to
+`GGML_HEXAGON_NDEV=4` and passes
+`--device HTP0,HTP1,HTP2,HTP3`; set `GGML_HEXAGON_NDEV=1` to run only
+HTP0, or `2`/`3` for smaller increments.
+
+Before retesting on the Phone, rebuild and redeploy `libggml-hexagon.so`
+and associated Android backend libraries from the same branch. The Hexagon
+registry now enumerates *only successfully opened sessions*, preventing a
+null-device assertion when HTP1/2/3 creation fails. The explicit server
+`--device` list still fails closed if any requested session is missing; it
+will not silently drop to one HTP or CPU.
+
+```bash
+cd "$HOME/jupiter-htp"
+export LLAMA_JUPITER_PHONE_BIN_ROOT="$PWD"
+export GGML_HEXAGON_NDEV=4
+bash tools/jupiter/start_phone_htp.sh \
+    "$HOME/models/Qwen3-14B-Q4_K_M.gguf" 10140 \
+    2>&1 | tee jupiter-phone-htp4.log
+```
+
+Expected startup evidence (not an assertion of hardware success):
+
+```
+ggml-hex: Hexagon backend (experimental) : allocating new registry : ndev 4
+ggml-hex: HTP0 new session ...
+ggml-hex: HTP1 new session ...
+ggml-hex: HTP2 new session ...
+ggml-hex: HTP3 new session ...
+ggml-hex: HTP sessions opened=4 requested=4
+Devices:
+  HTP0: Hexagon ...
+  HTP1: Hexagon ...
+  HTP2: Hexagon ...
+  HTP3: Hexagon ...
+```
+
+**Important distinction:** four sessions are four FastRPC handles/address
+spaces onto the same SoC HTP, not four separate NPUs or 4 times the throughput.
+A 3 GiB VMEM setting per session does not automatically mean 12 GiB of
+physically usable memory. Actual combined mappings are limited by phone RAM,
+driver quotas, live allocations and session overhead.
+
+**The Jupiter PC model placement still selects the first RPC device
+(`RPC0`) for all Phone suffix layers.** All four sessions are available
+over RPC, but *opening them alone does not distribute model weights,
+KV, or Graph execution across HTP1..3*. That requires a separate
+session-aware layer partition and memory budget change. Keep the currently
+passing 40-layer model layout and `--pc-layers/--cpu-layers` unchanged until
+four-session initialization is validated. After that, add cross-session
+weight placement and compare its correctness/performance.
 
 ## Hexagon SDK 6.6 CMake configure fix
 
