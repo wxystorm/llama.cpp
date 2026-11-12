@@ -10625,6 +10625,17 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     ++(*htp_memory_diag)[0]; // invalid geometry
                     return false;
                 }
+                // A region may be smaller than the total available VRAM but
+                // larger than the single alternating weight Bank. Reject
+                // every full candidate (including forced and GPU-tail)
+                // unless BOTH Bank peaks strictly fit their individual
+                // equal-size capacity after GPU KV and scratch reservation.
+                if (model.gpu_weight_streaming &&
+                        !llama_ring_planner::gpu_streamed_banks_fit(
+                            model, regions, candidate.xg)) {
+                    ++(*htp_memory_diag)[4]; // single-bank VRAM overflow
+                    return false;
+                }
 
                 std::array<long double, 3> usage {};
                 for (const auto & region : regions) {
@@ -11033,8 +11044,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "nonuniform_profiled=%zu nonuniform_simulated=%zu "
             "first_cycle_profiled=%zu first_cycle_e_pool=%zu first_cycle_selected=%zu "
             "gpu_first_pairs_pruned=%zu gpu_first_shapes_pruned=%zu "
+            "gpu_first_one_bank_pruned=%zu "
             "prefix_expanded=%zu prefix_completed=%zu "
-            "prefix_gpu_pruned=%zu prefix_full_memory_pruned=%zu "
+            "prefix_gpu_pruned=%zu prefix_micro_pruned=%zu "
+            "prefix_full_memory_pruned=%zu "
             "throughput_shortlisted=%zu throughput_simulated=%zu "
             "local_anchors=%zu local_generated=%zu local_memory_reject=%zu "
             "local_profile_reject=%zu local_profiled=%zu "
@@ -11049,7 +11062,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "first_seeds_total_cap=256 prefix_beam_middle=24 "
             "prefix_beam_final=32 final_parents_top=24 "
             "seed_rank=0.35E_0.65ABS "
-            "prefix_rank=CUM_E_PLUS_STAGE_E width_spread_pct=25 "
+            "prefix_rank=CUM_E_PLUS_STAGE_E "
+            "later_dev_delta_max=2 later_cycle_width_delta_max=3 "
             "phone_depth=UNRESTRICTED_PREFIX "
             "cycles=2..4 shape=PREFIX_LOAD_COMPENSATION "
             "handoff=TOKEN_INTERVAL_PAIR_COST "
@@ -11066,8 +11080,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             result.first_cycle_e_pool, result.first_cycle_selected,
             result.first_cycle_gpu_pairs_pruned,
             result.first_cycle_gpu_shapes_pruned,
+            result.first_cycle_single_bank_pruned,
             result.prefix_expanded, result.prefix_completed,
             result.prefix_gpu_memory_pruned,
+            result.prefix_micro_pruned,
             result.prefix_full_memory_pruned,
             result.throughput_shortlisted, result.throughput_simulated,
             result.local_anchors, result.local_generated,
@@ -11118,6 +11134,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                            "W_cpu_mspt,W_gpu_mspt,W_phone_mspt,"
                            "T_p2g_mspt,T_g2c_mspt,T_c2p_mspt,"
                            "gpu_bank0_min_mib,gpu_bank1_min_mib,"
+                           "gpu_single_bank_capacity_mib,"
                            "gpu_kv_min_mib,gpu_peak_min_mib,"
                            "gpu_full_possible_min_mib,gpu_budget_mib,"
                            "prefix_gpu_pruned,prefix_full_memory_pruned,"
@@ -11146,6 +11163,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << seed.first_handoff_mspt[2] << ","
                             << (seed.gpu_bank0_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_bank1_min_bytes / 1048576.0L) << ","
+                            << (seed.gpu_single_bank_capacity_bytes /
+                                1048576.0L) << ","
                             << (seed.gpu_kv_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_peak_min_bytes / 1048576.0L) << ","
                             << (seed.gpu_full_possible_min_bytes /
@@ -11470,6 +11489,38 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
+        if (model.gpu_weight_streaming) {
+            long double capacity = 0.0L;
+            std::array<size_t, 2> peaks {};
+            const bool bank_ok = llama_ring_planner::
+                gpu_streamed_banks_fit(
+                    model, best_regions, best.xg, &capacity, &peaks);
+            size_t first_weight_bytes = 0;
+            const bool first_weight_known =
+                !best_regions.empty() &&
+                best_regions.front().device ==
+                    llama_region_ring_device::GPU &&
+                model.gpu_region_weight_bytes &&
+                model.gpu_region_weight_bytes(
+                    best_regions.front().layer_begin,
+                    best_regions.front().layer_end,
+                    first_weight_bytes);
+            const long double first_weight_mib =
+                (long double) first_weight_bytes / 1048576.0L;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_GPU_BANK_GUARD] status=%s"
+                " first_gpu_region_mib=%.1Lf"
+                " bank_A_peak_mib=%.1f bank_B_peak_mib=%.1f"
+                " one_bank_capacity_mib=%.1Lf"
+                " basis=GPU_90PCT_MINUS_FULL_KV_SCRATCH_HALVED"
+                " rule=EACH_BANK_PEAK_STRICTLY_LESS\n",
+                bank_ok ? "PASS" : "REJECT",
+                first_weight_mib,
+                peaks[0] / 1048576.0,
+                peaks[1] / 1048576.0,
+                capacity / 1048576.0L);
+            if (!bank_ok || !first_weight_known) { return false; }
+        }
         if (htp_session_guard) {
             auto limits = htp_limits;
             limits.xp = best.xp;

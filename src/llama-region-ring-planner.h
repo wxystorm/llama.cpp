@@ -376,6 +376,56 @@ inline bool gpu_weight_bank_peaks(
     return true;
 }
 
+// Two equal-capacity CUDA weight Banks share one physical GPU budget.
+// KV/scratch are not Bank capacity: they must be reserved BEFORE dividing
+// the remaining VRAM equally between Bank A and Bank B.
+// Use the actual total GPU layers for a complete Plan and a proven minimum
+// GPU-layer count for a prefix; a 0/unknown budget fails closed on streaming.
+inline long double gpu_streamed_single_bank_capacity_bytes(
+        const model & m, int total_gpu_layers, int xg) {
+    if (!m.gpu_weight_streaming || m.gpu_memory_budget_bytes <= 0.0L ||
+            total_gpu_layers < 0 || xg <= 0 ||
+            !std::isfinite(m.gpu_memory_budget_bytes) ||
+            !std::isfinite(m.gpu_kv_bytes_per_layer) ||
+            m.gpu_kv_bytes_per_layer < 0.0L) {
+        return 0.0L;
+    }
+    const long double gpu_kv =
+        (long double) total_gpu_layers * m.gpu_kv_bytes_per_layer;
+    const long double scratch = m.slot_pool > 0 ?
+        (long double) m.slot_pool * xg * m.hidden *
+            sizeof(float) * 3 : 0.0L;
+    const long double available =
+        m.gpu_memory_budget_bytes - gpu_kv - scratch;
+    return std::isfinite(available) && available > 0.0L ?
+        available / 2.0L : 0.0L;
+}
+
+inline bool gpu_streamed_banks_fit(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        int xg, long double * bank_capacity_bytes = nullptr,
+        std::array<size_t, 2> * bank_peaks_bytes = nullptr) {
+    if (!m.gpu_weight_streaming) { return true; }
+    if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
+    int gpu_layers = 0;
+    for (const auto & r : regions) {
+        if (r.device == device::GPU) {
+            if (r.layer_end <= r.layer_begin) { return false; }
+            gpu_layers += r.layer_end - r.layer_begin;
+        }
+    }
+    const long double capacity =
+        gpu_streamed_single_bank_capacity_bytes(m, gpu_layers, xg);
+    std::array<size_t, 2> peaks {};
+    const bool known = gpu_weight_bank_peaks(m, regions, peaks);
+    if (bank_capacity_bytes) { *bank_capacity_bytes = capacity; }
+    if (bank_peaks_bytes) { *bank_peaks_bytes = peaks; }
+    return known && capacity > 0.0L &&
+        (long double) peaks[0] < capacity &&
+        (long double) peaks[1] < capacity;
+}
+
 // A safe GPU-memory lower bound for a prefix of completed G/C/P Cycles.
 // On a streamed GPU, each cycle's GPU Region occupies alternating Banks;
 // peaks of BOTH Banks coexist, so VRAM weights = max(even-cycle regions)
@@ -392,6 +442,7 @@ struct gpu_prefix_memory_bound {
     long double scratch_bytes = 0.0L;
     long double total_min_bytes = 0.0L;
     long double budget_bytes = 0.0L;
+    long double single_bank_capacity_bytes = 0.0L;
 };
 
 inline bool gpu_prefix_memory_feasible(
@@ -404,7 +455,7 @@ inline bool gpu_prefix_memory_feasible(
     estimate.budget_bytes = m.gpu_memory_budget_bytes;
     if (estimate.budget_bytes <= 0.0L) {
         if (bound) { *bound = estimate; }
-        return true; // Unknown VRAM profile; retain existing full-plan gate.
+        return !m.gpu_weight_streaming; // Streaming must never bypass its Bank limit.
     }
     if (!m.gpu_region_weight_bytes || total_cycles < 2 ||
             total_cycles > 4 || xg <= 0 || prefix.empty() ||
@@ -475,11 +526,23 @@ inline bool gpu_prefix_memory_feasible(
             estimate.bank0_bytes + estimate.bank1_bytes :
             unstreamed_weights) +
         estimate.gpu_kv_min_bytes + estimate.scratch_bytes;
+    if (m.gpu_weight_streaming) {
+        // Prefix KV is a LOWER bound; if one Bank fails with even this
+        // optimistic available capacity, no completion can become legal.
+        const long double remain = estimate.budget_bytes -
+            estimate.gpu_kv_min_bytes - estimate.scratch_bytes;
+        estimate.single_bank_capacity_bytes = remain > 0.0L ?
+            remain / 2.0L : 0.0L;
+    }
     if (bound) {
         *bound = estimate;
     }
     return std::isfinite(estimate.total_min_bytes) &&
-        estimate.total_min_bytes <= estimate.budget_bytes;
+        estimate.total_min_bytes <= estimate.budget_bytes &&
+        (!m.gpu_weight_streaming ||
+         (estimate.single_bank_capacity_bytes > 0.0L &&
+          estimate.bank0_bytes < estimate.single_bank_capacity_bytes &&
+          estimate.bank1_bytes < estimate.single_bank_capacity_bytes));
 }
 
 // Exact minimum GPU VRAM required by any legal completion of a first
@@ -517,6 +580,15 @@ inline bool gpu_minimum_complete_first_cycle_memory(
     const long double gpu_kv_floor =
         std::max(0.0L, m.gpu_kv_bytes_per_layer) *
         (first_g + n_cycles - 1);
+    // Lower bound for one Bank before choosing XG (scratch excluded).
+    // An overfull first Bank can never be repaired by future Cycles.
+    const long double optimistic_bank_capacity =
+        (m.gpu_memory_budget_bytes - gpu_kv_floor) / 2.0L;
+    if (m.gpu_weight_streaming &&
+            (optimistic_bank_capacity <= 0.0L ||
+             (long double) first_weight >= optimistic_bank_capacity)) {
+        return false;
+    }
     best.total_min_bytes = std::numeric_limits<long double>::infinity();
 
     std::function<void(int, int, int, int,
@@ -525,7 +597,10 @@ inline bool gpu_minimum_complete_first_cycle_memory(
                long double bank0, long double bank1,
                long double unstreamed) {
         if (completed == n_cycles) {
-            if (begin != m.layers) {
+            if (begin != m.layers ||
+                    (m.gpu_weight_streaming &&
+                     (bank0 >= optimistic_bank_capacity ||
+                      bank1 >= optimistic_bank_capacity))) {
                 return;
             }
             const long double bytes =
@@ -586,7 +661,10 @@ inline bool gpu_minimum_complete_first_cycle_memory(
                 (m.gpu_weight_streaming ? b0 + b1 : all) +
                 gpu_kv_floor;
             if (gpu_lower > best.budget_bytes ||
-                    gpu_lower >= best.total_min_bytes) {
+                    gpu_lower >= best.total_min_bytes ||
+                    (m.gpu_weight_streaming &&
+                     (b0 >= optimistic_bank_capacity ||
+                      b1 >= optimistic_bank_capacity))) {
                 continue;
             }
             walk(completed + 1, begin + width,
@@ -2572,6 +2650,7 @@ struct first_cycle_seed_record {
     std::array<double, 3> first_handoff_mspt {};
     long double gpu_bank0_min_bytes = 0.0L;
     long double gpu_bank1_min_bytes = 0.0L;
+    long double gpu_single_bank_capacity_bytes = 0.0L;
     long double gpu_kv_min_bytes = 0.0L;
     long double gpu_peak_min_bytes = 0.0L;
     // Best achievable full-GPU-only footprint over legal later widths,
@@ -2618,11 +2697,13 @@ struct result {
     // Geometry/XG pairs rejected before E anchors or bitsets are built.
     size_t first_cycle_gpu_pairs_pruned = 0;
     size_t first_cycle_gpu_shapes_pruned = 0;
+    size_t first_cycle_single_bank_pruned = 0;
     size_t first_cycle_e_pool = 0;
     size_t first_cycle_selected = 0;
     std::vector<first_cycle_seed_record> first_cycle_seeds;
     size_t prefix_expanded = 0;
     size_t prefix_gpu_memory_pruned = 0;
+    size_t prefix_micro_pruned = 0;
     size_t prefix_full_memory_pruned = 0;
     size_t prefix_completed = 0;
     // Additional read-only DAG simulation from complete-layout neighbors.
@@ -2800,6 +2881,61 @@ inline bool first_cycle_chunk_supported(int x) {
            first_cycle_chunk_candidates.end();
 }
 
+// Subsequent Cycles are small corrections to the FIRST Cycle's G/C/P
+// allocation, never an independent repartition. CPU=0 is supported:
+// a skipped C contributes zero layers. The final PC GPU head/tail
+// belongs outside these Phone-final Cycle checks.
+static constexpr int k_runtime_later_device_delta_layers = 2;
+static constexpr int k_runtime_later_width_delta_layers = 3;
+
+inline bool runtime_cycle_micro_adjusted(
+        const std::vector<llama_region_ring_region> & regions) {
+    std::array<int, 3> first {0, 0, 0};
+    int first_width = 0;
+    int cycle = 0;
+    int next_layer = 0;
+    size_t i = 0;
+    while (i < regions.size()) {
+        if (regions[i].device != device::GPU ||
+                regions[i].layer_begin != next_layer) {
+            return false;
+        }
+        const auto & g_region = regions[i++];
+        const int g = g_region.layer_end - g_region.layer_begin;
+        int c = 0;
+        int p = 0;
+        next_layer = g_region.layer_end;
+        if (i < regions.size() && regions[i].device == device::CPU) {
+            if (regions[i].layer_begin != next_layer) { return false; }
+            c = regions[i].layer_end - regions[i].layer_begin;
+            next_layer = regions[i++].layer_end;
+        }
+        if (i >= regions.size() || regions[i].device != device::PHONE ||
+                regions[i].layer_begin != next_layer) {
+            return false;
+        }
+        p = regions[i].layer_end - regions[i].layer_begin;
+        next_layer = regions[i++].layer_end;
+        if (g <= 0 || c < 0 || p <= 0) { return false; }
+        const int width = g + c + p;
+        if (cycle == 0) {
+            first = {c, g, p};
+            first_width = width;
+        } else if (std::abs(g - first[(size_t) device::GPU]) >
+                       k_runtime_later_device_delta_layers ||
+                   std::abs(c - first[(size_t) device::CPU]) >
+                       k_runtime_later_device_delta_layers ||
+                   std::abs(p - first[(size_t) device::PHONE]) >
+                       k_runtime_later_device_delta_layers ||
+                   std::abs(width - first_width) >
+                       k_runtime_later_width_delta_layers) {
+            return false;
+        }
+        ++cycle;
+    }
+    return cycle >= 1;
+}
+
 // First-stage zero-CPU search. Keep legacy Uniform/Prefix E optimizers
 // unchanged: they assume three nonempty regions per cycle. Expand only
 // complete layouts by removing CPU regions from promising incumbents, plus
@@ -2824,7 +2960,8 @@ inline void search_runtime_cpu_optional(
                         const std::vector<llama_region_ring_region> & regions) {
         if (regions.empty() ||
                 !llama_region_ring_apply_topology_compatible(regions, m.layers) ||
-                regions.back().device != device::PHONE) {
+                regions.back().device != device::PHONE ||
+                !runtime_cycle_micro_adjusted(regions)) {
             return;
         }
         plan.concrete_regions = regions;
@@ -3124,7 +3261,8 @@ inline void refine_runtime_local_candidates(
             if (xc <= 0 || xg <= 0 || xp <= 0 ||
                     rs.empty() || rs.size() % 3 != 0 ||
                     !llama_region_ring_apply_topology_compatible(
-                        rs, m.layers)) {
+                        rs, m.layers) ||
+                    !runtime_cycle_micro_adjusted(rs)) {
                 return;
             }
             candidate plan;
@@ -3605,7 +3743,8 @@ inline result search_runtime_applicable(
         std::vector<llama_region_ring_region> regions;
         if (!make_regions(plan, m.layers, regions) ||
                 regions.empty() ||
-                regions.back().device != device::PHONE) {
+                regions.back().device != device::PHONE ||
+                !runtime_cycle_micro_adjusted(regions)) {
             continue;
         }
         std::string reason;
@@ -3683,7 +3822,8 @@ inline result search_runtime_applicable(
             candidate plan = source;
             plan.throughput_seed = true;
             std::vector<llama_region_ring_region> rs;
-            if (!make_regions(plan, m.layers, rs)) {
+            if (!make_regions(plan, m.layers, rs) ||
+                    !runtime_cycle_micro_adjusted(rs)) {
                 continue;
             }
             // Failed DAG evaluations still consume the two-attempt budget.
@@ -3890,7 +4030,11 @@ inline result search_runtime_applicable(
             const int max_other = std::min(
                 width_high, width + spread);
             if (remaining < (n_cycles - 1) * min_other ||
-                remaining > (n_cycles - 1) * max_other) {
+                remaining > (n_cycles - 1) * max_other ||
+                remaining < (n_cycles - 1) *
+                    (width - k_runtime_later_width_delta_layers) ||
+                remaining > (n_cycles - 1) *
+                    (width + k_runtime_later_width_delta_layers)) {
                 continue;
             }
             for (int p = 1; p <= width - 2; ++p) {
@@ -3919,6 +4063,17 @@ inline result search_runtime_applicable(
                 gpu_minimum_complete_first_cycle_memory(
                     m, shape.g, shape.c, shape.p, n_cycles,
                     width_low, width_high, spread, min_full_gpu);
+            // G1 runs in Bank A. The initial Region weight allocation
+            // must FIT ONE BANK by itself, not merely fit in the total
+            // BankA+BankB VRAM budget. Reserve even the MINIMUM possible
+            // future GPU KV and this XG's slot scratch before halving VRAM.
+            size_t first_gpu_weight = 0;
+            const bool first_weight_known =
+                !m.gpu_weight_streaming ||
+                (m.gpu_region_weight_bytes &&
+                 m.gpu_region_weight_bytes(
+                     0, shape.g, first_gpu_weight) &&
+                 first_gpu_weight > 0);
             bool any_gpu_xg = false;
             for (size_t gi = 0; gi < n_x; ++gi) {
                 if (chunks[gi] > m.tokens) {
@@ -3928,8 +4083,19 @@ inline result search_runtime_applicable(
                     m.slot_pool > 0 ?
                     (long double) m.slot_pool * chunks[gi] *
                         m.hidden * sizeof(float) * 3 : 0.0L;
+                const long double one_bank_capacity =
+                    m.gpu_weight_streaming ?
+                    gpu_streamed_single_bank_capacity_bytes(
+                        m, shape.g + n_cycles - 1, chunks[gi]) : 0.0L;
+                const bool first_bank_ok =
+                    !m.gpu_weight_streaming ||
+                    (first_weight_known && one_bank_capacity > 0.0L &&
+                     (long double) first_gpu_weight < one_bank_capacity);
+                if (!first_bank_ok) {
+                    ++out.first_cycle_single_bank_pruned;
+                }
                 const bool fits =
-                    gpu_continuation_possible &&
+                    first_bank_ok && gpu_continuation_possible &&
                     (m.gpu_memory_budget_bytes <= 0.0L ||
                      min_full_gpu.total_min_bytes + scratch <=
                          m.gpu_memory_budget_bytes);
@@ -4376,6 +4542,8 @@ inline result search_runtime_applicable(
                 m, first_regions, n_cycles, chunks[seed.gi], &bound)) {
             trace.gpu_bank0_min_bytes = bound.bank0_bytes;
             trace.gpu_bank1_min_bytes = bound.bank1_bytes;
+            trace.gpu_single_bank_capacity_bytes =
+                bound.single_bank_capacity_bytes;
             trace.gpu_kv_min_bytes = bound.gpu_kv_min_bytes;
             trace.gpu_peak_min_bytes = bound.total_min_bytes;
             trace.gpu_budget_bytes = bound.budget_bytes;
@@ -4429,12 +4597,12 @@ inline result search_runtime_applicable(
                 const int remain = m.layers - begin;
                 const int later = n_cycles - completed - 1;
                 const int next_min_width = std::max({
-                    width_low,
-                    state.max_width - seed.width_slack
+                    width_low, state.max_width - seed.width_slack,
+                    seed.width - k_runtime_later_width_delta_layers
                 });
                 const int next_max_width = std::min({
-                    width_high,
-                    state.min_width + seed.width_slack
+                    width_high, state.min_width + seed.width_slack,
+                    seed.width + k_runtime_later_width_delta_layers
                 });
                 for (int width = next_min_width;
                         width <= next_max_width; ++width) {
@@ -4462,9 +4630,23 @@ inline result search_runtime_applicable(
                         continue;
                     }
 
-                    for (int p = 1; p <= width - 2; ++p) {
-                        for (int g = 1; g < width - p; ++g) {
+                    for (int p = std::max(
+                            1, seed.p - k_runtime_later_device_delta_layers);
+                            p <= std::min(
+                                width - 2,
+                                seed.p + k_runtime_later_device_delta_layers);
+                            ++p) {
+                        for (int g = std::max(
+                                1, seed.g - k_runtime_later_device_delta_layers);
+                                g < width - p &&
+                                g <= seed.g + k_runtime_later_device_delta_layers;
+                                ++g) {
                             const int c = width - p - g;
+                            if (std::abs(c - seed.c) >
+                                    k_runtime_later_device_delta_layers) {
+                                ++out.prefix_micro_pruned;
+                                continue;
+                            }
                             const std::array<double, 3> extra {{
                                 service[(size_t) device::CPU][seed.ci][(size_t) c],
                                 service[(size_t) device::GPU][seed.gi][(size_t) g],
@@ -4721,6 +4903,16 @@ inline result search_runtime_applicable(
     refine_runtime_local_candidates(m, out, scored);
     // CPU-optional candidates are introduced after that legacy local pass.
     search_runtime_cpu_optional(m, out, scored);
+    // Defensive final gate: no uniform/local/CPU-optional family is
+    // exempt from later-Cycle micro-adjustment, even if it won by DAG.
+    out.top.erase(
+        std::remove_if(out.top.begin(), out.top.end(),
+            [&](const candidate & c) {
+                std::vector<llama_region_ring_region> rs;
+                return !make_regions(c, m.layers, rs) ||
+                    !runtime_cycle_micro_adjusted(rs);
+            }),
+        out.top.end());
     std::sort(out.top.begin(), out.top.end(), wall_less);
     if (!out.top.empty()) {
         out.selected = out.top.front();

@@ -1070,7 +1070,7 @@ int main() {
         bank.layers = 32;
         bank.slot_pool = 0;
         bank.gpu_weight_streaming = true;
-        bank.gpu_memory_budget_bytes = 1425.0L;
+        bank.gpu_memory_budget_bytes = 1600.0L;
         bank.gpu_kv_bytes_per_layer = 5.0L;
         bank.gpu_region_weight_bytes =
             [](int begin, int end, size_t & bytes) {
@@ -1093,12 +1093,15 @@ int main() {
         REQUIRE(initial.bank1_bytes == 100.0L);
         REQUIRE(initial.gpu_kv_min_bytes == 45.0L);
         REQUIRE(initial.total_min_bytes == 745.0L);
+        REQUIRE(initial.bank0_bytes < initial.single_bank_capacity_bytes);
         REQUIRE(gpu_prefix_memory_feasible(
             bank, all, 4, 16, &completed));
         REQUIRE(completed.bank0_bytes == 600.0L);
         REQUIRE(completed.bank1_bytes == 700.0L);
         REQUIRE(completed.gpu_kv_min_bytes == 120.0L);
         REQUIRE(completed.total_min_bytes == 1420.0L);
+        REQUIRE(completed.bank0_bytes < completed.single_bank_capacity_bytes);
+        REQUIRE(completed.bank1_bytes < completed.single_bank_capacity_bytes);
         bank.gpu_memory_budget_bytes = 1350.0L;
         REQUIRE(gpu_prefix_memory_feasible(bank, first, 4, 16));
         REQUIRE(!gpu_prefix_memory_feasible(bank, all, 4, 16));
@@ -1116,7 +1119,7 @@ int main() {
         bank.gpu_weight_streaming = true;
         bank.slot_pool = 2;
         bank.hidden = 8;
-        bank.gpu_memory_budget_bytes = 4000.0L;
+        bank.gpu_memory_budget_bytes = 4400.0L;
         REQUIRE(gpu_prefix_memory_feasible(
             bank, first, 4, 16, &initial));
         REQUIRE(initial.scratch_bytes == 3072.0L);
@@ -1129,7 +1132,7 @@ int main() {
         future.layers = 32;
         future.slot_pool = 0;
         future.gpu_weight_streaming = true;
-        future.gpu_memory_budget_bytes = 800.0L;
+        future.gpu_memory_budget_bytes = 1280.0L;
         future.gpu_kv_bytes_per_layer = 5.0L;
         future.gpu_region_weight_bytes =
             [](int begin, int end, size_t & bytes) {
@@ -1138,7 +1141,7 @@ int main() {
                 }
                 bytes = 0;
                 for (int layer = begin; layer < end; ++layer) {
-                    bytes += layer < 14 ? 100 : 500;
+                    bytes += layer < 14 ? 100 : 800;
                 }
                 return true;
             };
@@ -1147,11 +1150,79 @@ int main() {
         gpu_prefix_memory_bound min_complete;
         REQUIRE(!gpu_minimum_complete_first_cycle_memory(
             future, 6, 1, 1, 4, 6, 10, 2, min_complete));
-        future.gpu_memory_budget_bytes = 1300.0L;
+        future.gpu_memory_budget_bytes = 1700.0L;
         REQUIRE(gpu_minimum_complete_first_cycle_memory(
             future, 6, 1, 1, 4, 6, 10, 2, min_complete));
-        REQUIRE(min_complete.total_min_bytes >= 1145.0L);
-        REQUIRE(min_complete.total_min_bytes < 1300.0L);
+        REQUIRE(min_complete.total_min_bytes >= 1445.0L);
+        REQUIRE(min_complete.total_min_bytes < 1700.0L);
+    }
+
+    // A first G Region can fit TOTAL streamed VRAM yet exceed Bank A.
+    // Reject before E and at full-layout guard; equality also rejects.
+    {
+        model strict = mock_profile();
+        strict.layers = 16;
+        strict.slot_pool = 0;
+        strict.gpu_weight_streaming = true;
+        strict.gpu_kv_bytes_per_layer = 10.0L;
+        strict.gpu_memory_budget_bytes = 1100.0L;
+        strict.gpu_region_weight_bytes =
+            [](int begin, int end, size_t & bytes) {
+                if (begin < 0 || end <= begin) { return false; }
+                bytes = (size_t) (end - begin) * 100;
+                return true;
+            };
+        const auto complete = llama_region_ring_parse(
+            "G6,C1,P1,G3,C1,P4", 16);
+        std::array<size_t, 2> peaks {};
+        REQUIRE(gpu_weight_bank_peaks(strict, complete, peaks));
+        REQUIRE(peaks[0] == 600 && peaks[1] == 300);
+        // 600 + 300 + 9*10 = 990, below the total 1100 budget.
+        REQUIRE((long double) peaks[0] + peaks[1] +
+                9 * strict.gpu_kv_bytes_per_layer <
+                strict.gpu_memory_budget_bytes);
+        long double bank_capacity = 0.0L;
+        REQUIRE(!gpu_streamed_banks_fit(
+            strict, complete, 16, &bank_capacity));
+        REQUIRE(bank_capacity == 505.0L);
+        const std::vector<llama_region_ring_region> prefix {
+            {device::GPU, 0, 6}, {device::CPU, 6, 7},
+            {device::PHONE, 7, 8}
+        };
+        REQUIRE(!gpu_prefix_memory_feasible(
+            strict, prefix, 2, 16));
+        // Exactly one Bank's capacity is still REJECTED.
+        strict.gpu_memory_budget_bytes = 1290.0L;
+        REQUIRE(!gpu_streamed_banks_fit(
+            strict, complete, 16, &bank_capacity));
+        REQUIRE(bank_capacity == 600.0L);
+        strict.gpu_memory_budget_bytes = 1291.0L;
+        REQUIRE(gpu_streamed_banks_fit(
+            strict, complete, 16, &bank_capacity));
+        REQUIRE(bank_capacity == 600.5L);
+        strict.gpu_memory_budget_bytes = 0.0L;
+        REQUIRE(!gpu_streamed_banks_fit(strict, complete, 16));
+        REQUIRE(!gpu_prefix_memory_feasible(strict, prefix, 2, 16));
+    }
+
+    // Later Cycles are minor tweaks to the first allocation. CPU=0
+    // remains legal, but large migrations of layers are not.
+    {
+        const auto balanced = llama_region_ring_parse(
+            "G8,C2,P6,G9,C1,P6,G7,C3,P6", 48);
+        REQUIRE(runtime_cycle_micro_adjusted(balanced));
+        const auto cpu_free = llama_region_ring_parse(
+            "G9,P5,G8,P6,G10,P4", 42);
+        REQUIRE(runtime_cycle_micro_adjusted(cpu_free));
+        const auto large_device_shift = llama_region_ring_parse(
+            "G8,C2,P6,G5,C5,P6", 32);
+        REQUIRE(!runtime_cycle_micro_adjusted(large_device_shift));
+        const auto large_width_shift = llama_region_ring_parse(
+            "G8,C2,P6,G10,C4,P6", 36);
+        REQUIRE(!runtime_cycle_micro_adjusted(large_width_shift));
+        const auto cpu_free_large_shift = llama_region_ring_parse(
+            "G9,P5,G5,P9", 28);
+        REQUIRE(!runtime_cycle_micro_adjusted(cpu_free_large_shift));
     }
 
     // Search must measure E_min only over GPU-viable seed geometries.
@@ -1184,6 +1255,7 @@ int main() {
             limited, base, 64, 1, 0.08, 0);
         REQUIRE(selected.first_cycle_gpu_pairs_pruned > 0);
         REQUIRE(selected.first_cycle_gpu_shapes_pruned > 0);
+        REQUIRE(selected.first_cycle_single_bank_pruned > 0);
         REQUIRE(selected.first_cycle_selected > 0);
         REQUIRE(selected.first_cycle_selected <= 256);
         REQUIRE(selected.first_cycle_e_pool <= 640);
@@ -1199,6 +1271,10 @@ int main() {
             REQUIRE(gpu_prefix_memory_feasible(
                 limited, prefix, seed.cycles, seed.xg));
             REQUIRE(seed.gpu_peak_min_bytes <= seed.gpu_budget_bytes);
+            REQUIRE(seed.gpu_bank0_min_bytes <
+                    seed.gpu_single_bank_capacity_bytes);
+            REQUIRE(seed.gpu_bank1_min_bytes <
+                    seed.gpu_single_bank_capacity_bytes);
             REQUIRE(seed.gpu_full_possible_min_bytes <=
                     seed.gpu_budget_bytes);
             REQUIRE(seed.gpu_full_possible_min_bytes >=
@@ -1911,6 +1987,9 @@ int main() {
         // no topology-family quota and no max_simulations truncation.
         model value_profile = mock_profile();
         value_profile.gpu_weight_streaming = true;
+        // Streaming candidates now require a KNOWN per-Bank VRAM budget;
+        // unspecified memory no longer silently passes the first seed.
+        value_profile.gpu_memory_budget_bytes = 100000000.0L;
         value_profile.compute_ms =
             [](device d, int layers, int tokens, int, double & ms) {
                 const double per =
@@ -1946,6 +2025,11 @@ int main() {
         REQUIRE(value_result.valid);
         REQUIRE(value_result.shortlisted == value_result.simulated);
         REQUIRE(value_result.top.size() <= 24);
+        for (const auto & c : value_result.top) {
+            std::vector<llama_region_ring_region> rs;
+            REQUIRE(make_regions(c, value_profile.layers, rs));
+            REQUIRE(runtime_cycle_micro_adjusted(rs));
+        }
         REQUIRE(value_result.throughput_shortlisted <= 6);
         REQUIRE(value_result.throughput_shortlisted ==
                 value_result.throughput_simulated);
