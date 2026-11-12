@@ -2911,6 +2911,59 @@ bool rpc_server::set_tensor_from_local_file(
     const uint64_t tensor_nbytes =
         static_cast<uint64_t>(ggml_nbytes(tensor));
 
+    // HTP Q4_K/Q6_K weights are repacked into a padded, tiled layout.
+    // The raw GGUF tensor size is NOT the physical write footprint.
+    // Validate against the real backend allocation before repacking, so
+    // a bad RPC allocation fails as a protocol error instead of SIGSEGV.
+    const bool tiled_quant = tensor->type == GGML_TYPE_Q4_K ||
+                             tensor->type == GGML_TYPE_Q6_K;
+    const bool weight_diag = std::getenv("GGML_RPC_HTP_WEIGHT_DIAG") != nullptr;
+    const uintptr_t buffer_base =
+        reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(tensor->buffer));
+    const uintptr_t tensor_data = reinterpret_cast<uintptr_t>(tensor->data);
+    const uint64_t buffer_bytes =
+        static_cast<uint64_t>(ggml_backend_buffer_get_size(tensor->buffer));
+    const uint64_t required_bytes = tiled_quant ?
+        static_cast<uint64_t>(ggml_backend_buft_get_alloc_size(
+            ggml_backend_buffer_get_type(tensor->buffer), tensor)) :
+        tensor_nbytes;
+    if (weight_diag) {
+        GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=VALIDATE name='%s' type=%s "
+                      "ne=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64
+                      " src_bytes=%" PRIu64 " physical_bytes=%" PRIu64
+                      " buffer_bytes=%" PRIu64 " buffer_base=%p data=%p "
+                      "source_offset=%" PRIu64 " destination_offset=%" PRIu64 "\n",
+                      name.c_str(), ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3],
+                      tensor_nbytes, required_bytes, buffer_bytes,
+                      (void *) buffer_base, (void *) tensor_data,
+                      request.src_offset, request.dst_offset);
+    }
+    if (tensor_data < buffer_base ||
+        (uint64_t) (tensor_data - buffer_base) > buffer_bytes ||
+        required_bytes > buffer_bytes - (uint64_t) (tensor_data - buffer_base)) {
+        GGML_LOG_ERROR("[JUPITER_HTP_WEIGHT] phase=REJECT reason=PHYSICAL_BUFFER_OOB "
+                       "name='%s' type=%s required=%" PRIu64
+                       " remaining=%" PRIu64 "\n",
+                       name.c_str(), ggml_type_name(tensor->type),
+                       required_bytes, tensor_data >= buffer_base &&
+                       (uint64_t) (tensor_data - buffer_base) <= buffer_bytes ?
+                       buffer_bytes - (uint64_t) (tensor_data - buffer_base) : 0);
+        return false;
+    }
+    if (tiled_quant && (request.dst_offset != 0 ||
+                        request.n_copies != 1 ||
+                        request.copy_size != tensor_nbytes)) {
+        // The Hexagon quantized buffer set_tensor() repacker consumes a
+        // complete original GGUF tensor at offset zero.
+        GGML_LOG_ERROR("[JUPITER_HTP_WEIGHT] phase=REJECT reason=PARTIAL_QUANT_REPACK "
+                       "name='%s' copy=%" PRIu64 " tensor=%" PRIu64
+                       " count=%" PRIu64 " dst_offset=%" PRIu64 "\n",
+                       name.c_str(), request.copy_size, tensor_nbytes,
+                       request.n_copies, request.dst_offset);
+        return false;
+    }
+
     /*
      * 验证最后一次目标写入不会越过局部目标张量。
      *
@@ -2995,6 +3048,10 @@ bool rpc_server::set_tensor_from_local_file(
      */
     std::vector<uint8_t> staging;
 
+    if (weight_diag) {
+        GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=STAGING_BEGIN name='%s' "
+                      "bytes=%" PRIu64 "\n", name.c_str(), request.copy_size);
+    }
     try {
         staging.resize(
             static_cast<size_t>(request.copy_size));
@@ -3041,6 +3098,11 @@ bool rpc_server::set_tensor_from_local_file(
          * read() 中应当根据 name 找到完整源张量，
          * 再从它的相对偏移 src_i 开始读取。
          */
+        if (weight_diag) {
+            GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=READ_BEGIN name='%s' "
+                          "offset=%" PRIu64 " bytes=%zu\n",
+                          name.c_str(), src_i, staging.size());
+        }
         if (!local_tensor_source.read(
                 local_tensor_source.user_data,
                 name.c_str(),
@@ -3065,11 +3127,21 @@ bool rpc_server::set_tensor_from_local_file(
          * tensor->data 已经是远端目标张量基址。
          * dst_i 是相对于该基址的目标偏移。
          */
+        if (weight_diag) {
+            GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=READ_DONE name='%s' "
+                          "bytes=%zu\n", name.c_str(), staging.size());
+            GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=SET_BEGIN name='%s' "
+                          "type=%s\n", name.c_str(), ggml_type_name(tensor->type));
+        }
         ggml_backend_tensor_set(
             tensor,
             staging.data(),
             static_cast<size_t>(dst_i),
             staging.size());
+        if (weight_diag) {
+            GGML_LOG_INFO("[JUPITER_HTP_WEIGHT] phase=SET_DONE name='%s' "
+                          "type=%s\n", name.c_str(), ggml_type_name(tensor->type));
+        }
     }
 
     remember_tensor_extra(request.tensor, tensor);
