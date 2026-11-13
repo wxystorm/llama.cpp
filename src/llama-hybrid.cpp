@@ -10534,6 +10534,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XC") ||
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XG") ||
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XP"));
+    const char * ablation_raw =
+        std::getenv("LLAMA_REGION_RING_ABLATION");
+    const bool ablation_a2 = ablation_raw &&
+        std::strcmp(ablation_raw, "A2") == 0;
+    const bool ablation_a3 = ablation_raw &&
+        std::strcmp(ablation_raw, "A3") == 0;
+    model.gpu_bank_count = (ablation_a2 || ablation_a3) ? 1 : 2;
+    if ((ablation_a2 || ablation_a3) && force_ab_requested) {
+        LLAMA_LOG_ERROR("[REGION_RING_ABLATION] status=REJECT "
+                        "reason=AUTO_MODE_WITH_FORCED_LAYOUT\n");
+        return false;
+    }
     llama_ring_planner::htp_memory_limits htp_limits;
     if (have_layer_weights) {
         const auto planner_layer_bytes =
@@ -11037,6 +11049,164 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 result.baseline_valid ? 1 : 0,
                 result.baseline_valid ?
                     result.baseline.wall_ms : -1.0);
+        } else if (ablation_a2 || ablation_a3) {
+            // Profile-informed single-Bank ablation. The execution engine
+            // reuses one physical weight-cache Bank on demand; never apply
+            // the ordinary two-Bank peak memory bound to this search.
+            // A2 explores G/[C]/P Cycles with a PC-GPU tail; A3 fills
+            // GPU then CPU then Phone in one contiguous pass.
+            auto demand_model = model;
+            demand_model.gpu_weight_streaming = false;
+            if (ablation_a2) {
+                demand_model.phone_autonomous_final = false;
+            }
+            double best_cost = std::numeric_limits<double>::infinity();
+            size_t memory_ok = 0, scored = 0;
+            auto try_ablation = [&](
+                    const std::vector<llama_region_ring_region> & regions,
+                    int cycles) -> bool {
+                llama_ring_planner::candidate c;
+                c.cycles = cycles;
+                c.concrete_regions = regions;
+                c.xc = c.xg = c.xp = baseline_chunk;
+                c.g = regions[0].layer_end - regions[0].layer_begin;
+                c.c = 0;
+                c.p = 0;
+                for (size_t r = 1; r < regions.size(); ++r) {
+                    if (regions[r].device == llama_region_ring_device::CPU &&
+                            c.c == 0) {
+                        c.c = regions[r].layer_end - regions[r].layer_begin;
+                    }
+                    if (regions[r].device == llama_region_ring_device::PHONE &&
+                            c.p == 0) {
+                        c.p = regions[r].layer_end - regions[r].layer_begin;
+                    }
+                }
+                if (!model.memory_feasible || !model.memory_feasible(c)) {
+                    return false;
+                }
+                ++memory_ok;
+                std::string why;
+                if (!llama_ring_planner::simulate(
+                        demand_model, regions, c, &why)) {
+                    return false;
+                }
+                ++scored;
+                // Conservative non-overlapped H2D demand penalty. The first
+                // GPU Region is primed before timed prefill; every later
+                // GPU Region must reload the one physical Bank.
+                double h2d_penalty = 0.0;
+                size_t gpu_rank = 0;
+                for (const auto & region : regions) {
+                    if (region.device != llama_region_ring_device::GPU) {
+                        continue;
+                    }
+                    if (gpu_rank++ == 0) { continue; }
+                    size_t bytes = 0;
+                    double ms = 0.0;
+                    if (model.gpu_region_weight_bytes &&
+                            model.gpu_weight_h2d_ms &&
+                            model.gpu_region_weight_bytes(
+                                region.layer_begin, region.layer_end, bytes) &&
+                            model.gpu_weight_h2d_ms(bytes, ms) &&
+                            std::isfinite(ms) && ms >= 0.0) {
+                        h2d_penalty += ms;
+                    }
+                }
+                c.wall_ms += h2d_penalty;
+                c.weight_h2d_exposed_ms = h2d_penalty;
+                c.weight_h2d_busy_ms = h2d_penalty;
+                if (c.wall_ms < best_cost) {
+                    best_cost = c.wall_ms;
+                    result.selected = std::move(c);
+                    result.valid = true;
+                }
+                return true;
+            };
+            if (ablation_a2) {
+                // Balanced-width exploratory Cycle search. Actual HTP
+                // session, Android RAM, CPU RAM and single-Bank VRAM guards
+                // are applied to EVERY complete candidate. No DAG-based
+                // performance claim is made for the coarse demand score.
+                const int total = model.layers - 1; // PC GPU final head
+                for (int cycles = 2; cycles <= 5; ++cycles) {
+                    for (int g = 1; g <= 12; ++g) {
+                        for (int cpu = 0; cpu <= 10; ++cpu) {
+                            std::vector<llama_region_ring_region> regions;
+                            int begin = 0;
+                            bool legal = true;
+                            for (int k = 0; k < cycles; ++k) {
+                                const int width = total / cycles +
+                                    (k < total % cycles ? 1 : 0);
+                                const int phone = width - g - cpu;
+                                if (phone < 1) { legal = false; break; }
+                                regions.push_back({
+                                    llama_region_ring_device::GPU,
+                                    begin, begin + g});
+                                begin += g;
+                                if (cpu > 0) {
+                                    regions.push_back({
+                                        llama_region_ring_device::CPU,
+                                        begin, begin + cpu});
+                                    begin += cpu;
+                                }
+                                regions.push_back({
+                                    llama_region_ring_device::PHONE,
+                                    begin, begin + phone});
+                                begin += phone;
+                            }
+                            if (!legal || begin != total) { continue; }
+                            regions.push_back({
+                                llama_region_ring_device::GPU,
+                                total, model.layers});
+                            if (!llama_region_ring_apply_topology_compatible(
+                                    regions, model.layers)) {
+                                continue;
+                            }
+                            try_ablation(regions, cycles);
+                        }
+                    }
+                }
+            } else {
+                // Memory-only priority: maximize GPU layers, then CPU
+                // layers, leave a nonempty final HTP segment. The full
+                // HTP per-session/shared budget is checked by callback.
+                bool chosen = false;
+                for (int g = model.layers - 1; g >= 1 && !chosen; --g) {
+                    for (int cpu = model.layers - g - 1;
+                            cpu >= 0 && !chosen; --cpu) {
+                        std::vector<llama_region_ring_region> regions;
+                        regions.push_back({
+                            llama_region_ring_device::GPU, 0, g});
+                        if (cpu > 0) {
+                            regions.push_back({
+                                llama_region_ring_device::CPU, g, g + cpu});
+                        }
+                        regions.push_back({
+                            llama_region_ring_device::PHONE,
+                            g + cpu, model.layers});
+                        if (!llama_region_ring_single_cycle_force_compatible(
+                                regions, model.layers)) {
+                            continue;
+                        }
+                        // One-Cycle greedy chooses the FIRST memory-safe
+                        // allocation, not the fastest DAG layout.
+                        chosen = try_ablation(regions, 1);
+                    }
+                }
+            }
+            LLAMA_LOG_INFO(
+                "[REGION_RING_ABLATION_PLAN] mode=%s banks=1 "
+                "strategy=%s memory_feasible=%zu scored=%zu "
+                "layout=%s estimated_ms=%.3f status=%s\n",
+                ablation_a2 ? "A2" : "A3",
+                ablation_a2 ? "PROFILE_COARSE_CYCLE" : "MEMORY_GREEDY_G_C_N",
+                memory_ok, scored,
+                result.valid ?
+                    llama_region_ring_layout_string(
+                        result.selected.concrete_regions).c_str() : "NONE",
+                result.valid ? result.selected.wall_ms : -1.0,
+                result.valid ? "PASS" : "NO_FEASIBLE_PLAN");
         } else {
             result = llama_ring_planner::search_runtime_applicable(
                 model, baseline_regions, baseline_chunk,
@@ -11604,6 +11774,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         const char * htp_plan_env =
             std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
         const bool htp_only_auto = !forced_ab &&
+            !ablation_a2 && !ablation_a3 &&
             htp_plan_env != nullptr &&
             std::strcmp(htp_plan_env, "1") == 0;
         bool boundary_tensor_selected = false;
@@ -11723,7 +11894,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        bool htp_only_tail_selected = false;
+        bool htp_only_tail_selected = ablation_a2;
         if (htp_only_auto) {
             // Preserve the proven CPU-transport HTP-only execution contract:
             // Phone-only transformer layers followed by a PC GPU tail/head.
@@ -11819,7 +11990,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             best_has_directional ?
                 llama_region_ring_directional_topology_compatible(
                     best_regions, model.layers) :
-            forced_ab && forced_single_cycle ?
+            (forced_ab && forced_single_cycle) || ablation_a3 ?
                 llama_region_ring_single_cycle_topology_compatible(
                     best_regions, model.layers) :
                 llama_region_ring_apply_topology_compatible(
@@ -11990,7 +12161,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             if (*metrics_path != '\0') {
                 std::ofstream metrics(metrics_path, std::ios::app);
                 if (metrics) {
-                    const bool accepted = forced_ab ||
+                    const bool accepted = forced_ab || ablation_a3 ||
                         htp_only_tail_selected ||
                         (!identical && improvement_pct >= min_gain_pct);
                     metrics << std::fixed << std::setprecision(4)
@@ -12171,7 +12342,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             }
         }
 
-        if (!forced_ab && !htp_only_tail_selected &&
+        if (!forced_ab && !htp_only_tail_selected && !ablation_a3 &&
                 (identical || improvement_pct < min_gain_pct)) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE applied=0 "
