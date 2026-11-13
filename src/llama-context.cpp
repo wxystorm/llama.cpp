@@ -14680,7 +14680,12 @@ void llama_context::perf_reset() {
             backend_ptrs.size() >= 3 && backend_buft.size() >= 3 &&
             backend_ptrs[1] != nullptr && backend_ptrs[2] == backend_cpu;
         if (ready) {
-            for (size_t id = 1; id <= 2; ++id) {
+            const char * ablation =
+                std::getenv("LLAMA_REGION_RING_ABLATION");
+            const size_t bank_count = ablation &&
+                (std::strcmp(ablation, "A2") == 0 ||
+                 std::strcmp(ablation, "A3") == 0) ? 1 : 2;
+            for (size_t id = 1; id <= bank_count; ++id) {
                 auto & bank = region_ring_worker_resources[id];
                 if (!bank.sched) {
                     bank.sched.reset(ggml_backend_sched_new(
