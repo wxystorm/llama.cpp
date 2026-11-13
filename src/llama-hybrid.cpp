@@ -10571,8 +10571,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 };
         }
 
+        // Bank-count ablation: one physical Bank holds the largest GPU
+        // Region, never the sum of the model's logical GPU Regions.
+        const char * bank_count_env =
+            std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
+        const bool single_gpu_bank =
+            bank_count_env != nullptr &&
+            std::strcmp(bank_count_env, "1") == 0;
         // Identical GPU accounting to the full-layout memory guard:
-        // two-Bank peak weights + full-Prompt GPU KV + optional slot scratch.
+        // resident Bank peak weights + full-Prompt GPU KV + slot scratch.
         // The Planner applies this budget to E seeds and every Beam prefix.
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
@@ -10640,7 +10647,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes, htp_session_guard,
-             htp_limits, htp_memory_diag](
+             htp_limits, htp_memory_diag, single_gpu_bank](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
@@ -10653,11 +10660,34 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // every full candidate (including forced and GPU-tail)
                 // unless BOTH Bank peaks strictly fit their individual
                 // equal-size capacity after GPU KV and scratch reservation.
-                if (model.gpu_weight_streaming &&
-                        !llama_ring_planner::gpu_streamed_banks_fit(
-                            model, regions, candidate.xg)) {
-                    ++(*htp_memory_diag)[4]; // single-bank VRAM overflow
-                    return false;
+                if (model.gpu_weight_streaming) {
+                    bool gpu_fits = false;
+                    if (single_gpu_bank) {
+                        size_t max_weight = 0;
+                        int gpu_layers = 0;
+                        bool known = model.gpu_region_weight_bytes != nullptr;
+                        for (const auto & r : regions) {
+                            if (r.device != llama_region_ring_device::GPU) { continue; }
+                            size_t bytes = 0;
+                            known = known && model.gpu_region_weight_bytes(
+                                r.layer_begin, r.layer_end, bytes);
+                            max_weight = std::max(max_weight, bytes);
+                            gpu_layers += r.layer_end - r.layer_begin;
+                        }
+                        const long double kv =
+                            (long double) gpu_layers *
+                            model.gpu_kv_bytes_per_layer;
+                        gpu_fits = known && model.gpu_memory_budget_bytes > 0.0L &&
+                            (long double) max_weight + kv <
+                                model.gpu_memory_budget_bytes;
+                    } else {
+                        gpu_fits = llama_ring_planner::gpu_streamed_banks_fit(
+                            model, regions, candidate.xg);
+                    }
+                    if (!gpu_fits) {
+                        ++(*htp_memory_diag)[4];
+                        return false;
+                    }
                 }
 
                 std::array<long double, 3> usage {};
@@ -10884,10 +10914,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 model, regions, bank_peaks)) {
                             return false;
                         }
-                        usage[(size_t)
-                            llama_region_ring_device::GPU] +=
+                        const long double resident_weights = single_gpu_bank ?
+                            (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                             (long double) bank_peaks[0] +
                             (long double) bank_peaks[1];
+                        usage[(size_t)
+                            llama_region_ring_device::GPU] += resident_weights;
                     }
 
                     const size_t boundary_count =
@@ -11429,6 +11461,40 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // Cycle widths for deterministic APPLY_WIDE A/B checks.
             forced.concrete_regions = forced_regions;
 
+            if (single_gpu_bank && model.gpu_weight_streaming) {
+                size_t max_region_weight = 0;
+                int gpu_layers = 0;
+                for (const auto & r : forced_regions) {
+                    if (r.device != llama_region_ring_device::GPU) { continue; }
+                    size_t bytes = 0;
+                    if (!model.gpu_region_weight_bytes ||
+                            !model.gpu_region_weight_bytes(
+                                r.layer_begin, r.layer_end, bytes)) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_ABLATION_MEMORY] status=REJECT "
+                            "reason=GPU_REGION_WEIGHT_UNAVAILABLE\n");
+                        return false;
+                    }
+                    max_region_weight = std::max(max_region_weight, bytes);
+                    gpu_layers += r.layer_end - r.layer_begin;
+                }
+                const long double required =
+                    (long double) max_region_weight +
+                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer;
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_ABLATION_MEMORY] mode=SINGLE_BANK "
+                    "gpu_layers=%d max_region_mib=%.1f "
+                    "kv_mib=%.1Lf budget_mib=%.1Lf status=%s\n",
+                    gpu_layers, max_region_weight / 1048576.0,
+                    ((long double) gpu_layers *
+                        model.gpu_kv_bytes_per_layer) / 1048576.0L,
+                    model.gpu_memory_budget_bytes / 1048576.0L,
+                    required < model.gpu_memory_budget_bytes ? "PASS" : "REJECT");
+                if (model.gpu_memory_budget_bytes <= 0.0L ||
+                        required >= model.gpu_memory_budget_bytes) {
+                    return false;
+                }
+            }
             LLAMA_LOG_WARN(
                 "[REGION_RING_PLAN_FORCE_MEMORY] status=SKIPPED"
                 " reason=USER_FORCED_LAYOUT"
