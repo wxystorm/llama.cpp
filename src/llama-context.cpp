@@ -3933,11 +3933,33 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool gpu_bank_force_small_batch =
         gpu_bank_force_env != nullptr &&
         std::strcmp(gpu_bank_force_env, "1") == 0;
+    // Ablation controls: preserve weight streaming when disabling mover,
+    // and allow all GPU Regions to share one physical Bank. No new capacity
+    // is allocated when a single Bank is requested.
+    const char * gpu_bank_count_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
+    const bool gpu_bank_single =
+        gpu_bank_count_env != nullptr &&
+        std::strcmp(gpu_bank_count_env, "1") == 0;
+    const char * gpu_bank_prefetch_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_PREFETCH");
+    const bool gpu_bank_prefetch_enabled =
+        gpu_bank_prefetch_env == nullptr ||
+        std::strcmp(gpu_bank_prefetch_env, "0") != 0;
     const bool gpu_bank_streaming =
+        !gpu_bank_single && gpu_bank_prefetch_enabled &&
         llama_region_ring_gpu_bank_mover_enabled(
             gpu_weight_streaming, gpu_region_order.size(),
             (int) ubatch.n_tokens, gpu_bank_chunk_tokens,
             gpu_bank_force_small_batch);
+    if (gpu_weight_streaming) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_ABLATION] gpu_banks=%d gpu_prefetch=%d "
+            "gpu_bank_mover=%d status=CONFIGURED\n",
+            gpu_bank_single ? 1 : 2,
+            gpu_bank_prefetch_enabled ? 1 : 0,
+            gpu_bank_streaming ? 1 : 0);
+    }
     const bool gpu_bank_small_batch_override_applied =
         gpu_bank_streaming && gpu_bank_force_small_batch &&
         (int) ubatch.n_tokens < gpu_bank_min_tokens;
@@ -4007,7 +4029,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // CPU and GPU Bank A always have independent worker resources.
         // Bank B is needed only when a second GPU Region is executable.
         const size_t ring_pc_resource_count =
-            gpu_weight_streaming && gpu_region_order.size() >= 2 ? 3 : 2;
+            gpu_weight_streaming && !gpu_bank_single &&
+            gpu_region_order.size() >= 2 ? 3 : 2;
 
         for (size_t resource_id = 0;
              resource_id < ring_pc_resource_count; ++resource_id) {
@@ -4156,6 +4179,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         if (gpu_weight_streaming) {
             const size_t active_banks =
+                gpu_bank_single ? std::min<size_t>(1, gpu_region_order.size()) :
                 llama_region_ring_gpu_initial_bank_count(
                     gpu_region_order.size());
             LLAMA_LOG_INFO(
@@ -4179,7 +4203,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ring_res[0] == ring_res[1] ||
             ring_res[0] == ring_res[2] ||
             ring_res[1] == ring_res[2] ||
-            (gpu_weight_streaming &&
+            (gpu_weight_streaming && !gpu_bank_single &&
              (region_ring_worker_resources[2].sched.get() ==
                   ring_sched[0] ||
               region_ring_worker_resources[2].sched.get() ==
@@ -4205,10 +4229,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "weight_stream=%d status=ISOLATED_SCHED_ONLY\n",
             (void *) ring_sched[0], (void *) ring_res[0],
             (void *) ring_sched[1], (void *) ring_res[1],
-            gpu_weight_streaming ?
+            gpu_weight_streaming && !gpu_bank_single ?
                 (void *) region_ring_worker_resources[2].sched.get() :
                 nullptr,
-            gpu_weight_streaming ?
+            gpu_weight_streaming && !gpu_bank_single ?
                 (void *) region_ring_worker_resources[2].res.get() :
                 nullptr,
             (void *) ring_sched[2], (void *) ring_res[2],
@@ -4643,7 +4667,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens,
         region_chunk_tokens, slot_pool_size,
-        gpu_weight_streaming, std::move(ring_event_observer),
+        gpu_weight_streaming && !gpu_bank_single,
+        std::move(ring_event_observer),
         phone_input_push_requested, phone_input_stream_requested);
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
@@ -7316,6 +7341,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         }
 
                         const size_t bank_index =
+                            gpu_bank_single ? 0 :
                             llama_region_ring_gpu_weight_bank_for_rank(
                                 (size_t) rank);
                         const size_t selected_bank = bank_index + 1;
