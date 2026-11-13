@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import run_32b_ablation as a
 
@@ -17,6 +18,38 @@ class AblationTests(unittest.TestCase):
             cpu_reserve_mib=512,
             context=4096,
         )
+
+    def test_independent_profile_native_tokens_column(self):
+        rows = (
+            "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+            "prepare_ms,compute_ms,terminal,samples\\n"
+            "CPU,2,128,128,0,0,0,400,0,1\\n"
+            "GPU,2,128,128,0,0,0,20,0,1\\n"
+            "PHONE,2,128,256,0,0,0,70,0,1\\n"
+        ).replace("\\\\n", "\\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "profile.csv"
+            path.write_text(rows, encoding="utf-8")
+            sample = a.measured_ms_per_layer(path, 128)
+            self.assertEqual(sample, {"C": 200.0, "G": 10.0, "N": 35.0})
+
+    def test_a0_uses_fixed_htp_without_auto_profile(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(
+                model=Path(d) / "model.gguf",
+                exe=Path(d) / "llama-completion.exe",
+                rpc="127.0.0.1:50052",
+                prompt_dir=Path(d),
+                out=Path(d),
+                chunk=128, threads=8, limit=1, only_prompt="",
+                dry_run=False, plan_only=False)
+            with patch.object(a.subprocess, "call", return_value=0) as launch:
+                self.assertEqual(a.run_one("A0", a.FIXED, args), 0)
+            command = launch.call_args.args[0]
+            self.assertIn("--htp-only", command)
+            self.assertIn("--layout", command)
+            self.assertNotIn("--auto-plan", command)
+            self.assertNotIn("--force-plan-layout", command)
 
     def test_gguf_layer_tensor_offsets(self):
         def string(s):
