@@ -17,7 +17,7 @@ First obtain current Android available memory: `adb shell cat /proc/meminfo`. Co
 python .\tools\region-ring-experiments\run_32b_ablation.py `
   --model 'E:\llama\models\Qwen3-32B-Q4_K_M.gguf' `
   --rpc '10.39.52.114:50052' `
-  --out '.\32b-ablation' `
+  --out '.\32b-ablation-fixed-v2' `
   --cases A0 A1 A2 A3 `
   --phone-budget-mib 7800 `
   --limit 1
@@ -25,12 +25,12 @@ python .\tools\region-ring-experiments\run_32b_ablation.py `
 
 Replace 7800 with a budget based on actual Android MemAvailable. You can set `--only-prompt prompt_512_01.txt`, or use `--limit 0` for all 40 after the smoke tests pass.
 
-The first A0 run produces an independent G/C/N profile once; A1, A2 and A3 reuse it. To run A2/A3 alone, provide `--profile-csv` pointing to a previously measured independent profile, e.g.:
+A0 and A1 run fixed-layout HTP-only with `SKIP_PROFILE=1`; they do **not** need G/C/N calibration. A2 performs an independent G/C/N calibration once when no `--profile-csv` is supplied, saving it under `32b-ablation-fixed-v2/independent-profile/`. A3 only uses memory budget, not timings. To reuse an existing calibration for A2, provide `--profile-csv`, e.g.:
 
 ```powershell
 python .\tools\region-ring-experiments\run_32b_ablation.py `
   --cases A2 A3 `
-  --profile-csv '.\32b-ablation\A0\independent-profile\profile.csv' `
+  --profile-csv '.\32b-ablation-fixed-v2\independent-profile\profile.csv' `
   --phone-budget-mib 7800 `
   --limit 1
 ```
@@ -39,7 +39,8 @@ Use `--plan-only` to inspect layouts and memory estimates without running prompt
 
 ## Interpretation and limitations
 
-- A0 and A1 preload the **same first two GPU Bank weights**; A1 disables only subsequent background refills, leaving a more comparable H2D baseline.
+- A0 and A1 preload the **same first two GPU Bank weights** and both bypass standalone HTP profiling; A1 disables only subsequent background refills.
+- A2 starts a one-time calibration run only when no reusable G/C/N profile exists; if the Phone rejects every HTP probe, the calibration is **incomplete** and A2 correctly refuses to invent NPU service times. Inspect Phone `[HTP_INDEPENDENT_PROFILE]` logs, confirm the Phone -m GGUF matches PC Qwen3-32B, and check `GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1`, `GGML_RPC_PHONE_HTP_ONLY=1`, and compatible RPC patch versions.
 - A2 uses a physical **single GPU Bank**, keeps weight streaming on, and validates the peak GPU Region weights plus KV against native available VRAM.
 - A2's search is a **coarse independent-profile-guided heuristic**, not the full C++ DAG planner. The C++ forced-plan path still calculates its own estimate under the existing two-bank simulation assumptions, so avoid presenting its predicted latency as a validated single-bank simulation.
 - A3 is a **capacity-greedy** one-Cycle baseline. It does not optimize G/C/N speed. Both A2 and A3 change layer ownership relative to A0/A1.
