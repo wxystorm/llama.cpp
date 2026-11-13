@@ -195,5 +195,20 @@
     "prefill_ms": "milliseconds",
     "prefill_tps": "tokens per second",
     "missing_metric": "Empty not zero"
-  }
+  },
+  "partial_baselines": [
+    {
+      "id": "pc-only-32b",
+      "framework": "llama.cpp / PC-only",
+      "model": "32b",
+      "execution": "single-PC",
+      "kind": "incomplete_reference_baseline",
+      "observations": "runs/pc-only-32b/observations.csv",
+      "raw_log": "runs/pc-only-32b/256-group-server-log.txt",
+      "source": "user-reported measurements and provided server log, 2026-11-13",
+      "sample_count": 2,
+      "full_sharegpt40_run": false,
+      "note": "The 256-group measurement has 266 actual prompt tokens but unspecified prompt index; the 512_01 throughput is reported without a timing log. The runtime settings for this PC-only run were not supplied."
+    }
+  ]
 }

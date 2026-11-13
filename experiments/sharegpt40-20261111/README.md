@@ -26,3 +26,7 @@ For the new 32B source, only the top-level final `summary.csv` was used; the inc
 **Original binary ZIP files and verbose logs are not stored in this Git branch.** The GitHub connector can write UTF-8 text data, but cannot directly push local ZIP binaries. Use the archived checksums to verify separately retained original files.
 
 Performance comparisons require care: Prima, Jupiter, Galaxy and our fixed/layout-controlled region-ring runs differ in engine, model, quantization, planner and warmup/profile overhead. Prompt group labels are sampling buckets, not exact tokenizer counts. The `prefill_ms` field reflects the measured prefill stage, while `wall_ms` in detailed records can include setup and model preload time.
+
+## Additional partial baseline: single-PC 32B
+
+Two observations are documented in `runs/pc-only-32b/` and **are not part of the 360 complete-run records**. Group 256: 266 prompt tokens / 12325.37 ms / 21.58 tok/s from an engine log; group 512, `prompt_512_01.txt`: user-reported 32.9 tok/s, with no accompanying timing log. The group 256 log must not be assigned to `prompt_512_01.txt`.
