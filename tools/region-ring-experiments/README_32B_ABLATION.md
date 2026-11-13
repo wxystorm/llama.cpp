@@ -35,7 +35,7 @@ python .\tools\region-ring-experiments\run_32b_ablation.py `
   --limit 1
 ```
 
-Use `--plan-only` to inspect layouts and memory estimates without running prompts (it still needs a valid independent profile for A2). The output contains `A0/`, `A1/`, `A2/`, `A3/` with separate normal runner logs, plus `A2-plan.json`, `A3-plan.json`, and `plans.json`.
+Use `--plan-only` to inspect layouts and memory estimates without running prompts (it still needs a valid independent profile for A2). The output contains `A0/`, `A1/`, `A2/`, `A3/` with separate normal runner logs, plus `A2-plan.json`, `A3-plan.json`, `plans.json` and `ablation-comparison.csv` (per-prompt joined metrics).
 
 ## Interpretation and limitations
 
