@@ -11911,6 +11911,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
 
         bool htp_only_tail_selected = ablation_a2;
+        if (ablation_a2) {
+            // Tail activation/head belongs to the PC, not the HTP.
+            model.phone_autonomous_final = false;
+        }
         if (htp_only_auto) {
             // Preserve the proven CPU-transport HTP-only execution contract:
             // Phone-only transformer layers followed by a PC GPU tail/head.
