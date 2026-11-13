@@ -172,12 +172,11 @@ def check_runtime(folder, mode, selected, summaries):
 
 
 def run(args):
-    # Run A2 first to produce exactly ONE native independent C/G/N profile,
-    # then reuse it unchanged for A0/A1/A3. If A2 was not requested, the
-    # first requested mode owns that calibration. All results retain their
-    # own immutable run-config.json and resumable attempts.
-    modes = (("A2",) + tuple(m for m in args.modes if m != "A2")
-             if "A2" in args.modes else args.modes)
+    # The first selected mode produces one native independent C/G/N
+    # profile. Reuse that immutable profile for every later mode/repeat.
+    # Default order A0 -> A1 -> A2 -> A3 keeps the fixed-layout results
+    # even when a subsequent experimental single-Bank plan is infeasible.
+    modes = args.modes
     profile = args.profile_csv.resolve() if args.profile_csv else None
     if profile is None:
         first = modes[0]
