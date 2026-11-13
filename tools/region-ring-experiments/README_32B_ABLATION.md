@@ -67,7 +67,7 @@ Examples:
 
 # Reuse a previously verified independent C/G/N profile:
 .\tools\region-ring-experiments\run_32b_ablation.ps1 `
-  -ProfileCsv ".\mistral-or-32b-profile\independent-profile\profile.csv"
+  -ProfileCsv ".\qwen32b-profile\independent-profile\profile.csv"
 ```
 
 **Do not reuse a Profile from another model** (e.g., Mistral-24B). Choose
