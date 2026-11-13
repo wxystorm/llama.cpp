@@ -11185,8 +11185,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // C after maximizing G, subject to HTP session/Android RAM
                 // and the PC/GPU memory guards.
                 bool chosen = false;
-                for (int g = model.layers - 1; g >= 1 && !chosen; --g) {
-                    for (int cpu = 0;
+                // Phone-owned autonomous prefill currently needs >2
+                // stages, so retain at least one real CPU Region.
+                for (int g = model.layers - 2; g >= 1 && !chosen; --g) {
+                    for (int cpu = 1;
                             cpu <= model.layers - g - 1 && !chosen; ++cpu) {
                         std::vector<llama_region_ring_region> regions;
                         regions.push_back({
