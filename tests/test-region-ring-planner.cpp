@@ -580,6 +580,28 @@ int main() {
 
         const auto three_gpu_regions = llama_region_ring_parse(
             "G5,C2,P5,G5,C2,P5,G10,C2,P4", 40);
+        // Single physical Bank retains only the largest GPU Region.
+        // The normal two-Bank memory contract must remain unchanged.
+        model single_bank_model = single_model;
+        single_bank_model.gpu_bank_count = 1;
+        std::array<size_t, 2> single_peak {};
+        REQUIRE(gpu_weight_bank_peaks(
+            single_bank_model, three_gpu_regions, single_peak));
+        REQUIRE(single_peak[0] == 10 * 1024);
+        REQUIRE(single_peak[1] == 0);
+        std::array<size_t, 2> two_peaks {};
+        REQUIRE(gpu_weight_bank_peaks(
+            single_model, three_gpu_regions, two_peaks));
+        REQUIRE(two_peaks[0] == 10 * 1024);
+        REQUIRE(two_peaks[1] == 5 * 1024);
+        single_bank_model.gpu_memory_budget_bytes = 14 * 1024;
+        single_bank_model.gpu_kv_bytes_per_layer = 0;
+        single_bank_model.slot_pool = 0;
+        REQUIRE(gpu_streamed_banks_fit(
+            single_bank_model, three_gpu_regions, 64));
+        single_bank_model.gpu_bank_count = 2;
+        REQUIRE(!gpu_streamed_banks_fit(
+            single_bank_model, three_gpu_regions, 64));
         REQUIRE(!gpu_weight_h2d_total(
             single_model, three_gpu_regions, prompt_h2d));
         candidate rolling_without_profile;
