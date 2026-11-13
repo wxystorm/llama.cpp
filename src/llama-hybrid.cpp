@@ -10759,9 +10759,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         ++(*htp_memory_diag)[2]; // invalid bank geometry
                         return false;
                     }
-                    usage[(size_t) llama_region_ring_device::GPU] +=
+                    // One physical Bank is reused by all GPU Regions; it
+                    // needs only the largest Region, not both parity peaks.
+                    const long double resident_weights = single_gpu_bank ?
+                        (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                         (long double) bank_peaks[0] +
                         (long double) bank_peaks[1];
+                    usage[(size_t) llama_region_ring_device::GPU] +=
+                        resident_weights;
                 }
 
                 usage[(size_t) llama_region_ring_device::CPU] +=
@@ -10815,7 +10820,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (have_directional_weight_split &&
                 directional_ratio_ok && !htp_session_guard) {
             boundary_memory_feasible =
-                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio](
+                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank](
                     const std::vector<
                         llama_region_ring_region> & regions) {
                     std::array<long double, 3> usage {};
