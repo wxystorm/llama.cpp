@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "run_id": "ours-32b-g8p6",
+  "source_archive": "32b-我的-数据(1).zip",
+  "source_summary": "32b-g8p6-drain-first-all40-final/summary.csv",
+  "model": "${MODEL_DIR}/Qwen3-32B-Q4_K_M.gguf",
+  "executable": "${LLAMA_COMPLETION_EXE}",
+  "rpc": "${RPC_ENDPOINT}",
+  "prompt_dir": "${PROMPT_DIR}",
+  "layout": "G8,P6,G8,P6,G8,P6,G8,P6,G8",
+  "planner": "apply-wide",
+  "planning_mode": "fixed",
+  "skip_profile": true,
+  "source": "forced-skip-profile",
+  "context_by_prompt_group": {
+    "128": 512,
+    "256": 768,
+    "512": 1280,
+    "1024": 2304
+  },
+  "batch": 2048,
+  "ubatch": 2048,
+  "n_predict": 1,
+  "threads": 8,
+  "seed": 1234,
+  "flash_attention": "on",
+  "split_mode": "tensor",
+  "no_mmap": true,
+  "phone_backend": "HTP_ONLY",
+  "gpu_bank_streaming": true,
+  "gpu_bank_force_small_batch": true,
+  "chunk_policy": {
+    "plan_xc_xg_xp_values": [
+      96,
+      128
+    ],
+    "per_prompt_values_in": "per-prompt-details.csv",
+    "runtime_xc": 0
+  },
+  "flags": {
+    "drain_first_cycle": true,
+    "resource_aware_chunk_sched": true,
+    "phone_early_weights": true,
+    "priority_bank_mover": true,
+    "task_trace": true
+  },
+  "note": "Source ZIP also includes verification sub-runs; only the final root summary.csv provides the 40 recorded measurements."
+}

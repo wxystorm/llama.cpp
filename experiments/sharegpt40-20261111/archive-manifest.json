@@ -49,6 +49,20 @@
       "sha256": "b0ada2ac593c4fe9857254a343f915a2c837c4e432d97cf1be221e94a6bb56a6",
       "bytes": 273540,
       "runs": 40
+    },
+    {
+      "id": "ours-32b-g8p6",
+      "archive": "32b-我的-数据(1).zip",
+      "sha256": "7dffef5a2fc9f746ad385e36220f39c3e829a804d4e000bab32e7b2abc4fd7b7",
+      "bytes": 2703482,
+      "runs": 40
+    },
+    {
+      "id": "ours-24b-htp",
+      "archive": "24b-我的-数据(1).zip",
+      "sha256": "66557260722eb838ff296d084693d6ba76e6a706bdcbcbf3018c006eaf7e3b10",
+      "bytes": 2483946,
+      "runs": 40
     }
   ]
 }

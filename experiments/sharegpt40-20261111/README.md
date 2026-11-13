@@ -1,25 +1,28 @@
-# ShareGPT40 benchmark snapshot (2026-11-11)
+# ShareGPT40 benchmark snapshot (2026-11-13)
 
-Seven experiment groups cover **280 successful prompt-level records**: 10 prompts in each of four sampling groups (128, 256, 512, 1024) for each run. Existing results are preserved as recorded.
+Nine experimental runs cover **360 successful prompt-level records**: four prompt-length groups (128, 256, 512, 1024), with ten prompts per group and per run. Each result row is uniquely keyed by framework, model, prompt group and prompt filename. Existing run records are updated in-place when a matching key is found, never duplicated.
 
-## Included runs
+## Run inventory
 
-- Prima.cpp: Qwen3-14B, Qwen3-32B, and **Mistral Small 3.2 24B (Q6_K)**
-- Jupiter: Qwen3-14B and Qwen3-32B
-- Galaxy: Qwen3-14B
-- Our fixed region-ring: Qwen3-14B (`G9,P1,G9,P1,G9,P1,G10`)
+- Prima.cpp: Qwen3-14B, Qwen3-32B, Mistral Small 3.2 24B (Q6_K).
+- Jupiter: Qwen3-14B and Qwen3-32B.
+- Galaxy: Qwen3-14B.
+- Our distributed region-ring splits:
+  - Qwen3-14B `ours-14b-g9p1`, layout `G9,P1,G9,P1,G9,P1,G10`.
+  - Qwen3-32B `ours-32b-g8p6`, layout `G8,P6,G8,P6,G8,P6,G8,P6,G8`; fixed layout, chunk 96 or 128 per prompt, drain-first scheduling.
+  - Mistral Small 3.2 24B `ours-24b-htp`, layout `G5,P3,G5,P3,G6,P3,G5,P4,G6`; forced HTP plan and independent-backend profiling.
 
-## Files
+## Dataset files
 
-- `config.json`: model, hardware and run configuration metadata.
-- `results.csv`: 280 normalized prefill records.
-- `group-summary.csv`: 28 group means and medians for latency and throughput.
-- `archive-manifest.json`: filenames, original ZIP byte sizes and SHA-256 hashes.
-- `runs/ours-14b-g9p1/run-config.json`: fixed region-ring configuration.
-- `runs/ours-14b-g9p1/per-prompt-details.csv`: 40 prompt-level measurements and metadata.
-- `runs/prima-24b/run-config.json`: Prima 24B replay configuration, replacing original absolute paths and network addresses with environment placeholders.
-- `runs/prima-24b/per-prompt-details.csv`: Prima 24B prefill, decode and planner-output details for all 40 prompts.
+- `config.json`: models, hardware and per-run settings.
+- `results.csv`: 360 prefill observations.
+- `group-summary.csv`: 36 group means and medians (not pooled TPS).
+- `archive-manifest.json`: SHA-256 and byte sizes of nine uploaded source ZIPs.
+- `runs/*/run-config.json`: reproducible run settings, with host file paths and IP addresses replaced by environment placeholders.
+- `runs/*/per-prompt-details.csv`: context, chunks, latency, throughput, decode and GPU-bank timing measurements.
 
-The seven **original ZIP archives are not included in this Git branch**. The available repository connector supports submitting UTF-8 files but cannot upload local binary ZIP files directly. Use SHA-256 values in `archive-manifest.json` to verify locally retained source archives.
+For the new 32B source, only the top-level final `summary.csv` was used; the included separate verification runs are not double-counted. For the new 24B source, the final summary contains 40 PASS records; one earlier interrupted attempt was excluded.
 
-Run configurations are not identical: Prima uses HiGHS, Jupiter uses Sequence DP, Galaxy uses RANK_LOCAL, and our 14B system uses a fixed ring. The 24B Prima measurements use Mistral Small 3.2 Q6_K rather than Qwen3. Reported group values are unweighted means/medians, not pooled throughput. Sampling group labels are not exact tokenizer token counts.
+**Original binary ZIP files and verbose logs are not stored in this Git branch.** The GitHub connector can write UTF-8 text data, but cannot directly push local ZIP binaries. Use the archived checksums to verify separately retained original files.
+
+Performance comparisons require care: Prima, Jupiter, Galaxy and our fixed/layout-controlled region-ring runs differ in engine, model, quantization, planner and warmup/profile overhead. Prompt group labels are sampling buckets, not exact tokenizer counts. The `prefill_ms` field reflects the measured prefill stage, while `wall_ms` in detailed records can include setup and model preload time.

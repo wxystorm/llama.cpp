@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "experiment": "sharegpt40-seven-baselines-2026-11-11",
-  "prepared_on": "2026-11-11",
+  "experiment": "sharegpt40-nine-baselines-2026-11-13",
+  "prepared_on": "2026-11-13",
   "dataset": {
     "name": "ShareGPT40",
     "prompt_groups": [
@@ -147,6 +147,48 @@
         "phone_gpu_layers": 0
       },
       "runs": 40
+    },
+    {
+      "id": "ours-32b-g8p6",
+      "framework": "ours",
+      "model": "32b",
+      "method": "fixed region-ring GPU+HTP",
+      "run_config": "runs/ours-32b-g8p6/run-config.json",
+      "layout": "G8,P6,G8,P6,G8,P6,G8,P6,G8",
+      "planner": "apply-wide",
+      "skip_profile": true,
+      "plan_chunks": [
+        96,
+        128
+      ],
+      "batch": 2048,
+      "ubatch": 2048,
+      "predict": 1,
+      "threads": 8,
+      "no_mmap": true,
+      "gpu_weight_streaming": true,
+      "gpu_bank_force_small_batch": true,
+      "drain_first_cycle": true
+    },
+    {
+      "id": "ours-24b-htp",
+      "framework": "ours",
+      "model": "24b",
+      "method": "forced HTP region-ring with independent backend profile",
+      "run_config": "runs/ours-24b-htp/run-config.json",
+      "layout": "G5,P3,G5,P3,G6,P3,G5,P4,G6",
+      "planner": "apply-wide",
+      "planning_mode": "independent-backend-profile-then-plan",
+      "skip_profile": false,
+      "xc": 96,
+      "xg": 96,
+      "xp": 96,
+      "batch": 2048,
+      "ubatch": 2048,
+      "predict": 1,
+      "threads": 8,
+      "no_mmap": true,
+      "gpu_weight_streaming": true
     }
   ],
   "measurements": {
