@@ -1,40 +1,41 @@
-# ShareGPT40 benchmark snapshot (2026-11-13)
+# ShareGPT40 benchmark results (2026-11-13)
 
-Ten experimental runs cover **396 successful prompt-level records**: four prompt-length groups (128, 256, 512, 1024), with ten prompts per group and per run. Each result row is uniquely keyed by framework, model, prompt group and prompt filename. Existing run records are updated in-place when a matching key is found, never duplicated.
+This branch contains **10 experimental runs** and **396 successful prompt-level observations**, spanning prompt groups 128, 256, 512 and 1024.
+
+- **Nine** runs have 40 PASS observations each.
+- **Jupiter Mistral Small 3.2-24B** has 36 PASS observations (128: 10, 256: 10, 512: 10, 1024: 6). The four uncompleted 1024 prompts are **not** counted or inferred.
+- Two extra **PC-only Qwen3-32B** reference observations are recorded separately; they are not counted in the 396 complete/partial experiment observations or group statistics.
 
 ## Run inventory
 
-- Prima.cpp: Qwen3-14B, Qwen3-32B, Mistral Small 3.2 24B (Q6_K).
-- Jupiter: Qwen3-14B and Qwen3-32B.
-- Galaxy: Qwen3-14B.
-- Our distributed region-ring splits:
-  - Qwen3-14B `ours-14b-g9p1`, layout `G9,P1,G9,P1,G9,P1,G10`.
-  - Qwen3-32B `ours-32b-g8p6`, layout `G8,P6,G8,P6,G8,P6,G8,P6,G8`; fixed layout, chunk 96 or 128 per prompt, drain-first scheduling.
-  - Mistral Small 3.2 24B `ours-24b-htp`, layout `G5,P3,G5,P3,G6,P3,G5,P4,G6`; forced HTP plan and independent-backend profiling.
+| Method | Model | Run ID | Status |
+| --- | --- | --- | --- |
+| Prima.cpp | Qwen3-14B | `prima-14b` | 40/40 |
+| Prima.cpp | Mistral Small 3.2-24B Q6_K | `prima-24b` | 40/40 |
+| Prima.cpp | Qwen3-32B | `prima-32b` | 40/40 |
+| Jupiter | Qwen3-14B | `jupiter-14b` | 40/40 |
+| Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36/40 |
+| Jupiter | Qwen3-32B | `jupiter-32b` | 40/40 |
+| Galaxy | Qwen3-14B | `galaxy-14b` | 40/40 |
+| Ours (region ring) | Qwen3-14B | `ours-14b-g9p1` | 40/40 |
+| Ours (region ring) | Mistral Small 3.2-24B Q6_K | `ours-24b-htp` | 40/40 |
+| Ours (region ring) | Qwen3-32B | `ours-32b-g8p6` | 40/40 |
 
 ## Dataset files
 
-- `config.json`: models, hardware and per-run settings.
-- `results.csv`: 360 prefill observations.
-- `group-summary.csv`: 36 group means and medians (not pooled TPS).
-- `archive-manifest.json`: SHA-256 and byte sizes of nine uploaded source ZIPs.
-- `runs/*/run-config.json`: reproducible run settings, with host file paths and IP addresses replaced by environment placeholders.
-- `runs/*/per-prompt-details.csv`: context, chunks, latency, throughput, decode and GPU-bank timing measurements.
+- `config.json`: model and runtime configuration for each run, including references to per-run config files.
+- `results.csv`: 396 successful individual prefill measurements; primary key is `framework,model,group,prompt`.
+- `group-summary.csv`: 40 group rows containing arithmetic mean and median prefill throughput and latency. Each `runs` field records the actual sample count (Jupiter 24B group 1024 has `6`).
+- `archive-manifest.json`: source ZIP filenames, sizes and SHA-256 hashes.
+- `runs/jupiter-24b/run-config.json`: Jupiter 24B DP configuration, sanitized to use path and RPC placeholders.
+- `runs/jupiter-24b/per-prompt-details.csv`: all 36 observed DP measurements and selected chunk plans.
+- `runs/ours-*/` and `runs/prima-24b/`: other available run configurations and detailed measurements.
+- `runs/pc-only-32b/observations.csv`: single-PC 32B reference: **256 group = 21.58 tok/s** (266 tokens from a server log, prompt index unknown); **512 group = 32.9 tok/s** (`prompt_512_01.txt`, user-reported). Each reference is a single observation, not a Top-5 mean.
 
-For the new 32B source, only the top-level final `summary.csv` was used; the included separate verification runs are not double-counted. For the new 24B source, the final summary contains 40 PASS records; one earlier interrupted attempt was excluded.
+## Experimental notes
 
-**Original binary ZIP files and verbose logs are not stored in this Git branch.** The GitHub connector can write UTF-8 text data, but cannot directly push local ZIP binaries. Use the archived checksums to verify separately retained original files.
+The Jupiter 24B run used Sequence DP with `graph_prebuild=false`, `context=2048`, `batch=2048`, `ubatch=128`, `pc_layers=32`, `cpu_layers=24`, and 96-128 chunk bounds. Its status is partial because four 1024-group samples lack completed DP results.
 
-Performance comparisons require care: Prima, Jupiter, Galaxy and our fixed/layout-controlled region-ring runs differ in engine, model, quantization, planner and warmup/profile overhead. Prompt group labels are sampling buckets, not exact tokenizer counts. The `prefill_ms` field reflects the measured prefill stage, while `wall_ms` in detailed records can include setup and model preload time.
+Prompt groups (128, 256, 512, 1024) are sampling buckets and **are not exact tokenizer token counts**. Engines, quantization, run settings and tokenization can differ between methods; rank-sorted Top-5 measurements need not correspond to the same prompt. Group means and medians are arithmetic calculations on measured observations, not pooled TPS. The PC-only references are not used in these means or Top-5 ranking.
 
-## Additional partial baseline: single-PC 32B
-
-Two observations are documented in `runs/pc-only-32b/` and **are not part of the 360 complete-run records**. Group 256: 266 prompt tokens / 12325.37 ms / 21.58 tok/s from an engine log; group 512, `prompt_512_01.txt`: user-reported 32.9 tok/s, with no accompanying timing log. The group 256 log must not be assigned to `prompt_512_01.txt`.
-
-## Jupiter 24B addition (partial)
-
-The uploaded `jupiter-24b-数据.zip` contains 36 PASS Sequence DP results for Mistral Small 3.2-24B-Q6_K: groups 128/256/512 contain 10 each; group 1024 contains only 6. The additional 4 entries were not completed in the supplied DP summary and are **not imputed**. The run used `graph_prebuild=false`, 2048 context, batch 2048, ubatch 128, 32 PC layers (24 CPU), DP chunks bounded from 96 to 128, and one benchmark repeat.
-
-For this run, `runs/jupiter-24b/run-config.json` records the parameters and `runs/jupiter-24b/per-prompt-details.csv` retains the observed per-prompt TPS, latency and selected DP chunks. The group summary `runs` column contains actual sample counts (for Jupiter 24B: 10/10/10/6). Jupiter 24B Top 5 at 1024 is based on five of the six available values.
-
-The binary ZIP archive is not included in this repository branch; its SHA-256 is preserved in `archive-manifest.json`. Existing nine complete runs remain unchanged. PC-only 32B remains a separate two-observation reference in `runs/pc-only-32b/` and is not part of the Top 5 samples or full group statistics.
+The **original binary ZIP archives are not committed** to this branch because the connected GitHub writer only supports UTF-8 files. SHA-256 values of the original archives are stored in `archive-manifest.json`.
