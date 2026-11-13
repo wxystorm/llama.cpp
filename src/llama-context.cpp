@@ -3963,6 +3963,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const bool gpu_bank_small_batch_override_applied =
         gpu_bank_streaming && gpu_bank_force_small_batch &&
         (int) ubatch.n_tokens < gpu_bank_min_tokens;
+    // A0/A1 comparison starts with the same two initial resident Regions.
+    // Turning off background refills must not force initial H2D on the
+    // first task in A1 when A0 had preloaded the same weights.
+    const bool gpu_bank_initial_residency =
+        gpu_weight_streaming && !gpu_bank_single &&
+        (gpu_bank_streaming || !gpu_bank_prefetch_enabled);
 
     if (isolate_device_resources) {
         // The caller reads logits from the canonical Scheduler. Phone-final
@@ -4257,13 +4263,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order, ready, owners);
     };
     bool initial_banks_ready =
-        gpu_bank_streaming && initial_banks_match();
+        gpu_bank_initial_residency && initial_banks_match();
 
     // In graphless mode the default tiny warmup is intentionally skipped.
     // The worker schedulers do not exist until this point, so perf_reset()
     // could not preload the initial CUDA weight Banks. Prime them now,
     // after resources are created but before any real Chunk is dispatched.
-    if (gpu_bank_streaming && !initial_banks_ready &&
+    if (gpu_bank_initial_residency && !initial_banks_ready &&
             !region_ring_initial_banks_loaded) {
         const int64_t prime_begin_us = ggml_time_us();
         const bool primed = region_ring_load_initial_gpu_banks();
@@ -4281,7 +4287,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // The next UBatch restarts at its first two GPU Regions. Recover the
     // initial window before dispatch, after the preceding UBatch workers
     // and Bank mover have all joined. Cold-start failures remain strict.
-    if (gpu_bank_streaming && !initial_banks_ready &&
+    if (gpu_bank_initial_residency && !initial_banks_ready &&
             region_ring_initial_banks_loaded) {
         const size_t old_a = region_ring_worker_resources[1].bank_region;
         const size_t old_b = region_ring_worker_resources[2].bank_region;
@@ -4304,7 +4310,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             initial_banks_ready ? "READY" : "FAIL");
     }
 
-    if (gpu_bank_streaming && !initial_banks_ready) {
+    if (gpu_bank_initial_residency && !initial_banks_ready) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK] phase=PREFILL_START status=REJECT "
             "reason=INITIAL_BANKS_NOT_LOADED "
@@ -4321,7 +4327,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    if (gpu_bank_streaming && !region_ring_initial_banks_loaded) {
+    if (gpu_bank_initial_residency && !region_ring_initial_banks_loaded) {
         // State was recovered by successful warmup demand loads; no
         // weight upload is needed before this large prompt.
         region_ring_initial_banks_loaded = true;
@@ -4332,7 +4338,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order[0], gpu_region_order[1]);
     }
 
-    if (gpu_bank_streaming) {
+    if (gpu_bank_initial_residency) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK] phase=PREFILL_START banks=2 "
             "bankA_region=%zu bankB_region=%zu "
