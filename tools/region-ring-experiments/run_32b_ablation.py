@@ -242,7 +242,15 @@ def multi_cycle(weights: list[int], profile: dict[str, float], gpu_free: int,
                 cpu_service = cpu_total * profile["C"]
                 npu_service = npu_total * profile["N"]
                 boundaries = len(layout) - 1
-                h2d_ms = sum(weights[i] for i in range(count)) / MIB / 4.1
+                # Only GPU-owned weights traverse H2D. Counting all model
+                # weights would bias the candidate search against GPU layers.
+                offset = 0
+                gpu_weight_bytes = 0
+                for kind, depth in layout:
+                    if kind == "G":
+                        gpu_weight_bytes += sum(weights[offset:offset + depth])
+                    offset += depth
+                h2d_ms = (gpu_weight_bytes / MIB) / 4.1
                 score = max(gpu_service + h2d_ms, cpu_service, npu_service)
                 score += 12.0 * boundaries + 0.25 * sum(
                     (g * profile["G"] + p * profile["N"])
