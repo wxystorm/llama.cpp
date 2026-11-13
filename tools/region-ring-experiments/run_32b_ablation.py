@@ -322,6 +322,29 @@ def run_one(case: str, layout: str, args, stage_csv: Path | None) -> int:
     return subprocess.call(command, cwd=str(ROOT))
 
 
+def write_comparison(out: Path, plans: dict) -> None:
+    """Join one standard runner summary per case, no timing fabrication."""
+    target = out / "ablation-comparison.csv"
+    columns = ["case", "prompt", "status", "layout", "prefill_tokens",
+               "prefill_ms", "prefill_tps", "gpu_bank_streaming",
+               "bank_refills", "bank_h2d_ms", "bank_gpu_wait_ms",
+               "gpu_weight_stage_ms", "plan_predicted_ms"]
+    with target.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for case, meta in plans.items():
+            source = out / case / "summary.csv"
+            if not source.is_file():
+                continue
+            with source.open(encoding="utf-8-sig", newline="") as f:
+                for row in csv.DictReader(f):
+                    writer.writerow({k: (
+                        case if k == "case" else
+                        meta["layout"] if k == "layout" else
+                        row.get(k, "")
+                    ) for k in columns})
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", type=Path, default=Path(r"E:\llama\models\Qwen3-32B-Q4_K_M.gguf"))
@@ -394,6 +417,8 @@ def main() -> int:
             return ret
     (args.out / "plans.json").write_text(
         json.dumps(plans, indent=2), encoding="utf-8")
+    write_comparison(args.out, plans)
+    print(f"[ABLATION_SUMMARY] {args.out / 'ablation-comparison.csv'}", flush=True)
     return 0
 
 
