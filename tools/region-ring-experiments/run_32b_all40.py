@@ -786,8 +786,9 @@ def get_args(argv=None):
     args = parser.parse_args(argv)
     if not 3 <= args.model_layers <= 256:
         parser.error("--model-layers must be between 3 and 256")
-    if args.htp_only and not args.auto_plan:
-        parser.error("--htp-only in this runner requires --auto-plan")
+    if args.htp_only and not args.auto_plan and args.layout is None:
+        parser.error("--htp-only fixed mode requires explicit --layout; "
+                     "use --auto-plan for independent profiling")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
     # An independent C/G/N calibration is generated at first model startup
@@ -801,7 +802,7 @@ def get_args(argv=None):
     if args.htp_only and args.n_predict != 1:
         parser.error("HTP-only autonomous prefill currently requires --n-predict 1")
     if args.htp_only and args.no_phone_weight_preload:
-        parser.error("--htp-only auto-plan requires early Phone Region configuration")
+        parser.error("--htp-only requires early Phone Region configuration")
     if args.auto_plan and args.warmup_prompt is not None:
         parser.error("--warmup-prompt requires fixed mode")
     if args.skip_warmup and args.warmup_prompt is not None:
@@ -1069,6 +1070,8 @@ def main(argv=None):
         # Do not change the legacy off-mode signature; ON requires a
         # different experiment output and a freshly rebuilt engine.
         config["force_small_batch_mover"] = True
+    if args.htp_only and not args.auto_plan:
+        config["phone_execution"] = "CPU_TRANSPORT_HTP_ONLY_FIXED_SKIP_PROFILE"
     if args.auto_plan:
         # Keep fixed-mode schema 2 intact for previously completed runs.
         # Automatic Profile + Plan has a separate output and signature.
