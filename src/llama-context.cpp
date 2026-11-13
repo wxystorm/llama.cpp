@@ -14540,7 +14540,8 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         [&](size_t gpu_rank) -> bool {
             const size_t region = gpu_regions[gpu_rank];
             const size_t bank_index =
-                llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
+                llama_region_ring_gpu_weight_bank_for_rank(
+                    gpu_rank, gpu_bank_count);
             auto & bank = region_ring_worker_resources[bank_index + 1];
             const auto & stage = stages[region];
             ggml_status status = GGML_STATUS_SUCCESS;
