@@ -375,7 +375,12 @@ def main() -> int:
         print(f"[ABLATION_PLAN] case={case} layout={layout} info={json.dumps(details)}", flush=True)
         (args.out / f"{case}-plan.json").write_text(
             json.dumps(plans[case], indent=2), encoding="utf-8")
-        ret = run_one(case, layout, args, profile if case in ("A2", "A3") else args.profile_csv)
+        ret = run_one(case, layout, args, profile)
+        if ret == 0 and case == "A0" and profile is None:
+            shared = args.out / "A0/independent-profile/profile.csv"
+            if shared.is_file():
+                profile = shared
+                print(f"[ABLATION_PROFILE] source=A0_REUSE csv={profile}", flush=True)
         if ret != 0:
             print(f"[ABLATION_FAIL] case={case} exit_code={ret}", file=sys.stderr)
             return ret
