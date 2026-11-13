@@ -11089,7 +11089,19 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 std::string why;
                 if (!llama_ring_planner::simulate(
                         demand_model, regions, c, &why)) {
-                    return false;
+                    // A3 is intentionally a MEMORY-only greedy allocator.
+                    // A large contiguous Region can exceed sampled G/C/N
+                    // depths: missing cost interpolation must not invalidate
+                    // an otherwise memory-checked executable layout.
+                    if (!ablation_a3) { return false; }
+                    LLAMA_LOG_WARN(
+                        "[REGION_RING_ABLATION_PLAN] mode=A3 "
+                        "profile=UNSCORED reason=%s "
+                        "policy=MEMORY_ONLY\n", why.c_str());
+                    c.wall_ms = -1.0;
+                    result.selected = std::move(c);
+                    result.valid = true;
+                    return true;
                 }
                 ++scored;
                 // Conservative non-overlapped H2D demand penalty. The first
@@ -11168,13 +11180,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     }
                 }
             } else {
-                // Memory-only priority: maximize GPU layers, then CPU
-                // layers, leave a nonempty final HTP segment. The full
-                // HTP per-session/shared budget is checked by callback.
+                // Memory-only priority is GPU, then NPU (HTP), then CPU.
+                // Physical graph order stays G -> [C] -> P. Thus minimize
+                // C after maximizing G, subject to HTP session/Android RAM
+                // and the PC/GPU memory guards.
                 bool chosen = false;
                 for (int g = model.layers - 1; g >= 1 && !chosen; --g) {
-                    for (int cpu = model.layers - g - 1;
-                            cpu >= 0 && !chosen; --cpu) {
+                    for (int cpu = 0;
+                            cpu <= model.layers - g - 1 && !chosen; ++cpu) {
                         std::vector<llama_region_ring_region> regions;
                         regions.push_back({
                             llama_region_ring_device::GPU, 0, g});
@@ -11200,7 +11213,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "strategy=%s memory_feasible=%zu scored=%zu "
                 "layout=%s estimated_ms=%.3f status=%s\n",
                 ablation_a2 ? "A2" : "A3",
-                ablation_a2 ? "PROFILE_COARSE_CYCLE" : "MEMORY_GREEDY_G_C_N",
+                ablation_a2 ? "PROFILE_COARSE_CYCLE" :
+                              "MEMORY_GREEDY_GPU_HTP_CPU",
                 memory_ok, scored,
                 result.valid ?
                     llama_region_ring_layout_string(
