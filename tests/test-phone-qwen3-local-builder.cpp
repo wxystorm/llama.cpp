@@ -161,6 +161,74 @@ int main() {
     wrong_projection.wo = w.wo; // 14B's narrower Q output projection
     CHECK(!ggml_phone_qwen3::validate_weights(
         wide, wrong_projection, reason));
+    // Mistral Small 3.x (GGUF arch=llama) has Normal RoPE and no Q/K
+    // weight RMSNorm. Its optional affine biases must survive HTP graph
+    // construction; Qwen3's graph above must remain unchanged.
+    auto mistral = p;
+    mistral.version = ggml_phone_owned::k_htp_only_plan_version;
+    mistral.flags = ggml_phone_owned::flags_for_layers(2, true);
+    mistral.rope_type = ggml_phone_owned::k_rope_norm;
+    mistral.region = 8;
+    mistral.layer = 18;
+    mistral.total_tokens = 256;
+    mistral.chunk_tokens = 128;
+    mistral.n_kv = 256;
+    mistral.n_heads = 32;
+    CHECK(ggml_phone_owned::validate(mistral, reason));
+    ggml_init_params llama_params = {
+        ggml_tensor_overhead() * 2048 +
+            ggml_graph_overhead_custom(512, false) + 4096,
+        nullptr, true
+    };
+    ggml_context * llama_ctx = ggml_init(llama_params);
+    CHECK(llama_ctx);
+    auto llama_weights = weights(llama_ctx, 32);
+    llama_weights.q_norm = nullptr;
+    llama_weights.k_norm = nullptr;
+    llama_weights.ffn_gate = ggml_new_tensor_2d(
+        llama_ctx, GGML_TYPE_F32, 5120, 32768);
+    llama_weights.ffn_up = ggml_new_tensor_2d(
+        llama_ctx, GGML_TYPE_F32, 5120, 32768);
+    llama_weights.ffn_down = ggml_new_tensor_2d(
+        llama_ctx, GGML_TYPE_F32, 32768, 5120);
+    llama_weights.wq_b = ggml_new_tensor_1d(
+        llama_ctx, GGML_TYPE_F32, 4096);
+    llama_weights.ffn_up_b = ggml_new_tensor_1d(
+        llama_ctx, GGML_TYPE_F32, 32768);
+    CHECK(ggml_phone_qwen3::validate_weights(
+        mistral, llama_weights, reason));
+    for (uint32_t chunk = 0; chunk < 2; ++chunk) {
+        ggml_phone_qwen3::graph_result llama_graph {};
+        CHECK(ggml_phone_qwen3::build_graph(
+            llama_ctx, mistral, chunk, llama_weights, llama_graph, reason));
+        CHECK(llama_graph.output->ne[0] == 5120);
+        CHECK(llama_graph.output->ne[1] == 128);
+        int rope_nodes = 0, rms_nodes = 0, flash_nodes = 0;
+        int kv_writes = 0, glu_nodes = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(llama_graph.graph); ++i) {
+            const ggml_tensor * node =
+                ggml_graph_node(llama_graph.graph, i);
+            rope_nodes += node->op == GGML_OP_ROPE;
+            rms_nodes += node->op == GGML_OP_RMS_NORM;
+            flash_nodes += node->op == GGML_OP_FLASH_ATTN_EXT;
+            kv_writes += node->op == GGML_OP_SET_ROWS;
+            glu_nodes += node->op == GGML_OP_GLU;
+        }
+        CHECK(rope_nodes == 2 && rms_nodes == 2);
+        CHECK(flash_nodes == 1 && kv_writes == 2 && glu_nodes == 1);
+    }
+    // Neither Qwen3 head RMSNorm nor an incorrectly shaped bias can be
+    // silently used in a Llama HTP layer.
+    auto invalid_llama_weights = llama_weights;
+    invalid_llama_weights.q_norm = w.q_norm;
+    CHECK(!ggml_phone_qwen3::validate_weights(
+        mistral, invalid_llama_weights, reason));
+    invalid_llama_weights = llama_weights;
+    invalid_llama_weights.wq_b = ggml_new_tensor_1d(
+        llama_ctx, GGML_TYPE_F32, 5120);
+    CHECK(!ggml_phone_qwen3::validate_weights(
+        mistral, invalid_llama_weights, reason));
+    ggml_free(llama_ctx);
     ggml_free(ctx);
     std::puts("test-phone-qwen3-local-builder PASS");
     return 0;

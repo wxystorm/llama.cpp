@@ -166,14 +166,33 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     const bool hidden_input      = stage_graph && params.hybrid_hidden_input;
     const bool build_output_head = !stage_graph || params.hybrid_output_head;
     const bool embedding_only    = stage_graph && params.hybrid_embedding_only;
+    // The final PC head is a legal zero-layer interval: consume the last
+    // Region's F32 hidden state and apply only RMSNorm and LM projection.
+    const bool head_only = stage_graph && layer_begin == n_layer &&
+        layer_end == n_layer && hidden_input && build_output_head &&
+        !embedding_only;
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
     GGML_ASSERT(n_embd_head == n_rot);
-    GGML_ASSERT(layer_begin >= 0 && layer_begin < layer_end && layer_end <= n_layer);
+    GGML_ASSERT(layer_begin >= 0 &&
+                (layer_begin < layer_end || head_only) &&
+                layer_end <= n_layer);
     GGML_ASSERT(layer_begin == 0 || hidden_input);
     GGML_ASSERT(!build_output_head || layer_end == n_layer);
     GGML_ASSERT(!hidden_input || (ubatch.token == nullptr && ubatch.embd != nullptr));
     GGML_ASSERT(!embedding_only || (layer_begin == 0 && !hidden_input));
+
+    if (head_only) {
+        ggml_tensor * head = build_inp_stage();
+        head = build_norm(head, model.output_norm, NULL, LLM_NORM_RMS, -1);
+        cb(head, "result_norm", -1);
+        res->t_embd = head;
+        head = build_lora_mm(model.output, head, model.output_s);
+        cb(head, "result_output", -1);
+        res->t_logits = head;
+        ggml_build_forward_expand(gf, head);
+        return;
+    }
 
     ggml_tensor * cur;
     ggml_tensor * inpL;

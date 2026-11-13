@@ -3805,11 +3805,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         stages.begin(), stages.end(), [](const auto & stage) {
             return stage.kind == llama_hybrid_runtime_stage_kind::PHONE;
         });
-    // PC-final stages publish l_out for a canonical CPU-only Qwen3 Head.
+    // PC-final stages publish l_out for a canonical CPU-only dense Llama/Qwen3 Head.
     // The legacy Phone-final graph still owns the caller's logits otherwise.
     const bool pc_final_head_enabled =
         !terminal_phone && !directional_runtime &&
-        model.arch == LLM_ARCH_QWEN3;
+        (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_LLAMA);
     if (!terminal_phone && !pc_final_head_enabled) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_PC_FINAL_HEAD] event=REJECT "
@@ -3919,25 +3919,56 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     const int gpu_bank_chunk_tokens =
         !gpu_region_order.empty() ?
             stages[gpu_region_order.front()].macro_tokens : 0;
+    // Require two actual GPU Chunks, even when the second is partial.
+    // Keep the one-Chunk demand path and the explicit override for A/B.
     const int gpu_bank_min_tokens =
-        gpu_bank_chunk_tokens > 0 ?
-            2 * gpu_bank_chunk_tokens :
+        gpu_bank_chunk_tokens > 0 &&
+        gpu_bank_chunk_tokens < std::numeric_limits<int>::max() ?
+            gpu_bank_chunk_tokens + 1 :
             std::numeric_limits<int>::max();
-    // Opt-in: remove the two-full-GPU-Chunk minimum for short prefill.
-    // Single-token decode stays on the original demand-loading path.
+    // The explicit override may also test a one-Chunk prefill, but
+    // single-token decode always stays on demand loading.
     const char * gpu_bank_force_env =
         std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
     const bool gpu_bank_force_small_batch =
         gpu_bank_force_env != nullptr &&
         std::strcmp(gpu_bank_force_env, "1") == 0;
+    // Ablation controls: preserve weight streaming when disabling mover,
+    // and allow all GPU Regions to share one physical Bank. No new capacity
+    // is allocated when a single Bank is requested.
+    const char * gpu_bank_count_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
+    const bool gpu_bank_single =
+        gpu_bank_count_env != nullptr &&
+        std::strcmp(gpu_bank_count_env, "1") == 0;
+    const char * gpu_bank_prefetch_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_PREFETCH");
+    const bool gpu_bank_prefetch_enabled =
+        gpu_bank_prefetch_env == nullptr ||
+        std::strcmp(gpu_bank_prefetch_env, "0") != 0;
     const bool gpu_bank_streaming =
+        !gpu_bank_single && gpu_bank_prefetch_enabled &&
         llama_region_ring_gpu_bank_mover_enabled(
             gpu_weight_streaming, gpu_region_order.size(),
             (int) ubatch.n_tokens, gpu_bank_chunk_tokens,
             gpu_bank_force_small_batch);
+    if (gpu_weight_streaming) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_ABLATION] gpu_banks=%d gpu_prefetch=%d "
+            "gpu_bank_mover=%d status=CONFIGURED\n",
+            gpu_bank_single ? 1 : 2,
+            gpu_bank_prefetch_enabled ? 1 : 0,
+            gpu_bank_streaming ? 1 : 0);
+    }
     const bool gpu_bank_small_batch_override_applied =
         gpu_bank_streaming && gpu_bank_force_small_batch &&
         (int) ubatch.n_tokens < gpu_bank_min_tokens;
+    // A0/A1 comparison starts with the same two initial resident Regions.
+    // Turning off background refills must not force initial H2D on the
+    // first task in A1 when A0 had preloaded the same weights.
+    const bool gpu_bank_initial_residency =
+        gpu_weight_streaming && !gpu_bank_single &&
+        (gpu_bank_streaming || !gpu_bank_prefetch_enabled);
 
     if (isolate_device_resources) {
         // The caller reads logits from the canonical Scheduler. Phone-final
@@ -4004,7 +4035,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // CPU and GPU Bank A always have independent worker resources.
         // Bank B is needed only when a second GPU Region is executable.
         const size_t ring_pc_resource_count =
-            gpu_weight_streaming && gpu_region_order.size() >= 2 ? 3 : 2;
+            gpu_weight_streaming && !gpu_bank_single &&
+            gpu_region_order.size() >= 2 ? 3 : 2;
 
         for (size_t resource_id = 0;
              resource_id < ring_pc_resource_count; ++resource_id) {
@@ -4153,6 +4185,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
         if (gpu_weight_streaming) {
             const size_t active_banks =
+                gpu_bank_single ? std::min<size_t>(1, gpu_region_order.size()) :
                 llama_region_ring_gpu_initial_bank_count(
                     gpu_region_order.size());
             LLAMA_LOG_INFO(
@@ -4176,7 +4209,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             ring_res[0] == ring_res[1] ||
             ring_res[0] == ring_res[2] ||
             ring_res[1] == ring_res[2] ||
-            (gpu_weight_streaming &&
+            (gpu_weight_streaming && !gpu_bank_single &&
              (region_ring_worker_resources[2].sched.get() ==
                   ring_sched[0] ||
               region_ring_worker_resources[2].sched.get() ==
@@ -4202,10 +4235,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             "weight_stream=%d status=ISOLATED_SCHED_ONLY\n",
             (void *) ring_sched[0], (void *) ring_res[0],
             (void *) ring_sched[1], (void *) ring_res[1],
-            gpu_weight_streaming ?
+            gpu_weight_streaming && !gpu_bank_single ?
                 (void *) region_ring_worker_resources[2].sched.get() :
                 nullptr,
-            gpu_weight_streaming ?
+            gpu_weight_streaming && !gpu_bank_single ?
                 (void *) region_ring_worker_resources[2].res.get() :
                 nullptr,
             (void *) ring_sched[2], (void *) ring_res[2],
@@ -4230,13 +4263,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order, ready, owners);
     };
     bool initial_banks_ready =
-        gpu_bank_streaming && initial_banks_match();
+        gpu_bank_initial_residency && initial_banks_match();
 
     // In graphless mode the default tiny warmup is intentionally skipped.
     // The worker schedulers do not exist until this point, so perf_reset()
     // could not preload the initial CUDA weight Banks. Prime them now,
     // after resources are created but before any real Chunk is dispatched.
-    if (gpu_bank_streaming && !initial_banks_ready &&
+    if (gpu_bank_initial_residency && !initial_banks_ready &&
             !region_ring_initial_banks_loaded) {
         const int64_t prime_begin_us = ggml_time_us();
         const bool primed = region_ring_load_initial_gpu_banks();
@@ -4254,7 +4287,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     // The next UBatch restarts at its first two GPU Regions. Recover the
     // initial window before dispatch, after the preceding UBatch workers
     // and Bank mover have all joined. Cold-start failures remain strict.
-    if (gpu_bank_streaming && !initial_banks_ready &&
+    if (gpu_bank_initial_residency && !initial_banks_ready &&
             region_ring_initial_banks_loaded) {
         const size_t old_a = region_ring_worker_resources[1].bank_region;
         const size_t old_b = region_ring_worker_resources[2].bank_region;
@@ -4277,7 +4310,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             initial_banks_ready ? "READY" : "FAIL");
     }
 
-    if (gpu_bank_streaming && !initial_banks_ready) {
+    if (gpu_bank_initial_residency && !initial_banks_ready) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK] phase=PREFILL_START status=REJECT "
             "reason=INITIAL_BANKS_NOT_LOADED "
@@ -4294,7 +4327,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
-    if (gpu_bank_streaming && !region_ring_initial_banks_loaded) {
+    if (gpu_bank_initial_residency && !region_ring_initial_banks_loaded) {
         // State was recovered by successful warmup demand loads; no
         // weight upload is needed before this large prompt.
         region_ring_initial_banks_loaded = true;
@@ -4305,7 +4338,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_region_order[0], gpu_region_order[1]);
     }
 
-    if (gpu_bank_streaming) {
+    if (gpu_bank_initial_residency) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_GPU_BANK] phase=PREFILL_START banks=2 "
             "bankA_region=%zu bankB_region=%zu "
@@ -4640,7 +4673,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
     llama_region_ring_ready ready(
         regions, (int) ubatch.n_tokens,
         region_chunk_tokens, slot_pool_size,
-        gpu_weight_streaming, std::move(ring_event_observer),
+        gpu_weight_streaming && !gpu_bank_single,
+        std::move(ring_event_observer),
         phone_input_push_requested, phone_input_stream_requested);
     LLAMA_LOG_ERROR(
         "[REGION_RING_READY_V2] regions=%zu tasks=%zu "
@@ -4917,11 +4951,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         ubatch.n_tokens > 1 && stages.size() > 2 &&
         ggml_backend_is_meta(backend_ptrs[0]) &&
         ggml_backend_meta_n_backends(backend_ptrs[0]) == 2;
-    // The terminal Phone region may publish l_out autonomously; only Qwen3
-    // currently supports the separate zero-layer PC Output Head graph.
+    // The terminal Phone region may publish l_out autonomously. Both dense
+    // Qwen3 and Llama have a dedicated zero-layer PC Output Head graph.
     const bool phone_auto_final_enabled =
         phone_auto_final_requested && phone_auto_eligible &&
-        model.arch == LLM_ARCH_QWEN3;
+        (model.arch == LLM_ARCH_QWEN3 || model.arch == LLM_ARCH_LLAMA);
     // Graphless only changes the full Prefill path; tiny/decode retain
     // their normal PC graphs. PC must explicitly opt in independently of
     // the Phone server's matching GRAPHLESS switch.
@@ -5775,13 +5809,21 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     ggml_backend_reg_get_proc_address(
                         rpc_reg, GGML_BACKEND_RPC_PHONE_OWNED_KV_BIND_PROC)) :
                 nullptr;
+            const bool owned_qwen3 = model.arch == LLM_ARCH_QWEN3 &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+            const bool owned_llama = model.arch == LLM_ARCH_LLAMA &&
+                model.hparams.rope_type == LLAMA_ROPE_TYPE_NORM &&
+                !model.hparams.use_kq_norm &&
+                (model.hparams.f_attention_scale == 0.0f ||
+                 std::fabs(model.hparams.f_attention_scale -
+                    1.0f / std::sqrt(float(model.hparams.n_embd_head_k(0)))) <
+                    1.0e-6f);
             bool valid = register_plan != nullptr &&
                 phone_stream_run_id != 0 &&
-                model.arch == LLM_ARCH_QWEN3 &&
+                (owned_qwen3 || owned_llama) &&
                 ubatch.pos != nullptr && ubatch.pos[0] == 0 &&
                 cparams.n_ctx >= ubatch.n_tokens &&
-                cparams.flash_attn &&
-                model.hparams.rope_type == LLAMA_ROPE_TYPE_NEOX;
+                cparams.flash_attn;
             // The actual KV allocator, not RoPE positions, proves the
             // fresh physical slot assignment before any remote execution.
             if (valid && phone_graphless) {
@@ -5826,8 +5868,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 constexpr uint32_t htp_only_wire_version = 4;
                 plan.version = phone_htp_only ? htp_only_wire_version :
                     n_phone_layers == 1 ? 2u : 3u;
+                const uint32_t dense_arch_flags = owned_llama ? 3u : 1u;
                 plan.flags = (phone_htp_only || n_phone_layers > 1) ?
-                    (1u | (uint32_t(n_phone_layers) << 16)) : 1u;
+                    (dense_arch_flags | (uint32_t(n_phone_layers) << 16)) :
+                    dense_arch_flags;
                 plan.run_id = phone_input_push_run_id;
                 plan.p2c_run_id = phone_stream_run_id;
                 plan.region = (uint32_t) r;
@@ -5848,7 +5892,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     valid = model.hparams.n_head(l) == plan.n_heads &&
                         model.hparams.n_head_kv(l) == plan.n_heads_kv &&
                         model.hparams.n_embd_head_k(l) == plan.head_dim &&
-                        model.hparams.n_embd_head_v(l) == plan.head_dim;
+                        model.hparams.n_embd_head_v(l) == plan.head_dim &&
+                        model.hparams.n_rot(l) == plan.head_dim &&
+                        (!owned_llama ||
+                         (model.layers[l].rope_freqs == nullptr &&
+                          model.layers[l].rope_long == nullptr &&
+                          model.layers[l].rope_short == nullptr));
                 }
                 const uint64_t padded_kv =
                     (uint64_t(ubatch.n_tokens) + 255) / 256 * 256;
@@ -7298,6 +7347,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         }
 
                         const size_t bank_index =
+                            gpu_bank_single ? 0 :
                             llama_region_ring_gpu_weight_bank_for_rank(
                                 (size_t) rank);
                         const size_t selected_bank = bank_index + 1;
@@ -8607,7 +8657,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             }
         }
         // The terminal Phone/CPU/GPU Region published l_out to the host.
-        // Perform the canonical Qwen3 PC-only Head after workers drain.
+        // Perform the canonical dense Llama/Qwen3 PC-only Head after workers drain.
         int64_t phone_final_head_us = 0;
         if ((phone_auto_final_enabled || pc_final_head_enabled) &&
                 ret == GGML_STATUS_SUCCESS &&

@@ -25,6 +25,20 @@ GROUPS = (128, 256, 512, 1024)
 FIXED_LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"  # 5*G8 + 4*P6 = 64 layers
 CHUNK_TOKENS = 128
 MODEL_LAYERS = 64
+# Mistral Small 3.2 text decoder has 40 layers. This conservative
+# G/C/P fixture is only for fixed tests; automatic search owns its layout.
+MISTRAL_40_FIXED_LAYOUT = "G4,C5,P1,G4,C5,P1,G4,C5,P1,G4,C5,P1"
+
+
+def default_layout_for_layers(n: int) -> str:
+    if n == MODEL_LAYERS:
+        return FIXED_LAYOUT
+    if n == 40:
+        return MISTRAL_40_FIXED_LAYOUT
+    if 3 <= n <= 256:
+        return f"G1,C{n - 2},P1"
+    raise ValueError(f"unsupported model layer count: {n}")
+
 SUPPORTED_CHUNKS = (8, 12, 16, 20, 24, 28, 32, 40, 48,
                     56, 64, 80, 96, 112, 128, 160, 192)
 FORCED_RING_ENV = {
@@ -84,8 +98,8 @@ RESULT_COLUMNS = (
 )
 
 
-def normalize_layout(spec: str) -> str:
-    """Validate and normalize 64-layer G -> [C] -> [P] APPLY_WIDE topology.
+def normalize_layout(spec: str, model_layers: int = MODEL_LAYERS) -> str:
+    """Validate and normalize G -> [C] -> [P] APPLY_WIDE topology.
 
     The native runtime accepts 1-8 complete cycles with an optional GPU tail.
     Explicit C0 stages are omitted from the canonical representation.
@@ -103,8 +117,8 @@ def normalize_layout(spec: str) -> str:
         if depth:
             parsed.append((kind, depth))
     total = sum(depth for _, depth in parsed)
-    if total != MODEL_LAYERS:
-        raise ValueError(f"-Layout must allocate exactly {MODEL_LAYERS} layers; got {total}")
+    if total != model_layers:
+        raise ValueError(f"-Layout must allocate exactly {model_layers} layers; got {total}")
     i, cycles = 0, 0
     while i < len(parsed):
         if parsed[i][0] != "G":
@@ -131,7 +145,7 @@ def normalize_layout(spec: str) -> str:
 
 def default_out(args) -> Path:
     if args.auto_plan:
-        return Path("32b-auto-plan-n1-all40")
+        return Path(f"{args.model_layers}layer-auto-plan-n1-all40")
     if (args.layout == FIXED_LAYOUT and args.chunk == CHUNK_TOKENS and
             args.xc == CHUNK_TOKENS and args.xg == CHUNK_TOKENS and
             args.xp == CHUNK_TOKENS and args.n_predict == 1 and
@@ -577,6 +591,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         })
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
+    if getattr(args, "trace_tasks", False):
+        # Protected from inherited environment, but set explicitly for an
+        # isolated diagnostic run. Emitted after workers drain.
+        env["LLAMA_REGION_RING_TASK_TRACE"] = "1"
     if args.profile_every:
         # Genuine per-Stage timestamps, not reconstructed from Prefill TPS.
         # The CPU/GPU rows feed rolling CSV; Phone only if authoritative
@@ -689,6 +707,8 @@ def get_args(argv=None):
     parser.add_argument("--out", type=Path, default=None,
                         help="default result directory depends on --auto-plan")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--model-layers", type=int, default=MODEL_LAYERS,
+                        help="decoder layer count (default 64 for Qwen3-32B; 40 for Mistral Small 3.2)")
     parser.add_argument("--streaming", choices=("on", "off"), default="on")
     parser.add_argument("--auto-plan", action="store_true",
                         help="native hardware Profile plus APPLY_WIDE planning per process")
@@ -713,7 +733,7 @@ def get_args(argv=None):
     parser.add_argument("--warmup-prompt", default=None,
                         help="optional prompt file for unmeasured warm-up; default first scheduled prompt")
     parser.add_argument("--layout", default=None,
-                        help="forced 64-layer G/[C]/P topology (default G8,P6 x4 + G8)")
+                        help="fixed G/[C]/P topology; default follows --model-layers")
     parser.add_argument("--chunk", type=int, default=None,
                         help="common XC/XG/XP Chunk width (default 128)")
     parser.add_argument("--xc", type=int, default=None,
@@ -727,6 +747,8 @@ def get_args(argv=None):
     parser.add_argument("--profile-every", type=int, default=0,
                         help="0 (default): calibrate independent G/C/N baseline once and reuse V0; "
                              "N>0: legacy rolling real Stage CSV refresh after every N PASS prompts")
+    parser.add_argument("--trace-tasks", action="store_true",
+                        help="diagnostic-only PC-clock Region/Chunk timeline; distinct run config")
     parser.add_argument("--profile-grid", choices=("quick", "full"),
                         default="quick", help="standalone G/C/N depth and Chunk grid")
     parser.add_argument("--update-profile", action="store_true",
@@ -762,8 +784,11 @@ def get_args(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="print commands without touching results")
     parser.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     args = parser.parse_args(argv)
-    if args.htp_only and not args.auto_plan:
-        parser.error("--htp-only in this runner requires --auto-plan")
+    if not 3 <= args.model_layers <= 256:
+        parser.error("--model-layers must be between 3 and 256")
+    if args.htp_only and not args.auto_plan and args.layout is None:
+        parser.error("--htp-only fixed mode requires explicit --layout; "
+                     "use --auto-plan for independent profiling")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
     # An independent C/G/N calibration is generated at first model startup
@@ -777,7 +802,7 @@ def get_args(argv=None):
     if args.htp_only and args.n_predict != 1:
         parser.error("HTP-only autonomous prefill currently requires --n-predict 1")
     if args.htp_only and args.no_phone_weight_preload:
-        parser.error("--htp-only auto-plan requires early Phone Region configuration")
+        parser.error("--htp-only requires early Phone Region configuration")
     if args.auto_plan and args.warmup_prompt is not None:
         parser.error("--warmup-prompt requires fixed mode")
     if args.skip_warmup and args.warmup_prompt is not None:
@@ -799,7 +824,8 @@ def get_args(argv=None):
         try:
             # "N" is an alias for the same Phone physical backend ("P").
             args.force_plan_layout = normalize_layout(
-                args.force_plan_layout.upper().replace("N", "P"))
+                args.force_plan_layout.upper().replace("N", "P"),
+                args.model_layers)
         except ValueError as exc:
             parser.error("--force-plan-layout: " + str(exc))
         for key in ("force_plan_xc", "force_plan_xg", "force_plan_xp"):
@@ -811,7 +837,9 @@ def get_args(argv=None):
                              f"={width} unsupported; supported widths: " +
                              ", ".join(str(x) for x in SUPPORTED_CHUNKS))
     try:
-        args.layout = normalize_layout(args.layout if args.layout is not None else FIXED_LAYOUT)
+        args.layout = normalize_layout(
+            args.layout if args.layout is not None else
+            default_layout_for_layers(args.model_layers), args.model_layers)
     except ValueError as exc:
         parser.error(str(exc))
     has_phone = any(part.startswith("P") for part in args.layout.split(","))
@@ -1026,6 +1054,12 @@ def main(argv=None):
               "max_context": args.max_context, "context_padding": args.context_padding,
               "env": sorted(args.env),
               "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds}
+    # Preserve the original 64-layer run-config byte-for-byte for resume;
+    # only a nondefault model depth creates a new configuration key.
+    if args.model_layers != MODEL_LAYERS:
+        config["model_layers"] = args.model_layers
+    if getattr(args, "trace_tasks", False):
+        config["diagnostic_task_trace"] = True
     if args.boost_bank_mover:
         config["bank_mover_priority"] = "ABOVE_NORMAL"
     if args.phone_weight_preload:
@@ -1036,6 +1070,8 @@ def main(argv=None):
         # Do not change the legacy off-mode signature; ON requires a
         # different experiment output and a freshly rebuilt engine.
         config["force_small_batch_mover"] = True
+    if args.htp_only and not args.auto_plan:
+        config["phone_execution"] = "CPU_TRANSPORT_HTP_ONLY_FIXED_SKIP_PROFILE"
     if args.auto_plan:
         # Keep fixed-mode schema 2 intact for previously completed runs.
         # Automatic Profile + Plan has a separate output and signature.

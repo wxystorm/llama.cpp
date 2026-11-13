@@ -4,6 +4,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$Model,
+    [ValidateRange(3,256)][int]$ModelLayers = 64,
     [Parameter(Mandatory=$true)][string]$Rpc,
     [string]$PromptDir = "E:\llama\datasets\sharegpt\sharegpt40",
     [string]$Out = ".\32b-htp-only-profile5-plan-all40",
@@ -11,6 +12,7 @@ param(
     [ValidateRange(0,40)][int]$ProfileEvery = 0,
     [ValidateSet("quick","full")][string]$ProfileGrid = "quick",
     [switch]$UpdateProfile,
+    [switch]$TraceTasks,
     [string]$PhoneProfileLog = "",
     [string]$RealStageProfileCsv = "",
     [string]$ForceLayout = "",
@@ -39,7 +41,7 @@ if ($ProfileEvery -ne 0) {
 }
 $arguments = @(
     (Join-Path $PSScriptRoot "run_32b_all40.py"),
-    "--exe", $Exe, "--model", $Model, "--rpc", $Rpc,
+    "--exe", $Exe, "--model", $Model, "--model-layers", "$ModelLayers", "--rpc", $Rpc,
     "--prompt-dir", $PromptDir, "--repo-root", $root, "--out", $Out,
     "--auto-plan", "--htp-only", "--profile-every", "0",
     "--profile-grid", $ProfileGrid,
@@ -62,6 +64,7 @@ if ($ForceLayout) {
 }
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($UpdateProfile) { $arguments += "--update-profile" }
+if ($TraceTasks) { $arguments += "--trace-tasks" }
 if ($StopOnFail) { $arguments += "--stop-on-fail" }
 if ($DryRun) { $arguments += "--dry-run" }
 if ($PhoneProfileLog) { $arguments += @("--phone-profile-log", $PhoneProfileLog) }

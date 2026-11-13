@@ -8873,7 +8873,9 @@ static bool llama_hybrid_calibrate_independent_ring(
         const llama_hybrid_ffn_desc & ffn_desc,
         ggml_backend_t cpu, ggml_backend_t gpu, ggml_backend_t phone,
         const char * path) {
-    if (!path || !*path || !cpu || !phone || !profile.dense_phone_region_capable) {
+    // Independent HTP full-layer profiling is supported by Qwen3 and
+    // Llama; the Qwen3-only directional fusion flag is not a prerequisite.
+    if (!path || !*path || !cpu || !phone || profile.is_moe) {
         return false;
     }
     {
@@ -9013,7 +9015,10 @@ static bool llama_hybrid_calibrate_independent_ring(
             for (int kv : kv_spans) {
                 ggml_backend_rpc_phone_owned_plan plan {};
                 plan.version = 4;
-                plan.flags = 1u | (uint32_t(layers) << 16);
+                // The 108-byte RPC descriptor uses bit 1 to select Llama's
+                // Normal-RoPE math; the original Qwen3 bit pattern is kept.
+                plan.flags = (attn_desc.rope_type == LLAMA_ROPE_TYPE_NORM ?
+                    3u : 1u) | (uint32_t(layers) << 16);
                 plan.run_id = 1;
                 plan.p2c_run_id = 1;
                 plan.region = 0;
@@ -9351,6 +9356,9 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
+    // This bit denotes Qwen3's fused directional Phone island only.
+    // Llama's full-layer HTP support is advertised by htp_only_profile;
+    // never claim Qwen3's unrelated directional fusion is available.
     profile.dense_phone_region_capable =
         ml.get_arch() == LLM_ARCH_QWEN3;
     profile.n_layer = n_layer;
@@ -9365,7 +9373,8 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
     const char * controlled_env = std::getenv("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
     const bool htp_only_profile = controlled_env &&
         std::strcmp(controlled_env, "1") == 0 &&
-        ml.get_arch() == LLM_ARCH_QWEN3 &&
+        (ml.get_arch() == LLM_ARCH_QWEN3 ||
+         ml.get_arch() == LLM_ARCH_LLAMA) &&
         std::getenv("LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV") != nullptr;
     LLAMA_LOG_INFO("[REGION_RING_HTP_PROFILE] mode=%s source=%s\n",
                    htp_only_profile ? "HTP_ONLY" : "LEGACY",
@@ -10507,12 +10516,31 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     const bool have_layer_weights =
         profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
         weight_fallback != 0;
+    // Physical Bank-count ablation must be in scope for forced-layout
+    // validation as well as model-memory callbacks.
+    const char * bank_count_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
+    const bool single_gpu_bank =
+        bank_count_env != nullptr &&
+        std::strcmp(bank_count_env, "1") == 0;
     // Aggregate all memory callback outcomes without writing per-candidate
     // logs in the hot search loop. They are calls, not unique layouts.
     auto htp_memory_diag = std::make_shared<std::array<size_t, 7>>();
     htp_memory_diag->fill(0);
     const bool htp_session_guard =
         flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+    // Resolve FORCE once, before constructing any estimated memory guards.
+    // This also permits forced execution when the free-RAM sample is absent.
+    const auto forced_value_present = [](const char * key) {
+        const char * raw = std::getenv(key);
+        return raw != nullptr && *raw != '\0';
+    };
+    const bool force_ab_requested =
+        wide_apply && selected_layout != nullptr &&
+        (forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XC") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XG") ||
+         forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XP"));
     llama_ring_planner::htp_memory_limits htp_limits;
     if (have_layer_weights) {
         const auto planner_layer_bytes =
@@ -10551,7 +10579,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
 
         // Identical GPU accounting to the full-layout memory guard:
-        // two-Bank peak weights + full-Prompt GPU KV + optional slot scratch.
+        // resident Bank peak weights + full-Prompt GPU KV + slot scratch.
         // The Planner applies this budget to E seeds and every Beam prefix.
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
@@ -10567,7 +10595,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // Leave 10% unmapped headroom and reserve Graphless scratch for
         // every layer, not merely once per Phone Region.
         long double htp_session_budget_bytes = 2880.0L * 1048576.0L;
-        if (htp_session_guard) {
+        if (htp_session_guard && !force_ab_requested) {
             if (!have_layer_weights || profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_HTP_MEMORY] status=REJECT"
@@ -10602,7 +10630,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         htp_limits.n_ff = profile.n_ff;
         htp_limits.kv_bytes_per_token_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer;
-        if (htp_session_guard) {
+        if (htp_session_guard && !force_ab_requested) {
             LLAMA_LOG_INFO(
                 "[REGION_RING_HTP_MEMORY] sessions=4"
                 " per_session_budget_mib=%.1Lf"
@@ -10619,7 +10647,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes, htp_session_guard,
-             htp_limits, htp_memory_diag](
+             htp_limits, htp_memory_diag, single_gpu_bank](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
@@ -10632,11 +10660,34 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // every full candidate (including forced and GPU-tail)
                 // unless BOTH Bank peaks strictly fit their individual
                 // equal-size capacity after GPU KV and scratch reservation.
-                if (model.gpu_weight_streaming &&
-                        !llama_ring_planner::gpu_streamed_banks_fit(
-                            model, regions, candidate.xg)) {
-                    ++(*htp_memory_diag)[4]; // single-bank VRAM overflow
-                    return false;
+                if (model.gpu_weight_streaming) {
+                    bool gpu_fits = false;
+                    if (single_gpu_bank) {
+                        size_t max_weight = 0;
+                        int gpu_layers = 0;
+                        bool known = model.gpu_region_weight_bytes != nullptr;
+                        for (const auto & r : regions) {
+                            if (r.device != llama_region_ring_device::GPU) { continue; }
+                            size_t bytes = 0;
+                            known = known && model.gpu_region_weight_bytes(
+                                r.layer_begin, r.layer_end, bytes);
+                            max_weight = std::max(max_weight, bytes);
+                            gpu_layers += r.layer_end - r.layer_begin;
+                        }
+                        const long double kv =
+                            (long double) gpu_layers *
+                            model.gpu_kv_bytes_per_layer;
+                        gpu_fits = known && model.gpu_memory_budget_bytes > 0.0L &&
+                            (long double) max_weight + kv <
+                                model.gpu_memory_budget_bytes;
+                    } else {
+                        gpu_fits = llama_ring_planner::gpu_streamed_banks_fit(
+                            model, regions, candidate.xg);
+                    }
+                    if (!gpu_fits) {
+                        ++(*htp_memory_diag)[4];
+                        return false;
+                    }
                 }
 
                 std::array<long double, 3> usage {};
@@ -10708,9 +10759,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         ++(*htp_memory_diag)[2]; // invalid bank geometry
                         return false;
                     }
-                    usage[(size_t) llama_region_ring_device::GPU] +=
+                    // One physical Bank is reused by all GPU Regions; it
+                    // needs only the largest Region, not both parity peaks.
+                    const long double resident_weights = single_gpu_bank ?
+                        (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                         (long double) bank_peaks[0] +
                         (long double) bank_peaks[1];
+                    usage[(size_t) llama_region_ring_device::GPU] +=
+                        resident_weights;
                 }
 
                 usage[(size_t) llama_region_ring_device::CPU] +=
@@ -10764,7 +10820,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (have_directional_weight_split &&
                 directional_ratio_ok && !htp_session_guard) {
             boundary_memory_feasible =
-                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio](
+                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank](
                     const std::vector<
                         llama_region_ring_region> & regions) {
                     std::array<long double, 3> usage {};
@@ -10863,10 +10919,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 model, regions, bank_peaks)) {
                             return false;
                         }
-                        usage[(size_t)
-                            llama_region_ring_device::GPU] +=
+                        const long double resident_weights = single_gpu_bank ?
+                            (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                             (long double) bank_peaks[0] +
                             (long double) bank_peaks[1];
+                        usage[(size_t)
+                            llama_region_ring_device::GPU] += resident_weights;
                     }
 
                     const size_t boundary_count =
@@ -10927,6 +10985,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
     if (wide_apply && selected_layout != nullptr) {
+        // Forced layouts keep topology, profile and DAG validation, but do
+        // not reject on estimated RAM, GPU Bank or HTP memory budgets.
+        // Actual backend allocations can still fail at runtime.
         if (model.gpu_weight_streaming &&
                 profile.gpu_weight_h2d.size() < 2) {
             // No prompt H2D is needed for the first one/two GPU Regions.
@@ -10955,7 +11016,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return false;
             }
         }
-        if (!model.memory_feasible) {
+        if (!force_ab_requested && !model.memory_feasible) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
                 "reason=NO_MEMORY_PROFILE status=KEEP_BASELINE\n");
@@ -10992,22 +11053,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // through the remaining Cycles before full Prompt simulation.
         constexpr int wide_min_simulations = 64;
         // A forced A/B must never depend on a successful or expensive
-        // automatic search. It is checked independently against memory,
-        // profiles and the exact full-prompt event DAG below.
-        const char * force_requested_layout =
-            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_LAYOUT");
-        const char * force_requested_xc =
-            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XC");
-        const char * force_requested_xg =
-            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XG");
-        const char * force_requested_xp =
-            std::getenv("LLAMA_HYBRID_REGION_RING_FORCE_XP");
-        const bool force_ab_requested =
-            (force_requested_layout && *force_requested_layout) ||
-            (force_requested_xc && *force_requested_xc) ||
-            (force_requested_xg && *force_requested_xg) ||
-            (force_requested_xp && *force_requested_xp);
-
+        // automatic search. Only topology, profiles and the exact full-prompt
+        // event DAG are enforced for a user-forced layout.
         llama_ring_planner::result result;
         if (force_ab_requested) {
             // Baseline is diagnostic only in forced mode. If its profile
@@ -11419,95 +11466,45 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             // Cycle widths for deterministic APPLY_WIDE A/B checks.
             forced.concrete_regions = forced_regions;
 
-            const bool force_candidate_mem_ok =
-                !model.memory_feasible || model.memory_feasible(forced);
-            const bool force_region_mem_ok =
-                force_candidate_mem_ok &&
-                (!model.region_memory_feasible ||
-                 model.region_memory_feasible(forced_regions));
-            if (!force_candidate_mem_ok || !force_region_mem_ok) {
-                // The normal HTP_MEMORY_DIAG is printed BEFORE the force
-                // callback runs. Print its actual counters at failure time;
-                // zero counts there are NOT proof a forced Plan was legal.
-                const auto & d = *htp_memory_diag;
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_FORCE_MEMORY] status=REJECT"
-                    " candidate_memory=%d region_memory=%d"
-                    " geometry=%zu session_map=%zu bank_shape=%zu"
-                    " host_ram=%zu gpu_vram=%zu phone_ram=%zu pass=%zu"
-                    " phase=FORCED_PLAN\n",
-                    force_candidate_mem_ok ? 1 : 0,
-                    force_region_mem_ok ? 1 : 0,
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6]);
-                if (model.gpu_weight_streaming) {
-                    long double cap = 0.0L;
-                    std::array<size_t, 2> bank_peaks {};
-                    std::array<long double, 2> bank_capacities {};
-                    const bool banks_fit =
-                        llama_ring_planner::gpu_streamed_banks_fit(
-                            model, forced_regions, force_xg, &cap,
-                            &bank_peaks, &bank_capacities);
-                    LLAMA_LOG_ERROR(
-                        "[REGION_RING_PLAN_FORCE_BANK] status=%s"
-                        " bank_A_peak_mib=%.1f bank_B_peak_mib=%.1f"
-                        " bank_A_capacity_mib=%.1Lf"
-                        " bank_B_capacity_mib=%.1Lf"
-                        " basis=DYNAMIC_OTHER_BANK_RESIDUAL"
-                        " rule=PEAK_A_PLUS_PEAK_B_PLUS_KV_SCRATCH_LT_BUDGET\n",
-                        banks_fit ? "PASS" : "REJECT",
-                        bank_peaks[0] / 1048576.0,
-                        bank_peaks[1] / 1048576.0,
-                        bank_capacities[0] / 1048576.0L,
-                        bank_capacities[1] / 1048576.0L);
+            if (single_gpu_bank && model.gpu_weight_streaming) {
+                size_t max_region_weight = 0;
+                int gpu_layers = 0;
+                for (const auto & r : forced_regions) {
+                    if (r.device != llama_region_ring_device::GPU) { continue; }
+                    size_t bytes = 0;
+                    if (!model.gpu_region_weight_bytes ||
+                            !model.gpu_region_weight_bytes(
+                                r.layer_begin, r.layer_end, bytes)) {
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_ABLATION_MEMORY] status=REJECT "
+                            "reason=GPU_REGION_WEIGHT_UNAVAILABLE\n");
+                        return false;
+                    }
+                    max_region_weight = std::max(max_region_weight, bytes);
+                    gpu_layers += r.layer_end - r.layer_begin;
                 }
-                if (htp_session_guard) {
-                    auto limits = htp_limits;
-                    limits.xp = force_xp;
-                    llama_ring_planner::htp_memory_usage u;
-                    const auto layer_bytes = [&profile, weight_fallback](int l) {
-                        return profile.layer_weight_bytes.size() ==
-                                (size_t) profile.n_layer ?
-                            profile.layer_weight_bytes[(size_t) l] :
-                            weight_fallback;
-                    };
-                    const bool htp_ok =
-                        llama_ring_planner::htp_plan_memory_feasible(
-                            forced_regions, limits, layer_bytes, &u);
-                    const char * htp_reason =
-                        u.reject == llama_ring_planner::htp_memory_reject::
-                                SESSION_MAPPING ? "SESSION_MAPPING" :
-                        u.reject == llama_ring_planner::htp_memory_reject::
-                                SHARED_RAM ? "SHARED_RAM" :
-                        u.reject == llama_ring_planner::htp_memory_reject::
-                                NONE ? "NONE" : "INVALID";
-                    LLAMA_LOG_ERROR(
-                        "[REGION_RING_PLAN_FORCE_HTP] status=%s"
-                        " reason=%s phone_layers=%d"
-                        " session_layers=%d,%d,%d,%d"
-                        " session_total_mib=%.1Lf,%.1Lf,%.1Lf,%.1Lf"
-                        " scratch_per_layer_mib=%.1Lf"
-                        " shared_total_mib=%.1Lf shared_budget_mib=%.1Lf"
-                        " session_budget_mib=%.1Lf\n",
-                        htp_ok ? "PASS" : "REJECT", htp_reason,
-                        u.phone_layers, u.session_layers[0],
-                        u.session_layers[1], u.session_layers[2],
-                        u.session_layers[3],
-                        u.session_total_bytes[0] / 1048576.0L,
-                        u.session_total_bytes[1] / 1048576.0L,
-                        u.session_total_bytes[2] / 1048576.0L,
-                        u.session_total_bytes[3] / 1048576.0L,
-                        u.scratch_bytes_per_layer / 1048576.0L,
-                        u.shared_total_bytes / 1048576.0L,
-                        limits.shared_budget_bytes / 1048576.0L,
-                        limits.session_budget_bytes / 1048576.0L);
-                }
+                const long double required =
+                    (long double) max_region_weight +
+                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer;
                 LLAMA_LOG_ERROR(
-                    "[REGION_RING_PLAN_FORCE] mode=APPLY_WIDE "
-                    "status=REJECT reason=MEMORY_BUDGET "
-                    "layout=%s XC=%d XG=%d XP=%d\n",
-                    force_layout, force_xc, force_xg, force_xp);
-                return false;
+                    "[REGION_RING_ABLATION_MEMORY] mode=SINGLE_BANK "
+                    "gpu_layers=%d max_region_mib=%.1f "
+                    "kv_mib=%.1Lf budget_mib=%.1Lf status=%s\n",
+                    gpu_layers, max_region_weight / 1048576.0,
+                    ((long double) gpu_layers *
+                        model.gpu_kv_bytes_per_layer) / 1048576.0L,
+                    model.gpu_memory_budget_bytes / 1048576.0L,
+                    required < model.gpu_memory_budget_bytes ? "PASS" : "REJECT");
+                if (model.gpu_memory_budget_bytes <= 0.0L ||
+                        required >= model.gpu_memory_budget_bytes) {
+                    return false;
+                }
             }
+            LLAMA_LOG_WARN(
+                "[REGION_RING_PLAN_FORCE_MEMORY] status=SKIPPED"
+                " reason=USER_FORCED_LAYOUT"
+                " checks=CPU_RAM,GPU_BANK,HTP_SESSION,PHONE_SHARED_RAM"
+                " runtime_allocation=ENFORCED\n");
 
             // Phone-autonomous terminal delivery is inapplicable when
             // the final activation belongs to CPU/CUDA. Keep nonterminal
@@ -11529,7 +11526,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // Even with all three devices present, one G->C->P pass
                 // has no P->G return boundary. E=max(e1,e2,e3) measures
                 // a repeating ring, not this pipeline. Force A/B ranking
-                // therefore uses only memory guards and the full event DAG.
+                // therefore uses the full event DAG without an E-score.
                 forced.ring_error = {-1.0, -1.0, -1.0};
                 forced.ring_error_max = -1.0;
                 forced.ring_error_mean = -1.0;
@@ -11572,7 +11569,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
-        if (model.gpu_weight_streaming) {
+        if (model.gpu_weight_streaming && !forced_ab) {
             long double capacity = 0.0L;
             std::array<size_t, 2> peaks {};
             std::array<long double, 2> bank_capacities {};
@@ -11608,7 +11605,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 bank_capacities[1] / 1048576.0L);
             if (!bank_ok || !first_weight_known) { return false; }
         }
-        if (htp_session_guard) {
+        if (htp_session_guard && !forced_ab) {
             auto limits = htp_limits;
             limits.xp = best.xp;
             llama_ring_planner::htp_memory_usage selected_memory;

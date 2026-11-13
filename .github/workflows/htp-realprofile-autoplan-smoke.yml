@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/32b-independent-backend-profile-20261111
+      - feat/llama-mistral32-region-htp-20261112
   workflow_dispatch:
 
 jobs:

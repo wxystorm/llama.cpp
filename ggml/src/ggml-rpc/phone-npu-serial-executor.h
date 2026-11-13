@@ -134,14 +134,51 @@ public:
             return false;
         }
 
-        // Dense Qwen3 full-layer weight contract. Do not guess missing
-        // optional tensors or silently build an incomplete HTP layer.
-        static const char * suffixes[] = {
+        // Shared mandatory Qwen3 / Llama dense weights. Llama/Mistral omits
+        // per-head Q/K norm; Qwen3 requires both. Inspect the local GGUF
+        // before early preload, as the PC-owned Plan arrives later.
+        std::vector<const char *> suffixes = {
             "attn_norm.weight", "attn_q.weight", "attn_k.weight",
             "attn_v.weight", "attn_output.weight", "ffn_norm.weight",
-            "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
-            "attn_q_norm.weight", "attn_k_norm.weight"
+            "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"
         };
+        const auto contains = [&](const char * suffix) {
+            char name[GGML_MAX_NAME] = {};
+            if (std::snprintf(name, sizeof(name), "blk.%u.%s", layer, suffix) <= 0) {
+                return false;
+            }
+            ggml_rpc_local_tensor_info info {};
+            return local.get_info(local.user_data, name, &info);
+        };
+        const bool q_norm = contains("attn_q_norm.weight");
+        const bool k_norm = contains("attn_k_norm.weight");
+        if (q_norm != k_norm) {
+            reason = "HTP_MODEL_LOAD_INCOMPLETE_QK_NORM";
+            return false;
+        }
+        if (q_norm) {
+            suffixes.push_back("attn_q_norm.weight");
+            suffixes.push_back("attn_k_norm.weight");
+        }
+        // Llama dense optional affine biases participate in the actual
+        // graph. Never silently drop a present GGUF bias tensor.
+        for (const char * suffix : {
+                "attn_q.bias", "attn_k.bias", "attn_v.bias",
+                "attn_output.bias", "ffn_gate.bias", "ffn_up.bias",
+                "ffn_down.bias" }) {
+            if (contains(suffix)) { suffixes.push_back(suffix); }
+        }
+        // Per-layer custom frequency tensors and unsupported experts need
+        // an explicit builder; failing early is safer than wrong outputs.
+        for (const char * suffix : {
+                "attn_rope_freqs.weight", "rope_freqs.weight",
+                "rope_long.weight", "rope_short.weight",
+                "ffn_gate_inp.weight", "ffn_gate_exps.weight" }) {
+            if (contains(suffix)) {
+                reason = std::string("HTP_MODEL_LOAD_UNSUPPORTED_EXTRA:") + suffix;
+                return false;
+            }
+        }
         std::unordered_map<
             std::string, std::unique_ptr<persistent_tensor>> pending;
         for (const char * suffix : suffixes) {
@@ -331,6 +368,13 @@ public:
         weights.ffn_down = find_weight("ffn_down.weight");
         weights.q_norm = find_weight("attn_q_norm.weight");
         weights.k_norm = find_weight("attn_k_norm.weight");
+        weights.wq_b = find_weight("attn_q.bias");
+        weights.wk_b = find_weight("attn_k.bias");
+        weights.wv_b = find_weight("attn_v.bias");
+        weights.wo_b = find_weight("attn_output.bias");
+        weights.ffn_gate_b = find_weight("ffn_gate.bias");
+        weights.ffn_up_b = find_weight("ffn_up.bias");
+        weights.ffn_down_b = find_weight("ffn_down.bias");
         if (!ggml_phone_qwen3::validate_weights(plan, weights, why)) {
             reason = std::string("PHONE_LOCAL_MODEL_") + why;
             return false;
@@ -473,6 +517,13 @@ public:
         w.ffn_down = load("ffn_down.weight");
         w.q_norm = load("attn_q_norm.weight");
         w.k_norm = load("attn_k_norm.weight");
+        w.wq_b = load("attn_q.bias");
+        w.wk_b = load("attn_k.bias");
+        w.wv_b = load("attn_v.bias");
+        w.wo_b = load("attn_output.bias");
+        w.ffn_gate_b = load("ffn_gate.bias");
+        w.ffn_up_b = load("ffn_up.bias");
+        w.ffn_down_b = load("ffn_down.bias");
         if (!ggml_phone_qwen3::validate_weights(plan, w, why)) {
             reason = std::string("PHONE_OWNED_HTP_WEIGHTS:") + why;
             return false;
