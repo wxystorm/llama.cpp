@@ -260,8 +260,9 @@ inline bool llama_region_ring_gpu_bank_mover_enabled(
 // GPU weight streaming uses two fixed physical Banks. Keep Bank
 // parity and rank+2 lookahead in one shared policy so runtime, planner and
 // regression tests cannot silently drift.
-inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
-    return rank & 1u;
+inline size_t llama_region_ring_gpu_weight_bank_for_rank(
+        size_t rank, size_t bank_count = 2) {
+    return bank_count == 1 ? 0u : (rank & 1u);
 }
 
 // Only the first one or two GPU Regions need load-time residency. A
@@ -269,8 +270,8 @@ inline size_t llama_region_ring_gpu_weight_bank_for_rank(size_t rank) {
 // an obsolete multi-Cycle assumption. Keep the same rule in the loader,
 // runtime and Planner regression tests.
 inline size_t llama_region_ring_gpu_initial_bank_count(
-        size_t gpu_region_count) {
-    return std::min<size_t>(gpu_region_count, 2);
+        size_t gpu_region_count, size_t bank_count = 2) {
+    return std::min(gpu_region_count, bank_count);
 }
 
 // The Bank's actual resident Region is the source of truth at prefill
@@ -297,11 +298,12 @@ inline bool llama_region_ring_gpu_initial_banks_match(
 }
 
 inline std::optional<size_t> llama_region_ring_gpu_weight_next_rank(
-        size_t rank, size_t gpu_region_count) {
-    if (rank > std::numeric_limits<size_t>::max() - 2) {
+        size_t rank, size_t gpu_region_count, size_t bank_count = 2) {
+    if (bank_count < 1 || bank_count > 2 ||
+            rank > std::numeric_limits<size_t>::max() - bank_count) {
         return std::nullopt;
     }
-    const size_t next = rank + 2;
+    const size_t next = rank + bank_count;
     return next < gpu_region_count ?
         std::optional<size_t>(next) : std::nullopt;
 }
