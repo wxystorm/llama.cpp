@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "experiment": "sharegpt40-nine-baselines-2026-11-13",
+  "experiment": "sharegpt40-ten-baselines-2026-11-13",
   "prepared_on": "2026-11-13",
   "dataset": {
     "name": "ShareGPT40",
@@ -189,6 +189,25 @@
       "threads": 8,
       "no_mmap": true,
       "gpu_weight_streaming": true
+    },
+    {
+      "id": "jupiter-24b",
+      "framework": "jupiter",
+      "model": "24b",
+      "method": "Sequence DP",
+      "run_config": "runs/jupiter-24b/run-config.json",
+      "context": 2048,
+      "batch": 2048,
+      "ubatch": 128,
+      "pc_layers": 32,
+      "cpu_layers": 24,
+      "graph_prebuild": false,
+      "min_chunk": 96,
+      "max_chunk": 128,
+      "bench_repeats": 1,
+      "expected_prompts": 40,
+      "observed_passes": 36,
+      "complete": false
     }
   ],
   "measurements": {

@@ -63,6 +63,15 @@
       "sha256": "66557260722eb838ff296d084693d6ba76e6a706bdcbcbf3018c006eaf7e3b10",
       "bytes": 2483946,
       "runs": 40
+    },
+    {
+      "id": "jupiter-24b",
+      "archive": "jupiter-24b-数据.zip",
+      "sha256": "cfe8d44470f266c07afc9e5422762dcd9f47d5db27a2309a29272ad4e7abbd3a",
+      "bytes": 31302058,
+      "runs": 36,
+      "expected_runs": 40,
+      "status": "PARTIAL"
     }
   ]
 }
