@@ -12153,6 +12153,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
             forced_ab ? "FORCED_AB" :
+            ablation_a2 ? "ABLATION_A2_SINGLE_BANK_CYCLES" :
+            ablation_a3 ? "ABLATION_A3_GREEDY_ONE_CYCLE" :
             htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
@@ -12190,6 +12192,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "\"mode\":\"apply-wide\","
                             << "\"source\":\""
                             << (forced_ab ? "forced" :
+                                ablation_a2 ? "ablation_a2" :
+                                ablation_a3 ? "ablation_a3" :
                                 htp_only_tail_selected ? "htp_gpu_tail" :
                                 boundary_tensor_selected ? "tensor" :
                                 best.local_refined ?
@@ -12252,7 +12256,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << improvement_pct
                             << ",\"e\":" << best.ring_error_max
                             << ",\"e_applicable\":"
-                            << (forced_ab && forced_single_cycle ?
+                            << ((forced_ab && forced_single_cycle) ||
+                                 ablation_a2 || ablation_a3 ?
                                 "false" : "true")
                             << ",\"first_cycle_e\":"
                             << (best.prefix_cycles > 0 ?
@@ -12384,6 +12389,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "layout=%s XC=%d XG=%d XP=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
             forced_ab ? "FORCED_AB" :
+            ablation_a2 ? "ABLATION_A2_SINGLE_BANK_CYCLES" :
+            ablation_a3 ? "ABLATION_A3_GREEDY_ONE_CYCLE" :
             htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
