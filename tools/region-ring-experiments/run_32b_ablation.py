@@ -128,9 +128,11 @@ def read_summary(folder, selected):
     return result
 
 
-def check_runtime(folder, mode, selected):
+def check_runtime(folder, mode, selected, summaries):
     for name in selected:
-        metrics = folder / "runs" / Path(name).stem / "attempt-0001" / "metrics.jsonl"
+        attempt = int(summaries[name].get("attempt") or 1)
+        metrics = (folder / "runs" / Path(name).stem /
+                   f"attempt-{attempt:04d}" / "metrics.jsonl")
         if not metrics.is_file():
             raise RuntimeError(f"missing metrics: {metrics}")
         with metrics.open(encoding="utf-8") as f:
@@ -142,13 +144,28 @@ def check_runtime(folder, mode, selected):
             raise RuntimeError(f"no prefill ring metrics in {metrics}")
         for r in rings:
             expected_banks = 1 if mode in ("A2", "A3") else 2
-            if r.get("ablation_mode") != mode or                     r.get("gpu_bank_count") != expected_banks:
+            if (r.get("ablation_mode") != mode or
+                    r.get("gpu_bank_count") != expected_banks):
                 raise RuntimeError(f"runtime ignored requested {mode}: "
                                    f"{metrics} ({r.get('ablation_mode')}, "
                                    f"{r.get('gpu_bank_count')} Banks)")
             if mode != "A0" and r.get("gpu_bank_streaming") is not False:
                 raise RuntimeError(f"{mode} unexpectedly enabled GPU Bank "
                                    f"Mover: {metrics}")
+            if mode == "A0" and (r.get("gpu_bank_streaming") is not True
+                    or int(r.get("bank_refills") or 0) < 3):
+                raise RuntimeError(f"A0 did not perform three GPU Bank "
+                                   f"refills: {metrics}")
+            layout = str(r.get("layout") or "")
+            stages = layout.split(",")
+            if mode in ("A0", "A1") and layout != FIXED_64:
+                raise RuntimeError(f"fixed layout changed in {mode}: {layout}")
+            if mode == "A2" and (sum(x.startswith("G") for x in stages) < 3
+                    or not stages[-1].startswith("G")):
+                raise RuntimeError(f"A2 is not a multi-Cycle GPU-tail: {layout}")
+            if mode == "A3" and (sum(x.startswith("G") for x in stages) != 1
+                    or not stages[-1].startswith("P")):
+                raise RuntimeError(f"A3 is not a single G->C->P pass: {layout}")
         print(f"[ABLATION_CHECK] mode={mode} prompt={name} "
               f"banks={expected_banks} mover={'ON' if mode == 'A0' else 'OFF'} "
               "status=PASS", flush=True)
@@ -181,8 +198,8 @@ def run(args):
             if rc != 0:
                 raise RuntimeError(f"{mode} runner failed with code {rc}; "
                                    f"see {out / 'runs'}")
-            check_runtime(out, mode, args.prompts)
             rows = read_summary(out, args.prompts)
+            check_runtime(out, mode, args.prompts, rows)
             for name in args.prompts:
                 table.append({"mode": mode, "repeat": repeat,
                               "prompt": name, **rows[name]})
