@@ -22,11 +22,11 @@ class AblationTests(unittest.TestCase):
     def test_independent_profile_native_tokens_column(self):
         rows = (
             "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
-            "prepare_ms,compute_ms,terminal,samples\\n"
-            "CPU,2,128,128,0,0,0,400,0,1\\n"
-            "GPU,2,128,128,0,0,0,20,0,1\\n"
-            "PHONE,2,128,256,0,0,0,70,0,1\\n"
-        ).replace("\\\\n", "\\n")
+            "prepare_ms,compute_ms,terminal,samples\n"
+            "CPU,2,128,128,0,0,0,400,0,1\n"
+            "GPU,2,128,128,0,0,0,20,0,1\n"
+            "PHONE,2,128,256,0,0,0,70,0,1\n"
+        )
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "profile.csv"
             path.write_text(rows, encoding="utf-8")
