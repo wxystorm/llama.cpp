@@ -408,7 +408,7 @@ def main() -> int:
     ap.add_argument("--exe", type=Path, default=ROOT / "build-tensor-v2/bin/Release/llama-completion.exe")
     ap.add_argument("--rpc", default="10.39.52.114:50052")
     ap.add_argument("--prompt-dir", type=Path, default=Path(r"E:\llama\datasets\sharegpt\sharegpt40"))
-    ap.add_argument("--out", type=Path, default=ROOT / "32b-ablation")
+    ap.add_argument("--out", type=Path, default=ROOT / "32b-ablation-fixed-v2")
     ap.add_argument("--cases", nargs="+", choices=("A0", "A1", "A2", "A3"), default=["A0", "A1", "A2", "A3"])
     ap.add_argument("--limit", type=int, default=1, help="only one prompt by default; 0 selects all")
     ap.add_argument("--only-prompt", default="")
