@@ -48,8 +48,8 @@ On PC PowerShell, after checking out the feature branch and rebuilding
 
 By default, only **prompt_128_01.txt** and **prompt_512_01.txt** are
 run, once per mode. The suite uses `--no-mmap`, XG/XP/XC=128, 2048 batch,
-2048 ubatch, `n_predict=1`, no forced full-40 sweep. It runs A2 first so
-its **single independent G/C/N profile** can be reused by A0/A1/A3.
+2048 ubatch, `n_predict=1`, no forced full-40 sweep. It runs A0 first,
+then reuses its **single independent G/C/N profile** in A1/A2/A3.
 
 Examples:
 
