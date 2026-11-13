@@ -1146,6 +1146,16 @@ static void test_gpu_weight_two_bank_policy() {
           !enabled(true, 5, 173, 0, true),
           "override must preserve device, streaming and Chunk guards");
 
+    check(llama_region_ring_gpu_weight_bank_for_rank(0, 1) == 0 &&
+          llama_region_ring_gpu_weight_bank_for_rank(1, 1) == 0 &&
+          llama_region_ring_gpu_weight_bank_for_rank(4, 1) == 0,
+          "single Bank must map every GPU Region to Bank A");
+    check(llama_region_ring_gpu_initial_bank_count(5, 1) == 1 &&
+          llama_region_ring_gpu_initial_bank_count(5, 2) == 2,
+          "initial load must respect physical Bank count");
+    const auto single_next = llama_region_ring_gpu_weight_next_rank(1, 5, 1);
+    check(single_next && *single_next == 2,
+          "single Bank successor is next GPU Region");
     check(llama_region_ring_gpu_weight_bank_for_rank(0) == 0,
           "rank0 must use Bank A");
     check(llama_region_ring_gpu_weight_bank_for_rank(1) == 1,
