@@ -3916,6 +3916,15 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         }
     }
 
+    const char * ablation_mode =
+        std::getenv("LLAMA_REGION_RING_ABLATION");
+    const bool ablation_one_bank =
+        ablation_mode && (std::strcmp(ablation_mode, "A2") == 0 ||
+                          std::strcmp(ablation_mode, "A3") == 0);
+    const bool ablation_no_prefetch =
+        ablation_mode && (std::strcmp(ablation_mode, "A1") == 0 ||
+                          ablation_one_bank);
+    const size_t gpu_bank_count = ablation_one_bank ? 1 : 2;
     const int gpu_bank_chunk_tokens =
         !gpu_region_order.empty() ?
             stages[gpu_region_order.front()].macro_tokens : 0;
@@ -3934,6 +3943,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         gpu_bank_force_env != nullptr &&
         std::strcmp(gpu_bank_force_env, "1") == 0;
     const bool gpu_bank_streaming =
+        !ablation_no_prefetch &&
         llama_region_ring_gpu_bank_mover_enabled(
             gpu_weight_streaming, gpu_region_order.size(),
             (int) ubatch.n_tokens, gpu_bank_chunk_tokens,
@@ -4007,7 +4017,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         // CPU and GPU Bank A always have independent worker resources.
         // Bank B is needed only when a second GPU Region is executable.
         const size_t ring_pc_resource_count =
-            gpu_weight_streaming && gpu_region_order.size() >= 2 ? 3 : 2;
+            gpu_weight_streaming && gpu_bank_count == 2 &&
+                gpu_region_order.size() >= 2 ? 3 : 2;
 
         for (size_t resource_id = 0;
              resource_id < ring_pc_resource_count; ++resource_id) {
@@ -4157,7 +4168,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (gpu_weight_streaming) {
             const size_t active_banks =
                 llama_region_ring_gpu_initial_bank_count(
-                    gpu_region_order.size());
+                    gpu_region_order.size(), gpu_bank_count);
             LLAMA_LOG_INFO(
                 "[REGION_RING_GPU_BANK] phase=INIT banks=%zu "
                 "mapping=FIXED_PARITY canonical=CPU destination=CUDA "
@@ -4165,6 +4176,8 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 "force_small_batch=%d override_applied=%d status=READY\n",
                 active_banks,
                 gpu_bank_streaming ? "CPU_SINGLE" :
+                ablation_one_bank ? "SINGLE_BANK_DEMAND" :
+                ablation_no_prefetch ? "TWO_BANK_DEMAND" :
                 active_banks == 1 ? "SINGLE_BANK_NO_REFILL" :
                 active_banks == 0 ? "NO_GPU_REGION" :
                                     "INACTIVE_SMALL_BATCH",
@@ -7317,7 +7330,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
 
                         const size_t bank_index =
                             llama_region_ring_gpu_weight_bank_for_rank(
-                                (size_t) rank);
+                                (size_t) rank, gpu_bank_count);
                         const size_t selected_bank = bank_index + 1;
                         auto & selected =
                             region_ring_worker_resources[selected_bank];
@@ -7396,6 +7409,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             selected.bank_generation,
                             gpu_bank_wait_us / 1000.0,
                             gpu_bank_streaming ? "REFILL" :
+                            ablation_one_bank ? "SINGLE_BANK_DEMAND" :
                             gpu_region_order.size() == 1 ?
                                 (gpu_bank_resident ?
                                     "SINGLE_BANK_RESIDENT" :
@@ -8874,6 +8888,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << pc_phone_overlap_us / 1000.0 << ","
                             << "\"gpu_bank_streaming\":"
                             << (gpu_bank_streaming ? "true" : "false")
+                            << ",\"gpu_bank_count\":" << gpu_bank_count
+                            << ",\"gpu_bank_prefetch\":"
+                            << (gpu_bank_streaming ? "true" : "false")
+                            << ",\"ablation_mode\":\""
+                            << (ablation_mode ? ablation_mode : "OFF") << "\""
                             << ",\"resource_aware_chunk_sched\":"
                             << (resource_aware_chunk_sched ? "true" : "false")
                             << ",\"drain_first_cycle\":"
@@ -14251,8 +14270,14 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             gpu_regions.push_back(r);
         }
     }
+    const char * ablation_mode =
+        std::getenv("LLAMA_REGION_RING_ABLATION");
+    const size_t gpu_bank_count = ablation_mode &&
+        (std::strcmp(ablation_mode, "A2") == 0 ||
+         std::strcmp(ablation_mode, "A3") == 0) ? 1 : 2;
     const size_t initial_banks =
-        llama_region_ring_gpu_initial_bank_count(gpu_regions.size());
+        llama_region_ring_gpu_initial_bank_count(
+            gpu_regions.size(), gpu_bank_count);
     if (initial_banks == 0 || xg <= 0) {
         return false; // No GPU work: neither Bank is needed.
     }
@@ -14376,7 +14401,8 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
             const size_t region = gpu_regions[gpu_rank];
             const auto & stage = stages[region];
             const size_t bank_index =
-                llama_region_ring_gpu_weight_bank_for_rank(gpu_rank);
+                llama_region_ring_gpu_weight_bank_for_rank(
+                    gpu_rank, gpu_bank_count);
 
             ggml_status status = GGML_STATUS_SUCCESS;
             const int64_t prepare_begin_us = ggml_time_us();
@@ -14576,7 +14602,8 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         };
 
     if (peak_reserve_enabled) {
-        for (size_t rank = 2; rank < gpu_regions.size(); ++rank) {
+        for (size_t rank = initial_banks;
+                rank < gpu_regions.size(); ++rank) {
             if (!reserve_future_bank_graph(rank)) {
                 region_ring_initial_banks_loaded = false;
                 bank_a.bank_ready = false;
