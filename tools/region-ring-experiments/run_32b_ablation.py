@@ -156,7 +156,8 @@ def measured_ms_per_layer(path: Path, chunk: int) -> dict[str, float]:
             continue
         try:
             layers = int(row.get("layers", 0))
-            tokens = int(row.get("chunk", row.get("chunk_tokens", 0)))
+            tokens = int(row.get("tokens") or row.get("chunk") or
+                         row.get("chunk_tokens") or 0)
             ms = float(row.get("compute_ms", row.get("compute_median_ms", 0)))
             if layers and tokens and ms > 0 and math.isfinite(ms):
                 values[d].append((abs(tokens - chunk), ms / layers * chunk / tokens))
@@ -288,18 +289,22 @@ def single_cycle(weights: list[int], gpu_free: int, cpu_free: int,
     raise ValueError("no capacity-feasible single-cycle G,[C],P layout")
 
 
-def run_one(case: str, layout: str, args, stage_csv: Path | None) -> int:
+def run_one(case: str, layout: str, args) -> int:
+    # Every measured case uses the fixed Ring execution path. A0/A1 must
+    # NOT run independent HTP probes just to execute a known-good G8/P6.
+    # A2 gets its *offline* G/C/N profile separately before selecting the
+    # fixed single-Bank layout. This keeps profiling out of timed inference.
     out = args.out / case
     command = [
         sys.executable, str(Path(__file__).with_name("run_32b_all40.py")),
         "--model", str(args.model), "--model-layers", "64",
         "--exe", str(args.exe), "--rpc", args.rpc,
-        "--prompt-dir", str(args.prompt_dir),
-        "--out", str(out), "--auto-plan", "--htp-only",
-        "--force-plan-layout", layout,
-        "--force-plan-xc", str(args.chunk),
-        "--force-plan-xg", str(args.chunk),
-        "--force-plan-xp", str(args.chunk),
+        "--prompt-dir", str(args.prompt_dir), "--out", str(out),
+        "--htp-only", "--layout", layout,
+        "--chunk", str(args.chunk),
+        "--xc", str(args.chunk),
+        "--xg", str(args.chunk),
+        "--xp", str(args.chunk),
         "--streaming", "on", "--batch", "2048", "--ubatch", "2048",
         "--n-predict", "1", "--threads", str(args.threads),
         "--limit", str(args.limit), "--trace-tasks", "--no-mmap",
@@ -310,16 +315,68 @@ def run_one(case: str, layout: str, args, stage_csv: Path | None) -> int:
         "--env", "LLAMA_REGION_RING_GPU_BANK_PREFETCH=" +
                    ("1" if case == "A0" else "0"),
     ]
-    if stage_csv is not None:
-        command += ["--real-stage-profile-csv", str(stage_csv)]
     if args.only_prompt:
         command += ["--only-prompt", args.only_prompt]
     if args.dry_run:
         command += ["--dry-run"]
-    print("[ABLATION_RUN]", case, layout, " ".join(f'"{p}"' if " " in p else p for p in command), flush=True)
+    print("[ABLATION_RUN]", case, layout,
+          " ".join(f'"{p}"' if " " in p else p for p in command), flush=True)
     if args.plan_only:
         return 0
     return subprocess.call(command, cwd=str(ROOT))
+
+
+def ensure_independent_profile(args) -> Path:
+    """One independent G/C/N calibration for A2 only, reused indefinitely.
+
+    The native profile is emitted before forced-Plan simulation. Its cache
+    remains valid if the experimental simulation subsequently rejects a Plan.
+    A missing HTP sample is a hard error and can never be patched with fake
+    CPU/GPU rows.
+    """
+    path = args.out / "independent-profile" / "profile.csv"
+    from run_32b_all40 import verify_independent_profile
+    if path.exists():
+        count = verify_independent_profile(path)
+        print(f"[ABLATION_PROFILE] event=REUSE npu_points={count} csv={path}", flush=True)
+        return path
+    if args.plan_only or args.dry_run:
+        raise ValueError("A2 needs --profile-csv for --plan-only/--dry-run "
+                         "or an existing independent-profile cache")
+    calibration_out = args.out / "independent-calibration-run"
+    command = [
+        sys.executable, str(Path(__file__).with_name("run_32b_all40.py")),
+        "--model", str(args.model), "--model-layers", "64",
+        "--exe", str(args.exe), "--rpc", args.rpc,
+        "--prompt-dir", str(args.prompt_dir),
+        "--out", str(calibration_out),
+        "--auto-plan", "--htp-only",
+        "--force-plan-layout", FIXED,
+        "--force-plan-xc", str(args.chunk),
+        "--force-plan-xg", str(args.chunk),
+        "--force-plan-xp", str(args.chunk),
+        "--streaming", "on", "--batch", "2048", "--ubatch", "2048",
+        "--n-predict", "1", "--threads", str(args.threads),
+        "--limit", "1", "--trace-tasks", "--no-mmap", "--skip-warmup",
+        "--stop-on-fail", "--max-retries", "0",
+    ]
+    print(f"[ABLATION_PROFILE] event=START source=INDEPENDENT_G_C_N "
+          f"out={calibration_out}", flush=True)
+    code = subprocess.call(command, cwd=str(ROOT))
+    native = calibration_out / "independent-profile" / "profile.csv"
+    if not native.exists():
+        raise ValueError("A2 independent calibration has no valid NPU sample. "
+                         f"See {calibration_out / 'runs'} and Phone-side "
+                         "[HTP_INDEPENDENT_PROFILE] logs. "
+                         f"calibration_exit={code}")
+    count = verify_independent_profile(native)
+    import shutil
+    path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(native, path)
+    shutil.copy2(native.with_suffix(".json"), path.with_suffix(".json"))
+    print(f"[ABLATION_PROFILE] event=READY npu_points={count} csv={path} "
+          f"calibration_exit={code}", flush=True)
+    return path
 
 
 def write_comparison(out: Path, plans: dict) -> None:
@@ -389,10 +446,10 @@ def main() -> int:
                 # A0's C++ independent one-shot grid profile can be reused
                 # for both A2 and A3 without rerunning calibration.
                 if profile is None:
-                    profile = args.out / "A0/independent-profile/profile.csv"
+                    profile = ensure_independent_profile(args)
                 if not profile.is_file():
                     ap.error(f"A2 requires independent profile CSV: {profile}. "
-                             "Run A0 first or supply --profile-csv.")
+                             "Supply --profile-csv or run with a working Phone HTP probe.")
                 measures = measured_ms_per_layer(profile, args.chunk)
                 layout, details = multi_cycle(weights, measures, gpu, cpu, phone, args)
             else:
@@ -406,12 +463,7 @@ def main() -> int:
         print(f"[ABLATION_PLAN] case={case} layout={layout} info={json.dumps(details)}", flush=True)
         (args.out / f"{case}-plan.json").write_text(
             json.dumps(plans[case], indent=2), encoding="utf-8")
-        ret = run_one(case, layout, args, profile)
-        if ret == 0 and case == "A0" and profile is None:
-            shared = args.out / "A0/independent-profile/profile.csv"
-            if shared.is_file():
-                profile = shared
-                print(f"[ABLATION_PROFILE] source=A0_REUSE csv={profile}", flush=True)
+        ret = run_one(case, layout, args)
         if ret != 0:
             print(f"[ABLATION_FAIL] case={case} exit_code={ret}", file=sys.stderr)
             return ret
