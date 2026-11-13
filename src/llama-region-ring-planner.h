@@ -170,6 +170,8 @@ struct model {
     // weights are rolled through two persistent Banks. Adjacent GPU Regions
     // may interleave; only same-Bank rank k-2 lifetime is serialized.
     bool gpu_weight_streaming = false;
+    // Ablation: one on-demand resident Bank, or the normal two Banks.
+    size_t gpu_bank_count = 2;
     double phone_register_ms = 0.0; // Legacy MoE P5 fallback only.
     // Dense: measured/proxied RPC graph bytes, not a hard-coded P5 graph.
     // embedded_directional means C2P -> Phone Full -> P2C runs inside Meta.
@@ -369,7 +371,8 @@ inline bool gpu_weight_bank_peaks(
             return false;
         }
         const size_t bank =
-            llama_region_ring_gpu_weight_bank_for_rank(gpu_ordinal);
+            llama_region_ring_gpu_weight_bank_for_rank(
+                gpu_ordinal, m.gpu_bank_count);
         peaks[bank] = std::max(peaks[bank], bytes);
         if (total_bytes) {
             if (bytes > std::numeric_limits<size_t>::max() - *total_bytes) {
@@ -506,7 +509,8 @@ inline bool gpu_prefix_memory_feasible(
             return false;
         }
         if (m.gpu_weight_streaming) {
-            long double & bank = gpu_rank % 2 == 0 ?
+            long double & bank = m.gpu_bank_count == 1 ||
+                    gpu_rank % 2 == 0 ?
                 estimate.bank0_bytes : estimate.bank1_bytes;
             bank = std::max(bank, (long double) weight_bytes);
         } else {
@@ -532,7 +536,8 @@ inline bool gpu_prefix_memory_feasible(
             return false;
         }
         if (m.gpu_weight_streaming) {
-            long double & bank = gpu_rank % 2 == 0 ?
+            long double & bank = m.gpu_bank_count == 1 ||
+                    gpu_rank % 2 == 0 ?
                 estimate.bank0_bytes : estimate.bank1_bytes;
             bank = std::max(bank, (long double) one_layer_bytes);
         } else {
@@ -682,10 +687,12 @@ inline bool gpu_minimum_complete_first_cycle_memory(
             }
             const long double bytes = (long double) layer_weight;
             const long double b0 =
-                m.gpu_weight_streaming && completed % 2 == 0 ?
+                m.gpu_weight_streaming &&
+                    (m.gpu_bank_count == 1 || completed % 2 == 0) ?
                     std::max(bank0, bytes) : bank0;
             const long double b1 =
-                m.gpu_weight_streaming && completed % 2 != 0 ?
+                m.gpu_weight_streaming && m.gpu_bank_count == 2 &&
+                    completed % 2 != 0 ?
                     std::max(bank1, bytes) : bank1;
             const long double all = unstreamed +
                 (m.gpu_weight_streaming ? 0.0L : bytes);
