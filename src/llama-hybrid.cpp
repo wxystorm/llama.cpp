@@ -10516,6 +10516,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     const bool have_layer_weights =
         profile.layer_weight_bytes.size() == (size_t) profile.n_layer ||
         weight_fallback != 0;
+    // Physical Bank-count ablation must be in scope for forced-layout
+    // validation as well as model-memory callbacks.
+    const char * bank_count_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
+    const bool single_gpu_bank =
+        bank_count_env != nullptr &&
+        std::strcmp(bank_count_env, "1") == 0;
     // Aggregate all memory callback outcomes without writing per-candidate
     // logs in the hot search loop. They are calls, not unique layouts.
     auto htp_memory_diag = std::make_shared<std::array<size_t, 7>>();
@@ -10571,13 +10578,6 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 };
         }
 
-        // Bank-count ablation: one physical Bank holds the largest GPU
-        // Region, never the sum of the model's logical GPU Regions.
-        const char * bank_count_env =
-            std::getenv("LLAMA_REGION_RING_GPU_BANK_COUNT");
-        const bool single_gpu_bank =
-            bank_count_env != nullptr &&
-            std::strcmp(bank_count_env, "1") == 0;
         // Identical GPU accounting to the full-layout memory guard:
         // resident Bank peak weights + full-Prompt GPU KV + slot scratch.
         // The Planner applies this budget to E seeds and every Beam prefix.
