@@ -24,6 +24,7 @@ param(
     [int]$Threads = 8,
     [int]$NPredict = 1,
     [ValidateRange(0,40)][int]$Limit = 0,
+    [ValidateSet(128,256,512,1024,2048)][int[]]$OnlyGroup = @(),
     [int]$MaxRetries = 1,
     [switch]$NoMmap,
     [switch]$StopOnFail,
@@ -62,6 +63,7 @@ if ($ForceLayout) {
           $PSBoundParameters.ContainsKey("ForceXP")) {
     throw "-ForceXC/-ForceXG/-ForceXP require -ForceLayout"
 }
+foreach ($group in $OnlyGroup) { $arguments += @("--only-group", "$group") }
 if ($NoMmap) { $arguments += "--no-mmap" }
 if ($UpdateProfile) { $arguments += "--update-profile" }
 if ($TraceTasks) { $arguments += "--trace-tasks" }
