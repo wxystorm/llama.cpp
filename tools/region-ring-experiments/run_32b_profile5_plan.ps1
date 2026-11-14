@@ -21,6 +21,7 @@ param(
     [int]$ForceXP = 128,
     [int]$Batch = 2048,
     [int]$UBatch = 2048,
+    [ValidateRange(256,131072)][int]$MaxContext = 4096,
     [int]$Threads = 8,
     [int]$NPredict = 1,
     [ValidateRange(0,40)][int]$Limit = 0,
@@ -48,6 +49,7 @@ $arguments = @(
     "--profile-grid", $ProfileGrid,
     "--streaming", "on", "--batch", "$Batch", "--ubatch", "$UBatch",
     "--n-predict", "$NPredict", "--threads", "$Threads",
+    "--max-context", "$MaxContext",
     "--max-retries", "$MaxRetries", "--limit", "$Limit",
     "--log-verbosity", "4", "--context-padding", "256"
 )
