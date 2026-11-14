@@ -1254,9 +1254,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const char * stream_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
     const bool stream_weights = stream_env != nullptr && std::strcmp(stream_env, "1") == 0;
     if (stream_weights) {
-        if (!ml.use_mmap || ml.use_direct_io || params.use_mlock) {
+        if (!ml.use_mmap || ml.use_direct_io || params.use_mlock ||
+                params.use_extra_bufts || !params.no_host) {
             throw std::runtime_error(
-                "GGML_OPENCL_STREAM_WEIGHTS requires mmap, no direct I/O and no mlock");
+                "GGML_OPENCL_STREAM_WEIGHTS requires --mmap --no-repack --no-host "
+                "without --direct-io or --mlock");
         }
         bool has_opencl = false;
         for (const auto & device : devices) {
