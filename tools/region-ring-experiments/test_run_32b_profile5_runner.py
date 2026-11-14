@@ -88,17 +88,17 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             profile = root / "profile.csv"
             profile.write_text(
                 "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
-                "prepare_ms,compute_ms,terminal,samples\\n"
-                "PHONE,3,96,2048,0,0,0,100,0,2\\n",
+                "prepare_ms,compute_ms,terminal,samples\n"
+                "PHONE,3,96,2048,0,0,0,100,0,2\n",
                 encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "3072"):
                 require_long_htp_kv_anchors(profile)
             with profile.open("a", encoding="utf-8") as output:
-                output.write("PHONE,3,96,3072,0,0,0,0,0,2\\n")
+                output.write("PHONE,3,96,3072,0,0,0,0,0,2\n")
             with self.assertRaisesRegex(ValueError, "3072"):
                 require_long_htp_kv_anchors(profile)
             with profile.open("a", encoding="utf-8") as output:
-                output.write("PHONE,4,128,3072,0,0,0,125,0,2\\n")
+                output.write("PHONE,4,128,3072,0,0,0,125,0,2\n")
             require_long_htp_kv_anchors(profile)
 
     def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
