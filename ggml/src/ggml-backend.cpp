@@ -23,8 +23,10 @@
 #include <chrono>
 #include <vector>
 #include <cinttypes>
+#include <cerrno>
 
 #ifdef __linux__
+#include <sys/resource.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -831,6 +833,7 @@ struct ggml_backend_sched {
     bool opencl_stream_weights;
     ggml_backend_sched_stream_advice_callback stream_advice_callback;
     void * stream_advice_userdata;
+    size_t stream_rss_limit_bytes;
 
     int debug;
 
@@ -1589,11 +1592,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t staged_weight_copies = 0;
     size_t opencl_splits = 0;
     size_t advised_weight_bytes = 0;
+    size_t peak_rss_kib = 0;
     double stage_submit_ms = 0.0;
     double advice_ms = 0.0;
 
     // read_bytes reflects process-attributed storage I/O including page faults
     // where Linux accounting supports it; it is NOT an exact per-weight counter.
+    auto read_rss_kib = []() -> size_t {
+#ifdef __linux__
+        FILE * file = fopen("/proc/self/status", "r");
+        if (!file) return SIZE_MAX;
+        char line[256];
+        size_t rss = SIZE_MAX;
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (strncmp(line, "VmRSS:", 6) == 0) {
+                unsigned long long kib = 0;
+                if (sscanf(line + 6, "%llu", &kib) == 1 && kib <= SIZE_MAX) {
+                    rss = (size_t) kib;
+                }
+                break;
+            }
+        }
+        fclose(file);
+        return rss;
+#else
+        return SIZE_MAX;
+#endif
+    };
     auto read_io_bytes = []() -> uint64_t {
 #ifdef __linux__
         FILE * file = fopen("/proc/self/io", "r");
@@ -1614,6 +1639,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 #endif
     };
     const uint64_t read_before = sched->opencl_stream_weights ? read_io_bytes() : UINT64_MAX;
+#ifdef __linux__
+    struct rusage resource_before = {};
+    if (sched->opencl_stream_weights) getrusage(RUSAGE_SELF, &resource_before);
+#endif
     const auto graph_start = std::chrono::steady_clock::now();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1822,6 +1851,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        if (is_opencl_split) {
+            const size_t rss_kib = read_rss_kib();
+            if (rss_kib != SIZE_MAX) {
+                peak_rss_kib = std::max(peak_rss_kib, rss_kib);
+                if (sched->stream_rss_limit_bytes != 0 &&
+                        rss_kib > sched->stream_rss_limit_bytes / 1024) {
+                    GGML_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT rss_mib=%.2f limit_mib=%.2f "
+                                   "split=%d after_cache_reclaim=1\n",
+                            rss_kib / 1024.0,
+                            sched->stream_rss_limit_bytes / (1024.0 * 1024.0), split_id);
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
+            }
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1838,13 +1882,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const uint64_t io_bytes = read_before != UINT64_MAX &&
                 read_after != UINT64_MAX && read_after >= read_before ?
                 read_after - read_before : UINT64_MAX;
+#ifdef __linux__
+        struct rusage resource_after = {};
+        getrusage(RUSAGE_SELF, &resource_after);
+        const long major_faults = resource_after.ru_majflt - resource_before.ru_majflt;
+        const long minor_faults = resource_after.ru_minflt - resource_before.ru_minflt;
+#else
+        const long major_faults = -1;
+        const long minor_faults = -1;
+#endif
         GGML_LOG_INFO("[PHONE_STREAM] opencl_splits=%zu weight_copies=%zu staged_weight_mib=%.2f "
                       "advised_weight_mib=%.2f copy_submit_ms=%.3f advice_ms=%.3f "
-                      "graph_wall_ms=%.3f process_read_bytes=%" PRIu64 "\n",
+                      "graph_wall_ms=%.3f process_read_bytes=%" PRIu64
+                      " major_faults=%ld minor_faults=%ld peak_sampled_rss_mib=%.2f\n",
                 opencl_splits, staged_weight_copies,
                 (double) staged_weight_bytes / (1024.0 * 1024.0),
                 (double) advised_weight_bytes / (1024.0 * 1024.0),
-                stage_submit_ms, advice_ms, wall_ms, io_bytes);
+                stage_submit_ms, advice_ms, wall_ms, io_bytes,
+                major_faults, minor_faults, peak_rss_kib / 1024.0);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1865,7 +1920,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     const char * stream_env = getenv("GGML_OPENCL_STREAM_WEIGHTS");
     sched->opencl_stream_weights = stream_env != NULL && strcmp(stream_env, "1") == 0;
+    sched->stream_rss_limit_bytes = 0;
     if (sched->opencl_stream_weights) {
+        const char * limit_env = getenv("GGML_OPENCL_STREAM_RSS_LIMIT_MIB");
+        if (limit_env && *limit_env) {
+            char * end = NULL;
+            const unsigned long long mib = strtoull(limit_env, &end, 10);
+            if (mib > 0 && end != limit_env && *end == '\0' &&
+                    mib <= SIZE_MAX / (1024ull * 1024ull)) {
+                sched->stream_rss_limit_bytes = (size_t) mib * 1024ull * 1024ull;
+            } else {
+                GGML_LOG_WARN("[PHONE_STREAM_BUDGET] ignored invalid RSS limit %s\n", limit_env);
+            }
+        }
         GGML_LOG_INFO("[PHONE_STREAM] scheduler=OPENCL_DEMAND_COPY weights=CPU_MMAP mode=DENSE_MATMUL\n");
     }
 
