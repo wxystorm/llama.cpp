@@ -20,7 +20,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <vector>
+#include <cinttypes>
+
+#ifdef __linux__
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -821,6 +829,8 @@ struct ggml_backend_sched {
     // Opt-in: CPU mmap weights are copied to the OpenCL device only when an op needs them.
     // Weight copies are allocated as graph-split inputs so ggml-gallocr can reuse GPU memory.
     bool opencl_stream_weights;
+    ggml_backend_sched_stream_advice_callback stream_advice_callback;
+    void * stream_advice_userdata;
 
     int debug;
 
@@ -1578,6 +1588,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t staged_weight_bytes = 0;
     size_t staged_weight_copies = 0;
     size_t opencl_splits = 0;
+    size_t advised_weight_bytes = 0;
+    double stage_submit_ms = 0.0;
+    double advice_ms = 0.0;
+
+    // read_bytes reflects process-attributed storage I/O including page faults
+    // where Linux accounting supports it; it is NOT an exact per-weight counter.
+    auto read_io_bytes = []() -> uint64_t {
+#ifdef __linux__
+        FILE * file = fopen("/proc/self/io", "r");
+        if (file == NULL) return UINT64_MAX;
+        char key[64];
+        uint64_t bytes = UINT64_MAX;
+        unsigned long long value = 0;
+        while (fscanf(file, "%63s %llu", key, &value) == 2) {
+            if (strcmp(key, "read_bytes:") == 0) {
+                bytes = (uint64_t) value;
+                break;
+            }
+        }
+        fclose(file);
+        return bytes;
+#else
+        return UINT64_MAX;
+#endif
+    };
+    const uint64_t read_before = sched->opencl_stream_weights ? read_io_bytes() : UINT64_MAX;
+    const auto graph_start = std::chrono::steady_clock::now();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1590,6 +1627,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ++opencl_splits;
         }
 
+        // The input sources stay immutable for the lifetime of this split.
+        // A staged host weight can be reclaimed only AFTER OpenCL completes.
+        std::vector<const ggml_tensor *> staged_sources;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1601,7 +1642,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // the file-backed page cache may already contain this weight.
                 staged_weight_bytes += ggml_nbytes(input);
                 ++staged_weight_copies;
+                staged_sources.push_back(input);
             }
+            const auto stage_start = std::chrono::steady_clock::now();
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -1719,6 +1762,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+            if (is_opencl_split) {
+                stage_submit_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - stage_start).count();
+            }
         }
 
         if (!sched->callback_eval) {
@@ -1760,6 +1807,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // For OpenCL demand staging, finish all GPU reads before reclaiming
+        // source mmap pages. This sacrifices overlap intentionally in v1.
+        if (is_opencl_split && !staged_sources.empty()) {
+            ggml_backend_synchronize(split_backend);
+            if (sched->stream_advice_callback != NULL) {
+                const auto advice_start = std::chrono::steady_clock::now();
+                for (const ggml_tensor * tensor : staged_sources) {
+                    advised_weight_bytes += sched->stream_advice_callback(
+                        tensor, sched->stream_advice_userdata);
+                }
+                advice_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - advice_start).count();
+            }
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1769,9 +1831,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (sched->opencl_stream_weights) {
-        GGML_LOG_INFO("[PHONE_STREAM] opencl_splits=%zu weight_copies=%zu staged_weight_mib=%.2f\n",
+        const uint64_t read_after = read_io_bytes();
+        const auto graph_end = std::chrono::steady_clock::now();
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            graph_end - graph_start).count();
+        const uint64_t io_bytes = read_before != UINT64_MAX &&
+                read_after != UINT64_MAX && read_after >= read_before ?
+                read_after - read_before : UINT64_MAX;
+        GGML_LOG_INFO("[PHONE_STREAM] opencl_splits=%zu weight_copies=%zu staged_weight_mib=%.2f "
+                      "advised_weight_mib=%.2f copy_submit_ms=%.3f advice_ms=%.3f "
+                      "graph_wall_ms=%.3f process_read_bytes=%" PRIu64 "\n",
                 opencl_splits, staged_weight_copies,
-                (double) staged_weight_bytes / (1024.0 * 1024.0));
+                (double) staged_weight_bytes / (1024.0 * 1024.0),
+                (double) advised_weight_bytes / (1024.0 * 1024.0),
+                stage_submit_ms, advice_ms, wall_ms, io_bytes);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1971,6 +2044,13 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_stream_advice_callback(ggml_backend_sched_t sched,
+        ggml_backend_sched_stream_advice_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->stream_advice_callback = callback;
+    sched->stream_advice_userdata = user_data;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
