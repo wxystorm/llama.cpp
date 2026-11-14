@@ -1655,6 +1655,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (is_opencl_split) {
             ++opencl_splits;
         }
+        const char * trace_splits = getenv("GGML_OPENCL_STREAM_TRACE_SPLITS");
+        const bool trace_split = is_opencl_split && trace_splits != NULL && strcmp(trace_splits, "1") == 0;
+        const uint64_t split_read_before = trace_split ? read_io_bytes() : UINT64_MAX;
+        const auto split_start = std::chrono::steady_clock::now();
 
         // The input sources stay immutable for the lifetime of this split.
         // A staged host weight can be reclaimed only AFTER OpenCL completes.
@@ -1849,6 +1853,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 advice_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - advice_start).count();
             }
+        }
+
+        if (trace_split) {
+            const uint64_t split_read_after = read_io_bytes();
+            const uint64_t split_io_bytes = split_read_before != UINT64_MAX &&
+                    split_read_after != UINT64_MAX && split_read_after >= split_read_before ?
+                    split_read_after - split_read_before : UINT64_MAX;
+            const double split_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - split_start).count();
+            GGML_LOG_INFO("[PHONE_STREAM_SPLIT] split=%d stage_inputs=%d wall_ms=%.3f "
+                          "process_read_bytes=%" PRIu64 "\n",
+                    split_id, split->n_inputs, split_ms, split_io_bytes);
         }
 
         if (is_opencl_split) {
