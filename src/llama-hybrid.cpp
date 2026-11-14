@@ -33,6 +33,7 @@
 #include <numeric>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_set>
