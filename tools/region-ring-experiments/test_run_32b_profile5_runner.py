@@ -45,6 +45,7 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
                 "--prompt-dir", str(prompt_dir),
                 "--only-group", "2048",
                 "--context-padding", "256",
+                "--max-context", "8192",
             ])
             self.assertEqual(args.only_group, [2048])
             ctx, hint = choose_context(2048, None, args)
