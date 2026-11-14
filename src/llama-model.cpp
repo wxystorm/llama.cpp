@@ -1303,6 +1303,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // build a list of buffer types for the CPU and GPU devices
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    if (stream_weights) {
+        // No implicit ACCEL (e.g. HTP) buffers in the phone-only baseline.
+        // All GGUF weights must be associated with the plain CPU buffer
+        // type so they can remain backed by the original file mapping.
+        ggml_backend_dev_t stream_cpu_dev =
+            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!stream_cpu_dev) {
+            throw std::runtime_error("phone OpenCL streaming requires CPU backend");
+        }
+        pimpl->cpu_buft_list.clear();
+        pimpl->cpu_buft_list.emplace_back(stream_cpu_dev, ggml_backend_cpu_buffer_type());
+    }
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
