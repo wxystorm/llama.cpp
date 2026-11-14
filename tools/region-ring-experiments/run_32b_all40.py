@@ -79,8 +79,10 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     # Do not inherit old per-Stage logging from previous Profile5 invocations.
     "LLAMA_REGION_RING_TASK_TRACE",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
+    "LLAMA_REGION_RING_PROFILE_KV_EXTEND",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
+LONG_HTP_KV_ANCHORS = (2048, 3072)
 METRIC_RX = r"(\d+(?:\.\d+)?)"
 RESULT_COLUMNS = (
     "prompt", "group", "prompt_tokens_hint", "context", "status", "attempt",
@@ -593,6 +595,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
             "LLAMA_REGION_RING_PRIORITY_BANK_MOVER": "1",
             "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH": "1",
         })
+    if args.htp_only and 2048 in (getattr(args, "only_group", None) or []):
+        # An optional long-context group creates a NEW independent HTP grid
+        # (256/512/1024/2048/3072) in a separate --out. No KV=4096 probe.
+        env["LLAMA_REGION_RING_PROFILE_KV_EXTEND"] = "1"
     if args.real_stage_profile_csv is not None:
         env["LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV"] = str(args.real_stage_profile_csv)
     if getattr(args, "trace_tasks", False):
@@ -974,13 +980,38 @@ def profile_once_resume_compatible(old: dict, new: dict) -> bool:
     return compatible == new
 
 
-def verify_independent_profile(path: Path) -> int:
+def require_long_htp_kv_anchors(path: Path, required=LONG_HTP_KV_ANCHORS):
+    """Long-context plans require REAL 2048/3072 HTP measurements."""
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        available = {
+            int(row.get("kv_tokens") or 0)
+            for row in rows if row.get("device") == "PHONE"
+            and math.isfinite(float(row.get("compute_ms") or 0.0))
+            and float(row.get("compute_ms") or 0.0) > 0.0
+        }
+    except (OSError, csv.Error, TypeError, ValueError) as exc:
+        raise ValueError(f"Cannot validate long-KV HTP Profile {path}: {exc}") from exc
+    missing = sorted(set(required) - available)
+    if missing:
+        raise ValueError(
+            f"Long-context group needs measured HTP KV={list(required)}; "
+            f"missing={missing} in {path}. Start with a NEW -Out directory "
+            "and omit -RealStageProfileCsv to collect a fresh Profile. "
+            "KV=4096 will not be probed."
+        )
+
+
+def verify_independent_profile(path: Path, required_kvs=()) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
     A rolling epoch CSV is not a standalone Profile; validate the native
     profile.json only for the initial independent G/C/N baseline.
     """
     npu_points = require_htp_stage_rows(path)
+    if required_kvs:
+        require_long_htp_kv_anchors(path, required_kvs)
     with path.open("r", encoding="utf-8-sig", newline="") as stream:
         points = list(csv.DictReader(stream))
     for backend in ("CPU", "GPU", "PHONE"):
@@ -1019,6 +1050,8 @@ def verify_independent_profile(path: Path) -> int:
 def main(argv=None):
     args = get_args(argv)
     user_stage_csv = args.real_stage_profile_csv
+    required_long_kv = LONG_HTP_KV_ANCHORS if (
+        args.htp_only and 2048 in (args.only_group or [])) else ()
     if args.auto_plan and args.htp_only and user_stage_csv is None:
         # The first C++ startup profiles C/G/N independently before it
         # searches the Plan. No fixed Ring, V0 prefill or Prompt is run.
@@ -1204,7 +1237,7 @@ def main(argv=None):
                       " source=INDEPENDENT_BACKEND_GRID", flush=True)
             if user_stage_csv is None:
                 if independent.is_file():
-                    count = verify_independent_profile(independent)
+                    count = verify_independent_profile(independent, required_long_kv)
                     print(f"[PROFILE] event=INDEPENDENT_REUSE"
                           f" npu_points={count} csv={independent}", flush=True)
                 else:
@@ -1214,6 +1247,8 @@ def main(argv=None):
                           " source=PC_NATIVE_AND_PHONE_RPC_HTP", flush=True)
             else:
                 require_htp_stage_rows(user_stage_csv)
+                if required_long_kv:
+                    require_long_htp_kv_anchors(user_stage_csv, required_long_kv)
 
         # One unmeasured representative Prefill per invocation. It is
         # deliberately NOT an entry in runs/, summary.csv or PASS counts.
@@ -1341,7 +1376,7 @@ def main(argv=None):
                     independent = args.out / "independent-profile" / "profile.csv"
                     profile_error = None
                     try:
-                        count = verify_independent_profile(independent)
+                        count = verify_independent_profile(independent, required_long_kv)
                     except (OSError, ValueError, TypeError) as exc:
                         profile_error = str(exc)
                     if profile_error is None:
