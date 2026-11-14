@@ -13,6 +13,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -594,6 +595,14 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS")) {
+        if (std::strcmp(stream, "1") == 0) {
+            ggml_backend_sched_set_stream_advice_callback(sched.get(),
+                [](const ggml_tensor * tensor, void * userdata) -> size_t {
+                    return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
+                }, const_cast<llama_model *>(&model));
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -629,6 +638,14 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS")) {
+                    if (std::strcmp(stream, "1") == 0) {
+                        ggml_backend_sched_set_stream_advice_callback(sched.get(),
+                            [](const ggml_tensor * tensor, void * userdata) -> size_t {
+                                return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
+                            }, const_cast<llama_model *>(&model));
+                    }
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -2402,10 +2419,46 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+    } else {
         GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
+        // A preflight reservation estimates graph compute buffers *before*
+        // allocating any OpenCL staging/activation memory. It cannot account
+        // for temporary buffers internal to the driver or model-level KV.
+        const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+        const char * budget = std::getenv("GGML_OPENCL_STREAM_GPU_BUDGET_MIB");
+        if (stream != nullptr && std::strcmp(stream, "1") == 0 &&
+                budget != nullptr && *budget != '\0') {
+            char * end = nullptr;
+            const unsigned long long mib = std::strtoull(budget, &end, 10);
+            if (mib == 0 || end == budget || *end != '\0' ||
+                    mib > SIZE_MAX / (1024ull * 1024ull)) {
+                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] invalid GPU budget: %s\n", budget);
+                return nullptr;
+            }
+            std::vector<size_t> estimated(backend_ptrs.size(), 0);
+            ggml_backend_sched_reserve_size(sched.get(), gf, estimated.data());
+            size_t required = 0;
+            for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                if (dev && std::strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+                    if (required > SIZE_MAX - estimated[i]) {
+                        LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] GPU size overflow\n");
+                        return nullptr;
+                    }
+                    required += estimated[i];
+                }
+            }
+            LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] gpu_reserve_mib=%.2f gpu_budget_mib=%llu\n",
+                    required / (1024.0 * 1024.0), mib);
+            if (required > mib * 1024ull * 1024ull) {
+                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT compute buffer reservation exceeds GPU budget\n");
+                return nullptr;
+            }
+        }
+        if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+            LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+            return nullptr;
+        }
     }
 
     return gf;

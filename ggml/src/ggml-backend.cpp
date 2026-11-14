@@ -20,7 +20,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <chrono>
 #include <vector>
+#include <cinttypes>
+#include <cerrno>
+
+#ifdef __linux__
+#include <sys/resource.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -818,6 +828,13 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // Opt-in: CPU mmap weights are copied to the OpenCL device only when an op needs them.
+    // Weight copies are allocated as graph-split inputs so ggml-gallocr can reuse GPU memory.
+    bool opencl_stream_weights;
+    ggml_backend_sched_stream_advice_callback stream_advice_callback;
+    void * stream_advice_userdata;
+    size_t stream_rss_limit_bytes;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -915,6 +932,31 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         // not an ideal solution
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+            // Phone-only out-of-core inference: keep the GGUF weights in a CPU mmap,
+            // but execute supported dense layer matmuls on Adreno OpenCL. The
+            // scheduler already starts a new split for each incompatible weight
+            // source, copies that weight just before its consumer, and reuses
+            // the split-input memory after the consumer has completed.
+            //
+            // Restrict this to dense transformer matmuls. Embedding/output
+            // weights stay on the CPU; MoE and other ops use normal scheduling.
+            if (sched->opencl_stream_weights &&
+                    tensor->op == GGML_OP_MUL_MAT &&
+                    src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer) &&
+                    strncmp(src->name, "blk.", 4) == 0) {
+                for (int b = 0; b < sched->n_backends - 1; ++b) {
+                    ggml_backend_t candidate = sched->backends[b];
+                    ggml_backend_dev_t dev = ggml_backend_get_device(candidate);
+                    if (dev != NULL &&
+                            strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0 &&
+                            ggml_backend_supports_op(candidate, tensor)) {
+                        SET_CAUSE(tensor, "1.opencl_stream");
+                        return b;
+                    }
+                }
+            }
+
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
@@ -1546,15 +1588,96 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    size_t staged_weight_bytes = 0;
+    size_t staged_weight_copies = 0;
+    size_t opencl_splits = 0;
+    size_t advised_weight_bytes = 0;
+    size_t peak_rss_kib = 0;
+    double stage_submit_ms = 0.0;
+    double advice_ms = 0.0;
+
+    // read_bytes reflects process-attributed storage I/O including page faults
+    // where Linux accounting supports it; it is NOT an exact per-weight counter.
+    auto read_rss_kib = []() -> size_t {
+#ifdef __linux__
+        FILE * file = fopen("/proc/self/status", "r");
+        if (!file) return SIZE_MAX;
+        char line[256];
+        size_t rss = SIZE_MAX;
+        while (fgets(line, sizeof(line), file) != NULL) {
+            if (strncmp(line, "VmRSS:", 6) == 0) {
+                unsigned long long kib = 0;
+                if (sscanf(line + 6, "%llu", &kib) == 1 && kib <= SIZE_MAX) {
+                    rss = (size_t) kib;
+                }
+                break;
+            }
+        }
+        fclose(file);
+        return rss;
+#else
+        return SIZE_MAX;
+#endif
+    };
+    auto read_io_bytes = []() -> uint64_t {
+#ifdef __linux__
+        FILE * file = fopen("/proc/self/io", "r");
+        if (file == NULL) return UINT64_MAX;
+        char key[64];
+        uint64_t bytes = UINT64_MAX;
+        unsigned long long value = 0;
+        while (fscanf(file, "%63s %llu", key, &value) == 2) {
+            if (strcmp(key, "read_bytes:") == 0) {
+                bytes = (uint64_t) value;
+                break;
+            }
+        }
+        fclose(file);
+        return bytes;
+#else
+        return UINT64_MAX;
+#endif
+    };
+    const uint64_t read_before = sched->opencl_stream_weights ? read_io_bytes() : UINT64_MAX;
+#ifdef __linux__
+    struct rusage resource_before = {};
+    if (sched->opencl_stream_weights) getrusage(RUSAGE_SELF, &resource_before);
+#endif
+    const auto graph_start = std::chrono::steady_clock::now();
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        ggml_backend_dev_t split_dev = ggml_backend_get_device(split_backend);
+        const bool is_opencl_split = sched->opencl_stream_weights &&
+            split_dev != NULL && strcmp(ggml_backend_dev_name(split_dev), "GPUOpenCL") == 0;
+        if (is_opencl_split) {
+            ++opencl_splits;
+        }
+        const char * trace_splits = getenv("GGML_OPENCL_STREAM_TRACE_SPLITS");
+        const bool trace_split = is_opencl_split && trace_splits != NULL && strcmp(trace_splits, "1") == 0;
+        const uint64_t split_read_before = trace_split ? read_io_bytes() : UINT64_MAX;
+        const auto split_start = std::chrono::steady_clock::now();
+
+        // The input sources stay immutable for the lifetime of this split.
+        // A staged host weight can be reclaimed only AFTER OpenCL completes.
+        std::vector<const ggml_tensor *> staged_sources;
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+            if (is_opencl_split && input->buffer != NULL &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer)) {
+                // These are requested staging bytes, not physical UFS I/O bytes:
+                // the file-backed page cache may already contain this weight.
+                staged_weight_bytes += ggml_nbytes(input);
+                ++staged_weight_copies;
+                staged_sources.push_back(input);
+            }
+            const auto stage_start = std::chrono::steady_clock::now();
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -1672,6 +1795,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+            if (is_opencl_split) {
+                stage_submit_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - stage_start).count();
+            }
         }
 
         if (!sched->callback_eval) {
@@ -1713,12 +1840,82 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // For OpenCL demand staging, finish all GPU reads before reclaiming
+        // source mmap pages. This sacrifices overlap intentionally in v1.
+        if (is_opencl_split && !staged_sources.empty()) {
+            ggml_backend_synchronize(split_backend);
+            if (sched->stream_advice_callback != NULL) {
+                const auto advice_start = std::chrono::steady_clock::now();
+                for (const ggml_tensor * tensor : staged_sources) {
+                    advised_weight_bytes += sched->stream_advice_callback(
+                        tensor, sched->stream_advice_userdata);
+                }
+                advice_ms += std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - advice_start).count();
+            }
+        }
+
+        if (trace_split) {
+            const uint64_t split_read_after = read_io_bytes();
+            const uint64_t split_io_bytes = split_read_before != UINT64_MAX &&
+                    split_read_after != UINT64_MAX && split_read_after >= split_read_before ?
+                    split_read_after - split_read_before : UINT64_MAX;
+            const double split_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - split_start).count();
+            GGML_LOG_INFO("[PHONE_STREAM_SPLIT] split=%d stage_inputs=%d wall_ms=%.3f "
+                          "process_read_bytes=%" PRIu64 "\n",
+                    split_id, split->n_inputs, split_ms, split_io_bytes);
+        }
+
+        if (is_opencl_split) {
+            const size_t rss_kib = read_rss_kib();
+            if (rss_kib != SIZE_MAX) {
+                peak_rss_kib = std::max(peak_rss_kib, rss_kib);
+                if (sched->stream_rss_limit_bytes != 0 &&
+                        rss_kib > sched->stream_rss_limit_bytes / 1024) {
+                    GGML_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT rss_mib=%.2f limit_mib=%.2f "
+                                   "split=%d after_cache_reclaim=1\n",
+                            rss_kib / 1024.0,
+                            sched->stream_rss_limit_bytes / (1024.0 * 1024.0), split_id);
+                    return GGML_STATUS_ALLOC_FAILED;
+                }
+            }
+        }
+
         // record the event of this copy
         if (split->n_inputs > 0) {
             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    if (sched->opencl_stream_weights) {
+        const uint64_t read_after = read_io_bytes();
+        const auto graph_end = std::chrono::steady_clock::now();
+        const double wall_ms = std::chrono::duration<double, std::milli>(
+            graph_end - graph_start).count();
+        const uint64_t io_bytes = read_before != UINT64_MAX &&
+                read_after != UINT64_MAX && read_after >= read_before ?
+                read_after - read_before : UINT64_MAX;
+#ifdef __linux__
+        struct rusage resource_after = {};
+        getrusage(RUSAGE_SELF, &resource_after);
+        const long major_faults = resource_after.ru_majflt - resource_before.ru_majflt;
+        const long minor_faults = resource_after.ru_minflt - resource_before.ru_minflt;
+#else
+        const long major_faults = -1;
+        const long minor_faults = -1;
+#endif
+        GGML_LOG_INFO("[PHONE_STREAM] opencl_splits=%zu weight_copies=%zu staged_weight_mib=%.2f "
+                      "advised_weight_mib=%.2f copy_submit_ms=%.3f advice_ms=%.3f "
+                      "graph_wall_ms=%.3f process_read_bytes=%" PRIu64
+                      " major_faults=%ld minor_faults=%ld peak_sampled_rss_mib=%.2f\n",
+                opencl_splits, staged_weight_copies,
+                (double) staged_weight_bytes / (1024.0 * 1024.0),
+                (double) advised_weight_bytes / (1024.0 * 1024.0),
+                stage_submit_ms, advice_ms, wall_ms, io_bytes,
+                major_faults, minor_faults, peak_rss_kib / 1024.0);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1736,6 +1933,24 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+
+    const char * stream_env = getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    sched->opencl_stream_weights = stream_env != NULL && strcmp(stream_env, "1") == 0;
+    sched->stream_rss_limit_bytes = 0;
+    if (sched->opencl_stream_weights) {
+        const char * limit_env = getenv("GGML_OPENCL_STREAM_RSS_LIMIT_MIB");
+        if (limit_env && *limit_env) {
+            char * end = NULL;
+            const unsigned long long mib = strtoull(limit_env, &end, 10);
+            if (mib > 0 && end != limit_env && *end == '\0' &&
+                    mib <= SIZE_MAX / (1024ull * 1024ull)) {
+                sched->stream_rss_limit_bytes = (size_t) mib * 1024ull * 1024ull;
+            } else {
+                GGML_LOG_WARN("[PHONE_STREAM_BUDGET] ignored invalid RSS limit %s\n", limit_env);
+            }
+        }
+        GGML_LOG_INFO("[PHONE_STREAM] scheduler=OPENCL_DEMAND_COPY weights=CPU_MMAP mode=DENSE_MATMUL\n");
+    }
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
@@ -1912,6 +2127,13 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
     }
+}
+
+void ggml_backend_sched_set_stream_advice_callback(ggml_backend_sched_t sched,
+        ggml_backend_sched_stream_advice_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->stream_advice_callback = callback;
+    sched->stream_advice_userdata = user_data;
 }
 
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
