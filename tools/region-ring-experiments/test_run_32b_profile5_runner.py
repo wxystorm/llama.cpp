@@ -16,6 +16,41 @@ from run_32b_all40 import (
 
 
 class HtpOnlyAutoPlanTests(unittest.TestCase):
+    def test_optional_2048_group_selected_without_changing_default_40(self):
+        from run_32b_all40 import (
+            GROUPS, SELECTABLE_GROUPS, UPPER_BOUNDS, prompts_in,
+            get_args, choose_context,
+        )
+        self.assertEqual(GROUPS, (128, 256, 512, 1024))
+        self.assertIn(2048, SELECTABLE_GROUPS)
+        self.assertEqual(UPPER_BOUNDS[2048], 4000)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir()
+            for group in GROUPS + (2048,):
+                for index in range(1, 11):
+                    (prompt_dir / f"prompt_{group}_{index:02}.txt").write_text("test")
+            defaults = prompts_in(prompt_dir)
+            self.assertEqual(len(defaults), 40)
+            extended = prompts_in(prompt_dir, GROUPS + (2048,))
+            selected = [(group, path) for group, path in extended if group == 2048]
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(selected[0][1].name, "prompt_2048_01.txt")
+            self.assertEqual(selected[-1][1].name, "prompt_2048_10.txt")
+            args = get_args([
+                "--exe", str(root / "unused.exe"),
+                "--model", str(root / "unused.gguf"),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompt_dir),
+                "--only-group", "2048",
+                "--context-padding", "256",
+            ])
+            self.assertEqual(args.only_group, [2048])
+            ctx, hint = choose_context(2048, None, args)
+            self.assertEqual(hint, 4000)
+            self.assertGreaterEqual(ctx, 4000 + args.n_predict + 256)
+
     def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
         """Regression: the PowerShell entry point pins --profile-every 0.
 
