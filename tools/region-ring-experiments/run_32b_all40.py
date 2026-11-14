@@ -22,6 +22,8 @@ import sys
 import time
 
 GROUPS = (128, 256, 512, 1024)
+OPTIONAL_GROUPS = (2048,)
+SELECTABLE_GROUPS = GROUPS + OPTIONAL_GROUPS
 FIXED_LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"  # 5*G8 + 4*P6 = 64 layers
 CHUNK_TOKENS = 128
 MODEL_LAYERS = 64
@@ -78,7 +80,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_TASK_TRACE",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
 }
-UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000}
+UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 METRIC_RX = r"(\d+(?:\.\d+)?)"
 RESULT_COLUMNS = (
     "prompt", "group", "prompt_tokens_hint", "context", "status", "attempt",
@@ -223,12 +225,14 @@ def read_manifest(folder: Path):
     return result
 
 
-def prompts_in(folder: Path):
+def prompts_in(folder: Path, groups=GROUPS):
     expected = [(group, folder / f"prompt_{group}_{i:02}.txt")
-                for group in GROUPS for i in range(1, 11)]
+                for group in groups for i in range(1, 11)]
     missing = [path.name for _, path in expected if not path.is_file()]
     if missing:
-        raise ValueError("ShareGPT40 requires all 40 prompts. Missing: " + ", ".join(missing))
+        raise ValueError(
+            f"Prompt directory is missing files for groups {tuple(groups)}: " +
+            ", ".join(missing))
     return expected
 
 
@@ -775,7 +779,7 @@ def get_args(argv=None):
     parser.add_argument("--boost-bank-mover", action="store_true",
                         help="raise Windows GPU Bank Mover CPU thread to ABOVE_NORMAL")
     parser.add_argument("--timeout", type=float, default=0, help="seconds; 0 disables")
-    parser.add_argument("--only-group", type=int, choices=GROUPS, action="append")
+    parser.add_argument("--only-group", type=int, choices=SELECTABLE_GROUPS, action="append")
     parser.add_argument("--only-prompt", action="append", default=[])
     parser.add_argument("--limit", type=int, default=0, help="max selected prompts this invocation; 0=all")
     parser.add_argument("--rerun-all", action="store_true", help="rerun PASS too; preserve old attempts")
@@ -1023,7 +1027,9 @@ def main(argv=None):
         if not args.dry_run:
             args.real_stage_profile_csv.parent.mkdir(
                 parents=True, exist_ok=True)
-    prompts = prompts_in(args.prompt_dir)
+    prompt_groups = GROUPS + tuple(
+        group for group in (args.only_group or ()) if group not in GROUPS)
+    prompts = prompts_in(args.prompt_dir, prompt_groups)
     manifest = read_manifest(args.prompt_dir)
     decisions = {}
     for group, prompt in prompts:
