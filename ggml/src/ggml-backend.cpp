@@ -818,6 +818,10 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // Opt-in: CPU mmap weights are copied to the OpenCL device only when an op needs them.
+    // Weight copies are allocated as graph-split inputs so ggml-gallocr can reuse GPU memory.
+    bool opencl_stream_weights;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -915,6 +919,31 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         // not an ideal solution
         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+            // Phone-only out-of-core inference: keep the GGUF weights in a CPU mmap,
+            // but execute supported dense layer matmuls on Adreno OpenCL. The
+            // scheduler already starts a new split for each incompatible weight
+            // source, copies that weight just before its consumer, and reuses
+            // the split-input memory after the consumer has completed.
+            //
+            // Restrict this to dense transformer matmuls. Embedding/output
+            // weights stay on the CPU; MoE and other ops use normal scheduling.
+            if (sched->opencl_stream_weights &&
+                    tensor->op == GGML_OP_MUL_MAT &&
+                    src_backend_id == sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer) &&
+                    strncmp(src->name, "blk.", 4) == 0) {
+                for (int b = 0; b < sched->n_backends - 1; ++b) {
+                    ggml_backend_t candidate = sched->backends[b];
+                    ggml_backend_dev_t dev = ggml_backend_get_device(candidate);
+                    if (dev != NULL &&
+                            strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0 &&
+                            ggml_backend_supports_op(candidate, tensor)) {
+                        SET_CAUSE(tensor, "1.opencl_stream");
+                        return b;
+                    }
+                }
+            }
+
             // check if a backend with higher prio wants to offload the op
             if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                 for (int b = 0; b < src_backend_id; b++) {
@@ -1546,15 +1575,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    size_t staged_weight_bytes = 0;
+    size_t staged_weight_copies = 0;
+    size_t opencl_splits = 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        ggml_backend_dev_t split_dev = ggml_backend_get_device(split_backend);
+        const bool is_opencl_split = sched->opencl_stream_weights &&
+            split_dev != NULL && strcmp(ggml_backend_dev_name(split_dev), "GPUOpenCL") == 0;
+        if (is_opencl_split) {
+            ++opencl_splits;
+        }
 
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
+            if (is_opencl_split && input->buffer != NULL &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer)) {
+                // These are requested staging bytes, not physical UFS I/O bytes:
+                // the file-backed page cache may already contain this weight.
+                staged_weight_bytes += ggml_nbytes(input);
+                ++staged_weight_copies;
+            }
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -1721,6 +1768,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    if (sched->opencl_stream_weights) {
+        GGML_LOG_INFO("[PHONE_STREAM] opencl_splits=%zu weight_copies=%zu staged_weight_mib=%.2f\n",
+                opencl_splits, staged_weight_copies,
+                (double) staged_weight_bytes / (1024.0 * 1024.0));
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1736,6 +1789,12 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU);
 
     struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));
+
+    const char * stream_env = getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    sched->opencl_stream_weights = stream_env != NULL && strcmp(stream_env, "1") == 0;
+    if (sched->opencl_stream_weights) {
+        GGML_LOG_INFO("[PHONE_STREAM] scheduler=OPENCL_DEMAND_COPY weights=CPU_MMAP mode=DENSE_MATMUL\n");
+    }
 
     const char * GGML_SCHED_DEBUG = getenv("GGML_SCHED_DEBUG");
     sched->debug = GGML_SCHED_DEBUG ? atoi(GGML_SCHED_DEBUG) : 0;
