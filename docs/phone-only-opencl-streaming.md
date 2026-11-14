@@ -122,6 +122,10 @@ generation timings. `metrics.log` filters:
   UFS controller byte counters;
 - `major_faults`, `minor_faults`, `peak_sampled_rss_mib`,
   `copy_submit_ms`, `advice_ms`, `graph_wall_ms`;
+- set `TRACE_SPLITS=1` in the runner to emit `[PHONE_STREAM_SPLIT]`
+  with per-OpenCL-split wall time and its attributed `read_bytes` delta.
+  These values include OpenCL transfer/compute/synchronization and
+  filesystem-cache advice, not isolated UFS service time;
 - `[PHONE_STREAM_BUDGET]`: graph allocation estimate or RSS threshold
   rejection;
 - standard `prompt eval time` and `eval time` / tokens-per-second.
