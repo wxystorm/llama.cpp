@@ -27,6 +27,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+
+#ifdef __linux__
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cmath>
 #include <functional>
 #include <map>
@@ -1031,6 +1038,21 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    struct stream_file {
+        uintptr_t begin = 0;
+        uintptr_t end = 0;
+        int fd = -1;
+    };
+    std::vector<stream_file> stream_files;
+
+    ~impl() {
+#ifdef __linux__
+        for (auto & file : stream_files) {
+            if (file.fd >= 0) close(file.fd);
+        }
+#endif
+    }
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1673,6 +1695,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (use_mmap_buffer) {
+#ifdef __linux__
+        // Retain independent descriptors for POSIX_FADV_DONTNEED. The model
+        // loader closes its own file descriptors after loading finishes.
+        if (stream_weights) {
+            for (size_t i = 0; i < ml.mappings.size(); ++i) {
+                const int fd = dup(ml.files.at(i)->file_id());
+                if (fd < 0) {
+                    throw std::runtime_error("failed to dup GGUF file for stream page-cache advice");
+                }
+                const uintptr_t first = (uintptr_t) ml.mappings[i]->addr();
+                pimpl->stream_files.push_back({first, first + ml.mappings[i]->size(), fd});
+            }
+        }
+#endif
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
@@ -1714,6 +1750,54 @@ size_t llama_model::n_tensors() const {
 
 size_t llama_model::n_devices() const {
     return devices.size();
+}
+
+size_t llama_model::advise_stream_weight(const ggml_tensor * tensor) const {
+#ifdef __linux__
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return 0;
+    }
+    const uintptr_t ptr = (uintptr_t) tensor->data;
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (nbytes == 0 || ptr > UINTPTR_MAX - nbytes) {
+        return 0;
+    }
+    const long page_size_long = sysconf(_SC_PAGESIZE);
+    if (page_size_long <= 0) {
+        return 0;
+    }
+    const uintptr_t page_size = (uintptr_t) page_size_long;
+    for (const auto & file : pimpl->stream_files) {
+        if (ptr < file.begin || ptr + nbytes > file.end) {
+            continue;
+        }
+        // Only whole interior pages: never invalidate a page that another
+        // tensor could share. fadvise and madvise are best-effort OS hints.
+        const uintptr_t first = ((ptr + page_size - 1) / page_size) * page_size;
+        const uintptr_t last = ((ptr + nbytes) / page_size) * page_size;
+        if (first >= last) {
+            return 0;
+        }
+        const size_t length = (size_t) (last - first);
+        const off_t offset = (off_t) (first - file.begin);
+        // Drop this mapping's PTEs so subsequent reuses can fault pages back
+        // into the process. The OS may keep clean pages in the global cache.
+        if (madvise((void *) first, length, MADV_DONTNEED) != 0) {
+            LLAMA_LOG_WARN("[PHONE_STREAM] madvise failed errno=%d\n", errno);
+        }
+        // POSIX_FADV_DONTNEED is advisory; successful return is not proof
+        // of page eviction. Android/Linux may decline under pressure.
+        const int status = posix_fadvise(file.fd, offset, (off_t) length, POSIX_FADV_DONTNEED);
+        if (status != 0) {
+            LLAMA_LOG_WARN("[PHONE_STREAM] posix_fadvise failed error=%d\n", status);
+            return 0;
+        }
+        return length;
+    }
+#else
+    (void) tensor;
+#endif
+    return 0;
 }
 
 const float * llama_model::tensor_split() const {
