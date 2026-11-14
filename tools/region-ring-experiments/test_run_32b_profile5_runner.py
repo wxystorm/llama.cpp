@@ -54,6 +54,53 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertEqual(hint, 4000)
             self.assertGreaterEqual(ctx, 4000 + args.n_predict + 256)
 
+    def test_long_kv_htp_grid_requires_2048_and_3072_real_samples(self):
+        from run_32b_all40 import require_long_htp_kv_anchors
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistral.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompts),
+                "--repo-root", str(root),
+                "--model-layers", "40",
+                "--auto-plan", "--htp-only",
+                "--max-context", "8192",
+            ]
+            long_args = get_args(base + ["--only-group", "2048"])
+            _, long_env = build_process(
+                long_args, prompts / "prompt_2048_01.txt", 4352, 4000,
+                root / "long.jsonl")
+            self.assertEqual(
+                long_env["LLAMA_REGION_RING_PROFILE_KV_EXTEND"], "1")
+            self.assertNotIn("LLAMA_REGION_RING_PROFILE_KV_EXTEND",
+                             build_process(
+                                 get_args(base + ["--only-group", "128"]),
+                                 prompts / "prompt_128_01.txt", 512, 167,
+                                 root / "short.jsonl")[1])
+
+            profile = root / "profile.csv"
+            profile.write_text(
+                "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                "prepare_ms,compute_ms,terminal,samples\\n"
+                "PHONE,3,96,2048,0,0,0,100,0,2\\n",
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "3072"):
+                require_long_htp_kv_anchors(profile)
+            with profile.open("a", encoding="utf-8") as output:
+                output.write("PHONE,3,96,3072,0,0,0,0,0,2\\n")
+            with self.assertRaisesRegex(ValueError, "3072"):
+                require_long_htp_kv_anchors(profile)
+            with profile.open("a", encoding="utf-8") as output:
+                output.write("PHONE,4,128,3072,0,0,0,125,0,2\\n")
+            require_long_htp_kv_anchors(profile)
+
     def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
         """Regression: the PowerShell entry point pins --profile-every 0.
 
