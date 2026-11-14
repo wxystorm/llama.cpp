@@ -8878,16 +8878,47 @@ static bool llama_hybrid_calibrate_independent_ring(
     if (!path || !*path || !cpu || !phone || profile.is_moe) {
         return false;
     }
+    // Long-Context evaluation is opt-in: preserve the short 256/512/1024
+    // HTP calibration for ordinary ShareGPT40 runs. 4096 is intentionally
+    // NOT probed on phones with insufficient HTP memory.
+    const bool long_kv_grid = [] {
+        const char * value =
+            std::getenv("LLAMA_REGION_RING_PROFILE_KV_EXTEND");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
     {
         std::ifstream cached(path);
         if (cached) {
             bool has_htp = false;
+            bool has_kv2048 = false;
+            bool has_kv3072 = false;
             std::string row;
             while (std::getline(cached, row)) {
-                if (row.rfind("PHONE,", 0) == 0) {
-                    has_htp = true;
+                if (row.rfind("PHONE,", 0) != 0) {
+                    continue;
+                }
+                has_htp = true;
+                // CSV schema: device,layers,tokens,kv_tokens,...
+                std::istringstream fields(row);
+                std::string cell;
+                int column = 0;
+                while (std::getline(fields, cell, ',')) {
+                    if (column++ != 3) {
+                        continue;
+                    }
+                    has_kv2048 |= cell == "2048";
+                    has_kv3072 |= cell == "3072";
                     break;
                 }
+            }
+            if (long_kv_grid && (!has_kv2048 || !has_kv3072)) {
+                LLAMA_LOG_ERROR(
+                    "[INDEPENDENT_PROFILE] status=REJECT"
+                    " reason=CACHE_MISSING_LONG_HTP_KV"
+                    " kv2048=%d kv3072=%d path=%s"
+                    " action=GENERATE_NEW_PROFILE_IN_NEW_OUT_DIR\n",
+                    has_kv2048 ? 1 : 0, has_kv3072 ? 1 : 0, path);
+                return false;
             }
             if (!has_htp) {
                 LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=REJECT"
@@ -8936,7 +8967,14 @@ static bool llama_hybrid_calibrate_independent_ring(
     const std::vector<int> depths = full_grid ?
         std::vector<int>{1, 2, 4, 6} : std::vector<int>{2, 4, 6};
     const std::array<int, 4> widths = {32, 64, 96, 128};
-    const std::array<int, 3> kv_spans = {256, 512, 1024};
+    const std::vector<int> kv_spans = long_kv_grid ?
+        std::vector<int>{256, 512, 1024, 2048, 3072} :
+        std::vector<int>{256, 512, 1024};
+    LLAMA_LOG_INFO(
+        "[INDEPENDENT_PROFILE] event=KV_GRID mode=%s"
+        " kv=%s status=READY\n",
+        long_kv_grid ? "LONG_2048_3072" : "DEFAULT",
+        long_kv_grid ? "256,512,1024,2048,3072" : "256,512,1024");
     const int first_layer = std::max(0, profile.n_layer / 2 - 3);
     // First write to a temporary file so a failed HTP point never publishes
     // a partial CSV which a later Prompt may mistakenly trust.
@@ -9090,6 +9128,29 @@ static bool llama_hybrid_calibrate_independent_ring(
                     measured.prepare_ms, measured.compute_ms,
                     measured.output_read_ms, measured.setup_ms,
                     service_ms);
+            }
+        }
+    }
+    // Long prompts need both additional REAL HTP anchors. Never silently
+    // accept a grid where the requested 2048/3072 samples all failed.
+    if (long_kv_grid) {
+        for (const int required_kv : {2048, 3072}) {
+            const bool has_anchor = std::any_of(
+                details.begin(), details.end(),
+                [required_kv](const point & p) {
+                    return p.dev == "PHONE" &&
+                           p.kv_tokens == required_kv &&
+                           p.compute_ms > 0.0;
+                });
+            if (!has_anchor) {
+                LLAMA_LOG_ERROR(
+                    "[INDEPENDENT_PROFILE] status=REJECT"
+                    " reason=LONG_HTP_KV_NO_VALID_SAMPLES kv=%d"
+                    " action=CHECK_PHONE_HTP_MEMORY_OR_PROBE_LOG\n",
+                    required_kv);
+                csv.close();
+                std::remove(temporary.c_str());
+                return false;
             }
         }
     }
