@@ -25,6 +25,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1250,6 +1251,26 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+    const char * stream_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    const bool stream_weights = stream_env != nullptr && std::strcmp(stream_env, "1") == 0;
+    if (stream_weights) {
+        if (!ml.use_mmap || ml.use_direct_io || params.use_mlock) {
+            throw std::runtime_error(
+                "GGML_OPENCL_STREAM_WEIGHTS requires mmap, no direct I/O and no mlock");
+        }
+        bool has_opencl = false;
+        for (const auto & device : devices) {
+            if (std::strcmp(ggml_backend_dev_name(device.dev), "GPUOpenCL") == 0) {
+                has_opencl = true;
+            }
+        }
+        if (!has_opencl) {
+            throw std::runtime_error(
+                "GGML_OPENCL_STREAM_WEIGHTS requires the GPUOpenCL device (build with GGML_OPENCL=ON)");
+        }
+        LLAMA_LOG_INFO("[PHONE_STREAM] mode=CPU_MMAP_OPENCL_ON_DEMAND model_weights=CPU "
+                       "prefetch=OFF n_gpu_layers=0\n");
+    }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -1517,7 +1538,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // The ordinary loading path populates every GGUF page at startup.
+    // In phone-only streaming mode, map the file lazily: touching a given
+    // weight during a split's CPU->OpenCL copy faults in only its pages.
+    ml.init_mappings(!stream_weights, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1695,6 +1719,12 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_gpu_layers() const {
+    const char * stream_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    if (stream_env != nullptr && std::strcmp(stream_env, "1") == 0) {
+        // Model weight buffers must remain on the CPU mmap. The OpenCL
+        // backend scheduler stages individual layer weights for compute.
+        return 0;
+    }
     // note: plus 1 for the "output" layer
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
 }
