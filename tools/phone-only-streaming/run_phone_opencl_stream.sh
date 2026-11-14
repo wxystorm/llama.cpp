@@ -17,6 +17,19 @@ N_BATCH="${N_BATCH:-512}"
 N_UBATCH="${N_UBATCH:-128}"
 N_THREADS="${N_THREADS:-6}"
 N_PREDICT="${N_PREDICT:-32}"
+# This is a reservation budget for GGML's OpenCL compute/staging arena,
+# NOT a global Adreno driver-memory ceiling.
+GPU_BUDGET_MIB="${GPU_BUDGET_MIB:-1536}"
+# This is a sampled process-RSS guard; file cache and the OpenCL driver
+# can consume additional system-wide RAM beyond it.
+RSS_LIMIT_MIB="${RSS_LIMIT_MIB:-7168}"
+
+for limit in "$GPU_BUDGET_MIB" "$RSS_LIMIT_MIB"; do
+    if ! [[ "$limit" =~ ^[1-9][0-9]*$ ]]; then
+        echo "GPU_BUDGET_MIB and RSS_LIMIT_MIB must be positive integers" >&2
+        exit 2
+    fi
+done
 
 for file in "$MODEL" "$PROMPT" "$LLAMA_BIN"; do
     if [ ! -f "$file" ]; then
@@ -26,11 +39,14 @@ for file in "$MODEL" "$PROMPT" "$LLAMA_BIN"; do
 done
 mkdir -p "$OUT_DIR"
 export GGML_OPENCL_STREAM_WEIGHTS=1
+export GGML_OPENCL_STREAM_GPU_BUDGET_MIB="$GPU_BUDGET_MIB"
+export GGML_OPENCL_STREAM_RSS_LIMIT_MIB="$RSS_LIMIT_MIB"
 export GGML_SCHED_DEBUG="${GGML_SCHED_DEBUG:-0}"
 
 echo "[PHONE_STREAM_RUN] model=$MODEL prompt=$PROMPT out=$OUT_DIR"
 echo "[PHONE_STREAM_RUN] ctx=$N_CTX batch=$N_BATCH ubatch=$N_UBATCH threads=$N_THREADS"
 echo "[PHONE_STREAM_RUN] device=GPUOpenCL mmap=1 repack=0 fit=off mode=phone-only"
+echo "[PHONE_STREAM_RUN] gpu_budget_mib=$GPU_BUDGET_MIB rss_limit_mib=$RSS_LIMIT_MIB"
 
 # The first run is the only request. No synthetic warmup is included in timings.
 # -ngl 0 is intentional: all model weights remain in file-backed CPU mmap.
