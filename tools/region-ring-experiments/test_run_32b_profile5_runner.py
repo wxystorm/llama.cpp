@@ -28,6 +28,8 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             root = Path(td)
             prompt_dir = root / "prompts"
             prompt_dir.mkdir()
+            (root / "unused.exe").touch()
+            (root / "unused.gguf").touch()
             for group in GROUPS + (2048,):
                 for index in range(1, 11):
                     (prompt_dir / f"prompt_{group}_{index:02}.txt").write_text("test")
