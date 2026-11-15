@@ -64,10 +64,12 @@ int main() {
     // The crash's selected 32B layout had 26 Phone layers across
     // N9,N7,N9,N1. The RPC server assigns a starting HTP Session to each
     // Region and then stripes consecutive LAYERS, not whole Regions.
-    // Reproduce [HTP0..3] = [6,6,7,7]; a 3200 MiB HTP vmem with a 10%
-    // mapping margin must reject this 167-token plan *before* Phone preload.
+    // Reproduce [HTP0..3] = [6,6,7,7]; even the full observed 3200 MiB
+    // HTP session VMEM must reject seven 32B layers after reserving scratch
+    // and graph metadata, before Phone preload.
     {
         htp_memory_limits limits;
+        REQUIRE(limits.session_budget_bytes == 3200.0L * HTP_MEMORY_MIB);
         limits.tokens = 167;
         limits.xp = 192;
         limits.n_embd = 5120;
@@ -109,6 +111,26 @@ int main() {
         REQUIRE(one_usage.session_layers ==
                 (std::array<int, 4>{{3, 2, 2, 2}}));
 
+        // Six 32B layers per HTP session are inside the actual 3200 MiB
+        // mapping budget with accounted scratch, but fail the old arbitrary
+        // 2880 MiB (90%) planner margin. Physical shared RAM is separate.
+        const std::vector<llama_region_ring_region> near_full = {
+            {device::GPU,   0,  8},
+            {device::PHONE, 8, 32},
+            {device::GPU,  32, 64},
+        };
+        htp_memory_usage near_full_usage;
+        REQUIRE(htp_plan_memory_feasible(
+            near_full, limits, layer_bytes, &near_full_usage));
+        REQUIRE(near_full_usage.session_layers ==
+                (std::array<int, 4>{{6, 6, 6, 6}}));
+        REQUIRE(near_full_usage.session_total_bytes[0] >
+                2880.0L * HTP_MEMORY_MIB);
+        htp_memory_limits old_margin = limits;
+        old_margin.session_budget_bytes = 2880.0L * HTP_MEMORY_MIB;
+        REQUIRE(!htp_plan_memory_feasible(
+            near_full, old_margin, layer_bytes));
+        
         // A smaller four-Region plan should remain feasible, even though
         // the bigger 26-layer plan is excluded by session capacity.
         const std::vector<llama_region_ring_region> safe = {
@@ -353,11 +375,11 @@ int main() {
 
     // First-cycle fine X candidates are available to deterministic A/B
     // runs. A subsequent Cycle must keep this selected X triple unchanged.
-    REQUIRE(first_cycle_chunk_candidates.size() == 9);
-    for (int x : {32, 48, 56, 64, 80, 96, 112, 128, 160}) {
+    REQUIRE(first_cycle_chunk_candidates.size() == 10);
+    for (int x : {32, 48, 64, 80, 96, 112, 128, 160, 192, 256}) {
         REQUIRE(first_cycle_chunk_supported(x));
     }
-    for (int x : {8, 12, 16, 20, 24, 40, 192, 256}) {
+    for (int x : {8, 12, 16, 20, 24, 40, 56}) {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 

@@ -242,10 +242,11 @@ llama_region_ring_phone_static_shapes(
     return result;
 }
 
-// Keep the small-prefill Bank Mover decision separate from the fixed Bank
-// parity policy. By default at least two full GPU Chunks are required;
-// explicit experiments may waive only that size gate. A 1-token decode
-// must retain its on-demand Bank path even when the experiment is enabled.
+// Keep the short-prefill Bank Mover decision separate from fixed Bank
+// parity. Two actual GPU Chunks are enough: the second may be partial.
+// No extra full Chunk is needed for the rank+2 prefetch of the next Region.
+// Explicit experiments may waive this prefill-size gate; 1-token decode
+// always retains its on-demand Bank path.
 inline bool llama_region_ring_gpu_bank_mover_enabled(
         bool gpu_weight_streaming, size_t gpu_region_count,
         int ubatch_tokens, int gpu_chunk_tokens, bool force_small_batch) {
@@ -253,7 +254,7 @@ inline bool llama_region_ring_gpu_bank_mover_enabled(
             ubatch_tokens <= 1 || gpu_chunk_tokens <= 0) {
         return false;
     }
-    return force_small_batch || ubatch_tokens >= 2 * gpu_chunk_tokens;
+    return force_small_batch || ubatch_tokens > gpu_chunk_tokens;
 }
 
 // GPU weight streaming uses two fixed physical Banks. Keep Bank

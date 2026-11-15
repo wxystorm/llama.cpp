@@ -20,10 +20,13 @@ static constexpr long double HTP_MEMORY_MIB = 1048576.0L;
 
 struct htp_memory_limits {
     // opt_vmem = 3355443200 bytes (3200 MiB) in the observed HTP0..HTP3
-    // driver logs. Keep a 10% VA/queue margin; this is NOT four RAM pools.
-    long double session_budget_bytes = 2880.0L * HTP_MEMORY_MIB;
+    // driver logs. Use the full observed session VMEM; the per-session
+    // reserve below already accounts for queue/graph metadata and scratch.
+    // This is NOT four independent physical RAM pools.
+    long double session_budget_bytes = 3200.0L * HTP_MEMORY_MIB;
     // The RPC-visible CPU transport must report Android MemAvailable, not
-    // MemTotal. The caller applies a physical-RAM safety fraction once.
+    // MemTotal. The caller budgets reported available physical RAM; this
+    // struct separately accounts for staging and FastRPC reserves.
     long double shared_budget_bytes = 0.0L;
     // Quantized HTP tensors are allocated in the repack buft, not simply
     // mmap'd from GGUF. This is deliberately an upper-bound multiplier.

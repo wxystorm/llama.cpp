@@ -3207,7 +3207,8 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     struct htp_mm_kernel_params * kparams
 ) {
     const int aligned_tile_size = htp_mm_get_weight_aligned_tile_size(wtype);
-    const bool pipeline = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
+    const bool pipeline_requested = is_matmul_id ? false : htp_mm_hmx_pipeline(ne11);
+    bool pipeline = pipeline_requested;
     const int n_threads = (int)sess->n_threads;
     const int ne10 = src1->ne[0];
 
@@ -3272,60 +3273,104 @@ static bool ggml_hexagon_precompute_hmx_mm_params(
     }
 
     if (!use_grouped) {
-        // Fallback to simple 2D path (group_size = 1)
-        size_t best_mblocks = SIZE_MAX;
-        int best_act_threads = 0;
-        size_t best_m_chunk = 0;
-        size_t best_n_chunk = 0;
-        size_t best_vtcm_size = 0;
+        // Keep the fast HMX pipeline for normal shapes. A large K dimension
+        // can make its doubled weight/dequant buffers exceed the 8 MiB VTCM.
+        // Retry with the existing non-pipelined HMX kernel before HVX: unlike
+        // HVX, it tiles M and N and need not stage the full activation batch.
+        bool selected = false;
+        for (int pass = 0; pass < (pipeline_requested ? 2 : 1); ++pass) {
+            const bool try_pipeline = pipeline_requested && pass == 0;
+            size_t best_mblocks = SIZE_MAX;
+            int best_act_threads = 0;
+            size_t best_m_chunk = 0;
+            size_t best_n_chunk = 0;
+            size_t best_vtcm_size = 0;
 
-        // For MUL_MAT_ID the kernel runs one 2D matmul per expert, with M equal to the number of rows routed to that expert.
-        // A single expert can receive up to all routed rows (dst->ne[1]*dst->ne[2] = n_expert_used*n_tokens), so size the chunk
-        // search for that upper bound rather than ne12 (token positions only).
-        // We recompute m_chunk per expert against the actual count in the NPU kernel.
-        const int m_id_rows    = (int) ((size_t) dst->ne[1] * dst->ne[2]);
-        const int m_for_chunks = is_matmul_id ? hex_align_up(m_id_rows, 32) : ne11_padded;
-        const int m_for_cost   = is_matmul_id ? m_id_rows : ne11;
+            // For MUL_MAT_ID, the maximum number of rows reaching an
+            // individual expert is n_expert_used * n_tokens.
+            const int m_id_rows = (int) ((size_t) dst->ne[1] * dst->ne[2]);
+            const int m_for_chunks = is_matmul_id ? hex_align_up(m_id_rows, 32) : ne11_padded;
+            const int m_for_cost = is_matmul_id ? m_id_rows : ne11;
 
-        int act_threads = n_threads;
-        while (act_threads >= 1) {
-            const size_t act_f32_size = is_matmul_id ? 0 : hex_align_up(act_threads * HTP_MM_DMA_ACT_MULTIPLIER * ne00_padded * sizeof(float), HTP_MM_HMX_TILE_SIZE);
-            size_t simple_2d_overhead = 256 + act_f32_size;
-            size_t simple_2d_size_per_n, simple_2d_size_per_m, simple_2d_size_per_mn;
-            htp_mm_hmx_get_2d_chunk_costs(wtype, ne00_padded, pipeline, aligned_tile_size, &simple_2d_size_per_n, &simple_2d_size_per_m, &simple_2d_size_per_mn);
+            for (int act_threads = n_threads; act_threads >= 1;
+                    act_threads = act_threads == 1 ? 0 : act_threads / 2) {
+                const size_t act_f32_size = is_matmul_id ? 0 :
+                    hex_align_up(act_threads * HTP_MM_DMA_ACT_MULTIPLIER *
+                                 ne00_padded * sizeof(float), HTP_MM_HMX_TILE_SIZE);
+                const size_t overhead = 256 + act_f32_size;
+                size_t size_per_n = 0, size_per_m = 0, size_per_mn = 0;
+                htp_mm_hmx_get_2d_chunk_costs(wtype, ne00_padded,
+                                              try_pipeline, aligned_tile_size,
+                                              &size_per_n, &size_per_m,
+                                              &size_per_mn);
 
-            size_t m_chunk_candidate = 0;
-            size_t n_chunk_candidate = 0;
-            size_t vtcm_size_candidate = 0;
-
-            if (htp_mm_hmx_compute_chunks(vtcm_budget, simple_2d_overhead, simple_2d_size_per_n, simple_2d_size_per_m, simple_2d_size_per_mn, m_for_chunks, ne01_padded,
-                                   (size_t) ne01_padded * HTP_MM_HMX_COST_W_DEQUANT, (size_t) m_for_cost * HTP_MM_HMX_COST_A_CONVERT,
-                                   &m_chunk_candidate, &n_chunk_candidate, &vtcm_size_candidate) == 0) {
-                size_t exact_size = htp_mm_hmx_get_2d_vtcm_size(wtype, ne00_padded, m_chunk_candidate, n_chunk_candidate, pipeline, is_matmul_id ? 0 : act_threads, aligned_tile_size);
-                if (exact_size <= vtcm_budget) {
-                    size_t mblocks = ((size_t) m_for_cost + m_chunk_candidate - 1) / m_chunk_candidate;
-                    if (mblocks < best_mblocks || (mblocks == best_mblocks && act_threads > best_act_threads)) {
-                        best_mblocks = mblocks;
-                        best_act_threads = act_threads;
-                        best_m_chunk = m_chunk_candidate;
-                        best_n_chunk = n_chunk_candidate;
-                        best_vtcm_size = exact_size;
-                    }
+                size_t mc = 0, nc = 0, estimated = 0;
+                if (htp_mm_hmx_compute_chunks(
+                        vtcm_budget, overhead, size_per_n, size_per_m,
+                        size_per_mn, m_for_chunks, ne01_padded,
+                        (size_t) ne01_padded * HTP_MM_HMX_COST_W_DEQUANT,
+                        (size_t) m_for_cost * HTP_MM_HMX_COST_A_CONVERT,
+                        &mc, &nc, &estimated) != 0) {
+                    HEX_VERBOSE("ggml-hex: %s HMX 2D no tiles"
+                                " K=%d M=%d N=%d pipeline=%d act_threads=%d"
+                                " overhead=%zu vtcm_budget=%zu"
+                                " reason=CHUNK_SOLVER_NO_FIT\n",
+                                sess->name.c_str(), ne00_padded, ne11,
+                                ne01_padded, try_pipeline ? 1 : 0,
+                                act_threads, overhead, vtcm_budget);
+                    continue;
+                }
+                const size_t exact = htp_mm_hmx_get_2d_vtcm_size(
+                    wtype, ne00_padded, mc, nc, try_pipeline,
+                    is_matmul_id ? 0 : act_threads, aligned_tile_size);
+                if (exact > vtcm_budget) {
+                    HEX_VERBOSE("ggml-hex: %s HMX 2D no fit"
+                                " K=%d M=%d N=%d pipeline=%d act_threads=%d"
+                                " mc=%zu nc=%zu estimated=%zu exact=%zu"
+                                " vtcm_budget=%zu reason=EXACT_VTCM_OVER_BUDGET\n",
+                                sess->name.c_str(), ne00_padded, ne11,
+                                ne01_padded, try_pipeline ? 1 : 0,
+                                act_threads, mc, nc, estimated, exact,
+                                vtcm_budget);
+                    continue;
+                }
+                const size_t mblocks = ((size_t) m_for_cost + mc - 1) / mc;
+                if (mblocks < best_mblocks ||
+                        (mblocks == best_mblocks &&
+                         act_threads > best_act_threads)) {
+                    best_mblocks = mblocks;
+                    best_act_threads = act_threads;
+                    best_m_chunk = mc;
+                    best_n_chunk = nc;
+                    best_vtcm_size = exact;
                 }
             }
-            if (act_threads == 1) {
-                act_threads = 0;
-            } else {
-                act_threads /= 2;
-            }
-        }
 
-        if (best_act_threads > 0) {
-            m_chunk = best_m_chunk;
-            n_chunk = best_n_chunk;
-            vtcm_size = best_vtcm_size;
-            act_threads_selected = best_act_threads;
-        } else {
+            if (best_act_threads > 0) {
+                pipeline = try_pipeline;
+                m_chunk = best_m_chunk;
+                n_chunk = best_n_chunk;
+                vtcm_size = best_vtcm_size;
+                act_threads_selected = best_act_threads;
+                selected = true;
+                HEX_VERBOSE("ggml-hex: %s HMX 2D selected"
+                            " K=%d M=%d N=%d pipeline=%d requested_pipeline=%d"
+                            " mc=%zu nc=%zu act_threads=%d vtcm_bytes=%zu"
+                            " budget_bytes=%zu status=PASS\n",
+                            sess->name.c_str(), ne00_padded, ne11,
+                            ne01_padded, pipeline ? 1 : 0,
+                            pipeline_requested ? 1 : 0,
+                            m_chunk, n_chunk, act_threads_selected,
+                            vtcm_size, vtcm_budget);
+                break;
+            }
+            HEX_VERBOSE("ggml-hex: %s HMX 2D pipeline attempt failed"
+                        " K=%d M=%d N=%d pipeline=%d vtcm_budget=%zu"
+                        " reason=NO_FEASIBLE_CHUNKS\n",
+                        sess->name.c_str(), ne00_padded, ne11,
+                        ne01_padded, try_pipeline ? 1 : 0, vtcm_budget);
+        }
+        if (!selected) {
             return false;
         }
     }
@@ -3450,22 +3495,39 @@ static void ggml_hexagon_precompute_hvx_mm_params(
                 HEX_VERBOSE("ggml-hex: %s HVX tiled path VTCM size needed (%zu) > budget (%zu), falling back to HVX flat\n", sess->name.c_str(), L.total_bytes, vtcm_budget);
             }
 
-            // Flat HVX fallback
+            // Flat HVX fallback. The DSP implementation requires a
+            // power-of-two prefetch in [2, HTP_MM_MAX_PREFETCH]. Do not
+            // reserve sixteen huge Q6_K weight tiles unconditionally.
             {
                 kparams->src1_row_size = (wtype == GGML_TYPE_Q4_1 || wtype == GGML_TYPE_Q4_K) ? htp_mm_q8_1_flat_row_size(ne10) : htp_mm_q8_0_flat_row_size(ne10);
                 kparams->kernel_type = HTP_MM_KERNEL_HVX_QUANT_ROW_FLAT;
 
                 struct htp_mm_hvx_vtcm_layout L;
-                htp_mm_hvx_vtcm_layout_build(
-                    &L, kparams->kernel_type, wtype, ne10, src1_nrows, sess->n_threads,
-                    dst->nb[1], src0->nb[1], src1->nb[1], 16, false, false, false
-                );
-
-                kparams->n_prefetch = 16;
+                uint32_t chosen_prefetch = HTP_MM_MAX_PREFETCH;
+                for (uint32_t d = HTP_MM_MAX_PREFETCH; d >= 2; d /= 2) {
+                    htp_mm_hvx_vtcm_layout_build(
+                        &L, kparams->kernel_type, wtype, ne10,
+                        src1_nrows, sess->n_threads,
+                        dst->nb[1], src0->nb[1], src1->nb[1],
+                        d, false, false, false);
+                    chosen_prefetch = d;
+                    if (L.total_bytes <= vtcm_budget) {
+                        break;
+                    }
+                }
+                kparams->n_prefetch = chosen_prefetch;
                 kparams->vtcm_size = L.total_bytes;
                 kparams->vtcm_src0_size = L.src0_bytes;
                 kparams->vtcm_src1_size = L.src1_bytes;
                 kparams->vtcm_dst_size = L.dst_bytes;
+                if (L.total_bytes > vtcm_budget) {
+                    HEX_VERBOSE("ggml-hex: %s HVX flat no fit"
+                                " K=%d M=%d N=%d prefetch=%u needed=%zu"
+                                " vtcm_budget=%zu status=REJECT\n",
+                                sess->name.c_str(), ne10, src1_nrows,
+                                src0->ne[1], chosen_prefetch,
+                                L.total_bytes, vtcm_budget);
+                }
             }
         }
 
@@ -3571,12 +3633,33 @@ static void ggml_hexagon_precompute_matmul_params(
 
     const size_t vtcm_budget = sess->vtcm_size;
 
-    // Check HMX eligibility and try precomputing HMX parameters
-    bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
-    if (hmx_enabled && ggml_hexagon_matmul_is_hmx_eligible(src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
-        if (ggml_hexagon_precompute_hmx_mm_params(sess, src0, src1, dst, wtype, ne00_padded, ne01_padded, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, vtcm_budget, kparams)) {
-            goto finalize;
+    // Diagnose why HMX was not selected before falling back to HVX.
+    const bool hmx_enabled = (sess->n_hmx > 0) && (opt_mm_select >= 3);
+    if (hmx_enabled) {
+        if (ggml_hexagon_matmul_is_hmx_eligible(
+                src0, src1, dst, ne01_padded, is_matmul_id, is_batched)) {
+            if (ggml_hexagon_precompute_hmx_mm_params(
+                    sess, src0, src1, dst, wtype, ne00_padded, ne01_padded,
+                    ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched,
+                    vtcm_budget, kparams)) {
+                goto finalize;
+            }
+            HEX_VERBOSE("ggml-hex: %s HMX fallback to HVX"
+                        " K=%d M=%d N=%d reason=NO_FEASIBLE_VTCM_TILES"
+                        " vtcm_budget=%zu\n",
+                        sess->name.c_str(), ne00_padded, ne11, ne01_padded,
+                        vtcm_budget);
+        } else {
+            HEX_VERBOSE("ggml-hex: %s HMX fallback to HVX"
+                        " K=%d M=%d N=%d reason=NOT_ELIGIBLE\n",
+                        sess->name.c_str(), ne00_padded, ne11, ne01_padded);
         }
+    } else {
+        HEX_VERBOSE("ggml-hex: %s HMX fallback to HVX"
+                    " K=%d M=%d N=%d reason=HMX_DISABLED"
+                    " session_hmx=%d mm_select=%d\n",
+                    sess->name.c_str(), ne00_padded, ne11, ne01_padded,
+                    sess->n_hmx, opt_mm_select);
     }
 
     // Fallback to HVX parameter computation

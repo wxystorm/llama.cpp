@@ -204,8 +204,9 @@ struct model {
     std::function<bool(int, int, size_t &)> gpu_region_weight_bytes;
     std::function<bool(size_t, double &)> gpu_weight_h2d_ms;
     // APPLY_WIDE GPU memory budget and per-GPU-layer KV cost, in bytes.
-    // The same 90% free-VRAM allowance and full-Prompt KV size used by
-    // memory_feasible(candidate). Zero budget disables early GPU filtering.
+    // APPLY_WIDE uses the full backend-reported free VRAM, while charging
+    // both weight Bank peaks, full-Prompt KV, and scratch. Zero budget
+    // disables early GPU filtering.
     long double gpu_memory_budget_bytes = 0.0L;
     long double gpu_kv_bytes_per_layer = 0.0L;
     std::function<bool(const candidate &)> memory_feasible;
@@ -2768,9 +2769,9 @@ inline result search(
         return out;
     }
 
-    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
+    const std::array<int,10> x_cpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_gpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_phone {32,48,64,80,96,112,128,160,192,256};
     std::vector<candidate> coarse;
 
     for (int n = 2; n <= 4; ++n) {
@@ -2903,8 +2904,8 @@ inline result search(
 }
 
 // Shared fine-Chunk grid for Prefix seeding and local X adjustments.
-static constexpr std::array<int, 9> first_cycle_chunk_candidates {
-    32, 48, 56, 64, 80, 96, 112, 128, 160
+static constexpr std::array<int, 10> first_cycle_chunk_candidates {
+    32, 48, 64, 80, 96, 112, 128, 160, 192, 256
 };
 
 inline bool first_cycle_chunk_supported(int x) {
@@ -3615,9 +3616,9 @@ inline result search_runtime_applicable(
             m, baseline_regions, out.baseline) &&
         simulate(m, baseline_regions, out.baseline);
 
-    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
+    const std::array<int,10> x_cpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_gpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_phone {32,48,64,80,96,112,128,160,192,256};
     std::vector<candidate> coarse;
 
     for (int cycles = k_runtime_min_cycles; cycles <= k_runtime_max_cycles; ++cycles) {

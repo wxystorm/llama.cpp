@@ -207,6 +207,46 @@ int main() {
     CHECK(matches_chunk(invalid, 5, 500, 12, 91, 12ULL*5120*4, 12ULL*5120*4));
     CHECK(!matches_chunk(invalid, 5, 500, 100, 91, 100ULL*5120*4, 100ULL*5120*4));
 
+    // Dense Llama/Mistral keeps the 108-byte wire ABI but requires Normal
+    // RoPE and carries its architecture bit through every striped HTP layer.
+    auto mistral = a;
+    mistral.version = k_htp_only_plan_version;
+    mistral.flags = flags_for_layers(4, true);
+    mistral.region = 7;
+    mistral.layer = 20;
+    mistral.total_tokens = 256;
+    mistral.chunk_tokens = 64;
+    mistral.n_kv = 256;
+    mistral.n_heads = 32;
+    mistral.n_heads_kv = 8;
+    mistral.rope_type = k_rope_norm;
+    CHECK(validate(mistral, reason));
+    CHECK(is_llama_dense(mistral));
+    CHECK(layer_count(mistral) == 4);
+    CHECK(chunk_count(mistral) == 4);
+    for (uint32_t offset = 0; offset < 4; ++offset) {
+        const auto child = single_layer_plan(mistral, offset);
+        CHECK(child.layer == 20 + offset);
+        CHECK(child.flags == (k_flag_flash_attn | k_flag_llama_dense));
+        CHECK(child.version == k_plan_version);
+        CHECK(is_llama_dense(child));
+        CHECK(validate(child, reason));
+    }
+    auto mistral_mismatch = mistral;
+    mistral_mismatch.rope_type = k_rope_neox;
+    CHECK(!validate(mistral_mismatch, reason));
+    mistral_mismatch = mistral;
+    mistral_mismatch.flags = flags_for_layers(4);
+    CHECK(!validate(mistral_mismatch, reason));
+    mistral_mismatch = mistral;
+    mistral_mismatch.flags = flags_for_layers(4, true) | 4u;
+    CHECK(!validate(mistral_mismatch, reason));
+    // Existing Qwen3 graph descriptor must never turn into Llama silently.
+    auto qwen_child = single_layer_plan(three, 0);
+    CHECK(!is_llama_dense(qwen_child));
+    CHECK(qwen_child.flags == k_flag_flash_attn);
+    CHECK(qwen_child.rope_type == k_rope_neox);
+
     plans.erase_run(41);
     CHECK(plans.size() == 2);
     CHECK(plans.count_run(42) == 2);

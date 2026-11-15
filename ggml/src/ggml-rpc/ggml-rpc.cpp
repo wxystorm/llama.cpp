@@ -7971,7 +7971,10 @@ bool rpc_server::phone_independent_probe(
     }
     ggml_phone_owned::region_plan plan {};
     plan.version = ggml_phone_owned::k_htp_only_plan_version;
-    plan.flags = ggml_phone_owned::flags_for_layers(depth);
+    // Preserve the architecture bit supplied by the independent PC Profile.
+    // Without it a Normal-RoPE Llama probe silently becomes Qwen3/NeoX.
+    plan.flags = ggml_phone_owned::flags_for_layers(
+        depth, (w.flags & ggml_phone_owned::k_flag_llama_dense) != 0);
     plan.region = 0;
     plan.layer = w.layer;
     plan.total_tokens = w.total_tokens;

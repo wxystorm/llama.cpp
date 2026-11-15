@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feat/phone-owned-plan-bootstrap-20261106
+      - feat/llama-mistral32-region-htp-20261112
   workflow_dispatch:
 
 jobs:

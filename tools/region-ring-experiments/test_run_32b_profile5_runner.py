@@ -16,6 +16,123 @@ from run_32b_all40 import (
 
 
 class HtpOnlyAutoPlanTests(unittest.TestCase):
+    def test_optional_2048_group_selected_without_changing_default_40(self):
+        from run_32b_all40 import (
+            GROUPS, SELECTABLE_GROUPS, UPPER_BOUNDS, prompts_in,
+            get_args, choose_context,
+        )
+        self.assertEqual(GROUPS, (128, 256, 512, 1024))
+        self.assertIn(2048, SELECTABLE_GROUPS)
+        self.assertEqual(UPPER_BOUNDS[2048], 4000)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            prompt_dir = root / "prompts"
+            prompt_dir.mkdir()
+            (root / "unused.exe").touch()
+            (root / "unused.gguf").touch()
+            for group in GROUPS + (2048,):
+                for index in range(1, 11):
+                    (prompt_dir / f"prompt_{group}_{index:02}.txt").write_text("test")
+            defaults = prompts_in(prompt_dir)
+            self.assertEqual(len(defaults), 40)
+            extended = prompts_in(prompt_dir, GROUPS + (2048,))
+            selected = [(group, path) for group, path in extended if group == 2048]
+            self.assertEqual(len(selected), 10)
+            self.assertEqual(selected[0][1].name, "prompt_2048_01.txt")
+            self.assertEqual(selected[-1][1].name, "prompt_2048_10.txt")
+            args = get_args([
+                "--exe", str(root / "unused.exe"),
+                "--model", str(root / "unused.gguf"),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompt_dir),
+                "--only-group", "2048",
+                "--context-padding", "256",
+                "--max-context", "8192",
+            ])
+            self.assertEqual(args.only_group, [2048])
+            ctx, hint = choose_context(2048, None, args)
+            self.assertEqual(hint, 4000)
+            self.assertGreaterEqual(ctx, 4000 + args.n_predict + 256)
+
+    def test_long_kv_htp_grid_requires_2048_and_3072_real_samples(self):
+        from run_32b_all40 import require_long_htp_kv_anchors
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistral.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompts),
+                "--repo-root", str(root),
+                "--model-layers", "40",
+                "--auto-plan", "--htp-only",
+                "--max-context", "8192",
+            ]
+            long_args = get_args(base + ["--only-group", "2048"])
+            _, long_env = build_process(
+                long_args, prompts / "prompt_2048_01.txt", 4352, 4000,
+                root / "long.jsonl")
+            self.assertEqual(
+                long_env["LLAMA_REGION_RING_PROFILE_KV_EXTEND"], "1")
+            self.assertNotIn("LLAMA_REGION_RING_PROFILE_KV_EXTEND",
+                             build_process(
+                                 get_args(base + ["--only-group", "128"]),
+                                 prompts / "prompt_128_01.txt", 512, 167,
+                                 root / "short.jsonl")[1])
+
+            profile = root / "profile.csv"
+            profile.write_text(
+                "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+                "prepare_ms,compute_ms,terminal,samples\n"
+                "PHONE,3,96,2048,0,0,0,100,0,2\n",
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "3072"):
+                require_long_htp_kv_anchors(profile)
+            with profile.open("a", encoding="utf-8") as output:
+                output.write("PHONE,3,96,3072,0,0,0,0,0,2\n")
+            with self.assertRaisesRegex(ValueError, "3072"):
+                require_long_htp_kv_anchors(profile)
+            with profile.open("a", encoding="utf-8") as output:
+                output.write("PHONE,4,128,3072,0,0,0,125,0,2\n")
+            require_long_htp_kv_anchors(profile)
+
+    def test_forced_plan_supports_256_chunk(self):
+        from run_32b_all40 import SUPPORTED_CHUNKS
+        self.assertIn(256, SUPPORTED_CHUNKS)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            exe = root / "llama-completion.exe"
+            prompt_dir = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompt_dir.mkdir()
+            args = get_args([
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompt_dir),
+                "--repo-root", str(root),
+                "--auto-plan", "--htp-only",
+                "--force-plan-layout", "G8,P6,G8,P6,G8,P6,G8,P6,G8",
+                "--force-plan-xc", "256",
+                "--force-plan-xg", "256",
+                "--force-plan-xp", "256",
+            ])
+            self.assertEqual(
+                (args.force_plan_xc, args.force_plan_xg, args.force_plan_xp),
+                (256, 256, 256))
+            _, env = build_process(
+                args, prompt_dir / "prompt_512_01.txt",
+                1024, 587, root / "metrics.jsonl")
+            for name in ("XC", "XG", "XP"):
+                self.assertEqual(
+                    env["LLAMA_HYBRID_REGION_RING_FORCE_" + name], "256")
+
     def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
         """Regression: the PowerShell entry point pins --profile-every 0.
 
@@ -51,6 +168,81 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
             self.assertTrue(args.phone_weight_preload)
             self.assertFalse(args.warmup)
             self.assertEqual(args.out, out)
+
+    def test_diagnostic_trace_requires_explicit_switch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistral24b.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--model-layers", "40", "--prompt-dir", str(prompts),
+                "--repo-root", str(root), "--auto-plan", "--htp-only"
+            ]
+            default = get_args(base)
+            _, default_env = build_process(
+                default, prompts / "prompt_128_01.txt", 512, 173,
+                root / "default.jsonl")
+            self.assertNotIn("LLAMA_REGION_RING_TASK_TRACE", default_env)
+            diagnostic = get_args(base + ["--trace-tasks"])
+            _, diagnostic_env = build_process(
+                diagnostic, prompts / "prompt_128_01.txt", 512, 173,
+                root / "diagnostic.jsonl")
+            self.assertEqual(diagnostic_env["LLAMA_REGION_RING_TASK_TRACE"], "1")
+
+    def test_mistral_small_40_layer_auto_plan_and_forced_layout(self):
+        from run_32b_all40 import (default_layout_for_layers,
+                                   normalize_layout)
+        self.assertEqual(normalize_layout(default_layout_for_layers(40), 40),
+                         "G4,C5,P1,G4,C5,P1,G4,C5,P1,G4,C5,P1")
+        self.assertEqual(normalize_layout(
+            "G4,C5,P1,G4,C5,P1,G4,C5,P1,G4,C5,P1", 40),
+            default_layout_for_layers(40))
+        with self.assertRaisesRegex(ValueError, "exactly 40 layers"):
+            normalize_layout(default_layout_for_layers(64), 40)
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "mistralai_Mistral-Small-3.2-24B-Instruct-2506-Q6_K.gguf"
+            exe = root / "llama-completion.exe"
+            prompts = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompts.mkdir()
+            base = [
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--model-layers", "40",
+                "--prompt-dir", str(prompts), "--repo-root", str(root),
+                "--auto-plan", "--htp-only", "--profile-every", "0",
+            ]
+            auto = get_args(base)
+            self.assertEqual(auto.model_layers, 40)
+            self.assertEqual(auto.layout, default_layout_for_layers(40))
+            self.assertTrue(auto.phone_weight_preload)
+            self.assertFalse(auto.warmup)
+            command, env = build_process(
+                auto, prompts / "prompt_128_01.txt", 512, 167,
+                root / "metrics.jsonl")
+            self.assertIn("--no-warmup", command)
+            self.assertEqual(env["LLAMA_HYBRID_REGION_RING_PLANNER"],
+                             "apply-wide")
+            forced = get_args(base + [
+                "--force-plan-layout", "G4,C5,N1,G4,C5,N1,G4,C5,N1,G4,C5,N1",
+                "--force-plan-xc", "64",
+                "--force-plan-xg", "64",
+                "--force-plan-xp", "64",
+            ])
+            self.assertEqual(forced.force_plan_layout,
+                             default_layout_for_layers(40))
+            with self.assertRaises(SystemExit):
+                get_args(base + [
+                    "--force-plan-layout", default_layout_for_layers(64)])
 
     def test_fixed_htp_forced_plan_keeps_v0_and_memory_guards(self):
         with tempfile.TemporaryDirectory() as td:
