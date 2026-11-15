@@ -70,6 +70,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_HYBRID_REGION_RING_EXEC",
     "LLAMA_HYBRID_REGION_RING_LAYOUT",
     "LLAMA_HYBRID_REGION_RING_PLAN_LAYOUT",
+    "LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE_CSV",
     "LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH",
     "LLAMA_REGION_RING_PRIORITY_BANK_MOVER",
@@ -566,6 +567,9 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
             "LLAMA_HYBRID_REGION_RING_FORCE_XP": str(args.xp),
         }),
     })
+    if args.auto_plan and getattr(args, "locked_layout", None):
+        # Native chunk-only search preserves the full memory/DAG guards.
+        env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] = args.locked_layout
     if args.auto_plan and getattr(args, "force_plan_layout", None):
         # Native APPLY_WIDE forced A/B still checks exact DAG and
         # HTP Session/shared physical Android RAM budgets.
@@ -731,6 +735,9 @@ def get_args(argv=None):
     parser.add_argument("--htp-only", action="store_true",
                         help="with --auto-plan use CPU RPC transport and 4 private HTP sessions; "
                              "Phone must set GGML_RPC_PHONE_NPU_PLAN_CONTROLLED=1")
+    parser.add_argument("--lock-layout-after-first", action="store_true",
+                        help="after first PASS freeze G/C/N layer layout; "
+                             "later prompts tune only XC/XG/XP with memory guards")
     parser.add_argument("--force-plan-layout", default=None,
                         help="optional HTP-only native forced G/[C]/P plan; "
                              "N is accepted as alias for P, with memory guards")
@@ -807,6 +814,11 @@ def get_args(argv=None):
                      "use --auto-plan for independent profiling")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
+    if args.lock_layout_after_first and not (args.auto_plan and args.htp_only):
+        parser.error("--lock-layout-after-first requires --auto-plan --htp-only")
+    if args.lock_layout_after_first and args.profile_every:
+        parser.error("--lock-layout-after-first requires --profile-every 0")
+    args.locked_layout = None
     # An independent C/G/N calibration is generated at first model startup
     # and reused from --out/independent-profile on subsequent prompts.
     # Rolling runtime-Stage profiling is optional, never a prerequisite
@@ -833,6 +845,8 @@ def get_args(argv=None):
         args.force_plan_layout, args.force_plan_xc,
         args.force_plan_xg, args.force_plan_xp))
     if any_force_plan:
+        if args.lock_layout_after_first:
+            parser.error("--lock-layout-after-first cannot use --force-plan-*")
         if not (args.auto_plan and args.htp_only):
             parser.error("--force-plan-* requires --auto-plan --htp-only")
         if not args.force_plan_layout:
@@ -1151,6 +1165,9 @@ def main(argv=None):
                 if user_stage_csv is not None else
                 "AUTO_INDEPENDENT_G_C_N" if args.htp_only else None),
         })
+    if args.lock_layout_after_first:
+        config["lock_layout_after_first"] = True
+        config["gpu_region_max_budget_fraction"] = 0.5
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
                                      decisions[first_prompt.name]["context"],
@@ -1163,7 +1180,7 @@ def main(argv=None):
     }
     if args.auto_plan and args.htp_only and args.profile_every == 0:
         print("[PROFILE] policy=INDEPENDENT_ONCE active=V0 rolling=DISABLED "
-              "plan_per_prompt=1", flush=True)
+              f"plan_per_prompt={'CHUNKS_ONLY_AFTER_FIRST_PASS' if args.lock_layout_after_first else '1'}", flush=True)
     if args.auto_plan:
         print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
               f"native_profile=INDEPENDENT_BACKEND_GRID "
@@ -1171,6 +1188,10 @@ def main(argv=None):
               f"baseline_chunk={CHUNK_TOKENS} "
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
+        if args.lock_layout_after_first:
+            print("[PLAN_LOCK] policy=FIRST_PASS_PLACEMENT"
+                  " later=CHUNK_ONLY gpu_region_max_budget_fraction=0.50"
+                  " persistent=placement-lock.json", flush=True)
         if args.force_plan_layout:
             print(f"[PLAN_FORCE] source=USER layout={args.force_plan_layout} "
                   f"XC={args.force_plan_xc} XG={args.force_plan_xg} "
