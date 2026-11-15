@@ -447,7 +447,16 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// Opt-in, phone-local file-backed inference modes. No RPC or PC participates.
+enum class common_phone_stream_backend : int {
+    none   = 0,
+    cpu    = 1,
+    opencl = 2,
+    npu    = 3,
+};
+
 struct common_params {
+    common_phone_stream_backend phone_stream_backend = common_phone_stream_backend::none;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
