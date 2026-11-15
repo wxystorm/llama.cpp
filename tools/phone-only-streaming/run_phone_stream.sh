@@ -52,7 +52,7 @@ export GGML_OPENCL_STREAM_TRACE_SPLITS="${TRACE_SPLITS:-0}"
 echo "[PHONE_STREAM_RUN] backend=$MODE model=$MODEL prompt=$PROMPT"
 echo "[PHONE_STREAM_RUN] ctx=$N_CTX batch=$N_BATCH ubatch=$N_UBATCH predict=$N_PREDICT"
 echo "[PHONE_STREAM_RUN] device_budget_mib=$DEVICE_BUDGET_MIB rss_limit_mib=$RSS_LIMIT_MIB"
-echo "[PHONE_STREAM_RUN] npu_requires_native_supported_quant=1"
+echo "[PHONE_STREAM_RUN] npu_q4_k_q6_k=enabled (requires rebuilt DSP skeleton)"
 
 set +e
 "$LLAMA_BIN" \

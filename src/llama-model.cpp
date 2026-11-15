@@ -1581,10 +1581,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // The master Hexagon backend handles F16/F32 and Q4_0/Q4_1/Q8_0/
-    // IQ4_NL/MXFP4 matmul weights, but not K-quantized tensors. Reject an
-    // ineligible quantized model rather than silently benchmarking CPU
-    // fallbacks as if the whole model were running on the NPU.
+    // Allow the quantized formats implemented by this branch's HTP
+    // kernels. Reject unsupported types rather than silently benchmarking
+    // CPU fallbacks as NPU performance.
     if (stream_weights && stream_env && std::strcmp(stream_env, "npu") == 0) {
         size_t unsupported = 0;
         const char * first = nullptr;
@@ -1595,7 +1594,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q4_1 &&
                     t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_IQ4_NL &&
-                    t->type != GGML_TYPE_MXFP4) {
+                    t->type != GGML_TYPE_MXFP4 && t->type != GGML_TYPE_Q4_K &&
+                    t->type != GGML_TYPE_Q6_K) {
                 ++unsupported;
                 if (!first) first = t->name;
             }
@@ -1603,9 +1603,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (unsupported > 0) {
             throw std::runtime_error(format(
                 "[PHONE_STREAM_NPU] model contains %zu unsupported quantized block tensors "
-                "(first: %s). The Hexagon backend on this branch cannot execute "
-                "Q4_K/Q6_K directly. Use a supported quantization or port the "
-                "Q4_K/Q6_K HTP kernels from the separate HTP development branch.",
+                "(first: %s). Supported: Q4_0/Q4_1/Q8_0/IQ4_NL/MXFP4/Q4_K/Q6_K. "
+                "No whole-model CPU fallback is permitted for this benchmark.",
                 unsupported, first ? first : "unknown"));
         }
     }

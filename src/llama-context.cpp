@@ -412,6 +412,26 @@ llama_context::llama_context(
                 }
             }
 
+            const char * phone_stream_mode = std::getenv("GGML_PHONE_STREAM_BACKEND");
+            ggml_backend_dev_t backend_dev = ggml_backend_get_device(backend.get());
+            if (phone_stream_mode && std::strcmp(phone_stream_mode, "npu") == 0 &&
+                    std::strcmp(ggml_backend_dev_name(backend_dev), "HTP0") == 0) {
+                // The scheduler must allocate staged quantized tensors in
+                // the HTP REPACK buffer, not the ordinary HTP buffer.
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend_dev);
+                auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+                if (!get_extra) {
+                    throw std::runtime_error("[PHONE_STREAM_NPU] Hexagon repack buffer API unavailable");
+                }
+                ggml_backend_buffer_type_t * extra = get_extra(backend_dev);
+                if (!extra || !extra[0] || !ggml_backend_dev_supports_buft(backend_dev, extra[0])) {
+                    throw std::runtime_error("[PHONE_STREAM_NPU] no compatible Hexagon repack buffer");
+                }
+                buft = extra[0];
+                LLAMA_LOG_INFO("[PHONE_STREAM_NPU] device=HTP0 scheduler_buft=%s mode=ON_DEMAND_REPACK\n",
+                        ggml_backend_buft_name(buft));
+            }
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);

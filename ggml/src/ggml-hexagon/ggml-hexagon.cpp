@@ -4777,7 +4777,9 @@ static ggml_backend_dev_t ggml_backend_hexagon_reg_get_device(ggml_backend_reg_t
 }
 
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 && opt_hostbuf) {
+    const char * stream_mode = getenv("GGML_PHONE_STREAM_BACKEND");
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0 &&
+            (opt_hostbuf || (stream_mode && strcmp(stream_mode, "npu") == 0))) {
         ggml_backend_dev_get_extra_bufts_t fct = ggml_backend_hexagon_device_get_extra_buffers_type;
         return (void *) fct;
     }

@@ -50,27 +50,26 @@ HTP0; the CPU mode has no accelerator reservation. Both modes use
 `RSS_LIMIT_MIB=7168` as a *sampled process RSS guard*, not a hard global
 RAM or GPU driver limit. Customize limits for your device.
 
-## Model support of the currently based-on-master Hexagon backend
+## HTP Q4_K/Q6_K support (experimental)
 
-The Hexagon code in this branch supports GEMM weights in
-`F16`, `F32`, `Q4_0`, `Q4_1`, `Q8_0`, `IQ4_NL`, and `MXFP4`,
-subject to per-operator shape and HTP resource limits. **It does not
-support the `Q4_K` or `Q6_K` GEMM weights in your usual Q4_K_M/Q6_K
-models.** Running `-npu` on those GGUFs fails with
-`[PHONE_STREAM_NPU]` before the large model mappings are materialized;
-this is intentional and avoids falsely reporting CPU fallback as HTP.
+The HTP Host and DSP paths have been selectively transplanted from
+`feat/llama-mistral32-region-htp-20261112`: Q4_K and Q6_K K-quantized
+block matmuls are now eligible for `-npu` and stage their tensors in
+temporary **HTP REPACK buffers** while the source GGUF stays on UFS/CPU mmap.
+Q4_K uses Q4_1-compatible Tiled and Scale/Min layout; Q6_K uses dedicated
+HVX Tiled/Flat and HMX dequantization kernels.
 
-There is a separate experimental HTP implementation in
-`feat/llama-mistral32-region-htp-20261112` containing Q4_K/Q6_K
-kernels, but they have **not** been ported into this master-derived
-phone-only branch. Use the supported GGUF formats for initial NPU smoke
-tests. Running your 24B Q6_K or 32B Q4_K_M on HTP requires porting
-those Hexagon host+DSP kernels (and retesting correct repacking).
+**Rebuild and deploy both the Android Host binary and Hexagon DSP skeleton.**
+A Host-only rebuild does not update DSP kernels or its type table.
+The DSP mmap-slot reclamation fix is included for repeated layer switches.
+For wide Q6_K, HMX retries a non-pipelined solve; HVX Flat reduces
+prefetch depth when necessary.
 
-For `-npu` build with `-DGGML_HEXAGON=ON`, the Qualcomm Hexagon SDK,
-HTP DSP skeletons and required FastRPC deployment. For `-opencl` build
-with `-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON`.
-For `-cpu` neither accelerator backend is needed.
+This port is source-integrated but **not yet compile-tested or device-tested**.
+Check CPU/HTP parity and run a many-layer memory stress test before
+recording throughput data. The existing Qwen3-32B-Q4_K_M and
+Mistral-Small-24B-Q6_K GGUFs do not need re-quantization.
+
 
 ## Scheduling / page cache
 
