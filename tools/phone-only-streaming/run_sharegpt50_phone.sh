@@ -131,7 +131,9 @@ SUMMARY="$RUN_DIR/summary.tsv"
 if [ ! -f "$SUMMARY" ]; then
     printf 'time\tmodel\tbackend\tgroup\tprompt\tstatus\texit_code\tprefill_tokens\tprefill_ms\tprefill_tok_s\taccelerated_matmuls\tweight_copies\tstaged_weight_mib\tlog\n' > "$SUMMARY"
 fi
-"$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
+# Preflight is informational: keep HTP0 disabled so a missing FastRPC DSP
+# library cannot abort the entire sweep before CPU/GPU cases begin.
+GGML_HEXAGON_NDEV=0 "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
 echo "[SWEEP] 2 models x 50 prompts x 3 backends = 300 cases (when MODES is default)"
 echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1"
 echo "[SWEEP] resume skips PASS and FAIL; RETRY_FAILED=1 to retry failures"
