@@ -18,7 +18,7 @@ MODEL_14B="$1"
 MODEL_32B="$2"
 PROMPT_DIR="$3"
 
-LLAMA_BIN="${LLAMA_BIN:-/data/local/tmp/phone-stream-htp/bin/llama-cli}"
+LLAMA_BIN="${LLAMA_BIN:-${HOME:-/data/local/tmp}/phone-stream-htp/bin/llama-cli}"
 LOG_ROOT="${LOG_ROOT:-${HOME:-/data/local/tmp}/log}"
 RUN_DIR="$LOG_ROOT/sharegpt50"
 MODES="${MODES:-cpu gpu htp}"
