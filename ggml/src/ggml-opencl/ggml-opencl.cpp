@@ -46,7 +46,9 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 #include <mutex>
 #include <regex>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #undef MIN
 #undef MAX
@@ -7778,7 +7780,50 @@ struct ggml_backend_opencl_buffer_context {
         return extra;
     }
 
+    // The first SoA upload replaces tensor->extra with quantized subbuffer metadata.
+    // Keep the original parent cl_mem metadata so subsequent streaming uploads do not
+    // mistakenly attempt to create subbuffers of an already-created subbuffer.
+    struct soa_weight_upload_state {
+        ggml_tensor_extra_cl * original_extra;
+        void * converted_extra;
+        enum ggml_type type;
+    };
+
+    std::unordered_map<const ggml_tensor *, soa_weight_upload_state> soa_weight_uploads;
+    size_t soa_reupload_log_count = 0;
+
+    template <typename QuantExtra, typename Allocate>
+    std::pair<ggml_tensor_extra_cl *, QuantExtra *> prepare_soa_weight_upload(
+            ggml_tensor * tensor, cl_command_queue queue, Allocate allocate) {
+        auto it = soa_weight_uploads.find(tensor);
+        if (it != soa_weight_uploads.end() &&
+                it->second.converted_extra == tensor->extra && it->second.type == tensor->type) {
+            // The old quantized subbuffers can still be referenced by queued kernels.
+            // Finish them before releasing and rebuilding the SoA views.
+            CL_CHECK(clFinish(queue));
+            auto * converted = static_cast<QuantExtra *>(it->second.converted_extra);
+            converted->reset();
+            GGML_ASSERT(it->second.original_extra && it->second.original_extra->data_device);
+            if (soa_reupload_log_count++ < 4) {
+                GGML_LOG_INFO("ggml_opencl: reusing SoA parent for tensor %s (type %s)\n",
+                        tensor->name, ggml_type_name(tensor->type));
+            }
+            return {it->second.original_extra, converted};
+        }
+
+        // init_tensor can reinitialize a tensor in the same buffer context.
+        // In that case its current extra is again the generic parent metadata.
+        soa_weight_uploads.erase(tensor);
+        auto * original = static_cast<ggml_tensor_extra_cl *>(tensor->extra);
+        GGML_ASSERT(original && original->data_device);
+        QuantExtra * converted = allocate();
+        soa_weight_uploads.emplace(tensor, soa_weight_upload_state {original, converted, tensor->type});
+        return {original, converted};
+    }
+
     void reset() {
+        // All recycled SoA extras lose their association with the old tensor layout.
+        soa_weight_uploads.clear();
         for (ggml_tensor_extra_cl * e : temp_tensor_extras_in_use) {
             temp_tensor_extras.push_back(e);
         }
@@ -7912,6 +7957,7 @@ static void * ggml_backend_opencl_buffer_get_base(ggml_backend_buffer_t buffer) 
 
 static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
+    ctx->soa_weight_uploads.erase(tensor);
 
     if (tensor->view_src != nullptr) {
         GGML_ASSERT(tensor->view_src->buffer->buft == buffer->buft);
@@ -7960,12 +8006,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
 
 #ifdef GGML_OPENCL_SOA_Q
     if (tensor->type == GGML_TYPE_Q1_0) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q1_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q1_0();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q1_0>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q1_0(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         // q1_0 block = ggml_half d + (QK1_0/8) quant bytes = 2 + 16 = 18 bytes
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
@@ -8047,12 +8091,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         }
         // Tensors should have been preallocated, therefore they should
         // already have ggml_tensor_extra_cl as extra.
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q4_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_0();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q4_0>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q4_0(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
@@ -8185,12 +8227,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q4_1) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q4_1 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_1();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q4_1>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q4_1(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_m = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
@@ -8317,12 +8357,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q5_0) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q5_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q5_0();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q5_0>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q5_0(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_qs = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
@@ -8480,12 +8518,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q5_1) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q5_1 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q5_1();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q5_1>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q5_1(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_m = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
@@ -8635,12 +8671,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_MXFP4) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_mxfp4 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_mxfp4();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_mxfp4>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_mxfp4(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_e = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(char);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
@@ -8746,12 +8780,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
             return;
         }
 
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q8_0 * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q8_0();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q8_0>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q8_0(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(ggml_blck_size(tensor->type)*sizeof(char));
@@ -8851,11 +8883,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_IQ4_NL) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
-
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_iq4_nl * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_iq4_nl();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_iq4_nl>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_iq4_nl(); });
+        GGML_ASSERT(extra_orig && "Tensors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_q = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*(ggml_blck_size(tensor->type)/2);
@@ -8932,12 +8963,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q4_K) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q4_K * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q4_K();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q4_K>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q4_K(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_d = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
         size_t size_dm = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*sizeof(ggml_fp16_t);
@@ -9082,12 +9111,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q5_K) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q5_K * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q5_K();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q5_K>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q5_K(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_q  = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         size_t size_qh = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/8;
@@ -9271,12 +9298,10 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, 
         return;
     }
     if (tensor->type == GGML_TYPE_Q6_K) {
-        ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
-        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
-
-        // Allocate the new extra and create aliases from the original.
         ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-        ggml_tensor_extra_cl_q6_K * extra = ctx->ggml_opencl_alloc_temp_tensor_extra_q6_K();
+        auto [extra_orig, extra] = ctx->prepare_soa_weight_upload<ggml_tensor_extra_cl_q6_K>(
+                tensor, queue, [&]() { return ctx->ggml_opencl_alloc_temp_tensor_extra_q6_K(); });
+        GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
 
         size_t size_ql = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/2;
         size_t size_qh = ggml_nelements(tensor)/ggml_blck_size(tensor->type)*ggml_blck_size(tensor->type)/4;
