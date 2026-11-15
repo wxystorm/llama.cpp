@@ -140,27 +140,6 @@ fi
 # library cannot abort the entire sweep before CPU/GPU cases begin.
 GGML_HEXAGON_NDEV=0 "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
 
-# Fail before the 100 HTP cases if the requested FastRPC sessions cannot
-# open. The listed device names are authoritative; registration debug logs
-# can mention HTP0 even when it failed to initialize.
-case " $MODES " in
-    *" htp "*)
-        if ! GGML_HEXAGON_NDEV="$HTP_SESSIONS" GGML_HEXAGON_HOSTBUF=0 \
-                "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/htp-devices.log" 2>&1; then
-            echo "[SWEEP_ERROR] HTP device preflight failed; see $RUN_DIR/htp-devices.log" >&2
-            exit 2
-        fi
-        session=0
-        while [ "$session" -lt "$HTP_SESSIONS" ]; do
-            if ! grep -Eq "^  HTP${session}: " "$RUN_DIR/htp-devices.log"; then
-                echo "[SWEEP_ERROR] HTP$session unavailable; see $RUN_DIR/htp-devices.log" >&2
-                exit 2
-            fi
-            session=$((session + 1))
-        done
-        ;;
-esac
-
 echo "[SWEEP] 2 models x 50 prompts x 3 backends = 300 cases (when MODES is default)"
 echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1 htp_sessions=$HTP_SESSIONS"
 echo "[SWEEP] resume skips PASS and FAIL; RETRY_FAILED=1 to retry failures"
@@ -175,6 +154,23 @@ for mode in $MODES; do
         gpu) flag="-opencl"; budget="$GPU_BUDGET_MIB"; export GGML_HEXAGON_NDEV=0 ;;
         htp) flag="-npu"; budget="$HTP_BUDGET_MIB"; export GGML_HEXAGON_NDEV="$HTP_SESSIONS" ;;
     esac
+    if [ "$mode" = htp ]; then
+        # Preflight HTP just before the HTP segment, so CPU/GPU cases can
+        # complete even if FastRPC DSP libraries are unavailable.
+        if ! GGML_HEXAGON_NDEV="$HTP_SESSIONS" GGML_HEXAGON_HOSTBUF=0 \
+                "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/htp-devices.log" 2>&1; then
+            echo "[SWEEP_ERROR] HTP device preflight failed; see $RUN_DIR/htp-devices.log" >&2
+            exit 2
+        fi
+        session=0
+        while [ "$session" -lt "$HTP_SESSIONS" ]; do
+            if ! grep -Eq "^  HTP${session}: " "$RUN_DIR/htp-devices.log"; then
+                echo "[SWEEP_ERROR] HTP$session unavailable; see $RUN_DIR/htp-devices.log" >&2
+                exit 2
+            fi
+            session=$((session + 1))
+        done
+    fi
     export GGML_PHONE_STREAM_DEVICE_BUDGET_MIB="$budget"
     for model_tag in 14b 32b; do
         case "$model_tag" in
