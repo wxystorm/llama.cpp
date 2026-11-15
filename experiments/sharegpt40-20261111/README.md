@@ -4,7 +4,7 @@ This branch contains **10 experimental runs** and **396 successful prompt-level 
 
 - **Nine** runs have 40 PASS observations each.
 - **Jupiter Mistral Small 3.2-24B** has 36 PASS observations (128: 10, 256: 10, 512: 10, 1024: 6). The four uncompleted 1024 prompts are **not** counted or inferred.
-- Two extra **PC-only Qwen3-32B** reference observations are recorded separately; they are not counted in the 396 complete/partial experiment observations or group statistics.
+- Four extra **single-PC reference observations** (one Qwen3-14B and three Qwen3-32B) are recorded separately; they are not counted in the 396 experimental observations or group statistics.
 
 ## Run inventory
 
@@ -30,7 +30,9 @@ This branch contains **10 experimental runs** and **396 successful prompt-level 
 - `runs/jupiter-24b/run-config.json`: Jupiter 24B DP configuration, sanitized to use path and RPC placeholders.
 - `runs/jupiter-24b/per-prompt-details.csv`: all 36 observed DP measurements and selected chunk plans.
 - `runs/ours-*/` and `runs/prima-24b/`: other available run configurations and detailed measurements.
-- `runs/pc-only-32b/observations.csv`: single-PC 32B reference: **256 group = 21.58 tok/s** (266 tokens from a server log, prompt index unknown); **512 group = 32.9 tok/s** (`prompt_512_01.txt`, user-reported). Each reference is a single observation, not a Top-5 mean.
+- `runs/pc-only-32b/observations.csv`: single-PC 32B references: **256 group = 21.58 tok/s**, **512 group = 32.9 tok/s**, **2048 group = 17.61 tok/s** (the last is the lowest of three 2048-group runs in the newest log).
+- `runs/pc-only-14b/observations.csv`: single-PC 14B 2048-group reference: **66.89 tok/s**, lowest of two completed 14B runs. The command for this selected run and exact prompt filename are not visible in the uploaded text.
+- `runs/pc-only-14b/2048-min-run-config.json`, `runs/pc-only-32b/2048-min-run-config.json`: source information and verified execution options for the selected minimum-throughput records.
 
 ## Experimental notes
 

@@ -224,10 +224,24 @@
       "kind": "incomplete_reference_baseline",
       "observations": "runs/pc-only-32b/observations.csv",
       "raw_log": "runs/pc-only-32b/256-group-server-log.txt",
-      "source": "user-reported measurements and provided server log, 2026-11-13",
-      "sample_count": 2,
+      "source": "Earlier 256 and 512 baseline references plus a 2048-group minimum from the 2026-11-15 uploaded logfile",
+      "sample_count": 3,
       "full_sharegpt40_run": false,
-      "note": "The 256-group measurement has 266 actual prompt tokens but unspecified prompt index; the 512_01 throughput is reported without a timing log. The runtime settings for this PC-only run were not supplied."
+      "note": "256: 21.58 tok/s (prompt index unknown); 512_01: user reported 32.9 tok/s; 2048_02: selected minimum 17.61 tok/s from the newest log. None represents a group Top-5 or full 40-prompt result.",
+      "additional_run_config": "runs/pc-only-32b/2048-min-run-config.json"
+    },
+    {
+      "id": "pc-only-14b",
+      "framework": "llama.cpp / PC-only",
+      "model": "14b",
+      "execution": "single-PC",
+      "kind": "incomplete_reference_baseline",
+      "full_sharegpt40_run": false,
+      "sample_count": 1,
+      "observations": "runs/pc-only-14b/observations.csv",
+      "run_config": "runs/pc-only-14b/2048-min-run-config.json",
+      "source": "selected lowest Prefill TPS from 2 completed 14B log measurements, 2026-11-15",
+      "note": "2048-group 66.89 tok/s; exact prompt filename and launch flags are not present for the selected record."
     }
   ]
 }

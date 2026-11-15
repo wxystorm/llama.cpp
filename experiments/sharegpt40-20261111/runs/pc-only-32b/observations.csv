@@ -1,3 +1,4 @@
 framework,model,device,group,prompt,status,prompt_tokens,prefill_ms,prefill_tps,decode_tokens,decode_ms,decode_tps,total_ms,graphs_reused,graph_reallocs,measurement_source,notes
 pc-only,32b,PC,256,,LOGGED,266,12325.37,21.58,3,4872.29,0.41,17197.66,2,0,user-provided-server-log,Prompt index not specified; reported prompt eval TPS from llama-server
 pc-only,32b,PC,512,prompt_512_01.txt,REPORTED,,,32.9,,,,,,,user-reported,No detailed timing log or exact token count provided; do not infer values
+pc-only,32b,PC,2048,prompt_2048_02.txt,LOGGED_MIN,2151,122146.17,17.61,3,11215.84,0.18,133362.01,10,0,user-provided-server-log,Lowest TPS of 3 completed 32B measurements; -ngl all -t 8 -c 3000 -b 128 -ub 128 -n 3; source log line 253

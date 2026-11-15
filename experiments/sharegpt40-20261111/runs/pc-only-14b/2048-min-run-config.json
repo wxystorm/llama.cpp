@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "run_id": "pc-only-14b",
+  "model": "${MODEL_DIR}/Qwen3-14B-Q4_K_M.gguf",
+  "device": "single-PC",
+  "implementation": "official llama.cpp llama-cli",
+  "gguf_quantization": "Q4_K_M",
+  "build": "b11897-fd8f8451a",
+  "source_file": "粘贴的文本 (1)(20261115-141500).txt",
+  "source_sha256": "c26c795fd4263aa3048f00b6dffb722194d6fa45db72b231db91d21206145ca5",
+  "source_line": 59,
+  "selection": "lowest final prompt-eval TPS across the two completed 14B runs in this log",
+  "observed_prefill_tps": 66.89,
+  "observed_prefill_ms": 31484.74,
+  "observed_prompt_tokens": 2106,
+  "input_group": 2048,
+  "prompt_file": null,
+  "prompt_file_known": false,
+  "options": {
+    "n_gpu_layers": null,
+    "threads": null,
+    "context": null,
+    "batch": null,
+    "ubatch": null,
+    "n_predict": null
+  },
+  "note": "The first selected 14B output begins after the command; runtime flags and exact prompt filename are not present in the supplied log. Do not infer them from later commands."
+}

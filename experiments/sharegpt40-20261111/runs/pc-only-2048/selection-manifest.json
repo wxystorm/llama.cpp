@@ -1,0 +1,26 @@
+{
+  "file": "粘贴的文本 (1)(20261115-141500).txt",
+  "file_sha256": "c26c795fd4263aa3048f00b6dffb722194d6fa45db72b231db91d21206145ca5",
+  "file_bytes": 26287,
+  "logged_build": "b11897-fd8f8451a",
+  "selection_rule": "For each model (14B, 32B), choose exactly one complete 2048-group run with the lowest final prompt-eval tokens/sec from the supplied log; ignore intermediate progress metrics.",
+  "selected": [
+    {
+      "model": "14b",
+      "candidate_count": 2,
+      "selected_prefill_tps": 66.89,
+      "source_line": 59,
+      "prompt_verified": false
+    },
+    {
+      "model": "32b",
+      "candidate_count": 3,
+      "selected_prefill_tps": 17.61,
+      "source_line": 253,
+      "prompt_verified": true,
+      "prompt": "prompt_2048_02.txt"
+    }
+  ],
+  "original_text_committed": false,
+  "rationale": "The uploaded text includes long prompt/source content and machine-specific local paths. Only sanitized timing/config values from the selected two runs were committed."
+}

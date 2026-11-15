@@ -1,0 +1,2 @@
+framework,model,device,group,prompt,status,prompt_tokens,prefill_ms,prefill_tps,decode_tokens,decode_ms,decode_tps,total_ms,graphs_reused,graph_reallocs,measurement_source,notes
+pc-only,14b,PC,2048,,LOGGED_MIN,2106,31484.74,66.89,3,2981.13,0.67,34465.87,10,0,user-provided-server-log,Lowest TPS of 2 completed 14B measurements in the uploaded file; prompt filename and command not visible; source log line 59
