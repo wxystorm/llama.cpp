@@ -204,8 +204,9 @@ struct model {
     std::function<bool(int, int, size_t &)> gpu_region_weight_bytes;
     std::function<bool(size_t, double &)> gpu_weight_h2d_ms;
     // APPLY_WIDE GPU memory budget and per-GPU-layer KV cost, in bytes.
-    // The same 90% free-VRAM allowance and full-Prompt KV size used by
-    // memory_feasible(candidate). Zero budget disables early GPU filtering.
+    // APPLY_WIDE uses the full backend-reported free VRAM, while charging
+    // both weight Bank peaks, full-Prompt KV, and scratch. Zero budget
+    // disables early GPU filtering.
     long double gpu_memory_budget_bytes = 0.0L;
     long double gpu_kv_bytes_per_layer = 0.0L;
     std::function<bool(const candidate &)> memory_feasible;
