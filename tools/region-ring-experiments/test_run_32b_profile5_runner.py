@@ -101,6 +101,38 @@ class HtpOnlyAutoPlanTests(unittest.TestCase):
                 output.write("PHONE,4,128,3072,0,0,0,125,0,2\n")
             require_long_htp_kv_anchors(profile)
 
+    def test_forced_plan_supports_256_chunk(self):
+        from run_32b_all40 import SUPPORTED_CHUNKS
+        self.assertIn(256, SUPPORTED_CHUNKS)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            exe = root / "llama-completion.exe"
+            prompt_dir = root / "prompts"
+            model.touch()
+            exe.touch()
+            prompt_dir.mkdir()
+            args = get_args([
+                "--exe", str(exe), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(prompt_dir),
+                "--repo-root", str(root),
+                "--auto-plan", "--htp-only",
+                "--force-plan-layout", "G8,P6,G8,P6,G8,P6,G8,P6,G8",
+                "--force-plan-xc", "256",
+                "--force-plan-xg", "256",
+                "--force-plan-xp", "256",
+            ])
+            self.assertEqual(
+                (args.force_plan_xc, args.force_plan_xg, args.force_plan_xp),
+                (256, 256, 256))
+            _, env = build_process(
+                args, prompt_dir / "prompt_512_01.txt",
+                1024, 587, root / "metrics.jsonl")
+            for name in ("XC", "XG", "XP"):
+                self.assertEqual(
+                    env["LLAMA_HYBRID_REGION_RING_FORCE_" + name], "256")
+
     def test_htp_only_autoplan_accepts_zero_rolling_profiles(self):
         """Regression: the PowerShell entry point pins --profile-every 0.
 
