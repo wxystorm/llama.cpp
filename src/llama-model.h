@@ -658,6 +658,10 @@ struct llama_model {
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
+    // Advise the kernel that a staged file-backed weight is no longer needed
+    // by the OpenCL device. Returns the bytes covered by the advice (a hint,
+    // not a guarantee that Linux actually reclaimed the physical pages).
+    size_t advise_stream_weight(const ggml_tensor * tensor) const;
 
     bool has_tensor_overrides() const;
 

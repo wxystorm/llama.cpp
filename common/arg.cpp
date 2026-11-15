@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdlib>
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
@@ -789,6 +790,67 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if (params.phone_stream_backend != common_phone_stream_backend::none) {
+        const char * mode = nullptr;
+        const char * device_name = nullptr;
+        switch (params.phone_stream_backend) {
+            case common_phone_stream_backend::cpu:
+                mode = "cpu";
+                device_name = "none";
+                break;
+            case common_phone_stream_backend::opencl:
+                mode = "opencl";
+                device_name = "GPUOpenCL";
+                break;
+            case common_phone_stream_backend::npu:
+                mode = "npu";
+                device_name = "HTP0";
+                break;
+            default:
+                throw std::invalid_argument("invalid phone streaming backend mode");
+        }
+#if defined(_WIN32)
+        if (_putenv_s("GGML_PHONE_STREAM_BACKEND", mode) != 0) {
+            throw std::runtime_error("failed to set GGML_PHONE_STREAM_BACKEND");
+        }
+#else
+        if (setenv("GGML_PHONE_STREAM_BACKEND", mode, 1) != 0) {
+            throw std::runtime_error("failed to set GGML_PHONE_STREAM_BACKEND");
+        }
+#endif
+        // Hexagon reads HOSTBUF during backend registry initialization.
+        // Configure it BEFORE parse_device_list() calls backend_load_all().
+        if (params.phone_stream_backend == common_phone_stream_backend::npu) {
+#if defined(_WIN32)
+            if (_putenv_s("GGML_HEXAGON_HOSTBUF", "0") != 0 ||
+                _putenv_s("GGML_HEXAGON_NDEV", "1") != 0) {
+                throw std::runtime_error("failed to set HTP phone-only environment");
+            }
+#else
+            if (setenv("GGML_HEXAGON_HOSTBUF", "0", 1) != 0) {
+                throw std::runtime_error("failed to set GGML_HEXAGON_HOSTBUF");
+            }
+            if (setenv("GGML_HEXAGON_NDEV", "1", 1) != 0) {
+                throw std::runtime_error("failed to set GGML_HEXAGON_NDEV");
+            }
+#endif
+        }
+        // Do not allow the normal model-fit code or generic GPU offload
+        // to preallocate the entire model or change the backend selection.
+        params.devices         = parse_device_list(device_name);
+        params.fit_params      = false;
+        params.n_gpu_layers    = 0;
+        params.use_mmap        = true;
+        params.use_direct_io   = false;
+        params.use_mlock       = false;
+        params.no_extra_bufts  = true;
+        params.no_host         = true;
+        params.no_kv_offload   = true;
+        params.warmup          = false;
+        LOG_INF("[PHONE_STREAM] selected=%s device=%s mmap=1 no_repack=1 no_host=1 kv_cpu=1\n",
+                mode, device_name);
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2531,6 +2593,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
+    add_opt(common_arg(
+        {"-cpu"},
+        "phone-only CPU execution, with file-backed GGUF weights loaded on demand",
+        [](common_params & params) {
+            if (params.phone_stream_backend != common_phone_stream_backend::none &&
+                params.phone_stream_backend != common_phone_stream_backend::cpu) {
+                throw std::invalid_argument("use only one of -cpu, -opencl, -npu");
+            }
+            params.phone_stream_backend = common_phone_stream_backend::cpu;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-opencl"},
+        "phone-only Adreno OpenCL compute, with weights staged from mmap on demand",
+        [](common_params & params) {
+            if (params.phone_stream_backend != common_phone_stream_backend::none &&
+                params.phone_stream_backend != common_phone_stream_backend::opencl) {
+                throw std::invalid_argument("use only one of -cpu, -opencl, -npu");
+            }
+            params.phone_stream_backend = common_phone_stream_backend::opencl;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-npu"},
+        "phone-only Hexagon HTP compute for supported operators and quantizations",
+        [](common_params & params) {
+            if (params.phone_stream_backend != common_phone_stream_backend::none &&
+                params.phone_stream_backend != common_phone_stream_backend::npu) {
+                throw std::invalid_argument("use only one of -cpu, -opencl, -npu");
+            }
+            params.phone_stream_backend = common_phone_stream_backend::npu;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"

@@ -313,6 +313,12 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Optional out-of-core hook. Called *after* a split has completed and
+    // the backend has been synchronized. The tensor points to an original
+    // immutable host-backed source, not its GPU staging copy. The callback
+    // may advise the OS to evict its file cache pages. Returns advised bytes.
+    typedef size_t (*ggml_backend_sched_stream_advice_callback)(const struct ggml_tensor * tensor, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -350,6 +356,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    // Configure a per-weight page-cache reclamation hook for synchronous
+    // OpenCL weight streaming. Does nothing unless the streaming mode is on.
+    GGML_API void                 ggml_backend_sched_set_stream_advice_callback(ggml_backend_sched_t sched, ggml_backend_sched_stream_advice_callback callback, void * user_data);
 
     //
     // Meta backend
