@@ -3,7 +3,7 @@
 # Positional args: MODEL_14B.gguf MODEL_32B.gguf PROMPT_DIR
 # Run with: sh run_sharegpt50_phone.sh <14B> <32B> <prompts>
 # Override: LLAMA_BIN, LOG_ROOT, MODES, PREDICT, BATCH, UBATCH_*, CONTEXT_*,
-#           THREADS, RSS_LIMIT_MIB, GPU_BUDGET_MIB, HTP_BUDGET_MIB,
+#           THREADS, RSS_LIMIT_MIB, GPU_BUDGET_MIB, HTP_BUDGET_MIB, HTP_SESSIONS,
 #           PAUSE_SEC, TIMEOUT_SEC, LIMIT_CASES, RETRY_FAILED, FORCE_RERUN.
 set -u
 
@@ -38,6 +38,7 @@ CONTEXT_2048="${CONTEXT_2048:-8192}"
 RSS_LIMIT_MIB="${RSS_LIMIT_MIB:-7168}"
 GPU_BUDGET_MIB="${GPU_BUDGET_MIB:-1536}"
 HTP_BUDGET_MIB="${HTP_BUDGET_MIB:-768}"
+HTP_SESSIONS="${HTP_SESSIONS:-4}"
 PAUSE_SEC="${PAUSE_SEC:-5}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-0}"
 LIMIT_CASES="${LIMIT_CASES:-0}"
@@ -62,12 +63,16 @@ fi
 for n in "$PREDICT" "$BATCH" "$THREADS" \
          "$UBATCH_128" "$UBATCH_256" "$UBATCH_512" "$UBATCH_1024" "$UBATCH_2048" \
          "$CONTEXT_128" "$CONTEXT_256" "$CONTEXT_512" "$CONTEXT_1024" "$CONTEXT_2048" \
-         "$RSS_LIMIT_MIB" "$GPU_BUDGET_MIB" "$HTP_BUDGET_MIB" \
+         "$RSS_LIMIT_MIB" "$GPU_BUDGET_MIB" "$HTP_BUDGET_MIB" "$HTP_SESSIONS" \
          "$PAUSE_SEC" "$TIMEOUT_SEC" "$LIMIT_CASES" "$RETRY_FAILED" "$FORCE_RERUN"; do
     case "$n" in
         ''|*[!0-9]*) echo "[SWEEP_ERROR] invalid numeric setting: $n" >&2; exit 2 ;;
     esac
 done
+if [ "$HTP_SESSIONS" -lt 1 ] || [ "$HTP_SESSIONS" -gt 4 ]; then
+    echo "[SWEEP_ERROR] HTP_SESSIONS must be between 1 and 4" >&2
+    exit 2
+fi
 if [ "$TIMEOUT_SEC" -gt 0 ] && ! command -v timeout >/dev/null 2>&1; then
     echo "[SWEEP_ERROR] TIMEOUT_SEC requires the timeout command" >&2
     exit 2
@@ -115,8 +120,8 @@ CONFIG_NEXT="$RUN_DIR/.config.next"
     printf 'modes=%s\npredict=%s\nbatch=%s\nthreads=%s\n' "$MODES" "$PREDICT" "$BATCH" "$THREADS"
     printf 'ubatch=%s,%s,%s,%s,%s\n' "$UBATCH_128" "$UBATCH_256" "$UBATCH_512" "$UBATCH_1024" "$UBATCH_2048"
     printf 'context=%s,%s,%s,%s,%s\n' "$CONTEXT_128" "$CONTEXT_256" "$CONTEXT_512" "$CONTEXT_1024" "$CONTEXT_2048"
-    printf 'rss_limit_mib=%s\ngpu_budget_mib=%s\nhtp_budget_mib=%s\nverbosity=3\ntrace_splits=1\n' \
-        "$RSS_LIMIT_MIB" "$GPU_BUDGET_MIB" "$HTP_BUDGET_MIB"
+    printf 'rss_limit_mib=%s\ngpu_budget_mib=%s\nhtp_budget_mib=%s\nhtp_sessions=%s\nverbosity=3\ntrace_splits=1\n' \
+        "$RSS_LIMIT_MIB" "$GPU_BUDGET_MIB" "$HTP_BUDGET_MIB" "$HTP_SESSIONS"
 } > "$CONFIG_NEXT"
 if [ -f "$RUN_DIR/config.txt" ] &&
         [ "$(cat "$RUN_DIR/config.txt")" != "$(cat "$CONFIG_NEXT")" ]; then
@@ -135,7 +140,7 @@ fi
 # library cannot abort the entire sweep before CPU/GPU cases begin.
 GGML_HEXAGON_NDEV=0 "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
 echo "[SWEEP] 2 models x 50 prompts x 3 backends = 300 cases (when MODES is default)"
-echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1"
+echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1 htp_sessions=$HTP_SESSIONS"
 echo "[SWEEP] resume skips PASS and FAIL; RETRY_FAILED=1 to retry failures"
 ran=0
 skipped=0
@@ -146,7 +151,7 @@ for mode in $MODES; do
     case "$mode" in
         cpu) flag="-cpu"; budget="$GPU_BUDGET_MIB"; export GGML_HEXAGON_NDEV=0 ;;
         gpu) flag="-opencl"; budget="$GPU_BUDGET_MIB"; export GGML_HEXAGON_NDEV=0 ;;
-        htp) flag="-npu"; budget="$HTP_BUDGET_MIB"; export GGML_HEXAGON_NDEV=1 ;;
+        htp) flag="-npu"; budget="$HTP_BUDGET_MIB"; export GGML_HEXAGON_NDEV="$HTP_SESSIONS" ;;
     esac
     export GGML_PHONE_STREAM_DEVICE_BUDGET_MIB="$budget"
     for model_tag in 14b 32b; do
@@ -202,7 +207,7 @@ for mode in $MODES; do
                 rc=$?
                 printf '[SWEEP_END] exit_code=%s\n' "$rc" >> "$logfile"
 
-                grep -E 'PHONE_STREAM|PHONE_STREAM_SPLIT|PHONE_STREAM_BUDGET|HTP_MMAP|HTP0|GPUOpenCL|ggml-hex|prompt eval time|eval time|total time|llama_perf|model buffer size|compute buffer size' \
+                grep -E 'PHONE_STREAM|PHONE_STREAM_SPLIT|PHONE_STREAM_BUDGET|HTP_MMAP|HTP[0-3]|GPUOpenCL|ggml-hex|prompt eval time|eval time|total time|llama_perf|model buffer size|compute buffer size' \
                     "$logfile" > "$keyfile" || true
                 perf_line="$(grep -E 'prompt eval time[[:space:]]*=' "$logfile" | tail -n 1)"
                 prefill_ms="$(printf '%s\n' "$perf_line" | awk '{for (i=1;i<=NF;i++) if ($i=="=" && $(i+2)=="ms") {print $(i+1); exit}}')"
