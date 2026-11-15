@@ -595,8 +595,10 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND")) {
-        if (*stream) {
+    {
+        const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND");
+        const char * legacy = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+        if ((stream && *stream) || (!stream && legacy && std::strcmp(legacy, "1") == 0)) {
             ggml_backend_sched_set_stream_advice_callback(sched.get(),
                 [](const ggml_tensor * tensor, void * userdata) -> size_t {
                     return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
@@ -638,8 +640,10 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                if (const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND")) {
-                    if (*stream) {
+                {
+                    const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND");
+                    const char * legacy = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+                    if ((stream && *stream) || (!stream && legacy && std::strcmp(legacy, "1") == 0)) {
                         ggml_backend_sched_set_stream_advice_callback(sched.get(),
                             [](const ggml_tensor * tensor, void * userdata) -> size_t {
                                 return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
