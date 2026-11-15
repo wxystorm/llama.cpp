@@ -42,7 +42,7 @@ def default_layout_for_layers(n: int) -> str:
     raise ValueError(f"unsupported model layer count: {n}")
 
 SUPPORTED_CHUNKS = (8, 12, 16, 20, 24, 28, 32, 40, 48,
-                    56, 64, 80, 96, 112, 128, 160, 192)
+                    56, 64, 80, 96, 112, 128, 160, 192, 256)
 FORCED_RING_ENV = {
     "LLAMA_HYBRID_REGION_RING_PLANNER": "apply-wide",
     "LLAMA_HYBRID_REGION_RING_SKIP_PROFILE": "1",
