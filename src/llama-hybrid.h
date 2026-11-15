@@ -96,6 +96,9 @@ struct llama_hybrid_layer_compute_point {
     double prepare_ms     = 0.0;
     // Measured by the Phone RPC server, includes device synchronization.
     double phone_server_ms = 0.0;
+    // Actual allocation in the synthetic GPU layer-block probe, with its
+    // weight tensors excluded. Used as a CUDA compute-buffer budget proxy.
+    size_t runtime_bytes   = 0;
 };
 
 struct llama_hybrid_attn_compute_point {

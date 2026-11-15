@@ -70,7 +70,7 @@ static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION           = 0.90;
 // APPLY_WIDE uses the backend-reported available memory for feasibility.
 // GPU Bank/KV/scratch and HTP session mapping remain hard capacity checks.
 static constexpr long double LLAMA_REGION_RING_PC_MEMORY_FRACTION  = 1.0L;
-static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 1.0L;
+static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 0.97L;
 static constexpr long double LLAMA_REGION_RING_PHONE_MEMORY_FRACTION = 1.0L;
 static constexpr long double LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION = 1.0L;
 static constexpr long double LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB = 3200.0L;
@@ -606,6 +606,7 @@ struct llama_hybrid_graph_timing {
     double prepare_ms     = 0.0;
     double phone_server_ms = 0.0;
     size_t rpc_graph_wire_bytes = 0;
+    size_t runtime_bytes  = 0;
 };
 
 static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backend,
@@ -8626,11 +8627,26 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
     ggml_tensor * mask  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, tokens, tokens);
 
     ggml_tensor * cur = input;
+    size_t probe_weight_bytes = 0;
     for (int il = 0; il < n_layers; ++il) {
         // Use distinct synthetic weights per layer. Reusing one weight set would make later
         // layers unrealistically cache-hot and underestimate real multi-layer execution time.
         const llama_hybrid_probe_layer_weights weights =
             llama_hybrid_make_probe_layer_weights(ctx.get(), attn_desc, ffn_desc);
+        // Sum the exact probed weight tensors. The rest of the CUDA buffer
+        // is measured graph input/output/attention/FFN activation storage.
+        const ggml_tensor * const tensors[] = {
+            weights.attn_norm, weights.wq, weights.wk, weights.wv,
+            weights.wo, weights.q_norm, weights.k_norm,
+            weights.ffn_norm, weights.gate, weights.up, weights.down,
+        };
+        for (const ggml_tensor * tensor : tensors) {
+            if (tensor != nullptr &&
+                    !llama_hybrid_add_bytes(
+                        probe_weight_bytes, ggml_nbytes(tensor))) {
+                return false;
+            }
+        }
         cur = llama_hybrid_build_probe_layer(ctx.get(), cur, pos, mask, attn_desc, ffn_desc, weights, tokens);
     }
 
@@ -8654,6 +8670,10 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
                         ggml_backend_name(backend));
         return false;
     }
+    const size_t allocated_bytes = ggml_backend_buffer_get_size(buffer.get());
+    const size_t compute_buffer_bytes =
+        allocated_bytes > probe_weight_bytes ?
+        allocated_bytes - probe_weight_bytes : 0;
     ggml_backend_buffer_clear(buffer.get(), 0);
 
     std::vector<int32_t> pos_data(tokens);
@@ -8676,6 +8696,9 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
         LLAMA_LOG_ERROR("%s: layer block execution failed layers=%d\n", __func__, n_layers);
         return false;
     }
+    // profile_graph_timing() resets timing, so retain the allocated
+    // non-weight CUDA graph-buffer measurement only after it completes.
+    timing.runtime_bytes = compute_buffer_bytes;
 
     return true;
 }
@@ -8782,14 +8805,16 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
             }
             profile.gpu_layer_blocks.push_back({
                 tokens, block_layers, gpu_timing.wall_ms,
-                gpu_timing.compute_est_ms, gpu_timing.prepare_ms
+                gpu_timing.compute_est_ms, gpu_timing.prepare_ms,
+                0.0, gpu_timing.runtime_bytes
             });
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-                "prepare_ms=%.3f per_layer_ms=%.3f\n",
+                "prepare_ms=%.3f per_layer_ms=%.3f cuda_compute_buffer_mib=%.3f\n",
                 ggml_backend_name(gpu_backend), block_layers, tokens,
                 gpu_timing.wall_ms, gpu_timing.prepare_ms,
-                gpu_timing.wall_ms / block_layers);
+                gpu_timing.wall_ms / block_layers,
+                gpu_timing.runtime_bytes / 1048576.0);
         }
     }
 
@@ -9538,6 +9563,37 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
             LLAMA_LOG_ERROR("[INDEPENDENT_PROFILE] status=FAIL"
                             " action=REJECT_AUTO_PLAN\n");
             return false;
+        }
+    }
+
+    // CUDA profiling can retain allocations (driver pools / graph state).
+    // The initial memory sample predates those probes; re-query the live
+    // device before caching an APPLY_WIDE budget so retained CUDA allocations
+    // are not incorrectly treated as free space. This is not a WDDM
+    // residency-budget query, only the best backend-reported free-VRAM floor.
+    const char * ring_memory_mode =
+        std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+    if (gpu &&
+            ring_memory_mode != nullptr &&
+            std::strcmp(ring_memory_mode, "apply-wide") == 0) {
+        size_t free_after = 0;
+        size_t total_after = 0;
+        if (llama_hybrid_read_backend_memory(
+                gpu.get(), free_after, total_after) &&
+                free_after > 0) {
+            const size_t previous_free = profile.gpu_free_mem;
+            profile.gpu_free_mem =
+                previous_free > 0 ?
+                std::min(previous_free, free_after) : free_after;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_GPU_MEMORY_PROFILE] before_free_mib=%.1f "
+                "after_free_mib=%.1f budget_free_mib=%.1f "
+                "retained_delta_mib=%.1f status=MEASURED\n",
+                previous_free / 1048576.0,
+                free_after / 1048576.0,
+                profile.gpu_free_mem / 1048576.0,
+                previous_free > free_after ?
+                    (previous_free - free_after) / 1048576.0 : 0.0);
         }
     }
 
@@ -10661,15 +10717,81 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 };
         }
 
-        // Identical GPU accounting to the full-layout memory guard:
-        // resident Bank peak weights + full-Prompt GPU KV + slot scratch.
-        // The Planner applies this budget to E seeds and every Beam prefix.
+        // Charge two independent CUDA graph allocation buffers, measured
+        // from the actual GPU backend's synthetic multi-layer probe after
+        // excluding weights. Pick an anchor at or above the planned XG.
+        // The non-weight CUDA allocation is a conservative proxy for each
+        // Bank Scheduler's runtime buffer, not a prediction of its exact
+        // pointer layout.
+        model.gpu_compute_buffer_bytes =
+            [&profile](int xg, size_t & bytes) -> bool {
+                bytes = 0;
+                if (xg <= 0) { return false; }
+                int best_tokens = std::numeric_limits<int>::max();
+                const auto consider = [&](int tokens, size_t runtime) {
+                    if (tokens >= xg && runtime > 0 &&
+                            tokens <= best_tokens) {
+                        if (tokens < best_tokens) {
+                            best_tokens = tokens;
+                            bytes = 0;
+                        }
+                        bytes = std::max(bytes, runtime);
+                    }
+                };
+                for (const auto & p : profile.gpu_layer_blocks) {
+                    consider(p.tokens, p.runtime_bytes);
+                }
+                for (const auto & p : profile.gpu_attn) {
+                    consider(p.tokens, p.runtime_bytes);
+                }
+                return bytes > 0;
+            };
+        // Miscellaneous allocations not represented by CUDA weight Bank,
+        // GPU KV, host Slots or synthetic graph buffers (CUDA pool,
+        // transfer backend, graph executable and device-side workspaces).
+        // This is a clearly labelled future-allocation reserve, NOT an
+        // assertion that cudaMemGetInfo reports WDDM residency limits.
+        long double cuda_misc_reserve_mib = 128.0L;
+        if (const char * raw = std::getenv(
+                "LLAMA_REGION_RING_CUDA_MISC_RESERVE_MIB")) {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end == raw || *end != '\0' ||
+                    !std::isfinite(parsed) ||
+                    parsed < 0.0 || parsed > 4096.0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_MEMORY] status=REJECT "
+                    "reason=INVALID_CUDA_MISC_RESERVE value=%s\n", raw);
+                return false;
+            }
+            cuda_misc_reserve_mib = (long double) parsed;
+        }
+        model.gpu_cuda_other_reserve_bytes =
+            cuda_misc_reserve_mib * 1048576.0L;
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
-            (long double) profile.gpu_free_mem * LLAMA_REGION_RING_GPU_MEMORY_FRACTION;
+            (long double) profile.gpu_free_mem *
+                LLAMA_REGION_RING_GPU_MEMORY_FRACTION;
         model.gpu_kv_bytes_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer *
             (model.kv_start + model.tokens);
+        size_t sample_compute_bytes = 0;
+        const int sampled_xg = 32;
+        const bool sample_available =
+            model.gpu_compute_buffer_bytes(
+                sampled_xg, sample_compute_bytes);
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_MEMORY] fraction=%.2Lf free_mib=%.1f "
+            "budget_mib=%.1Lf sample_xg=%d sample_compute_per_bank_mib=%.1f "
+            "sample_status=%s cuda_other_reserve_mib=%.1Lf "
+            "source=PROFILED_CUDA_GRAPH_ALLOCATION status=CONFIGURED\n",
+            LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
+            profile.gpu_free_mem / 1048576.0,
+            model.gpu_memory_budget_bytes / 1048576.0L,
+            sampled_xg,
+            sample_compute_bytes / 1048576.0,
+            sample_available ? "AVAILABLE" : "MISSING",
+            cuda_misc_reserve_mib);
 
         // Actual HTP RPC runtime: a Region chooses a starting FastRPC
         // Session, then stripes EACH layer across HTP0..HTP3. Four virtual
@@ -10761,8 +10883,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // A region may be smaller than the total available VRAM but
                 // larger than the single alternating weight Bank. Reject
                 // every full candidate (including forced and GPU-tail)
-                // unless BOTH Bank peaks strictly fit their individual
-                // equal-size capacity after GPU KV and scratch reservation.
+                // unless BOTH Bank peaks strictly fit their dynamically
+                // available capacity after GPU KV, scratch and CUDA
+                // compute/runtime reservations.
                 if (model.gpu_weight_streaming) {
                     bool gpu_fits = false;
                     if (single_gpu_bank) {
@@ -10780,9 +10903,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         const long double kv =
                             (long double) gpu_layers *
                             model.gpu_kv_bytes_per_layer;
-                        gpu_fits = known && model.gpu_memory_budget_bytes > 0.0L &&
-                            (long double) max_weight + kv <
-                                model.gpu_memory_budget_bytes;
+                        const long double cuda_extra =
+                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                model, candidate.xg, 1);
+                        gpu_fits = gpu_layers == 0 ||
+                            (known && model.gpu_memory_budget_bytes > 0.0L &&
+                             (long double) max_weight + kv + cuda_extra <
+                                 model.gpu_memory_budget_bytes);
                     } else {
                         gpu_fits = llama_ring_planner::gpu_streamed_banks_fit(
                             model, regions, candidate.xg);
@@ -10868,8 +10995,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                         (long double) bank_peaks[0] +
                         (long double) bank_peaks[1];
-                    usage[(size_t) llama_region_ring_device::GPU] +=
-                        resident_weights;
+                    if (bank_peaks[0] > 0 || bank_peaks[1] > 0) {
+                        usage[(size_t) llama_region_ring_device::GPU] +=
+                            resident_weights +
+                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                model, candidate.xg,
+                                single_gpu_bank || bank_peaks[1] == 0 ?
+                                    1 : 2);
+                    }
                 }
 
                 usage[(size_t) llama_region_ring_device::CPU] +=
@@ -10925,7 +11058,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (have_directional_weight_split &&
                 directional_ratio_ok && !htp_session_guard) {
             boundary_memory_feasible =
-                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank](
+                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank, baseline_chunk](
                     const std::vector<
                         llama_region_ring_region> & regions) {
                     std::array<long double, 3> usage {};
@@ -11028,8 +11161,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                             (long double) bank_peaks[0] +
                             (long double) bank_peaks[1];
-                        usage[(size_t)
-                            llama_region_ring_device::GPU] += resident_weights;
+                        if (bank_peaks[0] > 0 || bank_peaks[1] > 0) {
+                            usage[(size_t)
+                                llama_region_ring_device::GPU] +=
+                                resident_weights +
+                                llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                    model, baseline_chunk,
+                                    single_gpu_bank || bank_peaks[1] == 0 ?
+                                        1 : 2);
+                        }
                     }
 
                     const size_t boundary_count =
@@ -11592,7 +11732,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
                 const long double required =
                     (long double) max_region_weight +
-                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer;
+                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer +
+                    llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                        model, forced.xg, 1);
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_ABLATION_MEMORY] mode=SINGLE_BANK "
                     "gpu_layers=%d max_region_mib=%.1f "

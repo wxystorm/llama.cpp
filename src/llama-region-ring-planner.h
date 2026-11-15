@@ -203,12 +203,14 @@ struct model {
     // measured/proxied host->CUDA transfer time for those bytes.
     std::function<bool(int, int, size_t &)> gpu_region_weight_bytes;
     std::function<bool(size_t, double &)> gpu_weight_h2d_ms;
-    // APPLY_WIDE GPU memory budget and per-GPU-layer KV cost, in bytes.
-    // APPLY_WIDE uses the full backend-reported free VRAM, while charging
-    // both weight Bank peaks, full-Prompt KV, and scratch. Zero budget
-    // disables early GPU filtering.
+    // APPLY_WIDE GPU budget: fraction of backend-reported free VRAM.
+    // CUDA residency additionally charges the two weight Bank peaks, KV,
+    // cross-stage Slots, profiled per-Bank compute buffers and miscellaneous
+    // CUDA runtime/transfer/graph reserve. A zero budget rejects streaming.
     long double gpu_memory_budget_bytes = 0.0L;
     long double gpu_kv_bytes_per_layer = 0.0L;
+    std::function<bool(int, size_t &)> gpu_compute_buffer_bytes;
+    long double gpu_cuda_other_reserve_bytes = 0.0L;
     std::function<bool(const candidate &)> memory_feasible;
     // Unlike memory_feasible(candidate), this callback accepts per-cycle
     // C/G boundaries. It is used ONLY by the real APPLY-safe search.
@@ -383,6 +385,29 @@ inline bool gpu_weight_bank_peaks(
     return true;
 }
 
+// Reserve the per-Bank CUDA compute buffers from a representative, actually
+// allocated GPU profile graph. There are two independent CUDA schedulers, so
+// their transient buffers may coexist. Other CUDA allocations have a separate
+// non-weight safety reserve. Missing explicitly requested profiles fail closed.
+inline long double gpu_cuda_additional_reserve_bytes(
+        const model & m, int xg, int physical_banks = 2) {
+    if (xg <= 0 || physical_banks < 1 || physical_banks > 2 ||
+            !std::isfinite(m.gpu_cuda_other_reserve_bytes) ||
+            m.gpu_cuda_other_reserve_bytes < 0.0L) {
+        return std::numeric_limits<long double>::infinity();
+    }
+    long double extra = m.gpu_cuda_other_reserve_bytes;
+    if (m.gpu_compute_buffer_bytes) {
+        size_t per_bank_bytes = 0;
+        if (!m.gpu_compute_buffer_bytes(xg, per_bank_bytes) ||
+                per_bank_bytes == 0) {
+            return std::numeric_limits<long double>::infinity();
+        }
+        extra += (long double) physical_banks * (long double) per_bank_bytes;
+    }
+    return extra;
+}
+
 // Bank A and Bank B are INDEPENDENT weight-cache schedulers with dynamic
 // allocation. The old "GPU free / 2" limit was a false hard constraint:
 // a 2500 MiB Bank A and a 2200 MiB Bank B can coexist if their combined
@@ -393,7 +418,8 @@ inline bool gpu_weight_bank_peaks(
 // minimum for a prefix. Unknown streaming budgets fail closed.
 inline long double gpu_streamed_single_bank_capacity_bytes(
         const model & m, int total_gpu_layers, int xg,
-        long double other_bank_peak_bytes = 0.0L) {
+        long double other_bank_peak_bytes = 0.0L,
+        int physical_banks = 2) {
     if (!m.gpu_weight_streaming || m.gpu_memory_budget_bytes <= 0.0L ||
             total_gpu_layers < 0 || xg <= 0 ||
             !std::isfinite(m.gpu_memory_budget_bytes) ||
@@ -408,9 +434,11 @@ inline long double gpu_streamed_single_bank_capacity_bytes(
     const long double scratch = m.slot_pool > 0 ?
         (long double) m.slot_pool * xg * m.hidden *
             sizeof(float) * 3 : 0.0L;
+    const long double cuda_extra =
+        gpu_cuda_additional_reserve_bytes(m, xg, physical_banks);
     const long double available =
         m.gpu_memory_budget_bytes - gpu_kv - scratch -
-        other_bank_peak_bytes;
+        cuda_extra - other_bank_peak_bytes;
     return std::isfinite(available) && available > 0.0L ?
         available : 0.0L;
 }
@@ -422,21 +450,33 @@ inline bool gpu_streamed_banks_fit(
         std::array<size_t, 2> * bank_peaks_bytes = nullptr,
         std::array<long double, 2> * bank_capacities_bytes = nullptr) {
     if (!m.gpu_weight_streaming) { return true; }
-    if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     int gpu_layers = 0;
+    int gpu_regions = 0;
     for (const auto & r : regions) {
         if (r.device == device::GPU) {
             if (r.layer_end <= r.layer_begin) { return false; }
             gpu_layers += r.layer_end - r.layer_begin;
+            ++gpu_regions;
         }
     }
+    // A zero-GPU layout has no CUDA Banks or GPU compute buffer to reserve.
+    if (gpu_layers == 0) {
+        if (bank_capacity_bytes) { *bank_capacity_bytes = 0.0L; }
+        if (bank_peaks_bytes) { *bank_peaks_bytes = {}; }
+        if (bank_capacities_bytes) { *bank_capacities_bytes = {}; }
+        return true;
+    }
+    if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     std::array<size_t, 2> peaks {};
     const bool known = gpu_weight_bank_peaks(m, regions, peaks);
+    const int physical_banks = std::min(gpu_regions, 2);
     const std::array<long double, 2> capacities {{
         gpu_streamed_single_bank_capacity_bytes(
-            m, gpu_layers, xg, (long double) peaks[1]),
+            m, gpu_layers, xg, (long double) peaks[1],
+            physical_banks),
         gpu_streamed_single_bank_capacity_bytes(
-            m, gpu_layers, xg, (long double) peaks[0]),
+            m, gpu_layers, xg, (long double) peaks[0],
+            physical_banks),
     }};
     // Historical optional scalar output now means the dynamically
     // available Bank A capacity after accounting for Bank B.
@@ -462,6 +502,7 @@ struct gpu_prefix_memory_bound {
     long double bank1_bytes = 0.0L;
     long double gpu_kv_min_bytes = 0.0L;
     long double scratch_bytes = 0.0L;
+    long double cuda_extra_bytes = 0.0L;
     long double total_min_bytes = 0.0L;
     long double budget_bytes = 0.0L;
     // Bank A/B residual capacities after the OTHER currently known
@@ -546,17 +587,21 @@ inline bool gpu_prefix_memory_feasible(
         estimate.scratch_bytes =
             (long double) m.slot_pool * xg * m.hidden * sizeof(float) * 3;
     }
+    estimate.cuda_extra_bytes = m.gpu_weight_streaming ?
+        gpu_cuda_additional_reserve_bytes(m, xg) : 0.0L;
     estimate.total_min_bytes =
         (m.gpu_weight_streaming ?
             estimate.bank0_bytes + estimate.bank1_bytes :
             unstreamed_weights) +
-        estimate.gpu_kv_min_bytes + estimate.scratch_bytes;
+        estimate.gpu_kv_min_bytes + estimate.scratch_bytes +
+        estimate.cuda_extra_bytes;
     if (m.gpu_weight_streaming) {
         // Prefix KV / future GPU Region sizes are LOWER bounds.
         // Do not invent an equal Bank split: each scheduler can have
         // a different dynamically allocated weight-cache footprint.
         const long double remain = estimate.budget_bytes -
-            estimate.gpu_kv_min_bytes - estimate.scratch_bytes;
+            estimate.gpu_kv_min_bytes - estimate.scratch_bytes -
+            estimate.cuda_extra_bytes;
         estimate.single_bank_capacity_bytes =
             std::max(0.0L, remain - estimate.bank1_bytes);
         estimate.bank1_capacity_bytes =
@@ -4137,10 +4182,14 @@ inline result search_runtime_applicable(
                 if (!first_bank_ok) {
                     ++out.first_cycle_single_bank_pruned;
                 }
+                const long double cuda_extra =
+                    m.gpu_weight_streaming ?
+                    gpu_cuda_additional_reserve_bytes(
+                        m, chunks[gi]) : 0.0L;
                 const bool fits =
                     first_bank_ok && gpu_continuation_possible &&
                     (m.gpu_memory_budget_bytes <= 0.0L ||
-                     min_full_gpu.total_min_bytes + scratch <=
+                     min_full_gpu.total_min_bytes + scratch + cuda_extra <=
                          m.gpu_memory_budget_bytes);
                 if (fits) {
                     first_gpu_ok[si * n_x + gi] = 1;
@@ -4607,7 +4656,7 @@ inline result search_runtime_applicable(
                     seed.width_slack, best_gpu_only)) {
                 trace.gpu_full_possible_min_bytes =
                     best_gpu_only.total_min_bytes +
-                    bound.scratch_bytes;
+                    bound.scratch_bytes + bound.cuda_extra_bytes;
             }
         }
         const int avg_low = m.layers / n_cycles;
