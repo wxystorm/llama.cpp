@@ -10906,9 +10906,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         const long double cuda_extra =
                             llama_ring_planner::gpu_cuda_additional_reserve_bytes(
                                 model, candidate.xg, 1);
-                        gpu_fits = known && model.gpu_memory_budget_bytes > 0.0L &&
-                            (long double) max_weight + kv + cuda_extra <
-                                model.gpu_memory_budget_bytes;
+                        gpu_fits = gpu_layers == 0 ||
+                            (known && model.gpu_memory_budget_bytes > 0.0L &&
+                             (long double) max_weight + kv + cuda_extra <
+                                 model.gpu_memory_budget_bytes);
                     } else {
                         gpu_fits = llama_ring_planner::gpu_streamed_banks_fit(
                             model, regions, candidate.xg);
@@ -10994,11 +10995,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                         (long double) bank_peaks[0] +
                         (long double) bank_peaks[1];
-                    usage[(size_t) llama_region_ring_device::GPU] +=
-                        resident_weights +
-                        llama_ring_planner::gpu_cuda_additional_reserve_bytes(
-                            model, candidate.xg,
-                            single_gpu_bank ? 1 : 2);
+                    if (bank_peaks[0] > 0 || bank_peaks[1] > 0) {
+                        usage[(size_t) llama_region_ring_device::GPU] +=
+                            resident_weights +
+                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                model, candidate.xg,
+                                single_gpu_bank ? 1 : 2);
+                    }
                 }
 
                 usage[(size_t) llama_region_ring_device::CPU] +=
@@ -11157,12 +11160,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             (long double) std::max(bank_peaks[0], bank_peaks[1]) :
                             (long double) bank_peaks[0] +
                             (long double) bank_peaks[1];
-                        usage[(size_t)
-                            llama_region_ring_device::GPU] +=
-                            resident_weights +
-                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
-                                model, baseline_chunk,
-                                single_gpu_bank ? 1 : 2);
+                        if (bank_peaks[0] > 0 || bank_peaks[1] > 0) {
+                            usage[(size_t)
+                                llama_region_ring_device::GPU] +=
+                                resident_weights +
+                                llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                    model, baseline_chunk,
+                                    single_gpu_bank ? 1 : 2);
+                        }
                     }
 
                     const size_t boundary_count =
