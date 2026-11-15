@@ -67,8 +67,13 @@ static constexpr size_t               LLAMA_HYBRID_PHONE_PREFILL_RETURN_LANES = 
 static constexpr double LLAMA_HYBRID_PC_MEMORY_FRACTION            = 0.70;
 static constexpr double LLAMA_HYBRID_PHONE_MEMORY_FRACTION_DEFAULT = 0.90;
 static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION           = 0.90;
-// Region Ring GPU Bank search uses the full reported free VRAM, with no 10% reservation.
+// APPLY_WIDE uses the backend-reported available memory for feasibility.
+// GPU Bank/KV/scratch and HTP session mapping remain hard capacity checks.
+static constexpr long double LLAMA_REGION_RING_PC_MEMORY_FRACTION  = 1.0L;
 static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 1.0L;
+static constexpr long double LLAMA_REGION_RING_PHONE_MEMORY_FRACTION = 1.0L;
+static constexpr long double LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION = 1.0L;
+static constexpr long double LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB = 3200.0L;
 
 static double llama_hybrid_phone_memory_fraction() {
     const char * value = std::getenv("LLAMA_HYBRID_PHONE_MEMORY_FRACTION");
@@ -10669,10 +10674,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // Actual HTP RPC runtime: a Region chooses a starting FastRPC
         // Session, then stripes EACH layer across HTP0..HTP3. Four virtual
         // address spaces still share physical Android RAM.
-        // The observed HTP op batching vmem is 3200 MiB per Session.
-        // Leave 10% unmapped headroom and reserve Graphless scratch for
-        // every layer, not merely once per Phone Region.
-        long double htp_session_budget_bytes = 2880.0L * 1048576.0L;
+        // HTP VMEM is capped at the observed 3200 MiB per Session.
+        // Do not apply an additional 10% planner-only margin: the
+        // per-layer Graphless scratch and repacked weights are already
+        // charged by htp_plan_memory_feasible().
+        long double htp_session_budget_bytes =
+            LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB * 1048576.0L;
         if (htp_session_guard && !force_ab_requested) {
             if (!have_layer_weights || profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
@@ -10685,7 +10692,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 char * end = nullptr;
                 const double mib = std::strtod(raw, &end);
                 if (end != raw && *end == '\0' && std::isfinite(mib) &&
-                        mib >= 256.0 && mib <= 3200.0) {
+                        mib >= 256.0 && mib <= LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB) {
                     htp_session_budget_bytes =
                         (long double) mib * 1048576.0L;
                 } else {
@@ -10701,7 +10708,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // The phone server returns /proc/meminfo MemAvailable, NOT a
         // fabricated free=total report from its CPU transport backend.
         htp_limits.shared_budget_bytes =
-            (long double) profile.phone_free_mem * 0.85L;
+            (long double) profile.phone_free_mem * LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION;
         htp_limits.tokens = model.tokens;
         htp_limits.kv_start = model.kv_start;
         htp_limits.n_embd = model.hidden;
@@ -10872,7 +10879,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     profile.phone_free_mem
                 };
                 const long double fraction[] = {
-                    0.85L, LLAMA_REGION_RING_GPU_MEMORY_FRACTION, 0.90L};
+                    LLAMA_REGION_RING_PC_MEMORY_FRACTION,
+                    LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
+                    LLAMA_REGION_RING_PHONE_MEMORY_FRACTION};
                 for (size_t i = 0; i < 3; ++i) {
                     if (free_bytes[i] != 0 &&
                             usage[i] >
@@ -11019,7 +11028,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         profile.phone_free_mem
                     };
                     const long double fraction[] = {
-                        0.85L, LLAMA_REGION_RING_GPU_MEMORY_FRACTION, 0.90L};
+                        LLAMA_REGION_RING_PC_MEMORY_FRACTION,
+                    LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
+                    LLAMA_REGION_RING_PHONE_MEMORY_FRACTION};
                     for (size_t i = 0; i < 3; ++i) {
                         if (free_bytes[i] != 0 &&
                                 usage[i] >
