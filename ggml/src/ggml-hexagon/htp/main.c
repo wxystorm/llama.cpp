@@ -860,40 +860,65 @@ static inline void mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
 }
 
 static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
-    uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
-    uint32_t b_reuse = 0; // buf reuse count
+    uint32_t m_reuse = 0; // bitmap of DSP mmap slots used by this batch
+    uint32_t b_reuse = 0;
+    uint64_t m_vmem = 0;
+    uint64_t e_vmem = 0;
 
-    uint64_t m_vmem  = 0; // mapped vmem
-    uint64_t e_vmem  = 0; // extra  vmem
-
-    // See what we can reuse
-    for (uint32_t i=0; i < n_bufs; i++) {
+    // Mark all reused buffers before evicting any old DSP mapping.
+    for (uint32_t i = 0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
         if (reuse_buf(ctx, &m_reuse, b)) { b_reuse++; } else { e_vmem += b->size; }
-        FARF(HIGH, "prep-buf #%u : pass0 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
+        FARF(HIGH, "prep-buf #%u pass0 fd=%u size=%u reused=%u", i, b->fd,
+             (uint32_t) b->size, b->base != 0);
+    }
+    if (b_reuse == n_bufs) return;
+
+    uint32_t mapped_slots = 0;
+    for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
+        m_vmem += ctx->mmap[i].size;
+        mapped_slots += ctx->mmap[i].size != 0;
     }
 
-    if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
-
-    // See how much vmem we have mmaped right now
-    for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) { m_vmem += ctx->mmap[i].size; }
-
-    FARF(HIGH, "prep-bufs : pass1 mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-bufs %u b-reuse %u",
-            (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_bufs, b_reuse);
-
-    if ((m_vmem + e_vmem) > ctx->max_vmem) {
-        // Drop unused mappings
-        for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
-            bool used = m_reuse & (1<<i);
-            if (!used) { drop_mmap(ctx, ctx->mmap + i); }
+    const uint32_t incoming_slots = n_bufs - b_reuse;
+    const bool slot_pressure = mapped_slots + incoming_slots > HTP_MAX_MMAPS;
+    const bool vmem_pressure = m_vmem > ctx->max_vmem || e_vmem > ctx->max_vmem - m_vmem;
+    if (slot_pressure || vmem_pressure) {
+        FARF(HIGH, "[HTP_MMAP_SLOT_RECLAIM] mapped=%u incoming=%u reused=%u max=%u vm=%llu extra=%llu",
+             mapped_slots, incoming_slots, b_reuse, (unsigned) HTP_MAX_MMAPS,
+             (unsigned long long) m_vmem, (unsigned long long) e_vmem);
+        // Never drop descriptors referenced by this batch.
+        for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
+            if ((m_reuse & (1u << i)) == 0) {
+                drop_mmap(ctx, ctx->mmap + i);
+            }
         }
     }
 
-    // Create missing mappings
-    for (uint32_t i=0; i < n_bufs; i++) {
+    uint32_t free_slots = 0;
+    uint64_t used_vmem = 0;
+    for (uint32_t i = 0; i < HTP_MAX_MMAPS; i++) {
+        free_slots += ctx->mmap[i].size == 0;
+        used_vmem += ctx->mmap[i].size;
+    }
+    if (incoming_slots > free_slots || used_vmem > ctx->max_vmem ||
+            e_vmem > ctx->max_vmem - used_vmem) {
+        FARF(ERROR, "[HTP_MMAP_SLOT_ERROR] incoming=%u free=%u mapped_vmem=%llu incoming_vmem=%llu max_vmem=%llu",
+             incoming_slots, free_slots,
+             (unsigned long long) used_vmem, (unsigned long long) e_vmem,
+             (unsigned long long) ctx->max_vmem);
+        abort();
+    }
+
+    for (uint32_t i = 0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
         mmap_buf(ctx, b);
-        FARF(HIGH, "prep-buf #%u : pass1 fd %u base %p size %u flags 0x%x", i, b->fd, (void*) b->base, (uint32_t) b->size, b->flags);
+        if (!b->base) {
+            FARF(ERROR, "[HTP_MMAP_SLOT_ERROR] unmapped fd=%u size=%u", b->fd, (uint32_t) b->size);
+            abort();
+        }
+        FARF(HIGH, "prep-buf #%u pass1 fd=%u base=%p size=%u", i, b->fd,
+             (void *) b->base, (uint32_t) b->size);
     }
 }
 
