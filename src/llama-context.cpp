@@ -14630,16 +14630,28 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
          (bank_b.bank_ready &&
           bank_b.bank_region == gpu_regions[1]));
 
+    // Actual allocated per-Bank CUDA graph buffers (separate from the
+    // weight-cache buffers above). Compare with the Planner's sampled
+    // compute-buffer reserve when diagnosing residency pressure.
+    const size_t cuda_compute_a_bytes =
+        ggml_backend_sched_get_buffer_size(
+            bank_a.sched.get(), backend_ptrs[1]);
+    const size_t cuda_compute_b_bytes = initial_banks == 2 ?
+        ggml_backend_sched_get_buffer_size(
+            bank_b.sched.get(), backend_ptrs[1]) : 0;
     LLAMA_LOG_ERROR(
         "[REGION_RING_GPU_BANK_PEAK_SUM] phase=LOAD_TIME "
         "banks=%zu enabled=%d future_graphs=%zu prepare_ms=%.3f "
-        "capacity_a_mib=%.3f capacity_b_mib=%.3f status=%s\n",
+        "capacity_a_mib=%.3f capacity_b_mib=%.3f "
+        "compute_a_mib=%.3f compute_b_mib=%.3f status=%s\n",
         initial_banks, peak_reserve_enabled ? 1 : 0,
         peak_reserve_graphs, peak_reserve_us / 1000.0,
         ggml_backend_sched_get_weight_cache_buffer_size(bank_a.sched.get()) / 1048576.0,
         initial_banks == 2 ?
             ggml_backend_sched_get_weight_cache_buffer_size(
                 bank_b.sched.get()) / 1048576.0 : 0.0,
+        cuda_compute_a_bytes / 1048576.0,
+        cuda_compute_b_bytes / 1048576.0,
         region_ring_initial_banks_loaded ? "READY" : "FAIL");
 
     LLAMA_LOG_ERROR(
