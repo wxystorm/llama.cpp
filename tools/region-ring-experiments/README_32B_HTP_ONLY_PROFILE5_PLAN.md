@@ -488,6 +488,44 @@ apply to the one-shot workflow. Look for
 `[INDEPENDENT_PROFILE] event=REUSE`, and
 `[PLAN] ... profile=V0`. Old `profile-epochs/` data is audit-only.
 
+## GPU streamed-Bank memory budget (APPLY_WIDE)
+
+Automatic APPLY_WIDE memory feasibility now uses **97% of live
+CUDA-backend-reported free VRAM**. A second GPU free-memory sample is taken
+after independent/native profiling so retained CUDA allocations are not
+mistaken for unallocated capacity. This is a `cudaMemGetInfo`-based
+availability check, **not** a Windows WDDM residency-budget measurement.
+
+The GPU memory requirement contains the maximum resident weight cache of
+each alternating Bank (A + B), GPU KV, cross-stage Slot scratch,
+**two** CUDA compute buffers, and a separate reserve for miscellaneous
+CUDA allocations. The compute buffer estimate uses the non-weight
+allocation size of an actual synthetic GPU layer-block profile at or
+above the candidate GPU Chunk width. It is a **proxy**, not the exact
+physical Bank scheduler footprint. One-bank ablations charge one such
+buffer instead of two. The additional CUDA overhead defaults to **128 MiB**
+for pools, Graph executables, and other device allocations, and is
+configurable on the PC via:
+
+```powershell
+--env "LLAMA_REGION_RING_CUDA_MISC_RESERVE_MIB=256"
+```
+
+Log indicators:
+
+- `[REGION_RING_GPU_MEMORY_PROFILE]`: pre/post CUDA free-memory samples
+- `[REGION_RING_GPU_MEMORY]`: 0.97 fraction, effective budget, sample
+  compute size and additional reserve
+- `[REGION_RING_GPU_BANK_PEAK_SUM]`: actual weight-cache capacities and
+  `compute_a_mib` / `compute_b_mib` from the allocated Bank schedulers
+
+These extra checks apply to automatic selection, not the explicitly
+**user-forced** diagnostic layout path, which still logs
+`[REGION_RING_PLAN_FORCE_MEMORY] status=SKIPPED`. Use automatic selection
+to validate memory feasibility; forced layouts may pass allocation and
+still experience large performance regressions under VRAM pressure.
+A 97% CUDA reported-free limit alone cannot guarantee WDDM residency.
+
 ## Limits and verification
 
 The HTP-only 32B branch deliberately does not benchmark Adreno OpenCL
