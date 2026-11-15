@@ -488,6 +488,47 @@ apply to the one-shot workflow. Look for
 `[INDEPENDENT_PROFILE] event=REUSE`, and
 `[PLAN] ... profile=V0`. Old `profile-epochs/` data is audit-only.
 
+## First-PASS placement lock with per-Prompt Chunk-only refinement
+
+The ShareGPT 40+optional-2048 runner can freeze physical model-layer
+ownership after the **first successful (PASS) native Plan**. This is a
+resume-safe experiment: the first Prompt runs the full planner, writes
+`placement-lock.json` atomically, and every later Prompt uses exactly the
+same ordered G/C/P Regions. C++ enumerates only XC, XG, XP over its regular
+Chunk grid and ranks feasible combinations via full-Prompt DAG simulation.
+No G/C/N layer ownership changes are allowed. To enable:
+
+```powershell
+--auto-plan --htp-only --lock-layout-after-first
+```
+
+- First PASS creates `placement-lock.json`, storing the frozen layout,
+  prompt name, and initial XC/XG/XP. Interrupted resumes load the file; if
+  it was not written before a crash, the runner can recover the earliest
+  successful Plan from recorded attempt results.
+- After the first PASS, the runner sets
+  `LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT` **only** in subsequent engine
+  subprocesses. This is **not** `FORCE_LAYOUT`: the original full
+  GPU/CPU/HTP memory-budget callback and exact DAG checks still apply.
+- If no Chunk combination fits the locked ownership for a later longer
+  Prompt, C++ emits `[REGION_RING_PLAN_LOCK] status=REJECT` and the
+  runner marks the Prompt failed; it never silently repartitions weights.
+  This means a layout optimized for the first short Prompt may not fit
+  a later 2048–4000-token context. For a uniform worst-case layout,
+  start a new out directory and choose the longest Prompt as the first
+  selected experiment.
+- The runner verifies that subsequent Planner records have source
+  `locked_chunk_only` and preserve the frozen layout; mismatches and
+  executables that lack the new logic are never counted as PASS.
+- Locking cannot be combined with manual `--force-plan-*` or rolling
+  Profile-every-N mode.
+
+Streamed GPU planning additionally limits **each individual GPU Region's
+weight bytes to 50% of the 97%-of-free GPU memory budget**, separately from
+the sum-of-Bank-peaks+KV+CUDA buffer feasibility check. This cap refers to
+GPU **bytes**, not 50% of total model layers. Explicit user FORCE_LAYOUT
+remains diagnostic and may bypass this search constraint.
+
 ## GPU streamed-Bank memory budget (APPLY_WIDE)
 
 Automatic APPLY_WIDE memory feasibility now uses **97% of live
