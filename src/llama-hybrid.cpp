@@ -10883,8 +10883,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 // A region may be smaller than the total available VRAM but
                 // larger than the single alternating weight Bank. Reject
                 // every full candidate (including forced and GPU-tail)
-                // unless BOTH Bank peaks strictly fit their individual
-                // equal-size capacity after GPU KV and scratch reservation.
+                // unless BOTH Bank peaks strictly fit their dynamically
+                // available capacity after GPU KV, scratch and CUDA
+                // compute/runtime reservations.
                 if (model.gpu_weight_streaming) {
                     bool gpu_fits = false;
                     if (single_gpu_bank) {
@@ -10902,8 +10903,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         const long double kv =
                             (long double) gpu_layers *
                             model.gpu_kv_bytes_per_layer;
+                        const long double cuda_extra =
+                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                model, candidate.xg, 1);
                         gpu_fits = known && model.gpu_memory_budget_bytes > 0.0L &&
-                            (long double) max_weight + kv <
+                            (long double) max_weight + kv + cuda_extra <
                                 model.gpu_memory_budget_bytes;
                     } else {
                         gpu_fits = llama_ring_planner::gpu_streamed_banks_fit(
@@ -10991,7 +10995,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         (long double) bank_peaks[0] +
                         (long double) bank_peaks[1];
                     usage[(size_t) llama_region_ring_device::GPU] +=
-                        resident_weights;
+                        resident_weights +
+                        llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                            model, candidate.xg,
+                            single_gpu_bank ? 1 : 2);
                 }
 
                 usage[(size_t) llama_region_ring_device::CPU] +=
@@ -11151,7 +11158,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             (long double) bank_peaks[0] +
                             (long double) bank_peaks[1];
                         usage[(size_t)
-                            llama_region_ring_device::GPU] += resident_weights;
+                            llama_region_ring_device::GPU] +=
+                            resident_weights +
+                            llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                                model, baseline_chunk,
+                                single_gpu_bank ? 1 : 2);
                     }
 
                     const size_t boundary_count =
@@ -11714,7 +11725,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
                 const long double required =
                     (long double) max_region_weight +
-                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer;
+                    (long double) gpu_layers * model.gpu_kv_bytes_per_layer +
+                    llama_ring_planner::gpu_cuda_additional_reserve_bytes(
+                        model, forced.xg, 1);
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_ABLATION_MEMORY] mode=SINGLE_BANK "
                     "gpu_layers=%d max_region_mib=%.1f "
