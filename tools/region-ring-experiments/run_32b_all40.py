@@ -637,9 +637,15 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     if args.no_mmap:
         command.append("--no-mmap")
     if args.htp_only:
-        # Native Qwen3 HTP-only supports fresh prefill only. Avoid an
-        # unmeasured legacy tiny/decode warmup through CPU RPC transport.
-        command.append("--no-warmup")
+        # Graphless Phone skips the legacy 1-2 token warmup. An explicitly
+        # opted-in diagnostic runs a representative prefill in THIS process,
+        # then clears KV and resets timing before the measured prompt.
+        diag_env = dict(entry.split("=", 1) for entry in args.env)
+        full_prefill_warmup = (
+            diag_env.get("LLAMA_REGION_RING_DIAG_FULL_WARMUP") == "1"
+            and diag_env.get("LLAMA_HYBRID_PREFILL_WARMUP") == "1"
+        )
+        command.append("--warmup" if full_prefill_warmup else "--no-warmup")
     return command, env
 
 
@@ -910,6 +916,12 @@ def get_args(argv=None):
     forbidden = sorted({entry.split("=", 1)[0] for entry in args.env} & PROTECTED_RING_ENV)
     if forbidden:
         parser.error("--env cannot override fixed Ring settings: " + ", ".join(forbidden))
+    diag_env = dict(entry.split("=", 1) for entry in args.env)
+    if (args.htp_only and
+            diag_env.get("LLAMA_REGION_RING_DIAG_FULL_WARMUP") == "1" and
+            diag_env.get("LLAMA_HYBRID_PREFILL_WARMUP") != "1"):
+        parser.error("diagnostic Graphless warmup requires "
+                     "--env LLAMA_HYBRID_PREFILL_WARMUP=1")
     if args.profile_every:
         required = {"LLAMA_REGION_RING_TASK_TRACE",
                     "LLAMA_REGION_RING_REAL_STAGE_PROFILE"}
