@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Phone-local ShareGPT50 sweep: 14B/32B x CPU/Adreno/HTP x 50 prompts.
+# Phone-local ShareGPT sweep: 14B/32B x CPU/Adreno/HTP x first 2 prompts per group.
 # Positional args: MODEL_14B.gguf MODEL_32B.gguf PROMPT_DIR
 # Run with: sh run_sharegpt50_phone.sh <14B> <32B> <prompts>
 # Override: LLAMA_BIN, LOG_ROOT, MODES, PREDICT, BATCH, UBATCH_*, CONTEXT_*,
@@ -84,11 +84,11 @@ for mode in $MODES; do
     esac
 done
 
-# Fail early if the 50 requested txt prompts are not complete.
+# Only the first two prompts in each of 5 groups are required (10 prompts total).
 missing=0
 for group in 128 256 512 1024 2048; do
     i=1
-    while [ "$i" -le 10 ]; do
+    while [ "$i" -le 2 ]; do
         two_digits="$(printf '%02d' "$i")"
         f="$PROMPT_DIR/prompt_${group}_${two_digits}.txt"
         if [ ! -f "$f" ]; then
@@ -140,9 +140,10 @@ fi
 # library cannot abort the entire sweep before CPU/GPU cases begin.
 GGML_HEXAGON_NDEV=0 "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
 
-echo "[SWEEP] 2 models x 50 prompts x 3 backends = 300 cases (when MODES is default)"
+echo "[SWEEP] 2 models x 10 prompts x 3 backends = 60 cases (when MODES is default)"
+echo "[SWEEP] prompt selection: groups=128,256,512,1024,2048 indices=01,02"
 echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1 htp_sessions=$HTP_SESSIONS"
-echo "[SWEEP] resume skips PASS and FAIL; RETRY_FAILED=1 to retry failures"
+echo "[SWEEP] resume skips PASS and FAIL by default (RETRY_FAILED=0, FORCE_RERUN=0)"
 ran=0
 skipped=0
 passed=0
@@ -188,7 +189,7 @@ for mode in $MODES; do
             case_dir="$RUN_DIR/$model_tag/$mode"
             mkdir -p "$case_dir" || exit 2
             i=1
-            while [ "$i" -le 10 ]; do
+            while [ "$i" -le 2 ]; do
                 two_digits="$(printf '%02d' "$i")"
                 base="prompt_${group}_${two_digits}"
                 prompt="$PROMPT_DIR/$base.txt"
