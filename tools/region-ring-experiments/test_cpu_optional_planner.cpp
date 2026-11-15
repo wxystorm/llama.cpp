@@ -181,6 +181,11 @@ static void test_gpu_cuda_memory_reserve() {
     assert(!gpu_streamed_banks_fit(m, layout, 32));
     m.gpu_memory_budget_bytes = 480 * MiB;
     assert(gpu_streamed_banks_fit(m, layout, 32));
+    // No CUDA allocation should be reserved for CPU+Phone-only plans.
+    const auto zero_gpu = llama_region_ring_parse_apply_wide_layout(
+        "C20,P20", 40);
+    m.gpu_memory_budget_bytes = 0.0L;
+    assert(gpu_streamed_banks_fit(m, zero_gpu, 32));
 
     const std::vector<llama_region_ring_region> prefix = {
         {device::GPU, 0, 13},
