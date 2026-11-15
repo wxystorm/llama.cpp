@@ -8944,6 +8944,21 @@ static bool llama_hybrid_calibrate_independent_ring(
                         json_path.c_str());
                     return false;
                 }
+                // A previous V0 profile sampled only through Chunk=128.
+                // Never silently reuse it after expanding the measured grid.
+                const std::string metadata(
+                    (std::istreambuf_iterator<char>(saved)),
+                    std::istreambuf_iterator<char>());
+                if (metadata.find(
+                        "\"chunk_widths\":[32,64,96,128,192,256]") ==
+                        std::string::npos) {
+                    LLAMA_LOG_ERROR(
+                        "[INDEPENDENT_PROFILE] status=REJECT"
+                        " reason=CACHE_CHUNK_GRID_MISMATCH path=%s"
+                        " action=GENERATE_NEW_PROFILE_IN_NEW_OUT_DIR\n",
+                        json_path.c_str());
+                    return false;
+                }
             }
             LLAMA_LOG_INFO(
                 "[INDEPENDENT_PROFILE] event=REUSE path=%s"
@@ -9215,6 +9230,7 @@ static bool llama_hybrid_calibrate_independent_ring(
         json << "{\"schema\":1,\"mode\":\"INDEPENDENT_BACKEND_PROFILE\","
              << "\"model\":{\"layers\":" << profile.n_layer
              << ",\"hidden\":" << profile.n_embd << "},"
+             << "\"chunk_widths\":[32,64,96,128,192,256],"
              << "\"backends\":{\"G\":\"CUDA\",\"C\":\"CPU\","
              << "\"N\":\"HTP_STRIPED\","
              << "\"A\":\"UNAVAILABLE_IN_HTP_ONLY_MODE\"},"
