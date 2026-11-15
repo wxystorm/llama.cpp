@@ -449,7 +449,6 @@ inline bool gpu_streamed_banks_fit(
         std::array<size_t, 2> * bank_peaks_bytes = nullptr,
         std::array<long double, 2> * bank_capacities_bytes = nullptr) {
     if (!m.gpu_weight_streaming) { return true; }
-    if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     int gpu_layers = 0;
     for (const auto & r : regions) {
         if (r.device == device::GPU) {
@@ -457,6 +456,14 @@ inline bool gpu_streamed_banks_fit(
             gpu_layers += r.layer_end - r.layer_begin;
         }
     }
+    // A zero-GPU layout has no CUDA Banks or GPU compute buffer to reserve.
+    if (gpu_layers == 0) {
+        if (bank_capacity_bytes) { *bank_capacity_bytes = 0.0L; }
+        if (bank_peaks_bytes) { *bank_peaks_bytes = {}; }
+        if (bank_capacities_bytes) { *bank_capacities_bytes = {}; }
+        return true;
+    }
+    if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     std::array<size_t, 2> peaks {};
     const bool known = gpu_weight_bank_peaks(m, regions, peaks);
     const std::array<long double, 2> capacities {{
