@@ -1273,27 +1273,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
-    const char * stream_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
-    const bool stream_weights = stream_env != nullptr && std::strcmp(stream_env, "1") == 0;
+    const char * stream_env = std::getenv("GGML_PHONE_STREAM_BACKEND");
+    const char * legacy_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    const bool stream_weights = (stream_env && *stream_env) ||
+        (legacy_env && std::strcmp(legacy_env, "1") == 0);
     if (stream_weights) {
         if (!ml.use_mmap || ml.use_direct_io || params.use_mlock ||
                 params.use_extra_bufts || !params.no_host) {
             throw std::runtime_error(
-                "GGML_OPENCL_STREAM_WEIGHTS requires --mmap --no-repack --no-host "
+                "phone stream mode requires --mmap --no-repack --no-host "
                 "without --direct-io or --mlock");
         }
-        bool has_opencl = false;
-        for (const auto & device : devices) {
-            if (std::strcmp(ggml_backend_dev_name(device.dev), "GPUOpenCL") == 0) {
-                has_opencl = true;
+        const char * target = stream_env ? stream_env : "opencl";
+        if (std::strcmp(target, "cpu") != 0) {
+            const char * expected = std::strcmp(target, "npu") == 0 ? "HTP0" : "GPUOpenCL";
+            bool found = false;
+            for (const auto & device : devices) {
+                if (std::strcmp(ggml_backend_dev_name(device.dev), expected) == 0) {
+                    found = true;
+                }
+            }
+            if (!found) {
+                throw std::runtime_error(format(
+                    "[PHONE_STREAM] target %s unavailable; select -cpu or build the required backend",
+                    expected));
             }
         }
-        if (!has_opencl) {
-            throw std::runtime_error(
-                "GGML_OPENCL_STREAM_WEIGHTS requires the GPUOpenCL device (build with GGML_OPENCL=ON)");
-        }
-        LLAMA_LOG_INFO("[PHONE_STREAM] mode=CPU_MMAP_OPENCL_ON_DEMAND model_weights=CPU "
-                       "prefetch=OFF n_gpu_layers=0\n");
+        LLAMA_LOG_INFO("[PHONE_STREAM] mode=%s weights=CPU_MMAP_ON_DEMAND prefetch=OFF n_gpu_layers=0\n",
+                       target);
     }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
@@ -1817,8 +1824,10 @@ const float * llama_model::tensor_split() const {
 }
 
 uint32_t llama_model::n_gpu_layers() const {
-    const char * stream_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
-    if (stream_env != nullptr && std::strcmp(stream_env, "1") == 0) {
+    const char * stream_env = std::getenv("GGML_PHONE_STREAM_BACKEND");
+    const char * legacy_env = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+    if ((stream_env && *stream_env) ||
+        (legacy_env && std::strcmp(legacy_env, "1") == 0)) {
         // Model weight buffers must remain on the CPU mmap. The OpenCL
         // backend scheduler stages individual layer weights for compute.
         return 0;
