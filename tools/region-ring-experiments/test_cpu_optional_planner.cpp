@@ -181,6 +181,22 @@ static void test_gpu_cuda_memory_reserve() {
     assert(!gpu_streamed_banks_fit(m, layout, 32));
     m.gpu_memory_budget_bytes = 480 * MiB;
     assert(gpu_streamed_banks_fit(m, layout, 32));
+    // A one-Region CUDA layout needs only one physical scheduler buffer.
+    const std::vector<llama_region_ring_region> one_gpu = {
+        {device::GPU, 0, 13}, {device::PHONE, 13, 40},
+    };
+    m.gpu_memory_budget_bytes = 280 * MiB;
+    assert(gpu_streamed_banks_fit(m, one_gpu, 32));
+    m.gpu_memory_budget_bytes = 480 * MiB;
+    m.gpu_compute_buffer_bytes =
+        [](int, size_t &) { return false; };
+    assert(!gpu_streamed_banks_fit(m, layout, 32));
+    m.gpu_compute_buffer_bytes =
+        [](int xg, size_t & bytes) {
+            if (xg != 32) { return false; }
+            bytes = 64 * MiB;
+            return true;
+        };
     // No CUDA allocation should be reserved for CPU+Phone-only plans.
     const std::vector<llama_region_ring_region> zero_gpu = {
         {device::CPU, 0, 20}, {device::PHONE, 20, 40},
