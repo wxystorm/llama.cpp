@@ -102,7 +102,7 @@ fi
 APP_DIR="$(cd "$(dirname "$LLAMA_BIN")/.." && pwd)"
 export LD_LIBRARY_PATH="$APP_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export ADSP_LIBRARY_PATH="$APP_DIR/lib${ADSP_LIBRARY_PATH:+:$ADSP_LIBRARY_PATH}"
-export GGML_HEXAGON_NDEV=1
+# Set NDEV per experiment below. CPU/OpenCL must not open HTP sessions.
 export GGML_OPENCL_STREAM_TRACE_SPLITS=1
 export GGML_OPENCL_STREAM_RSS_LIMIT_MIB="$RSS_LIMIT_MIB"
 
@@ -142,9 +142,9 @@ failed=0
 
 for mode in $MODES; do
     case "$mode" in
-        cpu) flag="-cpu"; budget="$GPU_BUDGET_MIB" ;;
-        gpu) flag="-opencl"; budget="$GPU_BUDGET_MIB" ;;
-        htp) flag="-npu"; budget="$HTP_BUDGET_MIB" ;;
+        cpu) flag="-cpu"; budget="$GPU_BUDGET_MIB"; export GGML_HEXAGON_NDEV=0 ;;
+        gpu) flag="-opencl"; budget="$GPU_BUDGET_MIB"; export GGML_HEXAGON_NDEV=0 ;;
+        htp) flag="-npu"; budget="$HTP_BUDGET_MIB"; export GGML_HEXAGON_NDEV=1 ;;
     esac
     export GGML_PHONE_STREAM_DEVICE_BUDGET_MIB="$budget"
     for model_tag in 14b 32b; do
