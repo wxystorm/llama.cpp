@@ -894,6 +894,16 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
+// Phone-only HTP uses up to four separate FastRPC sessions. These are
+// independent buffer namespaces, not four physical NPUs.
+static int ggml_backend_phone_htp_index(const char * name) {
+    if (!name || strncmp(name, "HTP", 3) != 0 ||
+            name[3] < '0' || name[3] > '3' || name[4] != '\0') {
+        return -1;
+    }
+    return name[3] - '0';
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // assign pre-allocated nodes to their backend
@@ -943,18 +953,43 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                     src_backend_id == sched->n_backends - 1 &&
                     ggml_backend_buffer_is_host(src->buffer) &&
                     strncmp(src->name, "blk.", 4) == 0) {
-                const char * target_name = sched->stream_target == 2 ? "GPUOpenCL" : "HTP0";
-                for (int b = 0; b < sched->n_backends - 1; ++b) {
+                // All supported matrix multiplies in a layer use the same
+                // session (layer_id % n_htp). This avoids cross-session copies
+                // between the Q/K/V, attention and FFN matmuls of one layer.
+                // The standard scheduler handles activation copies between
+                // layers/sessions; failed capability checks fall through to CPU.
+                int htp_ids[4] = {-1, -1, -1, -1};
+                int n_htp = 0;
+                if (sched->stream_target == 3) {
+                    for (int b = 0; b < sched->n_backends - 1; ++b) {
+                        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                        if (dev && ggml_backend_phone_htp_index(ggml_backend_dev_name(dev)) >= 0 &&
+                                n_htp < 4) {
+                            htp_ids[n_htp++] = b;
+                        }
+                    }
+                }
+                int start_htp = 0;
+                if (n_htp > 0) {
+                    char * end = NULL;
+                    long layer_index = strtol(src->name + 4, &end, 10);
+                    if (end != src->name + 4 && *end == '.' && layer_index >= 0) {
+                        start_htp = (int) (layer_index % n_htp);
+                    }
+                }
+                const int attempts = sched->stream_target == 3 ? n_htp : sched->n_backends - 1;
+                for (int attempt = 0; attempt < attempts; ++attempt) {
+                    const int b = sched->stream_target == 3 ?
+                        htp_ids[(start_htp + attempt) % n_htp] : attempt;
                     ggml_backend_t candidate = sched->backends[b];
                     ggml_backend_dev_t dev = ggml_backend_get_device(candidate);
-                    if (dev == NULL || strcmp(ggml_backend_dev_name(dev), target_name) != 0) {
-                        continue;
-                    }
+                    if (dev == NULL) continue;
+                    if (sched->stream_target == 2 &&
+                            strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") != 0) continue;
                     // HTP only accepts weights already in its own buffer
                     // when checking support. A shadow, unallocated source
                     // allows an eligibility check BEFORE the GGML scheduler
-                    // stages the weight into its session's repack buffer.
-                    // The real graph and CPU source tensor stay unchanged.
+                    // stages the weight into its session's REPACK buffer.
                     bool supported = false;
                     if (sched->stream_target == 3) {
                         ggml_tensor shadow_weight = *src;
@@ -1608,6 +1643,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t staged_weight_copies = 0;
     size_t backend_splits = 0;
     size_t accelerated_matmuls = 0;
+    size_t htp_splits[4] = {};
+    size_t htp_matmuls[4] = {};
     size_t total_blk_matmuls = 0;
     size_t advised_weight_bytes = 0;
     size_t peak_rss_kib = 0;
@@ -1668,15 +1705,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         ggml_backend_dev_t split_dev = ggml_backend_get_device(split_backend);
+        const char * split_dev_name = split_dev ? ggml_backend_dev_name(split_dev) : "";
+        const int htp_index = ggml_backend_phone_htp_index(split_dev_name);
         const bool is_stream_split = sched->stream_weights_enabled && split_dev != NULL &&
             ((sched->stream_target == 1 &&
                 ggml_backend_dev_type(split_dev) == GGML_BACKEND_DEVICE_TYPE_CPU) ||
              (sched->stream_target == 2 &&
-                strcmp(ggml_backend_dev_name(split_dev), "GPUOpenCL") == 0) ||
-             (sched->stream_target == 3 &&
-                strcmp(ggml_backend_dev_name(split_dev), "HTP0") == 0));
+                strcmp(split_dev_name, "GPUOpenCL") == 0) ||
+             (sched->stream_target == 3 && htp_index >= 0));
         if (is_stream_split) {
             ++backend_splits;
+            if (sched->stream_target == 3 && htp_index >= 0) {
+                ++htp_splits[htp_index];
+            }
         }
         for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
             const ggml_tensor * node = split->graph.nodes[ni];
@@ -1686,6 +1727,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ++total_blk_matmuls;
                 if (is_stream_split && sched->stream_target != 1) {
                     ++accelerated_matmuls;
+                    if (sched->stream_target == 3 && htp_index >= 0) {
+                        ++htp_matmuls[htp_index];
+                    }
                 }
             }
         }
@@ -1914,9 +1958,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     split_read_after - split_read_before : UINT64_MAX;
             const double split_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - split_start).count();
-            GGML_LOG_INFO("[PHONE_STREAM_SPLIT] split=%d stage_inputs=%d wall_ms=%.3f "
+            GGML_LOG_INFO("[PHONE_STREAM_SPLIT] split=%d backend=%s stage_inputs=%d wall_ms=%.3f "
                           "process_read_bytes=%" PRIu64 "\n",
-                    split_id, split->n_inputs, split_ms, split_io_bytes);
+                    split_id, split_dev_name, split->n_inputs, split_ms, split_io_bytes);
         }
 
         if (is_stream_split) {
@@ -1968,13 +2012,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 (double) advised_weight_bytes / (1024.0 * 1024.0),
                 stage_submit_ms, advice_ms, wall_ms, io_bytes,
                 major_faults, minor_faults, peak_rss_kib / 1024.0);
+        if (sched->stream_target == 3) {
+            for (int b = 0; b < sched->n_backends; ++b) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
+                const int session = dev ? ggml_backend_phone_htp_index(ggml_backend_dev_name(dev)) : -1;
+                if (session >= 0) {
+                    GGML_LOG_INFO("[PHONE_STREAM_HTP] device=HTP%d splits=%zu accelerated_matmuls=%zu\n",
+                                  session, htp_splits[session], htp_matmuls[session]);
+                }
+            }
+        }
     }
 
     if ((sched->stream_target == 2 || sched->stream_target == 3) &&
             total_blk_matmuls > 0 && accelerated_matmuls == 0) {
         GGML_LOG_ERROR("[PHONE_STREAM] REJECT no transformer matrix multiplications executed on "
                        "requested %s backend; refusing misleading CPU-only fallback measurement\n",
-                sched->stream_target == 2 ? "GPUOpenCL" : "HTP0");
+                sched->stream_target == 2 ? "GPUOpenCL" : "HTP0..HTP3");
         return GGML_STATUS_FAILED;
     }
     return GGML_STATUS_SUCCESS;
