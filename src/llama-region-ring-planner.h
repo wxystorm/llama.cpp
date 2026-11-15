@@ -418,7 +418,8 @@ inline long double gpu_cuda_additional_reserve_bytes(
 // minimum for a prefix. Unknown streaming budgets fail closed.
 inline long double gpu_streamed_single_bank_capacity_bytes(
         const model & m, int total_gpu_layers, int xg,
-        long double other_bank_peak_bytes = 0.0L) {
+        long double other_bank_peak_bytes = 0.0L,
+        int physical_banks = 2) {
     if (!m.gpu_weight_streaming || m.gpu_memory_budget_bytes <= 0.0L ||
             total_gpu_layers < 0 || xg <= 0 ||
             !std::isfinite(m.gpu_memory_budget_bytes) ||
@@ -434,7 +435,7 @@ inline long double gpu_streamed_single_bank_capacity_bytes(
         (long double) m.slot_pool * xg * m.hidden *
             sizeof(float) * 3 : 0.0L;
     const long double cuda_extra =
-        gpu_cuda_additional_reserve_bytes(m, xg);
+        gpu_cuda_additional_reserve_bytes(m, xg, physical_banks);
     const long double available =
         m.gpu_memory_budget_bytes - gpu_kv - scratch -
         cuda_extra - other_bank_peak_bytes;
@@ -450,10 +451,12 @@ inline bool gpu_streamed_banks_fit(
         std::array<long double, 2> * bank_capacities_bytes = nullptr) {
     if (!m.gpu_weight_streaming) { return true; }
     int gpu_layers = 0;
+    int gpu_regions = 0;
     for (const auto & r : regions) {
         if (r.device == device::GPU) {
             if (r.layer_end <= r.layer_begin) { return false; }
             gpu_layers += r.layer_end - r.layer_begin;
+            ++gpu_regions;
         }
     }
     // A zero-GPU layout has no CUDA Banks or GPU compute buffer to reserve.
@@ -466,11 +469,14 @@ inline bool gpu_streamed_banks_fit(
     if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     std::array<size_t, 2> peaks {};
     const bool known = gpu_weight_bank_peaks(m, regions, peaks);
+    const int physical_banks = std::min(gpu_regions, 2);
     const std::array<long double, 2> capacities {{
         gpu_streamed_single_bank_capacity_bytes(
-            m, gpu_layers, xg, (long double) peaks[1]),
+            m, gpu_layers, xg, (long double) peaks[1],
+            physical_banks),
         gpu_streamed_single_bank_capacity_bytes(
-            m, gpu_layers, xg, (long double) peaks[0]),
+            m, gpu_layers, xg, (long double) peaks[0],
+            physical_banks),
     }};
     // Historical optional scalar output now means the dynamically
     // available Bank A capacity after accounting for Bank B.
@@ -4176,10 +4182,14 @@ inline result search_runtime_applicable(
                 if (!first_bank_ok) {
                     ++out.first_cycle_single_bank_pruned;
                 }
+                const long double cuda_extra =
+                    m.gpu_weight_streaming ?
+                    gpu_cuda_additional_reserve_bytes(
+                        m, chunks[gi]) : 0.0L;
                 const bool fits =
                     first_bank_ok && gpu_continuation_possible &&
                     (m.gpu_memory_budget_bytes <= 0.0L ||
-                     min_full_gpu.total_min_bytes + scratch <=
+                     min_full_gpu.total_min_bytes + scratch + cuda_extra <=
                          m.gpu_memory_budget_bytes);
                 if (fits) {
                     first_gpu_ok[si * n_x + gi] = 1;
@@ -4646,7 +4656,7 @@ inline result search_runtime_applicable(
                     seed.width_slack, best_gpu_only)) {
                 trace.gpu_full_possible_min_bytes =
                     best_gpu_only.total_min_bytes +
-                    bound.scratch_bytes;
+                    bound.scratch_bytes + bound.cuda_extra_bytes;
             }
         }
         const int avg_low = m.layers / n_cycles;
