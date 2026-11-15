@@ -8967,7 +8967,7 @@ static bool llama_hybrid_calibrate_independent_ring(
     }();
     const std::vector<int> depths = full_grid ?
         std::vector<int>{1, 2, 4, 6} : std::vector<int>{2, 4, 6};
-    const std::array<int, 4> widths = {32, 64, 96, 128};
+    const std::array<int, 6> widths = {32, 64, 96, 128, 192, 256};
     const std::vector<int> kv_spans = long_kv_grid ?
         std::vector<int>{256, 512, 1024, 2048, 3072} :
         std::vector<int>{256, 512, 1024};
