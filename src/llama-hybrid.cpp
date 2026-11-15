@@ -10709,6 +10709,24 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // fabricated free=total report from its CPU transport backend.
         htp_limits.shared_budget_bytes =
             (long double) profile.phone_free_mem * LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION;
+        if (htp_session_guard && !force_ab_requested) {
+            LLAMA_LOG_INFO(
+                "[REGION_RING_MEMORY_POLICY] mode=APPLY_WIDE"
+                " basis=BACKEND_REPORTED_AVAILABLE"
+                " pc_free_mib=%.1f gpu_free_mib=%.1f phone_free_mib=%.1f"
+                " pc_fraction=%.2Lf gpu_fraction=%.2Lf phone_fraction=%.2Lf"
+                " htp_shared_fraction=%.2Lf"
+                " htp_session_budget_mib=%.1Lf"
+                " status=PHYSICAL_CAPACITY_GUARDED\n",
+                profile.pc_free_mem / 1048576.0,
+                profile.gpu_free_mem / 1048576.0,
+                profile.phone_free_mem / 1048576.0,
+                LLAMA_REGION_RING_PC_MEMORY_FRACTION,
+                LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
+                LLAMA_REGION_RING_PHONE_MEMORY_FRACTION,
+                LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION,
+                htp_session_budget_bytes / 1048576.0L);
+        }
         htp_limits.tokens = model.tokens;
         htp_limits.kv_start = model.kv_start;
         htp_limits.n_embd = model.hidden;
