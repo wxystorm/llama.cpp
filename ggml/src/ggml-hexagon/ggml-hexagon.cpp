@@ -19,6 +19,9 @@
 #include <regex>
 #include <queue>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <vector>
 
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
