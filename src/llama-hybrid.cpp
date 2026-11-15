@@ -70,7 +70,7 @@ static constexpr double LLAMA_HYBRID_GPU_MEMORY_FRACTION           = 0.90;
 // APPLY_WIDE uses the backend-reported available memory for feasibility.
 // GPU Bank/KV/scratch and HTP session mapping remain hard capacity checks.
 static constexpr long double LLAMA_REGION_RING_PC_MEMORY_FRACTION  = 1.0L;
-static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 1.0L;
+static constexpr long double LLAMA_REGION_RING_GPU_MEMORY_FRACTION = 0.97L;
 static constexpr long double LLAMA_REGION_RING_PHONE_MEMORY_FRACTION = 1.0L;
 static constexpr long double LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION = 1.0L;
 static constexpr long double LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB = 3200.0L;
@@ -606,6 +606,7 @@ struct llama_hybrid_graph_timing {
     double prepare_ms     = 0.0;
     double phone_server_ms = 0.0;
     size_t rpc_graph_wire_bytes = 0;
+    size_t runtime_bytes  = 0;
 };
 
 static bool llama_hybrid_profile_graph_timing(ggml_backend_t              backend,
@@ -8626,11 +8627,26 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
     ggml_tensor * mask  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F16, tokens, tokens);
 
     ggml_tensor * cur = input;
+    size_t probe_weight_bytes = 0;
     for (int il = 0; il < n_layers; ++il) {
         // Use distinct synthetic weights per layer. Reusing one weight set would make later
         // layers unrealistically cache-hot and underestimate real multi-layer execution time.
         const llama_hybrid_probe_layer_weights weights =
             llama_hybrid_make_probe_layer_weights(ctx.get(), attn_desc, ffn_desc);
+        // Sum the exact probed weight tensors. The rest of the CUDA buffer
+        // is measured graph input/output/attention/FFN activation storage.
+        const ggml_tensor * const tensors[] = {
+            weights.attn_norm, weights.wq, weights.wk, weights.wv,
+            weights.wo, weights.q_norm, weights.k_norm,
+            weights.ffn_norm, weights.gate, weights.up, weights.down,
+        };
+        for (const ggml_tensor * tensor : tensors) {
+            if (tensor != nullptr &&
+                    !llama_hybrid_add_bytes(
+                        probe_weight_bytes, ggml_nbytes(tensor))) {
+                return false;
+            }
+        }
         cur = llama_hybrid_build_probe_layer(ctx.get(), cur, pos, mask, attn_desc, ffn_desc, weights, tokens);
     }
 
@@ -8654,6 +8670,10 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
                         ggml_backend_name(backend));
         return false;
     }
+    const size_t allocated_bytes = ggml_backend_buffer_get_size(buffer.get());
+    const size_t compute_buffer_bytes =
+        allocated_bytes > probe_weight_bytes ?
+        allocated_bytes - probe_weight_bytes : 0;
     ggml_backend_buffer_clear(buffer.get(), 0);
 
     std::vector<int32_t> pos_data(tokens);
@@ -8676,6 +8696,9 @@ static bool llama_hybrid_profile_layer_block_point(const llama_hybrid_attn_desc 
         LLAMA_LOG_ERROR("%s: layer block execution failed layers=%d\n", __func__, n_layers);
         return false;
     }
+    // profile_graph_timing() resets timing, so retain the allocated
+    // non-weight CUDA graph-buffer measurement only after it completes.
+    timing.runtime_bytes = compute_buffer_bytes;
 
     return true;
 }
@@ -8782,14 +8805,16 @@ bool llama_hybrid_profile_full_layer(llama_hybrid_profile &         profile,
             }
             profile.gpu_layer_blocks.push_back({
                 tokens, block_layers, gpu_timing.wall_ms,
-                gpu_timing.compute_est_ms, gpu_timing.prepare_ms
+                gpu_timing.compute_est_ms, gpu_timing.prepare_ms,
+                0.0, gpu_timing.runtime_bytes
             });
             LLAMA_LOG_INFO(
                 "[HYBRID_PROFILE_COMPUTE] backend=%s kind=layer_block layers=%d tokens=%d total_ms=%.3f "
-                "prepare_ms=%.3f per_layer_ms=%.3f\n",
+                "prepare_ms=%.3f per_layer_ms=%.3f cuda_compute_buffer_mib=%.3f\n",
                 ggml_backend_name(gpu_backend), block_layers, tokens,
                 gpu_timing.wall_ms, gpu_timing.prepare_ms,
-                gpu_timing.wall_ms / block_layers);
+                gpu_timing.wall_ms / block_layers,
+                gpu_timing.runtime_bytes / 1048576.0);
         }
     }
 
