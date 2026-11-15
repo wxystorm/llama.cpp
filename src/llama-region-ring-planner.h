@@ -390,8 +390,8 @@ inline bool gpu_weight_bank_peaks(
 // their transient buffers may coexist. Other CUDA allocations have a separate
 // non-weight safety reserve. Missing explicitly requested profiles fail closed.
 inline long double gpu_cuda_additional_reserve_bytes(
-        const model & m, int xg) {
-    if (xg <= 0 ||
+        const model & m, int xg, int physical_banks = 2) {
+    if (xg <= 0 || physical_banks < 1 || physical_banks > 2 ||
             !std::isfinite(m.gpu_cuda_other_reserve_bytes) ||
             m.gpu_cuda_other_reserve_bytes < 0.0L) {
         return std::numeric_limits<long double>::infinity();
@@ -403,7 +403,7 @@ inline long double gpu_cuda_additional_reserve_bytes(
                 per_bank_bytes == 0) {
             return std::numeric_limits<long double>::infinity();
         }
-        extra += 2.0L * (long double) per_bank_bytes;
+        extra += (long double) physical_banks * (long double) per_bank_bytes;
     }
     return extra;
 }
