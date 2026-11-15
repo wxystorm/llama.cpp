@@ -1,5 +1,9 @@
 # Phone-only CPU mmap + Adreno OpenCL weight streaming (experimental)
 
+> For the unified `-cpu`, `-opencl`, and `-npu` modes, see
+> [phone-only-streaming-modes.md](phone-only-streaming-modes.md).
+> This page documents the legacy OpenCL-only environment entrypoint.
+
 This branch adds a **phone-local** baseline for large GGUF models. No PC/RPC
 participates in computation. It is independent of Region Ring, HTP, and the
 cycle planner.
