@@ -676,6 +676,10 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
 // CLI argument parsing functions
 //
 
+// Phone-only mode applies device selection immediately after parsing the
+// command line. The implementation lives below common_params_parse_ex().
+static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & value);
+
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
 
