@@ -11000,7 +11000,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             resident_weights +
                             llama_ring_planner::gpu_cuda_additional_reserve_bytes(
                                 model, candidate.xg,
-                                single_gpu_bank ? 1 : 2);
+                                single_gpu_bank || bank_peaks[1] == 0 ?
+                                    1 : 2);
                     }
                 }
 
@@ -11166,7 +11167,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 resident_weights +
                                 llama_ring_planner::gpu_cuda_additional_reserve_bytes(
                                     model, baseline_chunk,
-                                    single_gpu_bank ? 1 : 2);
+                                    single_gpu_bank || bank_peaks[1] == 0 ?
+                                        1 : 2);
                         }
                     }
 
