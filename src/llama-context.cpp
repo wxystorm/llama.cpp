@@ -412,6 +412,28 @@ llama_context::llama_context(
                 }
             }
 
+            const char * phone_stream_mode = std::getenv("GGML_PHONE_STREAM_BACKEND");
+            ggml_backend_dev_t backend_dev = ggml_backend_get_device(backend.get());
+            const char * backend_name = ggml_backend_dev_name(backend_dev);
+            if (phone_stream_mode && std::strcmp(phone_stream_mode, "npu") == 0 &&
+                    std::strncmp(backend_name, "HTP", 3) == 0 &&
+                    backend_name[3] >= '0' && backend_name[3] <= '3' && backend_name[4] == '\0') {
+                // The scheduler must allocate staged quantized tensors in
+                // the HTP REPACK buffer, not the ordinary HTP buffer.
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(backend_dev);
+                auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+                if (!get_extra) {
+                    throw std::runtime_error("[PHONE_STREAM_NPU] Hexagon repack buffer API unavailable");
+                }
+                ggml_backend_buffer_type_t * extra = get_extra(backend_dev);
+                if (!extra || !extra[0] || !ggml_backend_dev_supports_buft(backend_dev, extra[0])) {
+                    throw std::runtime_error("[PHONE_STREAM_NPU] no compatible Hexagon repack buffer");
+                }
+                buft = extra[0];
+                LLAMA_LOG_INFO("[PHONE_STREAM_NPU] device=%s scheduler_buft=%s mode=ON_DEMAND_REPACK\n",
+                        backend_name, ggml_backend_buft_name(buft));
+            }
             backend_buft.push_back(buft);
             backend_ptrs.push_back(backend.get());
             backend_buf_exp_size.push_back(0);
@@ -2432,7 +2454,8 @@ ggml_cgraph * llama_context::graph_reserve(
         const char * legacy = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
         const bool active_gpu_stream = (stream != nullptr && std::strcmp(stream, "cpu") != 0) ||
             (stream == nullptr && legacy && std::strcmp(legacy, "1") == 0);
-        const char * target_dev = (stream && std::strcmp(stream, "npu") == 0) ? "HTP0" : "GPUOpenCL";
+        const bool npu_stream = stream && std::strcmp(stream, "npu") == 0;
+        const char * target_dev = npu_stream ? "HTP*" : "GPUOpenCL";
         const char * budget = std::getenv("GGML_PHONE_STREAM_DEVICE_BUDGET_MIB");
         if (!budget) budget = std::getenv("GGML_OPENCL_STREAM_GPU_BUDGET_MIB");
         if (active_gpu_stream && budget != nullptr && *budget != '\0') {
@@ -2446,9 +2469,25 @@ ggml_cgraph * llama_context::graph_reserve(
             std::vector<size_t> estimated(backend_ptrs.size(), 0);
             ggml_backend_sched_reserve_size(sched.get(), gf, estimated.data());
             size_t required = 0;
+            bool found_target = false;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
-                if (dev && std::strcmp(ggml_backend_dev_name(dev), target_dev) == 0) {
+                if (!dev) continue;
+                const char * dev_name = ggml_backend_dev_name(dev);
+                const bool htp = std::strncmp(dev_name, "HTP", 3) == 0 &&
+                    dev_name[3] >= '0' && dev_name[3] <= '3' && dev_name[4] == '\0';
+                if (npu_stream ? !htp : std::strcmp(dev_name, target_dev) != 0) continue;
+                found_target = true;
+                if (npu_stream) {
+                    // Each HTP session has its own VMEM/MBUF budget. A global
+                    // sum would incorrectly reject valid four-session plans.
+                    LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] device=%s reserve_mib=%.2f budget_mib=%llu\n",
+                            dev_name, estimated[i] / (1024.0 * 1024.0), mib);
+                    if (estimated[i] > mib * 1024ull * 1024ull) {
+                        LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT %s compute reserve exceeds session budget\n", dev_name);
+                        return nullptr;
+                    }
+                } else {
                     if (required > SIZE_MAX - estimated[i]) {
                         LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] GPU size overflow\n");
                         return nullptr;
@@ -2456,11 +2495,17 @@ ggml_cgraph * llama_context::graph_reserve(
                     required += estimated[i];
                 }
             }
-            LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] device=%s reserve_mib=%.2f budget_mib=%llu\n",
-                    target_dev, required / (1024.0 * 1024.0), mib);
-            if (required > mib * 1024ull * 1024ull) {
-                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT compute buffer reservation exceeds %s budget\n", target_dev);
+            if (!found_target) {
+                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] no selected backend matching %s\n", target_dev);
                 return nullptr;
+            }
+            if (!npu_stream) {
+                LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] device=%s reserve_mib=%.2f budget_mib=%llu\n",
+                        target_dev, required / (1024.0 * 1024.0), mib);
+                if (required > mib * 1024ull * 1024ull) {
+                    LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT compute reserve exceeds %s budget\n", target_dev);
+                    return nullptr;
+                }
             }
         }
         if (!ggml_backend_sched_reserve(sched.get(), gf)) {

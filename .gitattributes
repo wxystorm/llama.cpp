@@ -1,0 +1,2 @@
+# Android/Termux shell scripts must retain LF line endings when checked out on Windows.
+tools/phone-only-streaming/*.sh text eol=lf
