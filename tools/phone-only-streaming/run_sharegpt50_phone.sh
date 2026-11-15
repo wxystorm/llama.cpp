@@ -106,7 +106,7 @@ if ! mkdir -p "$RUN_DIR"; then
 fi
 APP_DIR="$(cd "$(dirname "$LLAMA_BIN")/.." && pwd)"
 export LD_LIBRARY_PATH="$APP_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export ADSP_LIBRARY_PATH="$APP_DIR/lib${ADSP_LIBRARY_PATH:+:$ADSP_LIBRARY_PATH}"
+export ADSP_LIBRARY_PATH="$APP_DIR/lib${ADSP_LIBRARY_PATH:+;$ADSP_LIBRARY_PATH}"
 # Set NDEV per experiment below. CPU/OpenCL must not open HTP sessions.
 export GGML_OPENCL_STREAM_TRACE_SPLITS=1
 export GGML_OPENCL_STREAM_RSS_LIMIT_MIB="$RSS_LIMIT_MIB"
@@ -207,7 +207,7 @@ for mode in $MODES; do
                 echo "[SWEEP_RUN] $model_tag $mode $base ctx=$ctx ub=$ub"
                 {
                     printf '[SWEEP_BEGIN] timestamp=%s model=%s backend=%s prompt=%s\n' "$timestamp" "$model_tag" "$mode" "$base"
-                    printf '[SWEEP_CONFIG] ctx=%s batch=%s ubatch=%s threads=%s predict=%s lv=3 rss_limit_mib=%s device_budget_mib=%s\n' \
+                    printf '[SWEEP_CONFIG] ctx=%s batch=%s ubatch=%s threads=%s predict=%s single_turn=1 lv=3 rss_limit_mib=%s device_budget_mib=%s\n' \
                         "$ctx" "$BATCH" "$ub" "$THREADS" "$PREDICT" "$RSS_LIMIT_MIB" "$budget"
                 } > "$logfile"
 
@@ -215,12 +215,12 @@ for mode in $MODES; do
                     timeout "$TIMEOUT_SEC" "$LLAMA_BIN" \
                         "$flag" -m "$model" -f "$prompt" \
                         -c "$ctx" -b "$BATCH" -ub "$ub" -t "$THREADS" \
-                        -n "$PREDICT" -lv 3 </dev/null >> "$logfile" 2>&1
+                        -n "$PREDICT" -st -lv 3 </dev/null >> "$logfile" 2>&1
                 else
                     "$LLAMA_BIN" \
                         "$flag" -m "$model" -f "$prompt" \
                         -c "$ctx" -b "$BATCH" -ub "$ub" -t "$THREADS" \
-                        -n "$PREDICT" -lv 3 </dev/null >> "$logfile" 2>&1
+                        -n "$PREDICT" -st -lv 3 </dev/null >> "$logfile" 2>&1
                 fi
                 rc=$?
                 printf '[SWEEP_END] exit_code=%s\n' "$rc" >> "$logfile"
