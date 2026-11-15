@@ -11311,10 +11311,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return false;
             }
             if (locked_regions.empty() ||
-                    !llama_region_ring_apply_topology_compatible(
+                    (!llama_region_ring_apply_topology_compatible(
                         locked_regions, model.layers) &&
-                    !llama_region_ring_single_cycle_force_compatible(
-                        locked_regions, model.layers)) {
+                     !llama_region_ring_single_cycle_force_compatible(
+                        locked_regions, model.layers))) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_LOCK] status=REJECT"
                     " reason=INVALID_TOPOLOGY\n");
