@@ -10784,14 +10784,16 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "[REGION_RING_GPU_MEMORY] fraction=%.2Lf free_mib=%.1f "
             "budget_mib=%.1Lf sample_xg=%d sample_compute_per_bank_mib=%.1f "
             "sample_status=%s cuda_other_reserve_mib=%.1Lf "
-            "source=PROFILED_CUDA_GRAPH_ALLOCATION status=CONFIGURED\n",
+            "max_region_fraction=%.2Lf"
+            " source=PROFILED_CUDA_GRAPH_ALLOCATION status=CONFIGURED\n",
             LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
             profile.gpu_free_mem / 1048576.0,
             model.gpu_memory_budget_bytes / 1048576.0L,
             sampled_xg,
             sample_compute_bytes / 1048576.0,
             sample_available ? "AVAILABLE" : "MISSING",
-            cuda_misc_reserve_mib);
+            cuda_misc_reserve_mib,
+            model.gpu_max_region_budget_fraction);
 
         // Actual HTP RPC runtime: a Region chooses a starting FastRPC
         // Session, then stripes EACH layer across HTP0..HTP3. Four virtual
@@ -10908,6 +10910,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 model, candidate.xg, 1);
                         gpu_fits = gpu_layers == 0 ||
                             (known && model.gpu_memory_budget_bytes > 0.0L &&
+                             llama_ring_planner::gpu_streamed_region_within_limit(
+                                 model, max_weight) &&
                              (long double) max_weight + kv + cuda_extra <
                                  model.gpu_memory_budget_bytes);
                     } else {
