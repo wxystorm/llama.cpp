@@ -2768,9 +2768,9 @@ inline result search(
         return out;
     }
 
-    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
+    const std::array<int,10> x_cpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_gpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_phone {32,48,64,80,96,112,128,160,192,256};
     std::vector<candidate> coarse;
 
     for (int n = 2; n <= 4; ++n) {
@@ -2903,8 +2903,8 @@ inline result search(
 }
 
 // Shared fine-Chunk grid for Prefix seeding and local X adjustments.
-static constexpr std::array<int, 9> first_cycle_chunk_candidates {
-    32, 48, 56, 64, 80, 96, 112, 128, 160
+static constexpr std::array<int, 10> first_cycle_chunk_candidates {
+    32, 48, 64, 80, 96, 112, 128, 160, 192, 256
 };
 
 inline bool first_cycle_chunk_supported(int x) {
@@ -3615,9 +3615,9 @@ inline result search_runtime_applicable(
             m, baseline_regions, out.baseline) &&
         simulate(m, baseline_regions, out.baseline);
 
-    const std::array<int,9> x_cpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_gpu {32,48,56,64,80,96,112,128,160};
-    const std::array<int,9> x_phone {32,48,56,64,80,96,112,128,160};
+    const std::array<int,10> x_cpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_gpu {32,48,64,80,96,112,128,160,192,256};
+    const std::array<int,10> x_phone {32,48,64,80,96,112,128,160,192,256};
     std::vector<candidate> coarse;
 
     for (int cycles = k_runtime_min_cycles; cycles <= k_runtime_max_cycles; ++cycles) {
