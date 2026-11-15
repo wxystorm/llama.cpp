@@ -1607,6 +1607,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t staged_weight_bytes = 0;
     size_t staged_weight_copies = 0;
     size_t backend_splits = 0;
+    size_t accelerated_matmuls = 0;
     size_t advised_weight_bytes = 0;
     size_t peak_rss_kib = 0;
     double stage_submit_ms = 0.0;
@@ -1675,6 +1676,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 strcmp(ggml_backend_dev_name(split_dev), "HTP0") == 0));
         if (is_stream_split) {
             ++backend_splits;
+            if (sched->stream_target != 1) {
+                for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
+                    const ggml_tensor * node = split->graph.nodes[ni];
+                    if (node->op == GGML_OP_MUL_MAT && node->src[0] &&
+                            strncmp(node->src[0]->name, "blk.", 4) == 0) {
+                        ++accelerated_matmuls;
+                    }
+                }
+            }
         }
         const char * trace_splits = getenv("GGML_OPENCL_STREAM_TRACE_SPLITS");
         const bool trace_split = is_stream_split && trace_splits != NULL && strcmp(trace_splits, "1") == 0;
@@ -1946,17 +1956,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const long major_faults = -1;
         const long minor_faults = -1;
 #endif
-        GGML_LOG_INFO("[PHONE_STREAM] backend_splits=%zu weight_copies=%zu staged_weight_mib=%.2f "
+        GGML_LOG_INFO("[PHONE_STREAM] backend_splits=%zu accelerated_matmuls=%zu weight_copies=%zu staged_weight_mib=%.2f "
                       "advised_weight_mib=%.2f copy_submit_ms=%.3f advice_ms=%.3f "
                       "graph_wall_ms=%.3f process_read_bytes=%" PRIu64
                       " major_faults=%ld minor_faults=%ld peak_sampled_rss_mib=%.2f\n",
-                backend_splits, staged_weight_copies,
+                backend_splits, accelerated_matmuls, staged_weight_copies,
                 (double) staged_weight_bytes / (1024.0 * 1024.0),
                 (double) advised_weight_bytes / (1024.0 * 1024.0),
                 stage_submit_ms, advice_ms, wall_ms, io_bytes,
                 major_faults, minor_faults, peak_rss_kib / 1024.0);
     }
 
+    if ((sched->stream_target == 2 || sched->stream_target == 3) &&
+            accelerated_matmuls == 0) {
+        GGML_LOG_ERROR("[PHONE_STREAM] REJECT no transformer matrix multiplications executed on "
+                       "requested %s backend; refusing misleading CPU-only fallback measurement\n",
+                sched->stream_target == 2 ? "GPUOpenCL" : "HTP0");
+        return GGML_STATUS_FAILED;
+    }
     return GGML_STATUS_SUCCESS;
 }
 
