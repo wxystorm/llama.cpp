@@ -139,6 +139,28 @@ fi
 # Preflight is informational: keep HTP0 disabled so a missing FastRPC DSP
 # library cannot abort the entire sweep before CPU/GPU cases begin.
 GGML_HEXAGON_NDEV=0 "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/devices.log" 2>&1 || true
+
+# Fail before the 100 HTP cases if the requested FastRPC sessions cannot
+# open. The listed device names are authoritative; registration debug logs
+# can mention HTP0 even when it failed to initialize.
+case " $MODES " in
+    *" htp "*)
+        if ! GGML_HEXAGON_NDEV="$HTP_SESSIONS" GGML_HEXAGON_HOSTBUF=0 \
+                "$LLAMA_BIN" --list-devices -lv 3 > "$RUN_DIR/htp-devices.log" 2>&1; then
+            echo "[SWEEP_ERROR] HTP device preflight failed; see $RUN_DIR/htp-devices.log" >&2
+            exit 2
+        fi
+        session=0
+        while [ "$session" -lt "$HTP_SESSIONS" ]; do
+            if ! grep -Eq "^  HTP${session}: " "$RUN_DIR/htp-devices.log"; then
+                echo "[SWEEP_ERROR] HTP$session unavailable; see $RUN_DIR/htp-devices.log" >&2
+                exit 2
+            fi
+            session=$((session + 1))
+        done
+        ;;
+esac
+
 echo "[SWEEP] 2 models x 50 prompts x 3 backends = 300 cases (when MODES is default)"
 echo "[SWEEP] logs=$RUN_DIR verbose=3 trace_splits=1 htp_sessions=$HTP_SESSIONS"
 echo "[SWEEP] resume skips PASS and FAIL; RETRY_FAILED=1 to retry failures"
