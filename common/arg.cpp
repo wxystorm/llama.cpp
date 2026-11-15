@@ -819,6 +819,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             throw std::runtime_error("failed to set GGML_PHONE_STREAM_BACKEND");
         }
 #endif
+        // Hexagon reads HOSTBUF during backend registry initialization.
+        // Configure it BEFORE parse_device_list() calls backend_load_all().
+        if (params.phone_stream_backend == common_phone_stream_backend::npu) {
+#if defined(_WIN32)
+            if (_putenv_s("GGML_HEXAGON_HOSTBUF", "0") != 0) {
+                throw std::runtime_error("failed to set GGML_HEXAGON_HOSTBUF");
+            }
+#else
+            if (setenv("GGML_HEXAGON_HOSTBUF", "0", 1) != 0) {
+                throw std::runtime_error("failed to set GGML_HEXAGON_HOSTBUF");
+            }
+#endif
+        }
         // Do not allow the normal model-fit code or generic GPU offload
         // to preallocate the entire model or change the backend selection.
         params.devices         = parse_device_list(device_name);
@@ -831,15 +844,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.no_host         = true;
         params.no_kv_offload   = true;
         params.warmup          = false;
-        // HTP must copy through its own repacking tensor setter. Disabling
-        // host-backed HTP buffers prevents bypassing this conversion.
-        if (params.phone_stream_backend == common_phone_stream_backend::npu) {
-#if defined(_WIN32)
-            _putenv_s("GGML_HEXAGON_HOSTBUF", "0");
-#else
-            setenv("GGML_HEXAGON_HOSTBUF", "0", 1);
-#endif
-        }
         LOG_INF("[PHONE_STREAM] selected=%s device=%s mmap=1 no_repack=1 no_host=1 kv_cpu=1\n",
                 mode, device_name);
     }
