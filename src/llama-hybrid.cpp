@@ -11282,6 +11282,173 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
 
+        // Cross-Prompt placement lock: first Prompt performs the full
+        // G/C/P search; the runner passes that chosen layer ownership to
+        // subsequent processes. Only XC/XG/XP may vary. Unlike the user
+        // FORCE_LAYOUT path this keeps ALL GPU/HTP/host memory guards.
+        const char * locked_layout = std::getenv(
+            "LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT");
+        if (locked_layout != nullptr && *locked_layout != '\0') {
+            if (force_ab_requested) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT"
+                    " reason=CONFLICTS_WITH_USER_FORCE\n");
+                return false;
+            }
+            std::vector<llama_region_ring_region> locked_regions;
+            try {
+                locked_regions =
+                    llama_region_ring_parse_apply_wide_layout(
+                        locked_layout, model.layers);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT"
+                    " reason=INVALID_LAYOUT detail=%s\n", e.what());
+                return false;
+            }
+            if (locked_regions.empty() ||
+                    !llama_region_ring_apply_topology_compatible(
+                        locked_regions, model.layers) &&
+                    !llama_region_ring_single_cycle_force_compatible(
+                        locked_regions, model.layers)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT"
+                    " reason=INVALID_TOPOLOGY\n");
+                return false;
+            }
+            const int n_gpu_regions = (int) std::count_if(
+                locked_regions.begin(), locked_regions.end(),
+                [](const auto & region) {
+                    return region.device ==
+                        llama_region_ring_device::GPU;
+                });
+            if (n_gpu_regions == 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT"
+                    " reason=NO_GPU_REGIONS\n");
+                return false;
+            }
+            llama_ring_planner::model locked_model = model;
+            if (locked_regions.back().device !=
+                    llama_region_ring_device::PHONE) {
+                locked_model.phone_autonomous_final = false;
+            }
+            llama_ring_planner::candidate best_chunk;
+            best_chunk.concrete_regions = locked_regions;
+            best_chunk.cycles = n_gpu_regions;
+            const int first = locked_regions.front().layer_end;
+            best_chunk.g = first;
+            best_chunk.c = 0;
+            best_chunk.p = 0;
+            bool valid = false;
+            size_t tried = 0;
+            size_t rejected_memory = 0;
+            size_t rejected_profile = 0;
+            const auto & widths =
+                llama_ring_planner::first_cycle_chunk_candidates;
+            for (const int xg : widths) {
+                // Two-Bank streaming requires at least two GPU chunks for
+                // the verified normal prefill path. Never silently pick
+                // a short-batch Chunk shape whose runtime cannot use it.
+                if (model.gpu_weight_streaming &&
+                        n_gpu_regions >= 2 && xg * 2 > model.tokens) {
+                    continue;
+                }
+                for (const int xc : widths) {
+                    for (const int xp : widths) {
+                        ++tried;
+                        llama_ring_planner::candidate probe;
+                        probe.concrete_regions = locked_regions;
+                        probe.cycles = n_gpu_regions;
+                        probe.g = first;
+                        probe.xc = xc;
+                        probe.xg = xg;
+                        probe.xp = xp;
+                        if (!model.memory_feasible ||
+                                !model.memory_feasible(probe)) {
+                            ++rejected_memory;
+                            continue;
+                        }
+                        std::string why;
+                        if (!llama_ring_planner::simulate(
+                                locked_model, locked_regions, probe, &why) ||
+                                !std::isfinite(probe.wall_ms) ||
+                                probe.wall_ms <= 0.0) {
+                            ++rejected_profile;
+                            continue;
+                        }
+                        if (!valid || probe.wall_ms < best_chunk.wall_ms) {
+                            best_chunk = std::move(probe);
+                            valid = true;
+                        }
+                    }
+                }
+            }
+            if (!valid) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT"
+                    " reason=NO_FEASIBLE_CHUNK"
+                    " layout=%s tried=%zu reject_memory=%zu"
+                    " reject_profile=%zu\n",
+                    locked_layout, tried, rejected_memory,
+                    rejected_profile);
+                return false; // Never unlock/repartition as a fallback.
+            }
+            *selected_layout =
+                llama_region_ring_layout_string(locked_regions);
+            *selected_xc = best_chunk.xc;
+            *selected_xg = best_chunk.xg;
+            *selected_xp = best_chunk.xp;
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_LOCK] status=PASS"
+                " source=CHUNK_ONLY layout=%s"
+                " XC=%d XG=%d XP=%d predicted_ms=%.3f"
+                " tried=%zu reject_memory=%zu reject_profile=%zu"
+                " region_budget_fraction=%.2Lf\n",
+                selected_layout->c_str(), *selected_xc,
+                *selected_xg, *selected_xp, best_chunk.wall_ms,
+                tried, rejected_memory, rejected_profile,
+                model.gpu_max_region_budget_fraction);
+            if (const char * metrics_path = std::getenv(
+                    "LLAMA_REGION_RING_METRICS_FILE")) {
+                if (*metrics_path != '\0') {
+                    std::ofstream metrics(metrics_path, std::ios::app);
+                    if (metrics) {
+                        metrics << std::fixed << std::setprecision(4)
+                                << "{\"type\":\"planner\",\"schema\":1,"
+                                << "\"mode\":\"apply-wide\","
+                                << "\"source\":\"locked_chunk_only\","
+                                << "\"applied\":true,"
+                                << "\"selected_layout\":\""
+                                << *selected_layout << "\","
+                                << "\"baseline_layout\":\""
+                                << *selected_layout << "\","
+                                << "\"layers\":" << model.layers << ","
+                                << "\"plan_tokens\":" << model.tokens << ","
+                                << "\"cycles\":" << n_gpu_regions << ","
+                                << "\"xc\":" << *selected_xc << ","
+                                << "\"xg\":" << *selected_xg << ","
+                                << "\"xp\":" << *selected_xp << ","
+                                << "\"gpu_weight_streaming\":"
+                                << (model.gpu_weight_streaming ?
+                                    "true" : "false") << ","
+                                << "\"locked_layout\":true,"
+                                << "\"predicted_ms\":" << best_chunk.wall_ms
+                                << "}\n";
+                    }
+                }
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
+                " phase=PRE_MODEL_LOAD selected=1"
+                " source=LOCKED_CHUNK_ONLY layout=%s"
+                " XC=%d XG=%d XP=%d"
+                " status=AWAIT_MODEL_PLACEMENT\n",
+                selected_layout->c_str(),
+                *selected_xc, *selected_xg, *selected_xp);
+            return true;
+        }
+
         double wide_e_margin = 0.08;
         if (const char * raw = std::getenv(
                 "LLAMA_HYBRID_REGION_RING_PLAN_E_MARGIN")) {
