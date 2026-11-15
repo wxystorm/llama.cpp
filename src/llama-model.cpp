@@ -1003,7 +1003,6 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
 
     uint64_t n_elements = 0;
 
