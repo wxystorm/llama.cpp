@@ -9566,6 +9566,37 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
         }
     }
 
+    // CUDA profiling can retain allocations (driver pools / graph state).
+    // The initial memory sample predates those probes; re-query the live
+    // device before caching an APPLY_WIDE budget so retained CUDA allocations
+    // are not incorrectly treated as free space. This is not a WDDM
+    // residency-budget query, only the best backend-reported free-VRAM floor.
+    const char * ring_memory_mode =
+        std::getenv("LLAMA_HYBRID_REGION_RING_PLANNER");
+    if (gpu &&
+            ring_memory_mode != nullptr &&
+            std::strcmp(ring_memory_mode, "apply-wide") == 0) {
+        size_t free_after = 0;
+        size_t total_after = 0;
+        if (llama_hybrid_read_backend_memory(
+                gpu.get(), free_after, total_after) &&
+                free_after > 0) {
+            const size_t previous_free = profile.gpu_free_mem;
+            profile.gpu_free_mem =
+                previous_free > 0 ?
+                std::min(previous_free, free_after) : free_after;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_GPU_MEMORY_PROFILE] before_free_mib=%.1f "
+                "after_free_mib=%.1f budget_free_mib=%.1f "
+                "retained_delta_mib=%.1f status=MEASURED\n",
+                previous_free / 1048576.0,
+                free_after / 1048576.0,
+                profile.gpu_free_mem / 1048576.0,
+                previous_free > free_after ?
+                    (previous_free - free_after) / 1048576.0 : 0.0);
+        }
+    }
+
     llama_hybrid_profile_print(profile);
 
     // Startup-only native Phone GPU graph timing. Runs are already complete;
@@ -10686,15 +10717,81 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 };
         }
 
-        // Identical GPU accounting to the full-layout memory guard:
-        // resident Bank peak weights + full-Prompt GPU KV + slot scratch.
-        // The Planner applies this budget to E seeds and every Beam prefix.
+        // Charge two independent CUDA graph allocation buffers, measured
+        // from the actual GPU backend's synthetic multi-layer probe after
+        // excluding weights. Pick an anchor at or above the planned XG.
+        // The non-weight CUDA allocation is a conservative proxy for each
+        // Bank Scheduler's runtime buffer, not a prediction of its exact
+        // pointer layout.
+        model.gpu_compute_buffer_bytes =
+            [&profile](int xg, size_t & bytes) -> bool {
+                bytes = 0;
+                if (xg <= 0) { return false; }
+                int best_tokens = std::numeric_limits<int>::max();
+                const auto consider = [&](int tokens, size_t runtime) {
+                    if (tokens >= xg && runtime > 0 &&
+                            tokens <= best_tokens) {
+                        if (tokens < best_tokens) {
+                            best_tokens = tokens;
+                            bytes = 0;
+                        }
+                        bytes = std::max(bytes, runtime);
+                    }
+                };
+                for (const auto & p : profile.gpu_layer_blocks) {
+                    consider(p.tokens, p.runtime_bytes);
+                }
+                for (const auto & p : profile.gpu_attn) {
+                    consider(p.tokens, p.runtime_bytes);
+                }
+                return bytes > 0;
+            };
+        // Miscellaneous allocations not represented by CUDA weight Bank,
+        // GPU KV, host Slots or synthetic graph buffers (CUDA pool,
+        // transfer backend, graph executable and device-side workspaces).
+        // This is a clearly labelled future-allocation reserve, NOT an
+        // assertion that cudaMemGetInfo reports WDDM residency limits.
+        long double cuda_misc_reserve_mib = 128.0L;
+        if (const char * raw = std::getenv(
+                "LLAMA_REGION_RING_CUDA_MISC_RESERVE_MIB")) {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end == raw || *end != '\0' ||
+                    !std::isfinite(parsed) ||
+                    parsed < 0.0 || parsed > 4096.0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_MEMORY] status=REJECT "
+                    "reason=INVALID_CUDA_MISC_RESERVE value=%s\n", raw);
+                return false;
+            }
+            cuda_misc_reserve_mib = (long double) parsed;
+        }
+        model.gpu_cuda_other_reserve_bytes =
+            cuda_misc_reserve_mib * 1048576.0L;
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
-            (long double) profile.gpu_free_mem * LLAMA_REGION_RING_GPU_MEMORY_FRACTION;
+            (long double) profile.gpu_free_mem *
+                LLAMA_REGION_RING_GPU_MEMORY_FRACTION;
         model.gpu_kv_bytes_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer *
             (model.kv_start + model.tokens);
+        size_t sample_compute_bytes = 0;
+        const int sampled_xg = 32;
+        const bool sample_available =
+            model.gpu_compute_buffer_bytes(
+                sampled_xg, sample_compute_bytes);
+        LLAMA_LOG_INFO(
+            "[REGION_RING_GPU_MEMORY] fraction=%.2Lf free_mib=%.1f "
+            "budget_mib=%.1Lf sample_xg=%d sample_compute_per_bank_mib=%.1f "
+            "sample_status=%s cuda_other_reserve_mib=%.1Lf "
+            "source=PROFILED_CUDA_GRAPH_ALLOCATION status=CONFIGURED\n",
+            LLAMA_REGION_RING_GPU_MEMORY_FRACTION,
+            profile.gpu_free_mem / 1048576.0,
+            model.gpu_memory_budget_bytes / 1048576.0L,
+            sampled_xg,
+            sample_compute_bytes / 1048576.0,
+            sample_available ? "AVAILABLE" : "MISSING",
+            cuda_misc_reserve_mib);
 
         // Actual HTP RPC runtime: a Region chooses a starting FastRPC
         // Session, then stripes EACH layer across HTP0..HTP3. Four virtual
