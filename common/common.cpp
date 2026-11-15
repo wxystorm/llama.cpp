@@ -25,6 +25,7 @@
 #include <iterator>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -1434,10 +1435,21 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         const char * value = std::getenv(name);
         return value != nullptr && std::strcmp(value, "1") == 0;
     };
-    const bool skip_graphless_warmup =
+    const bool graphless_phone_warmup =
         env_enabled("LLAMA_HYBRID_REGION_RING_V1") &&
         env_enabled("LLAMA_REGION_RING_PHONE_GRAPHLESS") &&
         env_enabled("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW");
+    // The default 1-2 token warmup is unsafe for Graphless Phone HTP.
+    // Only an explicitly requested, representative prefill may bypass it.
+    const bool diagnostic_full_warmup =
+        graphless_phone_warmup &&
+        env_enabled("LLAMA_REGION_RING_DIAG_FULL_WARMUP") &&
+        env_enabled("LLAMA_HYBRID_PREFILL_WARMUP");
+    const bool skip_graphless_warmup =
+        graphless_phone_warmup && !diagnostic_full_warmup;
+    if (params.warmup && diagnostic_full_warmup) {
+        COM_INF("%s", "[PHONE_GRAPHLESS_WARMUP] action=DIAGNOSTIC_FULL_PREFILL status=ENABLED\n");
+    }
     if (params.warmup && skip_graphless_warmup) {
         COM_INF("%s", "[PHONE_GRAPHLESS_WARMUP] action=SKIP reason=LEGACY_TINY_PHONE_SPLIT status=READY\n");
         // A normal warmup would prepare the CUDA weight Banks before timing
@@ -1520,7 +1532,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             tmp.push_back(decoder_start_token_id);
         }
         if (llama_model_has_decoder(model)) {
-            llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            const int warmup_decode_status =
+                llama_decode(lctx, llama_batch_get_one(tmp.data(), std::min(tmp.size(), (size_t) params.n_batch)));
+            if (diagnostic_full_warmup && warmup_decode_status != 0) {
+                COM_ERR("[HYBRID_PREFILL_WARMUP] status=FAIL decode=%d action=ABORT\n", warmup_decode_status);
+                throw std::runtime_error("Graphless diagnostic prefill warmup failed");
+            }
         }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
