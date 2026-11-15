@@ -485,6 +485,66 @@ def all_results(out: Path, prompts):
     return output
 
 
+def placement_lock_from_pass(row, model_layers):
+    """Extract immutable layer ownership from a genuinely successful Plan."""
+    if row.get("status") != "PASS" or row.get("plan_applied") is not True:
+        raise ValueError("Cannot lock placement from a non-PASS Planner result")
+    raw = row.get("plan_layout") or ""
+    layout = normalize_layout(raw, model_layers)
+    if row.get("layout") != layout:
+        raise ValueError("Planner-selected layout differs from executed Ring")
+    return {
+        "schema": 1, "layout": layout,
+        "first_prompt": row["prompt"], "created_at": utc_now(),
+        "first_xc": row.get("plan_xc"),
+        "first_xg": row.get("plan_xg"),
+        "first_xp": row.get("plan_xp"),
+        "max_gpu_region_budget_fraction": 0.5,
+    }
+
+
+def restore_placement_lock(out: Path, prompts, model_layers):
+    """Persist/restore a successful first placement; never silently unlock."""
+    path = out / "placement-lock.json"
+    if path.is_file():
+        locked = json.loads(path.read_text(encoding="utf-8"))
+        if locked.get("schema") != 1 or (
+                normalize_layout(locked.get("layout", ""), model_layers) !=
+                locked["layout"]):
+            raise ValueError(f"Invalid placement-lock.json: {path}")
+        return locked
+    # Recover from a crash between saving result.json and writing the lock.
+    # Scan the original dataset order and individual attempts, not just
+    # summary.csv, since a later retry may have superseded a PASS.
+    for _, prompt in prompts:
+        folder = out / "runs" / prompt.stem
+        for file in sorted(folder.glob("attempt-*/result.json")):
+            try:
+                row = json.loads(file.read_text(encoding="utf-8"))
+                if row.get("status") == "PASS" and row.get("plan_applied") is True:
+                    row["prompt"] = prompt.name
+                    locked = placement_lock_from_pass(row, model_layers)
+                    save_json(path, locked)
+                    return locked
+            except (ValueError, OSError, KeyError):
+                continue
+    return None
+
+
+def verify_placement_lock(row, locked):
+    """A locked run must acknowledge the native chunk-only Planner path."""
+    if row.get("status") != "PASS":
+        return row
+    if (row.get("plan_layout") != locked["layout"] or
+            row.get("layout") != locked["layout"]):
+        row["status"] = "PLAN_LOCK_MISMATCH"
+        row["error"] = "Runtime/Planner changed frozen G/C/N layer layout"
+    elif row.get("plan_source") != "locked_chunk_only":
+        row["status"] = "PLAN_LOCK_UNVERIFIED"
+        row["error"] = "Engine did not acknowledge native chunk-only search"
+    return row
+
+
 def write_summary(out: Path, prompts):
     latest = all_results(out, prompts)
     rows = [{column: latest[prompt.name].get(column, "") for column in RESULT_COLUMNS}
@@ -504,7 +564,8 @@ def write_summary(out: Path, prompts):
                            "NO_PLAN", "NO_EXECUTABLE_PLAN",
                            "PLAN_MISMATCH", "TIMEOUT", "INTERRUPTED",
                            "MOVER_UNVERIFIED", "MOVER_INACTIVE",
-                           "PRELOAD_FAILED", "PRELOAD_UNVERIFIED")}
+                           "PRELOAD_FAILED", "PRELOAD_UNVERIFIED",
+                           "PLAN_LOCK_MISMATCH", "PLAN_LOCK_UNVERIFIED")}
     save_json(out / "summary.json", {"updated_at": utc_now(), "total": len(prompts),
                                       "counts": counts, "summary_csv": str(path)})
     return counts
@@ -1253,6 +1314,15 @@ def main(argv=None):
                   and not (args.retry_failed_only
                            and latest[prompt.name]["status"] == "PENDING")]
 
+        if args.lock_layout_after_first:
+            locked = restore_placement_lock(args.out, prompts, args.model_layers)
+            if locked is not None:
+                args.locked_layout = locked["layout"]
+                print(f"[PLAN_LOCK] event=RESTORE"
+                      f" first_prompt={locked['first_prompt']}"
+                      f" layout={args.locked_layout}"
+                      " policy=CHUNKS_ONLY", flush=True)
+
         if args.auto_plan and args.htp_only and to_run:
             independent = args.out / "independent-profile" / "profile.csv"
             if args.update_profile:
@@ -1427,6 +1497,24 @@ def main(argv=None):
                         counts = write_summary(args.out, prompts)
                         print("[INDEPENDENT_PROFILE] status=FAIL"
                               f" reason={profile_error}", flush=True)
+                if args.lock_layout_after_first and row["status"] == "PASS":
+                    if args.locked_layout is None:
+                        frozen = placement_lock_from_pass(row, args.model_layers)
+                        save_json(args.out / "placement-lock.json", frozen)
+                        args.locked_layout = frozen["layout"]
+                        print(f"[PLAN_LOCK] event=CREATE"
+                              f" first_prompt={row['prompt']}"
+                              f" layout={args.locked_layout}"
+                              " policy=CHUNKS_ONLY_NEXT_PROMPT", flush=True)
+                    else:
+                        row = verify_placement_lock(
+                            row, {"layout": args.locked_layout})
+                        if row["status"] != "PASS":
+                            save_json(Path(row["result_file"]), row)
+                            counts = write_summary(args.out, prompts)
+                            print(f"[PLAN_LOCK] event=REJECT"
+                                  f" prompt={prompt.name} reason={row['error']}",
+                                  flush=True)
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
