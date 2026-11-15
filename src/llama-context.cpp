@@ -595,8 +595,8 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    if (const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS")) {
-        if (std::strcmp(stream, "1") == 0) {
+    if (const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND")) {
+        if (*stream) {
             ggml_backend_sched_set_stream_advice_callback(sched.get(),
                 [](const ggml_tensor * tensor, void * userdata) -> size_t {
                     return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
@@ -638,8 +638,8 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                if (const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS")) {
-                    if (std::strcmp(stream, "1") == 0) {
+                if (const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND")) {
+                    if (*stream) {
                         ggml_backend_sched_set_stream_advice_callback(sched.get(),
                             [](const ggml_tensor * tensor, void * userdata) -> size_t {
                                 return static_cast<const llama_model *>(userdata)->advise_stream_weight(tensor);
@@ -2424,10 +2424,14 @@ ggml_cgraph * llama_context::graph_reserve(
         // A preflight reservation estimates graph compute buffers *before*
         // allocating any OpenCL staging/activation memory. It cannot account
         // for temporary buffers internal to the driver or model-level KV.
-        const char * stream = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
-        const char * budget = std::getenv("GGML_OPENCL_STREAM_GPU_BUDGET_MIB");
-        if (stream != nullptr && std::strcmp(stream, "1") == 0 &&
-                budget != nullptr && *budget != '\0') {
+        const char * stream = std::getenv("GGML_PHONE_STREAM_BACKEND");
+        const char * legacy = std::getenv("GGML_OPENCL_STREAM_WEIGHTS");
+        const bool active_gpu_stream = (stream != nullptr && std::strcmp(stream, "cpu") != 0) ||
+            (stream == nullptr && legacy && std::strcmp(legacy, "1") == 0);
+        const char * target_dev = (stream && std::strcmp(stream, "npu") == 0) ? "HTP0" : "GPUOpenCL";
+        const char * budget = std::getenv("GGML_PHONE_STREAM_DEVICE_BUDGET_MIB");
+        if (!budget) budget = std::getenv("GGML_OPENCL_STREAM_GPU_BUDGET_MIB");
+        if (active_gpu_stream && budget != nullptr && *budget != '\0') {
             char * end = nullptr;
             const unsigned long long mib = std::strtoull(budget, &end, 10);
             if (mib == 0 || end == budget || *end != '\0' ||
@@ -2440,7 +2444,7 @@ ggml_cgraph * llama_context::graph_reserve(
             size_t required = 0;
             for (size_t i = 0; i < backend_ptrs.size(); ++i) {
                 ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
-                if (dev && std::strcmp(ggml_backend_dev_name(dev), "GPUOpenCL") == 0) {
+                if (dev && std::strcmp(ggml_backend_dev_name(dev), target_dev) == 0) {
                     if (required > SIZE_MAX - estimated[i]) {
                         LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] GPU size overflow\n");
                         return nullptr;
@@ -2448,10 +2452,10 @@ ggml_cgraph * llama_context::graph_reserve(
                     required += estimated[i];
                 }
             }
-            LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] gpu_reserve_mib=%.2f gpu_budget_mib=%llu\n",
-                    required / (1024.0 * 1024.0), mib);
+            LLAMA_LOG_INFO("[PHONE_STREAM_BUDGET] device=%s reserve_mib=%.2f budget_mib=%llu\n",
+                    target_dev, required / (1024.0 * 1024.0), mib);
             if (required > mib * 1024ull * 1024ull) {
-                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT compute buffer reservation exceeds GPU budget\n");
+                LLAMA_LOG_ERROR("[PHONE_STREAM_BUDGET] REJECT compute buffer reservation exceeds %s budget\n", target_dev);
                 return nullptr;
             }
         }
