@@ -1645,6 +1645,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t accelerated_matmuls = 0;
     size_t htp_splits[4] = {};
     size_t htp_matmuls[4] = {};
+    size_t htp_weight_copies[4] = {};
+    size_t htp_staged_weight_bytes[4] = {};
     size_t total_blk_matmuls = 0;
     size_t advised_weight_bytes = 0;
     size_t peak_rss_kib = 0;
@@ -1753,6 +1755,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // the file-backed page cache may already contain this weight.
                 staged_weight_bytes += ggml_nbytes(input);
                 ++staged_weight_copies;
+                if (sched->stream_target == 3 && htp_index >= 0) {
+                    ++htp_weight_copies[htp_index];
+                    htp_staged_weight_bytes[htp_index] += ggml_nbytes(input);
+                }
                 staged_sources.push_back(input);
             }
             const auto stage_start = std::chrono::steady_clock::now();
@@ -2017,8 +2023,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[b]);
                 const int session = dev ? ggml_backend_phone_htp_index(ggml_backend_dev_name(dev)) : -1;
                 if (session >= 0) {
-                    GGML_LOG_INFO("[PHONE_STREAM_HTP] device=HTP%d splits=%zu accelerated_matmuls=%zu\n",
-                                  session, htp_splits[session], htp_matmuls[session]);
+                    GGML_LOG_INFO("[PHONE_STREAM_HTP] device=HTP%d splits=%zu accelerated_matmuls=%zu "
+                                  "weight_copies=%zu staged_weight_mib=%.2f\n",
+                                  session, htp_splits[session], htp_matmuls[session],
+                                  htp_weight_copies[session],
+                                  htp_staged_weight_bytes[session] / (1024.0 * 1024.0));
                 }
             }
         }
