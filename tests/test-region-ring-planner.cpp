@@ -353,11 +353,11 @@ int main() {
 
     // First-cycle fine X candidates are available to deterministic A/B
     // runs. A subsequent Cycle must keep this selected X triple unchanged.
-    REQUIRE(first_cycle_chunk_candidates.size() == 9);
-    for (int x : {32, 48, 56, 64, 80, 96, 112, 128, 160}) {
+    REQUIRE(first_cycle_chunk_candidates.size() == 10);
+    for (int x : {32, 48, 64, 80, 96, 112, 128, 160, 192, 256}) {
         REQUIRE(first_cycle_chunk_supported(x));
     }
-    for (int x : {8, 12, 16, 20, 24, 40, 192, 256}) {
+    for (int x : {8, 12, 16, 20, 24, 40, 56}) {
         REQUIRE(!first_cycle_chunk_supported(x));
     }
 
