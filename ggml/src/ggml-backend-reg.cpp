@@ -205,6 +205,12 @@ struct ggml_backend_registry {
     }
 
     void register_device(ggml_backend_dev_t device) {
+        // A failed HTP session may produce a null device. Never publish it
+        // into the global list, where even CPU-only model loading can abort.
+        if (device == nullptr) {
+            GGML_LOG_WARN("%s: skipping null backend device (initialization failed)\n", __func__);
+            return;
+        }
         for (auto & dev : devices) {
             if (dev == device) {
                 return;
