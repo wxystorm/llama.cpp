@@ -823,12 +823,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         // Configure it BEFORE parse_device_list() calls backend_load_all().
         if (params.phone_stream_backend == common_phone_stream_backend::npu) {
 #if defined(_WIN32)
-            if (_putenv_s("GGML_HEXAGON_HOSTBUF", "0") != 0) {
-                throw std::runtime_error("failed to set GGML_HEXAGON_HOSTBUF");
+            if (_putenv_s("GGML_HEXAGON_HOSTBUF", "0") != 0 ||
+                _putenv_s("GGML_HEXAGON_NDEV", "1") != 0) {
+                throw std::runtime_error("failed to set HTP phone-only environment");
             }
 #else
             if (setenv("GGML_HEXAGON_HOSTBUF", "0", 1) != 0) {
                 throw std::runtime_error("failed to set GGML_HEXAGON_HOSTBUF");
+            }
+            if (setenv("GGML_HEXAGON_NDEV", "1", 1) != 0) {
+                throw std::runtime_error("failed to set GGML_HEXAGON_NDEV");
             }
 #endif
         }
