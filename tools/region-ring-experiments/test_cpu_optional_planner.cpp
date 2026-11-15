@@ -150,9 +150,55 @@ static void test_gpu_bank_pair_after_ubatch() {
     assert(!llama_region_ring_gpu_initial_banks_match(gpu_regions, ready, owners));
 }
 
+// Independent CUDA compute schedulers coexist with both weight Banks.
+// A layout that passed the old weight+KV-only check must be rejected when
+// measured activation storage and a separate CUDA runtime reserve are charged.
+static void test_gpu_cuda_memory_reserve() {
+    constexpr size_t MiB = 1024 * 1024;
+    model m = make_test_model();
+    m.gpu_weight_streaming = true;
+    m.slot_pool = 2;
+    m.gpu_kv_bytes_per_layer = (long double) MiB / 2;
+    m.gpu_region_weight_bytes =
+        [](int begin, int end, size_t & bytes) {
+            if (begin < 0 || end <= begin || end > 40) { return false; }
+            bytes = (size_t) (end - begin) * 10 * MiB;
+            return true;
+        };
+    m.gpu_compute_buffer_bytes =
+        [](int xg, size_t & bytes) {
+            if (xg != 32) { return false; }
+            bytes = 64 * MiB;
+            return true;
+        };
+    m.gpu_cuda_other_reserve_bytes = 40 * MiB;
+    assert(gpu_cuda_additional_reserve_bytes(m, 32) == 168 * MiB);
+    assert(gpu_cuda_additional_reserve_bytes(m, 32, 1) == 104 * MiB);
+
+    const auto layout = llama_region_ring_parse_apply_wide_layout(
+        "G13,P7,G12,C1,G7", 40);
+    m.gpu_memory_budget_bytes = 400 * MiB;
+    assert(!gpu_streamed_banks_fit(m, layout, 32));
+    m.gpu_memory_budget_bytes = 480 * MiB;
+    assert(gpu_streamed_banks_fit(m, layout, 32));
+
+    const std::vector<llama_region_ring_region> prefix = {
+        {device::GPU, 0, 13},
+        {device::CPU, 13, 14},
+        {device::PHONE, 14, 21},
+    };
+    m.gpu_memory_budget_bytes = 300 * MiB;
+    assert(!gpu_prefix_memory_feasible(m, prefix, 3, 32));
+    // Legacy zero-reserve models retain their former optimistic bound.
+    m.gpu_compute_buffer_bytes = nullptr;
+    m.gpu_cuda_other_reserve_bytes = 0.0L;
+    assert(gpu_prefix_memory_feasible(m, prefix, 3, 32));
+}
+
 int main() {
     test_layouts();
     test_optional_cpu_dag_and_memory();
     test_gpu_bank_pair_after_ubatch();
+    test_gpu_cuda_memory_reserve();
     std::cout << "CPU optional Planner offline tests: PASS\n";
 }
