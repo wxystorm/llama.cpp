@@ -11054,7 +11054,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         if (have_directional_weight_split &&
                 directional_ratio_ok && !htp_session_guard) {
             boundary_memory_feasible =
-                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank](
+                [&profile, &model, c2p_pc_ratio, p2c_pc_ratio, single_gpu_bank, baseline_chunk](
                     const std::vector<
                         llama_region_ring_region> & regions) {
                     std::array<long double, 3> usage {};
