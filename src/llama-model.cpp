@@ -1581,6 +1581,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // The master Hexagon backend handles F16/F32 and Q4_0/Q4_1/Q8_0/
+    // IQ4_NL/MXFP4 matmul weights, but not K-quantized tensors. Reject an
+    // ineligible quantized model rather than silently benchmarking CPU
+    // fallbacks as if the whole model were running on the NPU.
+    if (stream_weights && stream_env && std::strcmp(stream_env, "npu") == 0) {
+        size_t unsupported = 0;
+        const char * first = nullptr;
+        for (const auto & entry : tensors_by_name) {
+            const ggml_tensor * t = entry.second;
+            if (entry.first.compare(0, 4, "blk.") != 0 || !ggml_is_quantized(t->type)) {
+                continue;
+            }
+            if (t->type != GGML_TYPE_Q4_0 && t->type != GGML_TYPE_Q4_1 &&
+                    t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_IQ4_NL &&
+                    t->type != GGML_TYPE_MXFP4) {
+                ++unsupported;
+                if (!first) first = t->name;
+            }
+        }
+        if (unsupported > 0) {
+            throw std::runtime_error(format(
+                "[PHONE_STREAM_NPU] model contains %zu unsupported quantized block tensors "
+                "(first: %s). The Hexagon backend on this branch cannot execute "
+                "Q4_K/Q6_K directly. Use a supported quantization or port the "
+                "Q4_K/Q6_K HTP kernels from the separate HTP development branch.",
+                unsupported, first ? first : "unknown"));
+        }
+    }
+
     // The ordinary loading path populates every GGUF page at startup.
     // In phone-only streaming mode, map the file lazily: touching a given
     // weight during a split's CPU->OpenCL copy faults in only its pages.
