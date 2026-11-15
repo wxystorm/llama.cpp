@@ -217,10 +217,35 @@ static void test_gpu_cuda_memory_reserve() {
     assert(gpu_prefix_memory_feasible(m, prefix, 3, 32));
 }
 
+static void test_gpu_region_half_budget_cap() {
+    constexpr size_t MiB = 1024 * 1024;
+    model m = make_test_model();
+    m.gpu_weight_streaming = true;
+    m.slot_pool = 0;
+    m.gpu_kv_bytes_per_layer = 0.0L;
+    m.gpu_memory_budget_bytes = 400 * MiB;
+    m.gpu_region_weight_bytes = [](int begin, int end, size_t & bytes) {
+        if (begin < 0 || end <= begin || end > 40) { return false; }
+        bytes = (size_t) (end - begin) * 16 * MiB;
+        return true;
+    };
+    const auto layout = llama_region_ring_parse_apply_wide_layout(
+        "G13,P7,G12,C1,G7", 40);
+    assert(!gpu_streamed_region_within_limit(m, 13 * 16 * MiB));
+    assert(!gpu_streamed_banks_fit(m, layout, 32));
+    // 13*16 = 208MiB < half of 420MiB. Combined A+B=400MiB.
+    m.gpu_memory_budget_bytes = 420 * MiB;
+    assert(gpu_streamed_region_within_limit(m, 13 * 16 * MiB));
+    assert(gpu_streamed_banks_fit(m, layout, 32));
+    m.gpu_max_region_budget_fraction = 0.40L;
+    assert(!gpu_streamed_banks_fit(m, layout, 32));
+}
+
 int main() {
     test_layouts();
     test_optional_cpu_dag_and_memory();
     test_gpu_bank_pair_after_ubatch();
     test_gpu_cuda_memory_reserve();
+    test_gpu_region_half_budget_cap();
     std::cout << "CPU optional Planner offline tests: PASS\n";
 }

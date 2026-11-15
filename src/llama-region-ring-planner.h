@@ -209,6 +209,9 @@ struct model {
     // CUDA runtime/transfer/graph reserve. A zero budget rejects streaming.
     long double gpu_memory_budget_bytes = 0.0L;
     long double gpu_kv_bytes_per_layer = 0.0L;
+    // Limit each streamed GPU Region's resident weights to half of
+    // the available CUDA budget (APPLY_WIDE uses 0.97 * free VRAM).
+    long double gpu_max_region_budget_fraction = 0.50L;
     std::function<bool(int, size_t &)> gpu_compute_buffer_bytes;
     long double gpu_cuda_other_reserve_bytes = 0.0L;
     std::function<bool(const candidate &)> memory_feasible;
@@ -385,6 +388,21 @@ inline bool gpu_weight_bank_peaks(
     return true;
 }
 
+// Single streamed Region footprint guard, independent of combined Bank fit.
+inline bool gpu_streamed_region_within_limit(
+        const model & m, size_t weight_bytes) {
+    if (!m.gpu_weight_streaming) { return true; }
+    if (!std::isfinite(m.gpu_memory_budget_bytes) ||
+            m.gpu_memory_budget_bytes <= 0.0L ||
+            !std::isfinite(m.gpu_max_region_budget_fraction) ||
+            m.gpu_max_region_budget_fraction <= 0.0L ||
+            m.gpu_max_region_budget_fraction > 1.0L) {
+        return false;
+    }
+    return (long double) weight_bytes <=
+        m.gpu_max_region_budget_fraction * m.gpu_memory_budget_bytes;
+}
+
 // Reserve the per-Bank CUDA compute buffers from a representative, actually
 // allocated GPU profile graph. There are two independent CUDA schedulers, so
 // their transient buffers may coexist. Other CUDA allocations have a separate
@@ -469,6 +487,17 @@ inline bool gpu_streamed_banks_fit(
     if (m.gpu_memory_budget_bytes <= 0.0L) { return false; }
     std::array<size_t, 2> peaks {};
     const bool known = gpu_weight_bank_peaks(m, regions, peaks);
+    if (!known) { return false; }
+    for (const auto & region : regions) {
+        if (region.device != device::GPU) { continue; }
+        size_t weight = 0;
+        if (!m.gpu_region_weight_bytes ||
+                !m.gpu_region_weight_bytes(
+                    region.layer_begin, region.layer_end, weight) ||
+                !gpu_streamed_region_within_limit(m, weight)) {
+            return false;
+        }
+    }
     const int physical_banks = std::min(gpu_regions, 2);
     const std::array<long double, 2> capacities {{
         gpu_streamed_single_bank_capacity_bytes(
@@ -548,6 +577,9 @@ inline bool gpu_prefix_memory_feasible(
             return false;
         }
         if (m.gpu_weight_streaming) {
+            if (!gpu_streamed_region_within_limit(m, weight_bytes)) {
+                return false;
+            }
             long double & bank = gpu_rank % 2 == 0 ?
                 estimate.bank0_bytes : estimate.bank1_bytes;
             bank = std::max(bank, (long double) weight_bytes);
@@ -574,6 +606,9 @@ inline bool gpu_prefix_memory_feasible(
             return false;
         }
         if (m.gpu_weight_streaming) {
+            if (!gpu_streamed_region_within_limit(m, one_layer_bytes)) {
+                return false;
+            }
             long double & bank = gpu_rank % 2 == 0 ?
                 estimate.bank0_bytes : estimate.bank1_bytes;
             bank = std::max(bank, (long double) one_layer_bytes);
@@ -648,7 +683,9 @@ inline bool gpu_minimum_complete_first_cycle_memory(
     }
     size_t first_weight = 0;
     if (!m.gpu_region_weight_bytes(0, first_g, first_weight) ||
-            first_weight == 0) {
+            first_weight == 0 ||
+            (m.gpu_weight_streaming &&
+             !gpu_streamed_region_within_limit(m, first_weight))) {
         return false;
     }
     const long double gpu_kv_floor =
@@ -723,7 +760,9 @@ inline bool gpu_minimum_complete_first_cycle_memory(
             if (begin < 0 || begin >= m.layers ||
                     !m.gpu_region_weight_bytes(
                         begin, begin + 1, layer_weight) ||
-                    layer_weight == 0) {
+                    layer_weight == 0 ||
+                    (m.gpu_weight_streaming &&
+                     !gpu_streamed_region_within_limit(m, layer_weight))) {
                 continue;
             }
             const long double bytes = (long double) layer_weight;
