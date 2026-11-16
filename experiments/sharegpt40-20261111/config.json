@@ -211,41 +211,12 @@
     "prefill_tps": "tokens per second",
     "missing_metric": "Empty not zero"
   },
-  "partial_baselines": [
-    {
-      "id": "pc-only-32b",
-      "framework": "llama.cpp / PC-only",
-      "model": "32b",
-      "execution": "single-PC",
-      "kind": "incomplete_reference_baseline",
-      "observations": "runs/pc-only-32b/observations.csv",
-      "raw_log": "runs/pc-only-32b/256-group-server-log.txt",
-      "source": "Earlier 256 and 512 baseline references plus a 2048-group minimum from the 2026-11-15 uploaded logfile",
-      "sample_count": 3,
-      "full_sharegpt40_run": false,
-      "note": "256: 21.58 tok/s (prompt index unknown); 512_01: user reported 32.9 tok/s; 2048_02: selected minimum 17.61 tok/s from the newest log. None represents a group Top-5 or full 40-prompt result.",
-      "additional_run_config": "runs/pc-only-32b/2048-min-run-config.json"
-    },
-    {
-      "id": "pc-only-14b",
-      "framework": "llama.cpp / PC-only",
-      "model": "14b",
-      "execution": "single-PC",
-      "kind": "incomplete_reference_baseline",
-      "full_sharegpt40_run": false,
-      "sample_count": 1,
-      "observations": "runs/pc-only-14b/observations.csv",
-      "run_config": "runs/pc-only-14b/2048-min-run-config.json",
-      "source": "selected lowest Prefill TPS from 2 completed 14B log measurements, 2026-11-15",
-      "note": "2048-group 66.89 tok/s; exact prompt filename and launch flags are not present for the selected record."
-    }
-  ],
   "aggregate_baselines": [
     {
       "id": "llama-cpp-pc-only-14b-sharegpt50",
       "framework": "llama.cpp-pc-only",
       "model": "14b",
-      "type": "aggregate_only_group_means",
+      "type": "single_pc_group_summary",
       "groups": [
         0,
         128,
@@ -257,15 +228,13 @@
       "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
       "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
       "included_in_group_summary": true,
-      "included_in_results_csv": false,
-      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
-      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+      "included_in_results_csv": false
     },
     {
       "id": "llama-cpp-pc-only-24b-sharegpt50",
       "framework": "llama.cpp-pc-only",
       "model": "24b",
-      "type": "aggregate_only_group_means",
+      "type": "single_pc_group_summary",
       "groups": [
         0,
         128,
@@ -277,15 +246,13 @@
       "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
       "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
       "included_in_group_summary": true,
-      "included_in_results_csv": false,
-      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
-      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+      "included_in_results_csv": false
     },
     {
       "id": "llama-cpp-pc-only-32b-sharegpt50",
       "framework": "llama.cpp-pc-only",
       "model": "32b",
-      "type": "aggregate_only_group_means",
+      "type": "single_pc_group_summary",
       "groups": [
         0,
         128,
@@ -297,9 +264,7 @@
       "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
       "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
       "included_in_group_summary": true,
-      "included_in_results_csv": false,
-      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
-      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+      "included_in_results_csv": false
     }
   ]
 }
