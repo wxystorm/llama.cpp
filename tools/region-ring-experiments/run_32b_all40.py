@@ -842,11 +842,14 @@ def get_args(argv=None):
     parser.add_argument("--lock-layout-after-first", action="store_true",
                         help="after first PASS freeze G/C/N layer layout; "
                              "later prompts tune only XC/XG/XP with memory guards")
+    parser.add_argument("--sharegpt50-short-dataset", action="store_true",
+                        help="shared fixed-mode ablation dataset: 50 prompts "
+                             "across 0/128/256/512/1024, verified 64..128 "
+                             "token group0 and max context 2048")
     parser.add_argument("--main50-short", action="store_true",
-                        help="ShareGPT50_short groups 0/128/256/512/1024; "
-                             "the 0 bin must contain 64..128 real tokens; "
-                             "max context 2048, low Chunk Profile enabled, "
-                             "first applied Plan freezes layer placement")
+                        help="auto-plan: same ShareGPT50_short dataset plus "
+                             "measured sub-32 Chunks and first-applied "
+                             "1024_10 placement lock")
     parser.add_argument("--locked-layout", default=None,
                         help="user-fixed layer layout from FIRST prompt; "
                              "N is an alias for P; search XC/XG/XP per prompt "
@@ -942,16 +945,26 @@ def get_args(argv=None):
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
     if args.main50_short:
+        args.sharegpt50_short_dataset = True
+        if args.locked_layout is not None:
+            parser.error("--main50-short must auto-plan 1024_10; "
+                         "do not pass --locked-layout")
+        if args.real_stage_profile_csv is not None:
+            parser.error("--main50-short requires a fresh measured short "
+                         "Profile in the new --out directory")
         if not (args.auto_plan and args.htp_only and args.streaming == "on"):
             parser.error("--main50-short requires --auto-plan --htp-only --streaming on")
         if args.max_context != 2048:
             parser.error("--main50-short requires --max-context 2048")
-        if args.only_group and any(group == 2048 for group in args.only_group):
-            parser.error("--main50-short excludes the 2048-token group")
         if args.force_plan_layout:
             parser.error("--main50-short must auto-plan its first placement, not FORCE it")
         args.lock_layout_after_first = True
         args.lock_on_first_plan = True
+    if args.sharegpt50_short_dataset:
+        if args.max_context != 2048:
+            parser.error("--sharegpt50-short-dataset requires --max-context 2048")
+        if args.only_group and 2048 in args.only_group:
+            parser.error("ShareGPT50_short excludes group 2048")
     if args.lock_layout_after_first and not (args.auto_plan and args.htp_only):
         parser.error("--lock-layout-after-first requires --auto-plan --htp-only")
     if args.lock_layout_after_first and args.profile_every:
@@ -1273,13 +1286,13 @@ def main(argv=None):
         if not args.dry_run:
             args.real_stage_profile_csv.parent.mkdir(
                 parents=True, exist_ok=True)
-    prompt_groups = (MAIN50_SHORT_GROUPS if args.main50_short else
+    prompt_groups = (MAIN50_SHORT_GROUPS if args.sharegpt50_short_dataset else
                      GROUPS + tuple(
                          group for group in (args.only_group or ())
                          if group not in GROUPS))
     prompts = prompts_in(args.prompt_dir, prompt_groups)
     manifest = read_manifest(args.prompt_dir)
-    if args.main50_short:
+    if args.sharegpt50_short_dataset:
         missing = [p.name for _, p in prompts if manifest.get(p.name) is None]
         if missing:
             raise ValueError("--main50-short needs tokenizer counts in manifest.csv: " +
@@ -1322,6 +1335,12 @@ def main(argv=None):
         raise ValueError("Unknown --warmup-prompt file")
     if not selections:
         raise ValueError("No prompts selected")
+    if args.main50_short and not (args.out / "placement-lock.json").is_file():
+        if len(selections) != 1 or selections[0][1].name != "prompt_1024_10.txt":
+            raise ValueError("--main50-short requires a first independent "
+                             "--only-prompt prompt_1024_10.txt at ctx=2048 "
+                             "to create placement-lock.json; then resume "
+                             "the same --out without --only-prompt")
     config = {"version": 2, "model": file_id(args.model), "exe": file_id(args.exe),
               "rpc": args.rpc, "prompt_dir": str(args.prompt_dir),
               "prompts": decisions, "planner_search": "SKIPPED_FORCED_LAYOUT",
@@ -1387,6 +1406,8 @@ def main(argv=None):
         config["gpu_region_max_budget_fraction"] = 0.5
     if args.user_fixed_layout is not None:
         config["user_fixed_layer_layout"] = args.user_fixed_layout
+    if args.sharegpt50_short_dataset:
+        config["sharegpt50_short_dataset"] = True
     if args.main50_short:
         config["main50_short"] = True
         config["short_chunk_grid"] = list(SHORT_PROFILE_CHUNKS)
@@ -1430,12 +1451,12 @@ def main(argv=None):
             print(f"[PLAN_CHUNK_CAP] max_xg={args.max_plan_xg or 256} "
                   f"max_xp={args.max_plan_xp or 256} "
                   "search=AUTOMATIC_UNDER_CAP", flush=True)
-        if args.main50_short:
+        if args.sharegpt50_short_dataset:
             print("[MAIN50] groups=0,128,256,512,1024 total=50"
                   " group0_actual_tokens=64..128"
-                  " max_context=2048 anchor=prompt_1024_10.txt"
-                  " anchor_context=2048 short_chunks=8,16,24"
-                  " placement_lock=FIRST_APPLIED_PLAN", flush=True)
+                  " max_context=2048"
+                  f" planning={'FIRST_APPLIED_1024_10' if args.main50_short else 'FIXED_ABLATION'}",
+                  flush=True)
         if args.lock_layout_after_first:
             print(
                 "[PLAN_LOCK] policy=" +
