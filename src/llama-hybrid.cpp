@@ -8952,7 +8952,8 @@ static bool llama_hybrid_calibrate_independent_ring(
                     break;
                 }
             }
-            if (long_kv_grid && (!has_kv2048 || !has_kv3072)) {
+            if ((long_kv_grid && (!has_kv2048 || !has_kv3072)) ||
+                    (short_chunk_grid && !has_kv2048)) {
                 LLAMA_LOG_ERROR(
                     "[INDEPENDENT_PROFILE] status=REJECT"
                     " reason=CACHE_MISSING_LONG_HTP_KV"
@@ -9031,12 +9032,17 @@ static bool llama_hybrid_calibrate_independent_ring(
                            "32,64,96,128,192,256");
     const std::vector<int> kv_spans = long_kv_grid ?
         std::vector<int>{256, 512, 1024, 2048, 3072} :
+        short_chunk_grid ?
+        std::vector<int>{256, 512, 1024, 2048} :
         std::vector<int>{256, 512, 1024};
     LLAMA_LOG_INFO(
         "[INDEPENDENT_PROFILE] event=KV_GRID mode=%s"
         " kv=%s status=READY\n",
-        long_kv_grid ? "LONG_2048_3072" : "DEFAULT",
-        long_kv_grid ? "256,512,1024,2048,3072" : "256,512,1024");
+        long_kv_grid ? "LONG_2048_3072" :
+            short_chunk_grid ? "MAIN50_CTX_2048" : "DEFAULT",
+        long_kv_grid ? "256,512,1024,2048,3072" :
+            short_chunk_grid ? "256,512,1024,2048" :
+                               "256,512,1024");
     const int first_layer = std::max(0, profile.n_layer / 2 - 3);
     // First write to a temporary file so a failed HTP point never publishes
     // a partial CSV which a later Prompt may mistakenly trust.
@@ -9193,10 +9199,13 @@ static bool llama_hybrid_calibrate_independent_ring(
             }
         }
     }
-    // Long prompts need both additional REAL HTP anchors. Never silently
-    // accept a grid where the requested 2048/3072 samples all failed.
-    if (long_kv_grid) {
-        for (const int required_kv : {2048, 3072}) {
+    // Require actual HTP KV=2048 service in the main 50-token-range
+    // experiment, and KV=2048/3072 only in the legacy long-context grid.
+    // Never silently estimate the max Context using only KV<=1024.
+    if (long_kv_grid || short_chunk_grid) {
+        const std::vector<int> required_kv_anchors = long_kv_grid ?
+            std::vector<int>{2048, 3072} : std::vector<int>{2048};
+        for (const int required_kv : required_kv_anchors) {
             const bool has_anchor = std::any_of(
                 details.begin(), details.end(),
                 [required_kv](const point & p) {
