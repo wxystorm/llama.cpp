@@ -7079,9 +7079,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         auto run_phone_input_pusher = [&]() {
             llama_region_ring_maybe_raise_current_thread_priority(
                 "LLAMA_REGION_RING_PRIORITY_PHONE_PUSH", "PHONE_PUSH");
+            size_t active_region = stages.size();
+            size_t active_chunk = ready.n_chunks();
             try {
                 while (const auto next = ready.wait_take_input_push()) {
                     const auto & job = *next;
+                    active_region = job.region;
+                    active_chunk = job.chunk;
                     if (job.region == 0 || job.region >= stages.size() ||
                             job.chunk >= phone_push_state[job.region].size()) {
                         throw std::runtime_error("invalid Phone push input interval");
@@ -7148,6 +7152,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     }
                     phone_push_cv.notify_all();
                     if (!accepted) {
+                        LLAMA_LOG_ERROR(
+                            "[PHONE_INPUT_PUSH] event=FAIL"
+                            " region=%zu chunk=%zu bytes=%zu"
+                            " reason=RPC_INPUT_STREAM_PUSH_REJECTED"
+                            " action=CANCEL_REMAINING_TASKS\n",
+                            job.region, job.chunk, bytes);
                         ready.cancel();
                         phone_push_cv.notify_all();
                         break;
@@ -7158,7 +7168,20 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         ready.notify_external_ready();
                     }
                 }
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_PUSH] event=EXCEPTION"
+                    " region=%zu chunk=%zu reason=%s"
+                    " action=CANCEL_REMAINING_TASKS\n",
+                    active_region, active_chunk, e.what());
+                ready.cancel();
+                phone_push_cv.notify_all();
             } catch (...) {
+                LLAMA_LOG_ERROR(
+                    "[PHONE_INPUT_PUSH] event=EXCEPTION"
+                    " region=%zu chunk=%zu reason=UNKNOWN"
+                    " action=CANCEL_REMAINING_TASKS\n",
+                    active_region, active_chunk);
                 ready.cancel();
                 phone_push_cv.notify_all();
             }
