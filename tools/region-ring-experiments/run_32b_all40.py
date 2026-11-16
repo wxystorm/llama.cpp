@@ -629,7 +629,19 @@ def single_runner(out: Path):
 
 def choose_context(group, hint, args):
     estimate = hint if hint is not None else UPPER_BOUNDS[group]
-    context = max(args.min_context, ((estimate + args.n_predict + args.context_padding + 255) // 256) * 256)
+    # A cap on Context is not an invitation to drop real prompt tokens.
+    # The optional safety padding may shrink near the cap, but actual
+    # tokenizer tokens plus requested output must always fit.
+    required = estimate + args.n_predict
+    if args.main50_short and required > args.max_context:
+        raise ValueError(
+            f"group {group}: {required} required tokens exceed "
+            f"--max-context {args.max_context}")
+    context = max(
+        args.min_context,
+        ((required + args.context_padding + 255) // 256) * 256)
+    if args.main50_short:
+        context = min(context, args.max_context)
     if context > args.max_context:
         raise ValueError(f"group {group}: context {context} exceeds --max-context {args.max_context}")
     return context, estimate
@@ -1336,7 +1348,24 @@ def main(argv=None):
     if not selections:
         raise ValueError("No prompts selected")
     if args.main50_short and not (args.out / "placement-lock.json").is_file():
-        if len(selections) != 1 or selections[0][1].name != "prompt_1024_10.txt":
+        first_anchor_only = (
+            len(selections) == 1 and
+            selections[0][1].name == "prompt_1024_10.txt")
+        # A crash between result.json and placement-lock.json must not
+        # force an expensive repeat of the long-context Plan. Recovery
+        # still validates the chosen layout before restoring it.
+        anchor_results = (args.out / "runs" / "prompt_1024_10").glob(
+            "attempt-*/result.json")
+        recoverable_anchor = False
+        for saved in anchor_results:
+            try:
+                plan = json.loads(saved.read_text(encoding="utf-8"))
+                if plan.get("plan_applied") is True and plan.get("plan_layout"):
+                    recoverable_anchor = True
+                    break
+            except (OSError, ValueError):
+                continue
+        if not (first_anchor_only or recoverable_anchor):
             raise ValueError("--main50-short requires a first independent "
                              "--only-prompt prompt_1024_10.txt at ctx=2048 "
                              "to create placement-lock.json; then resume "
@@ -1531,6 +1560,10 @@ def main(argv=None):
                 args.out, prompts, args.model_layers,
                 lock_on_first_plan=args.main50_short)
             if locked is not None:
+                if args.main50_short and locked.get("first_prompt") != "prompt_1024_10.txt":
+                    raise ValueError("main50_short placement-lock.json must "
+                                     "originate from prompt_1024_10.txt; "
+                                     "start a new --out to avoid short-first layout")
                 if (args.user_fixed_layout is not None and
                         locked["layout"] != args.user_fixed_layout):
                     raise ValueError("Existing placement-lock.json conflicts "
