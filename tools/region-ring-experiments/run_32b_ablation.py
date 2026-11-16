@@ -315,7 +315,7 @@ def run_one(case: str, layout: str, args) -> int:
         "--env", "LLAMA_REGION_RING_GPU_BANK_PREFETCH=" +
                    ("1" if case == "A0" else "0"),
     ]
-    if not args.main50_short:
+    if not getattr(args, "main50_short", False):
         command.append("--stop-on-fail")
     else:
         command += ["--sharegpt50-short-dataset",
