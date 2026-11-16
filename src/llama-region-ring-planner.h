@@ -2820,6 +2820,8 @@ struct result {
     size_t cpu_shrink_dag_rejected = 0;
     size_t cpu_shrink_simulated = 0;
     size_t cpu_shrink_improved = 0;
+    double cpu_shrink_before_ms = std::numeric_limits<double>::infinity();
+    double cpu_shrink_after_ms = std::numeric_limits<double>::infinity();
     size_t first_cycle_profiled = 0;
     // Geometry/XG pairs rejected before E anchors or bitsets are built.
     size_t first_cycle_gpu_pairs_pruned = 0;
@@ -3304,6 +3306,7 @@ inline void refine_runtime_cpu_shrink(
     for (const auto & c : out.top) {
         incumbent_ms = std::min(incumbent_ms, c.wall_ms);
     }
+    out.cpu_shrink_before_ms = incumbent_ms;
     // Unlike topology preservation, this is a local search about CPU-bearing
     // survivors only; the final rank still compares every original candidate.
     for (size_t index : order) {
@@ -3393,8 +3396,8 @@ inline void refine_runtime_cpu_shrink(
                     }
                     ++out.cpu_shrink_profiled;
                     ++out.profiled;
-                    proposals.push_back({std::move(trial),
-                                         trial.coarse_ms, ai});
+                    const double proxy = trial.coarse_ms;
+                    proposals.push_back({std::move(trial), proxy, ai});
                 }
             }
         }
@@ -3442,6 +3445,7 @@ inline void refine_runtime_cpu_shrink(
         }
         out.top.push_back(std::move(trial));
     }
+    out.cpu_shrink_after_ms = incumbent_ms;
 }
 
 // Refine complete, already simulated uniform/prefix plans using their
