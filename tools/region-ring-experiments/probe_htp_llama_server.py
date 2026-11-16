@@ -177,16 +177,16 @@ def first_error_markers(path, limit=14):
     """
     import re
     primary = re.compile(
-        r"\\[(?:REGION_RING_WORKER|PHONE_INPUT_PUSH|PHONE_OWNED_PLAN|"
+        r"\[(?:REGION_RING_WORKER|PHONE_INPUT_PUSH|PHONE_OWNED_PLAN|"
         r"PHONE_HTP_ONLY|PHONE_AUTO|REGION_RING_GPU_BANK_MOVER|"
-        r"REGION_RING_P2C_JOIN)\\].*"
+        r"REGION_RING_P2C_JOIN)\].*"
         r"(?:event=EXCEPTION|event=FAIL|status=FAIL|status=REJECT|reason=)|"
-        r"\\[REGION_RING\\].*(?:event=DEADLOCK|event=FAIL)|"
+        r"\[REGION_RING\].*(?:event=DEADLOCK|event=FAIL)|"
         r"ggml_.*(?:error -?[0-9]+|failed)",
         re.IGNORECASE,
     )
     secondary = re.compile(
-        r"\\[(?:P2C_STREAM|REGION_RING_SUM|PHONE_INPUT_STREAM)\\]"
+        r"\[(?:P2C_STREAM|REGION_RING_SUM|PHONE_INPUT_STREAM)\]"
         r".*(?:status=FAIL|status=-1)|"
         r"llama_decode: failed to decode|srv.*Compute error",
         re.IGNORECASE,
