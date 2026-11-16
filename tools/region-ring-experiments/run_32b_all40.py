@@ -1270,6 +1270,12 @@ def verify_independent_profile(path: Path, required_kvs=(),
                        for p in points):
                 raise ValueError("Missing sub-32 measured backend point for " +
                                  backend + ": " + str(path))
+        if not any(p.get("device") == "PHONE" and
+                   int(p.get("kv_tokens") or 0) == 2048 and
+                   float(p.get("compute_ms") or 0) > 0
+                   for p in points):
+            raise ValueError("Main50 ctx2048 requires a REAL Phone HTP "
+                             "KV=2048 measurement: " + str(path))
     network = metadata.get("transfers", {})
     def valid_curve(direction):
         values = network.get(direction, [])
