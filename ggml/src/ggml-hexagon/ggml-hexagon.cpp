@@ -4732,6 +4732,15 @@ static std::vector<htp_opnode> ggml_hexagon_build_nodes(
     return computed_nodes;
 }
 
+// A single HTP session may host multiple Phone Regions, each precompiled
+// into one graph per Chunk. The old 256-entry cap was exhausted by the
+// Qwen3-32B 11-Region plan: HTP2 registered 4*58=232 existing graphs, then
+// failed at the 25th Chunk of its fifth layer (256 entries in total).
+// In the 2048-token, minimum-X16 case, this plan needs at most
+// 6 layers/session * ceil(2048/16)=768 fixed graphs on HTP2.
+// Keep a bounded 1024-entry safety cap while allowing that full workload.
+static constexpr size_t k_hexagon_fixed_graph_cache_limit = 1024;
+
 static bool ggml_backend_hexagon_precompile_fixed_graph(
         ggml_backend_t backend, ggml_cgraph * graph) {
     if (backend == nullptr || graph == nullptr ||
@@ -4743,7 +4752,14 @@ static bool ggml_backend_hexagon_precompile_fixed_graph(
     if (sess->fixed_graph_cache.count(graph->uid) != 0) {
         return true;
     }
-    if (sess->fixed_graph_cache.size() >= 256) {
+    if (sess->fixed_graph_cache.size() >=
+            k_hexagon_fixed_graph_cache_limit) {
+        GGML_LOG_ERROR(
+            "[HEXAGON_FIXED_GRAPH_CACHE] event=REJECT"
+            " uid=%" PRIu64 " entries=%zu limit=%zu"
+            " reason=PER_SESSION_GRAPH_CACHE_CAP status=FAIL\n",
+            graph->uid, sess->fixed_graph_cache.size(),
+            k_hexagon_fixed_graph_cache_limit);
         return false;
     }
     auto nodes = ggml_hexagon_build_nodes(sess, graph);
@@ -4777,7 +4793,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     } else {
         computed_nodes = ggml_hexagon_build_nodes(sess, graph);
 
-        if (fixed_uid && sess->fixed_graph_cache.size() < 256) {
+        if (fixed_uid && sess->fixed_graph_cache.size() <
+                k_hexagon_fixed_graph_cache_limit) {
             const auto inserted = sess->fixed_graph_cache.emplace(
                 graph->uid, std::move(computed_nodes));
             nodes_ptr = &inserted.first->second;
