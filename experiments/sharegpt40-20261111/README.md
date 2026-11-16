@@ -1,8 +1,8 @@
 # ShareGPT40 benchmark results (2026-11-13)
 
-This branch contains **10 experimental runs** and **396 successful prompt-level observations**, spanning prompt groups 128, 256, 512 and 1024.
+This branch contains **10 experimental runs** and **406 successful prompt-level observations**, spanning prompt groups 128, 256, 512, 1024 and 2048.
 
-- **Nine** runs have 40 PASS observations each.
+- **Eight** runs have 40 PASS observations each; Ours Qwen3-14B has 50 PASS observations.
 - **Jupiter Mistral Small 3.2-24B** has 36 PASS observations (128: 10, 256: 10, 512: 10, 1024: 6). The four uncompleted 1024 prompts are **not** counted or inferred.
 - Four extra **single-PC reference observations** (one Qwen3-14B and three Qwen3-32B) are recorded separately; they are not counted in the 396 experimental observations or group statistics.
 
@@ -17,15 +17,15 @@ This branch contains **10 experimental runs** and **396 successful prompt-level 
 | Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36/40 |
 | Jupiter | Qwen3-32B | `jupiter-32b` | 40/40 |
 | Galaxy | Qwen3-14B | `galaxy-14b` | 40/40 |
-| Ours (region ring) | Qwen3-14B | `ours-14b-g9p1` | 40/40 |
+| Ours (region ring) | Qwen3-14B | `ours-14b-autoplan` | 50/50 |
 | Ours (region ring) | Mistral Small 3.2-24B Q6_K | `ours-24b-htp` | 40/40 |
 | Ours (region ring) | Qwen3-32B | `ours-32b-g8p6` | 40/40 |
 
 ## Dataset files
 
 - `config.json`: model and runtime configuration for each run, including references to per-run config files.
-- `results.csv`: 396 successful individual prefill measurements; primary key is `framework,model,group,prompt`.
-- `group-summary.csv`: 40 group rows containing arithmetic mean and median prefill throughput and latency. Each `runs` field records the actual sample count (Jupiter 24B group 1024 has `6`).
+- `results.csv`: 406 successful individual prefill measurements; primary key is `framework,model,group,prompt`.
+- `group-summary.csv`: 41 group rows containing arithmetic mean and median prefill throughput and latency. Each `runs` field records the actual sample count (Jupiter 24B group 1024 has `6`).
 - `archive-manifest.json`: source ZIP filenames, sizes and SHA-256 hashes.
 - `runs/jupiter-24b/run-config.json`: Jupiter 24B DP configuration, sanitized to use path and RPC placeholders.
 - `runs/jupiter-24b/per-prompt-details.csv`: all 36 observed DP measurements and selected chunk plans.
@@ -41,3 +41,5 @@ The Jupiter 24B run used Sequence DP with `graph_prebuild=false`, `context=2048`
 Prompt groups (128, 256, 512, 1024) are sampling buckets and **are not exact tokenizer token counts**. Engines, quantization, run settings and tokenization can differ between methods; rank-sorted Top-5 measurements need not correspond to the same prompt. Group means and medians are arithmetic calculations on measured observations, not pooled TPS. The PC-only references are not used in these means or Top-5 ranking.
 
 The **original binary ZIP archives are not committed** to this branch because the connected GitHub writer only supports UTF-8 files. SHA-256 values of the original archives are stored in `archive-manifest.json`.
+
+Ours Qwen3-14B now has 50 entries. For matching prompts in groups 128-1024, the higher Prefill TPS of the two provided runs was retained; group 2048 uses the ten PASS measurements supplied in the chat log. Recorded layout is uniformly `G10,P9,G12,P1,G8`, with per-prompt XC/XG/XP taken from the new data. For selected historical wins this recorded layout is normalized metadata, not a claim of remeasurement under that layout.

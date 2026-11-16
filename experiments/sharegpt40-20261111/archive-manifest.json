@@ -37,11 +37,13 @@
       "runs": 40
     },
     {
-      "id": "ours-14b-g9p1",
-      "archive": "我的-14b-数据.zip",
-      "sha256": "0758b72808f3428e3a03108bca2b5976a32827fffdb1117b73b4631f3049974c",
-      "bytes": 1913855,
-      "runs": 40
+      "id": "ours-14b-autoplan",
+      "archive": "14b-autoplan-gpu-budget097-all50-1.zip",
+      "sha256": "0d9aa44cbd811531e1f862952785f126a84eb00be6c60ef0d131137bd4147cc7",
+      "bytes": 4501501,
+      "runs": 40,
+      "expected_runs": 50,
+      "status": "2048_GROUP_FROM_USER_LOG"
     },
     {
       "id": "prima-24b",
