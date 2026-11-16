@@ -635,7 +635,8 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         }),
     })
     if args.auto_plan and getattr(args, "locked_layout", None):
-        # Native chunk-only search preserves the full memory/DAG guards.
+        # User-fixed from first prompt or frozen after first PASS. Native
+        # chunk-only search preserves the full memory/DAG guards.
         env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] = args.locked_layout
     if args.auto_plan and getattr(args, "force_plan_layout", None):
         # Native APPLY_WIDE forced A/B still checks exact DAG and
@@ -808,6 +809,10 @@ def get_args(argv=None):
     parser.add_argument("--lock-layout-after-first", action="store_true",
                         help="after first PASS freeze G/C/N layer layout; "
                              "later prompts tune only XC/XG/XP with memory guards")
+    parser.add_argument("--locked-layout", default=None,
+                        help="user-fixed layer layout from FIRST prompt; "
+                             "N is an alias for P; search XC/XG/XP per prompt "
+                             "with native memory guards")
     parser.add_argument("--force-plan-layout", default=None,
                         help="optional HTP-only native forced G/[C]/P plan; "
                              "N is accepted as alias for P, with memory guards")
@@ -892,7 +897,25 @@ def get_args(argv=None):
         parser.error("--lock-layout-after-first requires --auto-plan --htp-only")
     if args.lock_layout_after_first and args.profile_every:
         parser.error("--lock-layout-after-first requires --profile-every 0")
-    args.locked_layout = None
+    # User-fixed placement takes effect on the FIRST prompt, not after a
+    # successful topology search. Native C++ still checks GPU/HTP/host RAM
+    # and independently searches XC/XG/XP every time.
+    if args.locked_layout is not None:
+        if not (args.auto_plan and args.htp_only and args.streaming == "on"):
+            parser.error("--locked-layout requires --auto-plan --htp-only "
+                         "--streaming on")
+        if args.profile_every:
+            parser.error("--locked-layout requires --profile-every 0")
+        try:
+            args.locked_layout = normalize_layout(
+                args.locked_layout.upper().replace("N", "P"),
+                args.model_layers)
+        except ValueError as exc:
+            parser.error("--locked-layout: " + str(exc))
+        if not any(part.startswith("P") for part in args.locked_layout.split(",")):
+            parser.error("--locked-layout requires at least one N/P region")
+        args.lock_layout_after_first = True
+    args.user_fixed_layout = args.locked_layout
     # An independent C/G/N calibration is generated at first model startup
     # and reused from --out/independent-profile on subsequent prompts.
     # Rolling runtime-Stage profiling is optional, never a prerequisite
@@ -924,6 +947,9 @@ def get_args(argv=None):
         args.force_plan_layout, args.force_plan_xc,
         args.force_plan_xg, args.force_plan_xp))
     if any_force_plan:
+        if args.user_fixed_layout is not None:
+            parser.error("--locked-layout conflicts with --force-plan-*; "
+                         "XC/XG/XP must remain automatically searched")
         if args.lock_layout_after_first:
             parser.error("--lock-layout-after-first cannot use --force-plan-*")
         if not (args.auto_plan and args.htp_only):
@@ -1258,6 +1284,8 @@ def main(argv=None):
     if args.lock_layout_after_first:
         config["lock_layout_after_first"] = True
         config["gpu_region_max_budget_fraction"] = 0.5
+    if args.user_fixed_layout is not None:
+        config["user_fixed_layer_layout"] = args.user_fixed_layout
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
                                      decisions[first_prompt.name]["context"],
@@ -1269,19 +1297,26 @@ def main(argv=None):
         and key != "LLAMA_REGION_RING_METRICS_FILE"
     }
     if args.auto_plan and args.htp_only and args.profile_every == 0:
+        plan_policy = ("CHUNKS_ONLY_FROM_FIRST_PROMPT"
+                       if args.user_fixed_layout is not None else
+                       "CHUNKS_ONLY_AFTER_FIRST_PASS"
+                       if args.lock_layout_after_first else "1")
         print("[PROFILE] policy=INDEPENDENT_ONCE active=V0 rolling=DISABLED "
-              f"plan_per_prompt={'CHUNKS_ONLY_AFTER_FIRST_PASS' if args.lock_layout_after_first else '1'}", flush=True)
+              f"plan_per_prompt={plan_policy}", flush=True)
     if args.auto_plan:
         print(f"[PROFILE_PLAN] mode=NATIVE_APPLY_WIDE "
               f"native_profile=INDEPENDENT_BACKEND_GRID "
-              f"fixed_layout={args.force_plan_layout or 'OFF'} "
+              f"fixed_layout={args.force_plan_layout or args.user_fixed_layout or 'OFF'} "
               f"baseline_chunk={CHUNK_TOKENS} "
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
         if args.lock_layout_after_first:
-            print("[PLAN_LOCK] policy=FIRST_PASS_PLACEMENT"
-                  " later=CHUNK_ONLY gpu_region_max_budget_fraction=0.50"
-                  " persistent=placement-lock.json", flush=True)
+            print(
+                "[PLAN_LOCK] policy=" +
+                ("USER_FIXED_FROM_FIRST" if args.user_fixed_layout else
+                 "FIRST_PASS_PLACEMENT") +
+                " later=CHUNK_ONLY gpu_region_max_budget_fraction=0.50"
+                " persistent=placement-lock.json", flush=True)
         if args.force_plan_layout:
             print(f"[PLAN_FORCE] source=USER layout={args.force_plan_layout} "
                   f"XC={args.force_plan_xc} XG={args.force_plan_xg} "
@@ -1346,11 +1381,21 @@ def main(argv=None):
         if args.lock_layout_after_first:
             locked = restore_placement_lock(args.out, prompts, args.model_layers)
             if locked is not None:
+                if (args.user_fixed_layout is not None and
+                        locked["layout"] != args.user_fixed_layout):
+                    raise ValueError("Existing placement-lock.json conflicts "
+                                     "with --locked-layout; use another --out")
                 args.locked_layout = locked["layout"]
                 print(f"[PLAN_LOCK] event=RESTORE"
                       f" first_prompt={locked['first_prompt']}"
                       f" layout={args.locked_layout}"
                       " policy=CHUNKS_ONLY", flush=True)
+            elif args.user_fixed_layout is not None:
+                # Do not create a persistent lock until a genuine PASS.
+                print(f"[PLAN_LOCK] event=USER_FIXED"
+                      f" layout={args.locked_layout}"
+                      " policy=CHUNKS_ONLY_FROM_FIRST"
+                      " status=READY", flush=True)
 
         if args.auto_plan and args.htp_only and to_run:
             independent = args.out / "independent-profile" / "profile.csv"
@@ -1544,6 +1589,17 @@ def main(argv=None):
                             print(f"[PLAN_LOCK] event=REJECT"
                                   f" prompt={prompt.name} reason={row['error']}",
                                   flush=True)
+                        elif (args.user_fixed_layout is not None and
+                              not (args.out / "placement-lock.json").is_file()):
+                            # Persist ONLY after the actual executed layout
+                            # and native Chunk-only Plan are both verified.
+                            frozen = placement_lock_from_pass(row, args.model_layers)
+                            frozen["source"] = "USER_FIXED_FROM_FIRST"
+                            save_json(args.out / "placement-lock.json", frozen)
+                            print(f"[PLAN_LOCK] event=CREATE"
+                                  f" first_prompt={row['prompt']}"
+                                  f" layout={frozen['layout']}"
+                                  " policy=USER_FIXED_CHUNKS_ONLY", flush=True)
                 print(f"  {row['status']}: prefill={row.get('prefill_tps')} tok/s "
                       f"({row.get('prefill_ms')} ms), decode={row.get('decode_tps')} tok/s "
                       f"attempt={row['attempt']}", flush=True)
