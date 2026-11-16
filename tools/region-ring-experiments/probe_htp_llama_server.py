@@ -260,9 +260,14 @@ def read_request_chunk_plan(log_path, offset, expected_tokens):
             f"Native Chunk Plan token mismatch: planner={tokens}, "
             f"server_timing={expected_tokens}")
     chunks = (int(xc), int(xg), int(xp))
-    if any(x < 16 or x > 32 for x in chunks):
+    # This layout contains only GPU and Phone Regions. XC is a modeled
+    # but unused CPU-stage width and is intentionally not capped by
+    # --max-plan-xg/--max-plan-xp. Only the physical GPU/Phone widths
+    # must stay in the controlled 16..32 interval.
+    if not (16 <= int(xc) <= 256 and
+            16 <= int(xg) <= 32 and 16 <= int(xp) <= 32):
         raise RuntimeError(
-            "Native Chunk Plan outside controlled 16..32 widths: "
+            "Native Chunk Plan outside controlled width bounds: "
             + str(chunks))
     if 2 * int(xg) > expected_tokens:
         raise RuntimeError(
