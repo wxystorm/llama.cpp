@@ -2810,6 +2810,16 @@ struct result {
     size_t cpu_optional_enumerated = 0;
     size_t cpu_optional_profiled = 0;
     size_t cpu_optional_simulated = 0;
+    // Final CPU-region shrink pass; zero-CPU/G-P seeds remain independent.
+    size_t cpu_shrink_anchors = 0;
+    size_t cpu_shrink_generated = 0;
+    size_t cpu_shrink_memory_rejected = 0;
+    size_t cpu_shrink_profile_rejected = 0;
+    size_t cpu_shrink_profiled = 0;
+    size_t cpu_shrink_shortlisted = 0;
+    size_t cpu_shrink_dag_rejected = 0;
+    size_t cpu_shrink_simulated = 0;
+    size_t cpu_shrink_improved = 0;
     size_t first_cycle_profiled = 0;
     // Geometry/XG pairs rejected before E anchors or bitsets are built.
     size_t first_cycle_gpu_pairs_pruned = 0;
@@ -3053,88 +3063,6 @@ inline bool runtime_cycle_micro_adjusted(
     return cycle >= 1;
 }
 
-// Distinguish fully GPU/Phone Cycles, fully three-device Cycles, and
-// genuinely mixed Cycles. A trailing PC GPU Head is not itself a Cycle.
-// Only already validated G/[C]/P layouts are classified here.
-inline int runtime_topology_family(
-        const std::vector<llama_region_ring_region> & regions) {
-    size_t cpu_regions = 0;
-    size_t phone_regions = 0;
-    for (const auto & region : regions) {
-        cpu_regions += region.device == device::CPU;
-        phone_regions += region.device == device::PHONE;
-    }
-    if (phone_regions == 0) { return -1; }
-    return cpu_regions == 0 ? 0 :
-           cpu_regions == phone_regions ? 1 : 2;
-}
-
-inline const char * runtime_topology_family_name(int family) {
-    switch (family) {
-        case 0: return "GP";
-        case 1: return "GCP";
-        case 2: return "MIXED";
-        default: return "INVALID";
-    }
-}
-
-// The HTP-only runtime adds a final PC GPU tail to Phone-final parents.
-// Retaining only the globally fastest Phone-final parents can silently
-// discard all G/P or mixed-CPU layouts BEFORE the final-tail memory/DAG
-// check. Reserve two distinct layouts for each topology x Cycle count,
-// then fill the remaining slots by full-Prompt DAG wall time. This is
-// diversification, not a fitness bonus: the final GPU-tail DAG still
-// selects the globally fastest executable candidate.
-inline void retain_runtime_topology_parents(
-        const model & m, std::vector<candidate> & top,
-        size_t cap = 48) {
-    if (top.size() <= cap) { return; }
-    if (cap == 0) {
-        top.clear();
-        return;
-    }
-    std::vector<uint8_t> selected(top.size(), 0);
-    std::vector<size_t> keep;
-    keep.reserve(cap);
-    const auto retain = [&](size_t index) {
-        if (selected[index] || keep.size() >= cap) { return; }
-        selected[index] = 1;
-        keep.push_back(index);
-    };
-    for (int cycles = k_runtime_min_cycles;
-            cycles <= k_runtime_max_cycles; ++cycles) {
-        for (int family = 0; family < 3; ++family) {
-            std::unordered_set<std::string> layouts;
-            for (size_t i = 0; i < top.size() &&
-                    keep.size() < cap && layouts.size() < 2; ++i) {
-                if (selected[i] || top[i].cycles != cycles) { continue; }
-                std::vector<llama_region_ring_region> regions;
-                if (!make_regions(top[i], m.layers, regions) ||
-                        runtime_topology_family(regions) != family) {
-                    continue;
-                }
-                const std::string layout =
-                    llama_region_ring_layout_string(regions);
-                if (layouts.insert(layout).second) {
-                    retain(i);
-                }
-            }
-        }
-    }
-    for (size_t i = 0; i < top.size() && keep.size() < cap; ++i) {
-        retain(i);
-    }
-    // Incoming top[] was already sorted by exact DAG wall time.
-    // Restoring its original index order preserves the global best at [0].
-    std::sort(keep.begin(), keep.end());
-    std::vector<candidate> diversified;
-    diversified.reserve(keep.size());
-    for (size_t i : keep) {
-        diversified.push_back(std::move(top[i]));
-    }
-    top = std::move(diversified);
-}
-
 // First-stage zero-CPU search. Keep legacy Uniform/Prefix E optimizers
 // unchanged: they assume three nonempty regions per cycle. Expand only
 // complete layouts by removing CPU regions from promising incumbents, plus
@@ -3342,6 +3270,177 @@ inline void search_runtime_cpu_optional(
         ++out.cpu_optional_simulated;
         ++out.shortlisted;
         out.top.push_back(std::move(plan));
+    }
+}
+
+// Late-stage local CPU reduction. Never force C=0 or award a topology
+// bonus: move one or two layers from one CPU Stage into its neighboring G
+// or P Stage, then compare with the unchanged incumbent by the SAME full
+// memory predicate, profiled service model, and complete event DAG.
+// C1 -> G/P removes that CPU Stage entirely; C2 -> C1 is also eligible.
+// Keep this pass bounded; it does not perform real inference or re-profile.
+inline void refine_runtime_cpu_shrink(
+        const model & m, result & out,
+        std::unordered_set<std::string> & scored) {
+    if (out.top.empty()) { return; }
+    constexpr size_t k_anchor_cap = 16;
+    constexpr size_t k_dag_cap = 96;
+
+    const auto key_for = [](const candidate & c,
+                            const std::vector<llama_region_ring_region> & rs) {
+        return llama_region_ring_layout_string(rs) + "/" +
+               std::to_string(c.xc) + "/" + std::to_string(c.xg) + "/" +
+               std::to_string(c.xp);
+    };
+    std::vector<size_t> order(out.top.size());
+    for (size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return out.top[a].wall_ms < out.top[b].wall_ms;
+    });
+    std::unordered_set<std::string> seen_anchor_layouts;
+    std::vector<candidate> anchors;
+    anchors.reserve(k_anchor_cap);
+    double incumbent_ms = std::numeric_limits<double>::infinity();
+    for (const auto & c : out.top) {
+        incumbent_ms = std::min(incumbent_ms, c.wall_ms);
+    }
+    // Unlike topology preservation, this is a local search about CPU-bearing
+    // survivors only; the final rank still compares every original candidate.
+    for (size_t index : order) {
+        const auto & plan = out.top[index];
+        std::vector<llama_region_ring_region> rs;
+        if (!make_regions(plan, m.layers, rs) ||
+                std::none_of(rs.begin(), rs.end(), [](const auto & r) {
+                    return r.device == device::CPU;
+                })) {
+            continue;
+        }
+        if (!seen_anchor_layouts.insert(
+                llama_region_ring_layout_string(rs)).second) {
+            continue;
+        }
+        anchors.push_back(plan);
+        if (anchors.size() >= k_anchor_cap) { break; }
+    }
+    out.cpu_shrink_anchors = anchors.size();
+
+    struct proposal {
+        candidate plan;
+        double proxy_ms = 0.0;
+        size_t anchor = 0;
+    };
+    std::vector<proposal> proposals;
+    std::unordered_set<std::string> generated;
+    for (size_t ai = 0; ai < anchors.size(); ++ai) {
+        const auto & source = anchors[ai];
+        std::vector<llama_region_ring_region> original;
+        if (!make_regions(source, m.layers, original)) { continue; }
+        for (size_t ci = 1; ci + 1 < original.size(); ++ci) {
+            if (original[ci].device != device::CPU ||
+                    original[ci - 1].device != device::GPU ||
+                    original[ci + 1].device != device::PHONE) {
+                continue;
+            }
+            const int depth =
+                original[ci].layer_end - original[ci].layer_begin;
+            for (int take = 1; take <= std::min(2, depth); ++take) {
+                for (int to_gpu = 0; to_gpu <= 1; ++to_gpu) {
+                    auto rs = original;
+                    if (to_gpu) {
+                        rs[ci - 1].layer_end += take;
+                        rs[ci].layer_begin += take;
+                    } else {
+                        rs[ci].layer_end -= take;
+                        rs[ci + 1].layer_begin -= take;
+                    }
+                    if (take == depth) {
+                        rs.erase(rs.begin() + ci);
+                    }
+                    if (!llama_region_ring_apply_topology_compatible(
+                            rs, m.layers) ||
+                            !runtime_cycle_micro_adjusted(rs)) {
+                        continue;
+                    }
+                    candidate trial = source;
+                    trial.concrete_regions = rs;
+                    trial.local_refined = true;
+                    trial.cpu_optional_seed = true;
+                    trial.prefix_cycles = 0;
+                    trial.throughput_seed = false;
+                    trial.g = rs[0].layer_end - rs[0].layer_begin;
+                    trial.c = rs[1].device == device::CPU ?
+                        rs[1].layer_end - rs[1].layer_begin : 0;
+                    const size_t pi = trial.c > 0 ? 2 : 1;
+                    trial.p = rs[pi].layer_end - rs[pi].layer_begin;
+                    const std::string key = key_for(trial, rs);
+                    if (scored.count(key) ||
+                            !generated.insert(key).second) {
+                        continue;
+                    }
+                    ++out.cpu_shrink_generated;
+                    if ((m.memory_feasible &&
+                            !m.memory_feasible(trial)) ||
+                            (m.region_memory_feasible &&
+                             !m.region_memory_feasible(rs))) {
+                        ++out.cpu_shrink_memory_rejected;
+                        ++out.rejected_memory;
+                        continue;
+                    }
+                    if (!estimate_region_ring_balance(m, rs, trial)) {
+                        ++out.cpu_shrink_profile_rejected;
+                        ++out.rejected_profile;
+                        continue;
+                    }
+                    ++out.cpu_shrink_profiled;
+                    ++out.profiled;
+                    proposals.push_back({std::move(trial),
+                                         trial.coarse_ms, ai});
+                }
+            }
+        }
+    }
+    std::sort(proposals.begin(), proposals.end(),
+        [](const proposal & a, const proposal & b) {
+            if (std::abs(a.proxy_ms - b.proxy_ms) > 0.05) {
+                return a.proxy_ms < b.proxy_ms;
+            }
+            return a.plan.ring_error_max < b.plan.ring_error_max;
+        });
+    std::vector<size_t> selected;
+    selected.reserve(std::min(k_dag_cap, proposals.size()));
+    std::vector<bool> chosen(proposals.size(), false);
+    std::vector<bool> anchor_covered(anchors.size(), false);
+    for (size_t i = 0; i < proposals.size() &&
+            selected.size() < k_dag_cap; ++i) {
+        if (!anchor_covered[proposals[i].anchor]) {
+            anchor_covered[proposals[i].anchor] = true;
+            chosen[i] = true;
+            selected.push_back(i);
+        }
+    }
+    for (size_t i = 0; i < proposals.size() &&
+            selected.size() < k_dag_cap; ++i) {
+        if (!chosen[i]) { selected.push_back(i); }
+    }
+    for (size_t index : selected) {
+        auto trial = std::move(proposals[index].plan);
+        const std::string key = key_for(trial, trial.concrete_regions);
+        if (!scored.insert(key).second) { continue; }
+        ++out.cpu_shrink_shortlisted;
+        std::string reason;
+        if (!simulate(m, trial.concrete_regions, trial, &reason)) {
+            ++out.cpu_shrink_dag_rejected;
+            ++out.rejected_deadlock;
+            continue;
+        }
+        ++out.cpu_shrink_simulated;
+        ++out.simulated;
+        ++out.shortlisted;
+        if (trial.wall_ms + 0.05 < incumbent_ms) {
+            incumbent_ms = trial.wall_ms;
+            ++out.cpu_shrink_improved;
+        }
+        out.top.push_back(std::move(trial));
     }
 }
 
@@ -5118,6 +5217,10 @@ inline result search_runtime_applicable(
     refine_runtime_local_candidates(m, out, scored);
     // CPU-optional candidates are introduced after that legacy local pass.
     search_runtime_cpu_optional(m, out, scored);
+    // Final local optimization: try C -> C-1/C-2 (including C1 -> C0),
+    // giving those layers to the neighboring GPU or HTP Phone. Original
+    // candidates remain in the pool and still compete by full DAG wall.
+    refine_runtime_cpu_shrink(m, out, scored);
     // Defensive final gate: no uniform/local/CPU-optional family is
     // exempt from later-Cycle micro-adjustment, even if it won by DAG.
     out.top.erase(
@@ -5132,10 +5235,12 @@ inline result search_runtime_applicable(
     if (!out.top.empty()) {
         out.selected = out.top.front();
         out.valid = true;
-        // Preserve G/P, G/C/P, and mixed-CPU topologies across Cycle
-        // counts before the HTP-only GPU-tail verification. Every survivor
-        // has already passed the original memory guard and full DAG.
-        retain_runtime_topology_parents(m, out.top, 48);
+        // HTP-only GPU-tail refinement derives 1..8 tail layers from
+        // these survivors. Keep more complete DAG-safe parents so an
+        // individually fast Phone-final plan does not monopolize selection.
+        if (out.top.size() > 24) {
+            out.top.resize(24);
+        }
     }
     return out;
 }
