@@ -1001,8 +1001,10 @@ def get_args(argv=None):
         args.lock_layout_after_first = True
     args.user_fixed_layout = args.locked_layout
     if (args.max_plan_xg is not None or args.max_plan_xp is not None):
-        if args.user_fixed_layout is None:
-            parser.error("--max-plan-xg/--max-plan-xp require --locked-layout")
+        if args.user_fixed_layout is None and not args.main50_short:
+            parser.error("--max-plan-xg/--max-plan-xp require "
+                         "--locked-layout or --main50-short ("
+                         "caps apply only after the first placement Plan)")
         allowed_caps = {32, 48, 64, 80, 96, 112, 128, 160, 192, 256}
         if any(v not in allowed_caps for v in
                (args.max_plan_xg, args.max_plan_xp) if v is not None):
