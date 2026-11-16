@@ -205,7 +205,7 @@ def first_error_markers(path, limit=14):
     primary = re.compile(
         r"\[(?:REGION_RING_WORKER|PHONE_INPUT_PUSH|PHONE_OWNED_PLAN|"
         r"PHONE_HTP_ONLY|PHONE_AUTO|REGION_RING_GPU_BANK_MOVER|"
-        r"REGION_RING_P2C_JOIN)\].*"
+        r"REGION_RING_P2C_JOIN|REGION_RING_REQUEST_CHUNK_PLAN)\].*"
         r"(?:event=EXCEPTION|event=FAIL|status=FAIL|status=REJECT|reason=)|"
         r"\[REGION_RING\].*(?:event=DEADLOCK|event=FAIL)|"
         r"ggml_.*(?:error -?[0-9]+|failed)",
