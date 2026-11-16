@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable 40-prompt ShareGPT benchmark for PRIMA rank 0.
+"""Resumable 40/50-prompt ShareGPT benchmark for PRIMA rank 0.
 
 Each prompt is an independent llama-cli process. Only a successful exit with
 parsed prompt-evaluation timing counts as PASS. Interrupted/failed cases retry.
@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 
 LENGTHS = (128, 256, 512, 1024)
+PER_GROUP = 10
 FIELDNAMES = (
     "case_id", "group", "prompt_file", "status",
     "actual_prefill_tokens", "prefill_ms", "prefill_tps",
@@ -103,24 +104,49 @@ def parse_perf(log: str) -> dict:
     return out
 
 
-def write_summary(output: Path) -> None:
+def discover_cases(prompt_dir: Path) -> list[tuple[int, str, Path]]:
+    """Detect ShareGPT40 or ShareGPT50; reject partial or unexpected datasets.
+
+    The 50-case dataset adds prompt_0_01..10 before the original four
+    groups. Its group label is 0 even though the texts contain 64-128 tokens.
+    """
+    groups = ((0,) + LENGTHS) if any(prompt_dir.glob("prompt_0_*.txt")) else LENGTHS
+    expected = [
+        (length, f"prompt_{length}_{index:02d}",
+         prompt_dir / f"prompt_{length}_{index:02d}.txt")
+        for length in groups for index in range(1, PER_GROUP + 1)
+    ]
+    missing = [str(path) for _, _, path in expected if not path.is_file()]
+    if missing:
+        raise ValueError("Prompt files missing:\n" + "\n".join(missing))
+    wanted = {path.name for _, _, path in expected}
+    unexpected = sorted(p.name for p in prompt_dir.glob("prompt_*.txt")
+                        if p.name not in wanted)
+    if unexpected:
+        raise ValueError("Unexpected prompt files (expected 40 or 50 standard files):\n"
+                         + "\n".join(unexpected))
+    return expected
+
+
+def write_summary(output: Path, expected: list[tuple[int, str, Path]],
+                  signature: str) -> None:
     records = []
-    for length in LENGTHS:
-        for index in range(1, 11):
-            case_id = f"prompt_{length}_{index:02d}"
-            path = output / "cases" / (case_id + ".json")
-            if path.exists():
-                try:
-                    records.append(json.loads(path.read_text(encoding="utf-8")))
-                except (ValueError, OSError):
-                    records.append({"case_id": case_id, "group": length, "status": "CORRUPT"})
+    for length, case_id, _ in expected:
+        path = output / "cases" / (case_id + ".json")
+        if path.exists():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                # Do not mix an older dataset's rows into this CSV.
+                if record.get("config_signature") == signature:
+                    records.append(record)
+            except (ValueError, OSError):
+                records.append({"case_id": case_id, "group": length, "status": "CORRUPT"})
     tmp = output / "summary.csv.tmp"
     with tmp.open("w", encoding="utf-8", newline="") as h:
         writer = csv.DictWriter(h, fieldnames=FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
     os.replace(tmp, output / "summary.csv")
-
 
 def terminate(proc: subprocess.Popen) -> None:
     if proc.poll() is not None:
@@ -140,7 +166,7 @@ def terminate(proc: subprocess.Popen) -> None:
 
 def build_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run 4 groups x 10 ShareGPT files with resumable results.")
+        description="Run 40 or 50 ShareGPT prompts (10 per group) with resumable results.")
     parser.add_argument("--prompt-dir", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--binary", type=Path, default=Path("./llama-cli"))
@@ -172,21 +198,28 @@ def main() -> int:
     model = args.model.expanduser().resolve()
     binary = args.binary.expanduser().resolve()
     output = args.out.expanduser().resolve()
-    expected = [
-        (length, f"prompt_{length}_{index:02d}", prompt_dir / f"prompt_{length}_{index:02d}.txt")
-        for length in LENGTHS
-        for index in range(1, 11)
-    ]
-    missing = [str(path) for _, _, path in expected if not path.is_file()]
-    if missing:
-        print("[ERROR] Prompt files missing:\n" + "\n".join(missing), file=sys.stderr)
+    try:
+        expected = discover_cases(prompt_dir)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
         return 2
+    total = len(expected)
+    groups = list(dict.fromkeys(length for length, _, _ in expected))
     if not model.is_file() or not binary.is_file():
         print(f"[ERROR] Missing binary or model: {binary}, {model}", file=sys.stderr)
         return 2
 
     model_stat = model.stat()
+    prompt_stats = [
+        (str(path), path.stat().st_size, path.stat().st_mtime_ns)
+        for _, _, path in expected
+    ]
+    prompt_digest = hashlib.sha256(
+        json.dumps(prompt_stats, ensure_ascii=False).encode()).hexdigest()[:16]
     signature_data = {
+        "prompt_dir": str(prompt_dir),
+        "prompt_count": total,
+        "prompt_digest": prompt_digest,
         "model": str(model),
         "model_size": model_stat.st_size,
         "model_mtime_ns": model_stat.st_mtime_ns,
@@ -201,8 +234,8 @@ def main() -> int:
         (output / "logs").mkdir(parents=True, exist_ok=True)
         (output / "run_config.json").write_text(
             json.dumps(signature_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        write_summary(output)
-    print(f"[PRIMA_SWEEP] prompts=40 signature={signature} output={output}", flush=True)
+        write_summary(output, expected, signature)
+    print(f"[PRIMA_SWEEP] prompts={total} groups={groups} signature={signature} output={output}", flush=True)
 
     completed, failed, attempted = 0, 0, 0
     for index, (length, case_id, prompt_path) in enumerate(expected, start=1):
@@ -215,7 +248,7 @@ def main() -> int:
                 pass
         if not args.force and old and old.get("status") == "PASS" and old.get("config_signature") == signature:
             completed += 1
-            print(f"[{index:02d}/40] SKIP {case_id} (PASS)", flush=True)
+            print(f"[{index:02d}/{total}] SKIP {case_id} (PASS)", flush=True)
             continue
 
         if args.max_new and attempted >= args.max_new:
@@ -230,7 +263,7 @@ def main() -> int:
             "--master", args.master, "--next", args.next,
             "--prefetch",
         ] + args.extra
-        print(f"[{index:02d}/40] RUN {case_id} (group={length})", flush=True)
+        print(f"[{index:02d}/{total}] RUN {case_id} (group={length})", flush=True)
         if args.dry_run:
             print(" ".join(repr(x) for x in command), flush=True)
             continue
@@ -241,7 +274,7 @@ def main() -> int:
             "log_path": str(log_path), "error": "",
         }
         atomic_json(result_path, result)
-        write_summary(output)
+        write_summary(output, expected, signature)
         started = time.monotonic()
         proc = None
         try:
@@ -275,7 +308,7 @@ def main() -> int:
             result["wall_s"] = round(time.monotonic() - started, 3)
             result["finished_at"] = now_iso()
             atomic_json(result_path, result)
-            write_summary(output)
+            write_summary(output, expected, signature)
             print("\n[PRIMA_SWEEP] interrupted; rerun the same command to resume.", flush=True)
             return 130
         except (OSError, RuntimeError) as exc:
@@ -287,8 +320,8 @@ def main() -> int:
         result["wall_s"] = round(time.monotonic() - started, 3)
         result["finished_at"] = now_iso()
         atomic_json(result_path, result)
-        write_summary(output)
-        print(f"[{index:02d}/40] {result['status']} {case_id} "
+        write_summary(output, expected, signature)
+        print(f"[{index:02d}/{total}] {result['status']} {case_id} "
               f"tokens={result.get('actual_prefill_tokens', '?')} "
               f"prefill={result.get('prefill_tps', '?')} tok/s "
               f"wall={result['wall_s']}s log={log_path}", flush=True)
@@ -299,7 +332,7 @@ def main() -> int:
             time.sleep(args.delay)
 
     if not args.dry_run:
-        print(f"[PRIMA_SWEEP] completed={completed}/40 failed={failed}; CSV={output / 'summary.csv'}")
+        print(f"[PRIMA_SWEEP] completed={completed}/{total} failed={failed}; CSV={output / 'summary.csv'}")
     return int(failed > 0)
 
 
