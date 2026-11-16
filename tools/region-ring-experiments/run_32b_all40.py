@@ -89,6 +89,9 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_LOCKED_MAX_XP",
     "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS",
     "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS",
+    # This is a resident-server-only opt-in. Never inherit it into the
+    # ordinary one-process-per-Prompt CLI benchmark by accident.
+    "LLAMA_REGION_RING_PER_REQUEST_CHUNKS",
 }
 UPPER_BOUNDS = {0: 128, 128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 SHORT_PROFILE_CHUNKS = (16, 24, 32, 64, 96, 128, 192, 256)
