@@ -1009,8 +1009,38 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs   = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t full_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const auto ring_env_enabled = [](const char * name) {
+        const char * value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    const char * ring_exec = std::getenv("LLAMA_HYBRID_REGION_RING_EXEC");
+    // Graphless Region Ring Prefill builds its own CPU and CUDA Bank schedulers.
+    // Reserving a full 4096-token canonical graph here allocates an additional
+    // multi-GiB CUDA workspace that the Ring cannot use, before the Bank A/B
+    // weight buffers are allocated. The canonical scheduler still needs a
+    // normal graph for one-token Decode (including the LM head).
+    const bool graphless_ring_banks =
+        model.hybrid_ring_gpu_weight_streaming &&
+        !model.hybrid_ring_plan_layout.empty() &&
+        llama_region_ring_enabled() &&
+        ring_exec != nullptr && std::strcmp(ring_exec, "fifo-pc-phone") == 0 &&
+        ring_env_enabled("LLAMA_REGION_RING_PHONE_GRAPHLESS") &&
+        ring_env_enabled("LLAMA_REGION_RING_PHONE_OWNED_PLAN_SHADOW") &&
+        ring_env_enabled("LLAMA_REGION_RING_PHONE_HTP_ONLY");
+    const bool decode_only = graphless_ring_banks &&
+        !region_ring_canonical_force_full_reserve;
+    const uint32_t n_tokens = decode_only ?
+        std::min(full_tokens, n_seqs) : full_tokens;
+    region_ring_canonical_decode_only_reserved = decode_only;
+    if (graphless_ring_banks) {
+        LLAMA_LOG_INFO(
+            "[REGION_RING_CANONICAL_RESERVE] phase=BEGIN mode=%s "
+            "full_ubatch=%u reserve_tokens=%u sequences=%u status=READY\n",
+            decode_only ? "DECODE_ONLY" : "FULL_FALLBACK",
+            full_tokens, n_tokens, n_seqs);
+    }
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
 
@@ -1116,6 +1146,23 @@ void llama_context::sched_reserve() {
         LLAMA_LOG_INFO("%s: graph splits = %d\n", __func__, n_splits_pp);
     } else {
         LLAMA_LOG_INFO("%s: graph splits = %d (with bs=%d), %d (with bs=1)\n", __func__, n_splits_pp, n_tokens, n_splits_tg);
+    }
+
+    if (graphless_ring_banks) {
+        size_t canonical_cuda_bytes = 0;
+        for (ggml_backend_t backend : backend_ptrs) {
+            const char * name = ggml_backend_name(backend);
+            if (name != nullptr && std::strncmp(name, "CUDA", 4) == 0) {
+                canonical_cuda_bytes +=
+                    ggml_backend_sched_get_buffer_size(sched.get(), backend);
+            }
+        }
+        LLAMA_LOG_INFO(
+            "[REGION_RING_CANONICAL_RESERVE] phase=END mode=%s "
+            "reserve_tokens=%u canonical_cuda_compute_mib=%.3f "
+            "status=READY\n",
+            decode_only ? "DECODE_ONLY" : "FULL_FALLBACK",
+            n_tokens, canonical_cuda_bytes / 1048576.0);
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -10471,6 +10518,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
     embd_seq.clear();
     output_swaps.clear();
 
+    // Only the strict single-sequence Graphless Ring path can use the
+    // Decode-only canonical reserve. Unsupported multi-token requests (e.g.
+    // embeddings or custom early logits) need the original full graph.
+    bool early_logits = false;
+    if (batch_inp.logits != nullptr) {
+        for (int32_t i = 0; i + 1 < batch_inp.n_tokens; ++i) {
+            early_logits = early_logits || batch_inp.logits[i] != 0;
+        }
+    }
+    const bool ring_prefill_input_compatible =
+        cparams.causal_attn &&
+        cparams.n_seq_max == 1 &&
+        batch_inp.token != nullptr && batch_inp.embd == nullptr &&
+        !cparams.embeddings && !cparams.embeddings_nextn &&
+        cparams.cb_eval == nullptr && !early_logits;
+    if (region_ring_canonical_decode_only_reserved &&
+            n_tokens_all > 1 && !ring_prefill_input_compatible) {
+        // Do this before any ubatch graph pointers are taken: sched_reserve()
+        // replaces the canonical Scheduler and its graph result objects.
+        region_ring_canonical_force_full_reserve = true;
+        sched_need_reserve = true;
+        LLAMA_LOG_WARN(
+            "[REGION_RING_CANONICAL_RESERVE] event=UPGRADE "
+            "batch_tokens=%u reason=NON_RING_INPUT status=FULL_FALLBACK\n",
+            n_tokens_all);
+    }
     sched_reserve();
 
     llama_hybrid_plan runtime_plan;
@@ -14654,8 +14727,43 @@ bool llama_context::region_ring_load_initial_gpu_banks() {
         cuda_compute_b_bytes / 1048576.0,
         region_ring_initial_banks_loaded ? "READY" : "FAIL");
 
+    // Audit the concurrently allocated canonical Decode workspace and
+    // independently allocated A/B Bank buffers. These are allocator sizes,
+    // not a WDDM physical-residency measurement; KV and CUDA pool overhead
+    // are reflected in the live device free-memory reading instead.
+    const size_t canonical_cuda_bytes =
+        sched != nullptr && backend_ptrs.size() > 1 ?
+        ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[1]) : 0;
+    const size_t bank_a_weight_bytes =
+        ggml_backend_sched_get_weight_cache_buffer_size(bank_a.sched.get());
+    const size_t bank_b_weight_bytes = initial_banks == 2 ?
+        ggml_backend_sched_get_weight_cache_buffer_size(bank_b.sched.get()) : 0;
+    size_t cuda_free_bytes = 0;
+    size_t cuda_total_bytes = 0;
+    if (backend_ptrs.size() > 1 && backend_ptrs[1] != nullptr) {
+        ggml_backend_dev_memory(
+            ggml_backend_get_device(backend_ptrs[1]),
+            &cuda_free_bytes, &cuda_total_bytes);
+    }
+    LLAMA_LOG_INFO(
+        "[REGION_RING_CUDA_ALLOCATION_AUDIT] phase=LOAD_TIME "
+        "canonical_cuda_mib=%.3f bank_a_weight_mib=%.3f "
+        "bank_b_weight_mib=%.3f bank_a_compute_mib=%.3f "
+        "bank_b_compute_mib=%.3f allocated_components_mib=%.3f "
+        "cuda_free_after_mib=%.3f cuda_total_mib=%.3f "
+        "source=ALLOCATOR_SIZES_PLUS_DEVICE_FREE_NOT_WDDM_RESIDENCY "
+        "status=OBSERVED\n",
+        canonical_cuda_bytes / 1048576.0,
+        bank_a_weight_bytes / 1048576.0,
+        bank_b_weight_bytes / 1048576.0,
+        cuda_compute_a_bytes / 1048576.0,
+        cuda_compute_b_bytes / 1048576.0,
+        (canonical_cuda_bytes + bank_a_weight_bytes + bank_b_weight_bytes +
+         cuda_compute_a_bytes + cuda_compute_b_bytes) / 1048576.0,
+        cuda_free_bytes / 1048576.0, cuda_total_bytes / 1048576.0);
+
     LLAMA_LOG_ERROR(
-        "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME "
+        "[REGION_RING_GPU_BANK_LOAD_SUM] phase=LOAD_TIME " 
         "banks=%zu region0=%zu region1=%lld bankA=%d bankB=%d "
         "upload_mib=%.3f prepare_ms=%.3f h2d_ms=%.3f "
         "wall_ms=%.3f status=%s\n",
