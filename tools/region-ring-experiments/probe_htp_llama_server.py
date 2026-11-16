@@ -386,6 +386,22 @@ def report_rows(records, group_order):
         tokens = sum(r["prompt_n"] for r in subset)
         prefill_ms = sum(r["prompt_ms"] for r in subset)
         rates = [r["prefill_tps"] for r in subset]
+        decisions = [
+            (r["plan_xc"], r["plan_xg"], r["plan_xp"])
+            for r in subset if all(
+                isinstance(r.get(k), int) and r.get(k) > 0
+                for k in ("plan_xc", "plan_xg", "plan_xp"))
+        ]
+        decision_counts = {}
+        for decision in decisions:
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+        plan_distribution = ";".join(
+            f"XC{p[0]}-XG{p[1]}-XP{p[2]}:{n}"
+            for p, n in sorted(decision_counts.items()))
+        planner_times = [
+            r["planner_ms"] for r in subset
+            if isinstance(r.get("planner_ms"), (float, int))
+        ]
         row = {
             "group": group,
             "completed": count,
@@ -404,6 +420,13 @@ def report_rows(records, group_order):
             "median_prefill_ms": round(
                 statistics.median([r["prompt_ms"] for r in subset]), 3)
                 if subset else "",
+            "chunk_plan_variants": len(decision_counts)
+                if decisions else "",
+            "chunk_plan_distribution": plan_distribution,
+            "mean_planner_ms": round(statistics.mean(planner_times), 3)
+                if planner_times else "",
+            "median_planner_ms": round(statistics.median(planner_times), 3)
+                if planner_times else "",
         }
         rows.append(row)
     return rows
