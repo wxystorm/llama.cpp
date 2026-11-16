@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen3-32B four-case ablation; one prompt by default, resumable by case.
+"""Four-case Ring ablation; legacy 32B or short-main 40/64-layer models.
 
 A0: fixed G8/P6, two GPU banks with mover.
 A1: same layout, two banks and demand loading (no mover).
