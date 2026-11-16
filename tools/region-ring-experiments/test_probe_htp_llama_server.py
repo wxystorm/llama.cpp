@@ -277,9 +277,29 @@ class ServerProbeTests(unittest.TestCase):
                             xg=32), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "changed fixed layout"):
                 probe.read_request_chunk_plan(log, 0, 66)
-            log.write_text(line.format(layout=correct, xg=48),
+            # Wider chunks are valid for long prompts up to the native cap.
+            long_line = (line.format(layout=correct, xg=256)
+                         .replace("tokens=66", "tokens=1855")
+                         .replace(" XP=16", " XP=256"))
+            long_runtime = (
+                "[REGION_RING_SUM] tokens=1855 XC=0 XG=256 XP=256"
+                " regions=11 first_region_chunks=8 tasks=88"
+                " executed=88 complete=1 wall_ms=100.0"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
+            log.write_text(long_line + long_runtime, encoding="utf-8")
+            got, _ = probe.read_request_chunk_plan(log, 0, 1855)
+            self.assertEqual((got["plan_xg"], got["plan_xp"]), (256, 256))
+            with self.assertRaisesRegex(RuntimeError, "width bounds"):
+                probe.read_request_chunk_plan(
+                    log, 0, 1855, max_plan_xg=32, max_plan_xp=32)
+
+            log.write_text(line.format(layout=correct, xg=272),
                            encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "width bounds"):
+                probe.read_request_chunk_plan(log, 0, 66)
+            log.write_text(line.format(layout=correct, xg=48),
+                           encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "insufficient tokens"):
                 probe.read_request_chunk_plan(log, 0, 66)
 
     def test_cpp_request_hook_reuses_locked_planner_and_stage_builder(self):
