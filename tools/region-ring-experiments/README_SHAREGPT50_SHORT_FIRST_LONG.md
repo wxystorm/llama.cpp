@@ -159,12 +159,79 @@ responses with `timings.cache_n != 0`, records the actual
 HTP-only request failure does **not** establish server compatibility:
 see the tail of `llama-server.log`. In particular, the current server
 initialization uses a two-token context capability probe, while HTP-only
-Graphless only supports substantive Prefill. That path is not yet
-validated end to end on the target PC/Phone.
+Graphless only supports substantive Prefill. That two-token probe remains a known diagnostic rejection, but
+the three substantive requests above have passed on the target PC/Phone.
 
 Offline checks:
 
     python .\tools\region-ring-experiments\test_probe_htp_llama_server.py
+
+### Verified server smoke and full 50-Prompt run (2026-11-16)
+
+After increasing the Phone Hexagon per-session fixed-Graph cache from
+256 to 1024, the persistent HTP-only server passed three consecutive
+requests. The first 1855-token prompt reached 85.629 tok/s; the 66-token
+short prompt reached 22.442 tok/s; the repeated 1855-token prompt reached
+80.250 tok/s. All three reported cache_n=0. This is a verified
+three-request smoke test, not a measured full 50-prompt result.
+
+The updated --all50 mode now uses exactly 50 UNIQUE prompts, including
+prompt_1024_10.txt FIRST as the long anchor, and ten samples from each of
+the five groups 0/128/256/512/1024. No duplicate long prompt is added.
+It keeps one resident llama-server across all 50 HTTP requests, with
+the same fixed topology and startup Chunk Plan (not per-request search).
+The 0 group is 64..128 actual tokens according to manifest.csv.
+
+Run from PowerShell with a NEW output directory (not 32b-server-smoke):
+
+    $root = "E:\llama\llama-tensor-v2"
+    cd $root
+    git pull --ff-only
+    python .\tools\region-ring-experiments\test_probe_htp_llama_server.py
+    cmake --build .\build-tensor-v2 --config Release --target llama-server -j 8
+
+    $serverOpts = @(
+      "--server-exe", "$root\build-tensor-v2\bin\Release\llama-server.exe",
+      "--model", "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
+      "--rpc", "10.238.229.239:50052",
+      "--prompt-dir", "E:\llama\datasets\sharegpt\sharegpt50_short",
+      "--profile-source", "$root\32b-sharegpt50-short-mmap-test\independent-profile",
+      "--out", "$root\32b-server-all50",
+      "--port", "18080",
+      "--all50"
+    )
+
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts
+
+To continue after an interruption, run the same command with --resume:
+
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts --resume
+
+Optional staged sweep: add --limit 10 to the INITIAL invocation, then
+use --resume without --limit to complete the remaining 40. A full
+sweep defaults to a five-second gap between requests, excluded from
+prefill_ms. To change the gap on a NEW experiment use
+--inter-prompt-delay-seconds 0; changing it while resuming is rejected.
+
+The script writes:
+- requests.jsonl: one flushed PASS row per completed request, never
+  overwritten by a resumed sweep.
+- requests.csv: per-prompt actual prompt_n, cache_n, prefill_ms, tps,
+  request_wall_ms, group, and difference from manifest tokenizer tokens.
+- summary.csv and summary.json: each group and an ALL row, number
+  completed/expected, median/mean/min/max tps, and weighted_tps equal to
+  total processed tokens divided by total prefill time.
+- server-run-config.json: fingerprint of the model, server binary,
+  Profile, inputs, startup Plan, HTP flags and delay. A different
+  fingerprint is NOT silently mixed into a partially completed run.
+- llama-server.log for the first run, separate resume-numbered log files
+  thereafter.
+
+The script stops on a failed request or unexpectedly reused cache
+instead of entering fake PASS results. Resumption starts a new resident
+server but does not rerun completed requests. A successful 3/3 smoke
+does not guarantee the entire 50 will pass.
+
 
 ## Consistent 32B A0..A3 ablations
 
