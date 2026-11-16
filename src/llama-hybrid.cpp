@@ -12422,9 +12422,24 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             double fastest = std::numeric_limits<double>::infinity();
             std::string last_reason = "NO_PHONE_FINAL_CANDIDATES";
             std::vector<llama_ring_planner::candidate> parents = result.top;
+            // Report how much each independently retained topology family
+            // contributes AFTER real memory and exact DAG filtering.
+            // A final GPU tail is appended and validated for every family;
+            // no family is selected by quota or granted an unsafe bypass.
+            struct topology_tail_stat {
+                size_t parents = 0;
+                size_t tested = 0;
+                size_t memory_rejected = 0;
+                size_t dag_rejected = 0;
+                size_t executable = 0;
+                double best_ms = std::numeric_limits<double>::infinity();
+                std::string best_layout;
+            };
+            std::array<topology_tail_stat, 3> family_stats {};
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_HTP_TAIL] event=PARENT_POOL"
-                " parents=%zu cap=24 cpu_optional_simulated=%zu"
+                " parents=%zu cap=48 cpu_optional_simulated=%zu"
+                " families=GP,GCP,MIXED"
                 " action=VERIFY_GPU_TAIL_BY_FULL_DAG\n",
                 parents.size(), result.cpu_optional_simulated);
             if (parents.empty()) {
@@ -12439,6 +12454,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             llama_region_ring_device::PHONE) {
                     continue;
                 }
+                const int family =
+                    llama_ring_planner::runtime_topology_family(base);
+                if (family < 0 || family >= 3) { continue; }
+                auto & stat = family_stats[(size_t) family];
+                ++stat.parents;
                 const int depth =
                     base.back().layer_end - base.back().layer_begin;
                 for (int tail = 1; tail <= std::min(8, depth); ++tail) {
@@ -12463,19 +12483,28 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     }
                     auto candidate = parent;
                     candidate.concrete_regions = shape;
+                    ++stat.tested;
                     if ((tail_model.memory_feasible &&
                          !tail_model.memory_feasible(candidate)) ||
                         (tail_model.region_memory_feasible &&
                          !tail_model.region_memory_feasible(shape))) {
+                        ++stat.memory_rejected;
                         last_reason = "MEMORY_BUDGET";
                         continue;
                     }
                     std::string reason;
                     if (!llama_ring_planner::simulate(
                             tail_model, shape, candidate, &reason)) {
+                        ++stat.dag_rejected;
                         last_reason = reason.empty() ?
                             "DAG_PROFILE" : reason;
                         continue;
+                    }
+                    ++stat.executable;
+                    if (candidate.wall_ms < stat.best_ms) {
+                        stat.best_ms = candidate.wall_ms;
+                        stat.best_layout =
+                            llama_region_ring_layout_string(shape);
                     }
                     if (candidate.wall_ms < fastest) {
                         fastest = candidate.wall_ms;
@@ -12484,6 +12513,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         htp_only_tail_selected = true;
                     }
                 }
+            }
+            // Emit even when every candidate fails. Each family can then
+            // be compared independently from the same Profile and DAG.
+            for (int family = 0; family < 3; ++family) {
+                const auto & stat = family_stats[(size_t) family];
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_TOPOLOGY] family=%s"
+                    " parents=%zu tested=%zu reject_memory=%zu"
+                    " reject_dag=%zu feasible=%zu"
+                    " best_ms=%.3f layout=%s status=%s\n",
+                    llama_ring_planner::runtime_topology_family_name(family),
+                    stat.parents, stat.tested, stat.memory_rejected,
+                    stat.dag_rejected, stat.executable,
+                    std::isfinite(stat.best_ms) ? stat.best_ms : -1.0,
+                    stat.best_layout.empty() ? "NONE" :
+                        stat.best_layout.c_str(),
+                    stat.executable > 0 ? "READY" : "UNAVAILABLE");
             }
             if (!htp_only_tail_selected) {
                 LLAMA_LOG_ERROR(
