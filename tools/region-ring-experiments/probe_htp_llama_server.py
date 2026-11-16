@@ -611,6 +611,8 @@ def main(argv=None):
                     prompt = path.read_text(encoding="utf-8-sig")
                     began = time.monotonic()
                     record = post_completion(args.port, prompt)
+                    # Do not charge CSV/log parsing to the HTTP request wall.
+                    http_wall_ms = round((time.monotonic() - began) * 1000, 3)
                     if args.per_request_chunks:
                         decision, log_offset = read_request_chunk_plan(
                             log_path, log_offset, record["prompt_n"])
@@ -621,8 +623,7 @@ def main(argv=None):
                         "manifest_n": int(manifest[path.name]),
                         "token_delta": record["prompt_n"] -
                                        int(manifest[path.name]),
-                        "request_wall_ms": round(
-                            (time.monotonic() - began) * 1000, 3),
+                        "request_wall_ms": http_wall_ms,
                         "planner_mode": (
                             "PER_REQUEST_LOCKED" if args.per_request_chunks
                             else "STARTUP_ONLY"),
