@@ -82,6 +82,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
     "LLAMA_REGION_RING_PROFILE_KV_EXTEND",
     "LLAMA_REGION_RING_PC_MMAP_BUDGET",
+    "LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 LONG_HTP_KV_ANCHORS = (2048, 3072)
@@ -652,6 +653,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     if args.pc_mmap_budget:
         # Native code also verifies the actual ml.use_mmap setting.
         env["LLAMA_REGION_RING_PC_MMAP_BUDGET"] = "1"
+    if args.skip_plan_memory_checks:
+        # Native code verifies this is a locked HTP-only streamed plan.
+        # Real GPU/PC/Phone allocation failures remain effective.
+        env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] = "1"
     if args.htp_only:
         # Preserve the proven 32B Phone-owned autonomous prefill contract.
         # -d CPU is a transport; all Phone Transformer layers run on HTP.
@@ -812,7 +817,11 @@ def get_args(argv=None):
     parser.add_argument("--locked-layout", default=None,
                         help="user-fixed layer layout from FIRST prompt; "
                              "N is an alias for P; search XC/XG/XP per prompt "
-                             "with native memory guards")
+                             "with native memory guards unless explicitly skipped")
+    parser.add_argument("--skip-plan-memory-checks", action="store_true",
+                        help="diagnostic opt-in for --locked-layout: skip CPU, "
+                             "GPU and HTP planned capacity feasibility, not "
+                             "actual device allocations")
     parser.add_argument("--force-plan-layout", default=None,
                         help="optional HTP-only native forced G/[C]/P plan; "
                              "N is accepted as alias for P, with memory guards")
@@ -916,6 +925,9 @@ def get_args(argv=None):
             parser.error("--locked-layout requires at least one N/P region")
         args.lock_layout_after_first = True
     args.user_fixed_layout = args.locked_layout
+    if args.skip_plan_memory_checks and args.user_fixed_layout is None:
+        parser.error("--skip-plan-memory-checks requires --locked-layout "
+                     "(--auto-plan --htp-only --streaming on)")
     # An independent C/G/N calibration is generated at first model startup
     # and reused from --out/independent-profile on subsequent prompts.
     # Rolling runtime-Stage profiling is optional, never a prerequisite
@@ -1286,6 +1298,8 @@ def main(argv=None):
         config["gpu_region_max_budget_fraction"] = 0.5
     if args.user_fixed_layout is not None:
         config["user_fixed_layer_layout"] = args.user_fixed_layout
+    if args.skip_plan_memory_checks:
+        config["plan_memory_policy"] = "SKIP_CAPACITY_ESTIMATES_LOCKED_ONLY"
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
                                      decisions[first_prompt.name]["context"],
@@ -1310,6 +1324,9 @@ def main(argv=None):
               f"baseline_chunk={CHUNK_TOKENS} "
               f"stage_csv={args.real_stage_profile_csv or 'NONE'} "
               "tail_coalesce=1", flush=True)
+        if args.skip_plan_memory_checks:
+            print("[PLAN_MEMORY] policy=SKIP_CAPACITY_ESTIMATES_LOCKED_ONLY"
+                  " runtime_allocators=UNCHANGED", flush=True)
         if args.lock_layout_after_first:
             print(
                 "[PLAN_LOCK] policy=" +
