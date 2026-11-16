@@ -22,8 +22,9 @@ import sys
 import time
 
 GROUPS = (128, 256, 512, 1024)
-OPTIONAL_GROUPS = (2048,)
-SELECTABLE_GROUPS = GROUPS + OPTIONAL_GROUPS
+OPTIONAL_GROUPS = (0, 2048)
+MAIN50_SHORT_GROUPS = (0, 128, 256, 512, 1024)
+SELECTABLE_GROUPS = MAIN50_SHORT_GROUPS + (2048,)
 FIXED_LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"  # 5*G8 + 4*P6 = 64 layers
 CHUNK_TOKENS = 128
 MODEL_LAYERS = 64
@@ -85,8 +86,11 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS",
     "LLAMA_REGION_RING_LOCKED_MAX_XG",
     "LLAMA_REGION_RING_LOCKED_MAX_XP",
+    "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS",
+    "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS",
 }
-UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
+UPPER_BOUNDS = {0: 128, 128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
+SHORT_PROFILE_CHUNKS = (8, 16, 24, 32, 64, 96, 128, 192, 256)
 LONG_HTP_KV_ANCHORS = (2048, 3072)
 METRIC_RX = r"(\d+(?:\.\d+)?)"
 RESULT_COLUMNS = (
@@ -220,7 +224,8 @@ def read_manifest(folder: Path):
         for record in csv.DictReader(stream):
             normalized = {re.sub(r"[^a-z0-9]", "", (key or "").lower()): val
                           for key, val in record.items()}
-            name = Path(normalized.get("file", "")).name
+            name = Path(normalized.get("file") or normalized.get("filename") or
+                        normalized.get("promptfile") or "").name
             tokens = None
             # ShareGPT40 extractor emits actual_tokens_tokenizer. Its
             # normalized CSV header is "actualtokenstokenizer"; without it,
@@ -494,13 +499,19 @@ def all_results(out: Path, prompts):
     return output
 
 
-def placement_lock_from_pass(row, model_layers):
-    """Extract immutable layer ownership from a genuinely successful Plan."""
-    if row.get("status") != "PASS" or row.get("plan_applied") is not True:
-        raise ValueError("Cannot lock placement from a non-PASS Planner result")
+def placement_lock_from_pass(row, model_layers, allow_failed_plan=False):
+    """Freeze the FIRST applied Plan, optionally before runtime PASS.
+
+    Plan placement is independent of runtime success. A failed first
+    attempt may still have an authoritative selected_layout. Never use
+    a missing or un-applied Planner result as a lock.
+    """
+    if row.get("plan_applied") is not True or (
+            not allow_failed_plan and row.get("status") != "PASS"):
+        raise ValueError("Cannot lock placement without an applied Plan")
     raw = row.get("plan_layout") or ""
     layout = normalize_layout(raw, model_layers)
-    if row.get("layout") != layout:
+    if row.get("status") == "PASS" and row.get("layout") != layout:
         raise ValueError("Planner-selected layout differs from executed Ring")
     return {
         "schema": 1, "layout": layout,
@@ -508,12 +519,15 @@ def placement_lock_from_pass(row, model_layers):
         "first_xc": row.get("plan_xc"),
         "first_xg": row.get("plan_xg"),
         "first_xp": row.get("plan_xp"),
+        "first_plan_status": row.get("status"),
+        "source": "FIRST_APPLIED_PLAN" if allow_failed_plan else "FIRST_PASS",
         "max_gpu_region_budget_fraction": 0.5,
     }
 
 
-def restore_placement_lock(out: Path, prompts, model_layers):
-    """Persist/restore a successful first placement; never silently unlock."""
+def restore_placement_lock(out: Path, prompts, model_layers,
+                           lock_on_first_plan=False):
+    """Persist/restore an applied Plan; never silently unlock."""
     path = out / "placement-lock.json"
     if path.is_file():
         locked = json.loads(path.read_text(encoding="utf-8"))
@@ -530,9 +544,14 @@ def restore_placement_lock(out: Path, prompts, model_layers):
         for file in sorted(folder.glob("attempt-*/result.json")):
             try:
                 row = json.loads(file.read_text(encoding="utf-8"))
-                if row.get("status") == "PASS" and row.get("plan_applied") is True:
+                if (row.get("plan_applied") is True and
+                        (row.get("status") == "PASS" or
+                         (lock_on_first_plan and row.get("status") not in
+                          ("RUNNING", "INTERRUPTED", "PENDING")))):
                     row["prompt"] = prompt.name
-                    locked = placement_lock_from_pass(row, model_layers)
+                    locked = placement_lock_from_pass(
+                        row, model_layers,
+                        allow_failed_plan=lock_on_first_plan)
                     save_json(path, locked)
                     return locked
             except (ValueError, OSError, KeyError):
@@ -663,6 +682,9 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         env["LLAMA_REGION_RING_LOCKED_MAX_XG"] = str(args.max_plan_xg)
     if args.max_plan_xp is not None:
         env["LLAMA_REGION_RING_LOCKED_MAX_XP"] = str(args.max_plan_xp)
+    if args.main50_short:
+        env["LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS"] = "1"
+        env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] = "1"
     if args.htp_only:
         # Preserve the proven 32B Phone-owned autonomous prefill contract.
         # -d CPU is a transport; all Phone Transformer layers run on HTP.
@@ -820,6 +842,11 @@ def get_args(argv=None):
     parser.add_argument("--lock-layout-after-first", action="store_true",
                         help="after first PASS freeze G/C/N layer layout; "
                              "later prompts tune only XC/XG/XP with memory guards")
+    parser.add_argument("--main50-short", action="store_true",
+                        help="ShareGPT50_short groups 0/128/256/512/1024; "
+                             "the 0 bin must contain 64..128 real tokens; "
+                             "max context 2048, low Chunk Profile enabled, "
+                             "first applied Plan freezes layer placement")
     parser.add_argument("--locked-layout", default=None,
                         help="user-fixed layer layout from FIRST prompt; "
                              "N is an alias for P; search XC/XG/XP per prompt "
@@ -914,6 +941,17 @@ def get_args(argv=None):
                      "use --auto-plan for independent profiling")
     if args.profile_every < 0:
         parser.error("--profile-every must be nonnegative")
+    if args.main50_short:
+        if not (args.auto_plan and args.htp_only and args.streaming == "on"):
+            parser.error("--main50-short requires --auto-plan --htp-only --streaming on")
+        if args.max_context != 2048:
+            parser.error("--main50-short requires --max-context 2048")
+        if args.only_group and any(group == 2048 for group in args.only_group):
+            parser.error("--main50-short excludes the 2048-token group")
+        if args.force_plan_layout:
+            parser.error("--main50-short must auto-plan its first placement, not FORCE it")
+        args.lock_layout_after_first = True
+        args.lock_on_first_plan = True
     if args.lock_layout_after_first and not (args.auto_plan and args.htp_only):
         parser.error("--lock-layout-after-first requires --auto-plan --htp-only")
     if args.lock_layout_after_first and args.profile_every:
@@ -1166,7 +1204,8 @@ def require_long_htp_kv_anchors(path: Path, required=LONG_HTP_KV_ANCHORS):
         )
 
 
-def verify_independent_profile(path: Path, required_kvs=()) -> int:
+def verify_independent_profile(path: Path, required_kvs=(),
+                               short_chunks=False) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
     A rolling epoch CSV is not a standalone Profile; validate the native
@@ -1195,6 +1234,17 @@ def verify_independent_profile(path: Path, required_kvs=()) -> int:
             len(metadata.get("stage_points", [])) != len(points)):
         raise ValueError(f"Independent profile.json does not match Stage CSV: "
                          f"{json_path}")
+    if short_chunks:
+        if tuple(metadata.get("chunk_widths", ())) != SHORT_PROFILE_CHUNKS:
+            raise ValueError("Short Chunk run requires NEW 8/16/24 measured "
+                             "independent Profile: " + str(json_path))
+        for backend in ("CPU", "GPU", "PHONE"):
+            if not any(p.get("device") == backend and
+                       0 < int(p.get("tokens") or 0) < 32 and
+                       float(p.get("compute_ms") or 0.0) > 0
+                       for p in points):
+                raise ValueError("Missing sub-32 measured backend point for " +
+                                 backend + ": " + str(path))
     network = metadata.get("transfers", {})
     def valid_curve(direction):
         values = network.get(direction, [])
@@ -1223,13 +1273,32 @@ def main(argv=None):
         if not args.dry_run:
             args.real_stage_profile_csv.parent.mkdir(
                 parents=True, exist_ok=True)
-    prompt_groups = GROUPS + tuple(
-        group for group in (args.only_group or ()) if group not in GROUPS)
+    prompt_groups = (MAIN50_SHORT_GROUPS if args.main50_short else
+                     GROUPS + tuple(
+                         group for group in (args.only_group or ())
+                         if group not in GROUPS))
     prompts = prompts_in(args.prompt_dir, prompt_groups)
     manifest = read_manifest(args.prompt_dir)
+    if args.main50_short:
+        missing = [p.name for _, p in prompts if manifest.get(p.name) is None]
+        if missing:
+            raise ValueError("--main50-short needs tokenizer counts in manifest.csv: " +
+                             ", ".join(missing[:15]))
+        invalid_short = [p.name + "=" + str(manifest[p.name])
+                         for group, p in prompts if group == 0 and
+                         not 64 <= manifest[p.name] <= 128]
+        if invalid_short:
+            raise ValueError("0 group contains 64..128 actual tokens, not empty prompts: " +
+                             ", ".join(invalid_short))
+        if any((manifest[p.name] + args.n_predict) > 2048 for _, p in prompts):
+            raise ValueError("A ShareGPT50_short prompt exceeds context 2048")
     decisions = {}
     for group, prompt in prompts:
         context, estimate = choose_context(group, manifest.get(prompt.name), args)
+        # The first planned placement must be tuned at the *largest* context.
+        # This decision is identical in anchor-only and full-resume runs.
+        if args.main50_short and prompt.name == "prompt_1024_10.txt":
+            context = 2048
         decisions[prompt.name] = {"context": context, "prompt_tokens_hint": estimate,
                                   "sha256": digest(prompt)}
     selections = [(g, p) for g, p in prompts
@@ -1318,6 +1387,12 @@ def main(argv=None):
         config["gpu_region_max_budget_fraction"] = 0.5
     if args.user_fixed_layout is not None:
         config["user_fixed_layer_layout"] = args.user_fixed_layout
+    if args.main50_short:
+        config["main50_short"] = True
+        config["short_chunk_grid"] = list(SHORT_PROFILE_CHUNKS)
+        config["placement_policy"] = "FIRST_APPLIED_LONG_PLAN_CHUNKS_ONLY"
+        config["anchor_prompt"] = "prompt_1024_10.txt"
+        config["anchor_context"] = 2048
     if args.skip_plan_memory_checks:
         config["plan_memory_policy"] = "SKIP_CAPACITY_ESTIMATES_LOCKED_ONLY"
     if args.max_plan_xg is not None:
@@ -1355,10 +1430,17 @@ def main(argv=None):
             print(f"[PLAN_CHUNK_CAP] max_xg={args.max_plan_xg or 256} "
                   f"max_xp={args.max_plan_xp or 256} "
                   "search=AUTOMATIC_UNDER_CAP", flush=True)
+        if args.main50_short:
+            print("[MAIN50] groups=0,128,256,512,1024 total=50"
+                  " group0_actual_tokens=64..128"
+                  " max_context=2048 anchor=prompt_1024_10.txt"
+                  " anchor_context=2048 short_chunks=8,16,24"
+                  " placement_lock=FIRST_APPLIED_PLAN", flush=True)
         if args.lock_layout_after_first:
             print(
                 "[PLAN_LOCK] policy=" +
                 ("USER_FIXED_FROM_FIRST" if args.user_fixed_layout else
+                 "FIRST_APPLIED_PLAN" if args.main50_short else
                  "FIRST_PASS_PLACEMENT") +
                 " later=CHUNK_ONLY gpu_region_max_budget_fraction=0.50"
                 " persistent=placement-lock.json", flush=True)
@@ -1424,7 +1506,9 @@ def main(argv=None):
                            and latest[prompt.name]["status"] == "PENDING")]
 
         if args.lock_layout_after_first:
-            locked = restore_placement_lock(args.out, prompts, args.model_layers)
+            locked = restore_placement_lock(
+                args.out, prompts, args.model_layers,
+                lock_on_first_plan=args.main50_short)
             if locked is not None:
                 if (args.user_fixed_layout is not None and
                         locked["layout"] != args.user_fixed_layout):
@@ -1459,7 +1543,9 @@ def main(argv=None):
                       " source=INDEPENDENT_BACKEND_GRID", flush=True)
             if user_stage_csv is None:
                 if independent.is_file():
-                    count = verify_independent_profile(independent, required_long_kv)
+                    count = verify_independent_profile(
+                        independent, required_long_kv,
+                        short_chunks=args.main50_short)
                     print(f"[PROFILE] event=INDEPENDENT_REUSE"
                           f" npu_points={count} csv={independent}", flush=True)
                 else:
@@ -1598,7 +1684,9 @@ def main(argv=None):
                     independent = args.out / "independent-profile" / "profile.csv"
                     profile_error = None
                     try:
-                        count = verify_independent_profile(independent, required_long_kv)
+                        count = verify_independent_profile(
+                        independent, required_long_kv,
+                        short_chunks=args.main50_short)
                     except (OSError, ValueError, TypeError) as exc:
                         profile_error = str(exc)
                     if profile_error is None:
@@ -1616,19 +1704,30 @@ def main(argv=None):
                         counts = write_summary(args.out, prompts)
                         print("[INDEPENDENT_PROFILE] status=FAIL"
                               f" reason={profile_error}", flush=True)
-                if args.lock_layout_after_first and row["status"] == "PASS":
+                if (args.lock_layout_after_first and
+                        (row["status"] == "PASS" or
+                         (args.main50_short and row.get("plan_applied") is True))):
                     if args.locked_layout is None:
-                        frozen = placement_lock_from_pass(row, args.model_layers)
+                        frozen = placement_lock_from_pass(
+                            row, args.model_layers,
+                            allow_failed_plan=args.main50_short)
                         save_json(args.out / "placement-lock.json", frozen)
                         args.locked_layout = frozen["layout"]
                         print(f"[PLAN_LOCK] event=CREATE"
                               f" first_prompt={row['prompt']}"
+                              f" first_status={row['status']}"
                               f" layout={args.locked_layout}"
-                              " policy=CHUNKS_ONLY_NEXT_PROMPT", flush=True)
+                              " policy=CHUNKS_ONLY_NEXT_ATTEMPT", flush=True)
                     else:
-                        row = verify_placement_lock(
-                            row, {"layout": args.locked_layout})
-                        if row["status"] != "PASS":
+                        if row["status"] == "PASS":
+                            row = verify_placement_lock(
+                                row, {"layout": args.locked_layout})
+                        elif (args.main50_short and
+                              row.get("plan_applied") is True and
+                              row.get("plan_layout") != args.locked_layout):
+                            row["status"] = "PLAN_LOCK_MISMATCH"
+                            row["error"] = "Failed runtime Plan changed locked layer placement"
+                        if row["status"] in ("PLAN_LOCK_MISMATCH", "PLAN_LOCK_UNVERIFIED"):
                             save_json(Path(row["result_file"]), row)
                             counts = write_summary(args.out, prompts)
                             print(f"[PLAN_LOCK] event=REJECT"
