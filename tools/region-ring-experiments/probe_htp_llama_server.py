@@ -240,6 +240,11 @@ REQUEST_PLAN_RE = re.compile(
     r"tokens=(\d+) kv_start=0 layout=([^\s]+) "
     r"XC=(\d+) XG=(\d+) XP=(\d+).*"
     r"planner_ms=([0-9.]+).*status=PASS")
+# Runtime may widen a tiny tail uniformly (e.g. selected XG32 becomes
+# actually executed XG33 for a 66-token request). Preserve both values.
+REQUEST_EXEC_RE = re.compile(
+    r"\[REGION_RING_SUM\] tokens=(\d+) XC=(\d+) XG=(\d+) XP=(\d+)"
+    r".*complete=1 .*status=0")
 
 
 def read_request_chunk_plan(log_path, offset, expected_tokens):
@@ -275,11 +280,34 @@ def read_request_chunk_plan(log_path, offset, expected_tokens):
             f"XG={xg}, tokens={expected_tokens}")
     if layout != "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7":
         raise RuntimeError("Native Chunk Planner changed fixed layout: " + layout)
+    executed = list(REQUEST_EXEC_RE.finditer(data))
+    if len(executed) != 1:
+        raise RuntimeError(
+            "Completed native Region Ring execution missing or ambiguous"
+            f" (matches={len(executed)}, expected_tokens={expected_tokens}); "
+            f"check {log_path} for REGION_RING_SUM")
+    exec_tokens, xc_actual, xg_actual, xp_actual = executed[0].groups()
+    if int(exec_tokens) != expected_tokens:
+        raise RuntimeError(
+            f"Native Region Ring execution token mismatch: "
+            f"actual={exec_tokens}, timing={expected_tokens}")
+    xca, xga, xpa = int(xc_actual), int(xg_actual), int(xp_actual)
+    # A selected 32 may execute as 33 after LLAMA_REGION_RING_COALESCE_TINY_TAIL.
+    # Do not confuse that uniform-width adjustment with a different Plan.
+    for name, selected, actual in (
+            ("XG", chunks[1], xga), ("XP", chunks[2], xpa)):
+        if not selected <= actual <= selected + selected // 4:
+            raise RuntimeError(
+                f"Runtime {name}={actual} differs unexpectedly "
+                f"from planned {name}={selected}")
     return {
         "plan_xc": chunks[0],
         "plan_xg": chunks[1],
         "plan_xp": chunks[2],
         "planner_ms": float(planner_ms),
+        "runtime_xc": xca,
+        "runtime_xg": xga,
+        "runtime_xp": xpa,
     }, next_offset
 
 
@@ -440,6 +468,7 @@ def write_reports(out, records):
         "token_delta", "cache_n", "prompt_ms", "prefill_tps",
         "request_wall_ms", "predicted_n", "planner_mode",
         "plan_xc", "plan_xg", "plan_xp", "planner_ms",
+        "runtime_xc", "runtime_xg", "runtime_xp",
         "runtime_layout", "status",
     ]
     with (out / "requests.csv").open(
@@ -671,6 +700,8 @@ def main(argv=None):
                           + (f" XC={record['plan_xc']}"
                              f" XG={record['plan_xg']}"
                              f" XP={record['plan_xp']}"
+                             f" actual_XG={record['runtime_xg']}"
+                             f" actual_XP={record['runtime_xp']}"
                              f" planner_ms={record['planner_ms']:.3f}"
                              if args.per_request_chunks else ""),
                           flush=True)
