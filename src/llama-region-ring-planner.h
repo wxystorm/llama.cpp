@@ -3448,6 +3448,188 @@ inline void refine_runtime_cpu_shrink(
     out.cpu_shrink_after_ms = incumbent_ms;
 }
 
+// Post-GPU-tail one-layer CPU elimination. The ordinary CPU-shrink pass
+// runs before the HTP-only GPU tail is constructed and cannot visit its
+// terminal G,C1,G shape. Explore local CPU1 removals only AFTER that tail
+// exists, including G,C1,G -> G,P1,G (new HTP layer) or one merged GPU
+// Region. The latter is often rejected by the existing 50-60% region cap.
+// Every candidate is checked against the same A/B GPU, PC and HTP memory
+// callback and against the full request event DAG. No unsafe direct G,G
+// topology is ever submitted to a runtime.
+struct final_cpu1_refine_stats {
+    size_t anchors = 0;
+    size_t generated = 0;
+    size_t rejected_memory = 0;
+    size_t rejected_profile = 0;
+    size_t rejected_dag = 0;
+    size_t simulated = 0;
+    size_t cpu1_before = 0;
+    size_t cpu1_after = 0;
+    size_t cpu_free_candidates = 0;
+    double best_zero_cpu_ms = std::numeric_limits<double>::infinity();
+    std::string best_zero_cpu_layout;
+    double before_ms = std::numeric_limits<double>::infinity();
+    double after_ms = std::numeric_limits<double>::infinity();
+};
+
+inline size_t count_single_layer_cpu_regions(
+        const std::vector<llama_region_ring_region> & regions) {
+    return (size_t) std::count_if(regions.begin(), regions.end(),
+        [](const auto & r) {
+            return r.device == device::CPU &&
+                   r.layer_end - r.layer_begin == 1;
+        });
+}
+
+inline void refine_runtime_final_cpu1(
+        const model & m,
+        const std::vector<candidate> & verified_gpu_tail_seeds,
+        candidate & winner,
+        std::vector<llama_region_ring_region> & winner_regions,
+        final_cpu1_refine_stats & stats) {
+    if (verified_gpu_tail_seeds.empty() || winner_regions.empty()) {
+        return;
+    }
+    constexpr size_t k_seed_cap = 12;
+    constexpr size_t k_beam_cap = 16;
+    constexpr int k_max_steps = 6;
+    stats.before_ms = winner.wall_ms;
+    stats.after_ms = winner.wall_ms;
+    stats.cpu1_before = count_single_layer_cpu_regions(winner_regions);
+    stats.cpu1_after = stats.cpu1_before;
+
+    std::vector<candidate> beam;
+    std::unordered_set<std::string> seen;
+    const auto plan_key = [](const candidate & plan,
+                             const std::vector<llama_region_ring_region> & rs) {
+        return llama_region_ring_layout_string(rs) + "/" +
+            std::to_string(plan.xc) + "/" +
+            std::to_string(plan.xg) + "/" +
+            std::to_string(plan.xp);
+    };
+    for (const auto & seed : verified_gpu_tail_seeds) {
+        std::vector<llama_region_ring_region> rs;
+        if (!make_regions(seed, m.layers, rs) ||
+                rs.back().device != device::GPU ||
+                !seen.insert(plan_key(seed, rs)).second) {
+            continue;
+        }
+        beam.push_back(seed);
+        if (beam.size() >= k_seed_cap) { break; }
+    }
+    stats.anchors = beam.size();
+    for (int step = 0; step < k_max_steps && !beam.empty(); ++step) {
+        std::vector<candidate> next;
+        for (const auto & source : beam) {
+            std::vector<llama_region_ring_region> rs;
+            if (!make_regions(source, m.layers, rs)) { continue; }
+            for (size_t ci = 1; ci + 1 < rs.size(); ++ci) {
+                if (rs[ci].device != device::CPU ||
+                        rs[ci].layer_end - rs[ci].layer_begin != 1 ||
+                        rs[ci - 1].device != device::GPU) {
+                    continue;
+                }
+                const bool before_phone = rs[ci + 1].device == device::PHONE;
+                const bool before_gpu_tail =
+                    ci + 2 == rs.size() &&
+                    rs[ci + 1].device == device::GPU;
+                if (!before_phone && !before_gpu_tail) { continue; }
+                // C1 between G/P: give it to the preceding G or following P.
+                // C1 between G/G-tail: merging G/C1/G is valid but may
+                // overflow one GPU weight Bank; replacing C1 with P1
+                // preserves two smaller GPU Regions and Phone returns.
+                for (int mode = 0; mode < 2; ++mode) {
+                    auto changed = rs;
+                    if (before_phone && mode == 0) {
+                        changed[ci - 1].layer_end = changed[ci].layer_end;
+                        changed.erase(changed.begin() + ci);
+                    } else if (before_phone && mode == 1) {
+                        changed[ci + 1].layer_begin = changed[ci].layer_begin;
+                        changed.erase(changed.begin() + ci);
+                    } else if (before_gpu_tail && mode == 0) {
+                        changed[ci - 1].layer_end = changed[ci + 1].layer_end;
+                        changed.erase(changed.begin() + ci,
+                                      changed.begin() + ci + 2);
+                    } else {
+                        changed[ci] = llama_region_ring_region(
+                            device::PHONE, changed[ci].layer_begin,
+                            changed[ci].layer_end);
+                    }
+                    if (!llama_region_ring_apply_topology_compatible(
+                            changed, m.layers) ||
+                            changed.back().device != device::GPU ||
+                            std::none_of(changed.begin(), changed.end(),
+                                [](const auto & r) {
+                                    return r.device == device::PHONE;
+                                })) {
+                        continue;
+                    }
+                    candidate trial = source;
+                    trial.concrete_regions = changed;
+                    trial.cpu_optional_seed = true;
+                    trial.local_refined = true;
+                    trial.prefix_cycles = 0;
+                    trial.throughput_seed = false;
+                    const std::string key = plan_key(trial, changed);
+                    if (!seen.insert(key).second) { continue; }
+                    ++stats.generated;
+                    if ((m.memory_feasible && !m.memory_feasible(trial)) ||
+                            (m.region_memory_feasible &&
+                             !m.region_memory_feasible(changed))) {
+                        ++stats.rejected_memory;
+                        continue;
+                    }
+                    if (!estimate_region_ring_balance(m, changed, trial)) {
+                        ++stats.rejected_profile;
+                        continue;
+                    }
+                    std::string why;
+                    if (!simulate(m, changed, trial, &why)) {
+                        ++stats.rejected_dag;
+                        continue;
+                    }
+                    ++stats.simulated;
+                    const size_t cpu1 = count_single_layer_cpu_regions(changed);
+                    if (cpu1 == 0) {
+                        ++stats.cpu_free_candidates;
+                        if (trial.wall_ms < stats.best_zero_cpu_ms) {
+                            stats.best_zero_cpu_ms = trial.wall_ms;
+                            stats.best_zero_cpu_layout =
+                                llama_region_ring_layout_string(changed);
+                        }
+                    }
+                    // The existing wall-time objective is authoritative.
+                    // Only an effectively equal wall (<0.05 ms) prefers
+                    // fewer small CPU stages.
+                    if (trial.wall_ms + 0.05 < winner.wall_ms ||
+                            (std::abs(trial.wall_ms - winner.wall_ms) <= 0.05 &&
+                             cpu1 < count_single_layer_cpu_regions(winner_regions))) {
+                        winner = trial;
+                        winner_regions = changed;
+                        stats.after_ms = trial.wall_ms;
+                        stats.cpu1_after = cpu1;
+                    }
+                    next.push_back(std::move(trial));
+                }
+            }
+        }
+        // Keep low-CPU candidates in the exploration Beam even when their
+        // intermediate predicted wall is slightly worse; only the global
+        // winner is allowed to replace the incumbent runtime layout.
+        std::sort(next.begin(), next.end(), [&](const candidate & a,
+                                                 const candidate & b) {
+            const size_t ca =
+                count_single_layer_cpu_regions(a.concrete_regions);
+            const size_t cb =
+                count_single_layer_cpu_regions(b.concrete_regions);
+            if (ca != cb) { return ca < cb; }
+            return a.wall_ms < b.wall_ms;
+        });
+        if (next.size() > k_beam_cap) { next.resize(k_beam_cap); }
+        beam = std::move(next);
+    }
+}
+
 // Refine complete, already simulated uniform/prefix plans using their
 // neighboring layer boundaries and Chunk choices. This is read-only:
 // no model execution, no additional device profiling, no live FIFO changes.
