@@ -5960,8 +5960,41 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                 plan.rope_attn_factor = cparams.yarn_attn_factor;
                 plan.rope_beta_fast = cparams.yarn_beta_fast;
                 plan.rope_beta_slow = cparams.yarn_beta_slow;
-                valid = valid && register_plan(phone_rpc_backend, &plan);
-                if (valid && phone_htp_only) {
+                // Distinguish a local Plan shape rejection from a
+                // remote HTP precompile/allocation failure. The legacy
+                // final summary only said registered=N status=FAIL and
+                // hid which of the five NPU Regions stopped registering.
+                if (!valid) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_OWNED_PLAN] side=pc event=REGION_REJECT"
+                        " region=%zu layer_begin=%u layers=%d"
+                        " reason=LOCAL_PLAN_SHAPE status=FAIL\n",
+                        r, layer, n_phone_layers);
+                    break;
+                }
+                const int64_t register_begin_us = ggml_time_us();
+                const bool registered =
+                    register_plan(phone_rpc_backend, &plan);
+                LLAMA_LOG_INFO(
+                    "[PHONE_OWNED_PLAN] side=pc event=RPC_REGION_REGISTER"
+                    " run=%" PRIu64 " region=%zu layer_begin=%u"
+                    " layers=%d chunk=%u tokens=%u"
+                    " rpc_wall_ms=%.3f status=%s\n",
+                    plan.run_id, r, layer, n_phone_layers,
+                    plan.chunk_tokens, plan.total_tokens,
+                    (ggml_time_us() - register_begin_us) / 1000.0,
+                    registered ? "PASS" : "FAIL");
+                valid = registered;
+                if (!valid) {
+                    LLAMA_LOG_ERROR(
+                        "[PHONE_OWNED_PLAN] side=pc event=REGION_REJECT"
+                        " region=%zu layer_begin=%u layers=%d"
+                        " reason=REMOTE_HTP_PLAN_OR_PRECOMPILE"
+                        " action=CHECK_PHONE_RPC_LOG status=FAIL\n",
+                        r, layer, n_phone_layers);
+                    break;
+                }
+                if (phone_htp_only) {
                     LLAMA_LOG_INFO(
                         "[PHONE_HTP_ONLY] event=REGION_READY"
                         " region=%zu layers=%d"
