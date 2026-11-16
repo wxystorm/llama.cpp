@@ -18,7 +18,9 @@ Example:
 import argparse
 from collections import deque
 import csv
+import hashlib
 import json
+import statistics
 from pathlib import Path
 import shutil
 import socket
@@ -75,7 +77,13 @@ def parse_args(argv=None):
     p.add_argument("--threads", type=int, default=8)
     p.add_argument("--startup-timeout", type=int, default=300)
     p.add_argument("--all50", action="store_true",
-                   help="experimental 50-Prompt server sweep with ONE fixed Chunk Plan")
+                   help="run all 50 unique prompts, starting with prompt_1024_10.txt")
+    p.add_argument("--resume", action="store_true",
+                   help="resume an interrupted --all50 run; skip verified completed requests")
+    p.add_argument("--limit", type=int, default=0,
+                   help="run only the first N unique prompts (0=all 50), for staged testing")
+    p.add_argument("--inter-prompt-delay-seconds", type=float, default=None,
+                   help="delay between HTTP requests (default: 5 for --all50, 0 for smoke)")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args(argv)
     if not 1024 <= args.port <= 65535:
@@ -87,6 +95,14 @@ def parse_args(argv=None):
         p.error("--prompt-dir not found")
     if args.threads <= 0 or args.startup_timeout <= 0:
         p.error("--threads and --startup-timeout must be positive")
+    if args.resume and not args.all50:
+        p.error("--resume requires --all50 (the smoke test repeats the same prompt)")
+    if args.limit < 0 or args.limit > 50 or (args.limit and not args.all50):
+        p.error("--limit requires --all50 and must be between 1 and 50")
+    if args.inter_prompt_delay_seconds is None:
+        args.inter_prompt_delay_seconds = 5.0 if args.all50 else 0.0
+    if not 0 <= args.inter_prompt_delay_seconds <= 3600:
+        p.error("--inter-prompt-delay-seconds must be between 0 and 3600")
     return args
 
 
@@ -95,10 +111,15 @@ def prompt_files(folder, all50):
         names = ["prompt_1024_10.txt", "prompt_0_01.txt",
                  "prompt_1024_10.txt"]
     else:
-        names = [
+        anchor = "prompt_1024_10.txt"
+        # Exactly 50 distinct cases. Long anchor FIRST checks that the
+        # startup plan and fresh HTP KV work before shorter requests.
+        names = [anchor] + [
             f"prompt_{group}_{i:02d}.txt"
             for group in runner.MAIN50_SHORT_GROUPS for i in range(1, 11)
-        ] + ["prompt_1024_10.txt"]
+            if f"prompt_{group}_{i:02d}.txt" != anchor
+        ]
+        assert len(names) == 50 and len(set(names)) == 50
     paths = [folder / name for name in names]
     missing = [str(p) for p in paths if not p.is_file()]
     if missing:
