@@ -302,6 +302,56 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "insufficient tokens"):
                 probe.read_request_chunk_plan(log, 0, 66)
 
+    def test_24b_layout_is_accepted_and_verified_for_resident_server(self):
+        layout = "G5,P3,G5,P3,G6,P3,G5,P4,G6"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "llama-server.exe"
+            model = root / "Mistral-Small-24B-Q6_K.gguf"
+            server.write_bytes(b"stub")
+            model.write_bytes(b"stub")
+            args = probe.parse_args([
+                "--server-exe", str(server), "--model", str(model),
+                "--rpc", "10.0.0.1:50052",
+                "--prompt-dir", str(root),
+                "--profile-source", str(root),
+                "--out", str(root / "24b-server-test"),
+                "--model-layers", "40",
+                "--locked-layout", layout,
+                "--per-request-chunks", "--all50",
+            ])
+            self.assertEqual(args.model_layers, 40)
+            self.assertEqual(args.locked_layout, layout)
+            self.assertTrue(args.per_request_chunks)
+            with self.assertRaises(SystemExit):
+                probe.parse_args([
+                    "--server-exe", str(server), "--model", str(model),
+                    "--rpc", "10.0.0.1:50052",
+                    "--prompt-dir", str(root), "--profile-source", str(root),
+                    "--out", str(root / "bad"),
+                    "--model-layers", "64", "--locked-layout", layout,
+                ])
+            log = root / "llama-server.log"
+            log.write_text(
+                "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                " tokens=1855 kv_start=0 layout=" + layout
+                + " XC=64 XG=96 XP=128"
+                " startup_XC=64 startup_XG=64 startup_XP=64"
+                " changed=1 planner_ms=12.125"
+                " source=LOCKED_CHUNK_ONLY"
+                " execution=THIS_DECODE_ONLY status=PASS\\n"
+                "[REGION_RING_SUM] tokens=1855 XC=0 XG=96 XP=128"
+                " regions=9 first_region_chunks=20 tasks=180"
+                " executed=180 complete=1 wall_ms=1234"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\\n",
+                encoding="utf-8")
+            planned, _ = probe.read_request_chunk_plan(
+                log, 0, 1855, 256, 256, layout)
+            self.assertEqual(
+                (planned["plan_xg"], planned["plan_xp"]), (96, 128))
+            with self.assertRaisesRegex(RuntimeError, "changed fixed layout"):
+                probe.read_request_chunk_plan(log, 0, 1855)
+
     def test_cpp_request_hook_reuses_locked_planner_and_stage_builder(self):
         source = (Path(__file__).resolve().parents[2] /
                   "src" / "llama-context.cpp").read_text(
