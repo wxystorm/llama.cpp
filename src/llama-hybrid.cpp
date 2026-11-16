@@ -11506,12 +11506,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             size_t rejected_profile = 0;
             // Short prompts may use a separately measured sub-32 grid.
             // A long placement anchor always uses the original Chunk grid;
-            // only subsequent <=256-token locked prompts can use 8/16/24.
+            // only <=256-token locked prompts can use 16/24 below X=32.
+            // X=8 remains a historical Profile point, never a Plan candidate.
             const bool short_chunk_search =
                 flag_on("LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS") &&
                 model.tokens <= 256;
             const std::vector<int> widths = short_chunk_search ?
-                std::vector<int>{8, 16, 24, 32, 48, 64, 80, 96,
+                std::vector<int>{16, 24, 32, 48, 64, 80, 96,
                                  112, 128, 160, 192, 256} :
                 std::vector<int>(
                     llama_ring_planner::first_cycle_chunk_candidates.begin(),
@@ -11525,12 +11526,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     char * end = nullptr;
                     const long value = std::strtol(raw, &end, 10);
                     if (end == raw || *end != '\0' ||
-                            value < (short_chunk_search ? 8 : 32) ||
+                            value < (short_chunk_search ? 16 : 32) ||
                             value > 256 ||
                             (!llama_ring_planner::first_cycle_chunk_supported(
                                  (int) value) &&
                              !(short_chunk_search &&
-                               (value == 8 || value == 16 || value == 24)))) {
+                               (value == 16 || value == 24)))) {
                         return false;
                     }
                     cap = (int) value;
@@ -11544,7 +11545,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "LLAMA_REGION_RING_LOCKED_MAX_XP", max_plan_xp)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_LOCK] status=REJECT "
-                    "reason=INVALID_CHUNK_CAP supported=8,16,24(only_when_short),32,48,64,80,96,112,128,160,192,256\n");
+                    "reason=INVALID_CHUNK_CAP supported=16,24(only_when_short),32,48,64,80,96,112,128,160,192,256\n");
                 return false;
             }
             LLAMA_LOG_ERROR(
