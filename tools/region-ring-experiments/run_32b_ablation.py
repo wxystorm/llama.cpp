@@ -297,7 +297,8 @@ def run_one(case: str, layout: str, args) -> int:
     out = args.out / case
     command = [
         sys.executable, str(Path(__file__).with_name("run_32b_all40.py")),
-        "--model", str(args.model), "--model-layers", "64",
+        "--model", str(args.model), "--model-layers",
+         str(getattr(args, "model_layers", 64)),
         "--exe", str(args.exe), "--rpc", args.rpc,
         "--prompt-dir", str(args.prompt_dir), "--out", str(out),
         "--htp-only", "--layout", layout,
@@ -351,7 +352,8 @@ def ensure_independent_profile(args) -> Path:
     calibration_out = args.out / "independent-calibration-run"
     command = [
         sys.executable, str(Path(__file__).with_name("run_32b_all40.py")),
-        "--model", str(args.model), "--model-layers", "64",
+        "--model", str(args.model), "--model-layers",
+         str(getattr(args, "model_layers", 64)),
         "--exe", str(args.exe), "--rpc", args.rpc,
         "--prompt-dir", str(args.prompt_dir),
         "--out", str(calibration_out),
@@ -415,6 +417,8 @@ def write_comparison(out: Path, plans: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", type=Path, default=Path(r"E:\llama\models\Qwen3-32B-Q4_K_M.gguf"))
+    ap.add_argument("--model-layers", type=int, choices=(40, 64), default=64,
+                    help="40 for 14B/24B; 64 for 32B in main50 mode")
     ap.add_argument("--exe", type=Path, default=ROOT / "build-tensor-v2/bin/Release/llama-completion.exe")
     ap.add_argument("--rpc", default="10.39.52.114:50052")
     ap.add_argument("--prompt-dir", type=Path, default=Path(r"E:\llama\datasets\sharegpt\sharegpt40"))
@@ -443,6 +447,9 @@ def main() -> int:
     args = ap.parse_args()
     if args.limit < 0 or args.limit > 50:
         ap.error("--limit must be 0..50")
+    if args.model_layers != 64 and not args.main50_short:
+        ap.error("--model-layers 40 requires --main50-short and a long "
+                 "baseline placement lock; legacy A0/A1 is 64-layer only")
     if args.main50_short:
         if args.context != 2048:
             ap.error("--main50-short requires --context 2048")
@@ -452,7 +459,7 @@ def main() -> int:
     if args.model.exists() is False:
         ap.error(f"model not found: {args.model}")
     args.out.mkdir(parents=True, exist_ok=True)
-    weights = gguf_layer_weights(args.model, 64)
+    weights = gguf_layer_weights(args.model, args.model_layers)
     has_planning = any(c in ("A2", "A3") for c in args.cases)
     gpu = free_vram_mib(args.gpu_free_mib) if has_planning else None
     cpu = free_ram_mib(args.cpu_free_mib) if has_planning else None
@@ -469,7 +476,7 @@ def main() -> int:
             if (lock.get("schema") != 1 or
                     lock.get("first_prompt") != "prompt_1024_10.txt"):
                 raise ValueError("not a 1024_10 placement lock")
-            baseline_layout = normalize_layout(lock["layout"], 64)
+            baseline_layout = normalize_layout(lock["layout"], args.model_layers)
         except (OSError, KeyError, ValueError) as exc:
             ap.error("Invalid Full baseline placement lock: " + str(exc))
     plans = {}
