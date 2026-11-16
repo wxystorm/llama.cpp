@@ -317,6 +317,19 @@ static void test_gpu_region_half_budget_cap() {
     assert(gpu_streamed_banks_fit(m, layout, 32));
     m.gpu_max_region_budget_fraction = 0.40L;
     assert(!gpu_streamed_banks_fit(m, layout, 32));
+
+    // A 55% per-Region cap can allow asymmetric A/B Bank peaks without
+    // relaxing their combined physical VRAM limit. 14*16=224 MiB and
+    // 12*16=192 MiB fit together in 420 MiB, but not in 410 MiB.
+    const auto skewed = llama_region_ring_parse_apply_wide_layout(
+        "G14,P6,G12,C1,G7", 40);
+    m.gpu_memory_budget_bytes = 420 * MiB;
+    m.gpu_max_region_budget_fraction = 0.50L;
+    assert(!gpu_streamed_banks_fit(m, skewed, 32));
+    m.gpu_max_region_budget_fraction = 0.55L;
+    assert(gpu_streamed_banks_fit(m, skewed, 32));
+    m.gpu_memory_budget_bytes = 410 * MiB;
+    assert(!gpu_streamed_banks_fit(m, skewed, 32));
 }
 
 int main() {
