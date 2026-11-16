@@ -6,7 +6,7 @@
   "source_received_date": "2026-11-17",
   "command": null,
   "command_in_source": false,
-  "placement_layout": null,
+  "placement_layout": "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7",
   "placement_layout_in_source": false,
   "mode": "server probe",
   "cache_n": 0,
@@ -23,5 +23,7 @@
   "chunk_plan": "XC, XG, XP and actual_XG, actual_XP per prompt",
   "per_prompt_file": "per-prompt-details.csv",
   "planner_ms": "per prompt as logged",
-  "note": "No server command or physical placement layout is supplied in this 32B block; do not copy the old fixed-placement configuration into this run."
+  "note": "No server command in the supplied 32B probe block; physical layer placement supplied in subsequent user message.",
+  "placement_layout_source": "user-confirmed after SERVER_PROBE logs",
+  "placement_layout_provided_separately": true
 }

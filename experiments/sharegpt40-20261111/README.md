@@ -19,7 +19,7 @@ Ten experimental runs; **426 successful per-prompt results** in `results.csv` an
 
 The replacement **Ours-32B** and **Ours-24B** results come from the two user-supplied `SERVER_PROBE` blocks (first 32B, second 24B). Each has 10 distinct prompts per group **0/128/256/512/1024**; `prompt_1024_10.txt` was run first as a long-prompt anchor, so rows are matched by filename, not output order. No old Ours 24B or 32B prompt measurements are retained.
 
-Each new run's `runs/ours-*-server-plan/per-prompt-details.csv` keeps input tokens, prefill latency and TPS, cache=0, planned XC/XG/XP, actual XG/XP and planner latency. The run config retains known execution settings; **no physical placement layout was supplied** in either new probe block, so none is invented. The explicit server launch command was provided only for the 24B block.
+Each new run's `runs/ours-*-server-plan/per-prompt-details.csv` keeps input tokens, prefill latency and TPS, cache=0, planned XC/XG/XP, actual XG/XP and planner latency. The physical layer placements were supplied separately by the user after the SERVER_PROBE logs: **24B** `G5,P3,G5,P3,G6,P3,G5,P4,G6` (40 layers) and **32B** `G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7` (64 layers). These layouts are recorded in the run configurations and in every per-prompt detail row; the underlying probe TPS, chunk sizes and planner times are unchanged. The explicit server launch command was provided only for the 24B block.
 
 Ours 14B is unchanged: 50 observations over groups 128/256/512/1024/2048; best of two past results at the first four groups, with the 2048 group from a later user-supplied log. Its recorded `G10,P9,G12,P1,G8` layout is normalized metadata for some historical winners, **not** a claim that they were remeasured under this placement.
 

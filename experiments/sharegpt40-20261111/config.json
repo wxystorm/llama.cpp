@@ -153,8 +153,8 @@
       "model": "32b",
       "method": "server-probe per-prompt plan",
       "run_config": "runs/ours-32b-server-plan/run-config.json",
-      "layout": null,
-      "layout_reported": false,
+      "layout": "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7",
+      "layout_reported": true,
       "planner": "SERVER_PROBE",
       "cache_prompt_tokens": 0,
       "group_counts": {
@@ -165,7 +165,8 @@
         "1024": 10
       },
       "metrics_source": "SERVER_PROBE prefill_ms and tps",
-      "per_prompt_chunks": "runs/ours-32b-server-plan/per-prompt-details.csv"
+      "per_prompt_chunks": "runs/ours-32b-server-plan/per-prompt-details.csv",
+      "layout_source": "user-confirmed follow-up to 2026-11-17 SERVER_PROBE data"
     },
     {
       "id": "ours-24b-server-plan",
@@ -173,8 +174,8 @@
       "model": "24b",
       "method": "server-probe per-prompt plan",
       "run_config": "runs/ours-24b-server-plan/run-config.json",
-      "layout": null,
-      "layout_reported": false,
+      "layout": "G5,P3,G5,P3,G6,P3,G5,P4,G6",
+      "layout_reported": true,
       "planner": "SERVER_PROBE",
       "cache_prompt_tokens": 0,
       "group_counts": {
@@ -185,7 +186,8 @@
         "1024": 10
       },
       "metrics_source": "SERVER_PROBE prefill_ms and tps",
-      "per_prompt_chunks": "runs/ours-24b-server-plan/per-prompt-details.csv"
+      "per_prompt_chunks": "runs/ours-24b-server-plan/per-prompt-details.csv",
+      "layout_source": "user-confirmed follow-up to 2026-11-17 SERVER_PROBE data"
     },
     {
       "id": "jupiter-24b",
