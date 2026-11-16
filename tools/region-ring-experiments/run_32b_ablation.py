@@ -308,13 +308,18 @@ def run_one(case: str, layout: str, args) -> int:
         "--streaming", "on", "--batch", "2048", "--ubatch", "2048",
         "--n-predict", "1", "--threads", str(args.threads),
         "--limit", str(args.limit), "--trace-tasks", "--no-mmap",
-        "--skip-warmup", "--stop-on-fail",
+        "--skip-warmup",
         "--max-retries", "0",
         "--env", "LLAMA_REGION_RING_GPU_BANK_COUNT=" +
                    ("1" if case in ("A2", "A3") else "2"),
         "--env", "LLAMA_REGION_RING_GPU_BANK_PREFETCH=" +
                    ("1" if case == "A0" else "0"),
     ]
+    if not args.main50_short:
+        command.append("--stop-on-fail")
+    else:
+        command += ["--sharegpt50-short-dataset",
+                    "--max-context", "2048", "--context-padding", "0"]
     if args.only_prompt:
         command += ["--only-prompt", args.only_prompt]
     if args.dry_run:
@@ -360,6 +365,11 @@ def ensure_independent_profile(args) -> Path:
         "--limit", "1", "--trace-tasks", "--no-mmap", "--skip-warmup",
         "--stop-on-fail", "--max-retries", "0",
     ]
+    if args.main50_short:
+        # Calibrate at the long anchor, never at the 0-bin short prompt.
+        command += ["--sharegpt50-short-dataset",
+                    "--max-context", "2048", "--context-padding", "0",
+                    "--only-prompt", "prompt_1024_10.txt"]
     print(f"[ABLATION_PROFILE] event=START source=INDEPENDENT_G_C_N "
           f"out={calibration_out}", flush=True)
     code = subprocess.call(command, cwd=str(ROOT))
@@ -412,6 +422,12 @@ def main() -> int:
     ap.add_argument("--cases", nargs="+", choices=("A0", "A1", "A2", "A3"), default=["A0", "A1", "A2", "A3"])
     ap.add_argument("--limit", type=int, default=1, help="only one prompt by default; 0 selects all")
     ap.add_argument("--only-prompt", default="")
+    ap.add_argument("--main50-short", action="store_true",
+                    help="use 0/128/256/512/1024 ShareGPT50_short 50-prompt "
+                         "data, 2048 maximum context and short fixed Chunk")
+    ap.add_argument("--baseline-placement-lock", type=Path,
+                    help="for main50 A0/A1, use the first long Prompt's "
+                         "placement-lock.json from the Full main run")
     ap.add_argument("--profile-csv", type=Path, help="existing independent CPU/GPU/HTP profile.csv")
     ap.add_argument("--gpu-free-mib", type=int, help="override nvidia-smi free GPU memory")
     ap.add_argument("--cpu-free-mib", type=int, help="override free PC RAM")
@@ -425,8 +441,14 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--plan-only", action="store_true", help="write plan manifest, do not invoke runner")
     args = ap.parse_args()
-    if args.limit < 0 or args.limit > 40:
-        ap.error("--limit must be 0..40")
+    if args.limit < 0 or args.limit > 50:
+        ap.error("--limit must be 0..50")
+    if args.main50_short:
+        if args.context != 2048:
+            ap.error("--main50-short requires --context 2048")
+        if args.chunk > 32:
+            ap.error("--main50-short needs --chunk <=32 so the 64-token "
+                     "0-bin supports two GPU chunks; use --chunk 32")
     if args.model.exists() is False:
         ap.error(f"model not found: {args.model}")
     args.out.mkdir(parents=True, exist_ok=True)
@@ -436,11 +458,34 @@ def main() -> int:
     cpu = free_ram_mib(args.cpu_free_mib) if has_planning else None
     phone = phone_budget_mib(args.phone_budget_mib) if has_planning else None
     profile = args.profile_csv
+    baseline_layout = FIXED
+    if args.main50_short and any(c in ("A0", "A1") for c in args.cases):
+        if not args.baseline_placement_lock:
+            ap.error("--main50-short A0/A1 need --baseline-placement-lock "
+                     "from the Full main50 run anchored at prompt_1024_10.txt")
+        try:
+            from run_32b_all40 import normalize_layout
+            lock = json.loads(args.baseline_placement_lock.read_text(encoding="utf-8"))
+            if (lock.get("schema") != 1 or
+                    lock.get("first_prompt") != "prompt_1024_10.txt"):
+                raise ValueError("not a 1024_10 placement lock")
+            baseline_layout = normalize_layout(lock["layout"], 64)
+        except (OSError, KeyError, ValueError) as exc:
+            ap.error("Invalid Full baseline placement lock: " + str(exc))
     plans = {}
+    had_failed_case = False
     for case in args.cases:
         if case in ("A0", "A1"):
-            layout = FIXED
-            details = {"gpu_layers": 40, "cpu_layers": 0, "phone_layers": 24}
+            layout = baseline_layout
+            details = {
+                "gpu_layers": sum(int(x[1:]) for x in layout.split(",")
+                                  if x.startswith("G")),
+                "cpu_layers": sum(int(x[1:]) for x in layout.split(",")
+                                  if x.startswith("C")),
+                "phone_layers": sum(int(x[1:]) for x in layout.split(",")
+                                    if x.startswith("P")),
+                "source": "FULL_MAIN50_LONG_ANCHOR" if args.main50_short else "LEGACY_FIXED",
+            }
         else:
             if case == "A2":
                 # A0's C++ independent one-shot grid profile can be reused
@@ -466,12 +511,14 @@ def main() -> int:
         ret = run_one(case, layout, args)
         if ret != 0:
             print(f"[ABLATION_FAIL] case={case} exit_code={ret}", file=sys.stderr)
-            return ret
+            if not args.main50_short:
+                return ret
+            had_failed_case = True
     (args.out / "plans.json").write_text(
         json.dumps(plans, indent=2), encoding="utf-8")
     write_comparison(args.out, plans)
     print(f"[ABLATION_SUMMARY] {args.out / 'ablation-comparison.csv'}", flush=True)
-    return 0
+    return 1 if had_failed_case else 0
 
 
 if __name__ == "__main__":
