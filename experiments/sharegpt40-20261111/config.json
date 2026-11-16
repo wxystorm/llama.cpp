@@ -9,12 +9,11 @@
       128,
       256,
       512,
-      1024,
-      2048
+      1024
     ],
     "prompts_per_group": 10,
     "prompt_ids": "prompt_{group}_{01..10}.txt",
-    "note": "Prompt groups are union across experiments: Ours 14B covers 128/256/512/1024/2048, Ours 24B and 32B cover 0/128/256/512/1024, legacy baselines cover 128/256/512/1024 (Jupiter24 1024 has 6)."
+    "note": "The three Ours server-plan runs each include groups 0/128/256/512/1024, with ten prompts per group. Other ShareGPT40 baselines use groups 128/256/512/1024; Jupiter 24B group 1024 has only six PASS observations. PC-only 2048 observations are separate and excluded from results.csv."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -102,27 +101,25 @@
       "final_layer_sp": false
     },
     {
-      "id": "ours-14b-autoplan",
+      "id": "ours-14b-server-plan",
       "framework": "ours",
       "model": "14b",
-      "method": "region-ring GPU + Phone",
-      "run_config": "runs/ours-14b-autoplan/run-config.json",
-      "layout": "G10,P9,G12,P1,G8",
-      "planner": "NATIVE_APPLY_WIDE",
-      "placement_lock": "FIRST_PASS_CHUNKS_ONLY",
-      "batch": 2048,
-      "ubatch": 2048,
-      "predict": 1,
-      "threads": 8,
-      "seed": 1234,
-      "no_mmap": true,
+      "method": "server-probe per-prompt plan",
+      "run_config": "runs/ours-14b-server-plan/run-config.json",
+      "layout": "G11,P5,G11,P5,G8",
+      "layout_reported": true,
+      "layout_source": "user-confirmed alongside SERVER_PROBE logs",
+      "planner": "SERVER_PROBE",
+      "cache_prompt_tokens": 0,
       "group_counts": {
+        "0": 10,
         "128": 10,
         "256": 10,
         "512": 10,
-        "1024": 10,
-        "2048": 10
-      }
+        "1024": 10
+      },
+      "metrics_source": "SERVER_PROBE prefill_ms and tps",
+      "per_prompt_chunks": "runs/ours-14b-server-plan/per-prompt-details.csv"
     },
     {
       "id": "prima-24b",

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "run_id": "ours-14b-server-plan",
+  "model": "${MODEL_DIR}/Qwen3-14B-Q4_K_M.gguf",
+  "source": "User supplied 50 SERVER_PROBE lines together with the physical layout",
+  "source_received_date": "2026-11-17",
+  "experiment": "ALL50_UNIQUE",
+  "fingerprint": "77a9f5237f59",
+  "long_anchor_first": "prompt_1024_10.txt",
+  "model_resident": true,
+  "prefill_cache_tokens": 0,
+  "probe_count": 50,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "prompts_per_group": 10,
+  "layout": "G11,P5,G11,P5,G8",
+  "layout_source": "user-supplied",
+  "chunk_policy": "XC/XG/XP and actual_XG/actual_XP per prompt, as measured",
+  "planner_metric": "planner_ms in per-prompt-details.csv",
+  "per_prompt_file": "per-prompt-details.csv",
+  "command_in_source": false,
+  "server_command": null,
+  "mode": "server probe",
+  "note": "Replaces the earlier mixed 14B autoplan measurements, including the old 2048 group, with the newly supplied matched 50 Server Plan measurements. Prefill throughput is not the old per-prompt maximum; it is the new log's measured TPS."
+}

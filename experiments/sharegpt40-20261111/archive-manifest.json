@@ -37,15 +37,6 @@
       "runs": 40
     },
     {
-      "id": "ours-14b-autoplan",
-      "archive": "14b-autoplan-gpu-budget097-all50-1.zip",
-      "sha256": "0d9aa44cbd811531e1f862952785f126a84eb00be6c60ef0d131137bd4147cc7",
-      "bytes": 4501501,
-      "runs": 40,
-      "expected_runs": 50,
-      "status": "2048_GROUP_FROM_USER_LOG"
-    },
-    {
       "id": "prima-24b",
       "archive": "prima-24b-数据.zip",
       "sha256": "b0ada2ac593c4fe9857254a343f915a2c837c4e432d97cf1be221e94a6bb56a6",
