@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "run_id": "llama-cpp-pc-only-sharegpt50",
+  "implementation": "llama.cpp",
+  "execution": "single-PC",
+  "model_labels_from_screenshot": [
+    "14B",
+    "24B",
+    "32B"
+  ],
+  "model_file_paths": null,
+  "model_file_quantizations": null,
+  "measurement_source": "two user-provided screenshots (model/group order and mean_tok/s columns)",
+  "screenshot_order_file": "image(20261116-175627).png",
+  "screenshot_values_file": "image(20261116-175619).png",
+  "screenshot_sha256": {
+    "image(20261116-175627).png": "153548bd9755cb778cb53427eb73209861c39c8fe43e566e76c6d26b51e90fae",
+    "image(20261116-175619).png": "bd1fd9821e3b156efb717bc370ad3aeba5ba180e9be8253147d81fb98845c331"
+  },
+  "command": "python .\\tools\\sharegpt50\\bench_single_pc_sharegpt50.py --mode server --ngl auto --per-group 10 --batch 2048 --ubatch 512 --ctx 3000",
+  "script": "tools/sharegpt50/bench_single_pc_sharegpt50.py",
+  "mode": "server",
+  "ngl": "auto",
+  "per_group": 10,
+  "batch": 2048,
+  "ubatch": 512,
+  "ctx": 3000,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "metric": "mean_tok/s",
+  "reported_rows": 15,
+  "num_models": 3,
+  "summary_csv": "group-means.csv",
+  "note": "Only aggregate per-group mean tok/s is available; the script source and exact model files could not be independently verified from the experiment branch. Group median and latency columns remain blank; results.csv is unchanged."
+}

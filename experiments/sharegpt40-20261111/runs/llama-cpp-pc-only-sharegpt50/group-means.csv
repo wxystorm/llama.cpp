@@ -1,0 +1,16 @@
+framework,model,group,runs,avg_prefill_tps
+llama.cpp-pc-only,14b,0,10,57.6334
+llama.cpp-pc-only,14b,128,10,69.8149
+llama.cpp-pc-only,14b,256,10,71.3049
+llama.cpp-pc-only,14b,512,10,69.4976
+llama.cpp-pc-only,14b,1024,10,66.6422
+llama.cpp-pc-only,24b,0,10,20.8682
+llama.cpp-pc-only,24b,128,10,21.7289
+llama.cpp-pc-only,24b,256,10,24.2536
+llama.cpp-pc-only,24b,512,10,31.5654
+llama.cpp-pc-only,24b,1024,10,32.0298
+llama.cpp-pc-only,32b,0,10,21.4223
+llama.cpp-pc-only,32b,128,10,24.6974
+llama.cpp-pc-only,32b,256,10,25.8188
+llama.cpp-pc-only,32b,512,10,29.8023
+llama.cpp-pc-only,32b,1024,10,29.0208

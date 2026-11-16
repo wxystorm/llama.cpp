@@ -239,5 +239,67 @@
       "source": "selected lowest Prefill TPS from 2 completed 14B log measurements, 2026-11-15",
       "note": "2048-group 66.89 tok/s; exact prompt filename and launch flags are not present for the selected record."
     }
+  ],
+  "aggregate_baselines": [
+    {
+      "id": "llama-cpp-pc-only-14b-sharegpt50",
+      "framework": "llama.cpp-pc-only",
+      "model": "14b",
+      "type": "aggregate_only_group_means",
+      "groups": [
+        0,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "reported_runs_per_group": 10,
+      "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
+      "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
+      "included_in_group_summary": true,
+      "included_in_results_csv": false,
+      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
+      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+    },
+    {
+      "id": "llama-cpp-pc-only-24b-sharegpt50",
+      "framework": "llama.cpp-pc-only",
+      "model": "24b",
+      "type": "aggregate_only_group_means",
+      "groups": [
+        0,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "reported_runs_per_group": 10,
+      "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
+      "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
+      "included_in_group_summary": true,
+      "included_in_results_csv": false,
+      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
+      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+    },
+    {
+      "id": "llama-cpp-pc-only-32b-sharegpt50",
+      "framework": "llama.cpp-pc-only",
+      "model": "32b",
+      "type": "aggregate_only_group_means",
+      "groups": [
+        0,
+        128,
+        256,
+        512,
+        1024
+      ],
+      "reported_runs_per_group": 10,
+      "group_summary": "runs/llama-cpp-pc-only-sharegpt50/group-means.csv",
+      "run_config": "runs/llama-cpp-pc-only-sharegpt50/run-config.json",
+      "included_in_group_summary": true,
+      "included_in_results_csv": false,
+      "source": "User-supplied screenshot of mean_tok/s by model and group, 2026-11-16",
+      "note": "No per-prompt measurements, per-group median, or mean prefill latency were supplied. Older partial PC-only observations remain separate."
+    }
   ]
 }
