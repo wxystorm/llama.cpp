@@ -83,6 +83,12 @@ def parse_args(argv=None):
                    help="run all 50 unique prompts, starting with prompt_1024_10.txt")
     p.add_argument("--per-request-chunks", action="store_true",
                    help="call native locked XC/XG/XP Planner on each real HTTP prefill")
+    p.add_argument("--max-plan-xg", type=int, default=256,
+                   choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
+                   help="native GPU Chunk search ceiling (default: 256)")
+    p.add_argument("--max-plan-xp", type=int, default=256,
+                   choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
+                   help="native Phone Chunk search ceiling (default: 256)")
     p.add_argument("--resume", action="store_true",
                    help="resume an interrupted --all50 run; skip verified completed requests")
     p.add_argument("--limit", type=int, default=0,
@@ -249,7 +255,8 @@ REQUEST_EXEC_RE = re.compile(
     r".*complete=1 .*status=0")
 
 
-def read_request_chunk_plan(log_path, offset, expected_tokens):
+def read_request_chunk_plan(log_path, offset, expected_tokens,
+                            max_plan_xg=256, max_plan_xp=256):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -270,9 +277,10 @@ def read_request_chunk_plan(log_path, offset, expected_tokens):
     # This layout contains only GPU and Phone Regions. XC is a modeled
     # but unused CPU-stage width and is intentionally not capped by
     # --max-plan-xg/--max-plan-xp. Only the physical GPU/Phone widths
-    # must stay in the controlled 16..32 interval.
-    if not (16 <= int(xc) <= 256 and
-            16 <= int(xg) <= 32 and 16 <= int(xp) <= 32):
+    # must stay within the configured ceiling (up to native 256).
+    if not (16 <= int(xc) <= min(256, expected_tokens) and
+            16 <= int(xg) <= max_plan_xg and
+            16 <= int(xp) <= min(max_plan_xp, expected_tokens)):
         raise RuntimeError(
             "Native Chunk Plan outside controlled width bounds: "
             + str(chunks))
@@ -578,15 +586,16 @@ def main(argv=None):
         "--sharegpt50-short-dataset",
         "--locked-layout", LAYOUT, "--locked-short-chunks",
         "--skip-plan-memory-checks",
-        "--max-plan-xg", "32", "--max-plan-xp", "32",
+        "--max-plan-xg", str(args.max_plan_xg),
+        "--max-plan-xp", str(args.max_plan_xp),
         "--batch", "2048", "--ubatch", "2048", "--n-predict", "1",
         "--threads", str(args.threads), "--min-context", "256",
         "--max-context", "2048", "--context-padding", "0",
     ])
     command = server_command(args.server_exe, args.model, args.rpc,
                              args.port, args.threads)
-    # A persistent server cannot re-plan XC/XG/XP on each HTTP request:
-    # model initialization sees this fixed long-Prompt planning size.
+    # Model initialization uses the long-Prompt anchor, while the opt-in
+    # request hook selects new Chunk widths for each fresh HTTP Prefill.
     target_profile = args.out / "independent-profile" / "profile.csv"
     if not args.dry_run:
         target_profile.parent.mkdir(parents=True, exist_ok=True)
@@ -604,8 +613,8 @@ def main(argv=None):
     assert env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] == (
         "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
     assert env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] == "1"
-    assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == "32"
-    assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == "32"
+    assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
+    assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
     assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
     if args.per_request_chunks:
         env["LLAMA_REGION_RING_PER_REQUEST_CHUNKS"] = "1"
@@ -616,7 +625,7 @@ def main(argv=None):
           ("PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH" if args.per_request_chunks
            else "ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH") +
           " layout=" + env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"], flush=True)
-    print("[SERVER_PROBE] chunk=XG_XP_MAX32 min16"
+    print(f"[SERVER_PROBE] chunk=XG_MAX{args.max_plan_xg}_XP_MAX{args.max_plan_xp} min16_short_min32_long"
           " kv_cache=DISABLED parallel=1 no_cont_batch=1"
           " memory_estimates=SKIPPED allocators=UNCHANGED", flush=True)
     print("[SERVER_PROBE] command=" + subprocess.list2cmdline(command), flush=True)
@@ -669,7 +678,8 @@ def main(argv=None):
                     http_wall_ms = round((time.monotonic() - began) * 1000, 3)
                     if args.per_request_chunks:
                         decision, log_offset = read_request_chunk_plan(
-                            log_path, log_offset, record["prompt_n"])
+                            log_path, log_offset, record["prompt_n"],
+                            args.max_plan_xg, args.max_plan_xp)
                         record.update(decision)
                     record.update({
                         "prompt": path.name, "index": i,
