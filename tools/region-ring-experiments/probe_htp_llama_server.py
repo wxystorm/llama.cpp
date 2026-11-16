@@ -20,6 +20,7 @@ from collections import deque
 import csv
 import hashlib
 import json
+import re
 import statistics
 from pathlib import Path
 import shutil
@@ -78,6 +79,8 @@ def parse_args(argv=None):
     p.add_argument("--startup-timeout", type=int, default=300)
     p.add_argument("--all50", action="store_true",
                    help="run all 50 unique prompts, starting with prompt_1024_10.txt")
+    p.add_argument("--per-request-chunks", action="store_true",
+                   help="call native locked XC/XG/XP Planner on each real HTTP prefill")
     p.add_argument("--resume", action="store_true",
                    help="resume an interrupted --all50 run; skip verified completed requests")
     p.add_argument("--limit", type=int, default=0,
@@ -229,6 +232,52 @@ def first_error_markers(path, limit=14):
     return "\n".join(root + followon[:4])
 
 
+# A native per-request Plan is a C++ decision in llama_context::decode;
+# do not treat a Python-side length heuristic as evidence that the server
+# executed a new Stage shape. Require the source runtime log for every PASS.
+REQUEST_PLAN_RE = re.compile(
+    r"\[REGION_RING_REQUEST_CHUNK_PLAN\] event=SELECT "
+    r"tokens=(\d+) kv_start=0 layout=([^\s]+) "
+    r"XC=(\d+) XG=(\d+) XP=(\d+).*"
+    r"planner_ms=([0-9.]+).*status=PASS")
+
+
+def read_request_chunk_plan(log_path, offset, expected_tokens):
+    """Read only logs appended since the previous HTTP request finished."""
+    with Path(log_path).open("rb") as stream:
+        stream.seek(offset)
+        data = stream.read().decode("utf-8", errors="replace")
+        next_offset = stream.tell()
+    matches = list(REQUEST_PLAN_RE.finditer(data))
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Native per-request Chunk decision missing or ambiguous "
+            f"(matches={len(matches)}, expected_tokens={expected_tokens}); "
+            f"check {log_path} for REGION_RING_REQUEST_CHUNK_PLAN")
+    tokens, layout, xc, xg, xp, planner_ms = matches[0].groups()
+    if int(tokens) != expected_tokens:
+        raise RuntimeError(
+            f"Native Chunk Plan token mismatch: planner={tokens}, "
+            f"server_timing={expected_tokens}")
+    chunks = (int(xc), int(xg), int(xp))
+    if any(x < 16 or x > 32 for x in chunks):
+        raise RuntimeError(
+            "Native Chunk Plan outside controlled 16..32 widths: "
+            + str(chunks))
+    if 2 * int(xg) > expected_tokens:
+        raise RuntimeError(
+            f"Two-Bank request has insufficient tokens: "
+            f"XG={xg}, tokens={expected_tokens}")
+    if layout != "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7":
+        raise RuntimeError("Native Chunk Planner changed fixed layout: " + layout)
+    return {
+        "plan_xc": chunks[0],
+        "plan_xg": chunks[1],
+        "plan_xp": chunks[2],
+        "planner_ms": float(planner_ms),
+    }, next_offset
+
+
 def group_for_prompt(name):
     """The 0 group is actually 64..128 tokenizer tokens."""
     return int(name.split("_", 2)[1])
@@ -362,6 +411,7 @@ def write_reports(out, records):
         "index", "group", "prompt", "manifest_n", "prompt_n",
         "token_delta", "cache_n", "prompt_ms", "prefill_tps",
         "request_wall_ms", "predicted_n", "planner_mode",
+        "plan_xc", "plan_xg", "plan_xp", "planner_ms",
         "runtime_layout", "status",
     ]
     with (out / "requests.csv").open(
@@ -498,7 +548,14 @@ def main(argv=None):
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == "32"
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == "32"
     assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
-    print("[SERVER_PROBE] policy=ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH"
+    if args.per_request_chunks:
+        env["LLAMA_REGION_RING_PER_REQUEST_CHUNKS"] = "1"
+    else:
+        # Do not inherit a previous experimental run's per-request flag.
+        env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    print("[SERVER_PROBE] policy=" +
+          ("PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH" if args.per_request_chunks
+           else "ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH") +
           " layout=" + env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"], flush=True)
     print("[SERVER_PROBE] chunk=XG_XP_MAX32 min16"
           " kv_cache=DISABLED parallel=1 no_cont_batch=1"
@@ -537,6 +594,7 @@ def main(argv=None):
             open_mode = "a" if args.all50 and args.resume else "w"
             with metrics_path.open(open_mode, encoding="utf-8") as output:
                 requested_this_process = 0
+                log_offset = 0
                 for i, path in enumerate(prompts, 1):
                     if args.all50 and args.limit and i > args.limit:
                         break
@@ -548,6 +606,10 @@ def main(argv=None):
                     prompt = path.read_text(encoding="utf-8-sig")
                     began = time.monotonic()
                     record = post_completion(args.port, prompt)
+                    if args.per_request_chunks:
+                        decision, log_offset = read_request_chunk_plan(
+                            log_path, log_offset, record["prompt_n"])
+                        record.update(decision)
                     record.update({
                         "prompt": path.name, "index": i,
                         "group": group_for_prompt(path.name),
@@ -556,7 +618,9 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": round(
                             (time.monotonic() - began) * 1000, 3),
-                        "planner_mode": "STARTUP_ONLY",
+                        "planner_mode": (
+                            "PER_REQUEST_LOCKED" if args.per_request_chunks
+                            else "STARTUP_ONLY"),
                         "runtime_layout": fake_args.locked_layout,
                         "status": "PASS",
                     })
@@ -574,7 +638,13 @@ def main(argv=None):
                           f" prompt_n={record['prompt_n']}"
                           f" cache_n={record['cache_n']}"
                           f" prefill_ms={record['prompt_ms']:.3f}"
-                          f" tps={record['prefill_tps']:.3f}", flush=True)
+                          f" tps={record['prefill_tps']:.3f}"
+                          + (f" XC={record['plan_xc']}"
+                             f" XG={record['plan_xg']}"
+                             f" XP={record['plan_xp']}"
+                             f" planner_ms={record['planner_ms']:.3f}"
+                             if args.per_request_chunks else ""),
+                          flush=True)
             if args.all50:
                 finished = len(completed) == 50
                 print(f"[SERVER_SWEEP] status={'PASS' if finished else 'PARTIAL'}"
