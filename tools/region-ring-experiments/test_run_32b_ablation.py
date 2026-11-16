@@ -51,6 +51,25 @@ class AblationTests(unittest.TestCase):
             self.assertNotIn("--auto-plan", command)
             self.assertNotIn("--force-plan-layout", command)
 
+    def test_short50_40layer_ablation_reuses_dataset_and_chunk32(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(
+                model=Path(d) / "mistral-24b.gguf",
+                model_layers=40, exe=Path(d) / "llama-completion.exe",
+                rpc="127.0.0.1:50052", prompt_dir=Path(d),
+                out=Path(d), chunk=32, threads=8, limit=0,
+                only_prompt="", dry_run=False, plan_only=False,
+                main50_short=True)
+            layout = "G4,P1,G4,P1,G4,P1,G4,P1,G4,P1,G4,P1,G4,P1,G5"
+            with patch.object(a.subprocess, "call", return_value=0) as launch:
+                self.assertEqual(a.run_one("A0", layout, args), 0)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[command.index("--model-layers") + 1], "40")
+            self.assertEqual(command[command.index("--chunk") + 1], "32")
+            self.assertIn("--sharegpt50-short-dataset", command)
+            self.assertEqual(command[command.index("--max-context") + 1], "2048")
+            self.assertNotIn("--stop-on-fail", command)
+
     def test_gguf_layer_tensor_offsets(self):
         def string(s):
             b = s.encode("utf-8")
