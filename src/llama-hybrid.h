@@ -172,6 +172,8 @@ struct llama_hybrid_attn_desc {
 struct llama_hybrid_profile {
     bool is_moe = false;
     bool dense_phone_region_capable = false; // Qwen3 Dense stage graph only.
+    // Taken from the actual GGUF model loader, never from a user env flag.
+    bool pc_model_weights_mmap = false;
 
     int probe_tokens           = 0;
     int reference_tokens       = 0;
