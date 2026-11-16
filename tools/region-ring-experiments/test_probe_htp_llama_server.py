@@ -64,6 +64,25 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cached tokens"):
                 probe.post_completion(18080, "hello")
 
+    def test_earliest_error_comes_before_p2c_stop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logfile = Path(tmp) / "llama-server.log"
+            logfile.write_text(
+                "[REGION_RING_WORKER] event=START\\n"
+                "[PHONE_INPUT_PUSH] event=FAIL region=7 chunk=0"
+                " reason=RPC_INPUT_STREAM_PUSH_REJECTED\\n"
+                "[P2C_STREAM] phase=STOP recv=174 pending=116 status=FAIL\\n"
+                "srv decode: Compute error.\\n",
+                encoding="utf-8",
+            )
+            found = probe.first_error_markers(logfile)
+            self.assertIn("region=7 chunk=0", found)
+            self.assertIn("RPC_INPUT_STREAM_PUSH_REJECTED", found)
+            self.assertIn("recv=174", found)
+            self.assertLess(
+                found.index("PHONE_INPUT_PUSH"),
+                found.index("P2C_STREAM"))
+
     def test_original_layout_has_exactly_64_layers(self):
         import re
         layers = sum(int(n) for _, n in
