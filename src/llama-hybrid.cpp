@@ -11450,20 +11450,33 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             size_t tried = 0;
             size_t rejected_memory = 0;
             size_t rejected_profile = 0;
+            // Short prompts may use a separately measured sub-32 grid.
+            // A long placement anchor always uses the original Chunk grid;
+            // only subsequent <=256-token locked prompts can use 8/16/24.
+            const bool short_chunk_search =
+                flag_on("LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS") &&
+                model.tokens <= 256;
+            const std::vector<int> widths = short_chunk_search ?
+                std::vector<int>{8, 16, 24, 32, 48, 64, 80, 96,
+                                 112, 128, 160, 192, 256} :
+                std::vector<int>(
+                    llama_ring_planner::first_cycle_chunk_candidates.begin(),
+                    llama_ring_planner::first_cycle_chunk_candidates.end());
             // Bound (do not fix) Chunk search for diagnostic regressions.
-            // This is deliberately restricted to the locked-placement path.
-            // Unsupported or malformed caps fail rather than silently
-            // allowing a larger XP/XG than the caller requested.
+            // Restrict overrides to the locked-placement path.
             const auto read_locked_chunk_cap =
-                [](const char * key, int & cap) -> bool {
+                [short_chunk_search](const char * key, int & cap) -> bool {
                     const char * raw = std::getenv(key);
                     if (raw == nullptr || *raw == '\0') { return true; }
                     char * end = nullptr;
                     const long value = std::strtol(raw, &end, 10);
                     if (end == raw || *end != '\0' ||
-                            value < 32 || value > 256 ||
-                            !llama_ring_planner::first_cycle_chunk_supported(
-                                (int) value)) {
+                            value < (short_chunk_search ? 8 : 32) ||
+                            value > 256 ||
+                            (!llama_ring_planner::first_cycle_chunk_supported(
+                                 (int) value) &&
+                             !(short_chunk_search &&
+                               (value == 8 || value == 16 || value == 24)))) {
                         return false;
                     }
                     cap = (int) value;
@@ -11477,15 +11490,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     "LLAMA_REGION_RING_LOCKED_MAX_XP", max_plan_xp)) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_LOCK] status=REJECT "
-                    "reason=INVALID_CHUNK_CAP supported=32,48,64,80,96,112,128,160,192,256\n");
+                    "reason=INVALID_CHUNK_CAP supported=8,16,24(only_when_short),32,48,64,80,96,112,128,160,192,256\n");
                 return false;
             }
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_LOCK] event=CHUNK_SEARCH_BOUNDS"
-                " max_xg=%d max_xp=%d policy=AUTOMATIC_UNDER_CAP\n",
-                max_plan_xg, max_plan_xp);
-            const auto & widths =
-                llama_ring_planner::first_cycle_chunk_candidates;
+                " max_xg=%d max_xp=%d short_grid=%d min_width=%d"
+                " policy=AUTOMATIC_UNDER_CAP\n",
+                max_plan_xg, max_plan_xp, short_chunk_search ? 1 : 0,
+                widths.front());
             for (const int xg : widths) {
                 if (xg > max_plan_xg) { continue; }
                 // Two-Bank streaming requires at least two GPU chunks for
