@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Experimental resident llama-server smoke test for HTP-only Ring Prefill.
 
-Unlike run_32b_all40.py, the server keeps ONE startup Chunk Plan for every
-request. This is NOT a replacement for the per-Prompt Chunk-only main study.
+By default the server keeps ONE startup Chunk Plan across requests.
+--per-request-chunks opts into the native locked-placement Planner in
+llama_context::decode(), with actual per-request token counts and runtime
+Stage widths. This remains distinct from reloading a model per Prompt.
 No actual capacity checks are bypassed; only the Planner's estimates are.
 
 Example:
