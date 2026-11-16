@@ -70,6 +70,30 @@ class AblationTests(unittest.TestCase):
             self.assertEqual(command[command.index("--max-context") + 1], "2048")
             self.assertNotIn("--stop-on-fail", command)
 
+    def test_short50_calibration_falls_back_to_40_layer_layout(self):
+        # A2 without a supplied Full profile must not try legacy G8/P6
+        # (64 layers) on the 14B/24B 40-layer models.
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            args = SimpleNamespace(
+                out=root, main50_short=True,
+                baseline_placement_lock=None,
+                model_layers=40,
+                model=root / "model.gguf",
+                exe=root / "llama-completion.exe",
+                rpc="127.0.0.1:50052", prompt_dir=root,
+                chunk=32, threads=8,
+                plan_only=False, dry_run=False)
+            with patch.object(a.subprocess, "call", return_value=1) as launch:
+                with self.assertRaisesRegex(ValueError, "valid NPU sample"):
+                    a.ensure_independent_profile(args)
+            command = launch.call_args.args[0]
+            layout = command[command.index("--force-plan-layout") + 1]
+            from run_32b_all40 import normalize_layout
+            self.assertEqual(normalize_layout(layout, 40), layout)
+            self.assertIn("--sharegpt50-short-dataset", command)
+            self.assertIn("prompt_1024_10.txt", command)
+
     def test_gguf_layer_tensor_offsets(self):
         def string(s):
             b = s.encode("utf-8")
