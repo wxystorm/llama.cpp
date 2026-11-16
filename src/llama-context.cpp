@@ -10731,13 +10731,106 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     model.hybrid_ring_plan_layout,
                     model.hparams.n_layer())) :
             std::vector<llama_region_ring_region>{};
-    const std::vector<llama_hybrid_runtime_stage> runtime_stages =
+    std::vector<llama_hybrid_runtime_stage> runtime_stages =
         region_ring_v1 ?
             llama_region_ring_runtime_stages(
                 ring_runtime_regions,
                 region_ring_xc, region_ring_xg, region_ring_xp) :
         has_runtime_plan ? llama_hybrid_build_runtime_stages(runtime_plan) :
                            std::vector<llama_hybrid_runtime_stage>{};
+
+    // Opt-in, per-request Chunk-only Planner for the resident HTP-only
+    // llama-server. The model already owns the immutable G/P layer layout
+    // and physical CUDA/Phone weight placement. Re-evaluate the *same*
+    // independent Profile/DAG on the actual request token count and rebuild
+    // only this decode() call's Stage macro widths; NEVER modify the model.
+    //
+    // The server's two-token capability probe must not enter Graphless
+    // planning. A real fresh Prefill is >=32 tokens, single sequence,
+    // whole-UBatch, and has a locked APPLY_WIDE model-owned placement.
+    const char * request_chunks_env =
+        std::getenv("LLAMA_REGION_RING_PER_REQUEST_CHUNKS");
+    const bool per_request_chunks =
+        request_chunks_env != nullptr &&
+        std::strcmp(request_chunks_env, "1") == 0;
+    if (per_request_chunks && n_tokens_all >= 32) {
+        const char * locked_layout =
+            std::getenv("LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT");
+        if (!region_ring_v1 ||
+                model.hybrid_ring_plan_mode != "APPLY_WIDE" ||
+                model.hybrid_ring_plan_layout.empty() ||
+                locked_layout == nullptr || *locked_layout == '\0' ||
+                !ring_prefill_input_compatible ||
+                n_tokens_all > cparams.n_ubatch ||
+                ring_runtime_regions.empty()) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_REQUEST_CHUNK_PLAN] event=REJECT"
+                " tokens=%u reason=REQUIRES_LOCKED_WHOLE_UBATCH_FRESH_PREFILL"
+                " status=FAIL\n", n_tokens_all);
+            return -1;
+        }
+        const int64_t plan_begin_us = ggml_time_us();
+        int baseline_chunk = 128;
+        if (const char * raw =
+                std::getenv("LLAMA_HYBRID_REGION_RING_CHUNK_TOKENS")) {
+            baseline_chunk = std::atoi(raw);
+        }
+        std::string request_layout;
+        int request_xc = 0;
+        int request_xg = 0;
+        int request_xp = 0;
+        const bool selected =
+            llama_hybrid_region_ring_planner_apply_wide(
+                (int) n_tokens_all, 0, baseline_chunk,
+                request_layout, request_xc, request_xg, request_xp);
+        // A mismatch is never permitted to silently repartition model
+        // weights or to fall back to the startup Chunk Plan. The existing
+        // locked search owns the short (16/24/32) and ordinary (32+) grids,
+        // X=8 exclusion, two-Bank constraint and optional estimate skips.
+        if (!selected ||
+                request_layout != model.hybrid_ring_plan_layout ||
+                request_xc <= 0 || request_xg <= 0 || request_xp <= 0 ||
+                request_xg > (int) n_tokens_all ||
+                request_xp > (int) n_tokens_all) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_REQUEST_CHUNK_PLAN] event=REJECT"
+                " tokens=%u layout=%s model_layout=%s"
+                " XC=%d XG=%d XP=%d"
+                " reason=CHUNK_SEARCH_FAILED_OR_LAYOUT_CHANGED"
+                " status=FAIL\n",
+                n_tokens_all, request_layout.c_str(),
+                model.hybrid_ring_plan_layout.c_str(),
+                request_xc, request_xg, request_xp);
+            return -1;
+        }
+        const int startup_xc = region_ring_xc;
+        const int startup_xg = region_ring_xg;
+        const int startup_xp = region_ring_xp;
+        region_ring_xc = request_xc;
+        region_ring_xg = request_xg;
+        region_ring_xp = request_xp;
+        runtime_stages = llama_region_ring_runtime_stages(
+            ring_runtime_regions,
+            region_ring_xc, region_ring_xg, region_ring_xp);
+        const double planner_ms =
+            (ggml_time_us() - plan_begin_us) / 1000.0;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+            " tokens=%u kv_start=0 layout=%s"
+            " XC=%d XG=%d XP=%d"
+            " startup_XC=%d startup_XG=%d startup_XP=%d"
+            " changed=%d planner_ms=%.3f"
+            " source=LOCKED_CHUNK_ONLY"
+            " layer_placement=IMMUTABLE"
+            " execution=THIS_DECODE_ONLY status=PASS\n",
+            n_tokens_all, request_layout.c_str(),
+            region_ring_xc, region_ring_xg, region_ring_xp,
+            startup_xc, startup_xg, startup_xp,
+            (startup_xc != region_ring_xc ||
+             startup_xg != region_ring_xg ||
+             startup_xp != region_ring_xp) ? 1 : 0,
+            planner_ms);
+    }
     if (region_ring_v1 &&
             llama_region_ring_has_directional_stages(
                 ring_runtime_regions) &&
