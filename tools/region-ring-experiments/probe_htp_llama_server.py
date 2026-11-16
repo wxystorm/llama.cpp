@@ -169,6 +169,45 @@ def log_tail(path, max_lines=45):
         return "".join(deque(f, maxlen=max_lines))
 
 
+def first_error_markers(path, limit=14):
+    """Read the ENTIRE server log; last-45-lines often hide first failure.
+
+    Prioritize worker/Phone RPC/PUSH root-cause messages over secondary
+    P2C drain failures and the final HTTP 500. Keep memory bounded.
+    """
+    import re
+    primary = re.compile(
+        r"\\[(?:REGION_RING_WORKER|PHONE_INPUT_PUSH|PHONE_OWNED_PLAN|"
+        r"PHONE_HTP_ONLY|PHONE_AUTO|REGION_RING_GPU_BANK_MOVER|"
+        r"REGION_RING_P2C_JOIN)\\].*"
+        r"(?:event=EXCEPTION|event=FAIL|status=FAIL|status=REJECT|reason=)|"
+        r"\\[REGION_RING\\].*(?:event=DEADLOCK|event=FAIL)|"
+        r"ggml_.*(?:error -?[0-9]+|failed)",
+        re.IGNORECASE,
+    )
+    secondary = re.compile(
+        r"\\[(?:P2C_STREAM|REGION_RING_SUM|PHONE_INPUT_STREAM)\\]"
+        r".*(?:status=FAIL|status=-1)|"
+        r"llama_decode: failed to decode|srv.*Compute error",
+        re.IGNORECASE,
+    )
+    root, followon = [], []
+    if not path.is_file():
+        return "server log not found: " + str(path)
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for number, line in enumerate(stream, 1):
+            target = root if primary.search(line) else (
+                followon if secondary.search(line) else None)
+            if target is not None and len(target) < limit:
+                target.append(f"{number}: {line.rstrip()}")
+            if len(root) >= limit:
+                break
+    if not root:
+        return "No first-cause marker found; inspect the full log.\n" + (
+            "\n".join(followon) or "(no secondary errors found)")
+    return "\n".join(root + followon[:4])
+
+
 def main(argv=None):
     args = parse_args(argv)
     # Avoid accidentally connecting to another unrelated server on this port.
@@ -269,7 +308,10 @@ def main(argv=None):
             print(f"[SERVER_PROBE] status=PASS results={metrics_path}", flush=True)
             return 0
         except Exception:
-            print("[SERVER_PROBE] status=FAIL server_log_tail:\n"
+            print("[SERVER_PROBE] status=FAIL first_error_markers:\n"
+                  + first_error_markers(log_path),
+                  file=sys.stderr, flush=True)
+            print("[SERVER_PROBE] server_log_tail:\n"
                   + log_tail(log_path), file=sys.stderr, flush=True)
             raise
         finally:
