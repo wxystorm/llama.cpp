@@ -187,6 +187,63 @@ class Main50ShortWorkflowTests(unittest.TestCase):
                     [a for a in fixed_args if a != "--locked-layout"
                      and a != "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"])
 
+    def test_x8_not_measured_and_legacy_cache_is_readable(self):
+        self.assertEqual(runner.SHORT_PROFILE_CHUNKS[0], 16)
+        self.assertNotIn(8, runner.SHORT_PROFILE_CHUNKS)
+        self.assertEqual(runner.LEGACY_SHORT_PROFILE_CHUNKS[0], 8)
+        self.assertNotIn(8, runner.SHORT_LOCKED_PLAN_CHUNKS)
+        profile_dir = self.root / "independent-profile"
+        profile_dir.mkdir()
+        csv_path = profile_dir / "profile.csv"
+        json_path = csv_path.with_suffix(".json")
+        columns = [
+            "device", "layers", "tokens", "kv_tokens", "setup_ms",
+            "upload_ms", "prepare_ms", "compute_ms", "terminal", "samples",
+        ]
+
+        def write_profile(widths, cpu_x=16):
+            rows = [
+                {"device": "CPU", "layers": 2, "tokens": cpu_x,
+                 "kv_tokens": cpu_x, "compute_ms": 1.0},
+                {"device": "GPU", "layers": 2, "tokens": 24,
+                 "kv_tokens": 24, "compute_ms": 2.0},
+                {"device": "PHONE", "layers": 2, "tokens": 16,
+                 "kv_tokens": 2048, "compute_ms": 3.0},
+            ]
+            with csv_path.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(
+                    stream, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            meta = {
+                "schema": 1,
+                "mode": "INDEPENDENT_BACKEND_PROFILE",
+                "backends": {"N": "HTP_STRIPED"},
+                "chunk_widths": list(widths),
+                "stage_points": rows,
+                "transfers": {
+                    "pc_to_phone": [{"bytes": 1024, "ms": 1}],
+                    "gpu_weight_h2d": [{"bytes": 1024, "ms": 1}],
+                    "phone_to_pc": [{"bytes": 1024, "ms": 1}],
+                },
+            }
+            json_path.write_text(
+                json.dumps(meta), encoding="utf-8")
+
+        # Both current 16+ and historical 8+ metadata can be reused.
+        for widths in (
+                runner.SHORT_PROFILE_CHUNKS,
+                runner.LEGACY_SHORT_PROFILE_CHUNKS):
+            write_profile(widths)
+            self.assertEqual(
+                runner.verify_independent_profile(
+                    csv_path, short_chunks=True), 1)
+        # Never accept X8 as the only measured CPU short point.
+        write_profile(runner.LEGACY_SHORT_PROFILE_CHUNKS, cpu_x=8)
+        with self.assertRaisesRegex(ValueError, "X=16/24"):
+            runner.verify_independent_profile(
+                csv_path, short_chunks=True)
+
     def test_fixed_ablation_shares_the_dataset_without_auto_plan(self):
         args = runner.get_args([
             "--exe", str(self.exe), "--model", str(self.model),
