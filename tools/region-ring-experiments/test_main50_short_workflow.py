@@ -146,6 +146,47 @@ class Main50ShortWorkflowTests(unittest.TestCase):
                     "--env",
                     "LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION=0.80"])
 
+    def test_fixed_layout_locked_short_chunks_omits_x8(self):
+        # This is a separate fixed-placement experiment: --main50-short
+        # intentionally forbids --locked-layout. Existing short calibration
+        # may still contain X=8, but locked Plan selection starts at X=16.
+        fixed_args = [
+            item for item in self.base if item != "--main50-short"
+        ] + [
+            "--sharegpt50-short-dataset", "--locked-layout",
+            "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7",
+            "--locked-short-chunks", "--skip-plan-memory-checks",
+        ]
+        args = runner.get_args(fixed_args)
+        self.assertEqual(
+            args.locked_layout, "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
+        self.assertTrue(args.skip_plan_memory_checks)
+        self.assertTrue(args.locked_short_chunks)
+        self.assertEqual(runner.SHORT_LOCKED_PLAN_CHUNKS[0], 16)
+        self.assertIn(24, runner.SHORT_LOCKED_PLAN_CHUNKS)
+        self.assertNotIn(8, runner.SHORT_LOCKED_PLAN_CHUNKS)
+        cmd, env = runner.build_process(
+            args, self.prompts / "prompt_0_01.txt",
+            256, 100, self.out / "fixed-short-metrics.jsonl")
+        self.assertIn(str(self.model), cmd)
+        self.assertEqual(
+            env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"], "1")
+        self.assertEqual(
+            env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"], "1")
+        self.assertEqual(
+            env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"],
+            "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
+
+        # Profile flags are not an escape hatch to an unvalidated layout.
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                runner.get_args(
+                    fixed_args + ["--main50-short"])
+            with self.assertRaises(SystemExit):
+                runner.get_args(
+                    [a for a in fixed_args if a != "--locked-layout"
+                     and a != "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"])
+
     def test_fixed_ablation_shares_the_dataset_without_auto_plan(self):
         args = runner.get_args([
             "--exe", str(self.exe), "--model", str(self.model),
