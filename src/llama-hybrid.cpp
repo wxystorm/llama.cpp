@@ -11500,7 +11500,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 max_plan_xg, max_plan_xp, short_chunk_search ? 1 : 0,
                 widths.front());
             for (const int xg : widths) {
-                if (xg > max_plan_xg) { continue; }
+                if (xg > max_plan_xg || xg > model.tokens) { continue; }
                 // Two-Bank streaming requires at least two GPU chunks for
                 // the verified normal prefill path. Never silently pick
                 // a short-batch Chunk shape whose runtime cannot use it.
@@ -11509,8 +11509,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     continue;
                 }
                 for (const int xc : widths) {
+                    if (xc > model.tokens) { continue; }
                     for (const int xp : widths) {
-                        if (xp > max_plan_xp) { continue; }
+                        // Phone-owned Plan v4 validates chunk_tokens <=
+                        // total_tokens. The DAG may score a wider one-Chunk
+                        // region, but the actual HTP RPC would reject it.
+                        if (xp > max_plan_xp || xp > model.tokens) { continue; }
                         ++tried;
                         llama_ring_planner::candidate probe;
                         probe.concrete_regions = locked_regions;
