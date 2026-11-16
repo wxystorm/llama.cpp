@@ -85,6 +85,38 @@ mmap enabled for the PC/GGUF weights, uses `-n 1`, and disables warmup.
 Do not reuse the old output directory: it contains legacy Plan v2/v3
 results with incompatible Phone memory placement.
 
+## Hexagon fixed-graph cache capacity (multi-Region HTP)
+
+The 32B layout `G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7` assigns
+21 HTP layers to four independent FastRPC sessions. A 1855-token
+Prompt at X=32 generates 58 fixed graphs per layer. HTP2 owns six
+of those layers and therefore needs 348 fixed graph cache entries.
+The former hard-coded `256` entry limit in
+`ggml/src/ggml-hexagon/ggml-hexagon.cpp` failed while registering
+Region 7, layer 45, after compiling exactly 24 Chunks:
+`4*58+24=256`. This was `PHONE_OWNED_HTP_COMPILE_FAILED`,
+**not** the unrelated 256 MiB scratch budget, an actual NPU OOM,
+or failed PC-to-Phone networking.
+
+The fixed-cache cap is now 1024 **per Hexagon session**, covering
+this layout even for 2048 tokens at the minimum X16
+(`6*128=768`). Both precompile and runtime insertions use the
+same bounded cap. If a larger future topology exceeds it, Phone
+prints `[HEXAGON_FIXED_GRAPH_CACHE] ... reason=PER_SESSION_GRAPH_CACHE_CAP`.
+The `GGML_HEXAGON_NDEV` sessions still share physical Phone RAM.
+
+**Rebuild and restart the PHONE `ggml-rpc-server` binary from the
+updated branch.** This patch changes `ggml-hexagon.cpp` inside the
+Phone backend; rebuilding Windows `llama-server` only will not fix it.
+Use the same checked-out branch on PC and Phone. Re-run the three
+`probe_htp_llama_server.py` requests before attempting `--all50`;
+a correct first Prefill is not yet proof that subsequent server
+requests (HTP fresh-KV reset / one-token decode) work.
+
+Source-level regression:
+
+    python tools/region-ring-experiments/test_phone_owned_scratch_reuse.py
+
 ## Scaling candidates
 
 Only change the Phone `GGML_RPC_PHONE_NPU_SERIAL_REGIONS` **and** PC
