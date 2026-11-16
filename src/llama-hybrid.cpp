@@ -10696,11 +10696,13 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     if (htp_session_guard && wide_apply) {
         LLAMA_LOG_INFO(
             "[REGION_RING_PC_MEMORY_POLICY] mode=%s model_mmap=%d "
-            "cpu_weights=FULL gpu_mmap=MAX_TWO_BANK_WINDOWS "
-            "phone_mmap=FILE_BACKED htp_ram=SEPARATE "
+            "cpu_weights=FULL gpu_host_weights=%s "
+            "phone_pc_weights=%s htp_ram=SEPARATE "
             "pc_free_mib=%.1f status=CONFIGURED\n",
             pc_mmap_windowed ? "MMAP_WINDOWED" : "RESIDENT_FULL",
             profile.pc_model_weights_mmap ? 1 : 0,
+            pc_mmap_windowed ? "TWO_BANK_WINDOWS" : "FULL_RESIDENT",
+            pc_mmap_windowed ? "FILE_BACKED" : "FULL_RESIDENT",
             profile.pc_free_mem / 1048576.0);
     }
     // Resolve FORCE once, before constructing any estimated memory guards.
