@@ -9238,6 +9238,31 @@ static bool llama_hybrid_calibrate_independent_ring(
         std::remove(temporary.c_str());
         return false;
     }
+    if (short_chunk_grid) {
+        const auto has_short_measurement = [&](const char * name) {
+            return std::any_of(details.begin(), details.end(),
+                [name](const point & p) {
+                    return p.dev == name && p.tokens > 0 &&
+                        p.tokens < 32 && std::isfinite(p.compute_ms) &&
+                        p.compute_ms > 0.0;
+                });
+        };
+        const bool cpu_short = has_short_measurement("CPU");
+        const bool gpu_short = has_short_measurement("GPU");
+        const bool htp_short = has_short_measurement("PHONE");
+        if (!cpu_short || (gpu && !gpu_short) || !htp_short) {
+            LLAMA_LOG_ERROR(
+                "[INDEPENDENT_PROFILE] status=REJECT"
+                " reason=SHORT_CHUNK_ANCHOR_UNAVAILABLE"
+                " cpu=%d gpu=%d phone=%d"
+                " action=CHECK_GPU_HTP_PROBES\n",
+                cpu_short ? 1 : 0, gpu_short ? 1 : 0,
+                htp_short ? 1 : 0);
+            csv.close();
+            std::remove(temporary.c_str());
+            return false;
+        }
+    }
     csv.flush();
     if (!csv.good()) {
         csv.close();
