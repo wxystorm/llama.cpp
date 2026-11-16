@@ -229,6 +229,205 @@ def first_error_markers(path, limit=14):
     return "\n".join(root + followon[:4])
 
 
+def group_for_prompt(name):
+    """The 0 group is actually 64..128 tokenizer tokens."""
+    return int(name.split("_", 2)[1])
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def file_identity(path):
+    resolved = Path(path).resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def sweep_config(args, command, env, all_prompts, anchor_tokens):
+    """Fingerprint every factor that must remain constant across a resume.
+
+    --limit is deliberately excluded: a staged first 10 and resumed full
+    50 must share exactly the same experiment identity.
+    """
+    runtime_env = {
+        key: value for key, value in sorted(env.items())
+        if key.startswith(("LLAMA_", "GGML_"))
+    }
+    base = {
+        "schema": 1,
+        "server_command": command,
+        "server_binary": file_identity(args.server_exe),
+        "model": file_identity(args.model),
+        "rpc": args.rpc,
+        "prompt_dir": str(args.prompt_dir.resolve()),
+        "prompts": [p.name for p in all_prompts],
+        "prompt_sha256": {p.name: sha256_file(p) for p in all_prompts},
+        "manifest_sha256": sha256_file(args.prompt_dir / "manifest.csv"),
+        "profile_sha256": {
+            name: sha256_file(args.profile_source / name)
+            for name in ("profile.csv", "profile.json")
+        },
+        "anchor_tokens": anchor_tokens,
+        "runtime_env": runtime_env,
+        "request": {"n_predict": 1, "cache_prompt": False,
+                    "parallel": 1, "context": 2048},
+        "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds,
+    }
+    encoded = json.dumps(
+        base, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode("utf-8")
+    return {
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+        "configuration": base,
+    }
+
+
+def load_completed_requests(path, prompts, fingerprint):
+    """Fail closed on edited, duplicated, mixed, or non-prefix result rows."""
+    if not path.is_file():
+        return []
+    completed = []
+    with path.open("r", encoding="utf-8") as stream:
+        for number, line in enumerate(stream, 1):
+            if not line.strip():
+                raise ValueError(f"Empty JSONL row {number} in {path}")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSONL row {number} in {path}: {exc}") from exc
+            if number > len(prompts) or not isinstance(record, dict):
+                raise ValueError("Unexpected extra or invalid result row "
+                                 + str(number))
+            expected = prompts[number - 1].name
+            if (record.get("index") != number or
+                    record.get("prompt") != expected or
+                    record.get("run_fingerprint") != fingerprint or
+                    record.get("cache_n") != 0 or
+                    record.get("status") != "PASS"):
+                raise ValueError(
+                    f"Resume result mismatch at row {number}: expected "
+                    f"{expected}, PASS, zero cache, matching fingerprint")
+            completed.append(record)
+    return completed
+
+
+def report_rows(records, group_order):
+    """Summarize per-prompt rates and token/time-weighted aggregate rate."""
+    rows = []
+    for group in [*group_order, "ALL"]:
+        subset = [r for r in records if group == "ALL" or
+                  r["group"] == group]
+        expected = 50 if group == "ALL" else 10
+        count = len(subset)
+        tokens = sum(r["prompt_n"] for r in subset)
+        prefill_ms = sum(r["prompt_ms"] for r in subset)
+        rates = [r["prefill_tps"] for r in subset]
+        row = {
+            "group": group,
+            "completed": count,
+            "expected": expected,
+            "status": "PASS" if count == expected else "INCOMPLETE",
+            "total_tokens": tokens,
+            "total_prefill_ms": round(prefill_ms, 3),
+            "weighted_tps": round(1000 * tokens / prefill_ms, 3)
+                if prefill_ms else "",
+            "median_tps": round(statistics.median(rates), 3)
+                if rates else "",
+            "mean_tps": round(statistics.mean(rates), 3)
+                if rates else "",
+            "min_tps": round(min(rates), 3) if rates else "",
+            "max_tps": round(max(rates), 3) if rates else "",
+            "median_prefill_ms": round(
+                statistics.median([r["prompt_ms"] for r in subset]), 3)
+                if subset else "",
+        }
+        rows.append(row)
+    return rows
+
+
+def write_reports(out, records):
+    """Rebuild readable tables after every PASS, including after resume."""
+    out.mkdir(parents=True, exist_ok=True)
+    detail_fields = [
+        "index", "group", "prompt", "manifest_n", "prompt_n",
+        "token_delta", "cache_n", "prompt_ms", "prefill_tps",
+        "request_wall_ms", "predicted_n", "planner_mode",
+        "runtime_layout", "status",
+    ]
+    with (out / "requests.csv").open(
+            "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(
+            stream, fieldnames=detail_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(records)
+    rows = report_rows(records, runner.MAIN50_SHORT_GROUPS)
+    with (out / "summary.csv").open(
+            "w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    (out / "summary.json").write_text(
+        json.dumps({"status": "PASS" if len(records) == 50
+                    else "INCOMPLETE",
+                    "completed": len(records), "expected": 50,
+                    "groups": rows}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+
+
+def prepare_sweep_output(args, config, prompts):
+    """Never silently overwrite a previous 50-Prompt benchmark."""
+    args.out.mkdir(parents=True, exist_ok=True)
+    config_path = args.out / "server-run-config.json"
+    metrics_path = args.out / "requests.jsonl"
+    if not args.resume and (config_path.exists() or metrics_path.exists()):
+        raise ValueError(
+            "Existing --all50 results would be overwritten. "
+            "Use --resume for the exact same experiment or a fresh --out.")
+    if args.resume and (config_path.exists() != metrics_path.exists()):
+        # Before the first request, a run may have created the config but
+        # not the JSONL. That is safe; a JSONL without a config is not.
+        if metrics_path.exists():
+            raise ValueError(
+                "Cannot resume requests.jsonl without server-run-config.json")
+    if config_path.exists():
+        stored = json.loads(config_path.read_text(encoding="utf-8"))
+        if stored.get("fingerprint") != config["fingerprint"]:
+            raise ValueError(
+                "Resume configuration changed (binary, model, Profile, "
+                "prompts, Chunk flags or delay). Use a new --out.")
+    else:
+        config_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+    completed = load_completed_requests(
+        metrics_path, prompts, config["fingerprint"])
+    write_reports(args.out, completed)
+    return completed
+
+
+def sweep_log_path(out, resume):
+    """A resumed server keeps earlier logs for postmortem comparisons."""
+    first = out / "llama-server.log"
+    if not resume or not first.exists():
+        return first
+    index = 1
+    while True:
+        candidate = out / f"llama-server-resume-{index:03d}.log"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def main(argv=None):
     args = parse_args(argv)
     # Avoid accidentally connecting to another unrelated server on this port.
