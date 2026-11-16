@@ -339,11 +339,11 @@ class ServerProbeTests(unittest.TestCase):
                 " startup_XC=64 startup_XG=64 startup_XP=64"
                 " changed=1 planner_ms=12.125"
                 " source=LOCKED_CHUNK_ONLY"
-                " execution=THIS_DECODE_ONLY status=PASS\\n"
+                " execution=THIS_DECODE_ONLY status=PASS\n"
                 "[REGION_RING_SUM] tokens=1855 XC=0 XG=96 XP=128"
                 " regions=9 first_region_chunks=20 tasks=180"
                 " executed=180 complete=1 wall_ms=1234"
-                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\\n",
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n",
                 encoding="utf-8")
             planned, _ = probe.read_request_chunk_plan(
                 log, 0, 1855, 256, 256, layout)
