@@ -3053,6 +3053,88 @@ inline bool runtime_cycle_micro_adjusted(
     return cycle >= 1;
 }
 
+// Distinguish fully GPU/Phone Cycles, fully three-device Cycles, and
+// genuinely mixed Cycles. A trailing PC GPU Head is not itself a Cycle.
+// Only already validated G/[C]/P layouts are classified here.
+inline int runtime_topology_family(
+        const std::vector<llama_region_ring_region> & regions) {
+    size_t cpu_regions = 0;
+    size_t phone_regions = 0;
+    for (const auto & region : regions) {
+        cpu_regions += region.device == device::CPU;
+        phone_regions += region.device == device::PHONE;
+    }
+    if (phone_regions == 0) { return -1; }
+    return cpu_regions == 0 ? 0 :
+           cpu_regions == phone_regions ? 1 : 2;
+}
+
+inline const char * runtime_topology_family_name(int family) {
+    switch (family) {
+        case 0: return "GP";
+        case 1: return "GCP";
+        case 2: return "MIXED";
+        default: return "INVALID";
+    }
+}
+
+// The HTP-only runtime adds a final PC GPU tail to Phone-final parents.
+// Retaining only the globally fastest Phone-final parents can silently
+// discard all G/P or mixed-CPU layouts BEFORE the final-tail memory/DAG
+// check. Reserve two distinct layouts for each topology x Cycle count,
+// then fill the remaining slots by full-Prompt DAG wall time. This is
+// diversification, not a fitness bonus: the final GPU-tail DAG still
+// selects the globally fastest executable candidate.
+inline void retain_runtime_topology_parents(
+        const model & m, std::vector<candidate> & top,
+        size_t cap = 48) {
+    if (top.size() <= cap) { return; }
+    if (cap == 0) {
+        top.clear();
+        return;
+    }
+    std::vector<uint8_t> selected(top.size(), 0);
+    std::vector<size_t> keep;
+    keep.reserve(cap);
+    const auto retain = [&](size_t index) {
+        if (selected[index] || keep.size() >= cap) { return; }
+        selected[index] = 1;
+        keep.push_back(index);
+    };
+    for (int cycles = k_runtime_min_cycles;
+            cycles <= k_runtime_max_cycles; ++cycles) {
+        for (int family = 0; family < 3; ++family) {
+            std::unordered_set<std::string> layouts;
+            for (size_t i = 0; i < top.size() &&
+                    keep.size() < cap && layouts.size() < 2; ++i) {
+                if (selected[i] || top[i].cycles != cycles) { continue; }
+                std::vector<llama_region_ring_region> regions;
+                if (!make_regions(top[i], m.layers, regions) ||
+                        runtime_topology_family(regions) != family) {
+                    continue;
+                }
+                const std::string layout =
+                    llama_region_ring_layout_string(regions);
+                if (layouts.insert(layout).second) {
+                    retain(i);
+                }
+            }
+        }
+    }
+    for (size_t i = 0; i < top.size() && keep.size() < cap; ++i) {
+        retain(i);
+    }
+    // Incoming top[] was already sorted by exact DAG wall time.
+    // Restoring its original index order preserves the global best at [0].
+    std::sort(keep.begin(), keep.end());
+    std::vector<candidate> diversified;
+    diversified.reserve(keep.size());
+    for (size_t i : keep) {
+        diversified.push_back(std::move(top[i]));
+    }
+    top = std::move(diversified);
+}
+
 // First-stage zero-CPU search. Keep legacy Uniform/Prefix E optimizers
 // unchanged: they assume three nonempty regions per cycle. Expand only
 // complete layouts by removing CPU regions from promising incumbents, plus
@@ -5050,12 +5132,10 @@ inline result search_runtime_applicable(
     if (!out.top.empty()) {
         out.selected = out.top.front();
         out.valid = true;
-        // HTP-only GPU-tail refinement derives 1..8 tail layers from
-        // these survivors. Keep more complete DAG-safe parents so an
-        // individually fast Phone-final plan does not monopolize selection.
-        if (out.top.size() > 24) {
-            out.top.resize(24);
-        }
+        // Preserve G/P, G/C/P, and mixed-CPU topologies across Cycle
+        // counts before the HTP-only GPU-tail verification. Every survivor
+        // has already passed the original memory guard and full DAG.
+        retain_runtime_topology_parents(m, out.top, 48);
     }
     return out;
 }
