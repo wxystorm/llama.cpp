@@ -220,21 +220,34 @@ class ServerProbeTests(unittest.TestCase):
                 " changed=1 planner_ms=5.125"
                 " source=LOCKED_CHUNK_ONLY layer_placement=IMMUTABLE"
                 " execution=THIS_DECODE_ONLY status=PASS\n")
+            runtime = (
+                "[REGION_RING_SUM] tokens=66 XC=0 XG=17 XP=25"
+                " regions=11 first_region_chunks=4 tasks=44"
+                " executed=44 complete=1 wall_ms=9.0"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
             log.write_text(
                 "[PHONE_HTP_ONLY] event=REJECT reason=REQUIRES_GRAPHLESS_FRESH_PREFILL\n"
-                + line, encoding="utf-8")
+                + line + runtime, encoding="utf-8")
             decision, offset = probe.read_request_chunk_plan(log, 0, 66)
             self.assertEqual(
                 (decision["plan_xc"], decision["plan_xg"],
                  decision["plan_xp"]), (24, 16, 24))
             self.assertAlmostEqual(decision["planner_ms"], 5.125)
+            self.assertEqual((decision["runtime_xc"],
+                              decision["runtime_xg"],
+                              decision["runtime_xp"]), (0, 17, 25))
             self.assertEqual(offset, log.stat().st_size)
+            log.write_text(line, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "execution missing"):
+                probe.read_request_chunk_plan(log, 0, 66)
+            log.write_text(line + runtime, encoding="utf-8")
 
             with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
                 probe.read_request_chunk_plan(log, offset, 66)
             with self.assertRaisesRegex(RuntimeError, "token mismatch"):
                 probe.read_request_chunk_plan(log, 0, 1855)
-            log.write_text(line + line, encoding="utf-8")
+            log.write_text(line + runtime + line + runtime,
+                           encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "matches=2"):
                 probe.read_request_chunk_plan(log, 0, 66)
 
@@ -249,8 +262,13 @@ class ServerProbeTests(unittest.TestCase):
                     " source=LOCKED_CHUNK_ONLY"
                     " execution=THIS_DECODE_ONLY status=PASS\n")
             correct = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+            runtime = (
+                "[REGION_RING_SUM] tokens=66 XC=0 XG=33 XP=17"
+                " regions=11 first_region_chunks=2 tasks=22"
+                " executed=22 complete=1 wall_ms=9.0"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
             log.write_text(
-                line.format(layout=correct, xg=32),
+                line.format(layout=correct, xg=32) + runtime,
                 encoding="utf-8")
             got, _ = probe.read_request_chunk_plan(log, 0, 66)
             self.assertEqual(got["plan_xg"], 32)
