@@ -445,6 +445,17 @@ def main(argv=None):
     if not 32 <= anchor_tokens < 2048:
         raise ValueError("Invalid 2048-context anchor token count")
     prompts = prompt_files(args.prompt_dir, args.all50)
+    if args.all50:
+        # Refuse a mismatched or truncated dataset before any expensive
+        # model load. Group 0 must remain the real 64..128-token group.
+        for path in prompts:
+            tokens = manifest.get(path.name)
+            if tokens is None or not 64 <= int(tokens) < 2048:
+                raise ValueError(
+                    f"Missing/out-of-context manifest token count: {path.name}={tokens}")
+            if group_for_prompt(path.name) == 0 and not 64 <= int(tokens) <= 128:
+                raise ValueError(
+                    f"Group 0 must be 64..128 actual tokens: {path.name}={tokens}")
 
     # Reuse the tested runner's full Phone HTP / CUDA / RPC environment.
     # The independent Profile may contain old X=8 entries but the startup
@@ -497,35 +508,84 @@ def main(argv=None):
         return 0
 
     args.out.mkdir(parents=True, exist_ok=True)
-    log_path = args.out / "llama-server.log"
     metrics_path = args.out / "requests.jsonl"
+    completed = []
+    if args.all50:
+        config = sweep_config(args, command, env, prompts, anchor_tokens)
+        completed = prepare_sweep_output(args, config, prompts)
+        selected_count = args.limit or len(prompts)
+        print(f"[SERVER_SWEEP] experiment=ALL50_UNIQUE"
+              f" long_anchor=FIRST selected={selected_count}/50"
+              f" existing_pass={len(completed)}"
+              f" resume={int(args.resume)}"
+              f" delay_seconds={args.inter_prompt_delay_seconds:.1f}"
+              f" fingerprint={config['fingerprint'][:12]}", flush=True)
+        if len(completed) >= selected_count:
+            print(f"[SERVER_SWEEP] status="
+                  f"{'PASS' if len(completed) == 50 else 'PARTIAL'}"
+                  f" completed={len(completed)}/50"
+                  f" no_new_requests=1 results={metrics_path}", flush=True)
+            return 0
+
+    log_path = sweep_log_path(args.out, args.resume)
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
         proc = subprocess.Popen(command, env=env,
                                 stdout=log, stderr=subprocess.STDOUT)
         try:
             wait_for_ready(proc, args.port, args.startup_timeout)
             print("[SERVER_PROBE] health=READY model=RESIDENT", flush=True)
-            with metrics_path.open("w", encoding="utf-8") as output:
+            open_mode = "a" if args.all50 and args.resume else "w"
+            with metrics_path.open(open_mode, encoding="utf-8") as output:
+                requested_this_process = 0
                 for i, path in enumerate(prompts, 1):
+                    if args.all50 and args.limit and i > args.limit:
+                        break
+                    if args.all50 and i <= len(completed):
+                        continue
+                    if (requested_this_process > 0 and
+                            args.inter_prompt_delay_seconds > 0):
+                        time.sleep(args.inter_prompt_delay_seconds)
                     prompt = path.read_text(encoding="utf-8-sig")
                     began = time.monotonic()
                     record = post_completion(args.port, prompt)
                     record.update({
                         "prompt": path.name, "index": i,
+                        "group": group_for_prompt(path.name),
+                        "manifest_n": int(manifest[path.name]),
+                        "token_delta": record["prompt_n"] -
+                                       int(manifest[path.name]),
                         "request_wall_ms": round(
                             (time.monotonic() - began) * 1000, 3),
                         "planner_mode": "STARTUP_ONLY",
                         "runtime_layout": fake_args.locked_layout,
+                        "status": "PASS",
                     })
+                    if args.all50:
+                        record["run_fingerprint"] = config["fingerprint"]
                     output.write(json.dumps(record, ensure_ascii=False) + "\n")
                     output.flush()
+                    requested_this_process += 1
+                    if args.all50:
+                        completed.append(record)
+                        write_reports(args.out, completed)
                     print(f"[SERVER_PROBE] {i}/{len(prompts)}"
                           f" prompt={path.name}"
+                          f" group={record['group']}"
                           f" prompt_n={record['prompt_n']}"
                           f" cache_n={record['cache_n']}"
                           f" prefill_ms={record['prompt_ms']:.3f}"
                           f" tps={record['prefill_tps']:.3f}", flush=True)
-            print(f"[SERVER_PROBE] status=PASS results={metrics_path}", flush=True)
+            if args.all50:
+                finished = len(completed) == 50
+                print(f"[SERVER_SWEEP] status={'PASS' if finished else 'PARTIAL'}"
+                      f" completed={len(completed)}/50"
+                      f" requests={metrics_path}"
+                      f" summary={args.out / 'summary.csv'}"
+                      f" details={args.out / 'requests.csv'}"
+                      f" log={log_path}", flush=True)
+            else:
+                print(f"[SERVER_PROBE] status=PASS results={metrics_path}",
+                      flush=True)
             return 0
         except Exception:
             print("[SERVER_PROBE] status=FAIL first_error_markers:\n"
