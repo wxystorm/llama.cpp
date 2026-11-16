@@ -124,10 +124,16 @@ Prefill PASS/TPS, not predicted_ms alone.
 ## Experimental resident llama-server smoke test
 
 `llama-server` can keep the 64-layer G/P topology and HTP weights
-resident across requests, but the current native Planner is a model-load
-hook. The server **does not re-plan XC/XG/XP per HTTP request**. Treat
-this mode as a separate fixed-Chunk feasibility/overhead test, never as
-equivalent to the dynamic per-Prompt main experiment.
+resident across requests. The default server mode preserves its
+model-load-time XC/XG/XP startup Plan. An additional opt-in
+`--per-request-chunks` now calls the **native locked-layout Planner**
+from `llama_context::decode()` before every real single-sequence
+Prefill, using actual request token count and the same independent
+G/C/N Profile/DAG; it applies the selected widths to this request's
+runtime Stages only. Neither mode reallocates the model's PC/Phone layer
+ownership. Keep startup-only and per-request runs in separate outputs;
+the resident-server result is not directly the same experiment as
+a separate process/model-load on each Prompt.
 
 The smoke harness reuses this runner's HTP-only GPU Bank/RPC environment,
 reuses a validated independent Profile (including an older X8 sample,
@@ -231,6 +237,89 @@ The script stops on a failed request or unexpectedly reused cache
 instead of entering fake PASS results. Resumption starts a new resident
 server but does not rerun completed requests. A successful 3/3 smoke
 does not guarantee the entire 50 will pass.
+
+
+### Native per-request Chunk-only Planner for resident llama-server
+
+Use this **instead of** startup-only mode when you want every Prompt
+to select its own XC/XG/XP. The Python script does NOT guess the Chunk
+width based on token length; C++ re-invokes the existing native
+`llama_hybrid_region_ring_planner_apply_wide()` search with actual
+`n_tokens_all`, scores the fixed Region topology using the stored
+Profile and full event DAG, and constructs new *local* runtime Stages
+before the current decode executes. The model-owned layer placement,
+HTP weight mappings and GPU Bank weights remain unchanged.
+
+Opt-in is through `LLAMA_REGION_RING_PER_REQUEST_CHUNKS=1`,
+set automatically by the Python harness when using
+`--per-request-chunks`. The known two-token llama-server capability
+probe is skipped (less than 32 tokens). A regular Prompt MUST be a
+single fresh sequence processed in one UBatch. A request that cannot
+be planned with the locked topology fails explicitly; it does not
+quietly fall back to startup-only Chunk widths or repartition weights.
+
+- For actual tokens <=256, use the independent short-width grid
+  (16, 24, 32 and wider), with X=8 excluded.
+- Longer Prompts retain the regular 32+ grid.
+- The selected physical XG and XP are capped at 32; the unused XC
+  model width may be larger because the fixed layout contains no
+  CPU layer Regions.
+- The two-Bank constraint 2*XG <= real tokens remains enforced.
+- `--skip-plan-memory-checks` still skips ONLY estimates in this
+  user-fixed locked layout; real allocation failures are still fatal.
+
+For the 32B long-short-long regression with native re-planning:
+
+    $root = "E:\llama\llama-tensor-v2"
+    cd $root
+    git pull --ff-only
+    cmake --build .\build-tensor-v2 --config Release --target llama-server -j 8
+    python .\tools\region-ring-experiments\test_probe_htp_llama_server.py
+
+    $args = @(
+      "--server-exe", "$root\build-tensor-v2\bin\Release\llama-server.exe",
+      "--model", "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
+      "--rpc", "10.238.229.239:50052",
+      "--prompt-dir", "E:\llama\datasets\sharegpt\sharegpt50_short",
+      "--profile-source", "$root\32b-sharegpt50-short-mmap-test\independent-profile",
+      "--out", "$root\32b-server-dynamic-smoke",
+      "--port", "18080",
+      "--per-request-chunks"
+    )
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py @args
+
+To run the FULL 50 unique Prompts, use a separate output directory
+and add `--all50`; the server remains resident for all 50:
+
+    $full = @(
+      "--server-exe", "$root\build-tensor-v2\bin\Release\llama-server.exe",
+      "--model", "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
+      "--rpc", "10.238.229.239:50052",
+      "--prompt-dir", "E:\llama\datasets\sharegpt\sharegpt50_short",
+      "--profile-source", "$root\32b-sharegpt50-short-mmap-test\independent-profile",
+      "--out", "$root\32b-server-dynamic-all50",
+      "--port", "18080",
+      "--all50", "--per-request-chunks"
+    )
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py @full
+
+    # Resume after an interruption, with identical inputs and binary.
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py @full --resume
+
+The harness validates EACH successful HTTP response against one native
+`[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT` log from the same
+request. A response without this marker is NOT counted as a valid
+per-request benchmark. The CSV/JSONL rows contain
+`plan_xc / plan_xg / plan_xp / planner_ms`; group summaries include
+the observed distribution of Chunk Plans and mean/median Planner time.
+The native Planner logs
+`[REGION_RING_REQUEST_CHUNK_PLAN] event=REJECT ... status=FAIL`
+if it cannot preserve the model-owned layout.
+
+For A/B comparison run startup-only in a DIFFERENT `--out` directory
+with the identical options EXCEPT omit `--per-request-chunks`.
+The per-request implementation is experimental and needs PC+HTP
+verification; do not treat the code change alone as a measured speedup.
 
 
 ## Consistent 32B A0..A3 ablations
