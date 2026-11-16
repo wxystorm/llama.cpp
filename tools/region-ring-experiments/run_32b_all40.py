@@ -1164,6 +1164,10 @@ def main(argv=None):
     selections = [(g, p) for g, p in prompts
                   if (not args.only_group or g in args.only_group)
                   and (not args.only_prompt or p.name in args.only_prompt)]
+    if args.only_prompt and set(args.only_prompt) - {p.name for _, p in prompts}:
+        raise ValueError("Unknown --only-prompt file")
+    if args.limit:
+        selections = selections[:args.limit]
     # Make the effective planner token estimate visible before GPU/HTP
     # memory feasibility search; a bin-bound fallback should never be silent.
     for group, prompt in selections:
@@ -1173,10 +1177,6 @@ def main(argv=None):
               f"plan_tokens={decisions[prompt.name]['prompt_tokens_hint']} "
               f"source={source} context={decisions[prompt.name]['context']}",
               flush=True)
-    if args.only_prompt and set(args.only_prompt) - {p.name for _, p in prompts}:
-        raise ValueError("Unknown --only-prompt file")
-    if args.limit:
-        selections = selections[:args.limit]
     if args.warmup_prompt is not None and args.warmup_prompt not in {
             p.name for _, p in prompts}:
         raise ValueError("Unknown --warmup-prompt file")
