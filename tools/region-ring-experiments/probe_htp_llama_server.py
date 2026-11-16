@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Experimental resident llama-server smoke test for HTP-only Ring Prefill.
+"""Resident llama-server smoke and 50-Prompt HTP-only Region Ring Prefill.
 
 By default the server keeps ONE startup Chunk Plan across requests.
 --per-request-chunks opts into the native locked-placement Planner in
 llama_context::decode(), with actual per-request token counts and runtime
 Stage widths. This remains distinct from reloading a model per Prompt.
+Accepts a model-specific --model-layers and --locked-layout so the same
+resident-server harness supports both Qwen3-32B and Mistral Small 24B.
 No actual capacity checks are bypassed; only the Planner's estimates are.
 
 Example:
@@ -37,6 +39,7 @@ import run_32b_all40 as runner
 
 # Qwen3-32B: the final G7 is essential; G6 would total only 63 layers.
 LAYOUT = "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"
+DEFAULT_CANONICAL_LAYOUT = LAYOUT.replace("N", "P")
 
 
 def server_command(server_exe, model, rpc, port, threads=8):
@@ -70,6 +73,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--server-exe", type=Path, required=True)
     p.add_argument("--model", type=Path, required=True)
+    p.add_argument("--model-layers", type=int, default=64,
+                   help="decoder layer count (Qwen3-32B: 64; Mistral 24B: 40)")
+    p.add_argument("--locked-layout", default=LAYOUT,
+                   help="immutable G/P Region layout; N is accepted as P alias")
     p.add_argument("--rpc", required=True)
     p.add_argument("--prompt-dir", type=Path, required=True)
     p.add_argument("--profile-source", type=Path, required=True,
@@ -99,6 +106,15 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if not 1024 <= args.port <= 65535:
         p.error("--port must be 1024..65535")
+    if not 3 <= args.model_layers <= 256:
+        p.error("--model-layers must be between 3 and 256")
+    try:
+        args.locked_layout = runner.normalize_layout(
+            args.locked_layout.upper().replace("N", "P"), args.model_layers)
+    except ValueError as exc:
+        p.error("--locked-layout: " + str(exc))
+    if not any(part.startswith("P") for part in args.locked_layout.split(",")):
+        p.error("--locked-layout requires a Phone Region")
     for label in ("server_exe", "model"):
         if not getattr(args, label).is_file():
             p.error("--" + label.replace("_", "-") + " not found")
@@ -256,7 +272,8 @@ REQUEST_EXEC_RE = re.compile(
 
 
 def read_request_chunk_plan(log_path, offset, expected_tokens,
-                            max_plan_xg=256, max_plan_xp=256):
+                            max_plan_xg=256, max_plan_xp=256,
+                            expected_layout=DEFAULT_CANONICAL_LAYOUT):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -288,7 +305,7 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
         raise RuntimeError(
             f"Two-Bank request has insufficient tokens: "
             f"XG={xg}, tokens={expected_tokens}")
-    if layout != "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7":
+    if layout != expected_layout:
         raise RuntimeError("Native Chunk Planner changed fixed layout: " + layout)
     executed = list(REQUEST_EXEC_RE.finditer(data))
     if len(executed) != 1:
@@ -575,16 +592,16 @@ def main(argv=None):
                     f"Group 0 must be 64..128 actual tokens: {path.name}={tokens}")
 
     # Reuse the tested runner's full Phone HTP / CUDA / RPC environment.
-    # The independent Profile may contain old X=8 entries but the startup
-    # locked Chunk search is capped at XG=XP=32, and never selects X=8.
+    # The independent Profile may contain historical X=8 entries;
+    # the locked Chunk search never selects X=8.
     fake_args = runner.get_args([
         "--exe", str(args.server_exe), "--model", str(args.model),
-        "--model-layers", "64", "--rpc", args.rpc,
+        "--model-layers", str(args.model_layers), "--rpc", args.rpc,
         "--prompt-dir", str(args.prompt_dir), "--out", str(args.out),
         "--repo-root", str(Path(__file__).resolve().parents[2]),
         "--auto-plan", "--htp-only", "--streaming", "on",
         "--sharegpt50-short-dataset",
-        "--locked-layout", LAYOUT, "--locked-short-chunks",
+        "--locked-layout", args.locked_layout, "--locked-short-chunks",
         "--skip-plan-memory-checks",
         "--max-plan-xg", str(args.max_plan_xg),
         "--max-plan-xp", str(args.max_plan_xp),
@@ -610,8 +627,7 @@ def main(argv=None):
     _, env = runner.build_process(fake_args, anchor, 2048,
                                   anchor_tokens, args.out / "metrics.jsonl")
     # Explicitly guard against inheriting a different user's runtime flags.
-    assert env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] == (
-        "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
+    assert env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] == args.locked_layout
     assert env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] == "1"
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
@@ -621,6 +637,7 @@ def main(argv=None):
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
           ("PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH" if args.per_request_chunks
            else "ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH") +
@@ -679,7 +696,8 @@ def main(argv=None):
                     if args.per_request_chunks:
                         decision, log_offset = read_request_chunk_plan(
                             log_path, log_offset, record["prompt_n"],
-                            args.max_plan_xg, args.max_plan_xp)
+                            args.max_plan_xg, args.max_plan_xp,
+                            args.locked_layout)
                         record.update(decision)
                     record.update({
                         "prompt": path.name, "index": i,
