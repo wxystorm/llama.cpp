@@ -218,8 +218,13 @@ def read_manifest(folder: Path):
                           for key, val in record.items()}
             name = Path(normalized.get("file", "")).name
             tokens = None
-            for field in ("modeltokens", "tokenstokenizer", "tokenizerlength",
-                          "tokenizerntokens", "tokenizerjstokens", "prompttokens", "ntokens", "tokens"):
+            # ShareGPT40 extractor emits actual_tokens_tokenizer. Its
+            # normalized CSV header is "actualtokenstokenizer"; without it,
+            # only-group 2048 silently falls back to the 4000-token bin bound.
+            for field in ("modeltokens", "actualtokenstokenizer",
+                          "tokenstokenizer", "tokenizerlength",
+                          "tokenizerntokens", "tokenizerjstokens",
+                          "prompttokens", "ntokens", "tokens"):
                 val = normalized.get(field, "")
                 if val and val.strip().isdigit() and int(val) > 0:
                     tokens = int(val)
@@ -1159,6 +1164,15 @@ def main(argv=None):
     selections = [(g, p) for g, p in prompts
                   if (not args.only_group or g in args.only_group)
                   and (not args.only_prompt or p.name in args.only_prompt)]
+    # Make the effective planner token estimate visible before GPU/HTP
+    # memory feasibility search; a bin-bound fallback should never be silent.
+    for group, prompt in selections:
+        hint = manifest.get(prompt.name)
+        source = "MANIFEST" if hint is not None else "BIN_UPPER_BOUND"
+        print(f"[PROMPT_TOKENS] prompt={prompt.name} group={group} "
+              f"plan_tokens={decisions[prompt.name]['prompt_tokens_hint']} "
+              f"source={source} context={decisions[prompt.name]['context']}",
+              flush=True)
     if args.only_prompt and set(args.only_prompt) - {p.name for _, p in prompts}:
         raise ValueError("Unknown --only-prompt file")
     if args.limit:
