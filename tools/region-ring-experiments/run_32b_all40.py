@@ -81,6 +81,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_TASK_TRACE",
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
     "LLAMA_REGION_RING_PROFILE_KV_EXTEND",
+    "LLAMA_REGION_RING_PC_MMAP_BUDGET",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 LONG_HTP_KV_ANCHORS = (2048, 3072)
@@ -647,6 +648,9 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         })
     if args.auto_plan and args.htp_only:
         env["LLAMA_REGION_RING_PROFILE_GRID"] = args.profile_grid
+    if args.pc_mmap_budget:
+        # Native code also verifies the actual ml.use_mmap setting.
+        env["LLAMA_REGION_RING_PC_MMAP_BUDGET"] = "1"
     if args.htp_only:
         # Preserve the proven 32B Phone-owned autonomous prefill contract.
         # -d CPU is a transport; all Phone Transformer layers run on HTP.
@@ -852,6 +856,10 @@ def get_args(argv=None):
     parser.add_argument("--log-verbosity", type=int, default=4)
     parser.add_argument("--no-mmap", action="store_true",
                         help="load GGUF without mmap (requires sufficient RAM)")
+    parser.add_argument("--pc-mmap-budget", action="store_true",
+                        help="opt-in PC mmap physical working-set budgeting:"
+                             " full CPU weights plus GPU Bank A/B windows;"
+                             " requires --auto-plan --htp-only and mmap")
     parser.add_argument("--min-context", type=int, default=256, help="minimum Context; auto-sized per prompt and 256-aligned")
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--context-padding", type=int, default=64, help="tokens reserved beyond prompt and generated token")
@@ -895,6 +903,11 @@ def get_args(argv=None):
         parser.error("--phone-profile-log requires --profile-every")
     if args.htp_only and args.n_predict != 1:
         parser.error("HTP-only autonomous prefill currently requires --n-predict 1")
+    if args.pc_mmap_budget and (
+            not args.auto_plan or not args.htp_only or
+            args.streaming != "on" or args.no_mmap):
+        parser.error("--pc-mmap-budget requires --auto-plan --htp-only "
+                     "--streaming on; omit --no-mmap")
     if args.htp_only and args.no_phone_weight_preload:
         parser.error("--htp-only requires early Phone Region configuration")
     if args.auto_plan and args.warmup_prompt is not None:
@@ -1240,6 +1253,8 @@ def main(argv=None):
                 if user_stage_csv is not None else
                 "AUTO_INDEPENDENT_G_C_N" if args.htp_only else None),
         })
+    if args.pc_mmap_budget:
+        config["pc_weight_accounting"] = "MMAP_CPU_FULL_GPU_TWO_BANK_WINDOWS"
     if args.lock_layout_after_first:
         config["lock_layout_after_first"] = True
         config["gpu_region_max_budget_fraction"] = 0.5
