@@ -113,6 +113,39 @@ class Main50ShortWorkflowTests(unittest.TestCase):
         self.assertEqual(restored["layout"], lock["layout"])
         self.assertTrue((self.out / "placement-lock.json").exists())
 
+    def test_opt_in_gpu_region_budget_retains_full_memory_guard(self):
+        args = runner.get_args(self.base + [
+            "--only-prompt", "prompt_1024_10.txt",
+            "--gpu-region-budget-fraction", "0.55",
+        ])
+        self.assertAlmostEqual(args.gpu_region_budget_fraction, 0.55)
+        command, env = runner.build_process(
+            args, self.prompts / "prompt_1024_10.txt",
+            2048, 1855, self.out / "test-metrics.jsonl")
+        self.assertIn(str(self.model), command)
+        self.assertEqual(
+            env["LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION"], "0.55")
+
+        default = runner.get_args(self.base + [
+            "--only-prompt", "prompt_1024_10.txt"])
+        _, default_env = runner.build_process(
+            default, self.prompts / "prompt_1024_10.txt",
+            2048, 1855, self.out / "default-metrics.jsonl")
+        self.assertNotIn(
+            "LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION", default_env)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            for illegal in ("0.49", "0.61", "nan"):
+                with self.assertRaises(SystemExit):
+                    runner.get_args(self.base + [
+                        "--only-prompt", "prompt_1024_10.txt",
+                        "--gpu-region-budget-fraction", illegal])
+            with self.assertRaises(SystemExit):
+                runner.get_args(self.base + [
+                    "--only-prompt", "prompt_1024_10.txt",
+                    "--env",
+                    "LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION=0.80"])
+
     def test_fixed_ablation_shares_the_dataset_without_auto_plan(self):
         args = runner.get_args([
             "--exe", str(self.exe), "--model", str(self.model),
