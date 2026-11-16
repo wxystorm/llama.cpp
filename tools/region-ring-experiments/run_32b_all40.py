@@ -91,8 +91,10 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS",
 }
 UPPER_BOUNDS = {0: 128, 128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
-SHORT_PROFILE_CHUNKS = (8, 16, 24, 32, 64, 96, 128, 192, 256)
-# Cached calibration may contain X=8; the live locked-plan search omits it.
+SHORT_PROFILE_CHUNKS = (16, 24, 32, 64, 96, 128, 192, 256)
+# Accept prior measured grids without recollecting Profile data. These
+# historical X=8 points are never requested by the locked Chunk search.
+LEGACY_SHORT_PROFILE_CHUNKS = (8,) + SHORT_PROFILE_CHUNKS
 SHORT_LOCKED_PLAN_CHUNKS = (16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256)
 LONG_HTP_KV_ANCHORS = (2048, 3072)
 METRIC_RX = r"(\d+(?:\.\d+)?)"
@@ -703,8 +705,8 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     if args.max_plan_xp is not None:
         env["LLAMA_REGION_RING_LOCKED_MAX_XP"] = str(args.max_plan_xp)
     if args.main50_short or args.locked_short_chunks:
-        # Reuse the existing measured 8/16/24 Profile, but the native
-        # locked placement search selects 16/24/32+ only (never 8).
+        # Sample 16/24+ on new runs; old Profiles containing an extra
+        # X=8 point remain compatible. The locked search never chooses 8.
         env["LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS"] = "1"
         env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] = "1"
     if args.htp_only:
@@ -880,7 +882,7 @@ def get_args(argv=None):
                         help="opt in to 16/24/32+ Chunk search for short"
                              " prompts with --locked-layout and"
                              " --sharegpt50-short-dataset; reuses existing"
-                             " measured short Profile (X=8 never selected)")
+                             " measured short Profile (X=8 not sampled or selected)")
     parser.add_argument("--skip-plan-memory-checks", action="store_true",
                         help="diagnostic opt-in for --locked-layout: skip CPU, "
                              "GPU and HTP planned capacity feasibility, not "
@@ -1297,16 +1299,17 @@ def verify_independent_profile(path: Path, required_kvs=(),
         raise ValueError(f"Independent profile.json does not match Stage CSV: "
                          f"{json_path}")
     if short_chunks:
-        if tuple(metadata.get("chunk_widths", ())) != SHORT_PROFILE_CHUNKS:
-            raise ValueError("Short Chunk run requires NEW 8/16/24 measured "
+        widths = tuple(metadata.get("chunk_widths", ()))
+        if widths not in (SHORT_PROFILE_CHUNKS, LEGACY_SHORT_PROFILE_CHUNKS):
+            raise ValueError("Short Chunk run requires measured 16/24 "
                              "independent Profile: " + str(json_path))
         for backend in ("CPU", "GPU", "PHONE"):
             if not any(p.get("device") == backend and
-                       0 < int(p.get("tokens") or 0) < 32 and
+                       int(p.get("tokens") or 0) in (16, 24) and
                        float(p.get("compute_ms") or 0.0) > 0
                        for p in points):
-                raise ValueError("Missing sub-32 measured backend point for " +
-                                 backend + ": " + str(path))
+                raise ValueError("Missing measured X=16/24 point for " +
+                                 backend + " (X=8 is ignored): " + str(path))
         if not any(p.get("device") == "PHONE" and
                    int(p.get("kv_tokens") or 0) == 2048 and
                    float(p.get("compute_ms") or 0) > 0
