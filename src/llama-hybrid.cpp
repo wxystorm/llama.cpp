@@ -8917,6 +8917,16 @@ static bool llama_hybrid_calibrate_independent_ring(
             std::getenv("LLAMA_REGION_RING_PROFILE_KV_EXTEND");
         return value != nullptr && std::strcmp(value, "1") == 0;
     }();
+    // Short-main benchmarks need REAL 8/16/24-token HTP/GPU/CPU samples.
+    // Keep the original grid and cache signature for every other run.
+    const bool short_chunk_grid = [] {
+        const char * value =
+            std::getenv("LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    const std::string expected_chunk_grid = short_chunk_grid ?
+        "\"chunk_widths\":[8,16,24,32,64,96,128,192,256]" :
+        "\"chunk_widths\":[32,64,96,128,192,256]";
     {
         std::ifstream cached(path);
         if (cached) {
@@ -8979,8 +8989,7 @@ static bool llama_hybrid_calibrate_independent_ring(
                 const std::string metadata(
                     (std::istreambuf_iterator<char>(saved)),
                     std::istreambuf_iterator<char>());
-                if (metadata.find(
-                        "\"chunk_widths\":[32,64,96,128,192,256]") ==
+                if (metadata.find(expected_chunk_grid) ==
                         std::string::npos) {
                     LLAMA_LOG_ERROR(
                         "[INDEPENDENT_PROFILE] status=REJECT"
@@ -9012,7 +9021,14 @@ static bool llama_hybrid_calibrate_independent_ring(
     }();
     const std::vector<int> depths = full_grid ?
         std::vector<int>{1, 2, 4, 6} : std::vector<int>{2, 4, 6};
-    const std::array<int, 6> widths = {32, 64, 96, 128, 192, 256};
+    const std::vector<int> widths = short_chunk_grid ?
+        std::vector<int>{8, 16, 24, 32, 64, 96, 128, 192, 256} :
+        std::vector<int>{32, 64, 96, 128, 192, 256};
+    LLAMA_LOG_INFO(
+        "[INDEPENDENT_PROFILE] event=CHUNK_GRID"
+        " widths=%s source=MEASURED_BACKENDS status=READY\n",
+        short_chunk_grid ? "8,16,24,32,64,96,128,192,256" :
+                           "32,64,96,128,192,256");
     const std::vector<int> kv_spans = long_kv_grid ?
         std::vector<int>{256, 512, 1024, 2048, 3072} :
         std::vector<int>{256, 512, 1024};
@@ -9260,7 +9276,7 @@ static bool llama_hybrid_calibrate_independent_ring(
         json << "{\"schema\":1,\"mode\":\"INDEPENDENT_BACKEND_PROFILE\","
              << "\"model\":{\"layers\":" << profile.n_layer
              << ",\"hidden\":" << profile.n_embd << "},"
-             << "\"chunk_widths\":[32,64,96,128,192,256],"
+             << expected_chunk_grid << ","
              << "\"backends\":{\"G\":\"CUDA\",\"C\":\"CPU\","
              << "\"N\":\"HTP_STRIPED\","
              << "\"A\":\"UNAVAILABLE_IN_HTP_ONLY_MODE\"},"
