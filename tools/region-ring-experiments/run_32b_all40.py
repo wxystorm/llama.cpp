@@ -83,6 +83,8 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_PROFILE_KV_EXTEND",
     "LLAMA_REGION_RING_PC_MMAP_BUDGET",
     "LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS",
+    "LLAMA_REGION_RING_LOCKED_MAX_XG",
+    "LLAMA_REGION_RING_LOCKED_MAX_XP",
 }
 UPPER_BOUNDS = {128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 LONG_HTP_KV_ANCHORS = (2048, 3072)
@@ -657,6 +659,10 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         # Native code verifies this is a locked HTP-only streamed plan.
         # Real GPU/PC/Phone allocation failures remain effective.
         env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] = "1"
+    if args.max_plan_xg is not None:
+        env["LLAMA_REGION_RING_LOCKED_MAX_XG"] = str(args.max_plan_xg)
+    if args.max_plan_xp is not None:
+        env["LLAMA_REGION_RING_LOCKED_MAX_XP"] = str(args.max_plan_xp)
     if args.htp_only:
         # Preserve the proven 32B Phone-owned autonomous prefill contract.
         # -d CPU is a transport; all Phone Transformer layers run on HTP.
@@ -822,6 +828,12 @@ def get_args(argv=None):
                         help="diagnostic opt-in for --locked-layout: skip CPU, "
                              "GPU and HTP planned capacity feasibility, not "
                              "actual device allocations")
+    parser.add_argument("--max-plan-xg", type=int, default=None,
+                        help="upper bound on native GPU Chunk search for "
+                             "--locked-layout, not a fixed XG (e.g. 128)")
+    parser.add_argument("--max-plan-xp", type=int, default=None,
+                        help="upper bound on native HTP Chunk search for "
+                             "--locked-layout, not a fixed XP (e.g. 128)")
     parser.add_argument("--force-plan-layout", default=None,
                         help="optional HTP-only native forced G/[C]/P plan; "
                              "N is accepted as alias for P, with memory guards")
@@ -925,6 +937,14 @@ def get_args(argv=None):
             parser.error("--locked-layout requires at least one N/P region")
         args.lock_layout_after_first = True
     args.user_fixed_layout = args.locked_layout
+    if (args.max_plan_xg is not None or args.max_plan_xp is not None):
+        if args.user_fixed_layout is None:
+            parser.error("--max-plan-xg/--max-plan-xp require --locked-layout")
+        allowed_caps = {32, 48, 64, 80, 96, 112, 128, 160, 192, 256}
+        if any(v not in allowed_caps for v in
+               (args.max_plan_xg, args.max_plan_xp) if v is not None):
+            parser.error("--max-plan-xg/--max-plan-xp must be one of: "
+                         "32,48,64,80,96,112,128,160,192,256")
     if args.skip_plan_memory_checks and args.user_fixed_layout is None:
         parser.error("--skip-plan-memory-checks requires --locked-layout "
                      "(--auto-plan --htp-only --streaming on)")
@@ -1300,6 +1320,10 @@ def main(argv=None):
         config["user_fixed_layer_layout"] = args.user_fixed_layout
     if args.skip_plan_memory_checks:
         config["plan_memory_policy"] = "SKIP_CAPACITY_ESTIMATES_LOCKED_ONLY"
+    if args.max_plan_xg is not None:
+        config["max_plan_xg"] = args.max_plan_xg
+    if args.max_plan_xp is not None:
+        config["max_plan_xp"] = args.max_plan_xp
     first_group, first_prompt = prompts[0]
     _, effective_env = build_process(args, first_prompt,
                                      decisions[first_prompt.name]["context"],
@@ -1327,6 +1351,10 @@ def main(argv=None):
         if args.skip_plan_memory_checks:
             print("[PLAN_MEMORY] policy=SKIP_CAPACITY_ESTIMATES_LOCKED_ONLY"
                   " runtime_allocators=UNCHANGED", flush=True)
+        if args.max_plan_xg is not None or args.max_plan_xp is not None:
+            print(f"[PLAN_CHUNK_CAP] max_xg={args.max_plan_xg or 256} "
+                  f"max_xp={args.max_plan_xp or 256} "
+                  "search=AUTOMATIC_UNDER_CAP", flush=True)
         if args.lock_layout_after_first:
             print(
                 "[PLAN_LOCK] policy=" +
