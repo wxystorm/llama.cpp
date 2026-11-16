@@ -72,7 +72,8 @@ GGUF and compatible HTP build before switching models.
 ## Consistent 32B A0..A3 ablations
 
 The existing four-case ablation runner now supports the same 50-prompt
-dataset, 2048-context ceiling and a CONTROLLED fixed Chunk width <=32
+dataset for 40-layer 14B/24B or 64-layer 32B models, a 2048-context
+ceiling and a CONTROLLED fixed Chunk width <=32
 for valid short 0-group two-Bank execution. A0/A1 use the anchored Full
 main-run placement lock, so they do not reuse an unrelated old G8/P6
 layout. A2/A3 retain their own offline planner alternatives by design.
@@ -80,8 +81,10 @@ layout. A2/A3 retain their own offline planner alternatives by design.
     python .\tools\region-ring-experiments\run_32b_ablation.py --model "$model" --exe "$root\build-tensor-v2\bin\Release\llama-completion.exe" --rpc "$rpc" --prompt-dir "$data" --out "$root\32b-ablation-sharegpt50-fresh" --main50-short --baseline-placement-lock "$out\placement-lock.json" --context 2048 --chunk 32 --limit 0 --phone-budget-mib 7800
 
 7800 MiB is an illustrative phone capacity only: replace it with the
-device's observed available-memory budget. The A0..A3 runner is currently
-32B-specific and does not automatically become a 14B/24B planner.
+device's observed available-memory budget. Run --model-layers 40 for Qwen3-14B or Mistral Small 24B, or 64
+for Qwen3-32B; use a separate matching long-anchor placement-lock.json,
+model GGUF and output directory for each model. A2/A3 retain their
+conservative offline memory heuristic and are not the native full Planner.
 
 ## Offline regression tests
 
