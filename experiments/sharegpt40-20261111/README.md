@@ -1,45 +1,30 @@
-# ShareGPT40 benchmark results (2026-11-13)
+# ShareGPT benchmark snapshot
 
-This branch contains **10 experimental runs** and **406 successful prompt-level observations**, spanning prompt groups 128, 256, 512, 1024 and 2048.
-
-- **Eight** runs have 40 PASS observations each; Ours Qwen3-14B has 50 PASS observations.
-- **Jupiter Mistral Small 3.2-24B** has 36 PASS observations (128: 10, 256: 10, 512: 10, 1024: 6). The four uncompleted 1024 prompts are **not** counted or inferred.
-- Four extra **single-PC reference observations** (one Qwen3-14B and three Qwen3-32B) are recorded separately; they are not counted in the 396 experimental observations or group statistics.
+Ten experimental runs; **426 successful per-prompt results** in `results.csv` and **43 group summaries** in `group-summary.csv`. Prompt groups are sampling labels, not exact model token counts.
 
 ## Run inventory
 
-| Method | Model | Run ID | Status |
-| --- | --- | --- | --- |
-| Prima.cpp | Qwen3-14B | `prima-14b` | 40/40 |
-| Prima.cpp | Mistral Small 3.2-24B Q6_K | `prima-24b` | 40/40 |
-| Prima.cpp | Qwen3-32B | `prima-32b` | 40/40 |
-| Jupiter | Qwen3-14B | `jupiter-14b` | 40/40 |
-| Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36/40 |
-| Jupiter | Qwen3-32B | `jupiter-32b` | 40/40 |
-| Galaxy | Qwen3-14B | `galaxy-14b` | 40/40 |
-| Ours (region ring) | Qwen3-14B | `ours-14b-autoplan` | 50/50 |
-| Ours (region ring) | Mistral Small 3.2-24B Q6_K | `ours-24b-htp` | 40/40 |
-| Ours (region ring) | Qwen3-32B | `ours-32b-g8p6` | 40/40 |
+| Method | Model | ID | Observations |
+| --- | --- | --- | ---: |
+| Prima.cpp | Qwen3-14B | `prima-14b` | 40 |
+| Prima.cpp | Mistral Small 3.2-24B Q6_K | `prima-24b` | 40 |
+| Prima.cpp | Qwen3-32B | `prima-32b` | 40 |
+| Jupiter | Qwen3-14B | `jupiter-14b` | 40 |
+| Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36 |
+| Jupiter | Qwen3-32B | `jupiter-32b` | 40 |
+| Galaxy | Qwen3-14B | `galaxy-14b` | 40 |
+| Ours | Qwen3-14B | `ours-14b-autoplan` | 50 |
+| Ours | Mistral Small 3.2-24B Q6_K | `ours-24b-server-plan` | 50 |
+| Ours | Qwen3-32B | `ours-32b-server-plan` | 50 |
 
-## Dataset files
+The replacement **Ours-32B** and **Ours-24B** results come from the two user-supplied `SERVER_PROBE` blocks (first 32B, second 24B). Each has 10 distinct prompts per group **0/128/256/512/1024**; `prompt_1024_10.txt` was run first as a long-prompt anchor, so rows are matched by filename, not output order. No old Ours 24B or 32B prompt measurements are retained.
 
-- `config.json`: model and runtime configuration for each run, including references to per-run config files.
-- `results.csv`: 406 successful individual prefill measurements; primary key is `framework,model,group,prompt`.
-- `group-summary.csv`: 41 group rows containing arithmetic mean and median prefill throughput and latency. Each `runs` field records the actual sample count (Jupiter 24B group 1024 has `6`).
-- `archive-manifest.json`: source ZIP filenames, sizes and SHA-256 hashes.
-- `runs/jupiter-24b/run-config.json`: Jupiter 24B DP configuration, sanitized to use path and RPC placeholders.
-- `runs/jupiter-24b/per-prompt-details.csv`: all 36 observed DP measurements and selected chunk plans.
-- `runs/ours-*/` and `runs/prima-24b/`: other available run configurations and detailed measurements.
-- `runs/pc-only-32b/observations.csv`: single-PC 32B references: **256 group = 21.58 tok/s**, **512 group = 32.9 tok/s**, **2048 group = 17.61 tok/s** (the last is the lowest of three 2048-group runs in the newest log).
-- `runs/pc-only-14b/observations.csv`: single-PC 14B 2048-group reference: **66.89 tok/s**, lowest of two completed 14B runs. The command for this selected run and exact prompt filename are not visible in the uploaded text.
-- `runs/pc-only-14b/2048-min-run-config.json`, `runs/pc-only-32b/2048-min-run-config.json`: source information and verified execution options for the selected minimum-throughput records.
+Each new run's `runs/ours-*-server-plan/per-prompt-details.csv` keeps input tokens, prefill latency and TPS, cache=0, planned XC/XG/XP, actual XG/XP and planner latency. The run config retains known execution settings; **no physical placement layout was supplied** in either new probe block, so none is invented. The explicit server launch command was provided only for the 24B block.
 
-## Experimental notes
+Ours 14B is unchanged: 50 observations over groups 128/256/512/1024/2048; best of two past results at the first four groups, with the 2048 group from a later user-supplied log. Its recorded `G10,P9,G12,P1,G8` layout is normalized metadata for some historical winners, **not** a claim that they were remeasured under this placement.
 
-The Jupiter 24B run used Sequence DP with `graph_prebuild=false`, `context=2048`, `batch=2048`, `ubatch=128`, `pc_layers=32`, `cpu_layers=24`, and 96-128 chunk bounds. Its status is partial because four 1024-group samples lack completed DP results.
+The six other complete runs each contain 40 observations over groups 128/256/512/1024. Jupiter 24B has 36 observations (group 1024: six), and its missing four are not imputed.
 
-Prompt groups (128, 256, 512, 1024) are sampling buckets and **are not exact tokenizer token counts**. Engines, quantization, run settings and tokenization can differ between methods; rank-sorted Top-5 measurements need not correspond to the same prompt. Group means and medians are arithmetic calculations on measured observations, not pooled TPS. The PC-only references are not used in these means or Top-5 ranking.
+`group-summary.csv` computes ordinary arithmetic mean/median of recorded per-prompt Prefill TPS and latency; a group mean is not pooled token throughput. Planner time is retained in per-prompt details, not added to prefill time.
 
-The **original binary ZIP archives are not committed** to this branch because the connected GitHub writer only supports UTF-8 files. SHA-256 values of the original archives are stored in `archive-manifest.json`.
-
-Ours Qwen3-14B now has 50 entries. For matching prompts in groups 128-1024, the higher Prefill TPS of the two provided runs was retained; group 2048 uses the ten PASS measurements supplied in the chat log. Recorded layout is uniformly `G10,P9,G12,P1,G8`, with per-prompt XC/XG/XP taken from the new data. For selected historical wins this recorded layout is normalized metadata, not a claim of remeasurement under that layout.
+`config.json` contains active run references, `archive-manifest.json` references available earlier ZIPs for runs whose measurements still derive from them, and `runs/pc-only-14b` and `runs/pc-only-32b` preserve four separate incomplete single-PC reference observations. The two replacement SERVER_PROBE blocks came from chat logs, not uploaded ZIP archives, so they have no archive SHA record.

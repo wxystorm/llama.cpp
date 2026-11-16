@@ -5,6 +5,7 @@
   "dataset": {
     "name": "ShareGPT40",
     "prompt_groups": [
+      0,
       128,
       256,
       512,
@@ -12,7 +13,8 @@
       2048
     ],
     "prompts_per_group": 10,
-    "prompt_ids": "prompt_{group}_{01..10}.txt"
+    "prompt_ids": "prompt_{group}_{01..10}.txt",
+    "note": "Prompt groups are union across experiments: Ours 14B covers 128/256/512/1024/2048, Ours 24B and 32B cover 0/128/256/512/1024, legacy baselines cover 128/256/512/1024 (Jupiter24 1024 has 6)."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -146,46 +148,44 @@
       "runs": 40
     },
     {
-      "id": "ours-32b-g8p6",
+      "id": "ours-32b-server-plan",
       "framework": "ours",
       "model": "32b",
-      "method": "fixed region-ring GPU+HTP",
-      "run_config": "runs/ours-32b-g8p6/run-config.json",
-      "layout": "G8,P6,G8,P6,G8,P6,G8,P6,G8",
-      "planner": "apply-wide",
-      "skip_profile": true,
-      "plan_chunks": [
-        96,
-        128
-      ],
-      "batch": 2048,
-      "ubatch": 2048,
-      "predict": 1,
-      "threads": 8,
-      "no_mmap": true,
-      "gpu_weight_streaming": true,
-      "gpu_bank_force_small_batch": true,
-      "drain_first_cycle": true
+      "method": "server-probe per-prompt plan",
+      "run_config": "runs/ours-32b-server-plan/run-config.json",
+      "layout": null,
+      "layout_reported": false,
+      "planner": "SERVER_PROBE",
+      "cache_prompt_tokens": 0,
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      },
+      "metrics_source": "SERVER_PROBE prefill_ms and tps",
+      "per_prompt_chunks": "runs/ours-32b-server-plan/per-prompt-details.csv"
     },
     {
-      "id": "ours-24b-htp",
+      "id": "ours-24b-server-plan",
       "framework": "ours",
       "model": "24b",
-      "method": "forced HTP region-ring with independent backend profile",
-      "run_config": "runs/ours-24b-htp/run-config.json",
-      "layout": "G5,P3,G5,P3,G6,P3,G5,P4,G6",
-      "planner": "apply-wide",
-      "planning_mode": "independent-backend-profile-then-plan",
-      "skip_profile": false,
-      "xc": 96,
-      "xg": 96,
-      "xp": 96,
-      "batch": 2048,
-      "ubatch": 2048,
-      "predict": 1,
-      "threads": 8,
-      "no_mmap": true,
-      "gpu_weight_streaming": true
+      "method": "server-probe per-prompt plan",
+      "run_config": "runs/ours-24b-server-plan/run-config.json",
+      "layout": null,
+      "layout_reported": false,
+      "planner": "SERVER_PROBE",
+      "cache_prompt_tokens": 0,
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      },
+      "metrics_source": "SERVER_PROBE prefill_ms and tps",
+      "per_prompt_chunks": "runs/ours-24b-server-plan/per-prompt-details.csv"
     },
     {
       "id": "jupiter-24b",

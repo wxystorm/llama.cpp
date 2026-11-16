@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "run_id": "ours-32b-server-plan",
+  "model": "${MODEL_DIR}/Qwen3-32B-Q4_K_M.gguf",
+  "source": "User supplied first SERVER_PROBE block with 50 per-prompt records",
+  "source_received_date": "2026-11-17",
+  "command": null,
+  "command_in_source": false,
+  "placement_layout": null,
+  "placement_layout_in_source": false,
+  "mode": "server probe",
+  "cache_n": 0,
+  "probe_count": 50,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "prompts_per_group": 10,
+  "long_anchor_first": "prompt_1024_10.txt",
+  "chunk_plan": "XC, XG, XP and actual_XG, actual_XP per prompt",
+  "per_prompt_file": "per-prompt-details.csv",
+  "planner_ms": "per prompt as logged",
+  "note": "No server command or physical placement layout is supplied in this 32B block; do not copy the old fixed-placement configuration into this run."
+}

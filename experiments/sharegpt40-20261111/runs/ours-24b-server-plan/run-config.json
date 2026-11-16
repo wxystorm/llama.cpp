@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "run_id": "ours-24b-server-plan",
+  "model": "${MODEL_DIR}/Mistral-Small-3.2-24B-Q6_K.gguf",
+  "source": "User supplied second SERVER_PROBE block with 50 per-prompt records",
+  "source_received_date": "2026-11-17",
+  "command_in_source": true,
+  "server_command_sanitized": "${LLAMA_SERVER_EXE} -m ${MODEL_DIR}/Mistral-Small-3.2-24B-Q6_K.gguf --rpc ${RPC_ENDPOINT} --split-mode tensor --flash-attn on -c 2048 -b 2048 -ub 2048 -t 8 --parallel 1 --no-cont-batching --no-cache-prompt --cache-ram 0 --ctx-checkpoints 0 --no-context-shift --no-warmup --host 127.0.0.1 --port 18080 -lv 4",
+  "placement_layout": null,
+  "placement_layout_in_source": false,
+  "mode": "server probe",
+  "server_sweep": "ALL50_UNIQUE",
+  "long_anchor_first": "prompt_1024_10.txt",
+  "cache_n": 0,
+  "probe_count": 50,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "prompts_per_group": 10,
+  "chunk_plan": "XC, XG, XP and actual_XG, actual_XP per prompt",
+  "per_prompt_file": "per-prompt-details.csv",
+  "planner_ms": "per prompt as logged",
+  "note": "Server command supplied for 24B; the physical model placement layout is not present in SERVER_PROBE lines."
+}
