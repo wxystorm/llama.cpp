@@ -9464,6 +9464,7 @@ bool llama_hybrid_autoplan(llama_model_loader & ml, const llama_model_params & p
 
     llama_hybrid_profile profile;
     profile.is_moe = is_qwen3_moe;
+    profile.pc_model_weights_mmap = ml.use_mmap;
     // This bit denotes Qwen3's fused directional Phone island only.
     // Llama's full-layer HTP support is advertised by htp_only_profile;
     // never claim Qwen3's unrelated directional fusion is available.
@@ -10668,6 +10669,40 @@ static bool llama_hybrid_region_ring_planner_evaluate(
     htp_memory_diag->fill(0);
     const bool htp_session_guard =
         flag_on("LLAMA_REGION_RING_PHONE_PLAN_CONTROLLED");
+    // Explicit opt-in. A model loaded with --no-mmap always uses full PC
+    // model-weight residency, regardless of this environment variable.
+    const bool pc_mmap_budget_requested =
+        flag_on("LLAMA_REGION_RING_PC_MMAP_BUDGET");
+    if (pc_mmap_budget_requested &&
+            (!wide_apply || !htp_session_guard ||
+             !model.gpu_weight_streaming ||
+             !profile.pc_model_weights_mmap)) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PC_MEMORY_POLICY] mode=MMAP_WINDOWED "
+            "model_mmap=%d htp_guard=%d gpu_stream=%d "
+            "status=REJECT reason=ACTUAL_MMAP_AND_HTP_STREAM_REQUIRED\n",
+            profile.pc_model_weights_mmap ? 1 : 0,
+            htp_session_guard ? 1 : 0,
+            model.gpu_weight_streaming ? 1 : 0);
+        return false;
+    }
+    const bool pc_mmap_windowed = pc_mmap_budget_requested;
+    if (pc_mmap_windowed && profile.pc_free_mem == 0) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PC_MEMORY_POLICY] status=REJECT "
+            "reason=PC_FREE_MEMORY_UNAVAILABLE\n");
+        return false;
+    }
+    if (htp_session_guard && wide_apply) {
+        LLAMA_LOG_INFO(
+            "[REGION_RING_PC_MEMORY_POLICY] mode=%s model_mmap=%d "
+            "cpu_weights=FULL gpu_mmap=MAX_TWO_BANK_WINDOWS "
+            "phone_mmap=FILE_BACKED htp_ram=SEPARATE "
+            "pc_free_mib=%.1f status=CONFIGURED\n",
+            pc_mmap_windowed ? "MMAP_WINDOWED" : "RESIDENT_FULL",
+            profile.pc_model_weights_mmap ? 1 : 0,
+            profile.pc_free_mem / 1048576.0);
+    }
     // Resolve FORCE once, before constructing any estimated memory guards.
     // This also permits forced execution when the free-RAM sample is absent.
     const auto forced_value_present = [](const char * key) {
@@ -10874,7 +10909,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.memory_feasible =
             [&profile, &model, planner_layer_bytes, htp_session_guard,
-             htp_limits, htp_memory_diag, single_gpu_bank](
+             htp_limits, htp_memory_diag, single_gpu_bank,
+             pc_mmap_windowed](
                     const llama_ring_planner::candidate & candidate) -> bool {
                 std::vector<llama_region_ring_region> regions;
                 if (!llama_ring_planner::make_regions(
@@ -10944,16 +10980,26 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     if (model.gpu_weight_streaming &&
                             region.device ==
                                 llama_region_ring_device::GPU) {
-                        // Streamed CUDA weights stay canonical on host.
-                        // Do not count all logical GPU Region weights as
-                        // simultaneously resident in VRAM.
-                        usage[(size_t) llama_region_ring_device::CPU] +=
-                            region_weight;
-                    } else if (!htp_session_guard ||
-                            region.device !=
+                        // Streamed GPU weights remain canonical on PC.
+                        // Without mmap all of them are resident. With mmap,
+                        // charge simultaneous Bank A+B page-cache windows
+                        // below rather than the full logical GPU layer set.
+                        if (!pc_mmap_windowed) {
+                            usage[(size_t) llama_region_ring_device::CPU] +=
+                                region_weight;
+                        }
+                    } else if (htp_session_guard &&
+                            region.device ==
                                 llama_region_ring_device::PHONE) {
-                        // HTP repacked weights/KV/scratch are added from the
-                        // actual per-LAYER session mapping below.
+                        // HTP weights/KV/scratch are counted on Phone.
+                        // The PC's canonical Phone GGUF tensors are real
+                        // allocations under --no-mmap; with mmap they are
+                        // file-backed and need not be pinned on PC.
+                        if (!pc_mmap_windowed) {
+                            usage[(size_t) llama_region_ring_device::CPU] +=
+                                region_weight;
+                        }
+                    } else {
                         usage[(size_t) region.device] += region_weight;
                     }
                 }
@@ -11006,6 +11052,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 model, candidate.xg,
                                 single_gpu_bank || bank_peaks[1] == 0 ?
                                     1 : 2);
+                        if (pc_mmap_windowed) {
+                            // Conservatively reserve both concurrently
+                            // staged GPU Bank source windows in PC RAM. The
+                            // GPU VRAM charge is independent, and CPU-model
+                            // weights, KV and activation buffers stay full.
+                            usage[(size_t) llama_region_ring_device::CPU] +=
+                                resident_weights;
+                        }
                     }
                 }
 
