@@ -11702,6 +11702,28 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 result.cpu_optional_profiled,
                 result.cpu_optional_simulated);
             LLAMA_LOG_INFO(
+                "[REGION_RING_PLAN_CPU_SHRINK] mode=APPLY_WIDE "
+                "operation=ONE_CPU_STAGE_MINUS_1_OR_2 "
+                "recipient=ADJACENT_GPU_OR_PHONE "
+                "anchors=%zu generated=%zu reject_memory=%zu "
+                "reject_profile=%zu profiled=%zu shortlisted=%zu "
+                "reject_dag=%zu simulated=%zu improvements=%zu "
+                "before_ms=%.3f after_ms=%.3f "
+                "constraints=UNCHANGED rank=FULL_PROMPT_DAG\n",
+                result.cpu_shrink_anchors,
+                result.cpu_shrink_generated,
+                result.cpu_shrink_memory_rejected,
+                result.cpu_shrink_profile_rejected,
+                result.cpu_shrink_profiled,
+                result.cpu_shrink_shortlisted,
+                result.cpu_shrink_dag_rejected,
+                result.cpu_shrink_simulated,
+                result.cpu_shrink_improved,
+                std::isfinite(result.cpu_shrink_before_ms) ?
+                    result.cpu_shrink_before_ms : -1.0,
+                std::isfinite(result.cpu_shrink_after_ms) ?
+                    result.cpu_shrink_after_ms : -1.0);
+            LLAMA_LOG_INFO(
             "[REGION_RING_PLAN_SEARCH] mode=APPLY_WIDE "
             "enumerated=%zu profiled=%zu e_window=%zu "
             "shortlisted=%zu simulated=%zu "
