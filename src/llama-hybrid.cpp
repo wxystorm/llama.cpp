@@ -10717,6 +10717,32 @@ static bool llama_hybrid_region_ring_planner_evaluate(
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XC") ||
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XG") ||
          forced_value_present("LLAMA_HYBRID_REGION_RING_FORCE_XP"));
+    // Explicit diagnostic opt-in: skip estimated memory feasibility ONLY
+    // in the native locked-placement Chunk search. Actual CUDA, HTP and
+    // host memory allocations remain unchanged and can still fail.
+    const bool skip_locked_memory_requested =
+        flag_on("LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS");
+    const char * requested_locked_layout =
+        std::getenv("LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT");
+    const bool skip_locked_memory =
+        skip_locked_memory_requested && wide_apply &&
+        selected_layout != nullptr && htp_session_guard &&
+        model.gpu_weight_streaming && !force_ab_requested &&
+        requested_locked_layout != nullptr &&
+        *requested_locked_layout != '\0';
+    if (skip_locked_memory_requested && !skip_locked_memory) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_MEMORY] mode=LOCKED_CHUNK_SEARCH"
+            " status=REJECT reason=REQUIRES_HTP_STREAMED_LOCKED_LAYOUT\n");
+        return false;
+    }
+    if (skip_locked_memory) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_PLAN_MEMORY] mode=LOCKED_CHUNK_SEARCH"
+            " checks=CPU_RAM_GPU_VRAM_PHONE_RAM_HTP_SESSION"
+            " policy=SKIP_ESTIMATES_ONLY runtime_allocators=UNCHANGED"
+            " status=SKIPPED\n");
+    }
     llama_ring_planner::htp_memory_limits htp_limits;
     if (have_layer_weights) {
         const auto planner_layer_bytes =
@@ -10841,7 +10867,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // charged by htp_plan_memory_feasible().
         long double htp_session_budget_bytes =
             LLAMA_REGION_RING_HTP_SESSION_VMEM_MIB * 1048576.0L;
-        if (htp_session_guard && !force_ab_requested) {
+        if (htp_session_guard && !force_ab_requested &&
+                !skip_locked_memory) {
             if (!have_layer_weights || profile.phone_free_mem == 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_HTP_MEMORY] status=REJECT"
@@ -10870,7 +10897,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         // fabricated free=total report from its CPU transport backend.
         htp_limits.shared_budget_bytes =
             (long double) profile.phone_free_mem * LLAMA_REGION_RING_HTP_SHARED_MEMORY_FRACTION;
-        if (htp_session_guard && !force_ab_requested) {
+        if (htp_session_guard && !force_ab_requested &&
+                !skip_locked_memory) {
             LLAMA_LOG_INFO(
                 "[REGION_RING_MEMORY_POLICY] mode=APPLY_WIDE"
                 " basis=BACKEND_REPORTED_AVAILABLE"
@@ -10894,7 +10922,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         htp_limits.n_ff = profile.n_ff;
         htp_limits.kv_bytes_per_token_per_layer =
             (long double) profile.kv_bytes_per_token_per_layer;
-        if (htp_session_guard && !force_ab_requested) {
+        if (htp_session_guard && !force_ab_requested &&
+                !skip_locked_memory) {
             LLAMA_LOG_INFO(
                 "[REGION_RING_HTP_MEMORY] sessions=4"
                 " per_session_budget_mib=%.1Lf"
@@ -11323,7 +11352,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 return false;
             }
         }
-        if (!force_ab_requested && !model.memory_feasible) {
+        if (!force_ab_requested && !skip_locked_memory &&
+                !model.memory_feasible) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_REJECT] mode=APPLY_WIDE "
                 "reason=NO_MEMORY_PROFILE status=KEEP_BASELINE\n");
@@ -11424,8 +11454,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         probe.xc = xc;
                         probe.xg = xg;
                         probe.xp = xp;
-                        if (!model.memory_feasible ||
-                                !model.memory_feasible(probe)) {
+                        if (!skip_locked_memory &&
+                                (!model.memory_feasible ||
+                                 !model.memory_feasible(probe))) {
                             ++rejected_memory;
                             continue;
                         }
@@ -11464,11 +11495,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 " source=CHUNK_ONLY layout=%s"
                 " XC=%d XG=%d XP=%d predicted_ms=%.3f"
                 " tried=%zu reject_memory=%zu reject_profile=%zu"
-                " region_budget_fraction=%.2Lf\n",
+                " region_budget_fraction=%.2Lf memory_policy=%s\n",
                 selected_layout->c_str(), *selected_xc,
                 *selected_xg, *selected_xp, best_chunk.wall_ms,
                 tried, rejected_memory, rejected_profile,
-                model.gpu_max_region_budget_fraction);
+                model.gpu_max_region_budget_fraction,
+                skip_locked_memory ? "SKIPPED" : "GUARDED");
             if (const char * metrics_path = std::getenv(
                     "LLAMA_REGION_RING_METRICS_FILE")) {
                 if (*metrics_path != '\0') {
@@ -11493,7 +11525,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 << (model.gpu_weight_streaming ?
                                     "true" : "false") << ","
                                 << "\"locked_layout\":true,"
-                                << "\"predicted_ms\":" << best_chunk.wall_ms
+                                << "\"memory_checks_skipped\":"
+                                << (skip_locked_memory ? "true" : "false")
+                                << ",\"predicted_ms\":" << best_chunk.wall_ms
                                 << "}\n";
                     }
                 }
