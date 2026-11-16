@@ -190,6 +190,87 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cached tokens"):
                 probe.post_completion(18080, "hello")
 
+    def test_native_per_request_planner_log_is_required_and_parsed(self):
+        layout = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "llama-server.log"
+            line = (
+                "12.345 E [REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                f" tokens=66 kv_start=0 layout={layout}"
+                " XC=24 XG=16 XP=24"
+                " startup_XC=32 startup_XG=32 startup_XP=32"
+                " changed=1 planner_ms=5.125"
+                " source=LOCKED_CHUNK_ONLY layer_placement=IMMUTABLE"
+                " execution=THIS_DECODE_ONLY status=PASS\n")
+            log.write_text(
+                "[PHONE_HTP_ONLY] event=REJECT reason=REQUIRES_GRAPHLESS_FRESH_PREFILL\n"
+                + line, encoding="utf-8")
+            decision, offset = probe.read_request_chunk_plan(log, 0, 66)
+            self.assertEqual(
+                (decision["plan_xc"], decision["plan_xg"],
+                 decision["plan_xp"]), (24, 16, 24))
+            self.assertAlmostEqual(decision["planner_ms"], 5.125)
+            self.assertEqual(offset, log.stat().st_size)
+
+            with self.assertRaisesRegex(RuntimeError, "missing or ambiguous"):
+                probe.read_request_chunk_plan(log, offset, 66)
+            with self.assertRaisesRegex(RuntimeError, "token mismatch"):
+                probe.read_request_chunk_plan(log, 0, 1855)
+            log.write_text(line + line, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "matches=2"):
+                probe.read_request_chunk_plan(log, 0, 66)
+
+    def test_native_per_request_plan_rejects_wrong_layout_and_bank_width(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "llama-server.log"
+            line = ("[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                    " tokens=66 kv_start=0 layout={layout}"
+                    " XC=32 XG={xg} XP=16"
+                    " startup_XC=32 startup_XG=32 startup_XP=32"
+                    " changed=1 planner_ms=0.100"
+                    " source=LOCKED_CHUNK_ONLY"
+                    " execution=THIS_DECODE_ONLY status=PASS\n")
+            correct = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+            log.write_text(
+                line.format(layout=correct, xg=32),
+                encoding="utf-8")
+            got, _ = probe.read_request_chunk_plan(log, 0, 66)
+            self.assertEqual(got["plan_xg"], 32)
+            log.write_text(
+                line.format(layout="G8,P4,G7,P4,G8,P5,G7,P4,G7,P4,G6",
+                            xg=32), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed fixed layout"):
+                probe.read_request_chunk_plan(log, 0, 66)
+            log.write_text(line.format(layout=correct, xg=48),
+                           encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "width bounds"):
+                probe.read_request_chunk_plan(log, 0, 66)
+
+    def test_cpp_request_hook_reuses_locked_planner_and_stage_builder(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "src" / "llama-context.cpp").read_text(
+                      encoding="utf-8")
+        start = source.index(
+            'std::getenv("LLAMA_REGION_RING_PER_REQUEST_CHUNKS")')
+        end = source.index("if (region_ring_v1 &&", start)
+        hook = source[start:end]
+        for phrase in (
+            'n_tokens_all >= 32',
+            'ring_prefill_input_compatible',
+            'model.hybrid_ring_plan_mode != "APPLY_WIDE"',
+            '"LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"',
+            'llama_hybrid_region_ring_planner_apply_wide(',
+            'request_layout != model.hybrid_ring_plan_layout',
+            'runtime_stages = llama_region_ring_runtime_stages(',
+            '"[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"',
+        ):
+            self.assertIn(phrase, hook)
+        self.assertNotIn("model.hybrid_ring_plan_gpu_chunk_tokens =", hook)
+        self.assertLess(
+            source.index("runtime_stages = llama_region_ring_runtime_stages(",
+                         start),
+            source.index("process_ubatch_region_ring(", start))
+
     def test_earliest_error_comes_before_p2c_stop(self):
         with tempfile.TemporaryDirectory() as tmp:
             logfile = Path(tmp) / "llama-server.log"
