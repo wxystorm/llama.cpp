@@ -310,8 +310,13 @@ The harness validates EACH successful HTTP response against one native
 `[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT` log from the same
 request. A response without this marker is NOT counted as a valid
 per-request benchmark. The CSV/JSONL rows contain
-`plan_xc / plan_xg / plan_xp / planner_ms`; group summaries include
-the observed distribution of Chunk Plans and mean/median Planner time.
+`plan_xc / plan_xg / plan_xp / planner_ms`, plus
+`runtime_xc / runtime_xg / runtime_xp` from the matching
+`[REGION_RING_SUM] ... complete=1 status=0` execution proof.
+Runtime tiny-tail coalescing may increase a selected physical width by
+up to 25%, so the selected and executed widths are deliberately separate.
+Group summaries include the distribution of selected Chunk Plans and
+mean/median Planner time.
 The native Planner logs
 `[REGION_RING_REQUEST_CHUNK_PLAN] event=REJECT ... status=FAIL`
 if it cannot preserve the model-owned layout.
