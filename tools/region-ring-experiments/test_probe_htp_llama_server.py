@@ -134,6 +134,17 @@ class ServerProbeTests(unittest.TestCase):
         self.assertEqual(zero["median_tps"], 96.0)
         self.assertEqual(zero["status"], "INCOMPLETE")
         self.assertEqual(rows[-1]["total_tokens"], 192)
+        self.assertEqual(zero["chunk_plan_distribution"], "")
+        records[0].update({"plan_xc": 16, "plan_xg": 16,
+                           "plan_xp": 24, "planner_ms": 6.0})
+        records[1].update({"plan_xc": 24, "plan_xg": 32,
+                           "plan_xp": 32, "planner_ms": 4.0})
+        with_plans = probe.report_rows(
+            records, probe.runner.MAIN50_SHORT_GROUPS)[0]
+        self.assertEqual(with_plans["chunk_plan_variants"], 2)
+        self.assertIn("XC16-XG16-XP24:1",
+                      with_plans["chunk_plan_distribution"])
+        self.assertEqual(with_plans["mean_planner_ms"], 5.0)
 
     def test_sweep_fingerprint_ignores_limit_but_checks_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,6 +181,13 @@ class ServerProbeTests(unittest.TestCase):
                 {"LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS": "1"},
                 prompts, 1855)
             self.assertNotEqual(first["fingerprint"], third["fingerprint"])
+            with_runtime = probe.sweep_config(
+                args, ["llama-server", "--parallel", "1"],
+                {"LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS": "1",
+                 "LLAMA_REGION_RING_PER_REQUEST_CHUNKS": "1"},
+                prompts, 1855)
+            self.assertNotEqual(third["fingerprint"],
+                                with_runtime["fingerprint"])
 
     def test_cache_in_non_cached_request_is_rejected(self):
         import json
