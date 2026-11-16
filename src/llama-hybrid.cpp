@@ -11434,9 +11434,44 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             size_t tried = 0;
             size_t rejected_memory = 0;
             size_t rejected_profile = 0;
+            // Bound (do not fix) Chunk search for diagnostic regressions.
+            // This is deliberately restricted to the locked-placement path.
+            // Unsupported or malformed caps fail rather than silently
+            // allowing a larger XP/XG than the caller requested.
+            const auto read_locked_chunk_cap =
+                [](const char * key, int & cap) -> bool {
+                    const char * raw = std::getenv(key);
+                    if (raw == nullptr || *raw == '\0') { return true; }
+                    char * end = nullptr;
+                    const long value = std::strtol(raw, &end, 10);
+                    if (end == raw || *end != '\0' ||
+                            value < 32 || value > 256 ||
+                            !llama_ring_planner::first_cycle_chunk_supported(
+                                (int) value)) {
+                        return false;
+                    }
+                    cap = (int) value;
+                    return true;
+                };
+            int max_plan_xg = 256;
+            int max_plan_xp = 256;
+            if (!read_locked_chunk_cap(
+                    "LLAMA_REGION_RING_LOCKED_MAX_XG", max_plan_xg) ||
+                !read_locked_chunk_cap(
+                    "LLAMA_REGION_RING_LOCKED_MAX_XP", max_plan_xp)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK] status=REJECT "
+                    "reason=INVALID_CHUNK_CAP supported=32,48,64,80,96,112,128,160,192,256\n");
+                return false;
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_PLAN_LOCK] event=CHUNK_SEARCH_BOUNDS"
+                " max_xg=%d max_xp=%d policy=AUTOMATIC_UNDER_CAP\n",
+                max_plan_xg, max_plan_xp);
             const auto & widths =
                 llama_ring_planner::first_cycle_chunk_candidates;
             for (const int xg : widths) {
+                if (xg > max_plan_xg) { continue; }
                 // Two-Bank streaming requires at least two GPU chunks for
                 // the verified normal prefill path. Never silently pick
                 // a short-batch Chunk shape whose runtime cannot use it.
@@ -11446,6 +11481,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
                 for (const int xc : widths) {
                     for (const int xp : widths) {
+                        if (xp > max_plan_xp) { continue; }
                         ++tried;
                         llama_ring_planner::candidate probe;
                         probe.concrete_regions = locked_regions;
@@ -11495,12 +11531,14 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 " source=CHUNK_ONLY layout=%s"
                 " XC=%d XG=%d XP=%d predicted_ms=%.3f"
                 " tried=%zu reject_memory=%zu reject_profile=%zu"
-                " region_budget_fraction=%.2Lf memory_policy=%s\n",
+                " region_budget_fraction=%.2Lf memory_policy=%s"
+                " max_xg=%d max_xp=%d\n",
                 selected_layout->c_str(), *selected_xc,
                 *selected_xg, *selected_xp, best_chunk.wall_ms,
                 tried, rejected_memory, rejected_profile,
                 model.gpu_max_region_budget_fraction,
-                skip_locked_memory ? "SKIPPED" : "GUARDED");
+                skip_locked_memory ? "SKIPPED" : "GUARDED",
+                max_plan_xg, max_plan_xp);
             if (const char * metrics_path = std::getenv(
                     "LLAMA_REGION_RING_METRICS_FILE")) {
                 if (*metrics_path != '\0') {
@@ -11527,6 +11565,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 << "\"locked_layout\":true,"
                                 << "\"memory_checks_skipped\":"
                                 << (skip_locked_memory ? "true" : "false")
+                                << ",\"max_plan_xg\":" << max_plan_xg
+                                << ",\"max_plan_xp\":" << max_plan_xp
                                 << ",\"predicted_ms\":" << best_chunk.wall_ms
                                 << "}\n";
                     }
