@@ -92,6 +92,8 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
 }
 UPPER_BOUNDS = {0: 128, 128: 255, 256: 511, 512: 1023, 1024: 2000, 2048: 4000}
 SHORT_PROFILE_CHUNKS = (8, 16, 24, 32, 64, 96, 128, 192, 256)
+# Cached calibration may contain X=8; the live locked-plan search omits it.
+SHORT_LOCKED_PLAN_CHUNKS = (16, 24, 32, 48, 64, 80, 96, 112, 128, 160, 192, 256)
 LONG_HTP_KV_ANCHORS = (2048, 3072)
 METRIC_RX = r"(\d+(?:\.\d+)?)"
 RESULT_COLUMNS = (
@@ -700,7 +702,9 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
         env["LLAMA_REGION_RING_LOCKED_MAX_XG"] = str(args.max_plan_xg)
     if args.max_plan_xp is not None:
         env["LLAMA_REGION_RING_LOCKED_MAX_XP"] = str(args.max_plan_xp)
-    if args.main50_short:
+    if args.main50_short or args.locked_short_chunks:
+        # Reuse the existing measured 8/16/24 Profile, but the native
+        # locked placement search selects 16/24/32+ only (never 8).
         env["LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS"] = "1"
         env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] = "1"
     if args.htp_only:
@@ -872,6 +876,11 @@ def get_args(argv=None):
                         help="user-fixed layer layout from FIRST prompt; "
                              "N is an alias for P; search XC/XG/XP per prompt "
                              "with native memory guards unless explicitly skipped")
+    parser.add_argument("--locked-short-chunks", action="store_true",
+                        help="opt in to 16/24/32+ Chunk search for short"
+                             " prompts with --locked-layout and"
+                             " --sharegpt50-short-dataset; reuses existing"
+                             " measured short Profile (X=8 never selected)")
     parser.add_argument("--skip-plan-memory-checks", action="store_true",
                         help="diagnostic opt-in for --locked-layout: skip CPU, "
                              "GPU and HTP planned capacity feasibility, not "
@@ -1011,16 +1020,24 @@ def get_args(argv=None):
             parser.error("--locked-layout requires at least one N/P region")
         args.lock_layout_after_first = True
     args.user_fixed_layout = args.locked_layout
+    if args.locked_short_chunks and (
+            args.user_fixed_layout is None or
+            not args.sharegpt50_short_dataset or args.main50_short):
+        parser.error("--locked-short-chunks requires --locked-layout"
+                     " and --sharegpt50-short-dataset, not --main50-short")
     if (args.max_plan_xg is not None or args.max_plan_xp is not None):
         if args.user_fixed_layout is None and not args.main50_short:
             parser.error("--max-plan-xg/--max-plan-xp require "
                          "--locked-layout or --main50-short ("
                          "caps apply only after the first placement Plan)")
         allowed_caps = {32, 48, 64, 80, 96, 112, 128, 160, 192, 256}
+        if args.locked_short_chunks or args.main50_short:
+            allowed_caps.update((16, 24))
         if any(v not in allowed_caps for v in
                (args.max_plan_xg, args.max_plan_xp) if v is not None):
             parser.error("--max-plan-xg/--max-plan-xp must be one of: "
-                         "32,48,64,80,96,112,128,160,192,256")
+                         "16,24 (short locked mode only),32,48,64,"
+                         "80,96,112,128,160,192,256")
     if args.skip_plan_memory_checks and args.user_fixed_layout is None:
         parser.error("--skip-plan-memory-checks requires --locked-layout "
                      "(--auto-plan --htp-only --streaming on)")
@@ -1465,9 +1482,14 @@ def main(argv=None):
         config["user_fixed_layer_layout"] = args.user_fixed_layout
     if args.sharegpt50_short_dataset:
         config["sharegpt50_short_dataset"] = True
+    if args.locked_short_chunks:
+        config["locked_short_chunks"] = True
+        config["short_chunk_grid"] = list(SHORT_PROFILE_CHUNKS)
     if args.main50_short:
         config["main50_short"] = True
         config["short_chunk_grid"] = list(SHORT_PROFILE_CHUNKS)
+    if args.main50_short or args.locked_short_chunks:
+        config["short_locked_plan_chunk_grid"] = list(SHORT_LOCKED_PLAN_CHUNKS)
         config["placement_policy"] = "FIRST_APPLIED_LONG_PLAN_CHUNKS_ONLY"
         config["anchor_prompt"] = "prompt_1024_10.txt"
         config["anchor_context"] = 2048
@@ -1627,7 +1649,7 @@ def main(argv=None):
                 if independent.is_file():
                     count = verify_independent_profile(
                         independent, required_long_kv,
-                        short_chunks=args.main50_short)
+                        short_chunks=(args.main50_short or args.locked_short_chunks))
                     print(f"[PROFILE] event=INDEPENDENT_REUSE"
                           f" npu_points={count} csv={independent}", flush=True)
                 else:
@@ -1768,7 +1790,7 @@ def main(argv=None):
                     try:
                         count = verify_independent_profile(
                         independent, required_long_kv,
-                        short_chunks=args.main50_short)
+                        short_chunks=(args.main50_short or args.locked_short_chunks))
                     except (OSError, ValueError, TypeError) as exc:
                         profile_error = str(exc)
                     if profile_error is None:
