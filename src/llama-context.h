@@ -623,6 +623,10 @@ private:
     std::mutex region_ring_backend_execution_mutex;
 
     bool sched_need_reserve = true;
+    // The canonical Scheduler serves Decode in Graphless Region Ring Prefill.
+    // Upgrade to the original full-UBatch reserve if a batch cannot use Ring.
+    bool region_ring_canonical_decode_only_reserved = false;
+    bool region_ring_canonical_force_full_reserve = false;
 
     ggml_backend_t                backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
