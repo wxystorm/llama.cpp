@@ -851,6 +851,36 @@ inline bool llama_region_ring_apply_topology_compatible(
     // permitted after at least one completed cycle. All intervals must
     // be exact, contiguous and nonempty.
     // The automatic APPLY_WIDE Planner searches 2..5 Phone-final cycles.
+    // Explicit 32B no-Multi-Cycle ablation: keep five physical G8 Regions
+    // (A/B/A/B/A banks) while folding PC/Phone handoffs into one P24 stage.
+    // Do not merge G8x4 into G32: that would invalidate bank alternation.
+    // Opt-in only; no change to the normal multi-cycle grammar.
+    const char * allow_adjacent_gpu =
+        std::getenv("LLAMA_REGION_RING_ALLOW_ADJACENT_GPU");
+    if (allow_adjacent_gpu != nullptr && allow_adjacent_gpu[0] == '1' &&
+            allow_adjacent_gpu[1] == '\0' && n_layer == 64 &&
+            regions.size() == 6) {
+        constexpr std::array<int, 6> widths = {8, 8, 8, 8, 24, 8};
+        constexpr std::array<llama_region_ring_device, 6> devices = {
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::GPU,
+            llama_region_ring_device::PHONE,
+            llama_region_ring_device::GPU,
+        };
+        int next_layer = 0;
+        bool exact = true;
+        for (size_t j = 0; j < regions.size(); ++j) {
+            const auto & r = regions[j];
+            exact = exact && r.device == devices[j] &&
+                r.kind == llama_region_ring_device_stage(devices[j]) &&
+                r.layer_begin == next_layer &&
+                r.layer_end == next_layer + widths[j];
+            next_layer = r.layer_end;
+        }
+        if (exact && next_layer == n_layer) { return true; }
+    }
     size_t i = 0;
     int layer = 0;
     int cycles = 0;
