@@ -83,6 +83,7 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_REAL_STAGE_PROFILE",
     "LLAMA_REGION_RING_PROFILE_KV_EXTEND",
     "LLAMA_REGION_RING_PC_MMAP_BUDGET",
+    "LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION",
     "LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS",
     "LLAMA_REGION_RING_LOCKED_MAX_XG",
     "LLAMA_REGION_RING_LOCKED_MAX_XP",
@@ -686,6 +687,11 @@ def build_process(args, prompt, ctx, estimate, metrics_path):
     if args.pc_mmap_budget:
         # Native code also verifies the actual ml.use_mmap setting.
         env["LLAMA_REGION_RING_PC_MMAP_BUDGET"] = "1"
+    if args.gpu_region_budget_fraction != 0.50:
+        # GPU A+B peaks, KV, measured CUDA compute, and runtime reserves
+        # are still checked against the physical 97%-of-free VRAM cap.
+        env["LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION"] = (
+            f"{args.gpu_region_budget_fraction:.2f}")
     if args.skip_plan_memory_checks:
         # Native code verifies this is a locked HTP-only streamed plan.
         # Real GPU/PC/Phone allocation failures remain effective.
@@ -928,6 +934,11 @@ def get_args(argv=None):
                         help="opt-in PC mmap physical working-set budgeting:"
                              " full CPU weights plus GPU Bank A/B windows;"
                              " requires --auto-plan --htp-only and mmap")
+    parser.add_argument("--gpu-region-budget-fraction", type=float, default=0.50,
+                        help="opt-in max weight size per GPU Region as a fraction"
+                             " of the actual GPU memory budget; 0.50 default,"
+                             " up to 0.60; full two-Bank CUDA memory checks"
+                             " remain mandatory")
     parser.add_argument("--min-context", type=int, default=256, help="minimum Context; auto-sized per prompt and 256-aligned")
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--context-padding", type=int, default=64, help="tokens reserved beyond prompt and generated token")
@@ -1028,6 +1039,13 @@ def get_args(argv=None):
             args.streaming != "on" or args.no_mmap):
         parser.error("--pc-mmap-budget requires --auto-plan --htp-only "
                      "--streaming on; omit --no-mmap")
+    if (not math.isfinite(args.gpu_region_budget_fraction) or
+            not 0.50 <= args.gpu_region_budget_fraction <= 0.60):
+        parser.error("--gpu-region-budget-fraction must be between 0.50 and 0.60")
+    if args.gpu_region_budget_fraction != 0.50 and (
+            not args.auto_plan or args.streaming != "on"):
+        parser.error("--gpu-region-budget-fraction > 0.50 requires"
+                     " --auto-plan --streaming on")
     if args.htp_only and args.no_phone_weight_preload:
         parser.error("--htp-only requires early Phone Region configuration")
     if args.auto_plan and args.warmup_prompt is not None:
@@ -1438,9 +1456,11 @@ def main(argv=None):
         })
     if args.pc_mmap_budget:
         config["pc_weight_accounting"] = "MMAP_CPU_FULL_GPU_TWO_BANK_WINDOWS"
+    if args.gpu_region_budget_fraction != 0.50:
+        config["gpu_region_max_budget_fraction"] = args.gpu_region_budget_fraction
     if args.lock_layout_after_first:
         config["lock_layout_after_first"] = True
-        config["gpu_region_max_budget_fraction"] = 0.5
+        config["gpu_region_max_budget_fraction"] = args.gpu_region_budget_fraction
     if args.user_fixed_layout is not None:
         config["user_fixed_layer_layout"] = args.user_fixed_layout
     if args.sharegpt50_short_dataset:
@@ -1500,7 +1520,7 @@ def main(argv=None):
                 ("USER_FIXED_FROM_FIRST" if args.user_fixed_layout else
                  "FIRST_APPLIED_PLAN" if args.main50_short else
                  "FIRST_PASS_PLACEMENT") +
-                " later=CHUNK_ONLY gpu_region_max_budget_fraction=0.50"
+                f" later=CHUNK_ONLY gpu_region_max_budget_fraction={args.gpu_region_budget_fraction:.2f}"
                 " persistent=placement-lock.json", flush=True)
         if args.force_plan_layout:
             print(f"[PLAN_FORCE] source=USER layout={args.force_plan_layout} "
