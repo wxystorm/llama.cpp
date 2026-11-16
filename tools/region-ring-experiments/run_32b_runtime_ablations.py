@@ -70,8 +70,8 @@ def require_native_patch(exe: Path, skip_build_check: bool) -> None:
     if not header.is_file() or "LLAMA_REGION_RING_ALLOW_ADJACENT_GPU" not in header.read_text(
             encoding="utf-8"):
         raise RuntimeError(
-            "The C++ opt-in adjacent-GPU topology patch is missing. Apply "
-            "32b_single_pass_adjacent_gpu.patch to the PC repository, "
+            "Adjacent GPU layout support is missing from this checkout. "
+            "Switch to feat/32b-runtime-ablation-singlepass-20261116, "
             "rebuild llama-completion.exe, and retry.")
     if not skip_build_check and exe.is_file() and exe.stat().st_mtime < header.stat().st_mtime:
         raise RuntimeError(
