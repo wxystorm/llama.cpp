@@ -121,6 +121,51 @@ host RAM and HTP allocations can still fail. Always use a separate
 `--out` directory from guarded or automatic runs; compare real
 Prefill PASS/TPS, not predicted_ms alone.
 
+## Experimental resident llama-server smoke test
+
+`llama-server` can keep the 64-layer G/P topology and HTP weights
+resident across requests, but the current native Planner is a model-load
+hook. The server **does not re-plan XC/XG/XP per HTTP request**. Treat
+this mode as a separate fixed-Chunk feasibility/overhead test, never as
+equivalent to the dynamic per-Prompt main experiment.
+
+The smoke harness reuses this runner's HTP-only GPU Bank/RPC environment,
+reuses a validated independent Profile (including an older X8 sample,
+which is never selected), locks the 64-layer topology, opts out of the
+Planner's memory ESTIMATES, and caps XG/XP at 32 so the 64-token short
+group can retain two-Bank execution. It starts one server, submits the
+longest Prompt, a short Prompt, then the longest Prompt again to check
+request reset. The full 50 can be attempted with `--all50` AFTER this
+three-request check passes.
+
+    $root = "E:\llama\llama-tensor-v2"
+    cd $root
+    cmake --build .\build-tensor-v2 --config Release --target llama-server -j 8
+
+    python .\tools\region-ring-experiments\probe_htp_llama_server.py `
+      --server-exe "$root\build-tensor-v2\bin\Release\llama-server.exe" `
+      --model "E:\llama\models\Qwen3-32B-Q4_K_M.gguf" `
+      --rpc "10.238.229.239:50052" `
+      --prompt-dir "E:\llama\datasets\sharegpt\sharegpt50_short" `
+      --profile-source "$root\32b-sharegpt50-short-mmap-test\independent-profile" `
+      --out "$root\32b-server-smoke" --port 18080
+
+The harness forces `--parallel 1`, disables continuous batching, prompt
+caching, on-disk KV checkpointing and ordinary warmup, and sends
+`{"cache_prompt":false,"n_predict":1}` to `/completion`. It rejects
+responses with `timings.cache_n != 0`, records the actual
+`timings.prompt_n/prompt_ms/prompt_per_second`, and writes
+`requests.jsonl` plus `llama-server.log`. A startup failure or later
+HTP-only request failure does **not** establish server compatibility:
+see the tail of `llama-server.log`. In particular, the current server
+initialization uses a two-token context capability probe, while HTP-only
+Graphless only supports substantive Prefill. That path is not yet
+validated end to end on the target PC/Phone.
+
+Offline checks:
+
+    python .\tools\region-ring-experiments\test_probe_htp_llama_server.py
+
 ## Consistent 32B A0..A3 ablations
 
 The existing four-case ablation runner now supports the same 50-prompt
