@@ -10881,6 +10881,26 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         }
         model.gpu_cuda_other_reserve_bytes =
             cuda_misc_reserve_mib * 1048576.0L;
+        // The per-Region 50% guard is a conservative shape limit, not
+        // the actual two-Bank capacity. Permit a small, explicit relaxation:
+        // A/B peak weights + KV + two CUDA compute buffers + runtime
+        // reserves still have to fit together under the 0.97 VRAM budget.
+        // Never raise physical RAM, HTP VMEM, or the global GPU fraction.
+        if (const char * raw = std::getenv(
+                "LLAMA_REGION_RING_GPU_REGION_BUDGET_FRACTION")) {
+            char * end = nullptr;
+            const double parsed = std::strtod(raw, &end);
+            if (end == raw || *end != '\0' ||
+                    !std::isfinite(parsed) ||
+                    parsed < 0.50 || parsed > 0.60) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPU_MEMORY] status=REJECT "
+                    "reason=INVALID_REGION_BUDGET_FRACTION "
+                    "value=%s supported=0.50..0.60\n", raw);
+                return false;
+            }
+            model.gpu_max_region_budget_fraction = (long double) parsed;
+        }
         model.gpu_memory_budget_bytes =
             profile.gpu_free_mem == 0 ? 0.0L :
             (long double) profile.gpu_free_mem *
