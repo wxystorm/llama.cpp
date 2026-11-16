@@ -137,6 +137,84 @@ static void test_optional_cpu_dag_and_memory() {
     }
 }
 
+// Final CPU shrink is an optional neighborhood around already-scored
+// plans. It must be able to remove C1 and partially shrink C2, and it must
+// reject memory-infeasible neighbors before their DAG simulation.
+static void test_final_cpu_shrink() {
+    for (int cpu_depth : {1, 2}) {
+        model m = make_test_model();
+        const auto base = llama_region_ring_parse_apply_wide_layout(
+            cpu_depth == 1 ?
+                "G11,C1,P2,G10,C1,P2,G11,C1,P1" :
+                "G11,C2,P1,G10,C2,P1,G10,C2,P1", 40);
+        assert(runtime_cycle_micro_adjusted(base));
+        candidate origin;
+        origin.cycles = 3;
+        origin.g = 11;
+        origin.c = cpu_depth;
+        origin.p = cpu_depth == 1 ? 2 : 1;
+        origin.xc = origin.xg = origin.xp = 64;
+        origin.concrete_regions = base;
+        assert(estimate_region_ring_balance(m, base, origin));
+        assert(simulate(m, base, origin));
+
+        result improved;
+        improved.top.push_back(origin);
+        std::unordered_set<std::string> seen;
+        refine_runtime_cpu_shrink(m, improved, seen);
+        assert(improved.cpu_shrink_anchors == 1);
+        assert(improved.cpu_shrink_generated > 0);
+        assert(improved.cpu_shrink_profiled > 0);
+        assert(improved.cpu_shrink_simulated > 0);
+        const int original_cpu_layers = cpu_depth * 3;
+        bool saw_cpu_drop = false;
+        bool saw_cpu_remove = false;
+        bool saw_partial = false;
+        for (const auto & plan : improved.top) {
+            std::vector<llama_region_ring_region> layout;
+            assert(make_regions(plan, 40, layout));
+            assert(llama_region_ring_apply_topology_compatible(layout, 40));
+            assert(runtime_cycle_micro_adjusted(layout));
+            int cpu_layers = 0;
+            int cpu_stages = 0;
+            for (const auto & region : layout) {
+                if (region.device == device::CPU) {
+                    cpu_layers += region.layer_end - region.layer_begin;
+                    ++cpu_stages;
+                }
+            }
+            if (cpu_layers < original_cpu_layers) { saw_cpu_drop = true; }
+            if (cpu_stages < 3) { saw_cpu_remove = true; }
+            if (cpu_depth == 2 &&
+                    cpu_layers == original_cpu_layers - 1) {
+                saw_partial = true;
+            }
+        }
+        assert(saw_cpu_drop);
+        assert(saw_cpu_remove);
+        if (cpu_depth == 2) { assert(saw_partial); }
+
+        // The same previously-scored source is retained, but all smaller
+        // CPU candidates fail the real callback and are never simulated.
+        m.memory_feasible = [original_cpu_layers](const candidate & plan) {
+            int count = 0;
+            for (const auto & region : plan.concrete_regions) {
+                if (region.device == device::CPU) {
+                    count += region.layer_end - region.layer_begin;
+                }
+            }
+            return count >= original_cpu_layers;
+        };
+        result rejected;
+        rejected.top.push_back(origin);
+        seen.clear();
+        refine_runtime_cpu_shrink(m, rejected, seen);
+        assert(rejected.cpu_shrink_memory_rejected > 0);
+        assert(rejected.cpu_shrink_simulated == 0);
+        assert(rejected.top.size() == 1);
+    }
+}
+
 // A previous 512-token UBatch can leave A/B holding later GPU Regions.
 // A stale "initial banks loaded" flag must not be considered sufficient.
 static void test_gpu_bank_pair_after_ubatch() {
@@ -244,6 +322,7 @@ static void test_gpu_region_half_budget_cap() {
 int main() {
     test_layouts();
     test_optional_cpu_dag_and_memory();
+    test_final_cpu_shrink();
     test_gpu_bank_pair_after_ubatch();
     test_gpu_cuda_memory_reserve();
     test_gpu_region_half_budget_cap();
