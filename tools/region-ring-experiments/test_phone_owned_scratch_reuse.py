@@ -11,6 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 EXEC = ROOT / "ggml" / "src" / "ggml-rpc" / "phone-npu-serial-executor.h"
 RPC = ROOT / "ggml" / "src" / "ggml-rpc" / "ggml-rpc.cpp"
+HEXAGON = ROOT / "ggml" / "src" / "ggml-hexagon" / "ggml-hexagon.cpp"
 
 
 class PhoneOwnedScratchReuseTests(unittest.TestCase):
@@ -18,6 +19,33 @@ class PhoneOwnedScratchReuseTests(unittest.TestCase):
     def setUpClass(cls):
         cls.executor = EXEC.read_text(encoding="utf-8")
         cls.rpc = RPC.read_text(encoding="utf-8")
+        cls.hexagon = HEXAGON.read_text(encoding="utf-8")
+
+    def test_hexagon_fixed_graph_cache_supports_all_32b_regions(self):
+        # Regression for 1855-token/X32: HTP2 had 4*58=232 entries
+        # and failed exactly after 24 more, at its old 256-entry cap.
+        # Five NPU Regions stripe (4,4,5,4,4) layers across four HTP
+        # sessions. The busiest session hosts six layers.
+        for tokens, width in ((1855, 32), (2048, 16)):
+            chunks_per_layer = (tokens + width - 1) // width
+            needed = 6 * chunks_per_layer
+            self.assertGreater(needed, 256)
+            self.assertLessEqual(needed, 1024)
+
+        # Both precompile and the on-demand graph-compute cache use
+        # this ONE cap; otherwise a later fixed graph can silently miss.
+        src = self.hexagon
+        self.assertIn(
+            "k_hexagon_fixed_graph_cache_limit = 1024", src)
+        self.assertGreaterEqual(
+            src.count("k_hexagon_fixed_graph_cache_limit"), 3)
+        self.assertIn(
+            "reason=PER_SESSION_GRAPH_CACHE_CAP status=FAIL", src)
+        pre = src[src.index("static bool ggml_backend_hexagon_precompile_fixed_graph("):
+                  src.index("static ggml_status ggml_backend_hexagon_graph_compute(")]
+        compute = src[src.index("static ggml_status ggml_backend_hexagon_graph_compute("):]
+        self.assertIn("k_hexagon_fixed_graph_cache_limit", pre)
+        self.assertIn("k_hexagon_fixed_graph_cache_limit", compute)
 
     def test_graphless_only_default_and_legacy_optout(self):
         src = self.executor
