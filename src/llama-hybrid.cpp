@@ -11703,6 +11703,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 result.cpu_optional_simulated);
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_CPU_SHRINK] mode=APPLY_WIDE "
+                "phase=PHONE_FINAL_PARENT "
                 "operation=ONE_CPU_STAGE_MINUS_1_OR_2 "
                 "recipient=ADJACENT_GPU_OR_PHONE "
                 "anchors=%zu generated=%zu reject_memory=%zu "
