@@ -3,7 +3,6 @@
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-import csv
 import json
 import sys
 import tempfile
