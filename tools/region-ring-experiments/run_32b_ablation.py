@@ -350,6 +350,21 @@ def ensure_independent_profile(args) -> Path:
         raise ValueError("A2 needs --profile-csv for --plan-only/--dry-run "
                          "or an existing independent-profile cache")
     calibration_out = args.out / "independent-calibration-run"
+    calibration_layout = FIXED
+    if args.main50_short:
+        from run_32b_all40 import default_layout_for_layers, normalize_layout
+        if args.baseline_placement_lock is not None:
+            lock_data = json.loads(
+                args.baseline_placement_lock.read_text(encoding="utf-8"))
+            if lock_data.get("first_prompt") != "prompt_1024_10.txt":
+                raise ValueError("Ablation calibration requires the long-anchor "
+                                 "placement-lock.json from prompt_1024_10.txt")
+            calibration_layout = normalize_layout(
+                lock_data["layout"], args.model_layers)
+        else:
+            # A2-only runs may not supply the Full baseline lock. Use a
+            # 40-layer topology for 14B/24B, not legacy 32B's G8/P6.
+            calibration_layout = default_layout_for_layers(args.model_layers)
     command = [
         sys.executable, str(Path(__file__).with_name("run_32b_all40.py")),
         "--model", str(args.model), "--model-layers",
@@ -358,7 +373,7 @@ def ensure_independent_profile(args) -> Path:
         "--prompt-dir", str(args.prompt_dir),
         "--out", str(calibration_out),
         "--auto-plan", "--htp-only",
-        "--force-plan-layout", FIXED,
+        "--force-plan-layout", calibration_layout,
         "--force-plan-xc", str(args.chunk),
         "--force-plan-xg", str(args.chunk),
         "--force-plan-xp", str(args.chunk),
@@ -373,7 +388,8 @@ def ensure_independent_profile(args) -> Path:
                     "--max-context", "2048", "--context-padding", "0",
                     "--only-prompt", "prompt_1024_10.txt"]
     print(f"[ABLATION_PROFILE] event=START source=INDEPENDENT_G_C_N "
-          f"out={calibration_out}", flush=True)
+          f"out={calibration_out} calibration_layout={calibration_layout} "
+          f"layers={args.model_layers}", flush=True)
     code = subprocess.call(command, cwd=str(ROOT))
     native = calibration_out / "independent-profile" / "profile.csv"
     if not native.exists():
