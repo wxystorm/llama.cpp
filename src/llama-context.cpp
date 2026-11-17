@@ -10779,10 +10779,59 @@ int llama_context::decode(const llama_batch & batch_inp) {
         int request_xc = 0;
         int request_xg = 0;
         int request_xp = 0;
-        const bool selected =
-            llama_hybrid_region_ring_planner_apply_wide(
+        // Ablation-only exact Chunk replay. The resident server reads an
+        // atomically replaced one-request sidecar immediately before each
+        // actual >=32-token Prefill. This never changes model layer placement
+        // and never calls the Chunk search for replayed requests. Unlike a
+        // token-count lookup, the driver supplies the intended Prompt's
+        // decision just before POST; mismatched token counts fail closed.
+        const char * replay_path =
+            std::getenv("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE");
+        const bool replay_requested =
+            replay_path != nullptr && *replay_path != '\0';
+        bool selected = false;
+        if (replay_requested) {
+            std::ifstream replay(replay_path);
+            uint32_t replay_tokens = 0;
+            std::string extra;
+            if (!replay ||
+                    !(replay >> replay_tokens >> request_layout >>
+                      request_xc >> request_xg >> request_xp) ||
+                    (replay >> extra)) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_REQUEST_CHUNK_REPLAY] event=REJECT"
+                    " reason=INVALID_OR_MISSING_SIDECAR file=%s status=FAIL\n",
+                    replay_path);
+                return -1;
+            }
+            if (replay_tokens != n_tokens_all ||
+                    request_xc < 16 || request_xc > 256 ||
+                    request_xg < 16 || request_xg > 256 ||
+                    request_xp < 16 || request_xp > 256 ||
+                    request_xc > (int) n_tokens_all ||
+                    2 * request_xg > (int) n_tokens_all ||
+                    request_xp > (int) n_tokens_all) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_REQUEST_CHUNK_REPLAY] event=REJECT"
+                    " reason=TOKEN_OR_WIDTH_MISMATCH"
+                    " expected_tokens=%u actual_tokens=%u"
+                    " XC=%d XG=%d XP=%d status=FAIL\n",
+                    replay_tokens, n_tokens_all,
+                    request_xc, request_xg, request_xp);
+                return -1;
+            }
+            selected = true;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_REQUEST_CHUNK_REPLAY] event=READ"
+                " tokens=%u layout=%s XC=%d XG=%d XP=%d"
+                " source=REFERENCE_REQUESTS_JSONL status=PASS\n",
+                n_tokens_all, request_layout.c_str(),
+                request_xc, request_xg, request_xp);
+        } else {
+            selected = llama_hybrid_region_ring_planner_apply_wide(
                 (int) n_tokens_all, 0, baseline_chunk,
                 request_layout, request_xc, request_xg, request_xp);
+        }
         // A mismatch is never permitted to silently repartition model
         // weights or to fall back to the startup Chunk Plan. The existing
         // locked search owns the short (16/24/32) and ordinary (32+) grids,
@@ -10820,7 +10869,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             " XC=%d XG=%d XP=%d"
             " startup_XC=%d startup_XG=%d startup_XP=%d"
             " changed=%d planner_ms=%.3f"
-            " source=LOCKED_CHUNK_ONLY"
+            " source=%s"
             " layer_placement=IMMUTABLE"
             " execution=THIS_DECODE_ONLY status=PASS\n",
             n_tokens_all, request_layout.c_str(),
@@ -10829,7 +10878,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             (startup_xc != region_ring_xc ||
              startup_xg != region_ring_xg ||
              startup_xp != region_ring_xp) ? 1 : 0,
-            planner_ms);
+            planner_ms,
+            replay_requested ? "LOCKED_CHUNK_REPLAY" : "LOCKED_CHUNK_ONLY");
     }
     if (region_ring_v1 &&
             llama_region_ring_has_directional_stages(
