@@ -19,8 +19,12 @@ git pull --ff-only origin feat/region-ring-sharegpt50-short-first-long-20261116
 python -m unittest discover -s .\tools\region-ring-experiments -p "test_probe_htp_llama_server.py"
 if ($LASTEXITCODE -ne 0) { throw "Python unit tests failed" }
 
-cmake --build .\build-tensor-v2 --config Release --target llama-completion llama-server test-region-ring-planner --parallel 8
+cmake --build .\build-tensor-v2 --config Release --target llama-completion llama-server --parallel 8
 if ($LASTEXITCODE -ne 0) { throw "C++ build failed" }
+
+# Optional when CMake was configured with LLAMA_BUILD_TESTS=ON:
+# cmake --build .\build-tensor-v2 --config Release --target test-region-ring-planner --parallel 8
+# .\build-tensor-v2\bin\Release\test-region-ring-planner.exe
 ~~~
 
 ## Step 1：独立 Profile + 线性评分重新生成 Placement

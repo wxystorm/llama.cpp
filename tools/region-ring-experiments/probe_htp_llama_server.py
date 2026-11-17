@@ -1041,6 +1041,19 @@ def main(argv=None):
                                 stdout=log, stderr=subprocess.STDOUT)
         try:
             wait_for_ready(proc, args.port, args.startup_timeout)
+            if args.no_dag_placement:
+                startup = log_path.read_text(encoding="utf-8",
+                                             errors="replace")
+                if ("[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE"
+                        not in startup or
+                    "event_simulation=OFF" not in startup or
+                    not re.search(
+                        r"\[REGION_RING_PLAN_LOCK\] status=PASS"
+                        r" source=CHUNK_ONLY [^\n]*"
+                        r"memory_policy=GUARDED", startup)):
+                    raise RuntimeError(
+                        "No-DAG model startup did not confirm linear-score"
+                        " guarded locked placement; check " + str(log_path))
             print("[SERVER_PROBE] health=READY model=RESIDENT", flush=True)
             open_mode = "a" if args.all50 and args.resume else "w"
             with metrics_path.open(open_mode, encoding="utf-8") as output:
