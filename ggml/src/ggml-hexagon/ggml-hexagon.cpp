@@ -33,6 +33,9 @@
 #else
 #    include <semaphore.h>
 #    include <unistd.h>
+#    ifdef __linux__
+#        include <sys/resource.h>
+#    endif
 #endif
 
 #pragma clang diagnostic ignored "-Wnested-anon-types"
@@ -93,6 +96,64 @@ static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
 #define HEX_VERBOSE(...) \
     if (opt_verbose) GGML_LOG_DEBUG(__VA_ARGS__)
+
+// Experimental, opt-in measurements for the phone-only -npu mode.
+static bool ggml_phone_moti_enabled() {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_PHONE_MOTI_LAYER");
+        return e && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+static int ggml_phone_moti_layer_id(const char * name) {
+    if (!name) return -1;
+    const char * p = strstr(name, "blk.");
+    if (!p) return -1;
+    p += 4;
+    if (*p < '0' || *p > '9') return -1;
+    char * end = nullptr;
+    const long n = strtol(p, &end, 10);
+    return end != p && n >= 0 && n <= 10000 ? (int) n : -1;
+}
+
+static bool ggml_phone_moti_trace_layer(int layer) {
+    if (!ggml_phone_moti_enabled() || layer < 0) return false;
+    const char * target = getenv("GGML_PHONE_MOTI_TARGET_LAYER");
+    if (!target || !*target) return true;
+    char * end = nullptr;
+    const long n = strtol(target, &end, 10);
+    return end != target && end && *end == '\0' && n == layer;
+}
+
+static uint64_t ggml_phone_moti_disk_read_bytes() {
+#ifdef __linux__
+    FILE * f = fopen("/proc/self/io", "r");
+    if (!f) return UINT64_MAX;
+    char key[64];
+    unsigned long long value = 0;
+    uint64_t bytes = UINT64_MAX;
+    while (fscanf(f, "%63s %llu", key, &value) == 2) {
+        if (strcmp(key, "read_bytes:") == 0) {
+            bytes = (uint64_t) value;
+            break;
+        }
+    }
+    fclose(f);
+    return bytes;
+#else
+    return UINT64_MAX;
+#endif
+}
+
+static long ggml_phone_moti_major_faults() {
+#ifdef __linux__
+    struct rusage r = {};
+    return getrusage(RUSAGE_SELF, &r) == 0 ? r.ru_majflt : -1;
+#else
+    return -1;
+#endif
+}
 
 static const char * status_to_str(uint32_t status) {
     switch (status) {
@@ -302,6 +363,7 @@ struct ggml_hexagon_shared_buffer {
 
     void mmap() {
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : FASTRPC_MAP_FD_DELAYED;
+        const auto moti_map_begin = std::chrono::steady_clock::now();
 
         int err = fastrpc_mmap(sess->domain_id, this->fd, (void *) this->base, 0, this->size, flags);
         if (err != 0) {
@@ -314,6 +376,13 @@ struct ggml_hexagon_shared_buffer {
                 sess->c_name(), (void *) this->base, this->size, this->fd, pinned);
 
         this->mapped = true;
+        if (ggml_phone_moti_enabled()) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - moti_map_begin).count();
+            GGML_LOG_INFO("[PHONE_MOTI_MAP] session=%s size_mib=%.3f pinned=%d "
+                          "map_ms=%.3f scope=buffer_allocation\n",
+                    sess->c_name(), this->size / 1048576.0, pinned ? 1 : 0, ms);
+        }
     }
 
     void unmap() {
@@ -335,6 +404,7 @@ struct ggml_hexagon_shared_buffer {
 
     void alloc(size_t size) {
         if (this->base) return;
+        const auto moti_alloc_begin = std::chrono::steady_clock::now();
 
         this->base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
         if (!this->base) {
@@ -348,6 +418,13 @@ struct ggml_hexagon_shared_buffer {
             throw std::runtime_error("ggml-hex: rpcmem_to_fd failed (see log for details)");
         }
         this->size = size;
+        if (ggml_phone_moti_enabled()) {
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - moti_alloc_begin).count();
+            GGML_LOG_INFO("[PHONE_MOTI_ALLOC] session=%s size_mib=%.3f pinned=%d "
+                          "alloc_fd_ms=%.3f scope=buffer_allocation\n",
+                    sess->c_name(), this->size / 1048576.0, pinned ? 1 : 0, ms);
+        }
 
         HEX_VERBOSE("ggml-hex: %s allocated buffer: base %p size %zu fd %d pinned %d\n", sess->c_name(),
                     (void *) this->base, this->size, this->fd, (int) pinned);
@@ -1279,6 +1356,31 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu\n", sess->c_name(), tensor->name, data, offset, size);
 
+    const int moti_layer = ggml_phone_moti_layer_id(tensor->name);
+    const bool moti_weight = ggml_phone_moti_trace_layer(moti_layer) &&
+            ggml_hexagon_is_repack_type(tensor->type);
+    const char * moti_prefault_env = moti_weight ? getenv("GGML_PHONE_MOTI_PRETOUCH") : nullptr;
+    const bool moti_prefault = moti_prefault_env && strcmp(moti_prefault_env, "1") == 0;
+    const uint64_t moti_read_before = moti_weight ? ggml_phone_moti_disk_read_bytes() : UINT64_MAX;
+    const long moti_faults_before = moti_weight ? ggml_phone_moti_major_faults() : -1;
+    const auto moti_start = std::chrono::steady_clock::now();
+
+    // Optional controlled phase experiment. This separates mmap page-in
+    // activity from the subsequent CPU tiled REPACK, but intentionally
+    // perturbs the normal streaming path. Page cache hits are not UFS reads.
+    if (moti_prefault && size > 0) {
+        volatile const uint8_t * src = static_cast<volatile const uint8_t *>(data);
+        volatile uint8_t checksum = 0;
+        for (size_t i = 0; i < size; i += 4096) {
+            checksum = (uint8_t) (checksum ^ src[i]);
+        }
+        checksum = (uint8_t) (checksum ^ src[size - 1]);
+        (void) checksum;
+    }
+    const auto moti_prefault_end = std::chrono::steady_clock::now();
+    const uint64_t moti_read_after_prefault = moti_weight ? ggml_phone_moti_disk_read_bytes() : UINT64_MAX;
+    const long moti_faults_after_prefault = moti_weight ? ggml_phone_moti_major_faults() : -1;
+
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
             GGML_ASSERT(offset == 0);
@@ -1328,6 +1430,35 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
             break;
     }
 
+    if (moti_weight) {
+        const auto moti_end = std::chrono::steady_clock::now();
+        const uint64_t moti_read_end = ggml_phone_moti_disk_read_bytes();
+        const long moti_faults_end = ggml_phone_moti_major_faults();
+        auto delta_mib = [](uint64_t before, uint64_t after) -> double {
+            return before == UINT64_MAX || after == UINT64_MAX || after < before ?
+                   -1.0 : (after - before) / 1048576.0;
+        };
+        const double page_touch_ms = moti_prefault ?
+                std::chrono::duration<double, std::milli>(moti_prefault_end - moti_start).count() : 0.0;
+        const double repack_ms = std::chrono::duration<double, std::milli>(
+                moti_end - moti_prefault_end).count();
+        const double total_ms = std::chrono::duration<double, std::milli>(
+                moti_end - moti_start).count();
+        const long touch_faults = moti_faults_before >= 0 && moti_faults_after_prefault >= 0 ?
+                moti_faults_after_prefault - moti_faults_before : -1;
+        const long repack_faults = moti_faults_after_prefault >= 0 && moti_faults_end >= 0 ?
+                moti_faults_end - moti_faults_after_prefault : -1;
+        GGML_LOG_INFO("[PHONE_MOTI_WEIGHT] session=%s layer=%d tensor=%s type=%s "
+                      "size_mib=%.3f pretouch=%d page_touch_ms=%.3f repack_wall_ms=%.3f total_ms=%.3f "
+                      "page_touch_read_mib=%.3f repack_read_mib=%.3f "
+                      "page_touch_major_faults=%ld repack_major_faults=%ld\n",
+                sess->c_name(), moti_layer, tensor->name, ggml_type_name(tensor->type),
+                size / 1048576.0, moti_prefault ? 1 : 0,
+                page_touch_ms, repack_ms, total_ms,
+                delta_mib(moti_read_before, moti_read_after_prefault),
+                delta_mib(moti_read_after_prefault, moti_read_end),
+                touch_faults, repack_faults);
+    }
 }
 
 static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
