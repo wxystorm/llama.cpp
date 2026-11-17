@@ -4,6 +4,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
+#include "../../ggml/src/prima-fig3-trace.h"
 
 #include <cassert>
 #include <cstdio>
@@ -207,6 +208,8 @@ int main(int argc, char ** argv) {
 
     model = llama_init.model;
     ctx = llama_init.context;
+    int64_t prima_fig3_prefill_begin_ns = 0;
+    bool prima_fig3_prefill_closed = false;
 
     if (model == NULL) {
         LOG_ERR("%s: error: unable to load model\n", __func__);
@@ -662,6 +665,10 @@ int main(int argc, char ** argv) {
             }
 
             if (my_rank == 0) {
+                if (!prima_fig3_prefill_closed && !embd.empty() && !prima_fig3_prefill_begin_ns && n_past == 0) {
+                    prima_fig3_prefill_begin_ns = prima_fig3::now_ns();
+                    prima_fig3::record("Boundary", "PREFILL_BEGIN", prima_fig3_prefill_begin_ns, prima_fig3_prefill_begin_ns);
+                }
                 for (int i = 0; i < (int) embd.size(); i += params.n_batch) {
                     int n_eval = (int) embd.size() - i;
                     if (n_eval > params.n_batch) {
@@ -697,6 +704,11 @@ int main(int argc, char ** argv) {
                     LOG_DBG("saved session to %s\n", path_session.c_str());
                 }
 
+                if (prima_fig3_prefill_begin_ns && !prima_fig3_prefill_closed) {
+                    const int64_t end_ns = prima_fig3::now_ns();
+                    prima_fig3::record("Boundary", "PREFILL", prima_fig3_prefill_begin_ns, end_ns, n_past);
+                    prima_fig3_prefill_closed = true;
+                }
                 const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
 
                 gpt_sampler_accept(smpl, id, /* accept_grammar= */ true);
