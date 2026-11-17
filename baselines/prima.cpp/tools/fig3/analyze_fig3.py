@@ -64,36 +64,58 @@ def calibrate(samples):
     drift = max(s["offset_phone_minus_pc_ns"] for s in selected) - min(
         s["offset_phone_minus_pc_ns"] for s in selected)
     limit = 20000000  # 20 ms
+    before = sorted((s for s in samples if s.get("phase") == "before"),
+                    key=lambda s: s["uncertainty_ns"])[:4]
+    after = sorted((s for s in samples if s.get("phase") == "after"),
+                   key=lambda s: s["uncertainty_ns"])[:4]
+    if not before or not after:
+        raise ValueError("missing before/after phone clock calibration")
+    temporal_drift = abs(
+        int(statistics.median(s["offset_phone_minus_pc_ns"] for s in before)) -
+        int(statistics.median(s["offset_phone_minus_pc_ns"] for s in after)))
+    if temporal_drift > limit:
+        raise ValueError(f"phone clock drift {temporal_drift/1e6:.3f} ms exceeds 20 ms")
     if drift > limit:
         raise ValueError(f"Phone clock offset spread {drift / 1e6:.3f} ms exceeds 20 ms")
-    return offset, min(s["uncertainty_ns"] for s in selected), drift
+    return offset, min(s["uncertainty_ns"] for s in selected), max(drift, temporal_drift)
 
 
 def projection(source, start, end):
-    bounds = {start, end}
+    """O(N log N) event sweep with mutually-exclusive priority projection."""
+    edges = []
     for r in source:
-        bounds.add(r["a"])
-        bounds.add(r["b"])
-    xs = sorted(bounds)
-    per_category = defaultdict(int)
+        if r["category"] not in CATEGORIES[:-1]:
+            continue
+        edges.append((r["a"], 1, r["category"]))
+        edges.append((r["b"], -1, r["category"]))
+    edges.sort()
+    points = sorted({start, end} | {x[0] for x in edges})
+    active = Counter()
+    totals = defaultdict(int)
     pieces = []
     overlap_ns = 0
-    for a, b in zip(xs, xs[1:]):
+    i = 0
+    for a, b in zip(points, points[1:]):
+        while i < len(edges) and edges[i][0] <= a:
+            _, change, cat = edges[i]
+            active[cat] += change
+            if active[cat] < 0:
+                raise ValueError("unbalanced event endpoints")
+            i += 1
         if b <= a:
             continue
-        active = [r for r in source if r["a"] < b and r["b"] > a
-                  and r["category"] in CATEGORIES]
-        if len(active) > 1:
+        if sum(active.values()) > 1:
             overlap_ns += b - a
-        kind = next((cat for cat in CATEGORIES[:-1] if any(
-            r["category"] == cat for r in active)), "Waiting / Other")
-        per_category[kind] += b - a
-        if pieces and pieces[-1]["category"] == kind and pieces[-1]["b"] == a:
+        cat = next((c for c in CATEGORIES[:-1] if active[c] > 0),
+                   "Waiting / Other")
+        totals[cat] += b - a
+        if pieces and pieces[-1]["category"] == cat and pieces[-1]["b"] == a:
             pieces[-1]["b"] = b
         else:
-            pieces.append(dict(a=a, b=b, category=kind))
-    assert sum(per_category.values()) == end - start
-    return pieces, per_category, overlap_ns
+            pieces.append(dict(a=a, b=b, category=cat))
+    if sum(totals.values()) != end - start:
+        raise ValueError("projection does not cover all Prefill nanoseconds")
+    return pieces, totals, overlap_ns
 
 
 def inspect(args):
@@ -142,10 +164,8 @@ def inspect(args):
         raise ValueError("missing PC CUDA device events - check CUDA build and tracing")
     if not counts[("pc", "RPC / Coordination")]:
         raise ValueError("missing PC ZeroMQ communication intervals")
-    if not any(x["category"] == "PCIe Copy" for x in raw):
-        raise ValueError("missing PCIe transfer instrumentation (no CUDA copies captured)")
-    if not any(x["category"] == "CPU Compute" for x in raw):
-        raise ValueError("missing PC CPU Compute (check CPU backend and rank assignment)")
+    # PCIe can be zero for a particular Prefill; never invent source events.
+    # Rank 0 may have zero CPU Graph time if entirely CUDA-assigned.
 
     projected, totals, overlap = projection(raw, t0, t1)
     envelope = t1 - t0
