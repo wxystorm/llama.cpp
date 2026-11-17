@@ -102,6 +102,8 @@ def parse_args(argv=None):
                    help="Runtime ablation: retain both GPU banks but load later weights synchronously on demand")
     p.add_argument("--no-multi-cycle", action="store_true",
                    help="Runtime ablation: lock G36,P21,G7; each Prompt runs native Planner XC/XG/XP search (no replay); keep six GPU Bank windows, async prefetch and Drain-First")
+    p.add_argument("--fixed-chunk", type=int, choices=(128,), default=None,
+                   help="Planner ablation: fixed XC=XG=XP=128; requests shorter than 128 run whole as one Chunk, retaining async double-bank streaming")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -149,6 +151,15 @@ def parse_args(argv=None):
         p.error("--no-multi-cycle must choose native XC/XG/XP for each Prompt; remove --replay-chunks-from")
     if args.no_multi_cycle and (not args.all50 or not args.per_request_chunks):
         p.error("--no-multi-cycle requires --all50 --per-request-chunks")
+    if args.fixed_chunk is not None:
+        if not args.all50 or not args.per_request_chunks:
+            p.error("--fixed-chunk requires --all50 --per-request-chunks")
+        if args.replay_chunks_from is not None:
+            p.error("--fixed-chunk cannot replay baseline Chunk decisions")
+        if args.no_drain_first or args.no_async_prefetch or args.no_multi_cycle:
+            p.error("Select only one ablation at a time")
+        if args.model_layers != 64 or args.locked_layout != DEFAULT_CANONICAL_LAYOUT:
+            p.error("--fixed-chunk 128 requires 32B Full Cycle locked layout")
     if sum((args.no_drain_first, args.no_async_prefetch,
             args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
@@ -312,7 +323,8 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
                             expected_source=None,
                             expected_sched_mode=None,
                             expect_sync_bank_demand=False,
-                            expect_gpg_ablation=False):
+                            expect_gpg_ablation=False,
+                            expected_fixed_chunk=None):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -349,6 +361,41 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
             raise RuntimeError(
                 "w/o Async Prefetch did not execute exactly "
                 f"{expected_refills} synchronous Bank refills")
+    if expected_fixed_chunk is not None:
+        fixed_width = min(expected_fixed_chunk, expected_tokens)
+        policy = ("WHOLE_PROMPT_SINGLE_CHUNK"
+                  if expected_tokens < expected_fixed_chunk else "FIXED_128")
+        native_fixed = re.search(
+            r"\[REGION_RING_FIXED_CHUNK\] target=(\d+) tokens=(\d+)"
+            r" XC=(\d+) XG=(\d+) XP=(\d+)"
+            r" policy=([^ ]+) gpu_small_batch_mover=FORCED"
+            r" profile_queries=0 status=PASS", data)
+        if (native_fixed is None or
+                tuple(map(int, native_fixed.groups()[:5])) !=
+                    (expected_fixed_chunk, expected_tokens,
+                     fixed_width, fixed_width, fixed_width) or
+                native_fixed.group(6) != policy):
+            raise RuntimeError(
+                "Fixed Chunk ablation did not execute prescribed widths "
+                "or full-prompt single-Chunk fallback")
+        if not re.search(
+                r"\[REGION_RING_ABLATION\] gpu_banks=2 gpu_prefetch=1 "
+                r"gpu_bank_mover=1 sync_demand=0 status=CONFIGURED", data):
+            raise RuntimeError(
+                "Fixed Chunk ablation must retain two GPU Banks and async mover")
+        if not re.search(
+                r"\[REGION_RING_GPU_BANK\] phase=INIT banks=2 "
+                r".*force_small_batch=1 override_applied=[01] status=READY", data):
+            raise RuntimeError(
+                "Fixed Chunk did not force two-bank mover for one-Chunk requests")
+        refills = re.findall(
+            r"\[REGION_RING_GPU_BANK_MOVER_SUM\] "
+            r"worker=CPU_SINGLE started=(\d+) completed=(\d+) "
+            r"failures=(\d+).*thread_started=1 thread_joined=1 "
+            r"status=PASS", data)
+        if len(refills) != 1 or tuple(map(int, refills[0])) != (4, 4, 0):
+            raise RuntimeError(
+                "Fixed Chunk lost original four asynchronous GPU Bank refills")
     if expect_gpg_ablation:
         if not re.search(
                 r"\[REGION_RING_MULTI_CYCLE_ABLATION\] mode=G_P_G "
@@ -401,7 +448,11 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
         raise RuntimeError(
             "Native Chunk Plan outside controlled width bounds: "
             + str(chunks))
-    if 2 * int(xg) > expected_tokens:
+    if expected_fixed_chunk is not None and chunks != (
+            min(expected_fixed_chunk, expected_tokens),) * 3:
+        raise RuntimeError(
+            "Fixed Chunk selected widths differ from declared target")
+    if expected_fixed_chunk is None and 2 * int(xg) > expected_tokens:
         raise RuntimeError(
             f"Two-Bank request has insufficient tokens: "
             f"XG={xg}, tokens={expected_tokens}")
@@ -505,6 +556,11 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["logical_layout"] = GPG_LOGICAL_LAYOUT
         base["physical_layout"] = GPG_PHYSICAL_LAYOUT
         base["chunk_policy"] = "NATIVE_PER_REQUEST_LOCKED_CHUNK_SEARCH_APPLIED"
+    if getattr(args, "fixed_chunk", None) is not None:
+        base["planner_ablation"] = "WO_DYNAMIC_CHUNK_FIXED_128"
+        base["fixed_chunk_tokens"] = args.fixed_chunk
+        base["short_prompt_policy"] = "WHOLE_PROMPT_SINGLE_CHUNK"
+        base["chunk_policy"] = "FIXED_NO_REQUEST_PROFILE_SEARCH"
     encoded = json.dumps(
         base, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")
@@ -848,6 +904,17 @@ def main(argv=None):
         env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+    if args.fixed_chunk is not None:
+        env["LLAMA_REGION_RING_FIXED_CHUNK_ABLATION"] = str(args.fixed_chunk)
+        env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "0"
+        env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+        env["LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED"] = "1"
+    else:
+        env.pop("LLAMA_REGION_RING_FIXED_CHUNK_ABLATION", None)
+        env.pop("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH", None)
     if args.no_multi_cycle:
         env["LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
@@ -871,6 +938,14 @@ def main(argv=None):
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    if args.fixed_chunk is not None:
+        print("[SERVER_PLANNER_ABLATION] mode=WO_DYNAMIC_CHUNK"
+              " fixed_chunk=128 short_prompt=WHOLE_PROMPT_SINGLE_CHUNK"
+              " native_chunk_search=DISABLED_PER_REQUEST"
+              " gpu_banks=2 async_prefetch=1 drain_first=1"
+              " layer_placement=IMMUTABLE"
+              " runtime_allocators=UNCHANGED",
+              flush=True)
     if args.no_multi_cycle:
         print("[SERVER_ABLATION] mode=WO_MULTI_CYCLE_GPG"
               " logical=" + GPG_LOGICAL_LAYOUT +
@@ -973,12 +1048,16 @@ def main(argv=None):
                             GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
                             else args.locked_layout,
                             "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
+                            else "FIXED_CHUNK_ABLATION"
+                            if args.fixed_chunk is not None
                             else "LOCKED_CHUNK_ONLY",
                             "FIFO" if args.no_drain_first else
                             "DRAIN_FIRST" if
                             (args.no_async_prefetch or
-                             args.no_multi_cycle) else None,
-                            args.no_async_prefetch, args.no_multi_cycle)
+                             args.no_multi_cycle or
+                             args.fixed_chunk is not None) else None,
+                            args.no_async_prefetch, args.no_multi_cycle,
+                            args.fixed_chunk)
                         if reference_chunks is not None and any(
                                 decision["plan_" + name] != ref["plan_" + name]
                                 for name in ("xc", "xg", "xp")):
@@ -994,6 +1073,8 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
+                            "FIXED_128_NO_REQUEST_SEARCH"
+                            if args.fixed_chunk is not None else
                             "GPG_PER_REQUEST_NATIVE" if args.no_multi_cycle
                             else "REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
                             else "PER_REQUEST_LOCKED" if args.per_request_chunks
@@ -1001,6 +1082,11 @@ def main(argv=None):
                         "runtime_layout": (
                             GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
                             else fake_args.locked_layout),
+                        **({"fixed_chunk_target": args.fixed_chunk,
+                            "fixed_chunk_short_policy": "WHOLE_PROMPT_SINGLE_CHUNK",
+                            "scheduler_mode": "DRAIN_FIRST",
+                            "prefetch_mode": "ASYNC_DOUBLE_BANK"}
+                           if args.fixed_chunk is not None else {}),
                         **({"logical_layout": GPG_LOGICAL_LAYOUT,
                             "scheduler_mode": "DRAIN_FIRST",
                             "prefetch_mode": "ASYNC_DOUBLE_BANK"}
