@@ -94,8 +94,9 @@ def main():
             (run,"Phone Compute",ms(20)+offset,ms(83)+offset,0,1,64),
         ])
         cmd=[sys.executable,str(script),"--profile-dir",str(profile),
-             "--phone-events",str(phone),"--run-id",run,"--pc-layers","24",
-             "--normal-prefill-ms","117","--expected-tokens","100"]
+             "--phone-events",str(phone),"--run-id",run,"--pc-layers","53",
+             "--normal-prefill-ms","117","--expected-tokens","100",
+             "--model-layers","64"]
         result=subprocess.run(cmd,capture_output=True,text=True)
         if result.returncode:
             raise AssertionError(result.stderr+"\n"+result.stdout)
@@ -104,6 +105,8 @@ def main():
         assert float(v["profile_envelope_ms"])==130.0
         assert v["full_coverage"]=="1" and v["required_sources_present"]=="1"
         assert v["phone_compute_events"]=="1" and v["chunk_events"]=="3"
+        assert v["model_layers"]=="64" and v["pc_layers"]=="53" and v["phone_layers"]=="11"
+        assert v["model_label"]=="32B"
         keys=["phone_compute","pcie_copy","gpu_compute","cpu_compute",
               "wi_fi_sync","waiting_other"]
         total=sum(float(v[k+"_pct"]) for k in keys)
@@ -119,7 +122,7 @@ def main():
         assert fail.returncode!=0
         assert "pc_cuda_events.csv" in fail.stderr
         test_new_rpc_protocol()
-        print("[JUPITER_FIG3_TEST] PASS: 8 clock samples, native phone run ID, GPU/CPU/PCIe/RPC, chunks, 100% coverage, strict missing-source rejection, real HELLO/TAG/CLOCK packet protocol")
+        print("[JUPITER_FIG3_TEST] PASS: 64 layers / PC53+Phone11, 8 clock samples, native phone run ID, GPU/CPU/PCIe/RPC, chunks, 100% coverage, strict missing-source rejection, real HELLO/TAG/CLOCK packet protocol")
 
 
 if __name__=="__main__":
