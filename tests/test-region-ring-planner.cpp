@@ -60,7 +60,99 @@ static model mock_profile() {
     return m;
 }
 
+static void test_gpg_phone_serial_profile_composition() {
+    // Independent HTP Profile measures N2/N4/N6, not a single N21 graph.
+    // The P21 execution is serial, so 6+6+6+3 must be assembled from
+    // measured *same-Chunk, same-KV* costs rather than depth-extrapolated.
+    const std::string csv = "test-gpg-phone-serial-profile.csv";
+    {
+        std::ofstream out(csv);
+        REQUIRE(out.good());
+        out << "device,layers,tokens,kv_tokens,setup_ms,upload_ms,"
+               "prepare_ms,compute_ms,terminal,samples\n";
+        for (const int d : {2, 4, 6}) {
+            out << "PHONE," << d << ",64,256,"
+                << (0.5 * d) << ",0,"
+                << (1.0 * d) << "," << (10.0 * d)
+                << ",0,5\n";
+        }
+    }
+    real_stage_profile profile;
+    std::string error;
+    REQUIRE(profile.load(csv, error));
+    REQUIRE(std::remove(csv.c_str()) == 0);
+    double ms = -1.0;
+    REQUIRE(!profile.estimate(
+        device::PHONE, 21, 64, 256, false,
+        real_stage_phase::COMPUTE, ms));
+    REQUIRE(profile.estimate_phone_serial_blocks(
+        21, 64, 256, false, real_stage_phase::COMPUTE, ms));
+    REQUIRE(std::fabs(ms - 210.0) < 1e-6);
+    REQUIRE(profile.estimate_phone_serial_blocks(
+        21, 64, 256, false, real_stage_phase::PREPARE, ms));
+    REQUIRE(std::fabs(ms - 21.0) < 1e-6);
+    REQUIRE(profile.estimate_phone_serial_blocks(
+        21, 64, 256, false, real_stage_phase::SETUP, ms));
+    REQUIRE(std::fabs(ms - 10.5) < 1e-6);
+    REQUIRE(!profile.estimate_phone_serial_blocks(
+        21, 64, 1024, false, real_stage_phase::COMPUTE, ms));
+    REQUIRE(!profile.estimate_phone_serial_blocks(
+        21, 300, 512, false, real_stage_phase::COMPUTE, ms));
+    REQUIRE(!profile.estimate_phone_serial_blocks(
+        21, 64, 256, true, real_stage_phase::COMPUTE, ms));
+}
+
+static void test_gpg_sequential_gpu_banks_simulate() {
+    // One logical GPU->Phone->GPU crossing, with 6 physical GPU regions.
+    // A valid mock profile must yield a finite DAG schedule while the
+    // original rank+2 streaming weight mover remains enabled.
+    model m = mock_profile();
+    m.layers = 64;
+    m.tokens = 128;
+    m.hidden = 5120;
+    m.gpu_weight_streaming = true;
+    m.gpu_region_weight_bytes = [](int a, int b, size_t & bytes) {
+        bytes = (size_t)(b - a) * 274310144u;
+        return a >= 0 && b > a;
+    };
+    m.gpu_weight_h2d_ms = [](size_t bytes, double & ms) {
+        ms = (double) bytes / 1048576.0 * 0.2;
+        return true;
+    };
+    m.prepare_ms = [](device, int, int, int, double & ms) {
+        ms = 1.0;
+        return true;
+    };
+    m.phone_full_return_stream = true;
+    m.phone_autonomous_prebuild = true;
+    m.phone_autonomous_prepare_overlap = true;
+    m.phone_autonomous_final = false;
+    std::vector<llama_region_ring_region> regions = {
+        {device::GPU, 0, 7},
+        {device::GPU, 7, 14},
+        {device::GPU, 14, 22},
+        {device::GPU, 22, 29},
+        {device::GPU, 29, 36},
+        {device::PHONE, 36, 57},
+        {device::GPU, 57, 64},
+    };
+    candidate c;
+    c.xc = 32;
+    c.xg = 32;
+    c.xp = 64;
+    std::string reason;
+    if (!simulate(m, regions, c, &reason)) {
+        std::fprintf(stderr,
+            "[REGION_RING_GPG_MOCK] result=FAIL reason=%s\n",
+            reason.c_str());
+        std::exit(EXIT_FAILURE);
+    }
+    REQUIRE(std::isfinite(c.wall_ms) && c.wall_ms > 0.0);
+}
+
 int main() {
+    test_gpg_phone_serial_profile_composition();
+    test_gpg_sequential_gpu_banks_simulate();
     // The crash's selected 32B layout had 26 Phone layers across
     // N9,N7,N9,N1. The RPC server assigns a starting HTP Session to each
     // Region and then stripes consecutive LAYERS, not whole Regions.
