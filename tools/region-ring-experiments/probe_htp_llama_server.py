@@ -287,12 +287,20 @@ REQUEST_EXEC_RE = re.compile(
 def read_request_chunk_plan(log_path, offset, expected_tokens,
                             max_plan_xg=256, max_plan_xp=256,
                             expected_layout=DEFAULT_CANONICAL_LAYOUT,
-                            expected_source=None):
+                            expected_source=None,
+                            expected_sched_mode=None):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
         data = stream.read().decode("utf-8", errors="replace")
         next_offset = stream.tell()
+    if expected_sched_mode is not None:
+        if ("[REGION_RING_RESOURCE_SCHED] enabled=1" not in data or
+                ("[REGION_RING_CYCLE_SCHED] mode=" +
+                 expected_sched_mode) not in data):
+            raise RuntimeError(
+                "Runtime scheduler ablation did not confirm resource-aware "
+                + expected_sched_mode)
     matches = list(REQUEST_PLAN_RE.finditer(data))
     if len(matches) != 1:
         raise RuntimeError(
@@ -604,7 +612,7 @@ def write_reports(out, records):
         "request_wall_ms", "predicted_n", "planner_mode",
         "plan_xc", "plan_xg", "plan_xp", "planner_ms",
         "runtime_xc", "runtime_xg", "runtime_xp",
-        "runtime_layout", "status",
+        "runtime_layout", "scheduler_mode", "status",
     ]
     with (out / "requests.csv").open(
             "w", encoding="utf-8-sig", newline="") as stream:
@@ -765,7 +773,9 @@ def main(argv=None):
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
-          ("PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH" if args.per_request_chunks
+          ("PER_REQUEST_REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
+           else "PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH"
+           if args.per_request_chunks
            else "ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH") +
           " layout=" + env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"], flush=True)
     print(f"[SERVER_PROBE] chunk=XG_MAX{args.max_plan_xg}_XP_MAX{args.max_plan_xp} min16_short_min32_long"
@@ -837,7 +847,8 @@ def main(argv=None):
                             args.max_plan_xg, args.max_plan_xp,
                             args.locked_layout,
                             "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
-                            else "LOCKED_CHUNK_ONLY")
+                            else "LOCKED_CHUNK_ONLY",
+                            "FIFO" if args.no_drain_first else None)
                         if reference_chunks is not None and any(
                                 decision["plan_" + name] != ref["plan_" + name]
                                 for name in ("xc", "xg", "xp")):
@@ -857,6 +868,8 @@ def main(argv=None):
                             else "PER_REQUEST_LOCKED" if args.per_request_chunks
                             else "STARTUP_ONLY"),
                         "runtime_layout": fake_args.locked_layout,
+                        **({"scheduler_mode": "FIFO"}
+                           if args.no_drain_first else {}),
                         "status": "PASS",
                     })
                     if args.all50:
