@@ -11673,6 +11673,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             size_t rejected_memory = 0;
             size_t rejected_profile = 0;
             std::map<std::string, size_t> profile_rejection_reasons;
+            // Capture deltas: the same memory callback also serves parent
+            // searches, and its cumulative diagnostics are not a per-layout
+            // summary. A locked search should report its OWN rejects.
+            const auto memory_diag_before = *htp_memory_diag;
             // Short prompts may use a separately measured sub-32 grid.
             // A long placement anchor always uses the original Chunk grid;
             // only <=256-token locked prompts can use 16/24 below X=32.
@@ -11773,6 +11777,59 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
             }
             if (!valid) {
+                const auto memory_diag_after = *htp_memory_diag;
+                const auto delta = [&](size_t index) -> size_t {
+                    return memory_diag_after[index] -
+                           memory_diag_before[index];
+                };
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_PLAN_LOCK_MEMORY_DIAG]"
+                    " geometry=%zu session_map=%zu bank_shape=%zu"
+                    " host_ram=%zu gpu_vram=%zu phone_ram=%zu pass=%zu"
+                    " source=LOCKED_CANDIDATE_MEMORY_CALLBACK"
+                    " status=COUNTED\n",
+                    delta(0), delta(1), delta(2), delta(3),
+                    delta(4), delta(5), delta(6));
+                if (model.gpu_weight_streaming) {
+                    std::array<size_t, 2> bank_peaks {};
+                    if (llama_ring_planner::gpu_weight_bank_peaks(
+                            model, locked_regions, bank_peaks)) {
+                        int gpu_layers = 0;
+                        for (const auto & r : locked_regions) {
+                            if (r.device == llama_region_ring_device::GPU) {
+                                gpu_layers += r.layer_end - r.layer_begin;
+                            }
+                        }
+                        const long double gpu_kv =
+                            (long double) gpu_layers *
+                            model.gpu_kv_bytes_per_layer;
+                        const long double cuda_extra =
+                            llama_ring_planner::
+                                gpu_cuda_additional_reserve_bytes(
+                                    model, widths.front(), 2);
+                        const long double estimated_total =
+                            (long double) bank_peaks[0] +
+                            (long double) bank_peaks[1] +
+                            gpu_kv + cuda_extra;
+                        LLAMA_LOG_ERROR(
+                            "[REGION_RING_PLAN_LOCK_GPU_MEMORY]"
+                            " min_xg=%d bankA_mib=%.1Lf bankB_mib=%.1Lf"
+                            " gpu_kv_mib=%.1Lf cuda_extra_mib=%.1Lf"
+                            " estimated_total_mib=%.1Lf"
+                            " gpu_budget_mib=%.1Lf"
+                            " region_limit_mib=%.1Lf"
+                            " status=DIAGNOSTIC_NOT_A_BYPASS\n",
+                            widths.front(),
+                            (long double) bank_peaks[0] / 1048576.0L,
+                            (long double) bank_peaks[1] / 1048576.0L,
+                            gpu_kv / 1048576.0L,
+                            cuda_extra / 1048576.0L,
+                            estimated_total / 1048576.0L,
+                            model.gpu_memory_budget_bytes / 1048576.0L,
+                            model.gpu_max_region_budget_fraction *
+                                model.gpu_memory_budget_bytes / 1048576.0L);
+                    }
+                }
                 std::string most_common_reason = "NONE";
                 size_t most_common_count = 0;
                 for (const auto & entry : profile_rejection_reasons) {
