@@ -814,9 +814,65 @@ llama_region_ring_parse_optional_cpu_cycles(
     return regions;
 }
 
+// Runtime-only w/o Multi-Cycle (32B) A/B. Keep ONE cross-device G->P->G
+// traversal while retaining the six ORIGINAL physical 7/7/8/7/7/7 GPU
+// weight windows. The first five windows form logical G36, then P21,
+// then the last G7. The fixed-parity two-Bank mover continues to stream
+// each GPU window exactly as in Full Cycle; no G36 weight allocation occurs.
+inline bool llama_region_ring_gpg_ablation_enabled() {
+    const char * value =
+        std::getenv("LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG");
+    return value != nullptr && std::string(value) == "1";
+}
+
+inline std::vector<llama_region_ring_region>
+llama_region_ring_gpg_physical_regions() {
+    constexpr std::array<int, 7> depths = { 7, 7, 8, 7, 7, 21, 7 };
+    std::vector<llama_region_ring_region> regions;
+    int layer = 0;
+    for (size_t i = 0; i < depths.size(); ++i) {
+        const auto device = i == 5 ?
+            llama_region_ring_device::PHONE :
+            llama_region_ring_device::GPU;
+        regions.emplace_back(device, layer, layer + depths[i]);
+        layer += depths[i];
+    }
+    return regions;
+}
+
+inline bool llama_region_ring_gpg_physical_compatible(
+        const std::vector<llama_region_ring_region> & regions,
+        int n_layer) {
+    if (n_layer != 64 || regions.size() != 7) {
+        return false;
+    }
+    const auto expected = llama_region_ring_gpg_physical_regions();
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (regions[i].device != expected[i].device ||
+                regions[i].kind != expected[i].kind ||
+                regions[i].layer_begin != expected[i].layer_begin ||
+                regions[i].layer_end != expected[i].layer_end) {
+            return false;
+        }
+    }
+    return true;
+}
+
 inline std::vector<llama_region_ring_region>
 llama_region_ring_parse_apply_wide_layout(
         const std::string & spec, int n_layer) {
+    if (llama_region_ring_gpg_ablation_enabled()) {
+        // Accept the visible logical G-P-G name AND the canonical
+        // physical spelling used by model-owned and per-request Plans.
+        if (n_layer != 64 ||
+                (spec != "G36,P21,G7" &&
+                 spec != "G7,G7,G8,G7,G7,P21,G7")) {
+            throw std::runtime_error(
+                "w/o Multi-Cycle requires exact G36,P21,G7 logical "
+                "layout and G7,G7,G8,G7,G7,P21,G7 physical windows");
+        }
+        return llama_region_ring_gpg_physical_regions();
+    }
     try {
         return llama_region_ring_parse(spec, n_layer);
     } catch (const std::exception & strict_error) {
@@ -840,6 +896,10 @@ llama_region_ring_parse_apply_wide_layout(
 inline bool llama_region_ring_apply_topology_compatible(
         const std::vector<llama_region_ring_region> & regions,
         int n_layer) {
+    if (llama_region_ring_gpg_ablation_enabled() &&
+            llama_region_ring_gpg_physical_compatible(regions, n_layer)) {
+        return true; // only this explicit 32B G-P-G ablation may join G stages
+    }
     if (regions.size() < 2 ||
             regions.size() > 3 * LLAMA_REGION_RING_APPLY_MAX_CYCLES ||
             n_layer <= 0 || regions.front().layer_begin != 0 ||
