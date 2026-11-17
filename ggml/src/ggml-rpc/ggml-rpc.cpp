@@ -1,5 +1,6 @@
 #include "ggml-rpc.h"
 #include "ggml-impl.h"
+#include "../ggml-jupiter-fig3.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
 #include "transport.h"
@@ -25,6 +26,26 @@
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+
+// Dedicated single-run Phone RPC service. Different lanes share the same
+// run label, while all timestamps remain phone-local until calibrated.
+static std::mutex g_jupiter_fig3_phone_mutex;
+static std::string g_jupiter_fig3_phone_run_id;
+static void jupiter_fig3_phone_interval(const char * category, uint32_t device,
+                                       uint64_t uid, uint32_t nodes,
+                                       int64_t start_ns, int64_t end_ns) {
+    if (!jupiter_fig3::phone_enabled() || end_ns <= start_ns) return;
+    std::string run_id;
+    { std::lock_guard<std::mutex> guard(g_jupiter_fig3_phone_mutex);
+      run_id = g_jupiter_fig3_phone_run_id; }
+    if (run_id.empty()) return;
+    std::ostringstream row;
+    row << run_id << ',' << category << ',' << start_ns << ',' << end_ns
+        << ',' << device << ',' << uid << ',' << nodes;
+    jupiter_fig3::append_file(std::getenv("LLAMA_JUPITER_FIG3_PHONE_FILE"),
+        "run_id,category,start_phone_ns,end_phone_ns,device,graph_uid,nodes",row.str());
+}
+
 
 #define LOG_DBG(...) \
     do { if (RPC_DEBUG) GGML_LOG_DEBUG(__VA_ARGS__); } while (0)
@@ -103,12 +124,17 @@ enum rpc_cmd {
     RPC_CMD_JUPITER_EVENT_RECORD,
     RPC_CMD_JUPITER_EVENT_WAIT,
     RPC_CMD_JUPITER_SYNC,
+    RPC_CMD_JUPITER_FIG3_TAG,
+    RPC_CMD_JUPITER_FIG3_CLOCK,
     RPC_CMD_COUNT,
 };
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 static_assert(RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE == 17, "RPC_CMD_SET_TENSOR_FROM_LOCAL_FILE must be before Jupiter commands");
 static_assert(RPC_CMD_JUPITER_EVENT_RECORD == 18, "Jupiter RPC command layout changed");
+static_assert(RPC_CMD_JUPITER_SYNC == 20, "Existing Jupiter sync opcode changed");
+static_assert(RPC_CMD_JUPITER_FIG3_TAG == 21 && RPC_CMD_JUPITER_FIG3_CLOCK == 22,
+              "Fig3 RPC opcodes must be appended");
 
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
@@ -232,6 +258,12 @@ struct rpc_msg_jupiter_event_req {
 
 struct rpc_msg_jupiter_rsp {
     uint8_t ok;
+};
+struct rpc_msg_jupiter_fig3_tag_req { char run_id[96]; };
+struct rpc_msg_jupiter_fig3_tag_rsp { uint8_t phone_instrumented; };
+struct rpc_msg_jupiter_fig3_clock_rsp {
+    int64_t recv_phone_ns;
+    int64_t send_phone_ns;
 };
 
 struct rpc_msg_set_tensor_from_local_file_rsp {
@@ -418,6 +450,7 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // No response
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+    const int64_t fig3_start_ns = jupiter_fig3::pc_enabled() ? jupiter_fig3::ns() : 0;
     uint8_t cmd_byte = cmd;
     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
         return false;
@@ -428,12 +461,16 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->send_data(input, input_size)) {
         return false;
     }
+    if (fig3_start_ns) jupiter_fig3::device(
+        "pc_rpc_events.csv","Wi-Fi Sync",fig3_start_ns,jupiter_fig3::ns(),
+        "RPC_SEND",int(cmd),input_size);
     return true;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
 // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
 static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+    const int64_t fig3_start_ns = jupiter_fig3::pc_enabled() ? jupiter_fig3::ns() : 0;
     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
         return false;
     }
@@ -447,6 +484,9 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, 
     if (!sock->recv_data(output, output_size)) {
         return false;
     }
+    if (fig3_start_ns) jupiter_fig3::device(
+        "pc_rpc_events.csv","Wi-Fi Sync",fig3_start_ns,jupiter_fig3::ns(),
+        "RPC_ROUNDTRIP",int(cmd),input_size+output_size);
     return true;
 }
 
