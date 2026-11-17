@@ -19,6 +19,16 @@ class Fig4bTests(unittest.TestCase):
             "--repeats", str(repeats),
         ])
 
+    def test_default_layout_matches_full_cycle_32b(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = self.args(Path(directory))
+            self.assertEqual(args.layout, "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
+            parts = [(p[0], int(p[1:])) for p in args.layout.split(",")]
+            self.assertEqual(sum(n for _, n in parts), 64)
+            self.assertEqual(sum(n for k, n in parts if k == "G"), 43)
+            self.assertEqual(sum(n for k, n in parts if k == "P"), 21)
+            self.assertEqual(sum(n for k, n in parts if k == "C"), 0)
+
     def test_forces_chunk_but_not_planner_and_preserves_runtime(self):
         with tempfile.TemporaryDirectory() as directory:
             args = self.args(Path(directory))
