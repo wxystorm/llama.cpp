@@ -16,7 +16,9 @@ $env:LLAMA_MOTI_PROFILE = "1"
 Remove-Item Env:LLAMA_MOTI_PROFILE
 ```
 
-The `[MOTI_PREFILL]` line is printed at the llama_context synchronization after a queued multi-token batch. It includes:
+The profiler starts after context scheduling and output reservation for a multi-token logical batch (at least 2 tokens). It now logs `[MOTI_BEGIN]` when a profiling interval starts, `[MOTI_SYNC]` when synchronization occurs, and always emits `[MOTI_PREFILL]` when an active interval ends—even if the current queued-token count is 0 or 1. The `tokens` value is the token count queued at that synchronization, not necessarily the full prompt length. This makes premature synchronization visible rather than silently dropping the measurement. A run may produce multiple intervals.
+
+The `[MOTI_PREFILL]` line includes:
 
 - `wall_ms`: measured wall time over the instrumented decode window (not identical to application prompt-eval time).
 - `cpu_ms`: sum of CPU backend graph-compute wall time, excluding separate graph-planning time.

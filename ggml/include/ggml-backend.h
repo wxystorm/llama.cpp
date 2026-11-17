@@ -80,6 +80,7 @@ extern "C" {
         uint64_t page_faults_all, process_peak_working_set, process_private_bytes;
         uint64_t gpu_device_used_peak, gpu_device_total;
     };
+    GGML_API bool                  ggml_moti_enabled(void);
     GGML_API bool                  ggml_moti_active(void);
     GGML_API void                  ggml_moti_begin(void);
     GGML_API struct ggml_moti_stats ggml_moti_end(void);

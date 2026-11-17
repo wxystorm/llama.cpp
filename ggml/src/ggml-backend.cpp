@@ -61,10 +61,16 @@ static void moti_max(std::atomic<uint64_t> & x, uint64_t v) {
     uint64_t n = x.load(std::memory_order_relaxed);
     while (v > n && !x.compare_exchange_weak(n, v, std::memory_order_relaxed)) {}
 }
+bool ggml_moti_enabled(void) {
+    static const bool enabled = [] {
+        const char * e = getenv("LLAMA_MOTI_PROFILE");
+        return e && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
 bool ggml_moti_active(void) { return moti.active.load(std::memory_order_relaxed); }
 void ggml_moti_begin(void) {
-    static const bool enabled = [] { const char * e = getenv("LLAMA_MOTI_PROFILE"); return e && strcmp(e, "1") == 0; }();
-    if (!enabled) return;
+    if (!ggml_moti_enabled()) return;
     static std::atomic<bool> announced {false};
     if (!announced.exchange(true, std::memory_order_relaxed)) {
         fprintf(stderr, "[MOTI_PROFILE] enabled=1; begin at first multi-token batch\n");

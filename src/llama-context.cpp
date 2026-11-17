@@ -955,10 +955,17 @@ void llama_context::synchronize() {
 
     ggml_backend_sched_synchronize(sched.get());
 
+    // The server-backed CLI may synchronize with a single queued output token,
+    // or with no queued tokens, after an earlier multi-token batch. Always
+    // report a started profiling interval instead of silently discarding it.
+    if (ggml_moti_enabled() && (n_queued_tokens > 0 || ggml_moti_active())) {
+        LLAMA_LOG_INFO("[MOTI_SYNC] queued_tokens=%d active=%d\n",
+                n_queued_tokens, ggml_moti_active() ? 1 : 0);
+    }
     if (ggml_moti_active()) {
         const auto p = ggml_moti_end();
-        if (n_queued_tokens > 1) {
-            LLAMA_LOG_INFO("[MOTI_PREFILL] tokens=%d wall_ms=%.3f cpu_ms=%.3f gpu_stream_ms=%.3f "
+        LLAMA_LOG_INFO("[MOTI_PREFILL] tokens=%d wall_ms=%.3f cpu_ms=%.3f gpu_stream_ms=%.3f "
+
                 "cpu_graphs=%" PRIu64 " gpu_graphs=%" PRIu64 " h2d_ms=%.3f d2h_ms=%.3f "
                 "h2d_mib=%.3f d2h_mib=%.3f h2d_calls=%" PRIu64 " d2h_calls=%" PRIu64 " "
                 "peak_working_set_mib=%.3f private_mib=%.3f gpu_device_used_peak_mib=%.3f "
@@ -969,7 +976,6 @@ void llama_context::synchronize() {
                 p.process_peak_working_set/1048576.0, p.process_private_bytes/1048576.0,
                 p.gpu_device_used_peak/1048576.0, p.gpu_device_total/1048576.0,
                 p.page_faults_all);
-        }
     }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -1960,10 +1966,6 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-    // Do not require the first batch in a server slot to be multi-token:
-    // a single-token batch can precede the actual prompt prefill.
-    if (n_tokens > 1 && !ggml_moti_active()) ggml_moti_begin();
-
     sched_reserve();
 
     n_queued_tokens += n_tokens;
@@ -1975,6 +1977,14 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    // Setup may call synchronize(); begin only after reservation completes.
+    if (n_tokens > 1 && !ggml_moti_active()) {
+        ggml_moti_begin();
+        if (ggml_moti_active()) {
+            LLAMA_LOG_INFO("[MOTI_BEGIN] batch_tokens=%u queued_tokens=%d\n", n_tokens, n_queued_tokens);
+        }
+    }
 
     const auto & out_ids = balloc->get_out_ids();
     for (uint32_t i = 0; i < n_outputs_all; ++i) {
@@ -2264,9 +2274,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
-    // Slot-based clients may queue an initial single token before the prompt;
-    // still start the profiler when the first multi-token batch arrives.
-    if (n_tokens_all > 1 && !ggml_moti_active()) ggml_moti_begin();
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
@@ -2329,6 +2336,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+
+    // Avoid premature profiler end: sched_reserve() and memory_update()
+    // can synchronize before any graph compute has been submitted.
+    if (n_tokens_all > 1 && !ggml_moti_active()) {
+        ggml_moti_begin();
+        if (ggml_moti_active()) {
+            LLAMA_LOG_INFO("[MOTI_BEGIN] batch_tokens=%u queued_tokens=%d\n", n_tokens_all, n_queued_tokens);
+        }
+    }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
