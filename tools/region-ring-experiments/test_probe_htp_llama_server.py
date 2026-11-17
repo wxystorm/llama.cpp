@@ -593,7 +593,7 @@ class ServerProbeTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
-    def test_planner_fixed_128_short_prompt_is_whole_one_chunk(self):
+    def test_planner_fixed_64_and_128_cli_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             server = root / "llama-server.exe"
@@ -624,8 +624,10 @@ class ServerProbeTests(unittest.TestCase):
                 probe.parse_args(args_list + ["--no-async-prefetch"])
             with self.assertRaises(SystemExit):
                 probe.parse_args(args_list + ["--no-drain-first"])
+            args64 = probe.parse_args(args_list[:-2] + ["--fixed-chunk", "64"])
+            self.assertEqual(args64.fixed_chunk, 64)
             with self.assertRaises(SystemExit):
-                probe.parse_args(args_list[:-2] + ["--fixed-chunk", "64"])
+                probe.parse_args(args_list[:-2] + ["--fixed-chunk", "96"])
             with self.assertRaises(SystemExit):
                 without_request = args_list.copy()
                 without_request.remove("--per-request-chunks")
@@ -635,21 +637,21 @@ class ServerProbeTests(unittest.TestCase):
                 without_all50.remove("--all50")
                 probe.parse_args(without_all50)
 
-    def test_planner_fixed_128_strict_native_single_chunk_and_mover(self):
+    def test_planner_fixed_64_and_128_native_single_chunk_and_mover(self):
         layout = probe.DEFAULT_CANONICAL_LAYOUT
 
         def make_log(n, selected=None, source="FIXED_CHUNK_ABLATION",
-                     async_mover=True, actual=None):
-            width = min(n, 128) if selected is None else selected
+                     async_mover=True, actual=None, target=128):
+            width = min(n, target) if selected is None else selected
             actual_width = width if actual is None else actual
             return (
                 "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1"
                 " phone_push_aware=1 status=READY\n"
                 "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
                 " rule=EARLIEST_EXECUTABLE_REGION status=READY\n"
-                "[REGION_RING_FIXED_CHUNK] target=128"
+                f"[REGION_RING_FIXED_CHUNK] target={target}"
                 f" tokens={n} XC={width} XG={width} XP={width}"
-                f" policy={'WHOLE_PROMPT_SINGLE_CHUNK' if n < 128 else 'FIXED_128'}"
+                f" policy={'WHOLE_PROMPT_SINGLE_CHUNK' if n < target else 'FIXED_' + str(target)}"
                 " gpu_small_batch_mover=FORCED"
                 " profile_queries=0 status=PASS\n"
                 "[REGION_RING_ABLATION] gpu_banks=2 gpu_prefetch=1"
@@ -712,6 +714,36 @@ class ServerProbeTests(unittest.TestCase):
             self.assertEqual((result["plan_xg"], result["plan_xp"]),
                              (128, 128))
             self.assertEqual(result["runtime_xg"], 129)
+
+            # Fixed-64: a 66-token request must select 64, not 128.
+            log.write_text(make_log(66, target=64), encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 66, 256, 256, layout,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 64)
+            self.assertEqual(
+                (result["plan_xc"], result["plan_xg"], result["plan_xp"]),
+                (64, 64, 64))
+
+            # Shorter than the fixed-64 target remains exactly one Chunk.
+            log.write_text(make_log(48, target=64), encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 48, 256, 256, layout,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 64)
+            self.assertEqual(
+                (result["plan_xc"], result["plan_xg"], result["plan_xp"]),
+                (48, 48, 48))
+            self.assertEqual((result["runtime_xg"], result["runtime_xp"]),
+                             (48, 48))
+
+            # A fixed-128 log must not be accepted as a fixed-64 result.
+            log.write_text(make_log(66, target=128), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "prescribed widths"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                    False, False, 64)
 
             # A small request must NOT be re-chunked to a legal preset
             log.write_text(make_log(66, selected=32), encoding="utf-8")

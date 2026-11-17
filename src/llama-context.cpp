@@ -10973,9 +10973,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
             std::getenv("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE");
         const bool replay_requested =
             replay_path != nullptr && *replay_path != '\0';
-        // Planner w/o dynamic Chunk/Profile ablation. Do not invoke the
-        // request-time DAG search: use width=128 on long prompts, and a
-        // SINGLE full-prompt Chunk for prompts shorter than 128. In the
+        // Planner w/o request-time dynamic Chunk ablation. Do not invoke the
+        // request-time DAG search: use the selected fixed width on long prompts, and a
+        // SINGLE full-prompt Chunk for shorter prompts. In the
         // latter case the two-Bank async Mover is explicitly forced by
         // LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH=1, avoiding the
         // ordinary >=2 GPU Chunk gate. Model layer placement is immutable.
@@ -10990,7 +10990,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const char * force_small_batch_raw =
                 std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
             if (replay_requested || end == fixed_chunk_raw ||
-                    *end != '\0' || target != 128 ||
+                    *end != '\0' || (target != 64 && target != 128) ||
                     force_small_batch_raw == nullptr ||
                     std::strcmp(force_small_batch_raw, "1") != 0) {
                 LLAMA_LOG_ERROR(
@@ -11015,7 +11015,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 target, n_tokens_all,
                 request_xc, request_xg, request_xp,
                 (int) n_tokens_all < target ?
-                    "WHOLE_PROMPT_SINGLE_CHUNK" : "FIXED_128");
+                    "WHOLE_PROMPT_SINGLE_CHUNK" : (target == 64 ? "FIXED_64" : "FIXED_128"));
         } else if (replay_requested) {
             std::ifstream replay(replay_path);
             uint32_t replay_tokens = 0;
