@@ -761,7 +761,7 @@ def main(argv=None):
               ("WO_DRAIN_FIRST" if args.no_drain_first else "FULL_CYCLE_REPLAY") +
               " source=" + str(args.replay_chunks_from) +
               " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
-              " native_chunk_search=DISABLED runtime_allocators=UNCHANGED",
+              " native_chunk_search=SCORED_NOT_APPLIED runtime_allocators=UNCHANGED",
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
