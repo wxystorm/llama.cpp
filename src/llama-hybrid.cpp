@@ -11438,6 +11438,29 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         selected_layout != nullptr ? "APPLY_SAFE" :
         topology_preview ? "TOPOLOGY_PREVIEW" : "DRY_RUN");
 
+    const bool no_dag_planner =
+        flag_on("LLAMA_REGION_RING_NO_DAG_PLANNER");
+    if (no_dag_planner) {
+        if (!wide_apply || selected_layout == nullptr ||
+                selected_xc == nullptr || selected_xg == nullptr ||
+                selected_xp == nullptr || !htp_session_guard ||
+                !model.gpu_weight_streaming || force_ab_requested ||
+                skip_locked_memory || !model.memory_feasible) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_NO_DAG_PLAN] status=REJECT"
+                " reason=REQUIRES_HTP_STREAMED_GUARDED_APPLY_WIDE\n");
+            return false;
+        }
+        model.linear_no_dag_ablation = true;
+        model.fixed_planner_chunk = 64;
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE"
+            " fixed_chunk=64 profile=INDEPENDENT_G_C_N"
+            " memory=GPU_CPU_PHONE_HTP_GUARDED"
+            " candidate_search=UNCHANGED event_simulation=OFF"
+            " runtime=UNCHANGED status=READY\n");
+    }
+
     if (wide_apply && selected_layout != nullptr) {
         // Forced layouts keep topology, profile and DAG validation, but do
         // not reject on estimated RAM, GPU Bank or HTP memory budgets.
@@ -11775,7 +11798,8 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     result.baseline.wall_ms : -1.0);
         } else {
             result = llama_ring_planner::search_runtime_applicable(
-                model, baseline_regions, baseline_chunk,
+                model, baseline_regions,
+                no_dag_planner ? 64 : baseline_chunk,
                 1, wide_e_margin, wide_min_simulations);
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_CPU_OPTIONAL] mode=APPLY_WIDE "
@@ -11794,7 +11818,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 "reject_profile=%zu profiled=%zu shortlisted=%zu "
                 "reject_dag=%zu simulated=%zu improvements=%zu "
                 "before_ms=%.3f after_ms=%.3f "
-                "constraints=UNCHANGED rank=FULL_PROMPT_DAG\n",
+                "constraints=UNCHANGED rank=EVALUATOR_SELECTED\n",
                 result.cpu_shrink_anchors,
                 result.cpu_shrink_generated,
                 result.cpu_shrink_memory_rejected,
@@ -11828,7 +11852,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "E_min=%.4f E_limit=%.4f E_effective_limit=%.4f "
             "E_margin=%.4f shortlist_floor=%d "
             "filter=E_WIDE_THEN_ABSOLUTE_PLUS_UNIFORM_CONTROL "
-            "exact=FULL_PROMPT_EVENT_SIM ranking=SIM_WALL "
+            "evaluator=ABLATION_SELECTED ranking=EVALUATOR_SCORE "
             "uniform_sim_cap=NONE first_e_pool_cap=640 "
             "first_seeds_total_cap=256 prefix_beam_middle=24 "
             "prefix_beam_final=32 final_parents_top=24 "
@@ -12532,7 +12556,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_HTP_TAIL] event=PARENT_POOL"
                 " parents=%zu cap=24 cpu_optional_simulated=%zu"
-                " action=VERIFY_GPU_TAIL_BY_FULL_DAG\n",
+                " action=VERIFY_GPU_TAIL_BY_EVALUATOR\n",
                 parents.size(), result.cpu_optional_simulated);
             if (parents.empty()) {
                 parents.push_back(result.selected);
@@ -12603,7 +12627,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             LLAMA_LOG_INFO(
                 "[REGION_RING_PLAN_HTP_TAIL] status=PASS"
                 " layout=%s predicted_ms=%.3f"
-                " rank=FULL_PROMPT_DAG rpc_visible=CPU\n",
+                " rank=EVALUATOR_SELECTED rpc_visible=CPU\n",
                 llama_region_ring_layout_string(best_regions).c_str(),
                 best.wall_ms);
         }
@@ -12641,7 +12665,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
         bool independent_link_ok = false;
         bool contended_link_ok = false;
         std::string link_ab_reason;
-        if (!best_has_directional) {
+        if (!best_has_directional && !no_dag_planner) {
             auto independent_model = model;
             independent_model.shared_phone_link = false;
             independent_model.duplex_phone_contention = false;
@@ -12757,6 +12781,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "gain_pct=%.3f required_gain_pct=%.3f E=%.4f "
             "status=SUPPORTED\n",
             forced_ab ? "FORCED_AB" :
+            no_dag_planner ? "LINEAR_NO_DAG" :
             htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :
@@ -12794,6 +12819,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << "\"mode\":\"apply-wide\","
                             << "\"source\":\""
                             << (forced_ab ? "forced" :
+                                no_dag_planner ? "linear_no_dag" :
                                 htp_only_tail_selected ? "htp_gpu_tail" :
                                 boundary_tensor_selected ? "tensor" :
                                 best.local_refined ?
@@ -12822,6 +12848,9 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             << ",\"gpu_weight_streaming\":"
                             << (model.gpu_weight_streaming ? "true" : "false")
                             << ",\"predicted_ms\":" << best.wall_ms
+                            << ",\"score_mode\":\""
+                            << (no_dag_planner ? "LINEAR_SUM_NO_QUEUE" : "EVENT_DAG")
+                            << "\""
                             << ",\"phone_auto_prebuild\":"
                             << (model.phone_autonomous_prebuild ? "true" : "false")
                             << ",\"phone_auto_final\":"
@@ -12988,6 +13017,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             "layout=%s XC=%d XG=%d XP=%d "
             "status=AWAIT_MODEL_PLACEMENT\n",
             forced_ab ? "FORCED_AB" :
+            no_dag_planner ? "LINEAR_NO_DAG" :
             htp_only_tail_selected ? "AUTO_HTP_ONLY_GPU_TAIL" :
             boundary_tensor_selected ?
                 "AUTO_RUNTIME_V2_BOUNDARY" :

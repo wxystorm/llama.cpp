@@ -628,6 +628,21 @@ class ServerProbeTests(unittest.TestCase):
             self.assertEqual(args64.fixed_chunk, 64)
             with self.assertRaises(SystemExit):
                 probe.parse_args(args_list[:-2] + ["--fixed-chunk", "96"])
+            new_layout = "G10,P4,G10,P4,G10,P4,G10,P4,G8"
+            new_args = args_list[:-4] + [
+                "--locked-layout", new_layout, "--fixed-chunk", "64"]
+            with self.assertRaises(SystemExit):
+                probe.parse_args(new_args)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(new_args + ["--no-dag-placement"])
+            valid_no_dag = probe.parse_args(new_args + [
+                "--no-dag-placement", "--guarded-memory-checks"])
+            self.assertTrue(valid_no_dag.no_dag_placement)
+            self.assertTrue(valid_no_dag.guarded_memory_checks)
+            self.assertEqual(valid_no_dag.locked_layout, new_layout)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list + [
+                    "--no-dag-placement", "--guarded-memory-checks"])
             with self.assertRaises(SystemExit):
                 without_request = args_list.copy()
                 without_request.remove("--per-request-chunks")
@@ -641,7 +656,8 @@ class ServerProbeTests(unittest.TestCase):
         layout = probe.DEFAULT_CANONICAL_LAYOUT
 
         def make_log(n, selected=None, source="FIXED_CHUNK_ABLATION",
-                     async_mover=True, actual=None, target=128):
+                     async_mover=True, actual=None, target=128,
+                     layout_override=None, refill_count=4):
             width = min(n, target) if selected is None else selected
             actual_width = width if actual is None else actual
             return (
@@ -662,7 +678,7 @@ class ServerProbeTests(unittest.TestCase):
                 " mover=CPU_SINGLE min_tokens=67"
                 " force_small_batch=1 override_applied=1 status=READY\n"
                 "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
-                f" tokens={n} kv_start=0 layout={layout}"
+                f" tokens={n} kv_start=0 layout={layout_override or layout}"
                 f" XC={width} XG={width} XP={width}"
                 " startup_XC=32 startup_XG=32 startup_XP=32"
                 " changed=1 planner_ms=0.010"
@@ -675,7 +691,8 @@ class ServerProbeTests(unittest.TestCase):
                 " executed=11 complete=1 wall_ms=300"
                 " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n"
                 "[REGION_RING_GPU_BANK_MOVER_SUM] worker=CPU_SINGLE"
-                " started=4 completed=4 failures=0 upload_mib=1234"
+                f" started={refill_count} completed={refill_count}"
+                " failures=0 upload_mib=1234"
                 " stage_cpu_copy_ms=0 stage_chunks=0"
                 " prepare_ms=50 h2d_ms=100 wall_ms=200"
                 " gpu_wait_ms=0 thread_started=1 thread_joined=1"
@@ -736,6 +753,18 @@ class ServerProbeTests(unittest.TestCase):
                 (48, 48, 48))
             self.assertEqual((result["runtime_xg"], result["runtime_xp"]),
                              (48, 48))
+
+            # Different GPU Region count needs a different refill count.
+            variable = "G10,P4,G10,P4,G10,P4,G10,P4,G8"
+            log.write_text(
+                make_log(128, target=64, layout_override=variable,
+                         refill_count=3),
+                encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 128, 256, 256, variable,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 64)
+            self.assertEqual(result["plan_xg"], 64)
 
             # A fixed-128 log must not be accepted as a fixed-64 result.
             log.write_text(make_log(66, target=128), encoding="utf-8")

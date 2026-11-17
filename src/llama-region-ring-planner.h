@@ -170,6 +170,10 @@ struct model {
     // weights are rolled through two persistent Banks. Adjacent GPU Regions
     // may interleave; only same-Bank rank k-2 lifetime is serialized.
     bool gpu_weight_streaming = false;
+    // Planning-only ablation: score service and transfers serially.
+    bool linear_no_dag_ablation = false;
+    // Fix every searched Chunk; zero retains the ordinary adaptive grid.
+    int fixed_planner_chunk = 0;
     double phone_register_ms = 0.0; // Legacy MoE P5 fallback only.
     // Dense: measured/proxied RPC graph bytes, not a hard-coded P5 graph.
     // embedded_directional means C2P -> Phone Full -> P2C runs inside Meta.
@@ -883,6 +887,130 @@ struct event {
     }
 };
 
+// Sum independently profiled single-Chunk service, preparation, transfers,
+// and rolling H2D. No scheduling events, overlap or pipeline bubbles.
+inline bool score_linear_no_dag(
+        const model & m,
+        const std::vector<llama_region_ring_region> & regions,
+        candidate & c, std::string * reason = nullptr) {
+    const auto reject = [&](const char * why) {
+        if (reason) { *reason = why; }
+        return false;
+    };
+    if (!m.compute_ms || !m.transfer_ms || m.tokens <= 0 ||
+            m.hidden <= 0 || regions.empty()) {
+        return reject("LINEAR_PROFILE_MISSING");
+    }
+    if (m.fixed_planner_chunk > 0 &&
+            (c.xc != m.fixed_planner_chunk ||
+             c.xg != m.fixed_planner_chunk ||
+             c.xp != m.fixed_planner_chunk)) {
+        return reject("FIXED_CHUNK_REQUIRED");
+    }
+    c.busy_ms = {};
+    c.transfer_busy_ms = {};
+    c.prepare_busy_ms = 0.0;
+    c.weight_h2d_busy_ms = 0.0;
+    c.weight_h2d_hidden_ms = 0.0;
+    c.weight_h2d_exposed_ms = 0.0;
+    c.weight_h2d_startup_ms = 0.0;
+    c.phone_auto_setup_ms = 0.0;
+    c.phone_auto_head_ms = 0.0;
+    c.phone_prepare_busy_ms = 0.0;
+    c.ring_error_max = 0.0;
+    c.ring_error_mean = 0.0;
+    c.tasks = 0;
+    c.edges = 0;
+    const int kv = m.kv_start + m.tokens / 2;
+    int next_layer = 0;
+    for (size_t ri = 0; ri < regions.size(); ++ri) {
+        const auto & region = regions[ri];
+        const int d = (int) region.device;
+        const int layers = region.layer_end - region.layer_begin;
+        if (d < 0 || d >= 3 || layers <= 0 ||
+                region.layer_begin != next_layer) {
+            return reject("INVALID_LINEAR_REGION");
+        }
+        next_layer = region.layer_end;
+        const int x = chunk_for(c, region.device);
+        if (x <= 0) { return reject("INVALID_CHUNK"); }
+        const double steps = (double) m.tokens / x;
+        const bool terminal = ri + 1 == regions.size();
+        double work_ms = 0.0;
+        if (!(m.compute_region_ms &&
+              m.compute_region_ms(
+                  region.device, region.layer_begin, region.layer_end,
+                  x, kv, terminal, work_ms)) &&
+            !m.compute_ms(region.device, layers, x, kv, work_ms)) {
+            return reject("COMPUTE_PROFILE_MISSING");
+        }
+        if (!std::isfinite(work_ms) || work_ms < 0.0) {
+            return reject("COMPUTE_PROFILE_INVALID");
+        }
+        c.busy_ms[(size_t) d] += work_ms * steps;
+        double prepare_ms = 0.0;
+        if (m.prepare_region_ms) {
+            if (!m.prepare_region_ms(
+                    region.device, region.layer_begin, region.layer_end,
+                    x, kv, terminal, prepare_ms)) {
+                return reject("PREPARE_PROFILE_MISSING");
+            }
+        } else if (m.prepare_ms &&
+                   !m.prepare_ms(region.device, layers, x, kv, prepare_ms)) {
+            return reject("PREPARE_PROFILE_MISSING");
+        }
+        if (!std::isfinite(prepare_ms) || prepare_ms < 0.0) {
+            return reject("PREPARE_PROFILE_INVALID");
+        }
+        c.prepare_busy_ms += prepare_ms * steps;
+        if (region.device == device::PHONE && !m.phone_autonomous_prebuild) {
+            double registration_ms = 0.0;
+            if (!phone_registration_cost(
+                    m, region.kind, layers, x, false, registration_ms)) {
+                return reject("REGISTRATION_PROFILE_MISSING");
+            }
+            c.prepare_busy_ms += registration_ms;
+        }
+    }
+    if (next_layer != m.layers) {
+        return reject("INCOMPLETE_LINEAR_LAYOUT");
+    }
+    for (size_t i = 0; i + 1 < regions.size(); ++i) {
+        const device source = regions[i].device;
+        const device dest = regions[i + 1].device;
+        if (source == dest) { continue; }
+        const int x = chunk_for(c, source);
+        const size_t bytes = (size_t) std::min(x, m.tokens) *
+            (size_t) m.hidden * sizeof(float);
+        double transfer_ms = 0.0;
+        if (!m.transfer_ms(source, dest, bytes, transfer_ms) ||
+                !std::isfinite(transfer_ms) || transfer_ms < 0.0) {
+            return reject("TRANSFER_PROFILE_MISSING");
+        }
+        const int lane = source == device::PHONE ? 2 :
+                         dest == device::PHONE ? 1 : 0;
+        c.transfer_busy_ms[(size_t) lane] +=
+            transfer_ms * ((double) m.tokens / x);
+    }
+    if (!gpu_weight_h2d_total(m, regions, c.weight_h2d_busy_ms)) {
+        return reject("WEIGHT_PROFILE_MISSING");
+    }
+    c.weight_h2d_exposed_ms = c.weight_h2d_busy_ms;
+    c.wall_ms = c.prepare_busy_ms + c.weight_h2d_busy_ms;
+    for (double v : c.busy_ms) { c.wall_ms += v; }
+    for (double v : c.transfer_busy_ms) { c.wall_ms += v; }
+    for (size_t i = 0; i < c.busy_ms.size(); ++i) {
+        c.service_ms_per_token[i] = c.busy_ms[i] / m.tokens;
+    }
+    c.pc_compute_bound_ms = c.busy_ms[0] + c.busy_ms[1];
+    c.phone_link_ms_per_token =
+        (c.transfer_busy_ms[1] + c.transfer_busy_ms[2]) / m.tokens;
+    c.pc_local_link_ms_per_token = c.transfer_busy_ms[0] / m.tokens;
+    c.coarse_ms = c.wall_ms;
+    return std::isfinite(c.wall_ms) && c.wall_ms > 0.0 ?
+        true : reject("LINEAR_SCORE_INVALID");
+}
+
 // Simulate the current runtime contract: per-device FIFO queues preserve
 // strict per-region KV order while boundary activations live in full-ubatch
 // storage with no producer-credit limit. A non-zero slot_pool is retained
@@ -895,6 +1023,9 @@ inline bool simulate(const model & m,
         if (reason) { *reason = why; }
         return false;
     };
+    if (m.linear_no_dag_ablation) {
+        return score_linear_no_dag(m, regions, c, reason);
+    }
     if (regions.empty() || m.tokens <= 0 || m.hidden <= 0 ||
         m.slot_pool < 0 || !m.compute_ms || !m.transfer_ms) {
         return reject("INVALID_MODEL");
@@ -2485,7 +2616,11 @@ inline bool estimate_region_ring_balance(
         const std::vector<llama_region_ring_region> & regions,
         candidate & c) {
     if (!m.compute_ms || !m.transfer_ms || m.hidden <= 0 ||
-        regions.empty() || c.xc <= 0 || c.xg <= 0 || c.xp <= 0) {
+        regions.empty() || c.xc <= 0 || c.xg <= 0 || c.xp <= 0 ||
+        (m.fixed_planner_chunk > 0 &&
+         (c.xc != m.fixed_planner_chunk ||
+          c.xg != m.fixed_planner_chunk ||
+          c.xp != m.fixed_planner_chunk))) {
         return false;
     }
 
@@ -4092,8 +4227,14 @@ inline result search_runtime_applicable(
                 for (int extra_owner = 0;
                         extra_owner < variations; ++extra_owner) {
                     for (int xc : x_cpu) {
+                        if (m.fixed_planner_chunk > 0 &&
+                                xc != m.fixed_planner_chunk) { continue; }
                         for (int xg : x_gpu) {
+                            if (m.fixed_planner_chunk > 0 &&
+                                    xg != m.fixed_planner_chunk) { continue; }
                             for (int xp : x_phone) {
+                                if (m.fixed_planner_chunk > 0 &&
+                                        xp != m.fixed_planner_chunk) { continue; }
                                 candidate plan;
                                 plan.cycles = cycles;
                                 plan.c = c;
@@ -4378,6 +4519,8 @@ inline result search_runtime_applicable(
             service[(size_t) dev][xi].assign(
                 (size_t) m.layers + 1, invalid);
             const int x = chunks[xi];
+            if (m.fixed_planner_chunk > 0 &&
+                    x != m.fixed_planner_chunk) { continue; }
             if (x > m.tokens) {
                 continue; // one effective Chunk; larger X is redundant
             }
@@ -4615,6 +4758,8 @@ inline result search_runtime_applicable(
         // (E_min + margin) window can be pruned by this preliminary bound.
         std::vector<size_t> anchors;
         for (int x : {32, 64, 96, 128}) {
+            if (m.fixed_planner_chunk > 0 &&
+                    x != m.fixed_planner_chunk) { continue; }
             const auto it = std::find(
                 chunks.begin(), chunks.end(), x);
             if (it != chunks.end() && x <= m.tokens) {

@@ -102,6 +102,10 @@ def parse_args(argv=None):
                    help="Runtime ablation: retain both GPU banks but load later weights synchronously on demand")
     p.add_argument("--no-multi-cycle", action="store_true",
                    help="Runtime ablation: lock G36,P21,G7; each Prompt runs native Planner XC/XG/XP search (no replay); keep six GPU Bank windows, async prefetch and Drain-First")
+    p.add_argument("--no-dag-placement", action="store_true",
+                   help="use an independently selected linear/no-DAG layout with fixed-64")
+    p.add_argument("--guarded-memory-checks", action="store_true",
+                   help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
     p.add_argument("--fixed-chunk", type=int, choices=(64, 128), default=None,
                    help="Planner ablation: fixed XC=XG=XP to 64 or 128; requests shorter than the target run whole as one Chunk, retaining async double-bank streaming")
     p.add_argument("--max-plan-xg", type=int, default=256,
@@ -158,8 +162,16 @@ def parse_args(argv=None):
             p.error("--fixed-chunk cannot replay baseline Chunk decisions")
         if args.no_drain_first or args.no_async_prefetch or args.no_multi_cycle:
             p.error("Select only one ablation at a time")
-        if args.model_layers != 64 or args.locked_layout != DEFAULT_CANONICAL_LAYOUT:
-            p.error("--fixed-chunk requires 32B Full Cycle locked layout")
+        if args.model_layers != 64 or (
+                args.locked_layout != DEFAULT_CANONICAL_LAYOUT and
+                not args.no_dag_placement):
+            p.error("--fixed-chunk requires 32B Full Cycle locked layout, unless --no-dag-placement")
+    if args.no_dag_placement:
+        if (args.fixed_chunk != 64 or not args.guarded_memory_checks or
+                not args.locked_layout.split(",")[-1].startswith("G") or
+                args.no_multi_cycle or args.no_async_prefetch or
+                args.no_drain_first or args.replay_chunks_from is not None):
+            p.error("--no-dag-placement requires --fixed-chunk 64, --guarded-memory-checks, GPU-tail layout and no other ablation")
     if sum((args.no_drain_first, args.no_async_prefetch,
             args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
@@ -393,9 +405,12 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
             r"worker=CPU_SINGLE started=(\d+) completed=(\d+) "
             r"failures=(\d+).*thread_started=1 thread_joined=1 "
             r"status=PASS", data)
-        if len(refills) != 1 or tuple(map(int, refills[0])) != (4, 4, 0):
+        expected_refills = max(
+            0, sum(p.startswith("G") for p in expected_layout.split(",")) - 2)
+        if len(refills) != 1 or tuple(map(int, refills[0])) != (
+                expected_refills, expected_refills, 0):
             raise RuntimeError(
-                "Fixed Chunk lost original four asynchronous GPU Bank refills")
+                f"Fixed Chunk lost {expected_refills} asynchronous GPU Bank refills")
     if expect_gpg_ablation:
         if not re.search(
                 r"\[REGION_RING_MULTI_CYCLE_ABLATION\] mode=G_P_G "
@@ -864,13 +879,14 @@ def main(argv=None):
         "--auto-plan", "--htp-only", "--streaming", "on",
         "--sharegpt50-short-dataset",
         "--locked-layout", args.locked_layout, "--locked-short-chunks",
-        "--skip-plan-memory-checks",
         "--max-plan-xg", str(args.max_plan_xg),
         "--max-plan-xp", str(args.max_plan_xp),
         "--batch", "2048", "--ubatch", "2048", "--n-predict", "1",
         "--threads", str(args.threads), "--min-context", "256",
         "--max-context", "2048", "--context-padding", "0",
     ])
+    if not args.guarded_memory_checks:
+        fake_args.skip_plan_memory_checks = True
     command = server_command(args.server_exe, args.model, args.rpc,
                              args.port, args.threads)
     # Model initialization uses the long-Prompt anchor, while the opt-in
@@ -890,7 +906,8 @@ def main(argv=None):
                                   anchor_tokens, args.out / "metrics.jsonl")
     # Explicitly guard against inheriting a different user's runtime flags.
     assert env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"] == args.locked_layout
-    assert env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] == "1"
+    assert env.get("LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS") == (
+        None if args.guarded_memory_checks else "1")
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
     assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
@@ -904,6 +921,10 @@ def main(argv=None):
         env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+    if args.no_dag_placement:
+        env["LLAMA_REGION_RING_NO_DAG_PLANNER"] = "1"
+    else:
+        env.pop("LLAMA_REGION_RING_NO_DAG_PLANNER", None)
     if args.fixed_chunk is not None:
         env["LLAMA_REGION_RING_FIXED_CHUNK_ABLATION"] = str(args.fixed_chunk)
         env["LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH"] = "1"
@@ -938,6 +959,12 @@ def main(argv=None):
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    if args.no_dag_placement:
+        print("[SERVER_PLANNER_ABLATION] mode=WO_QUEUEING_SIMULATION"
+              " score=LINEAR_SUM_NO_QUEUE fixed_chunk=64"
+              " startup_memory_checks=GUARDED"
+              " placement=PRESELECTED_FROM_NO_DAG"
+              " runtime=FULL_CYCLE", flush=True)
     if args.fixed_chunk is not None:
         print("[SERVER_PLANNER_ABLATION] mode=WO_DYNAMIC_CHUNK"
               f" fixed_chunk={args.fixed_chunk} short_prompt=WHOLE_PROMPT_SINGLE_CHUNK"
@@ -982,7 +1009,8 @@ def main(argv=None):
            if args.fixed_chunk is not None else
            f"[SERVER_PROBE] chunk=XG_MAX{args.max_plan_xg}_XP_MAX{args.max_plan_xp} min16_short_min32_long") +
           " kv_cache=DISABLED parallel=1 no_cont_batch=1"
-          " memory_estimates=SKIPPED allocators=UNCHANGED", flush=True)
+          f" memory_estimates={'GUARDED' if args.guarded_memory_checks else 'SKIPPED'}"
+          " allocators=UNCHANGED", flush=True)
     print("[SERVER_PROBE] command=" + subprocess.list2cmdline(command), flush=True)
     if args.dry_run:
         return 0
@@ -1077,6 +1105,8 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
+                            "WO_QUEUEING_SIMULATION_FIXED_64"
+                            if args.no_dag_placement else
                             f"FIXED_{args.fixed_chunk}_NO_REQUEST_SEARCH"
                             if args.fixed_chunk is not None else
                             "GPG_PER_REQUEST_NATIVE" if args.no_multi_cycle

@@ -89,6 +89,8 @@ PROTECTED_RING_ENV = set(FORCED_RING_ENV) | {
     "LLAMA_REGION_RING_LOCKED_MAX_XP",
     "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS",
     "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS",
+    # New Planner ablation must be explicitly selected per experiment.
+    "LLAMA_REGION_RING_NO_DAG_PLANNER",
     # This is a resident-server-only opt-in. Never inherit it into the
     # ordinary one-process-per-Prompt CLI benchmark by accident.
     "LLAMA_REGION_RING_PER_REQUEST_CHUNKS",

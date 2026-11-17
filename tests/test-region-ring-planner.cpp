@@ -150,7 +150,49 @@ static void test_gpg_sequential_gpu_banks_simulate() {
     REQUIRE(std::isfinite(c.wall_ms) && c.wall_ms > 0.0);
 }
 
+static void test_no_dag_serial_profile_scoring() {
+    model m = mock_profile();
+    m.layers = 12;
+    m.tokens = 256;
+    m.linear_no_dag_ablation = true;
+    m.fixed_planner_chunk = 64;
+    const auto regions = llama_region_ring_parse("G3,P3,G3,P3", 12);
+    REQUIRE(regions.size() == 4);
+    candidate c;
+    c.xc = c.xg = c.xp = 64;
+    std::string reason;
+    REQUIRE(simulate(m, regions, c, &reason));
+    REQUIRE(c.tasks == 0 && c.edges == 0);
+    REQUIRE(std::fabs(c.weight_h2d_busy_ms) < 1e-9);
+
+    double expected = 0.0;
+    const int kv = m.kv_start + m.tokens / 2;
+    for (const auto & r : regions) {
+        double ms = 0.0;
+        REQUIRE(m.compute_ms(r.device, r.layer_end - r.layer_begin,
+                             64, kv, ms));
+        expected += ms * 4.0;
+    }
+    for (size_t i = 0; i + 1 < regions.size(); ++i) {
+        double ms = 0.0;
+        REQUIRE(m.transfer_ms(
+            regions[i].device, regions[i + 1].device,
+            (size_t) 64 * m.hidden * sizeof(float), ms));
+        expected += ms * 4.0;
+    }
+    REQUIRE(std::fabs(c.wall_ms - expected) < 1e-6);
+
+    candidate wrong = c;
+    wrong.xg = 128;
+    REQUIRE(!simulate(m, regions, wrong, &reason));
+    REQUIRE(reason == "FIXED_CHUNK_REQUIRED");
+    REQUIRE(!estimate_region_ring_balance(m, regions, wrong));
+    candidate fixed = c;
+    REQUIRE(estimate_region_ring_balance(m, regions, fixed));
+}
+
 int main() {
+    test_no_dag_serial_profile_scoring();
     test_gpg_phone_serial_profile_composition();
     test_gpg_sequential_gpu_banks_simulate();
     // The crash's selected 32B layout had 26 Phone layers across
