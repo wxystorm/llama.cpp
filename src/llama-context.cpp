@@ -7471,6 +7471,7 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                     }
                     int gpu_bank = -1;
                     int64_t gpu_bank_wait_us = 0;
+                    int64_t gpu_bank_sync_wait_begin_us = 0;
                     bool gpu_bank_resident = false;
 
                     if (dev == 1 && gpu_weight_streaming) {
@@ -7490,8 +7491,80 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         auto & selected =
                             region_ring_worker_resources[selected_bank];
 
+                        if (gpu_bank_sync_demand) {
+                            bool resident = false;
+                            bool source_drained = false;
+                            const size_t previous_rank =
+                                rank >= 2 ? (size_t) rank - 2 :
+                                gpu_region_order.size();
+                            {
+                                std::lock_guard<std::mutex> lock(
+                                    gpu_bank_mover_mutex);
+                                resident = selected.bank_ready &&
+                                    selected.bank_region == task.region;
+                                source_drained =
+                                    previous_rank < gpu_bank_drained_ranks.size() &&
+                                    gpu_bank_drained_ranks[previous_rank] != 0;
+                            }
+                            if (!resident) {
+                                if (!source_drained) {
+                                    throw std::runtime_error(
+                                        "Sync Bank refill before previous "
+                                        "same-parity Region fully drained");
+                                }
+                                gpu_bank_sync_wait_begin_us = ggml_time_us();
+                                const size_t source_region =
+                                    gpu_region_order[previous_rank];
+                                LLAMA_LOG_ERROR(
+                                    "[REGION_RING_GPU_BANK_SYNC_DEMAND]"
+                                    " event=REFILL_START region=%zu"
+                                    " bank=%c source_region=%zu"
+                                    " trigger=FIRST_READY_GPU_CHUNK"
+                                    " status=RUNNING\n",
+                                    task.region, bank_index == 0 ? 'A' : 'B',
+                                    source_region);
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        gpu_bank_mover_mutex);
+                                    selected.bank_ready = false;
+                                }
+                                // Same graph-preparation and staged H2D path
+                                // as the background mover, but GPU compute
+                                // cannot proceed until it returns.
+                                const bool refilled = refill_gpu_bank(
+                                    task.region, bank_index, source_region);
+                                {
+                                    std::lock_guard<std::mutex> lock(
+                                        gpu_bank_mover_mutex);
+                                    if (refilled) {
+                                        selected.bank_region = task.region;
+                                        ++selected.bank_generation;
+                                        selected.bank_ready = true;
+                                    } else {
+                                        selected.bank_region =
+                                            std::numeric_limits<size_t>::max();
+                                        selected.bank_ready = false;
+                                        gpu_bank_mover_failed = true;
+                                    }
+                                }
+                                if (!refilled) {
+                                    throw std::runtime_error(
+                                        "Synchronous GPU Bank refill failed");
+                                }
+                                LLAMA_LOG_ERROR(
+                                    "[REGION_RING_GPU_BANK_SYNC_DEMAND]"
+                                    " event=REFILL_DONE region=%zu"
+                                    " bank=%c upload_ms=%.3f status=PASS\n",
+                                    task.region, bank_index == 0 ? 'A' : 'B',
+                                    (ggml_time_us() -
+                                     gpu_bank_sync_wait_begin_us) / 1000.0);
+                            }
+                        }
+
                         if (gpu_bank_streaming) {
-                            const int64_t wait_begin_us = ggml_time_us();
+                            const int64_t wait_begin_us =
+                                gpu_bank_sync_wait_begin_us > 0 ?
+                                gpu_bank_sync_wait_begin_us : ggml_time_us();
                             if (task_trace != nullptr) {
                                 task_trace->bank_wait_begin_us = wait_begin_us;
                             }
@@ -8386,7 +8459,29 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         state.final_result = task_result;
                     }
 
-                    if (gpu_region_drained) {
+                    if (gpu_region_drained && gpu_bank_sync_demand) {
+                        const int rank =
+                            task.region < gpu_region_rank.size() ?
+                                gpu_region_rank[task.region] : -1;
+                        if (rank < 0 ||
+                                (size_t) rank >= gpu_bank_drained_ranks.size()) {
+                            throw std::runtime_error(
+                                "Sync-demand drained Region has invalid rank");
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(
+                                gpu_bank_mover_mutex);
+                            gpu_bank_drained_ranks[(size_t) rank] = 1;
+                        }
+                        LLAMA_LOG_INFO(
+                            "[REGION_RING_GPU_BANK_SYNC_DEMAND] event=DRAIN"
+                            " region=%zu rank=%d"
+                            " next=ON_FIRST_READY_CHUNK status=READY\n",
+                            task.region, rank);
+                        // Do not take the READY mutex while holding Bank
+                        // mutex; resource predicates acquire them in reverse.
+                        ready.notify_external_ready();
+                    } else if (gpu_region_drained) {
                         const int rank =
                             task.region < gpu_region_rank.size() ?
                                 gpu_region_rank[task.region] : -1;
@@ -8744,12 +8839,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         if (gpu_bank_streaming) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_GPU_BANK_MOVER_SUM] "
-                "worker=CPU_SINGLE started=%zu completed=%zu "
+                "worker=%s started=%zu completed=%zu "
                 "failures=%zu upload_mib=%.3f "
                 "stage_cpu_copy_ms=%.3f stage_chunks=%zu "
                 "prepare_ms=%.3f h2d_ms=%.3f wall_ms=%.3f "
                 "gpu_wait_ms=%.3f "
                 "thread_started=%d thread_joined=%d status=%s\n",
+                gpu_bank_sync_demand ? "GPU_SYNC_DEMAND" : "CPU_SINGLE",
                 gpu_bank_mover_stats_v.started,
                 gpu_bank_mover_stats_v.completed,
                 gpu_bank_mover_stats_v.failures,
