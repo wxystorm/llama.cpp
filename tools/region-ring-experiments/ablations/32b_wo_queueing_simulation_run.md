@@ -27,18 +27,29 @@ if ($LASTEXITCODE -ne 0) { throw "C++ build failed" }
 # .\build-tensor-v2\bin\Release\test-region-ring-planner.exe
 ~~~
 
-## Step 1：独立 Profile + 线性评分重新生成 Placement
+## Step 1：复用旧 Profile + 线性评分重新生成 Placement
 
-下面复用先前采集完成的 32b-profile-fresh-v2。不要传入 locked-layout 或 main50-short；它们会阻止重新选层。
+沿用旧的 Full Cycle 独立 Profile，不重新采样，不使用本次重新采集的 32b-profile-fresh-v2。
+不要传入 locked-layout 或 main50-short；它们会阻止重新选层。
 
 ~~~powershell
 $root = "E:\llama\llama-tensor-v2"
-$profileOut = "$root\32b-profile-fresh-v2"
-$profileConfig = Get-Content "$profileOut\run-config.json" -Raw | ConvertFrom-Json
-$model = $profileConfig.model.path
-$rpc = $profileConfig.rpc
-$data = $profileConfig.prompt_dir
-$planOut = "$root\32b-wo-queue-sim-plan64"
+$oldProfileCandidates = @(
+    "$root\32b-server-chunk256-all50-new\independent-profile",
+    "$root\32b-sharegpt50-short-mmap-test\independent-profile"
+)
+$oldProfile = $oldProfileCandidates |
+    Where-Object {
+        (Test-Path "$_\profile.csv") -and
+        (Test-Path "$_\profile.json")
+    } | Select-Object -First 1
+if (-not $oldProfile) { throw "Old independent Profile not found" }
+Write-Host "[OLD_PROFILE] $oldProfile"
+
+$model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
+$rpc = "10.238.229.239:50052"
+$data = "E:\llama\datasets\sharegpt\sharegpt50_short"
+$planOut = "$root\32b-wo-queue-sim-plan64-old-profile"
 
 $planOpts = @(
     "--exe", "$root\build-tensor-v2\bin\Release\llama-completion.exe",
@@ -50,7 +61,7 @@ $planOpts = @(
     "--auto-plan", "--htp-only", "--streaming", "on",
     "--sharegpt50-short-dataset",
     "--lock-layout-after-first",
-    "--real-stage-profile-csv", "$profileOut\independent-profile\profile.csv",
+    "--real-stage-profile-csv", "$oldProfile\profile.csv",
     "--env", "LLAMA_REGION_RING_NO_DAG_PLANNER=1",
     "--batch", "2048", "--ubatch", "2048",
     "--n-predict", "1", "--threads", "8",
@@ -72,13 +83,13 @@ Write-Host "[NO_DAG_SELECTED_LAYOUT] $linearLayout"
 ## Step 2：常驻 Server，固定 64 执行 50 条
 
 ~~~powershell
-$serverOut = "$root\32b-wo-queue-sim-fixed64-all50"
+$serverOut = "$root\32b-wo-queue-sim-fixed64-all50-old-profile"
 $serverOpts5 = @(
     "--server-exe", "$root\build-tensor-v2\bin\Release\llama-server.exe",
     "--model", $model, "--model-layers", "64",
     "--locked-layout", $linearLayout,
     "--rpc", $rpc, "--prompt-dir", $data,
-    "--profile-source", "$profileOut\independent-profile",
+    "--profile-source", $oldProfile,
     "--port", "18080", "--threads", "8",
     "--all50", "--per-request-chunks",
     "--fixed-chunk", "64",
@@ -87,7 +98,7 @@ $serverOpts5 = @(
 )
 
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts5 `
-    --out "$root\32b-wo-queue-sim-fixed64-smoke" --limit 2
+    --out "$root\32b-wo-queue-sim-fixed64-smoke-old-profile" --limit 2
 if ($LASTEXITCODE -ne 0) { throw "No-DAG smoke failed" }
 
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts5 `

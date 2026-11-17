@@ -1171,9 +1171,17 @@ def get_args(argv=None):
         parser.error("--retry-failed-only conflicts with --rerun-all")
     if any(not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", e, re.DOTALL) for e in args.env):
         parser.error("--env must use NAME=VALUE")
-    forbidden = sorted({entry.split("=", 1)[0] for entry in args.env} & PROTECTED_RING_ENV)
+    # This opt-in is a planner-only ablation; block inheritance via
+    # PROTECTED_RING_ENV but allow an explicit per-run CLI selection.
+    no_dag_optin = "LLAMA_REGION_RING_NO_DAG_PLANNER"
+    forbidden = sorted(
+        {entry.split("=", 1)[0] for entry in args.env} &
+        (PROTECTED_RING_ENV - {no_dag_optin}))
     if forbidden:
         parser.error("--env cannot override fixed Ring settings: " + ", ".join(forbidden))
+    if any(entry.startswith(no_dag_optin + "=") and
+           entry != no_dag_optin + "=1" for entry in args.env):
+        parser.error("LLAMA_REGION_RING_NO_DAG_PLANNER only accepts 1")
     diag_env = dict(entry.split("=", 1) for entry in args.env)
     if (args.htp_only and
             diag_env.get("LLAMA_REGION_RING_DIAG_FULL_WARMUP") == "1" and
