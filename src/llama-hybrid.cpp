@@ -27,6 +27,7 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <memory>
 #include <iterator>
 #include <mutex>
@@ -10396,28 +10397,48 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     !base_prepare ||
                     base_prepare(d, layers, tokens, kv, ms);
             };
+            // The explicit w/o Multi-Cycle topology has one P21
+            // (layers [36,57)) rather than P4/P5 stages. HTP executes
+            // this Region as serial per-layer subplans. For this exact
+            // ablation only, compose calibrated Phone block costs instead
+            // of extrapolating a nonexistent measured 21-layer graph.
+            const auto estimate_real_region =
+                [measured](llama_region_ring_device d,
+                           int begin, int end, int tokens, int physical_kv,
+                           bool terminal, llama_ring_planner::real_stage_phase phase,
+                           double & ms) -> bool {
+                    if (physical_kv <= 0) { return false; }
+                    const bool final_phone =
+                        d == llama_region_ring_device::PHONE && terminal;
+                    if (measured->estimate(
+                            d, end - begin, tokens, physical_kv,
+                            final_phone, phase, ms)) {
+                        return true;
+                    }
+                    return llama_region_ring_gpg_ablation_enabled() &&
+                        d == llama_region_ring_device::PHONE &&
+                        begin == 36 && end == 57 && !terminal &&
+                        measured->estimate_phone_serial_blocks(
+                            end - begin, tokens, physical_kv, false, phase, ms);
+                };
             model.compute_region_ms =
-                [measured, base_compute, cost_kind, measured_kv](
+                [estimate_real_region, base_compute, cost_kind, measured_kv](
                     llama_region_ring_device d, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
                     const int physical_kv = measured_kv(d, tokens, kv);
-                    return (physical_kv > 0 &&
-                        measured->estimate(
-                            d, end - begin, tokens, physical_kv,
-                            d == llama_region_ring_device::PHONE && terminal,
-                            cost_kind, ms)) ||
+                    return estimate_real_region(
+                            d, begin, end, tokens, physical_kv, terminal,
+                            cost_kind, ms) ||
                         base_compute(d, end - begin, tokens, kv, ms);
                 };
             model.prepare_region_ms =
-                [measured, base_prepare, prep_kind, measured_kv](
+                [estimate_real_region, base_prepare, prep_kind, measured_kv](
                     llama_region_ring_device d, int begin, int end,
                     int tokens, int kv, bool terminal, double & ms) {
                     const int physical_kv = measured_kv(d, tokens, kv);
-                    return (physical_kv > 0 &&
-                        measured->estimate(
-                            d, end - begin, tokens, physical_kv,
-                            d == llama_region_ring_device::PHONE && terminal,
-                            prep_kind, ms)) ||
+                    return estimate_real_region(
+                            d, begin, end, tokens, physical_kv, terminal,
+                            prep_kind, ms) ||
                         !base_prepare ||
                         base_prepare(d, end - begin, tokens, kv, ms);
                 };
@@ -10433,15 +10454,28 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                     const int padded_kv =
                         llama_ring_planner::phone_graphless_profile_kv(
                             tokens, tokens);
-                    if (padded_kv > 0 && measured->estimate(
-                            llama_region_ring_device::PHONE, layers,
-                            tokens, padded_kv, terminal, setup_kind, ms)) {
+                    if (padded_kv > 0 &&
+                            (measured->estimate(
+                                 llama_region_ring_device::PHONE, layers,
+                                 tokens, padded_kv, terminal, setup_kind, ms) ||
+                             (llama_region_ring_gpg_ablation_enabled() &&
+                              layers == 21 && !terminal &&
+                              measured->estimate_phone_serial_blocks(
+                                  layers, tokens, padded_kv, false,
+                                  setup_kind, ms)))) {
                         return true;
                     }
                     return llama_ring_planner::phone_registration_cost(
                         model, llama_region_ring_stage_kind::PHONE,
                         layers, tokens, false, ms);
                 };
+            if (llama_region_ring_gpg_ablation_enabled()) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_GPG_PROFILE] mode=HTP_SERIAL_BLOCK_COMPOSITION"
+                    " logical_phone_layers=21 blocks=PROFILE_CALIBRATED"
+                    " direct_depth_extrapolation=DISABLED"
+                    " missing_sample=FAIL_CLOSED status=READY\n");
+            }
             LLAMA_LOG_INFO(
                 "[REGION_RING_REAL_STAGE_PROFILE] status=LOADED "
                 "points=%zu path=%s missing=LEGACY_FALLBACK\n",
@@ -11518,6 +11552,7 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             size_t tried = 0;
             size_t rejected_memory = 0;
             size_t rejected_profile = 0;
+            std::map<std::string, size_t> profile_rejection_reasons;
             // Short prompts may use a separately measured sub-32 grid.
             // A long placement anchor always uses the original Chunk grid;
             // only <=256-token locked prompts can use 16/24 below X=32.
@@ -11599,11 +11634,15 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                             continue;
                         }
                         std::string why;
-                        if (!llama_ring_planner::simulate(
-                                locked_model, locked_regions, probe, &why) ||
+                        const bool simulated = llama_ring_planner::simulate(
+                            locked_model, locked_regions, probe, &why);
+                        if (!simulated ||
                                 !std::isfinite(probe.wall_ms) ||
                                 probe.wall_ms <= 0.0) {
                             ++rejected_profile;
+                            ++profile_rejection_reasons[
+                                simulated ? "INVALID_PREDICTED_WALL" :
+                                (why.empty() ? "UNKNOWN" : why)];
                             continue;
                         }
                         if (!valid || probe.wall_ms < best_chunk.wall_ms) {
@@ -11614,13 +11653,23 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 }
             }
             if (!valid) {
+                std::string most_common_reason = "NONE";
+                size_t most_common_count = 0;
+                for (const auto & entry : profile_rejection_reasons) {
+                    if (entry.second > most_common_count) {
+                        most_common_reason = entry.first;
+                        most_common_count = entry.second;
+                    }
+                }
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_PLAN_LOCK] status=REJECT"
                     " reason=NO_FEASIBLE_CHUNK"
                     " layout=%s tried=%zu reject_memory=%zu"
-                    " reject_profile=%zu\n",
+                    " reject_profile=%zu top_profile_reason=%s"
+                    " top_profile_reason_count=%zu\n",
                     locked_layout, tried, rejected_memory,
-                    rejected_profile);
+                    rejected_profile, most_common_reason.c_str(),
+                    most_common_count);
                 return false; // Never unlock/repartition as a fallback.
             }
             *selected_layout =
