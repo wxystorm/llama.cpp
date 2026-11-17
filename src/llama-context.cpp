@@ -10782,7 +10782,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // Ablation-only exact Chunk replay. The resident server reads an
         // atomically replaced one-request sidecar immediately before each
         // actual >=32-token Prefill. This never changes model layer placement
-        // and never calls the Chunk search for replayed requests. Unlike a
+        // and still scores the Chunk search for fair planning overhead. Unlike a
         // token-count lookup, the driver supplies the intended Prompt's
         // decision just before POST; mismatched token counts fail closed.
         const char * replay_path =
@@ -10820,13 +10820,38 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     request_xc, request_xg, request_xp);
                 return -1;
             }
+            // Keep the native Planner's computation/overhead comparable to
+            // Full Cycle, but never apply its candidate widths: only the
+            // immutable recorded per-Prompt widths are executed. Reject a
+            // missing or mismatched scored placement rather than mixing
+            // different workload/weight configurations.
+            std::string scored_layout;
+            int scored_xc = 0;
+            int scored_xg = 0;
+            int scored_xp = 0;
+            const bool scored = llama_hybrid_region_ring_planner_apply_wide(
+                (int) n_tokens_all, 0, baseline_chunk,
+                scored_layout, scored_xc, scored_xg, scored_xp);
+            if (!scored || scored_layout != request_layout) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_REQUEST_CHUNK_REPLAY] event=REJECT"
+                    " reason=NATIVE_PLAN_UNSCOREABLE_OR_LAYOUT_CHANGED"
+                    " scored=%d recorded_layout=%s scored_layout=%s"
+                    " status=FAIL\n",
+                    scored ? 1 : 0, request_layout.c_str(),
+                    scored_layout.c_str());
+                return -1;
+            }
             selected = true;
             LLAMA_LOG_INFO(
                 "[REGION_RING_REQUEST_CHUNK_REPLAY] event=READ"
                 " tokens=%u layout=%s XC=%d XG=%d XP=%d"
+                " scored_XC=%d scored_XG=%d scored_XP=%d"
+                " action=EXECUTE_RECORDED_ONLY"
                 " source=REFERENCE_REQUESTS_JSONL status=PASS\n",
                 n_tokens_all, request_layout.c_str(),
-                request_xc, request_xg, request_xp);
+                request_xc, request_xg, request_xp,
+                scored_xc, scored_xg, scored_xp);
         } else {
             selected = llama_hybrid_region_ring_planner_apply_wide(
                 (int) n_tokens_all, 0, baseline_chunk,
