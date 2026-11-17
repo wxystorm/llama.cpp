@@ -451,6 +451,9 @@ def load_reference_chunks(path, prompts, layout, model, profile_source):
         if expected_hash != sha256_file(profile_source / name):
             raise ValueError("Full Cycle Profile differs: " + name)
     if (config.get("runtime_env") or {}).get(
+            "LLAMA_REGION_RING_PER_REQUEST_CHUNKS") != "1":
+        raise ValueError("Full Cycle did not use per-request Chunk planning")
+    if (config.get("runtime_env") or {}).get(
             "LLAMA_REGION_RING_DRAIN_FIRST_CYCLE") == "0":
         raise ValueError("Reference already has Drain-First disabled")
 
@@ -471,6 +474,7 @@ def load_reference_chunks(path, prompts, layout, model, profile_source):
                 row.get("prompt") != prompt.name or
                 row.get("status") != "PASS" or
                 row.get("cache_n") != 0 or
+                row.get("planner_mode") != "PER_REQUEST_LOCKED" or
                 row.get("runtime_layout") != layout):
             raise ValueError(
                 f"Baseline row {index} is not a PASS for {prompt.name}"
