@@ -7572,6 +7572,12 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                                 gpu_bank_mover_mutex);
                             if (!selected.bank_ready ||
                                     selected.bank_region != task.region) {
+                                // No background thread exists in sync mode:
+                                // waiting on the mover CV would deadlock.
+                                if (gpu_bank_sync_demand) {
+                                    throw std::runtime_error(
+                                        "Sync GPU Bank not ready after refill");
+                                }
                                 LLAMA_LOG_INFO(
                                     "[REGION_RING_GPU_BANK] event=WAIT "
                                     "region=%zu chunk=%zu bank=%c "
