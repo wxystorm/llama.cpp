@@ -4,6 +4,7 @@
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
+#include "../ggml-jupiter-fig3.h"
 #include "amx/amx.h"
 
 #include <cctype>
@@ -162,7 +163,12 @@ static void ggml_backend_cpu_graph_plan_free(ggml_backend_t backend, ggml_backen
 static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backend, ggml_backend_graph_plan_t plan) {
     struct ggml_backend_plan_cpu * cpu_plan = (struct ggml_backend_plan_cpu *)plan;
 
-    return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    if (!jupiter_fig3::pc_enabled()) return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    const auto start = jupiter_fig3::ns();
+    const auto status = ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
+    jupiter_fig3::device("pc_cpu_events.csv", "CPU Compute", start,
+                         jupiter_fig3::ns(), "CPU_PLAN_COMPUTE");
+    return status;
 
     GGML_UNUSED(backend);
 }
@@ -187,7 +193,12 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    if (!jupiter_fig3::pc_enabled()) return ggml_graph_compute(cgraph, &cplan);
+    const auto start = jupiter_fig3::ns();
+    const auto status = ggml_graph_compute(cgraph, &cplan);
+    jupiter_fig3::device("pc_cpu_events.csv", "CPU Compute", start,
+                         jupiter_fig3::ns(), "CPU_GRAPH_COMPUTE");
+    return status;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {
@@ -217,6 +228,10 @@ static ggml_guid_t ggml_backend_cpu_guid(void) {
 ggml_backend_t ggml_backend_cpu_init(void) {
     // initialize CPU backend now to avoid slowing the first graph computation
     ggml_cpu_init();
+    if (jupiter_fig3::pc_enabled()) {
+        jupiter_fig3::pc_row("pc_cpu_events.csv",
+                            "category,start_ns,end_ns,source,device,bytes");
+    }
 
     struct ggml_backend_cpu_context * ctx = new ggml_backend_cpu_context;
     if (ctx == NULL) {
