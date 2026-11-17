@@ -187,7 +187,11 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    const bool enabled = ggml_moti_active();
+    const int64_t begin = enabled ? ggml_time_us() : 0;
+    const enum ggml_status status = ggml_graph_compute(cgraph, &cplan);
+    if (enabled) ggml_moti_cpu((uint64_t) (ggml_time_us() - begin));
+    return status;
 }
 
 static const struct ggml_backend_i ggml_backend_cpu_i = {

@@ -81,6 +81,7 @@
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
@@ -3026,7 +3027,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const bool profile = ggml_moti_active();
+    const auto e = profile ? ggml_moti_cuda_event_begin(cuda_ctx->stream()) : ggml_moti_cuda_event_pair{};
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    if (profile) ggml_moti_cuda_event_finish(e, cuda_ctx->stream(), true, true, size);
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3035,7 +3039,10 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const bool profile = ggml_moti_active();
+    const auto e = profile ? ggml_moti_cuda_event_begin(cuda_ctx->stream()) : ggml_moti_cuda_event_pair{};
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    if (profile) ggml_moti_cuda_event_finish(e, cuda_ctx->stream(), true, false, size);
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -3123,6 +3130,8 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    ggml_moti_cuda_collect_events();
+    ggml_moti_cuda_sample_memory();
 
     GGML_UNUSED(backend);
 }
@@ -5256,10 +5265,53 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+struct ggml_moti_cuda_event_pair {
+    cudaEvent_t start, end;
+};
+static thread_local std::vector<ggml_moti_cuda_event_pair> ggml_moti_cuda_graph_events;
+static thread_local std::vector<std::pair<ggml_moti_cuda_event_pair, std::pair<bool, size_t>>> ggml_moti_cuda_copy_events;
+static void ggml_moti_cuda_sample_memory() {
+    if (!ggml_moti_active()) return;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) ggml_moti_gpu_mem(total_b-free_b, total_b);
+}
+static ggml_moti_cuda_event_pair ggml_moti_cuda_event_begin(cudaStream_t stream) {
+    ggml_moti_cuda_event_pair pair = {};
+    CUDA_CHECK(cudaEventCreate(&pair.start));
+    CUDA_CHECK(cudaEventCreate(&pair.end));
+    CUDA_CHECK(cudaEventRecord(pair.start, stream));
+    return pair;
+}
+static void ggml_moti_cuda_event_finish(ggml_moti_cuda_event_pair pair, cudaStream_t stream, bool copy, bool h2d = false, size_t bytes = 0) {
+    CUDA_CHECK(cudaEventRecord(pair.end, stream));
+    if (copy) ggml_moti_cuda_copy_events.push_back({pair, {h2d, bytes}});
+    else ggml_moti_cuda_graph_events.push_back(pair);
+}
+static void ggml_moti_cuda_collect_events() {
+    for (auto pair : ggml_moti_cuda_graph_events) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, pair.start, pair.end) == cudaSuccess)
+            ggml_moti_gpu((uint64_t) (ms*1000.0f));
+        CUDA_CHECK(cudaEventDestroy(pair.start));
+        CUDA_CHECK(cudaEventDestroy(pair.end));
+    }
+    ggml_moti_cuda_graph_events.clear();
+    for (auto entry : ggml_moti_cuda_copy_events) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, entry.first.start, entry.first.end) == cudaSuccess)
+            ggml_moti_copy(entry.second.first, entry.second.second, (uint64_t) (ms*1000.0f));
+        CUDA_CHECK(cudaEventDestroy(entry.first.start));
+        CUDA_CHECK(cudaEventDestroy(entry.first.end));
+    }
+    ggml_moti_cuda_copy_events.clear();
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    const bool moti_graph = ggml_moti_active();
+    const auto moti_event = moti_graph ? ggml_moti_cuda_event_begin(cuda_ctx->stream()) : ggml_moti_cuda_event_pair{};
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -5317,6 +5369,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (moti_graph) {
+        ggml_moti_cuda_event_finish(moti_event, cuda_ctx->stream(), false);
+        ggml_moti_cuda_sample_memory();
+    }
 
     return GGML_STATUS_SUCCESS;
 }

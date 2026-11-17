@@ -73,6 +73,21 @@ extern "C" {
     GGML_API void ggml_backend_tensor_copy  (const struct ggml_tensor * src, struct ggml_tensor * dst);
     GGML_API void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);
 
+    // Opt-in single-context profiling. Activity categories can overlap.
+    struct ggml_moti_stats {
+        uint64_t wall_us, cpu_us, gpu_stream_us, cpu_calls, gpu_calls;
+        uint64_t h2d_us, d2h_us, h2d_bytes, d2h_bytes, h2d_calls, d2h_calls;
+        uint64_t page_faults_all, process_peak_working_set, process_private_bytes;
+        uint64_t gpu_device_used_peak, gpu_device_total;
+    };
+    GGML_API bool                  ggml_moti_active(void);
+    GGML_API void                  ggml_moti_begin(void);
+    GGML_API struct ggml_moti_stats ggml_moti_end(void);
+    GGML_API void                  ggml_moti_cpu(uint64_t us);
+    GGML_API void                  ggml_moti_gpu(uint64_t us);
+    GGML_API void                  ggml_moti_copy(bool h2d, size_t bytes, uint64_t us);
+    GGML_API void                  ggml_moti_gpu_mem(size_t used, size_t total);
+
     //
     // Backend (stream)
     //

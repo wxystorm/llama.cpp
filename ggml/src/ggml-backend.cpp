@@ -20,14 +20,86 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
+#ifdef _WIN32
+#include <psapi.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
 
+
+// Experiment-only profiling, activated with LLAMA_MOTI_PROFILE=1.
+// Measures backend activity (which may overlap), not additive critical-path time.
+struct ggml_moti_counters {
+    std::atomic<bool> active {false};
+    std::atomic<uint64_t> cpu {0}, gpu {0}, cpu_n {0}, gpu_n {0};
+    std::atomic<uint64_t> h2d {0}, d2h {0}, h2d_b {0}, d2h_b {0}, h2d_n {0}, d2h_n {0};
+    std::atomic<uint64_t> gpu_peak {0}, gpu_total {0};
+    uint64_t started = 0, faults_before = 0;
+};
+static ggml_moti_counters moti;
+static uint64_t moti_faults(uint64_t * peak = nullptr, uint64_t * priv = nullptr) {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX m = {};
+    m.cb = sizeof(m);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *) &m, sizeof(m))) {
+        if (peak) *peak = m.PeakWorkingSetSize;
+        if (priv) *priv = m.PrivateUsage;
+        return m.PageFaultCount;
+    }
+#else
+    (void) peak; (void) priv;
+#endif
+    return 0;
+}
+static void moti_max(std::atomic<uint64_t> & x, uint64_t v) {
+    uint64_t n = x.load(std::memory_order_relaxed);
+    while (v > n && !x.compare_exchange_weak(n, v, std::memory_order_relaxed)) {}
+}
+bool ggml_moti_active(void) { return moti.active.load(std::memory_order_relaxed); }
+void ggml_moti_begin(void) {
+    static const bool enabled = [] { const char * e = getenv("LLAMA_MOTI_PROFILE"); return e && strcmp(e, "1") == 0; }();
+    if (!enabled) return;
+    moti.active = false;
+    moti.cpu = 0; moti.gpu = 0; moti.cpu_n = 0; moti.gpu_n = 0;
+    moti.h2d = 0; moti.d2h = 0; moti.h2d_b = 0; moti.d2h_b = 0;
+    moti.h2d_n = 0; moti.d2h_n = 0; moti.gpu_peak = 0; moti.gpu_total = 0;
+    moti.faults_before = moti_faults();
+    moti.started = ggml_time_us();
+    moti.active.store(true, std::memory_order_release);
+}
+struct ggml_moti_stats ggml_moti_end(void) {
+    moti.active.store(false, std::memory_order_release);
+    uint64_t peak = 0, priv = 0;
+    uint64_t faults = moti_faults(&peak, &priv);
+    return {moti.started ? (uint64_t) ggml_time_us() - moti.started : 0,
+        moti.cpu.load(), moti.gpu.load(), moti.cpu_n.load(), moti.gpu_n.load(),
+        moti.h2d.load(), moti.d2h.load(), moti.h2d_b.load(), moti.d2h_b.load(),
+        moti.h2d_n.load(), moti.d2h_n.load(), faults >= moti.faults_before ? faults - moti.faults_before : 0,
+        peak, priv, moti.gpu_peak.load(), moti.gpu_total.load()};
+}
+void ggml_moti_cpu(uint64_t us) {
+    if (ggml_moti_active()) { moti.cpu.fetch_add(us); moti.cpu_n.fetch_add(1); }
+}
+void ggml_moti_gpu(uint64_t us) {
+    if (ggml_moti_active()) { moti.gpu.fetch_add(us); moti.gpu_n.fetch_add(1); }
+}
+void ggml_moti_copy(bool h2d, size_t bytes, uint64_t us) {
+    if (!ggml_moti_active()) return;
+    (h2d ? moti.h2d : moti.d2h).fetch_add(us);
+    (h2d ? moti.h2d_b : moti.d2h_b).fetch_add(bytes);
+    (h2d ? moti.h2d_n : moti.d2h_n).fetch_add(1);
+}
+void ggml_moti_gpu_mem(size_t used, size_t total) {
+    if (!ggml_moti_active()) return;
+    moti_max(moti.gpu_peak, used);
+    moti_max(moti.gpu_total, total);
+}
 
 // backend buffer type
 

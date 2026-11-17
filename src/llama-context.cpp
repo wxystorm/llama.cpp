@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -953,6 +954,23 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+
+    if (ggml_moti_active()) {
+        const auto p = ggml_moti_end();
+        if (n_queued_tokens > 1) {
+            LLAMA_LOG_INFO("[MOTI_PREFILL] tokens=%d wall_ms=%.3f cpu_ms=%.3f gpu_stream_ms=%.3f "
+                "cpu_graphs=%" PRIu64 " gpu_graphs=%" PRIu64 " h2d_ms=%.3f d2h_ms=%.3f "
+                "h2d_mib=%.3f d2h_mib=%.3f h2d_calls=%" PRIu64 " d2h_calls=%" PRIu64 " "
+                "peak_working_set_mib=%.3f private_mib=%.3f gpu_device_used_peak_mib=%.3f "
+                "gpu_device_total_mib=%.3f page_faults_all=%" PRIu64 "\n",
+                n_queued_tokens, p.wall_us/1000.0, p.cpu_us/1000.0, p.gpu_stream_us/1000.0,
+                p.cpu_calls, p.gpu_calls, p.h2d_us/1000.0, p.d2h_us/1000.0,
+                p.h2d_bytes/1048576.0, p.d2h_bytes/1048576.0, p.h2d_calls, p.d2h_calls,
+                p.process_peak_working_set/1048576.0, p.process_private_bytes/1048576.0,
+                p.gpu_device_used_peak/1048576.0, p.gpu_device_total/1048576.0,
+                p.page_faults_all);
+        }
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1941,6 +1959,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
+        if (n_tokens > 1) ggml_moti_begin();
     }
 
     sched_reserve();
@@ -2242,6 +2261,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
+        if (n_tokens_all > 1) ggml_moti_begin();
     }
     n_queued_tokens += n_tokens_all;
 
