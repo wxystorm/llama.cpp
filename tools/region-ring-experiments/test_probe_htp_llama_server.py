@@ -505,7 +505,7 @@ class ServerProbeTests(unittest.TestCase):
     def test_sync_demand_log_verifies_two_banks_and_drain_first(self):
         layout = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
         prefix = (
-            "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=0"
+            "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1"
             " phone_push_aware=1 status=READY\n"
             "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
             " rule=EARLIEST_EXECUTABLE_REGION status=READY\n")
@@ -524,47 +524,72 @@ class ServerProbeTests(unittest.TestCase):
             " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
         mode = (
             "[REGION_RING_ABLATION] gpu_banks=2 gpu_prefetch=0"
-            " gpu_bank_mover=0 status=CONFIGURED\n")
+            " gpu_bank_mover=0 sync_demand=1 status=CONFIGURED\n"
+            "[REGION_RING_GPU_BANK_REFILL_MODE] mode=SYNC_ON_DEMAND"
+            " banks=2 background_thread=0"
+            " same_parity_drain_gate=1 status=READY\n")
+        refill_summary = (
+            "[REGION_RING_GPU_BANK_MOVER_SUM]"
+            " worker=GPU_SYNC_DEMAND started=4 completed=4"
+            " failures=0 upload_mib=3456.0 stage_cpu_copy_ms=0"
+            " stage_chunks=0 prepare_ms=10 h2d_ms=350 wall_ms=360"
+            " gpu_wait_ms=360 thread_started=0 thread_joined=0"
+            " status=PASS\n")
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "server.log"
-            log.write_text(mode + prefix + selected, encoding="utf-8")
+            log.write_text(
+                mode + prefix + selected + refill_summary,
+                encoding="utf-8")
             result, _ = probe.read_request_chunk_plan(
                 log, 0, 66, 256, 256, layout,
                 "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
             self.assertEqual(
                 (result["plan_xg"], result["plan_xp"]), (24, 32))
-            log.write_text(prefix + selected, encoding="utf-8")
+            log.write_text(
+                prefix + selected + refill_summary, encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "w/o Async Prefetch"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
                     "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
             log.write_text(
                 mode.replace("gpu_banks=2", "gpu_banks=1")
-                + prefix + selected, encoding="utf-8")
+                + prefix + selected + refill_summary, encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "w/o Async Prefetch"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
                     "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
             log.write_text(
-                mode + prefix.replace(
-                    "mode=DRAIN_FIRST", "mode=FIFO") + selected,
+                mode + prefix + selected +
+                refill_summary.replace("completed=4", "completed=3"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "synchronous Bank refills"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
+            log.write_text(
+                mode + prefix.replace("mode=DRAIN_FIRST", "mode=FIFO")
+                + selected + refill_summary,
                 encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "scheduler ablation"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
                     "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
 
-    def test_sync_bank_demand_is_existing_runtime_not_bank_count_change(self):
+    def test_strict_sync_demand_reuses_original_streaming_refill_path(self):
         source = (Path(__file__).resolve().parents[2] /
                   "src" / "llama-context.cpp").read_text(encoding="utf-8")
         for token in (
-            '"LLAMA_REGION_RING_GPU_BANK_PREFETCH"',
-            "gpu_bank_prefetch_enabled =",
+            '"LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"',
+            "gpu_bank_sync_demand =",
+            "gpu_bank_streaming && gpu_bank_sync_demand_requested",
+            "gpu_bank_drained_ranks",
+            "gpu_bank_streaming && !gpu_bank_sync_demand",
+            "refill_gpu_bank(",
+            "const bool refilled = refill_gpu_bank(",
+            "ready.notify_external_ready();",
+            '"[REGION_RING_GPU_BANK_REFILL_MODE] mode=SYNC_ON_DEMAND"',
+            '"[REGION_RING_GPU_BANK_SYNC_DEMAND]"',
             "gpu_bank_initial_residency =",
-            "gpu_bank_streaming || !gpu_bank_prefetch_enabled",
-            "if (gpu_bank_streaming)",
-            "gpu_region_order.size() == 1 ?",
-            '"SMALL_BATCH_DEMAND"',
         ):
             self.assertIn(token, source)
 
