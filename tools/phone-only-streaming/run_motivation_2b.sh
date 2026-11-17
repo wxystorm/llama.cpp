@@ -51,7 +51,7 @@ echo "[PHONE_MOTI_RUN] ctx=$N_CTX batch=$N_BATCH ubatch=$N_UBATCH threads=$N_THR
 set +e
 "$LLAMA_BIN" -npu -m "$MODEL" -f "$PROMPT" \
     -c "$N_CTX" -b "$N_BATCH" -ub "$N_UBATCH" \
-    -t "$N_THREADS" -n "$N_PREDICT" -lv 3 -st \
+    -t "$N_THREADS" -n "$N_PREDICT" -lv 4 -st \
     </dev/null > "$OUT_DIR/run.log" 2>&1
 status=$?
 set -e
