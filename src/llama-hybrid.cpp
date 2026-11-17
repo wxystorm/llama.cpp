@@ -8937,23 +8937,46 @@ static bool llama_hybrid_calibrate_independent_ring(
             bool has_htp = false;
             bool has_kv2048 = false;
             bool has_kv3072 = false;
+            // A legacy fixed-X=64 ablation is allowed to reuse a smaller
+            // measured grid, but never to synthesize a missing X64 sample.
+            std::array<bool, 3> measured_x64 {{false, false, false}};
+            bool measured_phone_x64_kv2048 = false;
             std::string row;
             while (std::getline(cached, row)) {
-                if (row.rfind("PHONE,", 0) != 0) {
+                const bool is_cpu = row.rfind("CPU,", 0) == 0;
+                const bool is_gpu = row.rfind("GPU,", 0) == 0;
+                const bool is_phone = row.rfind("PHONE,", 0) == 0;
+                if (!is_cpu && !is_gpu && !is_phone) {
                     continue;
                 }
-                has_htp = true;
-                // CSV schema: device,layers,tokens,kv_tokens,...
                 std::istringstream fields(row);
+                std::vector<std::string> cols;
                 std::string cell;
-                int column = 0;
                 while (std::getline(fields, cell, ',')) {
-                    if (column++ != 3) {
-                        continue;
-                    }
-                    has_kv2048 |= cell == "2048";
-                    has_kv3072 |= cell == "3072";
-                    break;
+                    cols.push_back(cell);
+                }
+                if (cols.size() < 8) {
+                    continue;
+                }
+                if (is_phone) {
+                    has_htp = true;
+                    has_kv2048 |= cols[3] == "2048";
+                    has_kv3072 |= cols[3] == "3072";
+                }
+                if (cols[2] != "64") {
+                    continue;
+                }
+                char * finish = nullptr;
+                const double compute_ms =
+                    std::strtod(cols[7].c_str(), &finish);
+                if (finish == cols[7].c_str() || *finish != '\0' ||
+                        !std::isfinite(compute_ms) || compute_ms <= 0.0) {
+                    continue;
+                }
+                const size_t index = is_cpu ? 0 : is_gpu ? 1 : 2;
+                measured_x64[index] = true;
+                if (is_phone && cols[3] == "2048") {
+                    measured_phone_x64_kv2048 = true;
                 }
             }
             if ((long_kv_grid && (!has_kv2048 || !has_kv3072)) ||
@@ -9000,13 +9023,79 @@ static bool llama_hybrid_calibrate_independent_ring(
                     short_chunk_grid &&
                     metadata.find(legacy_short_chunk_grid) !=
                         std::string::npos;
-                if (!cached_new && !cached_legacy) {
+
+                // Strict full-grid equality is correct for the normal
+                // adaptive Planner. The no-DAG experiment only ranks
+                // fixed-X64 candidates; requiring unused 16/24/192/256
+                // samples would discard genuine old X64 measurements.
+                // Keep this exception exclusive to the no-DAG opt-in.
+                const char * linear_env =
+                    std::getenv("LLAMA_REGION_RING_NO_DAG_PLANNER");
+                const bool linear_fixed64 =
+                    linear_env != nullptr &&
+                    std::strcmp(linear_env, "1") == 0 &&
+                    !short_chunk_grid;
+                bool metadata_has_x64 = false;
+                const size_t width_key =
+                    metadata.find("\"chunk_widths\"");
+                const size_t array_begin =
+                    width_key == std::string::npos ?
+                        std::string::npos :
+                        metadata.find('[', width_key);
+                const size_t array_end =
+                    array_begin == std::string::npos ?
+                        std::string::npos :
+                        metadata.find(']', array_begin);
+                if (array_end != std::string::npos) {
+                    std::istringstream widths(metadata.substr(
+                        array_begin + 1, array_end - array_begin - 1));
+                    std::string width_text;
+                    while (std::getline(widths, width_text, ',')) {
+                        char * finish = nullptr;
+                        const long width =
+                            std::strtol(width_text.c_str(), &finish, 10);
+                        if (finish != width_text.c_str() &&
+                                *finish == '\0' && width == 64) {
+                            metadata_has_x64 = true;
+                            break;
+                        }
+                    }
+                }
+                const bool fixed64_legacy_compatible =
+                    linear_fixed64 && metadata_has_x64 &&
+                    metadata.find("\"schema\":1") !=
+                        std::string::npos &&
+                    metadata.find(
+                        "\"mode\":\"INDEPENDENT_BACKEND_PROFILE\"") !=
+                        std::string::npos &&
+                    metadata.find("\"layers\":64") !=
+                        std::string::npos &&
+                    measured_x64[0] && measured_x64[1] &&
+                    measured_x64[2] && measured_phone_x64_kv2048;
+                if (!cached_new && !cached_legacy &&
+                        !fixed64_legacy_compatible) {
                     LLAMA_LOG_ERROR(
                         "[INDEPENDENT_PROFILE] status=REJECT"
                         " reason=CACHE_CHUNK_GRID_MISMATCH path=%s"
-                        " action=GENERATE_NEW_PROFILE_IN_NEW_OUT_DIR\n",
-                        json_path.c_str());
+                        " linear_fixed64=%d metadata_x64=%d"
+                        " measured_c64=%d g64=%d n64=%d n64_kv2048=%d"
+                        " action=CHECK_EXISTING_PROFILE_GRID\n",
+                        json_path.c_str(),
+                        linear_fixed64 ? 1 : 0, metadata_has_x64 ? 1 : 0,
+                        measured_x64[0] ? 1 : 0,
+                        measured_x64[1] ? 1 : 0,
+                        measured_x64[2] ? 1 : 0,
+                        measured_phone_x64_kv2048 ? 1 : 0);
                     return false;
+                }
+                if (fixed64_legacy_compatible &&
+                        !cached_new && !cached_legacy) {
+                    LLAMA_LOG_ERROR(
+                        "[INDEPENDENT_PROFILE] event=LEGACY_FIXED64_REUSE"
+                        " policy=NO_DAG_ONLY"
+                        " x64=C_G_N_MEASURED n64_kv2048=MEASURED"
+                        " full_grid=NOT_REQUIRED sampling=SKIPPED"
+                        " status=READY\n");
                 }
                 if (cached_legacy) {
                     LLAMA_LOG_INFO(

@@ -8,6 +8,7 @@
 - 物理约束仍包括 GPU 两个 Bank 的峰值、GPU KV/图缓冲、Phone 实际可用 RAM、HTP Session 映射与共享预算以及 PC RAM。运行阶段保留 GPU 双 Bank 异步搬运、Drain-First、多轮 Cycle、Phone HTP。
 - 选层时环境变量 LLAMA_REGION_RING_NO_DAG_PLANNER=1；必须处于 APPLY_WIDE + HTP-only + Streaming + Guarded-memory 模式。不可搭配 skip-plan-memory-checks。
 - 第一条最长 Prompt 只负责产生并验证 Placement；Server 常驻后仍锁定该 Placement 执行相同 50 条。
+- 旧 Profile 的 chunk_widths 可以不是新版完整网格，但只有本消融显式启用时才允许复用；要求 CSV 实测 CPU/GPU/PHONE X64 + Phone X64/KV2048，JSON 标记了 X64。正常动态 Chunk 实验继续严格检查全部网格；不伪造 Profile 元数据、不重新采样。
 
 ## 更新与测试
 
@@ -28,6 +29,8 @@ if ($LASTEXITCODE -ne 0) { throw "C++ build failed" }
 ~~~
 
 ## Step 1：复用旧 Profile + 线性评分重新生成 Placement
+
+以前由于旧采样网格不同触发 CACHE_CHUNK_GRID_MISMATCH；现在严格检查实际 X64 采样是否存在，合格才允许复用。源数据不修改。旧失败目录的 run-config.json 绑定了旧可执行文件哈希，因此重新编译后必须使用下面全新的 `--out` 目录，不能在旧目录里复跑。
 
 沿用旧的 Full Cycle 独立 Profile，不重新采样，不使用本次重新采集的 32b-profile-fresh-v2。
 不要传入 locked-layout 或 main50-short；它们会阻止重新选层。
@@ -50,7 +53,7 @@ Write-Host "[OLD_PROFILE] $oldProfile"
 $model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
 $rpc = "10.238.229.239:50052"
 $data = "E:\llama\datasets\sharegpt\sharegpt50_short"
-$planOut = "$root\32b-wo-queue-sim-plan64-old-profile"
+$planOut = "$root\32b-wo-queue-sim-plan64-old-profile-compat-v2"
 
 $planOpts = @(
     "--exe", "$root\build-tensor-v2\bin\Release\llama-completion.exe",
@@ -84,7 +87,7 @@ Write-Host "[NO_DAG_SELECTED_LAYOUT] $linearLayout"
 ## Step 2：常驻 Server，固定 64 执行 50 条
 
 ~~~powershell
-$serverOut = "$root\32b-wo-queue-sim-fixed64-all50-old-profile"
+$serverOut = "$root\32b-wo-queue-sim-fixed64-all50-old-profile-compat-v2"
 $serverOpts5 = @(
     "--server-exe", "$root\build-tensor-v2\bin\Release\llama-server.exe",
     "--model", $model, "--model-layers", "64",
@@ -99,7 +102,7 @@ $serverOpts5 = @(
 )
 
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts5 `
-    --out "$root\32b-wo-queue-sim-fixed64-smoke-old-profile" --limit 2
+    --out "$root\32b-wo-queue-sim-fixed64-smoke-old-profile-compat-v2" --limit 2
 if ($LASTEXITCODE -ne 0) { throw "No-DAG smoke failed" }
 
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @serverOpts5 `

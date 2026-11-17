@@ -839,7 +839,10 @@ def main(argv=None):
             raise RuntimeError("Port already in use: " + str(args.port))
 
     source = args.profile_source / "profile.csv"
-    runner.verify_independent_profile(source, short_chunks=True)
+    runner.verify_independent_profile(
+        source,
+        short_chunks=not args.no_dag_placement,
+        fixed_chunk=64 if args.no_dag_placement else None)
     anchor = args.prompt_dir / "prompt_1024_10.txt"
     manifest = runner.read_manifest(args.prompt_dir)
     if anchor.name not in manifest:
@@ -885,6 +888,10 @@ def main(argv=None):
         "--threads", str(args.threads), "--min-context", "256",
         "--max-context", "2048", "--context-padding", "0",
     ])
+    if args.no_dag_placement:
+        # Fixed X64 does not need the 16/24 short-Chunk adaptive grid.
+        # Keep the strict grid for all ordinary/replay Planner modes.
+        fake_args.locked_short_chunks = False
     if not args.guarded_memory_checks:
         fake_args.skip_plan_memory_checks = True
     command = server_command(args.server_exe, args.model, args.rpc,
@@ -910,7 +917,11 @@ def main(argv=None):
         None if args.guarded_memory_checks else "1")
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
-    assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
+    if args.no_dag_placement:
+        assert "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS" not in env
+        assert "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS" not in env
+    else:
+        assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
     if args.no_drain_first:
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "0"
     if args.no_async_prefetch:

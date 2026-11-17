@@ -1282,7 +1282,7 @@ def require_long_htp_kv_anchors(path: Path, required=LONG_HTP_KV_ANCHORS):
 
 
 def verify_independent_profile(path: Path, required_kvs=(),
-                               short_chunks=False) -> int:
+                               short_chunks=False, fixed_chunk=None) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
     A rolling epoch CSV is not a standalone Profile; validate the native
@@ -1311,6 +1311,33 @@ def verify_independent_profile(path: Path, required_kvs=(),
             len(metadata.get("stage_points", [])) != len(points)):
         raise ValueError(f"Independent profile.json does not match Stage CSV: "
                          f"{json_path}")
+    if fixed_chunk is not None:
+        # The linear no-DAG selection uses only X=64. A legacy independent
+        # Profile need not include the later adaptive 16/24/192/256 grid,
+        # but all scored backend service points must actually exist.
+        if fixed_chunk != 64 or fixed_chunk not in metadata.get(
+                "chunk_widths", ()):
+            raise ValueError(
+                f"Fixed-64 no-DAG run requires X64 in independent Profile: "
+                f"{json_path}")
+        for backend in ("CPU", "GPU", "PHONE"):
+            if not any(p.get("device") == backend and
+                       int(p.get("tokens") or 0) == 64 and
+                       math.isfinite(float(p.get("compute_ms") or 0.0)) and
+                       float(p.get("compute_ms") or 0.0) > 0.0
+                       for p in points):
+                raise ValueError(
+                    f"Fixed-64 no-DAG Profile lacks measured {backend}"
+                    f" X64 compute point: {path}")
+        if not any(p.get("device") == "PHONE" and
+                   int(p.get("tokens") or 0) == 64 and
+                   int(p.get("kv_tokens") or 0) == 2048 and
+                   math.isfinite(float(p.get("compute_ms") or 0.0)) and
+                   float(p.get("compute_ms") or 0.0) > 0.0
+                   for p in points):
+            raise ValueError(
+                f"Fixed-64 no-DAG Profile lacks measured HTP"
+                f" X64 KV=2048: {path}")
     if short_chunks:
         widths = tuple(metadata.get("chunk_widths", ()))
         if widths not in (SHORT_PROFILE_CHUNKS, LEGACY_SHORT_PROFILE_CHUNKS):

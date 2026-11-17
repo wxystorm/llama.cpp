@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline tests for the persistent HTP-only llama-server smoke harness."""
 from io import BytesIO
+import csv
 from pathlib import Path
 from types import SimpleNamespace
 import json
@@ -14,6 +15,64 @@ import probe_htp_llama_server as probe
 
 
 class ServerProbeTests(unittest.TestCase):
+    def test_legacy_fixed64_no_dag_profile_accepts_only_real_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "profile.csv"
+            names = ("device", "layers", "tokens", "kv_tokens",
+                     "setup_ms", "upload_ms", "prepare_ms",
+                     "compute_ms", "terminal", "samples")
+            rows = [
+                dict(zip(names, (dev, 2, 64, kv, 1, 0, 2, 3, 0, 5)))
+                for dev, kv in (("CPU", 1024), ("GPU", 1024),
+                                ("PHONE", 2048))
+            ]
+            metadata = {
+                "schema": 1, "mode": "INDEPENDENT_BACKEND_PROFILE",
+                "model": {"layers": 64, "hidden": 5120},
+                "chunk_widths": [32, 64, 96, 128],
+                "backends": {"G": "CUDA", "C": "CPU", "N": "HTP_STRIPED"},
+                "stage_points": [],
+                "transfers": {
+                    "pc_to_phone": [{"bytes": 4096, "ms": 1.1}],
+                    "phone_to_pc": [{"bytes": 4096, "ms": 1.2}],
+                    "gpu_weight_h2d": [{"bytes": 4096, "ms": 1.3}],
+                },
+            }
+
+            def save():
+                with csv_path.open("w", newline="", encoding="utf-8") as fp:
+                    w = csv.DictWriter(fp, fieldnames=names)
+                    w.writeheader()
+                    w.writerows(rows)
+                metadata["stage_points"] = [dict(row) for row in rows]
+                csv_path.with_suffix(".json").write_text(
+                    json.dumps(metadata), encoding="utf-8")
+
+            save()
+            self.assertEqual(
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64), 1)
+            with self.assertRaisesRegex(ValueError, "Short Chunk run"):
+                probe.runner.verify_independent_profile(
+                    csv_path, short_chunks=True)
+            metadata["chunk_widths"].remove(64)
+            save()
+            with self.assertRaisesRegex(ValueError, "requires X64"):
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64)
+            metadata["chunk_widths"].append(64)
+            rows[2]["kv_tokens"] = 1024
+            save()
+            with self.assertRaisesRegex(ValueError, "KV=2048"):
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64)
+            rows[2]["kv_tokens"] = 2048
+            rows[1]["tokens"] = 128
+            save()
+            with self.assertRaisesRegex(ValueError, "GPU X64"):
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64)
+
     def test_command_disables_cache_parallelism_and_warmup(self):
         cmd = probe.server_command(
             "llama-server.exe", "model.gguf", "127.0.0.1:50052",
