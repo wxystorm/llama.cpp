@@ -11,6 +11,7 @@
 #include "ggml-backend.h"
 
 #include "profiler.h"
+#include "../ggml/src/prima-fig3-trace.h"
 #include "network-utils.h"
 
 #ifdef GGML_USE_RPC
@@ -17927,6 +17928,7 @@ struct sync_meta {
 };
 
 static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, bool align_seq_ids = false) {
+    prima_fig3::scope fig3_io("Coordination", "ZMQ_SEND_META");
     GGML_ASSERT(meta != nullptr);
     try {
         std::vector<zmq::message_t> send_msgs;
@@ -17977,6 +17979,7 @@ static void llama_send_meta(zmq::socket_t & socket, struct sync_meta * meta, boo
 }
 
 static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
+    prima_fig3::scope fig3_io("Coordination", "ZMQ_RECV_META");
     socket.set(zmq::sockopt::rcvtimeo, 1000);
 
     std::vector<zmq::message_t> recv_msgs;
@@ -18088,6 +18091,7 @@ static int llama_recv_meta(zmq::socket_t & socket, struct sync_meta * meta) {
 }
 
 static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, struct input_tensors * tensors) {
+    prima_fig3::scope fig3_io("Coordination", "ZMQ_SEND_TENSORS");
     try {
         std::vector<zmq::message_t> send_msgs;
         size_t buf_size = 0;
@@ -18111,6 +18115,7 @@ static void llama_send_tensors(zmq::socket_t & socket, struct llama_ubatch * uba
 }
 
 static void llama_recv_tensors(zmq::socket_t & socket, struct llama_ubatch * ubatch, const bool is_out_embd=false) {
+    prima_fig3::scope fig3_io("Coordination", "ZMQ_RECV_TENSORS");
     std::vector<zmq::message_t> recv_msgs;
     if (!zmq::recv_multipart(socket, std::back_inserter(recv_msgs))) {
         LLAMA_LOG_INFO("Failed to receive tensor data.\n");
@@ -18516,7 +18521,9 @@ static int llama_decode_internal(
             ggml_backend_sched_set_eval_callback(lctx.sched[i], lctx.cparams.cb_eval, lctx.cparams.cb_eval_user_data);
         }
 
+        const int64_t fig3_build_begin = prima_fig3::enabled() ? prima_fig3::now_ns() : 0;
         std::vector<ggml_cgraph *> gf = llama_build_graph(lctx, ubatch, false);
+        if (fig3_build_begin) prima_fig3::record("Host Prepare", "GRAPH_BUILD", fig3_build_begin, prima_fig3::now_ns());
 
         // the output is always the last tensor in the graph
         struct ggml_tensor * res        = nullptr;
@@ -18581,6 +18588,7 @@ static int llama_decode_internal(
 
             {   // compute graph
                 timer(llama_graph_compute);
+                prima_fig3::scope fig3_graph("Host Prepare", "GRAPH_SUBMIT");
                 llama_graph_compute(lctx, sub_gf, lctx.sched[i], n_threads, threadpool); 
             }
 
@@ -18611,8 +18619,11 @@ static int llama_decode_internal(
             ggml_backend_t backend  = ggml_backend_sched_get_tensor_backend(lctx.sched[i], sub_gf_out);
             GGML_ASSERT(buf_size <= ggml_nbytes(sub_gf_out));
             GGML_ASSERT(backend  != nullptr);
+            const int64_t fig3_readback_begin = prima_fig3::enabled() ? prima_fig3::now_ns() : 0;
             ggml_backend_tensor_get_async(backend, sub_gf_out, embd_buf, 0, buf_size);
             ggml_backend_sched_synchronize(lctx.sched[i]);
+            if (fig3_readback_begin) prima_fig3::record("Host Transfer", "READBACK_AND_SYNC",
+                fig3_readback_begin, prima_fig3::now_ns(), static_cast<int64_t>(buf_size));
 
             // send the result to the next node or the master
             if (!(n_world == 1 || (my_rank == 0 && is_last_l))) {
@@ -18625,7 +18636,8 @@ static int llama_decode_internal(
             // overlap memory scheduling with other nodes' communication and computing
             if (cparams.prefetch && n_world > 1) {
                 timer(manage_graph_tensors);
-                
+                prima_fig3::scope fig3_prefetch("Prefetch", "MADVISE");
+
                 int next_gf_id = (i + 1) % gf.size();
                 manage_graph_tensors(gf[next_gf_id], POSIX_MADV_WILLNEED, cparams.force);
                 if (my_rank == 0 && (is_last_l || (next_gf_id == (int)gf.size() - 1))) {
