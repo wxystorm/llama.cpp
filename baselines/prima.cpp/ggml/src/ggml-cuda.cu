@@ -68,6 +68,7 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 struct prima_fig3_cuda_event {
     cudaEvent_t begin;
     cudaEvent_t end;
+    cudaStream_t stream;
     int device;
     const char * category;
     const char * kind;
@@ -96,7 +97,7 @@ static void prima_fig3_cuda_end(cudaStream_t stream, cudaEvent_t begin,
     CUDA_CHECK(cudaEventRecord(end, stream));
     std::lock_guard<std::mutex> guard(prima_fig3_cuda_lock);
     prima_fig3_cuda_pending.push_back(
-        {begin, end, device, category, kind, bytes, prima_fig3::now_ns()});
+        {begin, end, stream, device, category, kind, bytes, prima_fig3::now_ns()});
 }
 static void prima_fig3_cuda_flush(int device) {
     if (!prima_fig3::enabled()) return;
@@ -106,11 +107,17 @@ static void prima_fig3_cuda_flush(int device) {
         std::lock_guard<std::mutex> guard(prima_fig3_cuda_lock);
         auto it = prima_fig3_cuda_pending.begin();
         while (it != prima_fig3_cuda_pending.end()) {
-            if (it->device == device) {
+            // Other streams can still have pending GPU work. Do not
+            // consume or destroy their events before completion.
+            const cudaError_t ready = it->device == device ?
+                cudaEventQuery(it->end) : cudaErrorNotReady;
+            if (ready == cudaSuccess) {
                 finished.push_back(*it);
                 it = prima_fig3_cuda_pending.erase(it);
-            } else {
+            } else if (ready == cudaErrorNotReady) {
                 ++it;
+            } else {
+                CUDA_CHECK(ready);
             }
         }
     }
