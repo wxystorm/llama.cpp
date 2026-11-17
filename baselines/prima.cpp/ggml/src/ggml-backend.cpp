@@ -9,6 +9,7 @@
 #endif
 
 #include "ggml-backend-impl.h"
+#include "prima-fig3-trace.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -933,6 +934,8 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    prima_fig3::scope fig3_cpu(prima_fig3::rank() == 1 ? "Phone Compute" : "CPU Compute",
+                              "CPU_GRAPH", 0, "native_cpu");
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads, cpu_ctx->threadpool);
