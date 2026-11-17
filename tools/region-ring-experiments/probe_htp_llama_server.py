@@ -106,6 +106,8 @@ def parse_args(argv=None):
                    help="retain a previously selected no-DAG placement, then score dynamic XC/XG/XP per request using linear/no-DAG costs")
     p.add_argument("--guarded-memory-checks", action="store_true",
                    help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
+    p.add_argument("--skip-plan-memory-checks", action="store_true",
+                   help="no-DAG locked-layout only: explicitly skip planner ESTIMATED memory checks; CUDA/HTP runtime allocations remain active")
     p.add_argument("--fixed-chunk", type=int, choices=(64, 128), default=None,
                    help="Planner ablation: fixed XC=XG=XP to 64 or 128; requests shorter than the target run whole as one Chunk, retaining async double-bank streaming")
     p.add_argument("--max-plan-xg", type=int, default=256,
@@ -165,14 +167,19 @@ def parse_args(argv=None):
         if args.model_layers != 64 or (
                 args.locked_layout != DEFAULT_CANONICAL_LAYOUT):
             p.error("--fixed-chunk requires the 32B Full Cycle locked layout")
+    if args.guarded_memory_checks and args.skip_plan_memory_checks:
+        p.error("--guarded-memory-checks conflicts with --skip-plan-memory-checks")
+    if args.skip_plan_memory_checks and not args.no_dag_placement:
+        p.error("--skip-plan-memory-checks is only supported for --no-dag-placement")
     if args.no_dag_placement:
         if (not args.all50 or not args.per_request_chunks or
                 args.fixed_chunk is not None or
-                not args.guarded_memory_checks or
+                not (args.guarded_memory_checks or
+                     args.skip_plan_memory_checks) or
                 not args.locked_layout.split(",")[-1].startswith("G") or
                 args.no_multi_cycle or args.no_async_prefetch or
                 args.no_drain_first or args.replay_chunks_from is not None):
-            p.error("--no-dag-placement requires --all50, --per-request-chunks, --guarded-memory-checks, GPU-tail layout, no --fixed-chunk and no other ablation")
+            p.error("--no-dag-placement requires --all50, --per-request-chunks, GPU-tail layout, and exactly one of --guarded-memory-checks or --skip-plan-memory-checks; no --fixed-chunk or other ablation")
     if sum((args.no_drain_first, args.no_async_prefetch,
             args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
@@ -577,6 +584,9 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["chunk_policy"] = "NATIVE_PER_REQUEST_LINEAR_NO_DAG_CHUNK_SEARCH"
         base["placement_policy"] = "IMMUTABLE_NO_DAG_SELECTED_LAYOUT"
         base["score_policy"] = "LINEAR_SUM_NO_QUEUE"
+        base["planner_memory_policy"] = (
+            "SKIP_ESTIMATES_ONLY" if args.skip_plan_memory_checks
+            else "GUARDED")
     if getattr(args, "fixed_chunk", None) is not None:
         base["planner_ablation"] = f"WO_DYNAMIC_CHUNK_FIXED_{args.fixed_chunk}"
         base["fixed_chunk_tokens"] = args.fixed_chunk
@@ -903,7 +913,9 @@ def main(argv=None):
         # The native engine rejects this if the GGUF is not ACTUALLY mmap'd.
         # GPU dual-Bank, CUDA scratch, Phone RAM and HTP session guards stay on.
         fake_args.pc_mmap_budget = True
-    if not args.guarded_memory_checks:
+    if args.skip_plan_memory_checks or not args.guarded_memory_checks:
+        # Under --no-dag-placement this is an EXPLICIT opt-in; other
+        # ablations retain their historical guarded-memory flag behavior.
         fake_args.skip_plan_memory_checks = True
     command = server_command(args.server_exe, args.model, args.rpc,
                              args.port, args.threads)
@@ -995,7 +1007,9 @@ def main(argv=None):
         print("[SERVER_PLANNER_ABLATION] mode=WO_QUEUEING_SIMULATION"
               " score=LINEAR_SUM_NO_QUEUE"
               " chunks=ADAPTIVE_XC_XG_XP_PER_REQUEST"
-              " startup_memory_checks=GUARDED"
+              " startup_memory_checks=" +
+              ("ESTIMATES_SKIPPED" if args.skip_plan_memory_checks
+               else "GUARDED") +
               " pc_memory=MMAP_WINDOWED_VERIFIED"
               " placement=IMMUTABLE_PRESELECTED_NO_DAG"
               " runtime=FULL_CYCLE", flush=True)
@@ -1086,11 +1100,13 @@ def main(argv=None):
                     not re.search(
                         r"\[REGION_RING_PLAN_LOCK\] status=PASS"
                         r" source=LINEAR_NO_DAG_CHUNK_ONLY [^\n]*"
-                        r"memory_policy=GUARDED", startup)):
+                        + "memory_policy=" +
+                        ("SKIPPED" if args.skip_plan_memory_checks
+                         else "GUARDED"), startup)):
                     raise RuntimeError(
                         "No-DAG model startup did not confirm adaptive linear"
-                        " scoring with guarded locked placement; check "
-                        + str(log_path))
+                        " scoring with the selected locked-placement memory"
+                        " policy; check " + str(log_path))
             print("[SERVER_PROBE] health=READY model=RESIDENT", flush=True)
             open_mode = "a" if args.all50 and args.resume else "w"
             with metrics_path.open(open_mode, encoding="utf-8") as output:
