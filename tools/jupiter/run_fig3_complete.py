@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import struct
+import time
 import statistics
 import subprocess
 import sys
@@ -68,6 +70,50 @@ def parser():
     p.add_argument("--skip-scp",action="store_true")
     p.add_argument("--clock-limit-ms",type=float,default=20.0)
     return p
+
+
+def phone_profile_preflight(host: str, port: int, run_id: str):
+    """Verify NEW RPC opcodes and writable Phone CSV *before* any inference.
+
+    Match Jupiter rpc_msg_hello_req: 24 connection-capability bytes, all 0
+    to disable negotiated compression for this one short probe connection.
+    Appending TAG=21 and CLOCK=22 preserves legacy command numbering.
+    """
+    def exact(sock, n):
+        buf=bytearray()
+        while len(buf)<n:
+            chunk=sock.recv(n-len(buf))
+            if not chunk: raise RuntimeError("Phone closed Fig3 probe connection")
+            buf.extend(chunk)
+        return bytes(buf)
+    def response(sock, expected):
+        (size,)=struct.unpack("<Q",exact(sock,8))
+        if size!=expected:
+            raise RuntimeError(f"Phone Fig3 protocol response size={size}, expected={expected}")
+        return exact(sock,expected)
+    with socket.create_connection((host,port),timeout=6) as conn:
+        conn.settimeout(8)
+        conn.sendall(struct.pack("<BQ",14,24)+bytes(24))
+        hello=response(conn,28)
+        if hello[0]==0:
+            raise RuntimeError("Invalid RPC HELLO version")
+        payload=run_id.encode("ascii")
+        if not payload or len(payload)>=96:
+            raise ValueError("run_id must be an ASCII nonempty value <96 bytes")
+        conn.sendall(struct.pack("<BQ",21,96)+payload.ljust(96,b"\x00"))
+        ack=response(conn,1)
+        if ack!=b"\x01":
+            raise RuntimeError("Phone server did not acknowledge writable Fig3 CSV. Rebuild Phone RPC and export LLAMA_JUPITER_FIG3_PHONE_FILE.")
+        bounds=[]
+        for _ in range(8):
+            t0=time.monotonic_ns()
+            conn.sendall(struct.pack("<BQ",22,0))
+            p0,p1=struct.unpack("<qq",response(conn,16))
+            t3=time.monotonic_ns()
+            if p1<p0 or t3<=t0: raise RuntimeError("Invalid Phone clock samples")
+            bounds.append(max(0,(t3-t0-(p1-p0))/2)/1e6)
+        print(f"[JUPITER_FIG3_PREFLIGHT] PASS: Phone Fig3 RPC run tag + "
+              f"8 clock samples; best uncertainty={min(bounds):.3f} ms",flush=True)
 
 
 def identity(path: Path):
@@ -306,6 +352,9 @@ def main():
     except OSError as ex:
         raise RuntimeError(f"Phone RPC unreachable BEFORE model run: {ex}") from ex
     print("[JUPITER_FIG3] RPC TCP reachable",flush=True)
+    # Real protocol preflight catches wrong Phone binary or missing Phone
+    # profiler environment without spending a single minute on inference.
+    phone_profile_preflight(host,port,manifest["run_id"])
     if not manifest.get("profile"):
         # Run the profiled trial first: an old/uninstrumented Phone server
         # is rejected by the tag/clock handshake before doing a full Prefill.
