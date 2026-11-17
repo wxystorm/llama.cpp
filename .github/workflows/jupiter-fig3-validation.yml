@@ -1,0 +1,25 @@
+name: Jupiter Fig3 telemetry validation
+on:
+  push:
+    branches: [exp/jupiter-fig3-full-trace-20261118]
+  workflow_dispatch:
+jobs:
+  fig3-python-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: End-to-end synthetic Fig3 data validation
+        run: python tools/jupiter/test_fig3_complete.py
+      - name: Python syntax validation
+        run: python -m py_compile tools/jupiter/build_fig3_complete.py tools/jupiter/run_fig3_complete.py tools/jupiter/test_fig3_complete.py
+  fig3-rpc-cpu-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure CPU and Jupiter RPC (no UI, no CUDA hardware)
+        run: cmake -S . -B build-fig3-check -DGGML_CUDA=OFF -DGGML_RPC=ON -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_UI_GZIP=OFF -DLLAMA_BUILD_TESTS=OFF
+      - name: Compile PC logic and Phone RPC server for protocol verification
+        run: cmake --build build-fig3-check --target llama-cli ggml-rpc-server --parallel 3
