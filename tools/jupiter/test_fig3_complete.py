@@ -4,6 +4,11 @@ import csv
 import subprocess
 import sys
 import tempfile
+import socket
+import struct
+import threading
+import time
+import run_fig3_complete as runner
 from pathlib import Path
 
 
@@ -13,6 +18,46 @@ def csv_file(p,header,rows):
         w=csv.writer(f)
         w.writerow(header)
         w.writerows(rows)
+
+
+def test_new_rpc_protocol():
+    """Verify uncompressed HELLO, TAG and CLOCK exactly without a Phone."""
+    errors=[]
+    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1",0))
+        listener.listen(1)
+        port=listener.getsockname()[1]
+        def serve():
+            try:
+                with listener.accept()[0] as conn:
+                    def exact(n):
+                        data=b""
+                        while len(data)<n:
+                            more=conn.recv(n-len(data))
+                            if not more: raise RuntimeError("test peer closed")
+                            data+=more
+                        return data
+                    def request(cmd,size):
+                        got,got_size=struct.unpack("<BQ",exact(9))
+                        assert (got,got_size)==(cmd,size), (got,got_size)
+                        return exact(got_size) if got_size else b""
+                    assert request(14,24)==bytes(24)
+                    conn.sendall(struct.pack("<Q",28)+bytes((1,0,0,0))+bytes(24))
+                    tag=request(21,96)
+                    assert tag.startswith(b"fixture-run")
+                    conn.sendall(struct.pack("<Q",1)+b"\x01")
+                    for _ in range(8):
+                        request(22,0)
+                        now=time.monotonic_ns()
+                        conn.sendall(struct.pack("<Qqq",16,now,now+1000))
+            except Exception as exc:
+                errors.append(exc)
+        thread=threading.Thread(target=serve,daemon=True)
+        thread.start()
+        runner.phone_profile_preflight("127.0.0.1",port,"fixture-run")
+        thread.join(timeout=5)
+        assert not errors, errors
+        assert not thread.is_alive()
 
 
 def main():
@@ -73,7 +118,8 @@ def main():
         fail=subprocess.run(cmd,capture_output=True,text=True)
         assert fail.returncode!=0
         assert "pc_cuda_events.csv" in fail.stderr
-        print("[JUPITER_FIG3_TEST] PASS: 8 clock samples, native phone run ID, GPU/CPU/PCIe/RPC, chunks, 100% coverage, strict missing-source rejection")
+        test_new_rpc_protocol()
+        print("[JUPITER_FIG3_TEST] PASS: 8 clock samples, native phone run ID, GPU/CPU/PCIe/RPC, chunks, 100% coverage, strict missing-source rejection, real HELLO/TAG/CLOCK packet protocol")
 
 
 if __name__=="__main__":
