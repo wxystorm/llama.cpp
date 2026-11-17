@@ -704,12 +704,14 @@ int main(int argc, char ** argv) {
                     LOG_DBG("saved session to %s\n", path_session.c_str());
                 }
 
+                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
+                // Sampling materializes the pending logits. Recording the
+                // boundary BEFORE this call can exclude asynchronous GPU work.
                 if (prima_fig3_prefill_begin_ns && !prima_fig3_prefill_closed) {
                     const int64_t end_ns = prima_fig3::now_ns();
                     prima_fig3::record("Boundary", "PREFILL", prima_fig3_prefill_begin_ns, end_ns, n_past);
                     prima_fig3_prefill_closed = true;
                 }
-                const llama_token id = gpt_sampler_sample(smpl, ctx, -1);
 
                 gpt_sampler_accept(smpl, id, /* accept_grammar= */ true);
 
