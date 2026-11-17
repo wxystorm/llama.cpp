@@ -95,13 +95,13 @@ def parse_args(argv=None):
     p.add_argument("--per-request-chunks", action="store_true",
                    help="call native locked XC/XG/XP Planner on each real HTTP prefill")
     p.add_argument("--replay-chunks-from", type=Path, default=None,
-                   help="baseline requests.jsonl containing 50 per-Prompt XC/XG/XP plans")
+                   help="baseline requests.jsonl for FIFO/sync-prefetch ablations; incompatible with G-P-G dynamic Chunk search")
     p.add_argument("--no-drain-first", action="store_true",
                    help="Runtime ablation: use resource-aware FIFO, not Drain-First")
     p.add_argument("--no-async-prefetch", action="store_true",
                    help="Runtime ablation: retain both GPU banks but load later weights synchronously on demand")
     p.add_argument("--no-multi-cycle", action="store_true",
-                   help="Runtime ablation: logical G36,P21,G7; six GPU Bank windows, async prefetch and Drain-First remain on")
+                   help="Runtime ablation: lock G36,P21,G7; each Prompt runs native Planner XC/XG/XP search (no replay); keep six GPU Bank windows, async prefetch and Drain-First")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -145,8 +145,10 @@ def parse_args(argv=None):
         p.error("--no-drain-first requires recorded per-Prompt Chunk replay")
     if args.no_async_prefetch and args.replay_chunks_from is None:
         p.error("--no-async-prefetch requires recorded per-Prompt Chunk replay")
-    if args.no_multi_cycle and args.replay_chunks_from is None:
-        p.error("--no-multi-cycle requires recorded per-Prompt Chunk replay")
+    if args.no_multi_cycle and args.replay_chunks_from is not None:
+        p.error("--no-multi-cycle must choose native XC/XG/XP for each Prompt; remove --replay-chunks-from")
+    if args.no_multi_cycle and (not args.all50 or not args.per_request_chunks):
+        p.error("--no-multi-cycle requires --all50 --per-request-chunks")
     if sum((args.no_drain_first, args.no_async_prefetch,
             args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
@@ -502,6 +504,7 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["runtime_ablation"] = "WO_MULTI_CYCLE_GPG"
         base["logical_layout"] = GPG_LOGICAL_LAYOUT
         base["physical_layout"] = GPG_PHYSICAL_LAYOUT
+        base["chunk_policy"] = "NATIVE_PER_REQUEST_LOCKED_CHUNK_SEARCH_APPLIED"
     encoded = json.dumps(
         base, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")
@@ -858,16 +861,30 @@ def main(argv=None):
     if reference_chunks is not None:
         env["LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE"] = str(
             args.out / "request-chunk-replay.txt")
+    else:
+        # G-P-G and other native modes must not inherit a previous replay
+        # sidecar. Otherwise the C++ request hook scores but does NOT
+        # execute its own dynamically selected Chunk Plan.
+        env.pop("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE", None)
     if args.per_request_chunks:
         env["LLAMA_REGION_RING_PER_REQUEST_CHUNKS"] = "1"
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
-    if reference_chunks is not None:
+    if args.no_multi_cycle:
+        print("[SERVER_ABLATION] mode=WO_MULTI_CYCLE_GPG"
+              " logical=" + GPG_LOGICAL_LAYOUT +
+              " physical=" + GPG_PHYSICAL_LAYOUT +
+              " prompts=50 replay=OFF"
+              " native_chunk_search=PER_REQUEST_SCORED_AND_APPLIED"
+              " layer_placement=IMMUTABLE"
+              " bank_refill=ASYNC_DOUBLE_BANK"
+              " drain_first=ON runtime_allocators=UNCHANGED",
+              flush=True)
+    elif reference_chunks is not None:
         print("[SERVER_ABLATION] mode=" +
               ("WO_DRAIN_FIRST" if args.no_drain_first else
                "WO_ASYNC_PREFETCH" if args.no_async_prefetch else
-               "WO_MULTI_CYCLE_GPG" if args.no_multi_cycle else
                "FULL_CYCLE_REPLAY") +
               " source=" + str(args.replay_chunks_from) +
               " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
@@ -875,8 +892,6 @@ def main(argv=None):
               " bank_refill=" +
               ("STRICT_SYNC_DEMAND_WHEN_SELECTED"
                if args.no_async_prefetch else "ASYNC_DOUBLE_BANK") +
-              (" logical=G36,P21,G7 physical=" + GPG_PHYSICAL_LAYOUT
-               if args.no_multi_cycle else "") +
               " runtime_allocators=UNCHANGED",
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
@@ -979,7 +994,8 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
-                            "REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
+                            "GPG_PER_REQUEST_NATIVE" if args.no_multi_cycle
+                            else "REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
                             else "PER_REQUEST_LOCKED" if args.per_request_chunks
                             else "STARTUP_ONLY"),
                         "runtime_layout": (
