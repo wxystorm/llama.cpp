@@ -971,12 +971,16 @@ def main(argv=None):
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
-          ("PER_REQUEST_REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
+          ("FIXED_128_SINGLE_CHUNK_IF_SHORT" if args.fixed_chunk is not None
+           else "PER_REQUEST_REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
            else "PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH"
            if args.per_request_chunks
            else "ONE_STARTUP_PLAN NOT_PER_REQUEST_CHUNK_SEARCH") +
           " layout=" + env["LLAMA_HYBRID_REGION_RING_LOCKED_LAYOUT"], flush=True)
-    print(f"[SERVER_PROBE] chunk=XG_MAX{args.max_plan_xg}_XP_MAX{args.max_plan_xp} min16_short_min32_long"
+    print(("[SERVER_PROBE] chunk=FIXED_128 short_prompt=UNSPLIT"
+           " one_chunk_async_mover=FORCED"
+           if args.fixed_chunk is not None else
+           f"[SERVER_PROBE] chunk=XG_MAX{args.max_plan_xg}_XP_MAX{args.max_plan_xp} min16_short_min32_long") +
           " kv_cache=DISABLED parallel=1 no_cont_batch=1"
           " memory_estimates=SKIPPED allocators=UNCHANGED", flush=True)
     print("[SERVER_PROBE] command=" + subprocess.list2cmdline(command), flush=True)
