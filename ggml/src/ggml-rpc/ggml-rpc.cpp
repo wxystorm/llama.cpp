@@ -3728,6 +3728,36 @@ static void rpc_serve_client(rpc_server & server,
                 }
                 break;
             }
+            case RPC_CMD_JUPITER_FIG3_TAG: {
+                rpc_msg_jupiter_fig3_tag_req request {};
+                if (!recv_msg(sock, &request, sizeof(request))) return;
+                request.run_id[sizeof(request.run_id)-1] = '\0';
+                std::string run_id(request.run_id);
+                for (auto & ch : run_id) {
+                    if (!((ch>='a'&&ch<='z')||(ch>='A'&&ch<='Z')||
+                          (ch>='0'&&ch<='9')||ch=='_'||ch=='-'||ch=='.')) ch='_';
+                }
+                rpc_msg_jupiter_fig3_tag_rsp response {};
+                if (!run_id.empty() && jupiter_fig3::phone_enabled() &&
+                    jupiter_fig3::append_file(
+                        std::getenv("LLAMA_JUPITER_FIG3_PHONE_FILE"),
+                        "run_id,category,start_phone_ns,end_phone_ns,device,graph_uid,nodes",
+                        "")) {
+                    { std::lock_guard<std::mutex> guard(g_jupiter_fig3_phone_mutex);
+                      g_jupiter_fig3_phone_run_id = run_id; }
+                    response.phone_instrumented = 1;
+                }
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
+            case RPC_CMD_JUPITER_FIG3_CLOCK: {
+                if (!recv_msg(sock, nullptr, 0)) return;
+                rpc_msg_jupiter_fig3_clock_rsp response {};
+                response.recv_phone_ns = jupiter_fig3::ns();
+                response.send_phone_ns = jupiter_fig3::ns();
+                if (!send_msg(sock, &response, sizeof(response))) return;
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
