@@ -179,6 +179,49 @@ public:
         return false;
     }
 
+    // w/o Multi-Cycle G-P-G: the P21 Phone-owned Region is executed by
+    // sequential HTP layer subplans. A 21-layer graph was NOT measured,
+    // and estimate() intentionally forbids unrestricted depth extrapolation.
+    // Sum actual calibrated smaller-region costs (e.g. 6+6+6+3), preserving
+    // the SAME token and padded-KV probes for each block. This is only
+    // called by the explicit G-P-G ablation; ordinary Profile behavior and
+    // its depth-extrapolation guard stay unchanged.
+    bool estimate_phone_serial_blocks(
+            int layers, int tokens, int kv_tokens, bool terminal,
+            real_stage_phase phase, double & result) const {
+        if (layers <= 0 || tokens <= 0 || kv_tokens < tokens) {
+            return false;
+        }
+        int max_measured_depth = 0;
+        for (const auto & p : points_) {
+            if (p.dev == device::PHONE && p.terminal == terminal &&
+                    (phase != real_stage_phase::SETUP || p.setup_ms > 0.0)) {
+                max_measured_depth = std::max(max_measured_depth, p.layers);
+            }
+        }
+        if (max_measured_depth <= 0) {
+            return false;
+        }
+        double total = 0.0;
+        int remaining = layers;
+        while (remaining > 0) {
+            const int block_layers = std::min(
+                remaining, max_measured_depth);
+            double block_ms = 0.0;
+            if (!estimate(
+                    device::PHONE, block_layers, tokens, kv_tokens,
+                    terminal, phase, block_ms) ||
+                    !std::isfinite(block_ms) || block_ms < 0.0 ||
+                    total > std::numeric_limits<double>::max() - block_ms) {
+                return false;  // no fabricated missing KV/Chunk samples
+            }
+            total += block_ms;
+            remaining -= block_layers;
+        }
+        result = total;
+        return std::isfinite(result) && result >= 0.0;
+    }
+
 private:
     std::vector<real_stage_point> points_;
 
