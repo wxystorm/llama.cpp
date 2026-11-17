@@ -40,6 +40,7 @@ import run_32b_all40 as runner
 # Qwen3-32B: the final G7 is essential; G6 would total only 63 layers.
 LAYOUT = "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"
 DEFAULT_CANONICAL_LAYOUT = LAYOUT.replace("N", "P")
+MEMORY_PROPORTIONAL_LAYOUT = "G7,P5,G7,P5,G7,P5,G7,P5,G6,P4,G6"
 # w/o Multi-Cycle: one logical GPU->Phone->GPU crossing, but six physical
 # GPU windows keep the exact original two-Bank parity/preload topology.
 GPG_LOGICAL_LAYOUT = "G36,P21,G7"
@@ -104,6 +105,8 @@ def parse_args(argv=None):
                    help="Runtime ablation: lock G36,P21,G7; each Prompt runs native Planner XC/XG/XP search (no replay); keep six GPU Bank windows, async prefetch and Drain-First")
     p.add_argument("--no-dag-placement", action="store_true",
                    help="retain a previously selected no-DAG placement, then score dynamic XC/XG/XP per request using linear/no-DAG costs")
+    p.add_argument("--memory-proportional-placement", action="store_true",
+                   help="w/o Profile-Guided Placement: exact 32B G40/P24, DAG Chunk, memory-estimate bypass")
     p.add_argument("--guarded-memory-checks", action="store_true",
                    help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
     p.add_argument("--skip-plan-memory-checks", action="store_true",
@@ -167,10 +170,21 @@ def parse_args(argv=None):
         if args.model_layers != 64 or (
                 args.locked_layout != DEFAULT_CANONICAL_LAYOUT):
             p.error("--fixed-chunk requires the 32B Full Cycle locked layout")
+    if args.memory_proportional_placement:
+        if (args.model_layers != 64 or
+                args.locked_layout != MEMORY_PROPORTIONAL_LAYOUT or
+                not args.all50 or not args.per_request_chunks or
+                args.no_dag_placement or args.fixed_chunk is not None or
+                args.no_multi_cycle or args.no_async_prefetch or
+                args.no_drain_first or args.replay_chunks_from is not None or
+                args.guarded_memory_checks):
+            p.error("--memory-proportional-placement requires exact G40/P24, --all50 --per-request-chunks, DAG, and no other ablation")
+        args.skip_plan_memory_checks = True
     if args.guarded_memory_checks and args.skip_plan_memory_checks:
         p.error("--guarded-memory-checks conflicts with --skip-plan-memory-checks")
-    if args.skip_plan_memory_checks and not args.no_dag_placement:
-        p.error("--skip-plan-memory-checks is only supported for --no-dag-placement")
+    if args.skip_plan_memory_checks and not (
+            args.no_dag_placement or args.memory_proportional_placement):
+        p.error("--skip-plan-memory-checks requires --no-dag-placement or --memory-proportional-placement")
     if args.no_dag_placement:
         if (not args.all50 or not args.per_request_chunks or
                 args.fixed_chunk is not None or
@@ -579,6 +593,12 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["logical_layout"] = GPG_LOGICAL_LAYOUT
         base["physical_layout"] = GPG_PHYSICAL_LAYOUT
         base["chunk_policy"] = "NATIVE_PER_REQUEST_LOCKED_CHUNK_SEARCH_APPLIED"
+    if getattr(args, "memory_proportional_placement", False):
+        base["planner_ablation"] = "WO_PROFILE_GUIDED_PLACEMENT_G40_P24"
+        base["placement_policy"] = "MEMORY_PROPORTIONAL_LOCKED"
+        base["chunk_policy"] = "NATIVE_PER_REQUEST_DAG_CHUNKS"
+        base["score_policy"] = "EVENT_DAG"
+        base["planner_memory_policy"] = "SKIP_ESTIMATES_ONLY"
     if getattr(args, "no_dag_placement", False):
         base["planner_ablation"] = "WO_DAG_LINEAR_SCORE_DYNAMIC_CHUNKS"
         base["chunk_policy"] = "NATIVE_PER_REQUEST_LINEAR_NO_DAG_CHUNK_SEARCH"
@@ -905,6 +925,9 @@ def main(argv=None):
         "--threads", str(args.threads), "--min-context", "256",
         "--max-context", "2048", "--context-padding", "0",
     ])
+    if args.memory_proportional_placement:
+        # Keep CPU RAM backing weights mmap-windowed for GPU double-bank.
+        fake_args.pc_mmap_budget = True
     if args.no_dag_placement:
         # Fixed X64 does not need the 16/24 short-Chunk adaptive grid.
         # Keep the strict grid for all ordinary/replay Planner modes.
@@ -940,6 +963,9 @@ def main(argv=None):
         None if args.guarded_memory_checks else "1")
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
+    if args.memory_proportional_placement:
+        assert env["LLAMA_REGION_RING_PC_MMAP_BUDGET"] == "1"
+        assert env["LLAMA_REGION_RING_LOCKED_SKIP_MEMORY_CHECKS"] == "1"
     if args.no_dag_placement:
         assert "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS" not in env
         assert "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS" not in env
@@ -956,6 +982,12 @@ def main(argv=None):
         env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+    if args.memory_proportional_placement:
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "0"
+        env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+        env["LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED"] = "1"
     if args.no_dag_placement:
         env["LLAMA_REGION_RING_NO_DAG_PLANNER"] = "1"
         # Keep the Full Cycle Runtime unchanged: two asynchronously refilled
@@ -1003,6 +1035,11 @@ def main(argv=None):
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    if args.memory_proportional_placement:
+        print("[SERVER_PLANNER_ABLATION] mode=WO_PROFILE_GUIDED_PLACEMENT"
+              " layout=G40_P24 score=EVENT_DAG"
+              " dynamic_chunks=1 memory_estimates=SKIPPED"
+              " async_double_bank=1 drain_first=1", flush=True)
     if args.no_dag_placement:
         print("[SERVER_PLANNER_ABLATION] mode=WO_QUEUEING_SIMULATION"
               " score=LINEAR_SUM_NO_QUEUE"
@@ -1089,6 +1126,18 @@ def main(argv=None):
                                 stdout=log, stderr=subprocess.STDOUT)
         try:
             wait_for_ready(proc, args.port, args.startup_timeout)
+            if args.memory_proportional_placement:
+                startup = log_path.read_text(encoding="utf-8",
+                                             errors="replace")
+                if (not re.search(
+                        r"\[REGION_RING_PLAN_LOCK\] status=PASS"
+                        r" source=CHUNK_ONLY [^\n]*"
+                        r"memory_policy=SKIPPED", startup) or
+                        "policy=SKIP_ESTIMATES_ONLY" not in startup or
+                        "[REGION_RING_NO_DAG_PLAN] mode=" in startup):
+                    raise RuntimeError(
+                        "G40/P24 model startup did not confirm native DAG"
+                        " Chunk search with skipped memory estimates")
             if args.no_dag_placement:
                 startup = log_path.read_text(encoding="utf-8",
                                              errors="replace")
@@ -1156,6 +1205,7 @@ def main(argv=None):
                             (args.no_async_prefetch or
                              args.no_multi_cycle or
                              args.no_dag_placement or
+                             args.memory_proportional_placement or
                              args.fixed_chunk is not None) else None,
                             args.no_async_prefetch, args.no_multi_cycle,
                             args.fixed_chunk)
@@ -1174,6 +1224,8 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
+                            "WO_PROFILE_GUIDED_PLACEMENT_DAG_CHUNKS"
+                            if args.memory_proportional_placement else
                             "WO_QUEUEING_SIMULATION_DYNAMIC_CHUNKS"
                             if args.no_dag_placement else
                             f"FIXED_{args.fixed_chunk}_NO_REQUEST_SEARCH"
@@ -1185,6 +1237,11 @@ def main(argv=None):
                         "runtime_layout": (
                             GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
                             else fake_args.locked_layout),
+                        **({"planner_score": "EVENT_DAG",
+                            "chunk_policy": "ADAPTIVE_XC_XG_XP",
+                            "scheduler_mode": "DRAIN_FIRST",
+                            "prefetch_mode": "ASYNC_DOUBLE_BANK"}
+                           if args.memory_proportional_placement else {}),
                         **({"planner_score": "LINEAR_SUM_NO_QUEUE",
                             "chunk_policy": "ADAPTIVE_XC_XG_XP",
                             "scheduler_mode": "DRAIN_FIRST",

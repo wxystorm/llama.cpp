@@ -1185,6 +1185,73 @@ class ServerProbeTests(unittest.TestCase):
                 found.index("PHONE_INPUT_PUSH"),
                 found.index("P2C_STREAM"))
 
+    def test_memory_proportional_g40_p24_dag_bypasses_only_estimates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "llama-server.exe"
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            server.write_bytes(b"stub")
+            model.write_bytes(b"stub")
+            args = [
+                "--server-exe", str(server), "--model", str(model),
+                "--model-layers", "64",
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(root),
+                "--profile-source", str(root),
+                "--out", str(root / "memory-proportional"),
+                "--locked-layout", probe.MEMORY_PROPORTIONAL_LAYOUT,
+                "--all50", "--per-request-chunks",
+                "--memory-proportional-placement",
+            ]
+            parsed = probe.parse_args(args)
+            self.assertTrue(parsed.memory_proportional_placement)
+            self.assertTrue(parsed.skip_plan_memory_checks)
+            self.assertFalse(parsed.no_dag_placement)
+            self.assertIsNone(parsed.fixed_chunk)
+            self.assertEqual(
+                parsed.locked_layout, probe.MEMORY_PROPORTIONAL_LAYOUT)
+            for invalid in (
+                    ["--no-dag-placement", "--guarded-memory-checks"],
+                    ["--fixed-chunk", "64"],
+                    ["--guarded-memory-checks"],
+                    ["--no-multi-cycle"],
+                    ["--no-drain-first"],
+                    ["--no-async-prefetch"],
+            ):
+                with self.assertRaises(SystemExit):
+                    probe.parse_args(args + invalid)
+            other = args.copy()
+            other[other.index(probe.MEMORY_PROPORTIONAL_LAYOUT)] = (
+                probe.DEFAULT_CANONICAL_LAYOUT)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(other)
+
+    def test_memory_proportional_failure_labels_real_oom_only(self):
+        import importlib.util
+        module_path = (Path(__file__).resolve().parent / "ablations" /
+                       "run_32b_memory_proportional.py")
+        spec = importlib.util.spec_from_file_location("run_memory_prop",
+                                                       module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            log = out / "llama-server.log"
+            log.write_text(
+                "CUDA_ERROR_OUT_OF_MEMORY failed to allocate buffer\n",
+                encoding="utf-8")
+            result = module.classify_failure(out, 1)
+            self.assertEqual(result["status"], "OOM")
+            self.assertEqual(len(result["oom_evidence"]), 1)
+            self.assertTrue((out / "failure.json").is_file())
+            log.write_text("unrelated CPU crash\n", encoding="utf-8")
+            result = module.classify_failure(out, 1)
+            self.assertEqual(result["status"], "CRASH_UNCONFIRMED")
+            self.assertEqual(result["oom_evidence"], [])
+            self.assertEqual(len(
+                (out / "failures.jsonl").read_text(
+                    encoding="utf-8").splitlines()), 2)
+
     def test_original_layout_has_exactly_64_layers(self):
         layers = sum(int(part[1:]) for part in probe.LAYOUT.split(","))
         self.assertEqual(layers, 64)
