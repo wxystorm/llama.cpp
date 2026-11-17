@@ -593,6 +593,139 @@ class ServerProbeTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_wo_multi_cycle_accepts_only_64layer_g36_p21_g7(self):
+        self.assertEqual(probe.GPG_LOGICAL_LAYOUT, "G36,P21,G7")
+        self.assertEqual(probe.GPG_PHYSICAL_LAYOUT,
+                         "G7,G7,G8,G7,G7,P21,G7")
+        segments = probe.GPG_PHYSICAL_LAYOUT.split(",")
+        self.assertEqual(
+            sum(int(s[1:]) for s in segments if s[0] == "G"), 43)
+        self.assertEqual(
+            sum(int(s[1:]) for s in segments if s[0] == "P"), 21)
+        self.assertEqual(
+            [int(s[1:]) for s in segments if s[0] == "G"],
+            [7, 7, 8, 7, 7, 7])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, model = root / "llama-server.exe", root / "32b.gguf"
+            server.write_bytes(b"stub")
+            model.write_bytes(b"stub")
+            reference = root / "baseline.jsonl"
+            reference.write_text("{}\n", encoding="utf-8")
+            base = [
+                "--server-exe", str(server), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(root), "--profile-source", str(root),
+                "--out", str(root / "out"),
+                "--all50", "--per-request-chunks",
+                "--replay-chunks-from", str(reference),
+                "--locked-layout", probe.GPG_LOGICAL_LAYOUT,
+            ]
+            args = probe.parse_args(base + ["--no-multi-cycle"])
+            self.assertTrue(args.no_multi_cycle)
+            self.assertEqual(args.locked_layout, probe.GPG_LOGICAL_LAYOUT)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(base + [
+                    "--no-multi-cycle", "--no-async-prefetch"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(base + [
+                    "--no-multi-cycle", "--no-drain-first"])
+            invalid = base.copy()
+            invalid[invalid.index("--locked-layout") + 1] = (
+                probe.DEFAULT_CANONICAL_LAYOUT)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(invalid + ["--no-multi-cycle"])
+
+    def test_wo_multi_cycle_requires_async_mover_and_exact_replay(self):
+        layout = probe.GPG_PHYSICAL_LAYOUT
+        full = (
+            "[REGION_RING_MULTI_CYCLE_ABLATION] mode=G_P_G"
+            " logical=G36,P21,G7"
+            " physical=G7,G7,G8,G7,G7,P21,G7"
+            " gpu_layers=43 phone_layers=21"
+            " gpu_regions=6 phone_regions=1"
+            " gpu_banks=2 async_prefetch=1"
+            " drain_first=1 status=READY\n"
+            "[REGION_RING_ABLATION] gpu_banks=2 gpu_prefetch=1"
+            " gpu_bank_mover=1 sync_demand=0 status=CONFIGURED\n"
+            "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1"
+            " phone_push_aware=1 status=READY\n"
+            "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
+            " rule=EARLIEST_EXECUTABLE_REGION status=READY\n"
+            "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+            f" tokens=66 kv_start=0 layout={layout}"
+            " XC=16 XG=24 XP=48"
+            " startup_XC=32 startup_XG=32 startup_XP=32"
+            " changed=1 planner_ms=0.400"
+            " source=LOCKED_CHUNK_REPLAY"
+            " layer_placement=IMMUTABLE"
+            " execution=THIS_DECODE_ONLY status=PASS\n"
+            "[REGION_RING_SUM] tokens=66 XC=0 XG=24 XP=48"
+            " regions=7 first_region_chunks=3 tasks=21"
+            " executed=21 complete=1 wall_ms=300"
+            " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n"
+            "[REGION_RING_GPU_BANK_MOVER_SUM] worker=CPU_SINGLE"
+            " started=4 completed=4 failures=0 upload_mib=1234"
+            " stage_cpu_copy_ms=0 stage_chunks=0"
+            " prepare_ms=50 h2d_ms=100 wall_ms=200"
+            " gpu_wait_ms=0 thread_started=1 thread_joined=1"
+            " status=PASS\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "server.log"
+            log.write_text(full, encoding="utf-8")
+            decision, _ = probe.read_request_chunk_plan(
+                log, 0, 66, 256, 256, layout,
+                "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+            self.assertEqual(
+                (decision["plan_xc"], decision["plan_xg"],
+                 decision["plan_xp"]), (16, 24, 48))
+            log.write_text(
+                full.replace("gpu_prefetch=1", "gpu_prefetch=0"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "w/o Multi-Cycle"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+            log.write_text(
+                full.replace("completed=4", "completed=3"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "asynchronous"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+            log.write_text(
+                full.replace(
+                    "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST",
+                    "[REGION_RING_CYCLE_SCHED] mode=FIFO"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "scheduler ablation"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+
+    def test_gpg_canonical_parser_preserves_gpu_window_boundaries(self):
+        header = (Path(__file__).resolve().parents[2] /
+                  "src" / "llama-region-ring.h").read_text(encoding="utf-8")
+        context = (Path(__file__).resolve().parents[2] /
+                   "src" / "llama-context.cpp").read_text(encoding="utf-8")
+        for token in (
+            '"LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG"',
+            '"G36,P21,G7"',
+            '"G7,G7,G8,G7,G7,P21,G7"',
+            "llama_region_ring_gpg_physical_regions",
+            "llama_region_ring_gpg_physical_compatible",
+            "std::array<int, 7> depths = { 7, 7, 8, 7, 7, 21, 7 }",
+        ):
+            self.assertIn(token, header)
+        for token in (
+            "llama_region_ring_gpg_ablation_enabled()",
+            "gpu_region_order.size() != 6",
+            "!gpu_bank_streaming",
+            "!drain_first_cycle",
+            '"[REGION_RING_MULTI_CYCLE_ABLATION] mode=G_P_G"',
+        ):
+            self.assertIn(token, context)
+
     def test_cpp_request_replay_hook_checks_tokens_and_layout(self):
         source = (Path(__file__).resolve().parents[2] /
                   "src" / "llama-context.cpp").read_text(encoding="utf-8")
