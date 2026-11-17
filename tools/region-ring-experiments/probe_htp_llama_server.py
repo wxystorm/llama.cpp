@@ -40,6 +40,10 @@ import run_32b_all40 as runner
 # Qwen3-32B: the final G7 is essential; G6 would total only 63 layers.
 LAYOUT = "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"
 DEFAULT_CANONICAL_LAYOUT = LAYOUT.replace("N", "P")
+# w/o Multi-Cycle: one logical GPU->Phone->GPU crossing, but six physical
+# GPU windows keep the exact original two-Bank parity/preload topology.
+GPG_LOGICAL_LAYOUT = "G36,P21,G7"
+GPG_PHYSICAL_LAYOUT = "G7,G7,G8,G7,G7,P21,G7"
 
 
 def server_command(server_exe, model, rpc, port, threads=8):
@@ -96,6 +100,8 @@ def parse_args(argv=None):
                    help="Runtime ablation: use resource-aware FIFO, not Drain-First")
     p.add_argument("--no-async-prefetch", action="store_true",
                    help="Runtime ablation: retain both GPU banks but load later weights synchronously on demand")
+    p.add_argument("--no-multi-cycle", action="store_true",
+                   help="Runtime ablation: logical G36,P21,G7; six GPU Bank windows, async prefetch and Drain-First remain on")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -139,8 +145,16 @@ def parse_args(argv=None):
         p.error("--no-drain-first requires recorded per-Prompt Chunk replay")
     if args.no_async_prefetch and args.replay_chunks_from is None:
         p.error("--no-async-prefetch requires recorded per-Prompt Chunk replay")
-    if args.no_drain_first and args.no_async_prefetch:
+    if args.no_multi_cycle and args.replay_chunks_from is None:
+        p.error("--no-multi-cycle requires recorded per-Prompt Chunk replay")
+    if sum((args.no_drain_first, args.no_async_prefetch,
+            args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
+    if args.no_multi_cycle and (
+            args.model_layers != 64 or
+            args.locked_layout != GPG_LOGICAL_LAYOUT):
+        p.error("--no-multi-cycle requires --model-layers 64 "
+                "and --locked-layout G36,P21,G7")
     if args.resume and not args.all50:
         p.error("--resume requires --all50 (the smoke test repeats the same prompt)")
     if args.limit < 0 or args.limit > 50 or (args.limit and not args.all50):
@@ -295,7 +309,8 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
                             expected_layout=DEFAULT_CANONICAL_LAYOUT,
                             expected_source=None,
                             expected_sched_mode=None,
-                            expect_sync_bank_demand=False):
+                            expect_sync_bank_demand=False,
+                            expect_gpg_ablation=False):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -332,6 +347,32 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
             raise RuntimeError(
                 "w/o Async Prefetch did not execute exactly "
                 f"{expected_refills} synchronous Bank refills")
+    if expect_gpg_ablation:
+        if not re.search(
+                r"\[REGION_RING_MULTI_CYCLE_ABLATION\] mode=G_P_G "
+                r"logical=G36,P21,G7 "
+                r"physical=G7,G7,G8,G7,G7,P21,G7 "
+                r"gpu_layers=43 phone_layers=21 "
+                r"gpu_regions=6 phone_regions=1 "
+                r"gpu_banks=2 async_prefetch=1 "
+                r"drain_first=1 status=READY", data):
+            raise RuntimeError(
+                "w/o Multi-Cycle did not confirm exact G-P-G "
+                "topology and two-Bank async prefetch")
+        if not re.search(
+                r"\[REGION_RING_ABLATION\] gpu_banks=2 gpu_prefetch=1 "
+                r"gpu_bank_mover=1 sync_demand=0 status=CONFIGURED", data):
+            raise RuntimeError(
+                "w/o Multi-Cycle did not keep original background Bank Mover")
+        refills = re.findall(
+            r"\[REGION_RING_GPU_BANK_MOVER_SUM\] "
+            r"worker=CPU_SINGLE started=(\d+) completed=(\d+) "
+            r"failures=(\d+).*thread_started=1 thread_joined=1 "
+            r"status=PASS", data)
+        if len(refills) != 1 or tuple(map(int, refills[0])) != (4, 4, 0):
+            raise RuntimeError(
+                "w/o Multi-Cycle did not complete four asynchronous "
+                "Bank refills with the background worker")
     matches = list(REQUEST_PLAN_RE.finditer(data))
     if len(matches) != 1:
         raise RuntimeError(
@@ -457,6 +498,10 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["runtime_ablation"] = "WO_DRAIN_FIRST"
     if getattr(args, "no_async_prefetch", False):
         base["runtime_ablation"] = "WO_ASYNC_PREFETCH"
+    if getattr(args, "no_multi_cycle", False):
+        base["runtime_ablation"] = "WO_MULTI_CYCLE_GPG"
+        base["logical_layout"] = GPG_LOGICAL_LAYOUT
+        base["physical_layout"] = GPG_PHYSICAL_LAYOUT
     encoded = json.dumps(
         base, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")
@@ -645,7 +690,8 @@ def write_reports(out, records):
         "request_wall_ms", "predicted_n", "planner_mode",
         "plan_xc", "plan_xg", "plan_xp", "planner_ms",
         "runtime_xc", "runtime_xg", "runtime_xp",
-        "runtime_layout", "scheduler_mode", "prefetch_mode", "status",
+        "runtime_layout", "logical_layout", "scheduler_mode",
+        "prefetch_mode", "status",
     ]
     with (out / "requests.csv").open(
             "w", encoding="utf-8-sig", newline="") as stream:
@@ -742,7 +788,9 @@ def main(argv=None):
 
     reference_chunks = (
         load_reference_chunks(
-            args.replay_chunks_from, prompts, args.locked_layout,
+            args.replay_chunks_from, prompts,
+            DEFAULT_CANONICAL_LAYOUT if args.no_multi_cycle
+            else args.locked_layout,
             args.model, args.profile_source)
         if args.replay_chunks_from is not None else None)
 
@@ -797,6 +845,16 @@ def main(argv=None):
         env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+    if args.no_multi_cycle:
+        env["LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "0"
+        env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+        env["LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED"] = "1"
+    else:
+        # Never inherit a stale G-P-G topology from a previous experiment.
+        env.pop("LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG", None)
     if reference_chunks is not None:
         env["LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE"] = str(
             args.out / "request-chunk-replay.txt")
@@ -809,11 +867,16 @@ def main(argv=None):
         print("[SERVER_ABLATION] mode=" +
               ("WO_DRAIN_FIRST" if args.no_drain_first else
                "WO_ASYNC_PREFETCH" if args.no_async_prefetch else
+               "WO_MULTI_CYCLE_GPG" if args.no_multi_cycle else
                "FULL_CYCLE_REPLAY") +
               " source=" + str(args.replay_chunks_from) +
               " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
               " native_chunk_search=SCORED_NOT_APPLIED"
-              " bank_refill=STRICT_SYNC_DEMAND_WHEN_SELECTED"
+              " bank_refill=" +
+              ("STRICT_SYNC_DEMAND_WHEN_SELECTED"
+               if args.no_async_prefetch else "ASYNC_DOUBLE_BANK") +
+              (" logical=G36,P21,G7 physical=" + GPG_PHYSICAL_LAYOUT
+               if args.no_multi_cycle else "") +
               " runtime_allocators=UNCHANGED",
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
@@ -873,7 +936,9 @@ def main(argv=None):
                         ref = reference_chunks[path.name]
                         write_replay_sidecar(
                             args.out / "request-chunk-replay.txt",
-                            ref["prompt_n"], args.locked_layout,
+                            ref["prompt_n"],
+                            GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
+                            else args.locked_layout,
                             ref["plan_xc"], ref["plan_xg"], ref["plan_xp"])
                     prompt = path.read_text(encoding="utf-8-sig")
                     began = time.monotonic()
@@ -890,12 +955,15 @@ def main(argv=None):
                         decision, log_offset = read_request_chunk_plan(
                             log_path, log_offset, record["prompt_n"],
                             args.max_plan_xg, args.max_plan_xp,
-                            args.locked_layout,
+                            GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
+                            else args.locked_layout,
                             "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
                             else "LOCKED_CHUNK_ONLY",
                             "FIFO" if args.no_drain_first else
-                            "DRAIN_FIRST" if args.no_async_prefetch else None,
-                            args.no_async_prefetch)
+                            "DRAIN_FIRST" if
+                            (args.no_async_prefetch or
+                             args.no_multi_cycle) else None,
+                            args.no_async_prefetch, args.no_multi_cycle)
                         if reference_chunks is not None and any(
                                 decision["plan_" + name] != ref["plan_" + name]
                                 for name in ("xc", "xg", "xp")):
@@ -914,7 +982,13 @@ def main(argv=None):
                             "REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
                             else "PER_REQUEST_LOCKED" if args.per_request_chunks
                             else "STARTUP_ONLY"),
-                        "runtime_layout": fake_args.locked_layout,
+                        "runtime_layout": (
+                            GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
+                            else fake_args.locked_layout),
+                        **({"logical_layout": GPG_LOGICAL_LAYOUT,
+                            "scheduler_mode": "DRAIN_FIRST",
+                            "prefetch_mode": "ASYNC_DOUBLE_BANK"}
+                           if args.no_multi_cycle else {}),
                         **({"scheduler_mode": "FIFO"}
                            if args.no_drain_first else
                            {"scheduler_mode": "DRAIN_FIRST",
