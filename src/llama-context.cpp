@@ -6530,6 +6530,50 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             " fallback=LATER_READY no_cycle_barrier=1 status=READY\n",
             drain_first_cycle ? "DRAIN_FIRST" : "FIFO");
 
+        // Strict w/o Multi-Cycle A/B: logical G36 -> P21 -> G7, physical
+        // G7,G7,G8,G7,G7 -> P21 -> G7. All six GPU windows must keep
+        // original two-Bank async refill and Drain-First scheduling.
+        if (llama_region_ring_gpg_ablation_enabled() &&
+                ubatch.n_tokens >= 32) {
+            const auto physical =
+                llama_region_ring_gpg_physical_regions();
+            bool exact_physical =
+                stages.size() == physical.size();
+            for (size_t i = 0; exact_physical && i < stages.size(); ++i) {
+                const auto expected_kind =
+                    physical[i].device == llama_region_ring_device::PHONE ?
+                        llama_hybrid_runtime_stage_kind::PHONE :
+                        llama_hybrid_runtime_stage_kind::GPU;
+                exact_physical =
+                    stages[i].kind == expected_kind &&
+                    stages[i].layer_begin == physical[i].layer_begin &&
+                    stages[i].layer_end == physical[i].layer_end;
+            }
+            if (!exact_physical || gpu_region_order.size() != 6 ||
+                    !gpu_bank_streaming || gpu_bank_single ||
+                    gpu_bank_sync_demand || !gpu_bank_prefetch_enabled ||
+                    !resource_aware_chunk_sched || !drain_first_cycle) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_MULTI_CYCLE_ABLATION] mode=G_P_G"
+                    " event=REJECT reason=TOPOLOGY_OR_BANK_POLICY_CHANGED"
+                    " physical_stages=%zu gpu_regions=%zu"
+                    " async_mover=%d drain_first=%d status=FAIL\n",
+                    stages.size(), gpu_region_order.size(),
+                    gpu_bank_streaming && !gpu_bank_sync_demand ? 1 : 0,
+                    drain_first_cycle ? 1 : 0);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_MULTI_CYCLE_ABLATION] mode=G_P_G"
+                " logical=G36,P21,G7"
+                " physical=G7,G7,G8,G7,G7,P21,G7"
+                " gpu_layers=43 phone_layers=21"
+                " gpu_regions=6 phone_regions=1"
+                " gpu_banks=2 async_prefetch=1"
+                " drain_first=1 status=READY\n");
+        }
+
         std::mutex gpu_bank_mover_mutex;
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
