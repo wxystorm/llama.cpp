@@ -120,7 +120,7 @@ def preview(path: Path, events: list[dict], projected: list[dict],
     svg=[
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} 408">',
         '<rect width="1180" height="408" fill="white"/>',
-        '<text x="165" y="29" font-family="Arial" font-size="19" font-weight="bold" fill="#202D3B">Jupiter 14B - Fig. 3 timing evidence</text>',
+        f'<text x="165" y="29" font-family="Arial" font-size="19" font-weight="bold" fill="#202D3B">Jupiter {html.escape(values["model_label"])} - Fig. 3 timing evidence</text>',
         f'<text x="165" y="49" font-size="12" fill="#69788A">'
         + html.escape("Profile window %.2f s; Phone clock uncertainty %.3f ms" %
                       (values["profile_envelope_ms"]/1000, values["clock_uncertainty_ms"]))+"</text>",
@@ -223,13 +223,17 @@ def analyze(args):
     for r in sources: raw[r["category"]]+=r["end"]-r["start"]
     if sum(exclusive.values())!=total: raise ValueError("Projected coverage not 100%")
 
+    if args.model_layers is None or args.pc_layers is None or not (1 <= args.pc_layers < args.model_layers):
+        raise ValueError("Provide valid --model-layers and --pc-layers for the selected model")
+    model_label = {40: "14B", 64: "32B"}.get(args.model_layers, f"{args.model_layers}L")
     values=dict(
         framework="Jupiter",run_id=args.run_id,
+        model_layers=args.model_layers,model_label=model_label,
         normal_prefill_ms=round(args.normal_prefill_ms,3) if args.normal_prefill_ms is not None else "",
         profile_envelope_ms=round(total/1e6,3),
         tokens=tok,
         pc_layers=args.pc_layers if args.pc_layers is not None else "",
-        phone_layers=40-args.pc_layers if args.pc_layers is not None else "",
+        phone_layers=args.model_layers-args.pc_layers,
         phone_backend="native RPC backend (record device at Phone; no HTP claim)",
         clock_endpoint=endpoint,clock_uncertainty_ms=round(clock_bound,4),
         clock_samples=n_cal,phone_compute_events=counts["phone_native_Phone Compute"],
@@ -298,6 +302,7 @@ def main():
     p.add_argument("--normal-prefill-ms",type=float)
     p.add_argument("--expected-tokens",type=int)
     p.add_argument("--pc-layers",type=int)
+    p.add_argument("--model-layers",type=int,default=64)
     p.add_argument("--endpoint",default="")
     p.add_argument("--out-dir")
     p.add_argument("--max-clock-uncertainty-ms",type=float,default=20.0)
