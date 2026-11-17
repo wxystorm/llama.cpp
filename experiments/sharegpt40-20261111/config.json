@@ -13,7 +13,7 @@
     ],
     "prompts_per_group": 10,
     "prompt_ids": "prompt_{group}_{01..10}.txt",
-    "note": "Ours 14B/24B/32B and Galaxy 14B cover groups 0/128/256/512/1024 (10 prompts each). Other full baselines cover groups 128/256/512/1024; Jupiter 24B 1024 group has 6 PASS observations."
+    "note": "Ours 14B/24B/32B, Galaxy 14B, and Prima.cpp 24B/32B cover groups 0/128/256/512/1024. Prima.cpp 14B has a 0-group summary (10 prompts) and 40 existing prompt-level records. Jupiter 24B group 1024 has six PASS observations."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -53,12 +53,21 @@
       "id": "prima-32b",
       "framework": "prima.cpp",
       "model": "32b",
-      "context": 4096,
+      "context": 2048,
       "predict": 32,
       "batch": 512,
       "ubatch": 512,
       "threads": 8,
-      "planner": "HiGHS"
+      "planner": "HiGHS",
+      "runs": 50,
+      "run_config": "runs/prima-32b/run-config.json",
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      }
     },
     {
       "id": "jupiter-14b",
@@ -143,22 +152,21 @@
       "model": "24b",
       "model_family": "Mistral Small 3.2",
       "quantization": "Q6_K",
-      "context": 4096,
+      "context": 2048,
       "predict": 32,
       "batch": 512,
       "ubatch": 512,
       "threads": 8,
       "planner": "HiGHS",
       "run_config": "runs/prima-24b/run-config.json",
-      "observed_planner": {
-        "k": 1,
-        "W": 40,
-        "pc_layers": 19,
-        "pc_gpu_layers": 9,
-        "phone_layers": 21,
-        "phone_gpu_layers": 0
-      },
-      "runs": 40
+      "runs": 50,
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      }
     },
     {
       "id": "ours-32b-server-plan",

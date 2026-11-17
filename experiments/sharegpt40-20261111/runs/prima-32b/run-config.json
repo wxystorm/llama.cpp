@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "run_id": "prima-32b",
+  "model": "${MODEL_DIR}/Qwen3-32B-Q4_K_M.gguf",
+  "mode": "Prima.cpp",
+  "ctx": 2048,
+  "predict": 32,
+  "batch": 512,
+  "ubatch": 512,
+  "threads": 8,
+  "delay_seconds": 30,
+  "timeout_seconds": 3600,
+  "prompt_groups": [
+    0,
+    128,
+    256,
+    512,
+    1024
+  ],
+  "prompts_per_group": 10,
+  "status": "PASS",
+  "count": 50,
+  "source": "user-provided ShareGPT50 sweep output",
+  "config_signature": "b325b9a5183f5986",
+  "per_prompt_details": "per-prompt-details.csv"
+}
