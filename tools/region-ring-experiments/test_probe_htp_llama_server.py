@@ -1204,6 +1204,9 @@ class ServerProbeTests(unittest.TestCase):
                 "--memory-proportional-placement",
             ]
             parsed = probe.parse_args(args)
+            self.assertEqual(
+                probe.MEMORY_PROPORTIONAL_LAYOUT,
+                "G7,P5,G7,P5,G7,P5,G7,P5,G7,P4,G5")
             self.assertTrue(parsed.memory_proportional_placement)
             self.assertTrue(parsed.skip_plan_memory_checks)
             self.assertFalse(parsed.no_dag_placement)

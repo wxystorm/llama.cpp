@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 
-LAYOUT = "G7,P5,G7,P5,G7,P5,G7,P5,G6,P4,G6"
+LAYOUT = "G7,P5,G7,P5,G7,P5,G7,P5,G7,P4,G5"
 
 # A crash without one of these first-cause markers is NOT proof of OOM.
 OOM_RE = re.compile(

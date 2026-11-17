@@ -40,7 +40,7 @@ import run_32b_all40 as runner
 # Qwen3-32B: the final G7 is essential; G6 would total only 63 layers.
 LAYOUT = "G7,N4,G7,N4,G8,N5,G7,N4,G7,N4,G7"
 DEFAULT_CANONICAL_LAYOUT = LAYOUT.replace("N", "P")
-MEMORY_PROPORTIONAL_LAYOUT = "G7,P5,G7,P5,G7,P5,G7,P5,G6,P4,G6"
+MEMORY_PROPORTIONAL_LAYOUT = "G7,P5,G7,P5,G7,P5,G7,P5,G7,P4,G5"
 # w/o Multi-Cycle: one logical GPU->Phone->GPU crossing, but six physical
 # GPU windows keep the exact original two-Bank parity/preload topology.
 GPG_LOGICAL_LAYOUT = "G36,P21,G7"
