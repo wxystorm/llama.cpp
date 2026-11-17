@@ -892,6 +892,10 @@ def main(argv=None):
         # Fixed X64 does not need the 16/24 short-Chunk adaptive grid.
         # Keep the strict grid for all ordinary/replay Planner modes.
         fake_args.locked_short_chunks = False
+        # Match the pre-selection's physical mmap residency policy.
+        # The native engine rejects this if the GGUF is not ACTUALLY mmap'd.
+        # GPU dual-Bank, CUDA scratch, Phone RAM and HTP session guards stay on.
+        fake_args.pc_mmap_budget = True
     if not args.guarded_memory_checks:
         fake_args.skip_plan_memory_checks = True
     command = server_command(args.server_exe, args.model, args.rpc,
@@ -920,6 +924,7 @@ def main(argv=None):
     if args.no_dag_placement:
         assert "LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS" not in env
         assert "LLAMA_REGION_RING_PROFILE_SHORT_CHUNKS" not in env
+        assert env["LLAMA_REGION_RING_PC_MMAP_BUDGET"] == "1"
     else:
         assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
     if args.no_drain_first:
@@ -974,6 +979,7 @@ def main(argv=None):
         print("[SERVER_PLANNER_ABLATION] mode=WO_QUEUEING_SIMULATION"
               " score=LINEAR_SUM_NO_QUEUE fixed_chunk=64"
               " startup_memory_checks=GUARDED"
+              " pc_memory=MMAP_WINDOWED_VERIFIED"
               " placement=PRESELECTED_FROM_NO_DAG"
               " runtime=FULL_CYCLE", flush=True)
     if args.fixed_chunk is not None:
