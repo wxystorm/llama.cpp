@@ -35,6 +35,7 @@ if ($LASTEXITCODE -ne 0) { throw "C++ build failed" }
 ~~~powershell
 $root = "E:\llama\llama-tensor-v2"
 $oldProfileCandidates = @(
+    "$root\32b-planner-wo-profile-fixed64-all50-1\independent-profile",
     "$root\32b-server-chunk256-all50-new\independent-profile",
     "$root\32b-sharegpt50-short-mmap-test\independent-profile"
 )
