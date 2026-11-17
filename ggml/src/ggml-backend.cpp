@@ -23,6 +23,7 @@
 #include <chrono>
 #include <vector>
 #include <unordered_set>
+#include <map>
 #include <cinttypes>
 #include <cerrno>
 
@@ -1631,6 +1632,28 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Resolve "blk.N" names even when the scheduler prefixes them with a backend.
+static int ggml_phone_moti_layer_index(const char * name) {
+    if (!name) return -1;
+    const char * p = strstr(name, "blk.");
+    if (!p) return -1;
+    p += 4;
+    if (*p < '0' || *p > '9') return -1;
+    char * end = nullptr;
+    const long layer = strtol(p, &end, 10);
+    return end != p && layer >= 0 && layer <= 10000 ? (int) layer : -1;
+}
+
+struct ggml_phone_moti_layer_stats {
+    double stage_ms = 0.0;
+    double npu_wall_ms = 0.0;
+    uint64_t stage_read_bytes = 0;
+    long major_faults = 0;
+    size_t weight_bytes = 0;
+    size_t matmuls = 0;
+    size_t splits = 0;
+};
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1652,6 +1675,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t peak_rss_kib = 0;
     double stage_submit_ms = 0.0;
     double advice_ms = 0.0;
+    const char * phone_moti_env = getenv("GGML_PHONE_MOTI_LAYER");
+    const bool phone_moti = sched->stream_weights_enabled && sched->stream_target == 3 &&
+            phone_moti_env && strcmp(phone_moti_env, "1") == 0;
+    int phone_target_layer = -1;
+    if (const char * target = getenv("GGML_PHONE_MOTI_TARGET_LAYER")) {
+        char * end = nullptr;
+        const long value = strtol(target, &end, 10);
+        if (target != end && end && *end == '\0' && value >= 0 && value <= 10000) {
+            phone_target_layer = (int) value;
+        }
+    }
+    std::map<int, ggml_phone_moti_layer_stats> phone_moti_layers;
+    size_t phone_moti_mixed_splits = 0;
 
     // read_bytes reflects process-attributed storage I/O including page faults
     // where Linux accounting supports it; it is NOT an exact per-weight counter.
@@ -1715,6 +1751,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              (sched->stream_target == 2 &&
                 strcmp(split_dev_name, "GPUOpenCL") == 0) ||
              (sched->stream_target == 3 && htp_index >= 0));
+        const bool phone_moti_htp = phone_moti && is_stream_split && htp_index >= 0;
+        int phone_layer = -1;
+        bool phone_mixed = false;
+        size_t phone_matmuls = 0;
         if (is_stream_split) {
             ++backend_splits;
             if (sched->stream_target == 3 && htp_index >= 0) {
@@ -1724,6 +1764,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         for (int ni = 0; ni < split->graph.n_nodes; ++ni) {
             const ggml_tensor * node = split->graph.nodes[ni];
             // Cross-backend copies may rename a source "HTP0#blk.X...".
+            if (phone_moti_htp &&
+                    (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+                    node->src[0]) {
+                const int idx = ggml_phone_moti_layer_index(node->src[0]->name);
+                if (idx >= 0) {
+                    ++phone_matmuls;
+                    if (phone_layer >= 0 && phone_layer != idx) phone_mixed = true;
+                    if (phone_layer < 0) phone_layer = idx;
+                }
+            }
             if (node->op == GGML_OP_MUL_MAT && node->src[0] &&
                     strstr(node->src[0]->name, "blk.") != NULL) {
                 ++total_blk_matmuls;
@@ -1737,8 +1787,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
         const char * trace_splits = getenv("GGML_OPENCL_STREAM_TRACE_SPLITS");
         const bool trace_split = is_stream_split && trace_splits != NULL && strcmp(trace_splits, "1") == 0;
-        const uint64_t split_read_before = trace_split ? read_io_bytes() : UINT64_MAX;
+        const uint64_t split_read_before = (trace_split || phone_moti_htp) ? read_io_bytes() : UINT64_MAX;
         const auto split_start = std::chrono::steady_clock::now();
+#ifdef __linux__
+        struct rusage phone_rusage_before = {};
+        if (phone_moti_htp) getrusage(RUSAGE_SELF, &phone_rusage_before);
+#endif
 
         // The input sources stay immutable for the lifetime of this split.
         // A staged host weight can be reclaimed only AFTER OpenCL completes.
@@ -1885,6 +1939,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const auto phone_stage_end = std::chrono::steady_clock::now();
+        const uint64_t phone_stage_read_after = phone_moti_htp ? read_io_bytes() : UINT64_MAX;
+#ifdef __linux__
+        struct rusage phone_rusage_stage_end = {};
+        if (phone_moti_htp) getrusage(RUSAGE_SELF, &phone_rusage_stage_end);
+#endif
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1924,6 +1985,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // Hexagon graph_compute currently flushes synchronously. Keep the
+        // diagnostic interval end-to-end if the execution becomes async.
+        if (phone_moti_htp) {
+            ggml_backend_synchronize(split_backend);
+        }
+        const auto phone_compute_end = std::chrono::steady_clock::now();
+
         // In CPU mode, weights are read directly by CPU operators instead
         // of appearing as split inputs. Reclaim them after their split.
         if (is_stream_split && sched->stream_target == 1) {
@@ -1954,6 +2022,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 advice_ms += std::chrono::duration<double, std::milli>(
                     std::chrono::steady_clock::now() - advice_start).count();
+            }
+        }
+
+        if (phone_moti_htp) {
+            if (phone_layer < 0 || phone_mixed) {
+                ++phone_moti_mixed_splits;
+            } else if (phone_target_layer < 0 || phone_target_layer == phone_layer) {
+                const double stage_ms = std::chrono::duration<double, std::milli>(
+                    phone_stage_end - split_start).count();
+                const double npu_wall_ms = std::chrono::duration<double, std::milli>(
+                    phone_compute_end - phone_stage_end).count();
+                const uint64_t read_bytes = split_read_before != UINT64_MAX &&
+                        phone_stage_read_after != UINT64_MAX &&
+                        phone_stage_read_after >= split_read_before ?
+                        phone_stage_read_after - split_read_before : 0;
+                long major_faults = 0;
+#ifdef __linux__
+                major_faults = phone_rusage_stage_end.ru_majflt - phone_rusage_before.ru_majflt;
+#endif
+                size_t weight_bytes = 0;
+                for (const ggml_tensor * src : staged_sources) {
+                    weight_bytes += ggml_nbytes(src);
+                }
+                GGML_LOG_INFO("[PHONE_MOTI_SPLIT] layer=%d split=%d session=%s matmuls=%zu "
+                              "stage_ms=%.3f npu_wall_ms=%.3f weight_mib=%.3f "
+                              "stage_read_mib=%.3f major_faults=%ld\n",
+                        phone_layer, split_id, split_dev_name, phone_matmuls,
+                        stage_ms, npu_wall_ms, weight_bytes / 1048576.0,
+                        read_bytes / 1048576.0, major_faults);
+                auto & aggregate = phone_moti_layers[phone_layer];
+                aggregate.stage_ms += stage_ms;
+                aggregate.npu_wall_ms += npu_wall_ms;
+                aggregate.stage_read_bytes += read_bytes;
+                aggregate.major_faults += major_faults;
+                aggregate.weight_bytes += weight_bytes;
+                aggregate.matmuls += phone_matmuls;
+                ++aggregate.splits;
             }
         }
 
@@ -1990,6 +2095,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+    }
+
+    if (phone_moti) {
+        for (const auto & item : phone_moti_layers) {
+            const int layer = item.first;
+            const auto & v = item.second;
+            GGML_LOG_INFO("[PHONE_MOTI_LAYER] layer=%d splits=%zu matmuls=%zu "
+                          "stage_ms=%.3f npu_wall_ms=%.3f weight_mib=%.3f "
+                          "stage_read_mib=%.3f major_faults=%ld\n",
+                    layer, v.splits, v.matmuls, v.stage_ms, v.npu_wall_ms,
+                    v.weight_bytes / 1048576.0, v.stage_read_bytes / 1048576.0,
+                    v.major_faults);
+        }
+        GGML_LOG_INFO("[PHONE_MOTI_DIAG] target_layer=%d mixed_or_unattributed_splits=%zu "
+                      "layer_count=%zu\n",
+                phone_target_layer, phone_moti_mixed_splits, phone_moti_layers.size());
     }
 
     if (sched->stream_weights_enabled) {
