@@ -167,7 +167,7 @@ def build_cli(
         "--flash-attn", "on",
         "-lv", str(verbosity),
         "--no-conversation", "--single-turn", "--simple-io",
-        "--no-show-timings",  # retain server prompt eval time, hide CLI duplicate
+        *(["--no-show-timings"] if exe.stem.lower() == "llama-cli" else []),
         "-p", prompt,
     ]
 
