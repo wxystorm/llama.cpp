@@ -849,7 +849,8 @@ def main(argv=None):
     runner.verify_independent_profile(
         source,
         short_chunks=not args.no_dag_placement,
-        fixed_chunk=64 if args.no_dag_placement else None)
+        fixed_chunk=64 if args.no_dag_placement else None,
+        adaptive_no_dag=args.no_dag_placement)
     anchor = args.prompt_dir / "prompt_1024_10.txt"
     manifest = runner.read_manifest(args.prompt_dir)
     if anchor.name not in manifest:
