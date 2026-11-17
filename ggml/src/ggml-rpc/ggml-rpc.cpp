@@ -514,6 +514,42 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     return true;
 }
 
+static bool jupiter_fig3_tag_and_calibrate(socket_ptr sock, const std::string & endpoint) {
+    if (!jupiter_fig3::pc_enabled()) return true;
+    const char * run_id = std::getenv("LLAMA_JUPITER_FIG3_RUN_ID");
+    if (!run_id || !*run_id || std::strlen(run_id) >= 96) {
+        GGML_LOG_ERROR("[JUPITER_FIG3] missing or invalid RUN_ID\n");
+        return false;
+    }
+    rpc_msg_jupiter_fig3_tag_req tag {};
+    std::strncpy(tag.run_id, run_id, sizeof(tag.run_id)-1);
+    rpc_msg_jupiter_fig3_tag_rsp ack {};
+    if (!send_rpc_cmd(sock, RPC_CMD_JUPITER_FIG3_TAG,
+                      &tag, sizeof(tag), &ack, sizeof(ack)) ||
+        ack.phone_instrumented != 1) {
+        GGML_LOG_ERROR("[JUPITER_FIG3] Phone binary or Phone profiler env is missing\n");
+        return false;
+    }
+    for (int i = 0; i < 8; ++i) {
+        rpc_msg_jupiter_fig3_clock_rsp rsp {};
+        const int64_t t0 = jupiter_fig3::ns();
+        const bool ok = send_rpc_cmd(sock, RPC_CMD_JUPITER_FIG3_CLOCK,
+                                     nullptr, 0, &rsp, sizeof(rsp));
+        const int64_t t3 = jupiter_fig3::ns();
+        if (!ok || t3 <= t0 || rsp.send_phone_ns < rsp.recv_phone_ns) return false;
+        const int64_t offset = ((rsp.recv_phone_ns-t0)+(rsp.send_phone_ns-t3))/2;
+        const int64_t bound = std::max<int64_t>(
+            0,(t3-t0-(rsp.send_phone_ns-rsp.recv_phone_ns))/2);
+        std::ostringstream row;
+        row << run_id << ',' << endpoint << ',' << offset << ',' << bound
+            << ',' << (t3-t0) << ',' << t0 << ',' << t3;
+        jupiter_fig3::pc_row("pc_clock_sync.csv",
+            "run_id,endpoint,offset_phone_minus_pc_ns,uncertainty_ns,rtt_ns,t0_pc_ns,t3_pc_ns",
+            row.str());
+    }
+    return true;
+}
+
 static std::shared_ptr<socket_t> get_socket_lane(const std::string & endpoint, const char * lane) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -543,6 +579,10 @@ static std::shared_ptr<socket_t> get_socket_lane(const std::string & endpoint, c
         return nullptr;
     }
     if (!negotiate_hello(sock)) {
+        return nullptr;
+    }
+    if (!jupiter_fig3_tag_and_calibrate(sock, endpoint)) {
+        GGML_LOG_ERROR("[JUPITER_FIG3] Phone Fig3 handshake failed\n");
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s lane=%s\n", __func__, endpoint.c_str(), lane_name.c_str());
