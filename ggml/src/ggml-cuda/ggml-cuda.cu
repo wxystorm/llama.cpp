@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/jupiter-fig3-trace.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -715,16 +716,24 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = jupiter_fig3_cuda::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "H2D_SYNC", size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    jupiter_fig3_cuda::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    jupiter_fig3_cuda::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = jupiter_fig3_cuda::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "D2H_SYNC", size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    jupiter_fig3_cuda::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    jupiter_fig3_cuda::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -732,9 +741,13 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = jupiter_fig3_cuda::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "H2D_2D_SYNC", size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    jupiter_fig3_cuda::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    jupiter_fig3_cuda::flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -742,9 +755,13 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const auto trace = jupiter_fig3_cuda::begin(ctx->device, cudaStreamPerThread,
+            "PCIe Copy", "D2H_2D_SYNC", size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    jupiter_fig3_cuda::end(trace, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    jupiter_fig3_cuda::flush(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2283,6 +2300,11 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    if (jupiter_fig3::pc_enabled()) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        jupiter_fig3_cuda::flush(cuda_ctx->device);
+    }
     delete cuda_ctx;
     delete backend;
 }
@@ -2293,7 +2315,10 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = jupiter_fig3_cuda::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "H2D_ASYNC", size);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    jupiter_fig3_cuda::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2302,7 +2327,10 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = jupiter_fig3_cuda::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "D2H_ASYNC", size);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    jupiter_fig3_cuda::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2312,8 +2340,11 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = jupiter_fig3_cuda::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "H2D_2D_ASYNC", size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    jupiter_fig3_cuda::end(trace, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -2323,8 +2354,11 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const auto trace = jupiter_fig3_cuda::begin(cuda_ctx->device, cuda_ctx->stream(),
+            "PCIe Copy", "D2H_2D_ASYNC", size*n_copies);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    jupiter_fig3_cuda::end(trace, cuda_ctx->stream());
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2386,7 +2420,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
-
+    jupiter_fig3_cuda::flush(cuda_ctx->device);
     GGML_UNUSED(backend);
 }
 
@@ -3785,6 +3819,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     };
 
+    const auto direct_trace = !use_cuda_graph
+        ? jupiter_fig3_cuda::begin(cuda_ctx->device, cuda_ctx->stream(),
+                                  "GPU Compute", "CUDA_DIRECT_GRAPH")
+        : jupiter_fig3_cuda::ticket{};
+
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
@@ -3952,6 +3991,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
     }
 
+    if (!use_cuda_graph) {
+        jupiter_fig3_cuda::end(direct_trace, cuda_ctx->stream());
+    }
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
@@ -3960,8 +4002,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        // Launch graph
+        // Record actual CUDA graph launch after capture/instantiate (never
+        // call cudaEventRecord inside stream capture).
+        const auto launch_trace = jupiter_fig3_cuda::begin(
+            cuda_ctx->device, cuda_ctx->stream(), "GPU Compute", "CUDA_GRAPH_LAUNCH");
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        jupiter_fig3_cuda::end(launch_trace, cuda_ctx->stream());
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
