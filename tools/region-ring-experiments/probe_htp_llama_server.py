@@ -90,6 +90,10 @@ def parse_args(argv=None):
                    help="run all 50 unique prompts, starting with prompt_1024_10.txt")
     p.add_argument("--per-request-chunks", action="store_true",
                    help="call native locked XC/XG/XP Planner on each real HTTP prefill")
+    p.add_argument("--replay-chunks-from", type=Path, default=None,
+                   help="baseline requests.jsonl containing 50 per-Prompt XC/XG/XP plans")
+    p.add_argument("--no-drain-first", action="store_true",
+                   help="Runtime ablation: use resource-aware FIFO, not Drain-First")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -122,6 +126,15 @@ def parse_args(argv=None):
         p.error("--prompt-dir not found")
     if args.threads <= 0 or args.startup_timeout <= 0:
         p.error("--threads and --startup-timeout must be positive")
+    if args.replay_chunks_from is not None:
+        if not args.replay_chunks_from.is_file():
+            p.error("--replay-chunks-from not found")
+        if not args.all50 or not args.per_request_chunks:
+            p.error("--replay-chunks-from requires --all50 --per-request-chunks")
+        if args.replay_chunks_from.resolve() == (args.out / "requests.jsonl").resolve():
+            p.error("Baseline requests.jsonl must not be the ablation output")
+    if args.no_drain_first and args.replay_chunks_from is None:
+        p.error("--no-drain-first requires recorded per-Prompt Chunk replay")
     if args.resume and not args.all50:
         p.error("--resume requires --all50 (the smoke test repeats the same prompt)")
     if args.limit < 0 or args.limit > 50 or (args.limit and not args.all50):
@@ -273,7 +286,8 @@ REQUEST_EXEC_RE = re.compile(
 
 def read_request_chunk_plan(log_path, offset, expected_tokens,
                             max_plan_xg=256, max_plan_xp=256,
-                            expected_layout=DEFAULT_CANONICAL_LAYOUT):
+                            expected_layout=DEFAULT_CANONICAL_LAYOUT,
+                            expected_source=None):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -285,6 +299,10 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
             "Native per-request Chunk decision missing or ambiguous "
             f"(matches={len(matches)}, expected_tokens={expected_tokens}); "
             f"check {log_path} for REGION_RING_REQUEST_CHUNK_PLAN")
+    if (expected_source is not None and
+            ("source=" + expected_source) not in matches[0].group(0)):
+        raise RuntimeError(
+            "Native request Chunk source mismatch: expected " + expected_source)
     tokens, layout, xc, xg, xp, planner_ms = matches[0].groups()
     if int(tokens) != expected_tokens:
         raise RuntimeError(
@@ -391,6 +409,13 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
                     "parallel": 1, "context": 2048},
         "inter_prompt_delay_seconds": args.inter_prompt_delay_seconds,
     }
+    if getattr(args, "replay_chunks_from", None) is not None:
+        base["recorded_chunk_reference"] = {
+            "path": str(args.replay_chunks_from.resolve()),
+            "sha256": sha256_file(args.replay_chunks_from),
+        }
+    if getattr(args, "no_drain_first", False):
+        base["runtime_ablation"] = "WO_DRAIN_FIRST"
     encoded = json.dumps(
         base, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")
@@ -398,6 +423,85 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         "fingerprint": hashlib.sha256(encoded).hexdigest(),
         "configuration": base,
     }
+
+
+def load_reference_chunks(path, prompts, layout, model, profile_source):
+    """Load 50 completed source plans; reject changed data, model or Profile.
+
+    Reuse selected XC/XG/XP, not runtime-tail coalesced widths or group means.
+    Server compares the actual decoded token count to the recorded prompt_n.
+    """
+    path = Path(path)
+    baseline_config = path.parent / "server-run-config.json"
+    if not baseline_config.is_file():
+        raise ValueError("Full Cycle server-run-config.json missing: "
+                         + str(baseline_config))
+    metadata = json.loads(baseline_config.read_text(encoding="utf-8"))
+    config = metadata.get("configuration") or {}
+    names = [p.name for p in prompts]
+    if config.get("prompts") != names:
+        raise ValueError("Full Cycle Prompt list/order differs from ablation")
+    for prompt in prompts:
+        if (config.get("prompt_sha256") or {}).get(prompt.name) != sha256_file(prompt):
+            raise ValueError("Full Cycle dataset changed: " + prompt.name)
+    if config.get("model") != file_identity(model):
+        raise ValueError("Full Cycle model identity differs from ablation")
+    for name in ("profile.csv", "profile.json"):
+        expected_hash = (config.get("profile_sha256") or {}).get(name)
+        if expected_hash != sha256_file(profile_source / name):
+            raise ValueError("Full Cycle Profile differs: " + name)
+    if (config.get("runtime_env") or {}).get(
+            "LLAMA_REGION_RING_DRAIN_FIRST_CYCLE") == "0":
+        raise ValueError("Reference already has Drain-First disabled")
+
+    rows = []
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                raise ValueError(f"Empty baseline row {line_number}")
+            rows.append(json.loads(line))
+    if len(rows) != len(prompts) or len(rows) != 50:
+        raise ValueError(
+            f"Full Cycle baseline requires 50 PASS rows; got {len(rows)}")
+
+    decisions = {}
+    for index, (row, prompt) in enumerate(zip(rows, prompts), 1):
+        if not isinstance(row, dict) or (
+                row.get("index") != index or
+                row.get("prompt") != prompt.name or
+                row.get("status") != "PASS" or
+                row.get("cache_n") != 0 or
+                row.get("runtime_layout") != layout):
+            raise ValueError(
+                f"Baseline row {index} is not a PASS for {prompt.name}"
+                f" at immutable layout {layout}")
+        tokens = row.get("prompt_n")
+        chunks = tuple(row.get(key) for key in
+                       ("plan_xc", "plan_xg", "plan_xp"))
+        if (type(tokens) is not int or tokens < 32 or tokens > 2048 or
+                any(type(x) is not int or x < 16 or x > 256
+                    for x in chunks) or
+                chunks[0] > tokens or 2 * chunks[1] > tokens or
+                chunks[2] > tokens):
+            raise ValueError(
+                f"Invalid recorded Chunk widths for {prompt.name}: "
+                + str(chunks))
+        decisions[prompt.name] = {
+            "prompt_n": tokens,
+            "plan_xc": chunks[0],
+            "plan_xg": chunks[1],
+            "plan_xp": chunks[2],
+        }
+    return decisions
+
+
+def write_replay_sidecar(path, tokens, layout, xc, xg, xp):
+    """Atomically replace only between requests while the server is idle."""
+    path = Path(path)
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(
+        f"{tokens} {layout} {xc} {xg} {xp}\n", encoding="ascii")
+    temp_path.replace(path)
 
 
 def load_completed_requests(path, prompts, fingerprint):
@@ -591,6 +695,12 @@ def main(argv=None):
                 raise ValueError(
                     f"Group 0 must be 64..128 actual tokens: {path.name}={tokens}")
 
+    reference_chunks = (
+        load_reference_chunks(
+            args.replay_chunks_from, prompts, args.locked_layout,
+            args.model, args.profile_source)
+        if args.replay_chunks_from is not None else None)
+
     # Reuse the tested runner's full Phone HTP / CUDA / RPC environment.
     # The independent Profile may contain historical X=8 entries;
     # the locked Chunk search never selects X=8.
@@ -632,11 +742,23 @@ def main(argv=None):
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XG"] == str(args.max_plan_xg)
     assert env["LLAMA_REGION_RING_LOCKED_MAX_XP"] == str(args.max_plan_xp)
     assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
+    if args.no_drain_first:
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "0"
+    if reference_chunks is not None:
+        env["LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE"] = str(
+            args.out / "request-chunk-replay.txt")
     if args.per_request_chunks:
         env["LLAMA_REGION_RING_PER_REQUEST_CHUNKS"] = "1"
     else:
         # Do not inherit a previous experimental run's per-request flag.
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
+    if reference_chunks is not None:
+        print("[SERVER_ABLATION] mode=" +
+              ("WO_DRAIN_FIRST" if args.no_drain_first else "FULL_CYCLE_REPLAY") +
+              " source=" + str(args.replay_chunks_from) +
+              " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
+              " native_chunk_search=DISABLED runtime_allocators=UNCHANGED",
+              flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
           ("PER_REQUEST_NATIVE_LOCKED_CHUNK_SEARCH" if args.per_request_chunks
@@ -688,16 +810,36 @@ def main(argv=None):
                     if (requested_this_process > 0 and
                             args.inter_prompt_delay_seconds > 0):
                         time.sleep(args.inter_prompt_delay_seconds)
+                    if reference_chunks is not None:
+                        ref = reference_chunks[path.name]
+                        write_replay_sidecar(
+                            args.out / "request-chunk-replay.txt",
+                            ref["prompt_n"], args.locked_layout,
+                            ref["plan_xc"], ref["plan_xg"], ref["plan_xp"])
                     prompt = path.read_text(encoding="utf-8-sig")
                     began = time.monotonic()
                     record = post_completion(args.port, prompt)
                     # Do not charge CSV/log parsing to the HTTP request wall.
                     http_wall_ms = round((time.monotonic() - began) * 1000, 3)
+                    if reference_chunks is not None and (
+                            record["prompt_n"] != ref["prompt_n"]):
+                        raise RuntimeError(
+                            f"Baseline token count mismatch for {path.name}: "
+                            f"baseline={ref['prompt_n']}, "
+                            f"actual={record['prompt_n']}")
                     if args.per_request_chunks:
                         decision, log_offset = read_request_chunk_plan(
                             log_path, log_offset, record["prompt_n"],
                             args.max_plan_xg, args.max_plan_xp,
-                            args.locked_layout)
+                            args.locked_layout,
+                            "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
+                            else "LOCKED_CHUNK_ONLY")
+                        if reference_chunks is not None and any(
+                                decision["plan_" + name] != ref["plan_" + name]
+                                for name in ("xc", "xg", "xp")):
+                            raise RuntimeError(
+                                "Replayed Chunk differs from Full Cycle for "
+                                + path.name)
                         record.update(decision)
                     record.update({
                         "prompt": path.name, "index": i,
@@ -707,7 +849,8 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
-                            "PER_REQUEST_LOCKED" if args.per_request_chunks
+                            "REFERENCE_CHUNK_REPLAY" if reference_chunks is not None
+                            else "PER_REQUEST_LOCKED" if args.per_request_chunks
                             else "STARTUP_ONLY"),
                         "runtime_layout": fake_args.locked_layout,
                         "status": "PASS",
