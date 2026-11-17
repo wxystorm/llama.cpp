@@ -956,20 +956,69 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+struct ggml_moti_cuda_event_pair {
+    cudaEvent_t start, end;
+};
+static thread_local std::vector<ggml_moti_cuda_event_pair> ggml_moti_cuda_graph_events;
+static thread_local std::vector<std::pair<ggml_moti_cuda_event_pair, std::pair<bool, size_t>>> ggml_moti_cuda_copy_events;
+static void ggml_moti_cuda_sample_memory() {
+    if (!ggml_moti_active()) return;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) ggml_moti_gpu_mem(total_b-free_b, total_b);
+}
+static ggml_moti_cuda_event_pair ggml_moti_cuda_event_begin(cudaStream_t stream) {
+    ggml_moti_cuda_event_pair pair = {};
+    CUDA_CHECK(cudaEventCreate(&pair.start));
+    CUDA_CHECK(cudaEventCreate(&pair.end));
+    CUDA_CHECK(cudaEventRecord(pair.start, stream));
+    return pair;
+}
+static void ggml_moti_cuda_event_finish(ggml_moti_cuda_event_pair pair, cudaStream_t stream, bool copy, bool h2d = false, size_t bytes = 0) {
+    CUDA_CHECK(cudaEventRecord(pair.end, stream));
+    if (copy) ggml_moti_cuda_copy_events.push_back({pair, {h2d, bytes}});
+    else ggml_moti_cuda_graph_events.push_back(pair);
+}
+static void ggml_moti_cuda_collect_events() {
+    for (auto pair : ggml_moti_cuda_graph_events) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, pair.start, pair.end) == cudaSuccess)
+            ggml_moti_gpu((uint64_t) (ms*1000.0f));
+        CUDA_CHECK(cudaEventDestroy(pair.start));
+        CUDA_CHECK(cudaEventDestroy(pair.end));
+    }
+    ggml_moti_cuda_graph_events.clear();
+    for (auto entry : ggml_moti_cuda_copy_events) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, entry.first.start, entry.first.end) == cudaSuccess)
+            ggml_moti_copy(entry.second.first, entry.second.second, (uint64_t) (ms*1000.0f));
+        CUDA_CHECK(cudaEventDestroy(entry.first.start));
+        CUDA_CHECK(cudaEventDestroy(entry.first.end));
+    }
+    ggml_moti_cuda_copy_events.clear();
+}
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const bool profile = ggml_moti_active();
+    const auto e = profile ? ggml_moti_cuda_event_begin(cudaStreamPerThread) : ggml_moti_cuda_event_pair{};
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    if (profile) ggml_moti_cuda_event_finish(e, cudaStreamPerThread, true, true, size);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (profile) ggml_moti_cuda_collect_events();
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const bool profile = ggml_moti_active();
+    const auto e = profile ? ggml_moti_cuda_event_begin(cudaStreamPerThread) : ggml_moti_cuda_event_pair{};
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    if (profile) ggml_moti_cuda_event_finish(e, cudaStreamPerThread, true, false, size);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (profile) ggml_moti_cuda_collect_events();
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -5264,47 +5313,6 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     return graph->is_enabled();
 }
 #endif // USE_CUDA_GRAPH
-
-struct ggml_moti_cuda_event_pair {
-    cudaEvent_t start, end;
-};
-static thread_local std::vector<ggml_moti_cuda_event_pair> ggml_moti_cuda_graph_events;
-static thread_local std::vector<std::pair<ggml_moti_cuda_event_pair, std::pair<bool, size_t>>> ggml_moti_cuda_copy_events;
-static void ggml_moti_cuda_sample_memory() {
-    if (!ggml_moti_active()) return;
-    size_t free_b = 0, total_b = 0;
-    if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) ggml_moti_gpu_mem(total_b-free_b, total_b);
-}
-static ggml_moti_cuda_event_pair ggml_moti_cuda_event_begin(cudaStream_t stream) {
-    ggml_moti_cuda_event_pair pair = {};
-    CUDA_CHECK(cudaEventCreate(&pair.start));
-    CUDA_CHECK(cudaEventCreate(&pair.end));
-    CUDA_CHECK(cudaEventRecord(pair.start, stream));
-    return pair;
-}
-static void ggml_moti_cuda_event_finish(ggml_moti_cuda_event_pair pair, cudaStream_t stream, bool copy, bool h2d = false, size_t bytes = 0) {
-    CUDA_CHECK(cudaEventRecord(pair.end, stream));
-    if (copy) ggml_moti_cuda_copy_events.push_back({pair, {h2d, bytes}});
-    else ggml_moti_cuda_graph_events.push_back(pair);
-}
-static void ggml_moti_cuda_collect_events() {
-    for (auto pair : ggml_moti_cuda_graph_events) {
-        float ms = 0;
-        if (cudaEventElapsedTime(&ms, pair.start, pair.end) == cudaSuccess)
-            ggml_moti_gpu((uint64_t) (ms*1000.0f));
-        CUDA_CHECK(cudaEventDestroy(pair.start));
-        CUDA_CHECK(cudaEventDestroy(pair.end));
-    }
-    ggml_moti_cuda_graph_events.clear();
-    for (auto entry : ggml_moti_cuda_copy_events) {
-        float ms = 0;
-        if (cudaEventElapsedTime(&ms, entry.first.start, entry.first.end) == cudaSuccess)
-            ggml_moti_copy(entry.second.first, entry.second.second, (uint64_t) (ms*1000.0f));
-        CUDA_CHECK(cudaEventDestroy(entry.first.start));
-        CUDA_CHECK(cudaEventDestroy(entry.first.end));
-    }
-    ggml_moti_cuda_copy_events.clear();
-}
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
