@@ -21,7 +21,7 @@ from typing import Optional
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 RUNNER = HERE / "run_32b_all40.py"
-LAYOUT = "G8,P6,G8,P6,G8,P6,G8,P6,G8"
+LAYOUT = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
 GROUPS = (128, 512, 1024)
 CHUNKS = (32, 64, 128)
 ENV_POLICY = {
