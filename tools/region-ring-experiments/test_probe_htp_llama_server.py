@@ -720,6 +720,18 @@ class ServerProbeTests(unittest.TestCase):
             self.assertIsNone(valid_no_dag.fixed_chunk)
             self.assertTrue(valid_no_dag.per_request_chunks)
             self.assertEqual(valid_no_dag.locked_layout, new_layout)
+            skip_no_dag = probe.parse_args(dynamic_args + [
+                "--no-dag-placement", "--skip-plan-memory-checks"])
+            self.assertTrue(skip_no_dag.skip_plan_memory_checks)
+            self.assertFalse(skip_no_dag.guarded_memory_checks)
+            self.assertEqual(skip_no_dag.locked_layout, new_layout)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(dynamic_args + [
+                    "--no-dag-placement", "--skip-plan-memory-checks",
+                    "--guarded-memory-checks"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(dynamic_args + [
+                    "--skip-plan-memory-checks"])
             with self.assertRaises(SystemExit):
                 probe.parse_args(args_list + [
                     "--no-dag-placement", "--guarded-memory-checks"])
@@ -740,6 +752,21 @@ class ServerProbeTests(unittest.TestCase):
                 without_all50 = args_list.copy()
                 without_all50.remove("--all50")
                 probe.parse_args(without_all50)
+
+    def test_locked_no_dag_memory_skip_is_estimate_only(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "src" / "llama-hybrid.cpp").read_text(encoding="utf-8")
+        # Guarded new-placement search must remain separate from the
+        # already-supported explicit skip on an immutable locked layout.
+        no_dag = source.split(
+            'const bool no_dag_planner =', 1)[1].split(
+            'if (wide_apply && selected_layout != nullptr)', 1)[0]
+        self.assertIn('model.linear_no_dag_ablation = true;', no_dag)
+        self.assertNotIn('skip_locked_memory || !model.memory_feasible',
+                         no_dag)
+        self.assertIn('skip_locked_memory ? "ESTIMATES_SKIPPED"', no_dag)
+        self.assertIn('if (!skip_locked_memory &&', source)
+        self.assertIn('policy=SKIP_ESTIMATES_ONLY', source)
 
     def test_no_dag_dynamic_chunks_preserve_locked_layout_and_source(self):
         layout = "G8,P4,G6,C1,P5,G8,C1,P5,G6,P6,G8,C1,G5"
