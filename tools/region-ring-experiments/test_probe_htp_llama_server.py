@@ -52,6 +52,18 @@ class ServerProbeTests(unittest.TestCase):
             self.assertEqual(
                 probe.runner.verify_independent_profile(
                     csv_path, fixed_chunk=64), 1)
+            with self.assertRaisesRegex(ValueError, "measured CPU X32"):
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64, adaptive_no_dag=True)
+            rows.extend([
+                dict(zip(names, (dev, 2, 32, kv, 1, 0, 2, 3, 0, 5)))
+                for dev, kv in (("CPU", 256), ("GPU", 256),
+                                ("PHONE", 256))
+            ])
+            save()
+            self.assertEqual(
+                probe.runner.verify_independent_profile(
+                    csv_path, fixed_chunk=64, adaptive_no_dag=True), 2)
             with self.assertRaisesRegex(ValueError, "Short Chunk run"):
                 probe.runner.verify_independent_profile(
                     csv_path, short_chunks=True)
