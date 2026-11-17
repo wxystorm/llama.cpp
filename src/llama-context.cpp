@@ -1886,6 +1886,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        const int64_t fig3_chunk_start_ns =
+            jupiter_fig3::pc_enabled() && n_tokens_all > 1 ? jupiter_fig3::ns() : 0;
 
         if (jupiter_trace && n_tokens_all > 1) {
             LLAMA_LOG_INFO(
@@ -1927,6 +1929,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        if (fig3_chunk_start_ns && res != nullptr) {
+            std::ostringstream row;
+            row << jupiter_chunk_idx << ','
+                << (jupiter_chunk_idx % (uint32_t) jupiter_window) << ','
+                << n_tokens_prev << ',' << ubatch.n_tokens << ','
+                << fig3_chunk_start_ns << ',' << jupiter_fig3::ns();
+            jupiter_fig3::pc_row("pc_chunks.csv",
+                "chunk,slot,prefix_tokens,tokens,start_ns,queued_ns", row.str());
+        }
         if (jupiter_trace && n_tokens_all > 1 && res != nullptr) {
             LLAMA_LOG_INFO(
                     "[JUPITER_UBATCH] event=QUEUED chunk=%u slot=%u prefix_tokens=%lld tokens=%u t_us=%lld\n",
