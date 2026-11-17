@@ -94,6 +94,8 @@ def parse_args(argv=None):
                    help="baseline requests.jsonl containing 50 per-Prompt XC/XG/XP plans")
     p.add_argument("--no-drain-first", action="store_true",
                    help="Runtime ablation: use resource-aware FIFO, not Drain-First")
+    p.add_argument("--no-async-prefetch", action="store_true",
+                   help="Runtime ablation: retain both GPU banks but load later weights synchronously on demand")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -135,6 +137,10 @@ def parse_args(argv=None):
             p.error("Baseline requests.jsonl must not be the ablation output")
     if args.no_drain_first and args.replay_chunks_from is None:
         p.error("--no-drain-first requires recorded per-Prompt Chunk replay")
+    if args.no_async_prefetch and args.replay_chunks_from is None:
+        p.error("--no-async-prefetch requires recorded per-Prompt Chunk replay")
+    if args.no_drain_first and args.no_async_prefetch:
+        p.error("Select only one Runtime ablation at a time")
     if args.resume and not args.all50:
         p.error("--resume requires --all50 (the smoke test repeats the same prompt)")
     if args.limit < 0 or args.limit > 50 or (args.limit and not args.all50):
@@ -288,7 +294,8 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
                             max_plan_xg=256, max_plan_xp=256,
                             expected_layout=DEFAULT_CANONICAL_LAYOUT,
                             expected_source=None,
-                            expected_sched_mode=None):
+                            expected_sched_mode=None,
+                            expect_sync_bank_demand=False):
     """Read only logs appended since the previous HTTP request finished."""
     with Path(log_path).open("rb") as stream:
         stream.seek(offset)
@@ -301,6 +308,13 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
             raise RuntimeError(
                 "Runtime scheduler ablation did not confirm resource-aware "
                 + expected_sched_mode)
+    if expect_sync_bank_demand:
+        if not re.search(
+                r"\[REGION_RING_ABLATION\] gpu_banks=2 gpu_prefetch=0 "
+                r"gpu_bank_mover=0 status=CONFIGURED", data):
+            raise RuntimeError(
+                "w/o Async Prefetch did not retain 2 GPU banks "
+                "and disable background mover")
     matches = list(REQUEST_PLAN_RE.finditer(data))
     if len(matches) != 1:
         raise RuntimeError(
@@ -424,6 +438,8 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         }
     if getattr(args, "no_drain_first", False):
         base["runtime_ablation"] = "WO_DRAIN_FIRST"
+    if getattr(args, "no_async_prefetch", False):
+        base["runtime_ablation"] = "WO_ASYNC_PREFETCH"
     encoded = json.dumps(
         base, ensure_ascii=False, sort_keys=True,
         separators=(",", ":")).encode("utf-8")
@@ -612,7 +628,7 @@ def write_reports(out, records):
         "request_wall_ms", "predicted_n", "planner_mode",
         "plan_xc", "plan_xg", "plan_xp", "planner_ms",
         "runtime_xc", "runtime_xg", "runtime_xp",
-        "runtime_layout", "scheduler_mode", "status",
+        "runtime_layout", "scheduler_mode", "prefetch_mode", "status",
     ]
     with (out / "requests.csv").open(
             "w", encoding="utf-8-sig", newline="") as stream:
@@ -756,6 +772,13 @@ def main(argv=None):
     assert env["LLAMA_REGION_RING_LOCKED_SHORT_CHUNKS"] == "1"
     if args.no_drain_first:
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "0"
+    if args.no_async_prefetch:
+        # Existing native Runtime ablation: keep both fixed-parity banks and
+        # initial resident G Regions; later G Regions demand-upload on the
+        # GPU worker rather than a background Bank Mover thread.
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "0"
+        env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
     if reference_chunks is not None:
         env["LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE"] = str(
             args.out / "request-chunk-replay.txt")
@@ -766,7 +789,9 @@ def main(argv=None):
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
     if reference_chunks is not None:
         print("[SERVER_ABLATION] mode=" +
-              ("WO_DRAIN_FIRST" if args.no_drain_first else "FULL_CYCLE_REPLAY") +
+              ("WO_DRAIN_FIRST" if args.no_drain_first else
+               "WO_ASYNC_PREFETCH" if args.no_async_prefetch else
+               "FULL_CYCLE_REPLAY") +
               " source=" + str(args.replay_chunks_from) +
               " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
               " native_chunk_search=SCORED_NOT_APPLIED runtime_allocators=UNCHANGED",
@@ -848,7 +873,9 @@ def main(argv=None):
                             args.locked_layout,
                             "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
                             else "LOCKED_CHUNK_ONLY",
-                            "FIFO" if args.no_drain_first else None)
+                            "FIFO" if args.no_drain_first else
+                            "DRAIN_FIRST" if args.no_async_prefetch else None,
+                            args.no_async_prefetch)
                         if reference_chunks is not None and any(
                                 decision["plan_" + name] != ref["plan_" + name]
                                 for name in ("xc", "xg", "xp")):
@@ -869,7 +896,10 @@ def main(argv=None):
                             else "STARTUP_ONLY"),
                         "runtime_layout": fake_args.locked_layout,
                         **({"scheduler_mode": "FIFO"}
-                           if args.no_drain_first else {}),
+                           if args.no_drain_first else
+                           {"scheduler_mode": "DRAIN_FIRST",
+                            "prefetch_mode": "SYNC_DEMAND"}
+                           if args.no_async_prefetch else {}),
                         "status": "PASS",
                     })
                     if args.all50:
