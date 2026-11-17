@@ -10973,12 +10973,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
             std::getenv("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE");
         const bool replay_requested =
             replay_path != nullptr && *replay_path != '\0';
-        // Planner w/o Profile ablation: replace request-time DAG/Chunk
-        // search with a single predeclared width, clipped only to legal
-        // token counts. The original model placement/HTP profile is still
-        // loaded ONCE before requests; runtime allocation is unchanged.
-        // On a two-Bank run, XG <= floor(tokens/2) is mandatory, hence
-        // short prompts cannot literally execute XG=128.
+        // Planner w/o dynamic Chunk/Profile ablation. Do not invoke the
+        // request-time DAG search: use width=128 on long prompts, and a
+        // SINGLE full-prompt Chunk for prompts shorter than 128. In the
+        // latter case the two-Bank async Mover is explicitly forced by
+        // LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH=1, avoiding the
+        // ordinary >=2 GPU Chunk gate. Model layer placement is immutable.
         const char * fixed_chunk_raw =
             std::getenv("LLAMA_REGION_RING_FIXED_CHUNK_ABLATION");
         const bool fixed_chunk_requested =
@@ -10987,48 +10987,35 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (fixed_chunk_requested) {
             char * end = nullptr;
             const long target = std::strtol(fixed_chunk_raw, &end, 10);
-            const std::array<int, 10> legal = {
-                32, 48, 64, 80, 96, 112, 128, 160, 192, 256
-            };
+            const char * force_small_batch_raw =
+                std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
             if (replay_requested || end == fixed_chunk_raw ||
-                    *end != '\0' ||
-                    std::find(legal.begin(), legal.end(), target) ==
-                        legal.end()) {
+                    *end != '\0' || target != 128 ||
+                    force_small_batch_raw == nullptr ||
+                    std::strcmp(force_small_batch_raw, "1") != 0) {
                 LLAMA_LOG_ERROR(
                     "[REGION_RING_FIXED_CHUNK] event=REJECT"
-                    " reason=INVALID_TARGET_OR_REPLAY_CONFLICT"
+                    " reason=TARGET_REPLAY_OR_SMALL_BATCH_POLICY"
                     " target=%s status=FAIL\n", fixed_chunk_raw);
                 return -1;
             }
-            const auto legal_clamp = [&](int available) -> int {
-                int selected_width = 0;
-                for (const int width : legal) {
-                    if (width <= target && width <= available) {
-                        selected_width = width;
-                    }
-                }
-                return selected_width;
-            };
-            request_xc = legal_clamp((int) n_tokens_all);
-            request_xg = legal_clamp((int) n_tokens_all / 2);
-            request_xp = legal_clamp((int) n_tokens_all);
-            if (request_xc == 0 || request_xg == 0 || request_xp == 0) {
-                LLAMA_LOG_ERROR(
-                    "[REGION_RING_FIXED_CHUNK] event=REJECT"
-                    " reason=NO_LEGAL_TWO_BANK_CHUNK"
-                    " target=%ld tokens=%u status=FAIL\n",
-                    target, n_tokens_all);
-                return -1;
-            }
+            const int fixed_width =
+                std::min((int) target, (int) n_tokens_all);
+            request_xc = fixed_width;
+            request_xg = fixed_width;
+            request_xp = fixed_width;
             request_layout = model.hybrid_ring_plan_layout;
             selected = true;
             LLAMA_LOG_INFO(
                 "[REGION_RING_FIXED_CHUNK] target=%ld tokens=%u"
                 " XC=%d XG=%d XP=%d"
-                " policy=LEGAL_CLAMP_ONLY"
+                " policy=%s"
+                " gpu_small_batch_mover=FORCED"
                 " profile_queries=0 status=PASS\n",
                 target, n_tokens_all,
-                request_xc, request_xg, request_xp);
+                request_xc, request_xg, request_xp,
+                (int) n_tokens_all < target ?
+                    "WHOLE_PROMPT_SINGLE_CHUNK" : "FIXED_128");
         } else if (replay_requested) {
             std::ifstream replay(replay_path);
             uint32_t replay_tokens = 0;
