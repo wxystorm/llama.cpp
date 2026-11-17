@@ -9138,6 +9138,11 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                             << pc_phone_overlap_us / 1000.0 << ","
                             << "\"gpu_bank_streaming\":"
                             << (gpu_bank_streaming ? "true" : "false")
+                            << ",\"gpu_bank_async_prefetch\":"
+                            << (gpu_bank_streaming && !gpu_bank_sync_demand ?
+                                "true" : "false")
+                            << ",\"gpu_bank_sync_demand\":"
+                            << (gpu_bank_sync_demand ? "true" : "false")
                             << ",\"resource_aware_chunk_sched\":"
                             << (resource_aware_chunk_sched ? "true" : "false")
                             << ",\"drain_first_cycle\":"
