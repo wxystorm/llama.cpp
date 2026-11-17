@@ -470,6 +470,104 @@ class ServerProbeTests(unittest.TestCase):
                     log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_REPLAY",
                     "DRAIN_FIRST")
 
+    def test_wo_async_prefetch_requires_baseline_and_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, model = root / "llama-server.exe", root / "model.gguf"
+            server.write_bytes(b"stub")
+            model.write_bytes(b"stub")
+            reference = root / "full-cycle-requests.jsonl"
+            reference.write_text("{}\n", encoding="utf-8")
+            base = [
+                "--server-exe", str(server), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(root), "--profile-source", str(root),
+                "--out", str(root / "ablation"),
+                "--all50", "--per-request-chunks",
+                "--replay-chunks-from", str(reference),
+            ]
+            parsed = probe.parse_args(base + ["--no-async-prefetch"])
+            self.assertTrue(parsed.no_async_prefetch)
+            self.assertFalse(parsed.no_drain_first)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(
+                    base + ["--no-async-prefetch", "--no-drain-first"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args([
+                    "--server-exe", str(server), "--model", str(model),
+                    "--rpc", "127.0.0.1:50052",
+                    "--prompt-dir", str(root),
+                    "--profile-source", str(root),
+                    "--out", str(root / "ablation"),
+                    "--no-async-prefetch",
+                ])
+
+    def test_sync_demand_log_verifies_two_banks_and_drain_first(self):
+        layout = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+        prefix = (
+            "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=0"
+            " phone_push_aware=1 status=READY\n"
+            "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
+            " rule=EARLIEST_EXECUTABLE_REGION status=READY\n")
+        selected = (
+            "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+            f" tokens=66 kv_start=0 layout={layout}"
+            " XC=16 XG=24 XP=32"
+            " startup_XC=32 startup_XG=32 startup_XP=32"
+            " changed=1 planner_ms=0.200"
+            " source=LOCKED_CHUNK_REPLAY"
+            " layer_placement=IMMUTABLE"
+            " execution=THIS_DECODE_ONLY status=PASS\n"
+            "[REGION_RING_SUM] tokens=66 XC=0 XG=24 XP=33"
+            " regions=11 first_region_chunks=3 tasks=33"
+            " executed=33 complete=1 wall_ms=300"
+            " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
+        mode = (
+            "[REGION_RING_ABLATION] gpu_banks=2 gpu_prefetch=0"
+            " gpu_bank_mover=0 status=CONFIGURED\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "server.log"
+            log.write_text(mode + prefix + selected, encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 66, 256, 256, layout,
+                "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
+            self.assertEqual(
+                (result["plan_xg"], result["plan_xp"]), (24, 32))
+            log.write_text(prefix + selected, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "w/o Async Prefetch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
+            log.write_text(
+                mode.replace("gpu_banks=2", "gpu_banks=1")
+                + prefix + selected, encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "w/o Async Prefetch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
+            log.write_text(
+                mode + prefix.replace(
+                    "mode=DRAIN_FIRST", "mode=FIFO") + selected,
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "scheduler ablation"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", True)
+
+    def test_sync_bank_demand_is_existing_runtime_not_bank_count_change(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "src" / "llama-context.cpp").read_text(encoding="utf-8")
+        for token in (
+            '"LLAMA_REGION_RING_GPU_BANK_PREFETCH"',
+            "gpu_bank_prefetch_enabled =",
+            "gpu_bank_initial_residency =",
+            "gpu_bank_streaming || !gpu_bank_prefetch_enabled",
+            "if (gpu_bank_streaming)",
+            "gpu_region_order.size() == 1 ?",
+            '"SMALL_BATCH_DEMAND"',
+        ):
+            self.assertIn(token, source)
+
     def test_cpp_request_replay_hook_checks_tokens_and_layout(self):
         source = (Path(__file__).resolve().parents[2] /
                   "src" / "llama-context.cpp").read_text(encoding="utf-8")
