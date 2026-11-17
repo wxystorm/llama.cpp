@@ -163,9 +163,8 @@ def parse_args(argv=None):
         if args.no_drain_first or args.no_async_prefetch or args.no_multi_cycle:
             p.error("Select only one ablation at a time")
         if args.model_layers != 64 or (
-                args.locked_layout != DEFAULT_CANONICAL_LAYOUT and
-                not args.no_dag_placement):
-            p.error("--fixed-chunk requires 32B Full Cycle locked layout, unless --no-dag-placement")
+                args.locked_layout != DEFAULT_CANONICAL_LAYOUT):
+            p.error("--fixed-chunk requires the 32B Full Cycle locked layout")
     if args.no_dag_placement:
         if (not args.all50 or not args.per_request_chunks or
                 args.fixed_chunk is not None or
