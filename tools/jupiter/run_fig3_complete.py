@@ -30,17 +30,19 @@ except ImportError:
 
 TIMING = re.compile(
     r"prompt eval time\s*=\s*([\d.]+)\s*ms\s*/\s*(\d+)\s*tokens",re.IGNORECASE)
-BRANCH = "exp/jupiter-fig3-full-trace-20261118"
+BRANCH = "exp/jupiter-fig3-32b-20261118"
 
 
 def parser():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--exe",default=r".\build-jupiter\bin\Release\llama-cli.exe")
-    p.add_argument("--model",default=r"E:\llama\models\Qwen3-14B-Q4_K_M.gguf")
+    p.add_argument("--model",default=r"E:\llama\models\Qwen3-32B-Q4_K_M.gguf")
     p.add_argument("--prompt-file",
                    default=r"E:\llama\datasets\sharegpt\sharegpt50_short\prompt_1024_01.txt")
     p.add_argument("--rpc",default="10.238.229.239:10139")
-    p.add_argument("--pc-layers",type=int,default=24)
+    p.add_argument("--pc-layers",type=int,default=53)
+    p.add_argument("--model-layers",type=int,default=64,
+                   help="number of transformer layers (64 for Qwen3-32B)")
     p.add_argument("--context",type=int,default=2048)
     p.add_argument("--batch",type=int,default=2048)
     p.add_argument("--ubatch",type=int,default=128)
@@ -53,7 +55,7 @@ def parser():
     p.add_argument("--local-graph-reuse",action="store_true")
     p.add_argument("--normal-repeats",type=int,default=3)
     p.add_argument("--warmups",type=int,default=1)
-    p.add_argument("--out-dir",default="fig3-jupiter14b-complete")
+    p.add_argument("--out-dir",default="fig3-jupiter32b-complete")
     p.add_argument("--resume",action="store_true",
                    help="reuse all completed Profile and normal runs after interruption")
     p.add_argument("--analyze-only",action="store_true",
@@ -66,7 +68,7 @@ def parser():
     p.add_argument("--phone-host",default="")
     p.add_argument("--phone-ssh-port",type=int,default=8022)
     p.add_argument("--phone-remote-file",
-                   default="/data/data/com.termux/files/home/jupiter-fig3-phone.csv")
+                   default="/data/data/com.termux/files/home/jupiter-fig3-phone-32b.csv")
     p.add_argument("--skip-scp",action="store_true")
     p.add_argument("--clock-limit-ms",type=float,default=20.0)
     return p
@@ -127,8 +129,8 @@ def write_json(path: Path, value: dict):
 
 
 def check_paths(args, run_modes: bool):
-    if args.pc_layers<=0 or args.pc_layers>=40:
-        raise ValueError("14B requires 1..39 PC layers; remaining 40-PC are Phone layers")
+    if args.model_layers < 2 or not (1 <= args.pc_layers < args.model_layers):
+        raise ValueError(f"require 1 <= PC layers < model layers; got {args.pc_layers}/{args.model_layers}")
     if not (1<=args.ubatch<=args.batch<=args.context):
         raise ValueError("require 1 <= ubatch <= batch <= context")
     if args.window<1 or args.threads<1 or args.warmups<0 or args.normal_repeats<1:
@@ -280,7 +282,8 @@ def finalize(args,root,manifest):
     formal=argparse.Namespace(
         profile_dir=str(profile_dir),phone_events=str(phone),
         run_id=manifest["run_id"],normal_prefill_ms=normal_ms,
-        pc_layers=args.pc_layers,expected_tokens=manifest["profile"]["tokens"],
+        pc_layers=args.pc_layers,model_layers=args.model_layers,
+        expected_tokens=manifest["profile"]["tokens"],
         endpoint=args.rpc,max_clock_uncertainty_ms=args.clock_limit_ms,
         out_dir=str(profile_dir),allow_multiple_windows=False,
     )
@@ -299,7 +302,7 @@ def main():
     root=Path(args.out_dir).resolve()
     if args.dry_run:
         print("[JUPITER_FIG3] DRY_RUN_PASS: baseline=Jupiter original Layer Pipeline")
-        print(f"[JUPITER_FIG3] PC={args.pc_layers} Phone={40-args.pc_layers}, "
+        print(f"[JUPITER_FIG3] Model={args.model_layers} layers PC={args.pc_layers} Phone={args.model_layers-args.pc_layers}, "
               f"ubatch={args.ubatch} window={args.window} RPC={args.rpc}")
         print("[JUPITER_FIG3] command=",cli(args,"<contents-of-prompt-file>"))
         return
@@ -313,6 +316,7 @@ def main():
             # Restore source experiment args instead of silently mixing settings.
             args.rpc=manifest["rpc"]
         args.pc_layers=manifest["pc_layers"]
+        args.model_layers=manifest["model_layers"]
         finalize(args,root,manifest)
         return
     if manifest_file.exists():
@@ -320,8 +324,11 @@ def main():
             raise RuntimeError(f"{manifest_file} already exists. Use --resume "
                                "to avoid repeating already completed inference.")
         manifest=json.loads(manifest_file.read_text(encoding="utf-8"))
-        if manifest["rpc"]!=args.rpc or manifest["pc_layers"]!=args.pc_layers:
-            raise ValueError("Cannot resume with different model partition or Phone endpoint")
+        if (manifest["rpc"]!=args.rpc or manifest["pc_layers"]!=args.pc_layers or
+            manifest.get("model_layers")!=args.model_layers or
+            manifest["model"]["path"]!=str(Path(args.model).resolve()) or
+            manifest["prompt_file"]["path"]!=str(Path(args.prompt_file).resolve())):
+            raise ValueError("Cannot resume with different model/layers/prompt or Phone endpoint")
     else:
         prompt=Path(args.prompt_file).read_text(encoding="utf-8-sig").rstrip("\r\n")
         manifest={
@@ -330,8 +337,8 @@ def main():
             "model":identity(Path(args.model)), "exe":identity(Path(args.exe)),
             "prompt_file":identity(Path(args.prompt_file)),
             "prompt_sha256":hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
-            "rpc":args.rpc,"pc_layers":args.pc_layers,
-            "phone_layers":40-args.pc_layers,
+            "rpc":args.rpc,"pc_layers":args.pc_layers,"model_layers":args.model_layers,
+            "phone_layers":args.model_layers-args.pc_layers,
             "context":args.context,"batch":args.batch,"ubatch":args.ubatch,
             "window":args.window,"threads":args.threads,
             "async_c2p":args.async_c2p,"local_graph_reuse":args.local_graph_reuse,
