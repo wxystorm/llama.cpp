@@ -29,15 +29,13 @@ class Fig3Test(unittest.TestCase):
         source = [
             dict(a=0, b=30, category="GPU Compute"),
             dict(a=10, b=20, category="Phone Compute"),
-            dict(a=40, b=60, category="Coordination"),
+            dict(a=40, b=60, category="RPC / Coordination"),
         ]
         timeline, counts, overlap = projection(source, 0, 100)
         self.assertEqual(sum(counts.values()), 100)
         self.assertEqual(counts["Phone Compute"], 10)
         self.assertEqual(counts["GPU Compute"], 20)
-        self.assertEqual(counts["RPC / Coordination"], 0 if False else 0)
-        # Projection operates on normalized source classes; Coordination
-        # is mapped by inspect() rather than projection().
+        self.assertEqual(counts["RPC / Coordination"], 20)
         self.assertEqual(overlap, 10)
         self.assertEqual(timeline[0]["a"], 0)
         self.assertEqual(timeline[-1]["b"], 100)
