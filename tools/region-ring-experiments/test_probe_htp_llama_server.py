@@ -593,6 +593,148 @@ class ServerProbeTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_planner_fixed_128_short_prompt_is_whole_one_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "llama-server.exe"
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            server.write_bytes(b"stub")
+            model.write_bytes(b"stub")
+            baseline = root / "baseline.jsonl"
+            baseline.write_text("{}\n", encoding="utf-8")
+            args_list = [
+                "--server-exe", str(server), "--model", str(model),
+                "--rpc", "127.0.0.1:50052",
+                "--prompt-dir", str(root), "--profile-source", str(root),
+                "--out", str(root / "fixed-128"),
+                "--all50", "--per-request-chunks",
+                "--model-layers", "64",
+                "--locked-layout", probe.DEFAULT_CANONICAL_LAYOUT,
+                "--fixed-chunk", "128",
+            ]
+            args = probe.parse_args(args_list)
+            self.assertEqual(args.fixed_chunk, 128)
+            self.assertIsNone(args.replay_chunks_from)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list + [
+                    "--replay-chunks-from", str(baseline)])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list + ["--no-multi-cycle"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list + ["--no-async-prefetch"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list + ["--no-drain-first"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args(args_list[:-2] + ["--fixed-chunk", "64"])
+            with self.assertRaises(SystemExit):
+                without_request = args_list.copy()
+                without_request.remove("--per-request-chunks")
+                probe.parse_args(without_request)
+            with self.assertRaises(SystemExit):
+                without_all50 = args_list.copy()
+                without_all50.remove("--all50")
+                probe.parse_args(without_all50)
+
+    def test_planner_fixed_128_strict_native_single_chunk_and_mover(self):
+        layout = probe.DEFAULT_CANONICAL_LAYOUT
+
+        def make_log(n, selected=None, source="FIXED_CHUNK_ABLATION",
+                     async_mover=True, actual=None):
+            width = min(n, 128) if selected is None else selected
+            actual_width = width if actual is None else actual
+            return (
+                "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1"
+                " phone_push_aware=1 status=READY\n"
+                "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
+                " rule=EARLIEST_EXECUTABLE_REGION status=READY\n"
+                "[REGION_RING_FIXED_CHUNK] target=128"
+                f" tokens={n} XC={width} XG={width} XP={width}"
+                f" policy={'WHOLE_PROMPT_SINGLE_CHUNK' if n < 128 else 'FIXED_128'}"
+                " gpu_small_batch_mover=FORCED"
+                " profile_queries=0 status=PASS\n"
+                "[REGION_RING_ABLATION] gpu_banks=2 gpu_prefetch=1"
+                f" gpu_bank_mover={int(async_mover)} sync_demand=0"
+                " status=CONFIGURED\n"
+                "[REGION_RING_GPU_BANK] phase=INIT banks=2"
+                " mapping=FIXED_PARITY canonical=CPU destination=CUDA"
+                " mover=CPU_SINGLE min_tokens=67"
+                " force_small_batch=1 override_applied=1 status=READY\n"
+                "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                f" tokens={n} kv_start=0 layout={layout}"
+                f" XC={width} XG={width} XP={width}"
+                " startup_XC=32 startup_XG=32 startup_XP=32"
+                " changed=1 planner_ms=0.010"
+                f" source={source}"
+                " layer_placement=IMMUTABLE"
+                " execution=THIS_DECODE_ONLY status=PASS\n"
+                f"[REGION_RING_SUM] tokens={n} XC=0"
+                f" XG={actual_width} XP={actual_width}"
+                " regions=11 first_region_chunks=1 tasks=11"
+                " executed=11 complete=1 wall_ms=300"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n"
+                "[REGION_RING_GPU_BANK_MOVER_SUM] worker=CPU_SINGLE"
+                " started=4 completed=4 failures=0 upload_mib=1234"
+                " stage_cpu_copy_ms=0 stage_chunks=0"
+                " prepare_ms=50 h2d_ms=100 wall_ms=200"
+                " gpu_wait_ms=0 thread_started=1 thread_joined=1"
+                " status=PASS\n"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "server.log"
+            # Shorter than 128 => exactly one unsplit 66-token Stage
+            log.write_text(make_log(66), encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 66, 256, 256, layout,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 128)
+            self.assertEqual(
+                (result["plan_xc"], result["plan_xg"],
+                 result["plan_xp"]), (66, 66, 66))
+            self.assertEqual(
+                (result["runtime_xg"], result["runtime_xp"]), (66, 66))
+
+            # Exactly one normal 128-token Chunk is also permitted
+            log.write_text(make_log(128), encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 128, 256, 256, layout,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 128)
+            self.assertEqual((result["plan_xg"], result["plan_xp"]),
+                             (128, 128))
+
+            # Long prompt keeps 128 and may coalesce a tiny tail
+            log.write_text(make_log(513, actual=129), encoding="utf-8")
+            result, _ = probe.read_request_chunk_plan(
+                log, 0, 513, 256, 256, layout,
+                "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                False, False, 128)
+            self.assertEqual((result["plan_xg"], result["plan_xp"]),
+                             (128, 128))
+            self.assertEqual(result["runtime_xg"], 129)
+
+            # A small request must NOT be re-chunked to a legal preset
+            log.write_text(make_log(66, selected=32), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "prescribed widths"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                    False, False, 128)
+            log.write_text(make_log(66, source="LOCKED_CHUNK_ONLY"),
+                           encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                    False, False, 128)
+            log.write_text(make_log(66, async_mover=False),
+                           encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "async mover"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "FIXED_CHUNK_ABLATION", "DRAIN_FIRST",
+                    False, False, 128)
+
     def test_wo_multi_cycle_accepts_only_64layer_g36_p21_g7(self):
         self.assertEqual(probe.GPG_LOGICAL_LAYOUT, "G36,P21,G7")
         self.assertEqual(probe.GPG_PHYSICAL_LAYOUT,
