@@ -3,10 +3,10 @@
 ## 实验定义
 
 - 模型：Qwen3-32B-Q4_K_M，ShareGPT50_short，0/128/256/512/1024 各 10 条，共 50 条。
-- **锁定此前无 DAG 线性选层得到的布局**：`G8,P4,G6,C1,P5,G8,C1,P5,G6,P6,G8,C1,G5`（用户日志使用 `N`，与 `P` 同义）。GPU=41 层、Phone HTP=20 层、CPU=3 层，末尾 G5。
+- **固定 Placement**。历史 no-DAG 线性选层布局为 `G8,P4,G6,C1,P5,G8,C1,P5,G6,P6,G8,C1,G5`（GPU 41、Phone 20、CPU 3）。最近失败日志实际使用 `G8,P4,G7,P5,G8,P5,G7,P5,G7,P3,G5`（GPU 42、Phone 22、CPU 0）。下面示例沿用**最近失败日志中的布局**，如需历史布局仅修改 `$linearLayout`；不能把两套输出当作相同 Placement 对照。
 - Placement **不再变化**；每条 Prompt 基于旧独立 CPU/GPU/HTP Profile **重新搜索 XC/XG/XP**。不再固定 64。
 - 线性评分器把 Region 计算、Prepare、边界传输及 GPU Bank H2D 相加；不创建 DAG 事件，不建模并发重叠和队列气泡。C++ 日志必须显示 `chunk_policy=ADAPTIVE_XC_XG_XP` 和 `source=LINEAR_NO_DAG_CHUNK_ONLY`。
-- Runtime 保留双 Bank、后台异步预取、Drain-First、资源感知 Chunk 调度和 Phone HTP；保持 PC mmap 窗口、CUDA/HTP/Phone 物理内存校验，不使用 skip-plan-memory-checks。
+- Runtime 保留双 Bank、后台异步预取、Drain-First、资源感知 Chunk 调度和 Phone HTP。提供 **--skip-plan-memory-checks** 显式诊断选项：仅在已经锁定 Placement 的 no-DAG 动态分块中跳过 CPU/GPU/Phone/HTP 的 Planner 估算筛选；**不跳过实际 CUDA/HTP/系统内存分配**，运行时仍可能发生 OOM 或硬件分配失败。若想恢复保守估算，改用 --guarded-memory-checks，两者不能同时传。
 - **复用旧 Profile**：`32b-planner-wo-profile-fixed64-all50-1/independent-profile`，不新采样、不篡改旧 `profile.csv` 或 `profile.json`。原始 Placement 搜索那一轮固定 Chunk=64 是为了确定该不可变分层；本次 50 条动态 Chunk 不受其固定宽度限制。旧 Profile 必须包含实际 X32 与 X64 的 CPU/GPU/PHONE 数据及 Phone X64/KV2048 样本，不能用新采样替代。
 
 ## 更新与编译
@@ -35,7 +35,7 @@ $model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf"
 $rpc = "10.238.229.239:50052"  # 根据手机当前 RPC 地址调整
 $data = "E:\llama\datasets\sharegpt\sharegpt50_short"
 $oldProfile = "$root\32b-planner-wo-profile-fixed64-all50-1\independent-profile"
-$linearLayout = "G8,P4,G6,C1,P5,G8,C1,P5,G6,P6,G8,C1,G5"
+$linearLayout = "G8,P4,G7,P5,G8,P5,G7,P5,G7,P3,G5"   # 最近失败日志使用的布局
 
 if (!(Test-Path "$oldProfile\profile.csv") -or
     !(Test-Path "$oldProfile\profile.json")) {
@@ -51,16 +51,16 @@ $opts5 = @(
     "--port", "18080", "--threads", "8",
     "--all50", "--per-request-chunks",
     "--no-dag-placement",
-    "--guarded-memory-checks"
+    "--skip-plan-memory-checks"   # 不传 --guarded-memory-checks
 )
 
 # 先试两条，使用独立输出目录
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @opts5 `
-    --out "$root\32b-wo-dag-dynamic-smoke-old-profile" --limit 2
+    --out "$root\32b-wo-dag-dynamic-smoke-memoryskip-v1" --limit 2
 if ($LASTEXITCODE -ne 0) { throw "No-DAG dynamic Chunk smoke failed" }
 
 # 全 50 条；不要和之前的固定 64 实验共用 out
-$serverOut = "$root\32b-wo-dag-dynamic-all50-old-profile"
+$serverOut = "$root\32b-wo-dag-dynamic-all50-memoryskip-v1"
 python .\tools\region-ring-experiments\probe_htp_llama_server.py @opts5 `
     --out $serverOut
 
@@ -74,7 +74,7 @@ Get-Content "$serverOut\summary.csv"
 ## 必须验证的日志
 
 - Server 启动：`[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE chunk_policy=ADAPTIVE_XC_XG_XP ... placement=LOCKED ... event_simulation=OFF`
-- Server 启动：`[REGION_RING_PLAN_LOCK] status=PASS source=LINEAR_NO_DAG_CHUNK_ONLY ... memory_policy=GUARDED`
+- Server 启动：`[REGION_RING_PLAN_MEMORY] ... policy=SKIP_ESTIMATES_ONLY ... status=SKIPPED`，`[REGION_RING_NO_DAG_PLAN] ... memory=ESTIMATES_SKIPPED`，`[REGION_RING_PLAN_LOCK] status=PASS source=LINEAR_NO_DAG_CHUNK_ONLY ... memory_policy=SKIPPED`。通过只是选层筛选通过，不保证实际分配成功。
 - 每条请求：`[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT ... layout=G8,P4,...,G5 XC=... XG=... XP=... source=LINEAR_NO_DAG_CHUNK_ONLY layer_placement=IMMUTABLE`
 - `XC/XG/XP` 可以随 Prompt 改变，不要求必须改变；不得强制全部等于 64。脚本核对请求实际执行 `REGION_RING_SUM` 与所选块宽、固定布局、`cache_n=0`，最终需要 50/50 PASS。
 - 对 64–128 tokens 短 Prompt，双 GPU Bank 路径要求 `2*XG <= tokens`；旧 Profile 至少要有 X32 实测点。GPU bank refill 次数按布局中的 G Region 数量动态核对。
