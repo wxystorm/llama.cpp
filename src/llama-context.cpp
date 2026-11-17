@@ -3999,13 +3999,33 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
             gpu_weight_streaming, gpu_region_order.size(),
             (int) ubatch.n_tokens, gpu_bank_chunk_tokens,
             gpu_bank_force_small_batch);
+    // Strict w/o Async Prefetch: retain the original two-Bank streaming
+    // allocator, same-parity drain gate, and staged H2D refill function.
+    // Only move refill execution from the background CPU thread into the
+    // GPU worker, when the next Region receives its first ready Chunk.
+    const char * gpu_bank_sync_demand_env =
+        std::getenv("LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND");
+    const bool gpu_bank_sync_demand_requested =
+        gpu_bank_sync_demand_env != nullptr &&
+        std::strcmp(gpu_bank_sync_demand_env, "1") == 0;
+    const bool gpu_bank_sync_demand =
+        gpu_bank_streaming && gpu_bank_sync_demand_requested;
+    if (gpu_bank_sync_demand_requested && !gpu_bank_streaming &&
+            ubatch.n_tokens >= 32) {
+        LLAMA_LOG_ERROR(
+            "[REGION_RING_GPU_BANK_SYNC_DEMAND] event=REJECT"
+            " reason=REQUIRES_TWO_BANK_STREAMING_PREFILL status=FAIL\n");
+        ret = GGML_STATUS_FAILED;
+        return nullptr;
+    }
     if (gpu_weight_streaming) {
         LLAMA_LOG_ERROR(
             "[REGION_RING_ABLATION] gpu_banks=%d gpu_prefetch=%d "
-            "gpu_bank_mover=%d status=CONFIGURED\n",
+            "gpu_bank_mover=%d sync_demand=%d status=CONFIGURED\n",
             gpu_bank_single ? 1 : 2,
-            gpu_bank_prefetch_enabled ? 1 : 0,
-            gpu_bank_streaming ? 1 : 0);
+            gpu_bank_prefetch_enabled && !gpu_bank_sync_demand ? 1 : 0,
+            gpu_bank_streaming && !gpu_bank_sync_demand ? 1 : 0,
+            gpu_bank_sync_demand ? 1 : 0);
     }
     const bool gpu_bank_small_batch_override_applied =
         gpu_bank_streaming && gpu_bank_force_small_batch &&
@@ -6514,6 +6534,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::condition_variable gpu_bank_mover_cv;
         std::condition_variable gpu_bank_ready_cv;
         std::deque<gpu_bank_refill_job> gpu_bank_mover_jobs;
+        // Same-parity rank r+2 can evict rank r only after ALL its Chunks
+        // have finished. Protect this state using the Bank mutex.
+        std::vector<uint8_t> gpu_bank_drained_ranks(
+            gpu_region_order.size(), 0);
         bool gpu_bank_mover_stop = false;
         bool gpu_bank_mover_failed = false;
         gpu_bank_mover_stats gpu_bank_mover_stats_v;
@@ -6903,7 +6927,13 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
         std::thread gpu_bank_mover_thread;
         bool gpu_bank_mover_started = false;
         bool gpu_bank_mover_joined = false;
-        if (gpu_bank_streaming) {
+        if (gpu_bank_sync_demand) {
+            LLAMA_LOG_ERROR(
+                "[REGION_RING_GPU_BANK_REFILL_MODE] mode=SYNC_ON_DEMAND"
+                " banks=2 background_thread=0"
+                " same_parity_drain_gate=1 status=READY\n");
+        }
+        if (gpu_bank_streaming && !gpu_bank_sync_demand) {
             try {
                 gpu_bank_mover_thread =
                     std::thread(run_gpu_bank_mover);
@@ -7253,7 +7283,10 @@ llm_graph_result * llama_context::process_ubatch_region_ring(
                         region_ring_worker_resources[bank_index + 1];
                     const bool available = gpu_bank_mover_failed ||
                         (bank.bank_ready &&
-                         bank.bank_region == candidate.region);
+                         bank.bank_region == candidate.region) ||
+                        (gpu_bank_sync_demand && rank >= 2 &&
+                         (size_t) (rank - 2) < gpu_bank_drained_ranks.size() &&
+                         gpu_bank_drained_ranks[(size_t) rank - 2] != 0);
                     if (!available) { ++state.resource_deferred_checks; }
                     return available;
                 };
