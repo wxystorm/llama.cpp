@@ -311,10 +311,27 @@ def read_request_chunk_plan(log_path, offset, expected_tokens,
     if expect_sync_bank_demand:
         if not re.search(
                 r"\[REGION_RING_ABLATION\] gpu_banks=2 gpu_prefetch=0 "
-                r"gpu_bank_mover=0 status=CONFIGURED", data):
+                r"gpu_bank_mover=0 sync_demand=1 status=CONFIGURED", data):
             raise RuntimeError(
                 "w/o Async Prefetch did not retain 2 GPU banks "
-                "and disable background mover")
+                "and enable guarded synchronous refill")
+        if ("[REGION_RING_GPU_BANK_REFILL_MODE] mode=SYNC_ON_DEMAND"
+                not in data):
+            raise RuntimeError(
+                "w/o Async Prefetch did not disable the background loader")
+        summary = re.findall(
+            r"\[REGION_RING_GPU_BANK_MOVER_SUM\] "
+            r"worker=GPU_SYNC_DEMAND started=(\d+) completed=(\d+) "
+            r"failures=(\d+).*thread_started=0 thread_joined=0 "
+            r"status=PASS", data)
+        expected_refills = max(
+            0, sum(p.startswith("G") for p in expected_layout.split(",")) - 2)
+        if (len(summary) != 1 or
+                tuple(map(int, summary[0])) !=
+                (expected_refills, expected_refills, 0)):
+            raise RuntimeError(
+                "w/o Async Prefetch did not execute exactly "
+                f"{expected_refills} synchronous Bank refills")
     matches = list(REQUEST_PLAN_RE.finditer(data))
     if len(matches) != 1:
         raise RuntimeError(
@@ -773,10 +790,11 @@ def main(argv=None):
     if args.no_drain_first:
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "0"
     if args.no_async_prefetch:
-        # Existing native Runtime ablation: keep both fixed-parity banks and
-        # initial resident G Regions; later G Regions demand-upload on the
-        # GPU worker rather than a background Bank Mover thread.
-        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "0"
+        # Strict Runtime ablation: original two-Bank resource gates and
+        # graph-prepared staged H2D path remain active. A synchronous refill
+        # is triggered at the first ready Chunk only AFTER old Bank drain.
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "1"
         env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
     if reference_chunks is not None:
@@ -794,7 +812,9 @@ def main(argv=None):
                "FULL_CYCLE_REPLAY") +
               " source=" + str(args.replay_chunks_from) +
               " prompts=50 replay=EXACT_RECORDED_XC_XG_XP"
-              " native_chunk_search=SCORED_NOT_APPLIED runtime_allocators=UNCHANGED",
+              " native_chunk_search=SCORED_NOT_APPLIED"
+              " bank_refill=STRICT_SYNC_DEMAND_WHEN_SELECTED"
+              " runtime_allocators=UNCHANGED",
               flush=True)
     print(f"[SERVER_PROBE] model_layers={args.model_layers}", flush=True)
     print("[SERVER_PROBE] policy=" +
