@@ -2610,6 +2610,7 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+    const int64_t fig3_prepare_start_ns = jupiter_fig3::phone_enabled() ? jupiter_fig3::ns() : 0;
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
@@ -2689,9 +2690,17 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
                 graph_uid, device, n_nodes);
     }
 
+    const int64_t fig3_compute_start_ns = fig3_prepare_start_ns ? jupiter_fig3::ns() : 0;
     const int64_t phone_compute_start_us = phone_timeline ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (fig3_prepare_start_ns) {
+        const int64_t done_ns = jupiter_fig3::ns();
+        jupiter_fig3_phone_interval("Phone Prepare", device, graph_uid, n_nodes,
+                                   fig3_prepare_start_ns, fig3_compute_start_ns);
+        jupiter_fig3_phone_interval("Phone Compute", device, graph_uid, n_nodes,
+                                   fig3_compute_start_ns, done_ns);
+    }
     if (phone_timeline) {
         const int64_t phone_done_us = ggml_time_us();
         GGML_LOG_INFO(
@@ -2716,6 +2725,7 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
 }
 
 bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
+    const int64_t fig3_prepare_start_ns = jupiter_fig3::phone_enabled() ? jupiter_fig3::ns() : 0;
     const char * jupiter_trace_env = getenv("LLAMA_JUPITER_TRACE");
     const bool jupiter_trace = jupiter_trace_env != nullptr && atoi(jupiter_trace_env) != 0;
     const int64_t jupiter_trace_begin_us = jupiter_trace ? ggml_time_us() : 0;
@@ -2739,9 +2749,17 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
                 request.graph_uid, device, graph->n_nodes);
     }
 
+    const int64_t fig3_compute_start_ns = fig3_prepare_start_ns ? jupiter_fig3::ns() : 0;
     const int64_t phone_compute_start_us = phone_timeline ? ggml_time_us() : 0;
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+    if (fig3_prepare_start_ns) {
+        const int64_t done_ns = jupiter_fig3::ns();
+        jupiter_fig3_phone_interval("Phone Prepare", device, request.graph_uid, graph->n_nodes,
+                                   fig3_prepare_start_ns, fig3_compute_start_ns);
+        jupiter_fig3_phone_interval("Phone Compute", device, request.graph_uid, graph->n_nodes,
+                                   fig3_compute_start_ns, done_ns);
+    }
     if (phone_timeline) {
         const int64_t phone_done_us = ggml_time_us();
         GGML_LOG_INFO(
