@@ -1,4 +1,6 @@
 #include "llama-context.h"
+#include "../ggml/src/ggml-jupiter-fig3.h"
+#include <atomic>
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -22,6 +24,10 @@
 //
 // llama_context
 //
+
+// Single-turn Fig.3 launcher: one pending Prefill per PC process. Start is
+// recorded on first decoder batch, end only AFTER scheduler synchronization.
+static std::atomic<int64_t> g_jupiter_fig3_prefill_begin_ns {0};
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -681,6 +687,11 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (jupiter_fig3::pc_enabled() && n_queued_tokens > 1) {
+        const int64_t begin = g_jupiter_fig3_prefill_begin_ns.exchange(0);
+        if (begin > 0) jupiter_fig3::window(begin, jupiter_fig3::ns(),
+                                          static_cast<int>(n_queued_tokens));
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1788,6 +1799,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
+        if (jupiter_fig3::pc_enabled() && n_tokens_all > 1) {
+            g_jupiter_fig3_prefill_begin_ns.store(jupiter_fig3::ns());
+        }
     }
     n_queued_tokens += n_tokens_all;
 
