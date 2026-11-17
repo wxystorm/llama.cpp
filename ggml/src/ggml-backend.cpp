@@ -65,6 +65,10 @@ bool ggml_moti_active(void) { return moti.active.load(std::memory_order_relaxed)
 void ggml_moti_begin(void) {
     static const bool enabled = [] { const char * e = getenv("LLAMA_MOTI_PROFILE"); return e && strcmp(e, "1") == 0; }();
     if (!enabled) return;
+    static std::atomic<bool> announced {false};
+    if (!announced.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr, "[MOTI_PROFILE] enabled=1; begin at first multi-token batch\n");
+    }
     moti.active = false;
     moti.cpu = 0; moti.gpu = 0; moti.cpu_n = 0; moti.gpu_n = 0;
     moti.h2d = 0; moti.d2h = 0; moti.h2d_b = 0; moti.d2h_b = 0;

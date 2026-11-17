@@ -1959,8 +1959,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
-        if (n_tokens > 1) ggml_moti_begin();
     }
+    // Do not require the first batch in a server slot to be multi-token:
+    // a single-token batch can precede the actual prompt prefill.
+    if (n_tokens > 1 && !ggml_moti_active()) ggml_moti_begin();
 
     sched_reserve();
 
@@ -2261,8 +2263,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
-        if (n_tokens_all > 1) ggml_moti_begin();
     }
+    // Slot-based clients may queue an initial single token before the prompt;
+    // still start the profiler when the first multi-token batch arrives.
+    if (n_tokens_all > 1 && !ggml_moti_active()) ggml_moti_begin();
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
