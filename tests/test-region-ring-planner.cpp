@@ -189,6 +189,29 @@ static void test_no_dag_serial_profile_scoring() {
     REQUIRE(!estimate_region_ring_balance(m, regions, wrong));
     candidate fixed = c;
     REQUIRE(estimate_region_ring_balance(m, regions, fixed));
+
+    // Once layer ownership is locked, keep the linear evaluator but
+    // independently vary XG/XP as each Prompt's token count changes.
+    m.fixed_planner_chunk = 0;
+    candidate adaptive = c;
+    adaptive.xc = 32;
+    adaptive.xg = 128;
+    adaptive.xp = 64;
+    REQUIRE(simulate(m, regions, adaptive, &reason));
+    REQUIRE(adaptive.tasks == 0 && adaptive.edges == 0);
+    REQUIRE(std::isfinite(adaptive.wall_ms) && adaptive.wall_ms > 0.0);
+    REQUIRE(std::fabs(adaptive.wall_ms - c.wall_ms) > 1e-6);
+    REQUIRE(estimate_region_ring_balance(m, regions, adaptive));
+
+    m.tokens = 128;
+    candidate short_prompt = c;
+    short_prompt.xc = 32;
+    short_prompt.xg = 32;
+    short_prompt.xp = 64;
+    REQUIRE(simulate(m, regions, short_prompt, &reason));
+    REQUIRE(short_prompt.tasks == 0 && short_prompt.edges == 0);
+    REQUIRE(std::isfinite(short_prompt.wall_ms) &&
+            short_prompt.wall_ms > 0.0);
 }
 
 int main() {

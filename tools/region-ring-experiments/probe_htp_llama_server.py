@@ -103,7 +103,7 @@ def parse_args(argv=None):
     p.add_argument("--no-multi-cycle", action="store_true",
                    help="Runtime ablation: lock G36,P21,G7; each Prompt runs native Planner XC/XG/XP search (no replay); keep six GPU Bank windows, async prefetch and Drain-First")
     p.add_argument("--no-dag-placement", action="store_true",
-                   help="use an independently selected linear/no-DAG layout with fixed-64")
+                   help="retain a previously selected no-DAG placement, then score dynamic XC/XG/XP per request using linear/no-DAG costs")
     p.add_argument("--guarded-memory-checks", action="store_true",
                    help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
     p.add_argument("--fixed-chunk", type=int, choices=(64, 128), default=None,
@@ -167,11 +167,13 @@ def parse_args(argv=None):
                 not args.no_dag_placement):
             p.error("--fixed-chunk requires 32B Full Cycle locked layout, unless --no-dag-placement")
     if args.no_dag_placement:
-        if (args.fixed_chunk != 64 or not args.guarded_memory_checks or
+        if (not args.all50 or not args.per_request_chunks or
+                args.fixed_chunk is not None or
+                not args.guarded_memory_checks or
                 not args.locked_layout.split(",")[-1].startswith("G") or
                 args.no_multi_cycle or args.no_async_prefetch or
                 args.no_drain_first or args.replay_chunks_from is not None):
-            p.error("--no-dag-placement requires --fixed-chunk 64, --guarded-memory-checks, GPU-tail layout and no other ablation")
+            p.error("--no-dag-placement requires --all50, --per-request-chunks, --guarded-memory-checks, GPU-tail layout, no --fixed-chunk and no other ablation")
     if sum((args.no_drain_first, args.no_async_prefetch,
             args.no_multi_cycle)) > 1:
         p.error("Select only one Runtime ablation at a time")
@@ -571,6 +573,11 @@ def sweep_config(args, command, env, all_prompts, anchor_tokens):
         base["logical_layout"] = GPG_LOGICAL_LAYOUT
         base["physical_layout"] = GPG_PHYSICAL_LAYOUT
         base["chunk_policy"] = "NATIVE_PER_REQUEST_LOCKED_CHUNK_SEARCH_APPLIED"
+    if getattr(args, "no_dag_placement", False):
+        base["planner_ablation"] = "WO_DAG_LINEAR_SCORE_DYNAMIC_CHUNKS"
+        base["chunk_policy"] = "NATIVE_PER_REQUEST_LINEAR_NO_DAG_CHUNK_SEARCH"
+        base["placement_policy"] = "IMMUTABLE_NO_DAG_SELECTED_LAYOUT"
+        base["score_policy"] = "LINEAR_SUM_NO_QUEUE"
     if getattr(args, "fixed_chunk", None) is not None:
         base["planner_ablation"] = f"WO_DYNAMIC_CHUNK_FIXED_{args.fixed_chunk}"
         base["fixed_chunk_tokens"] = args.fixed_chunk
@@ -939,6 +946,15 @@ def main(argv=None):
         env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
     if args.no_dag_placement:
         env["LLAMA_REGION_RING_NO_DAG_PLANNER"] = "1"
+        # Keep the Full Cycle Runtime unchanged: two asynchronously refilled
+        # GPU Banks, Drain-First and the resource-aware Chunk scheduler.
+        # Unlike fixed-X64, Chunk search guarantees XG <= floor(tokens/2),
+        # so a forced single-Chunk mover override is unnecessary.
+        env["LLAMA_REGION_RING_GPU_BANK_PREFETCH"] = "1"
+        env["LLAMA_REGION_RING_GPU_BANK_SYNC_DEMAND"] = "0"
+        env["LLAMA_REGION_RING_GPU_BANK_COUNT"] = "2"
+        env["LLAMA_REGION_RING_DRAIN_FIRST_CYCLE"] = "1"
+        env["LLAMA_REGION_RING_RESOURCE_AWARE_CHUNK_SCHED"] = "1"
     else:
         env.pop("LLAMA_REGION_RING_NO_DAG_PLANNER", None)
     if args.fixed_chunk is not None:
@@ -977,10 +993,11 @@ def main(argv=None):
         env.pop("LLAMA_REGION_RING_PER_REQUEST_CHUNKS", None)
     if args.no_dag_placement:
         print("[SERVER_PLANNER_ABLATION] mode=WO_QUEUEING_SIMULATION"
-              " score=LINEAR_SUM_NO_QUEUE fixed_chunk=64"
+              " score=LINEAR_SUM_NO_QUEUE"
+              " chunks=ADAPTIVE_XC_XG_XP_PER_REQUEST"
               " startup_memory_checks=GUARDED"
               " pc_memory=MMAP_WINDOWED_VERIFIED"
-              " placement=PRESELECTED_FROM_NO_DAG"
+              " placement=IMMUTABLE_PRESELECTED_NO_DAG"
               " runtime=FULL_CYCLE", flush=True)
     if args.fixed_chunk is not None:
         print("[SERVER_PLANNER_ABLATION] mode=WO_DYNAMIC_CHUNK"
@@ -1063,14 +1080,17 @@ def main(argv=None):
                                              errors="replace")
                 if ("[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE"
                         not in startup or
+                    "chunk_policy=ADAPTIVE_XC_XG_XP" not in startup or
+                    "placement=LOCKED" not in startup or
                     "event_simulation=OFF" not in startup or
                     not re.search(
                         r"\[REGION_RING_PLAN_LOCK\] status=PASS"
-                        r" source=CHUNK_ONLY [^\n]*"
+                        r" source=LINEAR_NO_DAG_CHUNK_ONLY [^\n]*"
                         r"memory_policy=GUARDED", startup)):
                     raise RuntimeError(
-                        "No-DAG model startup did not confirm linear-score"
-                        " guarded locked placement; check " + str(log_path))
+                        "No-DAG model startup did not confirm adaptive linear"
+                        " scoring with guarded locked placement; check "
+                        + str(log_path))
             print("[SERVER_PROBE] health=READY model=RESIDENT", flush=True)
             open_mode = "a" if args.all50 and args.resume else "w"
             with metrics_path.open(open_mode, encoding="utf-8") as output:
@@ -1112,11 +1132,14 @@ def main(argv=None):
                             "LOCKED_CHUNK_REPLAY" if reference_chunks is not None
                             else "FIXED_CHUNK_ABLATION"
                             if args.fixed_chunk is not None
+                            else "LINEAR_NO_DAG_CHUNK_ONLY"
+                            if args.no_dag_placement
                             else "LOCKED_CHUNK_ONLY",
                             "FIFO" if args.no_drain_first else
                             "DRAIN_FIRST" if
                             (args.no_async_prefetch or
                              args.no_multi_cycle or
+                             args.no_dag_placement or
                              args.fixed_chunk is not None) else None,
                             args.no_async_prefetch, args.no_multi_cycle,
                             args.fixed_chunk)
@@ -1135,7 +1158,7 @@ def main(argv=None):
                                        int(manifest[path.name]),
                         "request_wall_ms": http_wall_ms,
                         "planner_mode": (
-                            "WO_QUEUEING_SIMULATION_FIXED_64"
+                            "WO_QUEUEING_SIMULATION_DYNAMIC_CHUNKS"
                             if args.no_dag_placement else
                             f"FIXED_{args.fixed_chunk}_NO_REQUEST_SEARCH"
                             if args.fixed_chunk is not None else
@@ -1146,6 +1169,11 @@ def main(argv=None):
                         "runtime_layout": (
                             GPG_PHYSICAL_LAYOUT if args.no_multi_cycle
                             else fake_args.locked_layout),
+                        **({"planner_score": "LINEAR_SUM_NO_QUEUE",
+                            "chunk_policy": "ADAPTIVE_XC_XG_XP",
+                            "scheduler_mode": "DRAIN_FIRST",
+                            "prefetch_mode": "ASYNC_DOUBLE_BANK"}
+                           if args.no_dag_placement else {}),
                         **({"fixed_chunk_target": args.fixed_chunk,
                             "fixed_chunk_short_policy": "WHOLE_PROMPT_SINGLE_CHUNK",
                             "scheduler_mode": "DRAIN_FIRST",

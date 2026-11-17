@@ -11131,7 +11131,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
              startup_xp != region_ring_xp) ? 1 : 0,
             planner_ms,
             fixed_chunk_requested ? "FIXED_CHUNK_ABLATION" :
-            replay_requested ? "LOCKED_CHUNK_REPLAY" : "LOCKED_CHUNK_ONLY");
+            replay_requested ? "LOCKED_CHUNK_REPLAY" :
+            (std::getenv("LLAMA_REGION_RING_NO_DAG_PLANNER") != nullptr &&
+             std::strcmp(
+                 std::getenv("LLAMA_REGION_RING_NO_DAG_PLANNER"), "1") == 0) ?
+                "LINEAR_NO_DAG_CHUNK_ONLY" : "LOCKED_CHUNK_ONLY");
     }
     if (region_ring_v1 &&
             llama_region_ring_has_directional_stages(

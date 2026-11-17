@@ -694,14 +694,32 @@ class ServerProbeTests(unittest.TestCase):
                 probe.parse_args(new_args)
             with self.assertRaises(SystemExit):
                 probe.parse_args(new_args + ["--no-dag-placement"])
-            valid_no_dag = probe.parse_args(new_args + [
+            with self.assertRaises(SystemExit):
+                probe.parse_args(new_args + [
+                    "--no-dag-placement", "--guarded-memory-checks"])
+            dynamic_args = args_list[:-4] + [
+                "--locked-layout", new_layout]
+            with self.assertRaises(SystemExit):
+                probe.parse_args(dynamic_args + ["--no-dag-placement"])
+            valid_no_dag = probe.parse_args(dynamic_args + [
                 "--no-dag-placement", "--guarded-memory-checks"])
             self.assertTrue(valid_no_dag.no_dag_placement)
             self.assertTrue(valid_no_dag.guarded_memory_checks)
+            self.assertIsNone(valid_no_dag.fixed_chunk)
+            self.assertTrue(valid_no_dag.per_request_chunks)
             self.assertEqual(valid_no_dag.locked_layout, new_layout)
             with self.assertRaises(SystemExit):
                 probe.parse_args(args_list + [
                     "--no-dag-placement", "--guarded-memory-checks"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args([a for a in dynamic_args if a !=
+                                  "--per-request-chunks"] +
+                                 ["--no-dag-placement",
+                                  "--guarded-memory-checks"])
+            with self.assertRaises(SystemExit):
+                probe.parse_args([a for a in dynamic_args if a != "--all50"] +
+                                 ["--no-dag-placement",
+                                  "--guarded-memory-checks"])
             with self.assertRaises(SystemExit):
                 without_request = args_list.copy()
                 without_request.remove("--per-request-chunks")
@@ -710,6 +728,66 @@ class ServerProbeTests(unittest.TestCase):
                 without_all50 = args_list.copy()
                 without_all50.remove("--all50")
                 probe.parse_args(without_all50)
+
+    def test_no_dag_dynamic_chunks_preserve_locked_layout_and_source(self):
+        layout = "G8,P4,G6,C1,P5,G8,C1,P5,G6,P6,G8,C1,G5"
+        scheduler = (
+            "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1"
+            " phone_push_aware=1 status=READY\n"
+            "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST"
+            " rule=EARLIEST_EXECUTABLE_REGION status=READY\n"
+        )
+
+        def request(tokens, xc, xg, xp, source="LINEAR_NO_DAG_CHUNK_ONLY"):
+            return (
+                f"[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                f" tokens={tokens} kv_start=0 layout={layout}"
+                f" XC={xc} XG={xg} XP={xp}"
+                " startup_XC=64 startup_XG=64 startup_XP=64"
+                " changed=1 planner_ms=0.450"
+                f" source={source} layer_placement=IMMUTABLE"
+                " execution=THIS_DECODE_ONLY status=PASS\n"
+                f"[REGION_RING_SUM] tokens={tokens} XC={xc} XG={xg} XP={xp}"
+                " regions=13 first_region_chunks=2 tasks=26"
+                " executed=26 complete=1 wall_ms=200.0"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n"
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "linear-no-dag.log"
+            log.write_text(scheduler + request(128, 64, 32, 64),
+                           encoding="utf-8")
+            first, _ = probe.read_request_chunk_plan(
+                log, 0, 128, 256, 256, layout,
+                "LINEAR_NO_DAG_CHUNK_ONLY", "DRAIN_FIRST")
+            self.assertEqual(
+                (first["plan_xc"], first["plan_xg"], first["plan_xp"]),
+                (64, 32, 64))
+            log.write_text(scheduler + request(1855, 128, 96, 192),
+                           encoding="utf-8")
+            second, _ = probe.read_request_chunk_plan(
+                log, 0, 1855, 256, 256, layout,
+                "LINEAR_NO_DAG_CHUNK_ONLY", "DRAIN_FIRST")
+            self.assertEqual(
+                (second["plan_xc"], second["plan_xg"], second["plan_xp"]),
+                (128, 96, 192))
+            self.assertNotEqual(
+                (first["plan_xc"], first["plan_xg"], first["plan_xp"]),
+                (second["plan_xc"], second["plan_xg"], second["plan_xp"]))
+            log.write_text(scheduler + request(
+                128, 64, 32, 64, source="LOCKED_CHUNK_ONLY"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 128, 256, 256, layout,
+                    "LINEAR_NO_DAG_CHUNK_ONLY", "DRAIN_FIRST")
+            log.write_text(scheduler + request(
+                128, 64, 32, 64).replace(layout, "G64"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "changed fixed layout"):
+                probe.read_request_chunk_plan(
+                    log, 0, 128, 256, 256, layout,
+                    "LINEAR_NO_DAG_CHUNK_ONLY", "DRAIN_FIRST")
 
     def test_planner_fixed_64_and_128_native_single_chunk_and_mover(self):
         layout = probe.DEFAULT_CANONICAL_LAYOUT

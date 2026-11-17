@@ -11541,13 +11541,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             return false;
         }
         model.linear_no_dag_ablation = true;
-        model.fixed_planner_chunk = 64;
+        // The first full Placement search used fixed X64. Once that layout
+        // is locked, preserve its layer ownership while searching XC/XG/XP
+        // independently for every Prompt using the same no-DAG scorer.
+        const bool locked_chunk_adaptive =
+            requested_locked_layout != nullptr &&
+            *requested_locked_layout != '\0';
+        model.fixed_planner_chunk = locked_chunk_adaptive ? 0 : 64;
         LLAMA_LOG_ERROR(
             "[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE"
-            " fixed_chunk=64 profile=INDEPENDENT_G_C_N"
+            " chunk_policy=%s profile=INDEPENDENT_G_C_N"
             " memory=GPU_CPU_PHONE_HTP_GUARDED"
-            " candidate_search=UNCHANGED event_simulation=OFF"
-            " runtime=UNCHANGED status=READY\n");
+            " placement=%s candidate_search=UNCHANGED"
+            " event_simulation=OFF runtime=UNCHANGED status=READY\n",
+            locked_chunk_adaptive ? "ADAPTIVE_XC_XG_XP" : "FIXED_64",
+            locked_chunk_adaptive ? "LOCKED" : "SEARCH_NEW");
     }
 
     if (wide_apply && selected_layout != nullptr) {
@@ -11791,11 +11799,12 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             *selected_xp = best_chunk.xp;
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_LOCK] status=PASS"
-                " source=CHUNK_ONLY layout=%s"
+                " source=%s layout=%s"
                 " XC=%d XG=%d XP=%d predicted_ms=%.3f"
                 " tried=%zu reject_memory=%zu reject_profile=%zu"
                 " region_budget_fraction=%.2Lf memory_policy=%s"
                 " max_xg=%d max_xp=%d\n",
+                no_dag_planner ? "LINEAR_NO_DAG_CHUNK_ONLY" : "CHUNK_ONLY",
                 selected_layout->c_str(), *selected_xc,
                 *selected_xg, *selected_xp, best_chunk.wall_ms,
                 tried, rejected_memory, rejected_profile,
@@ -11810,7 +11819,11 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                         metrics << std::fixed << std::setprecision(4)
                                 << "{\"type\":\"planner\",\"schema\":1,"
                                 << "\"mode\":\"apply-wide\","
-                                << "\"source\":\"locked_chunk_only\","
+                                << "\"source\":\""
+                                << (no_dag_planner ?
+                                    "locked_linear_no_dag_chunk_only" :
+                                    "locked_chunk_only")
+                                << "\","
                                 << "\"applied\":true,"
                                 << "\"selected_layout\":\""
                                 << *selected_layout << "\","
@@ -11831,16 +11844,21 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                                 << ",\"max_plan_xg\":" << max_plan_xg
                                 << ",\"max_plan_xp\":" << max_plan_xp
                                 << ",\"predicted_ms\":" << best_chunk.wall_ms
-                                << "}\n";
+                                << ",\"score_mode\":\""
+                                << (no_dag_planner ?
+                                    "LINEAR_SUM_NO_QUEUE" : "EVENT_DAG")
+                                << "\"}\n";
                     }
                 }
             }
             LLAMA_LOG_ERROR(
                 "[REGION_RING_PLAN_APPLY] mode=APPLY_WIDE"
                 " phase=PRE_MODEL_LOAD selected=1"
-                " source=LOCKED_CHUNK_ONLY layout=%s"
+                " source=%s layout=%s"
                 " XC=%d XG=%d XP=%d"
                 " status=AWAIT_MODEL_PLACEMENT\n",
+                no_dag_planner ?
+                    "LINEAR_NO_DAG_CHUNK_ONLY" : "LOCKED_CHUNK_ONLY",
                 selected_layout->c_str(),
                 *selected_xc, *selected_xg, *selected_xp);
             return true;

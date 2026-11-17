@@ -1282,7 +1282,8 @@ def require_long_htp_kv_anchors(path: Path, required=LONG_HTP_KV_ANCHORS):
 
 
 def verify_independent_profile(path: Path, required_kvs=(),
-                               short_chunks=False, fixed_chunk=None) -> int:
+                               short_chunks=False, fixed_chunk=None,
+                               adaptive_no_dag=False) -> int:
     """Fail closed on stale/truncated standalone calibration artifacts.
 
     A rolling epoch CSV is not a standalone Profile; validate the native
@@ -1311,6 +1312,24 @@ def verify_independent_profile(path: Path, required_kvs=(),
             len(metadata.get("stage_points", [])) != len(points)):
         raise ValueError(f"Independent profile.json does not match Stage CSV: "
                          f"{json_path}")
+    if adaptive_no_dag:
+        # The fixed Placement was scored at X64, but requests with only
+        # 64..128 tokens need XG<=tokens/2. Verify that the old Profile
+        # actually contains X32 for each backend rather than silently
+        # relying on unavailable short-grid measurements.
+        if fixed_chunk != 64 or 32 not in metadata.get("chunk_widths", ()):
+            raise ValueError(
+                "Adaptive no-DAG requests require measured X32/X64 "
+                "grid anchors in old Profile: " + str(json_path))
+        for backend in ("CPU", "GPU", "PHONE"):
+            if not any(p.get("device") == backend and
+                       int(p.get("tokens") or 0) == 32 and
+                       math.isfinite(float(p.get("compute_ms") or 0.0)) and
+                       float(p.get("compute_ms") or 0.0) > 0.0
+                       for p in points):
+                raise ValueError(
+                    "Adaptive no-DAG requires measured " + backend +
+                    " X32 Profile point: " + str(path))
     if fixed_chunk is not None:
         # The linear no-DAG selection uses only X=64. A legacy independent
         # Profile need not include the later adaptive 16/24/192/256 grid,
