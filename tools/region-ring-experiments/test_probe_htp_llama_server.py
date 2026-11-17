@@ -443,6 +443,8 @@ class ServerProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "llama-server.log"
             sample = (
+                "[REGION_RING_RESOURCE_SCHED] enabled=1 bank_aware=1 status=READY\n"
+                "[REGION_RING_CYCLE_SCHED] mode=FIFO rule=EARLIEST_EXECUTABLE_REGION status=READY\n"
                 "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
                 " tokens=66 kv_start=0 layout=" + layout +
                 " XC=16 XG=24 XP=32"
@@ -457,12 +459,16 @@ class ServerProbeTests(unittest.TestCase):
                 " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
             log.write_text(sample, encoding="utf-8")
             decision, _ = probe.read_request_chunk_plan(
-                log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_REPLAY")
+                log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_REPLAY", "FIFO")
             self.assertEqual(decision["plan_xg"], 24)
             self.assertEqual(decision["plan_xp"], 32)
             with self.assertRaisesRegex(RuntimeError, "source mismatch"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_ONLY")
+            with self.assertRaisesRegex(RuntimeError, "scheduler ablation"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_REPLAY",
+                    "DRAIN_FIRST")
 
     def test_cpp_request_replay_hook_checks_tokens_and_layout(self):
         source = (Path(__file__).resolve().parents[2] /
