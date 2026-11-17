@@ -7,7 +7,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-KV = re.compile(r"([a-zA-Z_][a-zA-Z_0-9]*)=([^\\s]+)")
+KV = re.compile(r"([a-zA-Z_][a-zA-Z_0-9]*)=([^\s]+)")
 
 def fields(line):
     return {key: val for key, val in KV.findall(line)}
@@ -92,8 +92,8 @@ def main():
         "NOTE: HTP wall includes submission / synchronization, not pure DSP kernel time.",
         "NOTE: mapping events are per buffer allocation, NOT necessarily per layer switch.",
     ]
-    (output / "summary.txt").write_text("\\n".join(report) + "\\n")
-    print("\\n".join(report))
+    (output / "summary.txt").write_text("\n".join(report) + "\n")
+    print("\n".join(report))
     return 0
 
 if __name__ == "__main__":

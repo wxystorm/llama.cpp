@@ -34,7 +34,7 @@ if ! [[ "$LAYER" =~ ^[0-9]+$ && "$PRETOUCH" =~ ^[01]$ ]]; then
 fi
 mkdir -p "$OUT_DIR"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-$HOME/phone-stream-htp/lib:$PREFIX/lib}"
+export LD_LIBRARY_PATH="$HOME/phone-stream-htp/lib:${LD_LIBRARY_PATH:-$PREFIX/lib}"
 export ADSP_LIBRARY_PATH="${ADSP_LIBRARY_PATH:-$HOME/phone-stream-htp/lib}"
 export GGML_HEXAGON_NDEV=1
 export GGML_HEXAGON_HOSTBUF=0
