@@ -11534,10 +11534,10 @@ static bool llama_hybrid_region_ring_planner_evaluate(
                 selected_xc == nullptr || selected_xg == nullptr ||
                 selected_xp == nullptr || !htp_session_guard ||
                 !model.gpu_weight_streaming || force_ab_requested ||
-                skip_locked_memory || !model.memory_feasible) {
+                !model.memory_feasible) {
             LLAMA_LOG_ERROR(
                 "[REGION_RING_NO_DAG_PLAN] status=REJECT"
-                " reason=REQUIRES_HTP_STREAMED_GUARDED_APPLY_WIDE\n");
+                " reason=REQUIRES_HTP_STREAMED_APPLY_WIDE\n");
             return false;
         }
         model.linear_no_dag_ablation = true;
@@ -11548,13 +11548,18 @@ static bool llama_hybrid_region_ring_planner_evaluate(
             requested_locked_layout != nullptr &&
             *requested_locked_layout != '\0';
         model.fixed_planner_chunk = locked_chunk_adaptive ? 0 : 64;
+        // Only a supplied locked Placement may bypass the planner's
+        // ESTIMATED memory callback. Full Placement search still has all
+        // memory guards; backend CUDA/HTP allocations are never bypassed.
         LLAMA_LOG_ERROR(
             "[REGION_RING_NO_DAG_PLAN] mode=LINEAR_SUM_NO_QUEUE"
             " chunk_policy=%s profile=INDEPENDENT_G_C_N"
-            " memory=GPU_CPU_PHONE_HTP_GUARDED"
+            " memory=%s"
             " placement=%s candidate_search=UNCHANGED"
             " event_simulation=OFF runtime=UNCHANGED status=READY\n",
             locked_chunk_adaptive ? "ADAPTIVE_XC_XG_XP" : "FIXED_64",
+            skip_locked_memory ? "ESTIMATES_SKIPPED" :
+                "GPU_CPU_PHONE_HTP_GUARDED",
             locked_chunk_adaptive ? "LOCKED" : "SEARCH_NEW");
     }
 
