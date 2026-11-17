@@ -48,4 +48,3 @@
 
 **消融结论：** 在既有 Full Cycle 基线与 Fixed-64 的完整 50 条输入对照下，固定 Chunk 使加权 Prefill 吞吐由 **123.037 tok/s** 降至 **110.466 tok/s**（下降 **10.22%**），总 Prefill 时间增加 **11.38%**。Full Cycle 相对 Fixed-64 提速 **1.114×**。
 
-注：此处 Full Cycle 使用仓库此前记录的参考基线；若改用重新采集的 Profile 进行主实验，应同步更新该对照，避免将不同 Profile 的性能变化视为 Chunk 策略的单独贡献。
