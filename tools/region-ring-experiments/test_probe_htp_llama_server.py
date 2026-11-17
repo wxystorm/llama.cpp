@@ -352,6 +352,133 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "changed fixed layout"):
                 probe.read_request_chunk_plan(log, 0, 1855)
 
+    def test_reference_chunk_replay_validates_full_cycle_run(self):
+        layout = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = root / "Qwen3-32B-Q4_K_M.gguf"
+            model.write_bytes(b"model")
+            profile = root / "independent-profile"
+            profile.mkdir()
+            (profile / "profile.csv").write_text("test\n", encoding="utf-8")
+            (profile / "profile.json").write_text("{}", encoding="utf-8")
+            for group in probe.runner.MAIN50_SHORT_GROUPS:
+                for index in range(1, 11):
+                    (root / f"prompt_{group}_{index:02d}.txt").write_text(
+                        f"Sample {group} {index}", encoding="utf-8")
+            prompts = probe.prompt_files(root, all50=True)
+            config = {"configuration": {
+                "prompts": [p.name for p in prompts],
+                "prompt_sha256": {
+                    p.name: probe.sha256_file(p) for p in prompts},
+                "model": probe.file_identity(model),
+                "profile_sha256": {
+                    name: probe.sha256_file(profile / name)
+                    for name in ("profile.csv", "profile.json")},
+                "runtime_env": {
+                    "LLAMA_REGION_RING_PER_REQUEST_CHUNKS": "1"},
+            }}
+            baseline = root / "full-cycle"
+            baseline.mkdir()
+            (baseline / "server-run-config.json").write_text(
+                json.dumps(config), encoding="utf-8")
+            rows = [{
+                "index": i,
+                "prompt": p.name,
+                "status": "PASS",
+                "cache_n": 0,
+                "planner_mode": "PER_REQUEST_LOCKED",
+                "runtime_layout": layout,
+                "prompt_n": 66 if "prompt_0_" in p.name else 1024,
+                "plan_xc": 16,
+                "plan_xg": 24,
+                "plan_xp": 32,
+            } for i, p in enumerate(prompts, 1)]
+            source = baseline / "requests.jsonl"
+            source.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8")
+            decisions = probe.load_reference_chunks(
+                source, prompts, layout, model, profile)
+            self.assertEqual(len(decisions), 50)
+            self.assertEqual(
+                (decisions["prompt_0_01.txt"]["plan_xg"],
+                 decisions["prompt_0_01.txt"]["plan_xp"]),
+                (24, 32))
+            sidecar = root / "replay.txt"
+            probe.write_replay_sidecar(sidecar, 66, layout, 16, 24, 32)
+            self.assertEqual(sidecar.read_text(encoding="ascii"),
+                             f"66 {layout} 16 24 32\n")
+            probe.write_replay_sidecar(sidecar, 1024, layout, 32, 64, 128)
+            self.assertEqual(sidecar.read_text(encoding="ascii"),
+                             f"1024 {layout} 32 64 128\n")
+            # Fail closed: a missing/non-PASS Prompt or altered Chunk width
+            # must not quietly change the ablation's independent variable.
+            rows[1]["status"] = "FAIL"
+            source.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "not a PASS"):
+                probe.load_reference_chunks(
+                    source, prompts, layout, model, profile)
+            rows[1]["status"] = "PASS"
+            rows[1]["plan_xg"] = 64  # 2*64 > 66
+            source.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Invalid recorded"):
+                probe.load_reference_chunks(
+                    source, prompts, layout, model, profile)
+            rows[1]["plan_xg"] = 24
+            rows.pop()
+            source.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "50 PASS rows"):
+                probe.load_reference_chunks(
+                    source, prompts, layout, model, profile)
+
+    def test_native_replay_log_source_is_mandatory(self):
+        layout = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "llama-server.log"
+            sample = (
+                "[REGION_RING_REQUEST_CHUNK_PLAN] event=SELECT"
+                " tokens=66 kv_start=0 layout=" + layout +
+                " XC=16 XG=24 XP=32"
+                " startup_XC=32 startup_XG=32 startup_XP=32"
+                " changed=1 planner_ms=0.200"
+                " source=LOCKED_CHUNK_REPLAY"
+                " layer_placement=IMMUTABLE"
+                " execution=THIS_DECODE_ONLY status=PASS\n"
+                "[REGION_RING_SUM] tokens=66 XC=0 XG=24 XP=33"
+                " regions=11 first_region_chunks=3 tasks=33"
+                " executed=33 complete=1 wall_ms=300"
+                " mode=DEVICE_FIFO_PC_PHONE_OVERLAP status=0\n")
+            log.write_text(sample, encoding="utf-8")
+            decision, _ = probe.read_request_chunk_plan(
+                log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_REPLAY")
+            self.assertEqual(decision["plan_xg"], 24)
+            self.assertEqual(decision["plan_xp"], 32)
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout, "LOCKED_CHUNK_ONLY")
+
+    def test_cpp_request_replay_hook_checks_tokens_and_layout(self):
+        source = (Path(__file__).resolve().parents[2] /
+                  "src" / "llama-context.cpp").read_text(encoding="utf-8")
+        start = source.index(
+            'std::getenv("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE")')
+        block = source[start:source.index("if (region_ring_v1 &&", start)]
+        for phrase in (
+            "std::ifstream replay(replay_path)",
+            "replay_tokens != n_tokens_all",
+            "request_layout != model.hybrid_ring_plan_layout",
+            "source=%s",
+            '"LOCKED_CHUNK_REPLAY"',
+        ):
+            self.assertIn(phrase, block)
+
     def test_cpp_request_hook_reuses_locked_planner_and_stage_builder(self):
         source = (Path(__file__).resolve().parents[2] /
                   "src" / "llama-context.cpp").read_text(
