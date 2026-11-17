@@ -1,0 +1,11 @@
+prompt_file,group,status,actual_tokens,prefill_ms,prefill_tps,mode,transport
+prompt_0_01.txt,0,PASS,74,19347.82,3.82,Galaxy,RANK_LOCAL
+prompt_0_02.txt,0,PASS,76,15191.71,5,Galaxy,RANK_LOCAL
+prompt_0_03.txt,0,PASS,77,15783.62,4.88,Galaxy,RANK_LOCAL
+prompt_0_04.txt,0,PASS,83,17026.35,4.87,Galaxy,RANK_LOCAL
+prompt_0_05.txt,0,PASS,98,18070.73,5.42,Galaxy,RANK_LOCAL
+prompt_0_06.txt,0,PASS,101,19535.64,5.17,Galaxy,RANK_LOCAL
+prompt_0_07.txt,0,PASS,104,19738.88,5.27,Galaxy,RANK_LOCAL
+prompt_0_08.txt,0,PASS,122,21094.42,5.78,Galaxy,RANK_LOCAL
+prompt_0_09.txt,0,PASS,126,20555.38,6.13,Galaxy,RANK_LOCAL
+prompt_0_10.txt,0,PASS,130,22893.81,5.68,Galaxy,RANK_LOCAL

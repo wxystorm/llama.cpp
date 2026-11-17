@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "run_id": "galaxy-14b-group0",
+  "source_archive": "galaxy-14b.zip",
+  "source_summary": "run-20261117-105542-729/summary.csv",
+  "model": "${MODEL_DIR}/Qwen3-14B-Q4_K_M.gguf",
+  "prompt_dir": "${PROMPT_DIR}",
+  "rpc": "${RPC_ENDPOINT}",
+  "mode": "Galaxy",
+  "transport": "RANK_LOCAL",
+  "galaxy2_layers": 1,
+  "collective_tile_tokens": 256,
+  "ctx": 2048,
+  "batch": 512,
+  "ubatch": 256,
+  "threads": 8,
+  "timeout_sec": 900,
+  "final_layer_sp": false,
+  "dump_logits": false,
+  "profile": false,
+  "prompt_groups": [
+    0
+  ],
+  "prompt_indices": "01..10",
+  "per_prompt_details": "per-prompt-details.csv"
+}

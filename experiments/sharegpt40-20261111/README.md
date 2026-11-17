@@ -1,6 +1,6 @@
 # ShareGPT benchmark snapshot
 
-Ten experimental runs; **426 successful per-prompt results** in `results.csv` and **58 group summary rows** in `group-summary.csv`. Prompt groups are sampling labels, not exact model token counts.
+Ten experimental runs; **436 successful per-prompt results** in `results.csv` and **60 group summary rows** in `group-summary.csv`. Prompt groups are sampling labels, not exact model token counts.
 
 ## Run inventory
 
@@ -12,7 +12,7 @@ Ten experimental runs; **426 successful per-prompt results** in `results.csv` an
 | Jupiter | Qwen3-14B | `jupiter-14b` | 40 |
 | Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36 |
 | Jupiter | Qwen3-32B | `jupiter-32b` | 40 |
-| Galaxy | Qwen3-14B | `galaxy-14b` | 40 |
+| Galaxy | Qwen3-14B | `galaxy-14b` | 50 |
 | Ours | Qwen3-14B | `ours-14b-server-plan` | 50 |
 | Ours | Mistral Small 3.2-24B Q6_K | `ours-24b-server-plan` | 50 |
 | Ours | Qwen3-32B | `ours-32b-server-plan` | 50 |
@@ -23,7 +23,7 @@ Each new run's `runs/ours-*-server-plan/per-prompt-details.csv` keeps input toke
 
 Ours 14B has been fully replaced by the new 50-prompt Server Plan measurements for groups 0/128/256/512/1024, with the user-confirmed placement `G11,P5,G11,P5,G8` (40 layers). Its earlier 2048 group and old mixed per-prompt maxima are no longer part of the current summary. They remain available in Git history.
 
-The six other complete runs each contain 40 observations over groups 128/256/512/1024. Jupiter 24B has 36 observations (group 1024: six), and its missing four are not imputed.
+Galaxy 14B covers groups 0/128/256/512/1024 with 10 prompts per group (group 0 mean: 5.202 tok/s). The five other complete baselines each contain 40 observations over groups 128/256/512/1024. Jupiter 24B has 36 observations (group 1024: six), and its missing four are not imputed.
 
 `group-summary.csv` computes ordinary arithmetic mean/median of recorded per-prompt Prefill TPS and latency; a group mean is not pooled token throughput. Planner time is retained in per-prompt details, not added to prefill time.
 

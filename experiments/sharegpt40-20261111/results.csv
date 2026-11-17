@@ -159,6 +159,16 @@ jupiter,32b,1024,prompt_1024_07.txt,PASS,1377,48921.31,28.147
 jupiter,32b,1024,prompt_1024_08.txt,PASS,1380,47985.86,28.758
 jupiter,32b,1024,prompt_1024_09.txt,PASS,1760,63984.51,27.507
 jupiter,32b,1024,prompt_1024_10.txt,PASS,1863,60790,30.646
+galaxy,14b,0,prompt_0_01.txt,PASS,74,19347.82,3.82
+galaxy,14b,0,prompt_0_02.txt,PASS,76,15191.71,5
+galaxy,14b,0,prompt_0_03.txt,PASS,77,15783.62,4.88
+galaxy,14b,0,prompt_0_04.txt,PASS,83,17026.35,4.87
+galaxy,14b,0,prompt_0_05.txt,PASS,98,18070.73,5.42
+galaxy,14b,0,prompt_0_06.txt,PASS,101,19535.64,5.17
+galaxy,14b,0,prompt_0_07.txt,PASS,104,19738.88,5.27
+galaxy,14b,0,prompt_0_08.txt,PASS,122,21094.42,5.78
+galaxy,14b,0,prompt_0_09.txt,PASS,126,20555.38,6.13
+galaxy,14b,0,prompt_0_10.txt,PASS,130,22893.81,5.68
 galaxy,14b,128,prompt_128_01.txt,PASS,175,48288.12,3.62
 galaxy,14b,128,prompt_128_02.txt,PASS,179,49099.55,3.65
 galaxy,14b,128,prompt_128_03.txt,PASS,181,49897.56,3.63

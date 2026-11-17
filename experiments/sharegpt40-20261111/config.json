@@ -13,7 +13,7 @@
     ],
     "prompts_per_group": 10,
     "prompt_ids": "prompt_{group}_{01..10}.txt",
-    "note": "The three Ours server-plan runs each include groups 0/128/256/512/1024, with ten prompts per group. Other ShareGPT40 baselines use groups 128/256/512/1024; Jupiter 24B group 1024 has only six PASS observations. PC-only 2048 observations are separate and excluded from results.csv."
+    "note": "Ours 14B/24B/32B and Galaxy 14B cover groups 0/128/256/512/1024 (10 prompts each). Other full baselines cover groups 128/256/512/1024; Jupiter 24B 1024 group has 6 PASS observations."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -35,12 +35,19 @@
       "id": "prima-14b",
       "framework": "prima.cpp",
       "model": "14b",
-      "context": 4096,
+      "context": 2048,
       "predict": 32,
       "batch": 512,
       "ubatch": 512,
       "threads": 8,
-      "planner": "HiGHS"
+      "planner": "HiGHS",
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      }
     },
     {
       "id": "prima-32b",
@@ -98,7 +105,16 @@
       "batch": 512,
       "ubatch": 256,
       "threads": 8,
-      "final_layer_sp": false
+      "final_layer_sp": false,
+      "supplemental_group0_config": "runs/galaxy-14b-group0/run-config.json",
+      "supplemental_group0_details": "runs/galaxy-14b-group0/per-prompt-details.csv",
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      }
     },
     {
       "id": "ours-14b-server-plan",

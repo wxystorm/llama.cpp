@@ -51,6 +51,15 @@
       "runs": 36,
       "expected_runs": 40,
       "status": "PARTIAL"
+    },
+    {
+      "id": "galaxy-14b-group0",
+      "archive": "galaxy-14b.zip",
+      "sha256": "4e7f0f23d79db38af01ae08cfd308acf7c3d22d68c9d4441f964fdf005b81888",
+      "bytes": 42732,
+      "runs": 10,
+      "group": 0,
+      "source_summary": "run-20261117-105542-729/summary.csv"
     }
   ]
 }
