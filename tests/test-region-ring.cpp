@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstdio>
 #include <exception>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,82 @@ static void check_rejected(const char * layout) {
         rejected = true;
     }
     check(rejected, "invalid layout was accepted");
+}
+
+// The w/o Multi-Cycle experiment has one logical G->P->G path, but
+// six physical GPU weight windows are essential: an unsplit G36 would
+// silently remove double-bank streaming and exceed the intended budget.
+static void test_gpg_wo_multi_cycle_ablation_layout() {
+    constexpr const char * key = "LLAMA_REGION_RING_NO_MULTI_CYCLE_GPG";
+#if defined(_WIN32)
+    check(_putenv_s(key, "") == 0, "clear GPG ablation env");
+#else
+    check(unsetenv(key) == 0, "clear GPG ablation env");
+#endif
+    const auto ordinary =
+        llama_region_ring_parse_apply_wide_layout("G36,P21,G7", 64);
+    check(ordinary.size() == 3,
+          "without ablation G-P-G should have three logical Regions");
+
+    bool rejected_physical_without_flag = false;
+    try {
+        (void) llama_region_ring_parse_apply_wide_layout(
+            "G7,G7,G8,G7,G7,P21,G7", 64);
+    } catch (const std::runtime_error &) {
+        rejected_physical_without_flag = true;
+    }
+    check(rejected_physical_without_flag,
+          "consecutive physical GPU Regions need explicit ablation");
+
+#if defined(_WIN32)
+    check(_putenv_s(key, "1") == 0, "enable GPG ablation env");
+#else
+    check(setenv(key, "1", 1) == 0, "enable GPG ablation env");
+#endif
+    const auto physical =
+        llama_region_ring_parse_apply_wide_layout("G36,P21,G7", 64);
+    check(llama_region_ring_layout_string(physical) ==
+              "G7,G7,G8,G7,G7,P21,G7",
+          "G36 must expand to five original GPU physical windows");
+    check(llama_region_ring_gpg_physical_compatible(physical, 64) &&
+              llama_region_ring_apply_topology_compatible(physical, 64),
+          "explicit GPG topology should be executable");
+    check(llama_region_ring_layer_counts(physical) ==
+              (std::array<int, 3>{0, 43, 21}),
+          "G-P-G must keep exactly 43 GPU and 21 Phone layers");
+    check(physical[5].layer_begin == 36 &&
+              physical[5].layer_end == 57 &&
+              physical.back().layer_begin == 57 &&
+              physical.back().layer_end == 64,
+          "G-P-G needs one Phone crossing and final G7");
+    const auto reparsed = llama_region_ring_parse_apply_wide_layout(
+        llama_region_ring_layout_string(physical), 64);
+    check(llama_region_ring_gpg_physical_compatible(reparsed, 64),
+          "model-owned physical layout must round-trip");
+    for (size_t rank = 0; rank < 6; ++rank) {
+        check(llama_region_ring_gpu_weight_bank_for_rank(rank) ==
+                  (rank & 1u), "double-bank parity must remain unchanged");
+        const auto successor =
+            llama_region_ring_gpu_weight_next_rank(rank, 6);
+        check(successor ==
+                  (rank + 2 < 6 ?
+                      std::optional<size_t>(rank + 2) : std::nullopt),
+              "GPU bank rank+2 prefetch must cover original four refills");
+    }
+    bool invalid_layout_rejected = false;
+    try {
+        (void) llama_region_ring_parse_apply_wide_layout(
+            "G36,P20,G8", 64);
+    } catch (const std::runtime_error &) {
+        invalid_layout_rejected = true;
+    }
+    check(invalid_layout_rejected,
+          "GPG ablation must reject mismatched layer allocations");
+#if defined(_WIN32)
+    check(_putenv_s(key, "") == 0, "restore GPG env");
+#else
+    check(unsetenv(key) == 0, "restore GPG env");
+#endif
 }
 
 static void test_layout() {
@@ -1785,6 +1863,8 @@ int main() {
     try {
         test_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] layout=PASS\n");
+        test_gpg_wo_multi_cycle_ablation_layout();
+        std::fprintf(stderr, "[REGION_RING_TEST] gpg_wo_multi_cycle=PASS\n");
         test_model_aware_default_layout();
         std::fprintf(stderr, "[REGION_RING_TEST] model_aware_layout=PASS\n");
         test_directional_layout();
