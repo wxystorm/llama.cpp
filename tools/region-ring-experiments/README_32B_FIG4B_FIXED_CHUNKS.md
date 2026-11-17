@@ -2,7 +2,7 @@
 
 This is an **experiment runner**, not generated paper results. It measures three **fixed** Chunk widths (32, 64, 128) at three ShareGPT input-length groups (128, 512, 1024), using the **same fixed 64-layer placement** and **identical full Cycle runtime policy**. It tests whether the best fixed Chunk width changes with prompt length. Crossing curves are a hypothesis, not an assumed outcome.
 
-- **Placement:** `G8,P6,G8,P6,G8,P6,G8,P6,G8` by default; exactly identical in every case. Use `--layout` only to supply a known-feasible *common* placement, never a different placement per Chunk.
+- **Placement:** `G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7` by default (43 GPU layers + 21 Phone HTP layers); exactly identical in every case. This is the fixed topology used by the 32B Full Cycle 50-prompt baseline (`probe_htp_llama_server.py` on `feat/region-ring-sharegpt50-short-first-long-20261116`). Use `--layout` only to supply a known-feasible *common* placement, never a different placement per Chunk. The figure runner does not automatically load `placement-lock.json` or re-run placement search.
 - **Chunks:** `XC = XG = XP = 32 / 64 / 128`, fixed independently of prompt length, **not** selected by the Planner. Native fixed mode skips hardware profiling and Planner search.
 - **Runtime:** GPU two banks, async prefetch, Drain-First, resource-aware Chunk scheduling, streaming ON and forced small-batch mover. The forced short-prompt mover is intentionally enabled for *every* case, to avoid silently switching the 128-token case into a non-streaming runtime.
 - **Inference:** one generated token, non-conversation, same model, prompt file and seed. One separate **unmeasured** prefill warmup per Chunk/repetition invocation; measured prefill comes from the engine, not wall time.
@@ -24,11 +24,12 @@ $opts = @(
   '--exe', "$root\build-tensor-v2\bin\Release\llama-completion.exe",
   '--model', 'E:\llama\models\Qwen3-32B-Q4_K_M.gguf',
   '--rpc', '10.238.229.239:50052',
-  '--prompt-dir', 'E:\llama\datasets\sharegpt\sharegpt40',
+  '--prompt-dir', 'E:\llama\datasets\sharegpt\sharegpt50_short',
   '--out', "$root\fig4b-32b-fixed-chunks",
   '--groups', '128', '512', '1024',
   '--chunks', '32', '64', '128',
-  '--batch', '2048', '--ubatch', '2048', '--threads', '8'
+  '--batch', '2048', '--ubatch', '2048', '--threads', '8',
+  '--min-context', '256', '--max-context', '2048', '--context-padding', '0'
 )
 
 # Inspect scheduled commands first (no inference).
