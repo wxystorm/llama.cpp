@@ -5,10 +5,11 @@ copy, strict 100% timeline. Analysis recovery never invokes inference.
 #>
 [CmdletBinding()]
 param(
-  [string]$Model = "E:\llama\models\Qwen3-14B-Q4_K_M.gguf",
+  [string]$Model = "E:\llama\models\Qwen3-32B-Q4_K_M.gguf",
   [string]$PromptFile = "E:\llama\datasets\sharegpt\sharegpt50_short\prompt_1024_01.txt",
   [string]$Rpc = "10.238.229.239:10139",
-  [int]$PcLayers = 24,
+  [int]$PcLayers = 53,
+  [int]$ModelLayers = 64,
   [int]$Context = 2048,
   [int]$Batch = 2048,
   [int]$UBatch = 128,
@@ -21,7 +22,8 @@ param(
   [string]$PhoneUser = "u0_a283",
   [int]$PhoneSshPort = 8022,
   [string]$PhoneEvents = "",
-  [string]$OutputDir = ".\fig3-jupiter14b-complete",
+  [string]$PhoneRemoteFile = "/data/data/com.termux/files/home/jupiter-fig3-phone-32b.csv",
+  [string]$OutputDir = ".\fig3-jupiter32b-complete",
   [switch]$AsyncC2P,
   [switch]$LocalGraphReuse,
   [switch]$SkipBuild,
@@ -34,8 +36,8 @@ $ErrorActionPreference = "Stop"
 Push-Location (Join-Path $PSScriptRoot "..\..")
 try {
   $branch = (& git branch --show-current).Trim()
-  if ($branch -ne "exp/jupiter-fig3-full-trace-20261118") {
-    throw "Wrong Jupiter branch '$branch'. Switch to exp/jupiter-fig3-full-trace-20261118."
+  if ($branch -ne "exp/jupiter-fig3-32b-20261118") {
+    throw "Wrong Jupiter branch '$branch'. Switch to exp/jupiter-fig3-32b-20261118."
   }
   Write-Host "[JUPITER_FIG3] GitBranch=$branch"
   if (-not $AnalyzeOnly) {
@@ -59,11 +61,12 @@ try {
     "--model", $Model,
     "--prompt-file", $PromptFile,
     "--rpc", $Rpc,
-    "--pc-layers", "$PcLayers",
+    "--pc-layers", "$PcLayers", "--model-layers", "$ModelLayers",
     "--context", "$Context", "--batch", "$Batch", "--ubatch", "$UBatch",
     "--window", "$Window", "--threads", "$Threads",
     "--normal-repeats", "$NormalRepeats", "--warmups", "$Warmups",
     "--phone-user", $PhoneUser, "--phone-ssh-port", "$PhoneSshPort",
+    "--phone-remote-file", $PhoneRemoteFile,
     "--out-dir", $OutputDir
   )
   if ($PlanFile) { $cmd += @("--plan-file", $PlanFile) }
