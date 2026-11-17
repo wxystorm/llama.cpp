@@ -10973,8 +10973,63 @@ int llama_context::decode(const llama_batch & batch_inp) {
             std::getenv("LLAMA_REGION_RING_REQUEST_CHUNK_REPLAY_FILE");
         const bool replay_requested =
             replay_path != nullptr && *replay_path != '\0';
+        // Planner w/o Profile ablation: replace request-time DAG/Chunk
+        // search with a single predeclared width, clipped only to legal
+        // token counts. The original model placement/HTP profile is still
+        // loaded ONCE before requests; runtime allocation is unchanged.
+        // On a two-Bank run, XG <= floor(tokens/2) is mandatory, hence
+        // short prompts cannot literally execute XG=128.
+        const char * fixed_chunk_raw =
+            std::getenv("LLAMA_REGION_RING_FIXED_CHUNK_ABLATION");
+        const bool fixed_chunk_requested =
+            fixed_chunk_raw != nullptr && *fixed_chunk_raw != '\0';
         bool selected = false;
-        if (replay_requested) {
+        if (fixed_chunk_requested) {
+            char * end = nullptr;
+            const long target = std::strtol(fixed_chunk_raw, &end, 10);
+            const std::array<int, 10> legal = {
+                32, 48, 64, 80, 96, 112, 128, 160, 192, 256
+            };
+            if (replay_requested || end == fixed_chunk_raw ||
+                    *end != '\0' ||
+                    std::find(legal.begin(), legal.end(), target) ==
+                        legal.end()) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_FIXED_CHUNK] event=REJECT"
+                    " reason=INVALID_TARGET_OR_REPLAY_CONFLICT"
+                    " target=%s status=FAIL\n", fixed_chunk_raw);
+                return -1;
+            }
+            const auto legal_clamp = [&](int available) -> int {
+                int selected_width = 0;
+                for (const int width : legal) {
+                    if (width <= target && width <= available) {
+                        selected_width = width;
+                    }
+                }
+                return selected_width;
+            };
+            request_xc = legal_clamp((int) n_tokens_all);
+            request_xg = legal_clamp((int) n_tokens_all / 2);
+            request_xp = legal_clamp((int) n_tokens_all);
+            if (request_xc == 0 || request_xg == 0 || request_xp == 0) {
+                LLAMA_LOG_ERROR(
+                    "[REGION_RING_FIXED_CHUNK] event=REJECT"
+                    " reason=NO_LEGAL_TWO_BANK_CHUNK"
+                    " target=%ld tokens=%u status=FAIL\n",
+                    target, n_tokens_all);
+                return -1;
+            }
+            request_layout = model.hybrid_ring_plan_layout;
+            selected = true;
+            LLAMA_LOG_INFO(
+                "[REGION_RING_FIXED_CHUNK] target=%ld tokens=%u"
+                " XC=%d XG=%d XP=%d"
+                " policy=LEGAL_CLAMP_ONLY"
+                " profile_queries=0 status=PASS\n",
+                target, n_tokens_all,
+                request_xc, request_xg, request_xp);
+        } else if (replay_requested) {
             std::ifstream replay(replay_path);
             uint32_t replay_tokens = 0;
             std::string extra;
@@ -11088,6 +11143,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
              startup_xg != region_ring_xg ||
              startup_xp != region_ring_xp) ? 1 : 0,
             planner_ms,
+            fixed_chunk_requested ? "FIXED_CHUNK_ABLATION" :
             replay_requested ? "LOCKED_CHUNK_REPLAY" : "LOCKED_CHUNK_ONLY");
     }
     if (region_ring_v1 &&
