@@ -618,12 +618,24 @@ class ServerProbeTests(unittest.TestCase):
                 "--prompt-dir", str(root), "--profile-source", str(root),
                 "--out", str(root / "out"),
                 "--all50", "--per-request-chunks",
-                "--replay-chunks-from", str(reference),
                 "--locked-layout", probe.GPG_LOGICAL_LAYOUT,
             ]
             args = probe.parse_args(base + ["--no-multi-cycle"])
             self.assertTrue(args.no_multi_cycle)
+            self.assertTrue(args.per_request_chunks)
+            self.assertIsNone(args.replay_chunks_from)
             self.assertEqual(args.locked_layout, probe.GPG_LOGICAL_LAYOUT)
+            with self.assertRaises(SystemExit):
+                probe.parse_args(base + [
+                    "--no-multi-cycle", "--replay-chunks-from", str(reference)])
+            with self.assertRaises(SystemExit):
+                no_per_request = base.copy()
+                no_per_request.remove("--per-request-chunks")
+                probe.parse_args(no_per_request + ["--no-multi-cycle"])
+            with self.assertRaises(SystemExit):
+                no_all50 = base.copy()
+                no_all50.remove("--all50")
+                probe.parse_args(no_all50 + ["--no-multi-cycle"])
             with self.assertRaises(SystemExit):
                 probe.parse_args(base + [
                     "--no-multi-cycle", "--no-async-prefetch"])
@@ -636,7 +648,7 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 probe.parse_args(invalid + ["--no-multi-cycle"])
 
-    def test_wo_multi_cycle_requires_async_mover_and_exact_replay(self):
+    def test_wo_multi_cycle_requires_async_mover_and_native_chunk_plan(self):
         layout = probe.GPG_PHYSICAL_LAYOUT
         full = (
             "[REGION_RING_MULTI_CYCLE_ABLATION] mode=G_P_G"
@@ -657,7 +669,7 @@ class ServerProbeTests(unittest.TestCase):
             " XC=16 XG=24 XP=48"
             " startup_XC=32 startup_XG=32 startup_XP=32"
             " changed=1 planner_ms=0.400"
-            " source=LOCKED_CHUNK_REPLAY"
+            " source=LOCKED_CHUNK_ONLY"
             " layer_placement=IMMUTABLE"
             " execution=THIS_DECODE_ONLY status=PASS\n"
             "[REGION_RING_SUM] tokens=66 XC=0 XG=24 XP=48"
@@ -675,24 +687,33 @@ class ServerProbeTests(unittest.TestCase):
             log.write_text(full, encoding="utf-8")
             decision, _ = probe.read_request_chunk_plan(
                 log, 0, 66, 256, 256, layout,
-                "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+                "LOCKED_CHUNK_ONLY", "DRAIN_FIRST", False, True)
             self.assertEqual(
                 (decision["plan_xc"], decision["plan_xg"],
                  decision["plan_xp"]), (16, 24, 48))
+            # A replay would silently disable native per-Prompt optimization.
+            log.write_text(
+                full.replace("source=LOCKED_CHUNK_ONLY",
+                             "source=LOCKED_CHUNK_REPLAY"),
+                encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "source mismatch"):
+                probe.read_request_chunk_plan(
+                    log, 0, 66, 256, 256, layout,
+                    "LOCKED_CHUNK_ONLY", "DRAIN_FIRST", False, True)
             log.write_text(
                 full.replace("gpu_prefetch=1", "gpu_prefetch=0"),
                 encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "w/o Multi-Cycle"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
-                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+                    "LOCKED_CHUNK_ONLY", "DRAIN_FIRST", False, True)
             log.write_text(
                 full.replace("completed=4", "completed=3"),
                 encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "asynchronous"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
-                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+                    "LOCKED_CHUNK_ONLY", "DRAIN_FIRST", False, True)
             log.write_text(
                 full.replace(
                     "[REGION_RING_CYCLE_SCHED] mode=DRAIN_FIRST",
@@ -701,7 +722,7 @@ class ServerProbeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "scheduler ablation"):
                 probe.read_request_chunk_plan(
                     log, 0, 66, 256, 256, layout,
-                    "LOCKED_CHUNK_REPLAY", "DRAIN_FIRST", False, True)
+                    "LOCKED_CHUNK_ONLY", "DRAIN_FIRST", False, True)
 
     def test_gpg_canonical_parser_preserves_gpu_window_boundaries(self):
         header = (Path(__file__).resolve().parents[2] /
