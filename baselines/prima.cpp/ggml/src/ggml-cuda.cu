@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "prima-fig3-trace.h"
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -58,6 +59,83 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+// Fig.3: CUDA duration is measured using device events, NOT graph host
+// submission time. CUDA events have no shared wall-clock epoch on this
+// legacy backend; mapping to the host is an upper-bound sync anchor.
+// The raw file explicitly labels this mapping as ESTIMATED, so the
+// analyzer cannot silently present it as a hardware-exact timeline.
+struct prima_fig3_cuda_event {
+    cudaEvent_t begin;
+    cudaEvent_t end;
+    int device;
+    const char * category;
+    const char * kind;
+    int64_t bytes;
+    int64_t submit_ns;
+};
+static std::mutex prima_fig3_cuda_lock;
+static std::vector<prima_fig3_cuda_event> prima_fig3_cuda_pending;
+
+static cudaEvent_t prima_fig3_cuda_begin(cudaStream_t stream) {
+    if (!prima_fig3::enabled()) return nullptr;
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    if (capture != cudaStreamCaptureStatusNone) return nullptr;
+    cudaEvent_t event;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDefault));
+    CUDA_CHECK(cudaEventRecord(event, stream));
+    return event;
+}
+static void prima_fig3_cuda_end(cudaStream_t stream, cudaEvent_t begin,
+                                int device, const char * category,
+                                const char * kind, int64_t bytes = 0) {
+    if (!begin) return;
+    cudaEvent_t end;
+    CUDA_CHECK(cudaEventCreateWithFlags(&end, cudaEventDefault));
+    CUDA_CHECK(cudaEventRecord(end, stream));
+    std::lock_guard<std::mutex> guard(prima_fig3_cuda_lock);
+    prima_fig3_cuda_pending.push_back(
+        {begin, end, device, category, kind, bytes, prima_fig3::now_ns()});
+}
+static void prima_fig3_cuda_flush(int device) {
+    if (!prima_fig3::enabled()) return;
+    const int64_t host_sync_ns = prima_fig3::now_ns();
+    std::vector<prima_fig3_cuda_event> finished;
+    {
+        std::lock_guard<std::mutex> guard(prima_fig3_cuda_lock);
+        auto it = prima_fig3_cuda_pending.begin();
+        while (it != prima_fig3_cuda_pending.end()) {
+            if (it->device == device) {
+                finished.push_back(*it);
+                it = prima_fig3_cuda_pending.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto & event : finished) {
+        float ms = 0.f;
+        const cudaError_t status = cudaEventElapsedTime(&ms, event.begin, event.end);
+        if (status == cudaSuccess && ms >= 0.f) {
+            int64_t duration_ns = static_cast<int64_t>(ms * 1000000.f);
+            // The sync return is an upper bound on device completion, NOT a
+            // synchronized CUDA/CPU clock reading. Keep this diagnostic
+            // explicit until a CUPTI absolute timestamp trace is available.
+            const int64_t end_ns = host_sync_ns;
+            prima_fig3::record(event.category, event.kind,
+                end_ns - duration_ns, end_ns, event.bytes,
+                "DEVICE_DURATION_SYNC_UPPER_BOUND");
+        } else {
+            prima_fig3::record("Diagnostic", "CUDA_EVENT_UNAVAILABLE",
+                host_sync_ns, host_sync_ns, event.bytes);
+        }
+        CUDA_CHECK(cudaEventDestroy(event.begin));
+        CUDA_CHECK(cudaEventDestroy(event.end));
+    }
+}
+
+
 
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg) {
@@ -473,16 +551,22 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const cudaEvent_t fig3_begin = prima_fig3_cuda_begin(cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    prima_fig3_cuda_end(cudaStreamPerThread, fig3_begin, ctx->device, "PCIe Copy", "H2D_BUFFER", static_cast<int64_t>(size));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    prima_fig3_cuda_flush(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    const cudaEvent_t fig3_begin = prima_fig3_cuda_begin(cudaStreamPerThread);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    prima_fig3_cuda_end(cudaStreamPerThread, fig3_begin, ctx->device, "PCIe Copy", "D2H_BUFFER", static_cast<int64_t>(size));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    prima_fig3_cuda_flush(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2377,7 +2461,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const cudaEvent_t fig3_begin = prima_fig3_cuda_begin(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync((char *)tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    prima_fig3_cuda_end(cuda_ctx->stream(), fig3_begin, cuda_ctx->device, "PCIe Copy", "H2D_ASYNC", static_cast<int64_t>(size));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2386,7 +2472,9 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
+    const cudaEvent_t fig3_begin = prima_fig3_cuda_begin(cuda_ctx->stream());
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *)tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    prima_fig3_cuda_end(cuda_ctx->stream(), fig3_begin, cuda_ctx->device, "PCIe Copy", "D2H_ASYNC", static_cast<int64_t>(size));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2448,6 +2536,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    prima_fig3_cuda_flush(cuda_ctx->device);
 
     GGML_UNUSED(backend);
 }
@@ -2509,6 +2598,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    const cudaEvent_t fig3_gpu_start = prima_fig3_cuda_begin(cuda_ctx->stream());
 
 #ifdef USE_CUDA_GRAPH
     static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -2774,6 +2864,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
     }
 
+    prima_fig3_cuda_end(cuda_ctx->stream(), fig3_gpu_start, cuda_ctx->device,
+                        "GPU Compute", "CUDA_GRAPH", 0);
     return GGML_STATUS_SUCCESS;
 }
 
