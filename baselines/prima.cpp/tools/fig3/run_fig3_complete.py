@@ -22,7 +22,8 @@ import threading
 import time
 from datetime import datetime, timezone
 from analyze_fig3 import inspect
-from layout_guard import parse_fixed, summarize_log, validate_layout, compare_runs
+from layout_guard import (parse_fixed, local_layer_counts, summarize_log,
+                          validate_layout, compare_runs)
 
 PERF = re.compile(r"prompt eval time\s*=\s*([\d,.]+)\s*ms\s*/\s*(\d+)\s*(?:tokens?|runs?)",
                   flags=re.I)
@@ -160,7 +161,8 @@ def args_parser():
     p.add_argument("--pc-ngl", type=int, default=None,
                    help="PC CUDA layers for --fixed-layers, e.g. 21")
     p.add_argument("--model-layers", type=int, default=0,
-                   help="optional exact model layer count for fixed layout validation")
+                   help="full model layer count, e.g. 64 for 32B; manual -lw "
+                        "windows may repeat across multiple ring cycles")
     p.add_argument("--warmups", type=int, default=1)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--profile-only", action="store_true",
@@ -194,8 +196,13 @@ def args_parser():
             pc, phone = parse_fixed(args.fixed_layers, args.model_layers)
         except ValueError as err:
             p.error(str(err))
-        if not 0 <= args.pc_ngl <= pc:
-            p.error("--pc-ngl must be between 0 and the number of PC layers")
+        if args.pc_ngl < 0:
+            p.error("--pc-ngl must be nonnegative")
+        pc_actual = (local_layer_counts(pc, phone, args.model_layers)[0]
+                     if args.model_layers else pc)
+        if args.pc_ngl > pc_actual:
+            p.error("--pc-ngl exceeds PC's estimated layers across all ring "
+                    "cycles; pass --model-layers for multi-cycle layouts")
     if not (0 < args.ubatch <= args.batch <= args.context):
         p.error("need 0 < ubatch <= batch <= context")
     if args.clock_interval < 0.5 or args.clock_interval > 5.0:
