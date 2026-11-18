@@ -47,9 +47,9 @@ GPG_LOGICAL_LAYOUT = "G36,P21,G7"
 GPG_PHYSICAL_LAYOUT = "G7,G7,G8,G7,G7,P21,G7"
 
 
-def server_command(server_exe, model, rpc, port, threads=8):
+def server_command(server_exe, model, rpc, port, threads=8, no_mmap=False):
     """Use one slot and a whole-prompt UBatch to avoid unsupported splits."""
-    return [
+    command = [
         str(server_exe), "-m", str(model), "--rpc", rpc,
         "--split-mode", "tensor", "--flash-attn", "on",
         "-c", "2048", "-b", "2048", "-ub", "2048",
@@ -60,6 +60,9 @@ def server_command(server_exe, model, rpc, port, threads=8):
         "--host", "127.0.0.1", "--port", str(port),
         "-lv", "4",
     ]
+    if no_mmap:
+        command.append("--no-mmap")
+    return command
 
 
 def completion_payload(text):
@@ -111,8 +114,13 @@ def parse_args(argv=None):
                    help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
     p.add_argument("--skip-plan-memory-checks", action="store_true",
                    help="no-DAG locked-layout only: explicitly skip planner ESTIMATED memory checks; CUDA/HTP runtime allocations remain active")
-    p.add_argument("--fixed-chunk", type=int, choices=(64, 128), default=None,
+    p.add_argument("--fixed-chunk", type=int, choices=(32, 64, 128), default=None,
                    help="Planner ablation: fixed XC=XG=XP to 64 or 128; requests shorter than the target run whole as one Chunk, retaining async double-bank streaming")
+    p.add_argument("--fig4b-prompts", nargs=3, default=None,
+                   metavar=("PROMPT_1024", "PROMPT_128", "PROMPT_512"),
+                   help="Fig.4(b): exactly three selected ShareGPT50_short inputs")
+    p.add_argument("--no-mmap", action="store_true",
+                   help="disable GGUF mmap in resident llama-server")
     p.add_argument("--max-plan-xg", type=int, default=256,
                    choices=(32, 48, 64, 80, 96, 112, 128, 160, 192, 256),
                    help="native GPU Chunk search ceiling (default: 256)")
@@ -160,6 +168,22 @@ def parse_args(argv=None):
         p.error("--no-multi-cycle must choose native XC/XG/XP for each Prompt; remove --replay-chunks-from")
     if args.no_multi_cycle and (not args.all50 or not args.per_request_chunks):
         p.error("--no-multi-cycle requires --all50 --per-request-chunks")
+    if args.fig4b_prompts is not None:
+        if (not args.all50 or not args.per_request_chunks or
+                args.fixed_chunk is None or args.model_layers != 64 or
+                not args.no_mmap or args.limit):
+            p.error("--fig4b-prompts requires --all50 --per-request-chunks "
+                    "--fixed-chunk --no-mmap model-layers=64 and no --limit")
+        parsed_groups = []
+        for name in args.fig4b_prompts:
+            match = re.fullmatch(r"prompt_(128|512|1024)_(0[1-9]|10)\.txt", name)
+            if match is None:
+                p.error("--fig4b-prompts requires valid "
+                        "prompt_128/512/1024_XX.txt file names")
+            parsed_groups.append(int(match.group(1)))
+        if sorted(parsed_groups) != [128, 512, 1024]:
+            p.error("--fig4b-prompts requires one prompt from each "
+                    "128/512/1024 group")
     if args.fixed_chunk is not None:
         if not args.all50 or not args.per_request_chunks:
             p.error("--fixed-chunk requires --all50 --per-request-chunks")
@@ -213,8 +237,10 @@ def parse_args(argv=None):
     return args
 
 
-def prompt_files(folder, all50):
-    if not all50:
+def prompt_files(folder, all50, fig4b_prompts=None):
+    if fig4b_prompts is not None:
+        names = list(fig4b_prompts)
+    elif not all50:
         names = ["prompt_1024_10.txt", "prompt_0_01.txt",
                  "prompt_1024_10.txt"]
     else:
@@ -734,13 +760,15 @@ def load_completed_requests(path, prompts, fingerprint):
     return completed
 
 
-def report_rows(records, group_order):
+def report_rows(records, group_order, expected_counts=None):
     """Summarize per-prompt rates and token/time-weighted aggregate rate."""
     rows = []
     for group in [*group_order, "ALL"]:
         subset = [r for r in records if group == "ALL" or
                   r["group"] == group]
-        expected = 50 if group == "ALL" else 10
+        expected = (sum(expected_counts.values()) if group == "ALL"
+                    else expected_counts.get(group, 0)) if expected_counts is not None else (
+                    50 if group == "ALL" else 10)
         count = len(subset)
         tokens = sum(r["prompt_n"] for r in subset)
         prefill_ms = sum(r["prompt_ms"] for r in subset)
@@ -791,7 +819,7 @@ def report_rows(records, group_order):
     return rows
 
 
-def write_reports(out, records):
+def write_reports(out, records, expected_counts=None):
     """Rebuild readable tables after every PASS, including after resume."""
     out.mkdir(parents=True, exist_ok=True)
     detail_fields = [
@@ -809,16 +837,17 @@ def write_reports(out, records):
             stream, fieldnames=detail_fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
-    rows = report_rows(records, runner.MAIN50_SHORT_GROUPS)
+    rows = report_rows(records, runner.MAIN50_SHORT_GROUPS, expected_counts)
     with (out / "summary.csv").open(
             "w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    expected_total = sum(expected_counts.values()) if expected_counts is not None else 50
     (out / "summary.json").write_text(
-        json.dumps({"status": "PASS" if len(records) == 50
+        json.dumps({"status": "PASS" if len(records) == expected_total
                     else "INCOMPLETE",
-                    "completed": len(records), "expected": 50,
+                    "completed": len(records), "expected": expected_total,
                     "groups": rows}, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8")
 
@@ -850,7 +879,10 @@ def prepare_sweep_output(args, config, prompts):
             encoding="utf-8")
     completed = load_completed_requests(
         metrics_path, prompts, config["fingerprint"])
-    write_reports(args.out, completed)
+    write_reports(args.out, completed, (
+        {group: sum(group_for_prompt(p.name) == group for p in prompts)
+         for group in runner.MAIN50_SHORT_GROUPS}
+        if args.fig4b_prompts is not None else None))
     return completed
 
 
@@ -887,7 +919,7 @@ def main(argv=None):
     anchor_tokens = int(manifest[anchor.name])
     if not 32 <= anchor_tokens < 2048:
         raise ValueError("Invalid 2048-context anchor token count")
-    prompts = prompt_files(args.prompt_dir, args.all50)
+    prompts = prompt_files(args.prompt_dir, args.all50, args.fig4b_prompts)
     if args.all50:
         # Refuse a mismatched or truncated dataset before any expensive
         # model load. Group 0 must remain the real 64..128-token group.
@@ -924,6 +956,7 @@ def main(argv=None):
         "--batch", "2048", "--ubatch", "2048", "--n-predict", "1",
         "--threads", str(args.threads), "--min-context", "256",
         "--max-context", "2048", "--context-padding", "0",
+        *(["--no-mmap"] if args.no_mmap else []),
     ])
     if args.memory_proportional_placement:
         # Keep CPU RAM backing weights mmap-windowed for GPU double-bank.
@@ -941,7 +974,7 @@ def main(argv=None):
         # ablations retain their historical guarded-memory flag behavior.
         fake_args.skip_plan_memory_checks = True
     command = server_command(args.server_exe, args.model, args.rpc,
-                             args.port, args.threads)
+                             args.port, args.threads, no_mmap=args.no_mmap)
     # Model initialization uses the long-Prompt anchor, while the opt-in
     # request hook selects new Chunk widths for each fresh HTTP Prefill.
     target_profile = args.out / "independent-profile" / "profile.csv"
@@ -1116,7 +1149,7 @@ def main(argv=None):
         if len(completed) >= selected_count:
             print(f"[SERVER_SWEEP] status="
                   f"{'PASS' if len(completed) == 50 else 'PARTIAL'}"
-                  f" completed={len(completed)}/50"
+                  f" completed={len(completed)}/{len(prompts)}"
                   f" no_new_requests=1 results={metrics_path}", flush=True)
             return 0
 
@@ -1270,7 +1303,11 @@ def main(argv=None):
                     requested_this_process += 1
                     if args.all50:
                         completed.append(record)
-                        write_reports(args.out, completed)
+                        write_reports(args.out, completed, (
+                            {group: sum(group_for_prompt(p.name) == group
+                                        for p in prompts)
+                             for group in runner.MAIN50_SHORT_GROUPS}
+                            if args.fig4b_prompts is not None else None))
                     print(f"[SERVER_PROBE] {i}/{len(prompts)}"
                           f" prompt={path.name}"
                           f" group={record['group']}"
@@ -1287,9 +1324,9 @@ def main(argv=None):
                              if args.per_request_chunks else ""),
                           flush=True)
             if args.all50:
-                finished = len(completed) == 50
+                finished = len(completed) == len(prompts)
                 print(f"[SERVER_SWEEP] status={'PASS' if finished else 'PARTIAL'}"
-                      f" completed={len(completed)}/50"
+                      f" completed={len(completed)}/{len(prompts)}"
                       f" requests={metrics_path}"
                       f" summary={args.out / 'summary.csv'}"
                       f" details={args.out / 'requests.csv'}"
