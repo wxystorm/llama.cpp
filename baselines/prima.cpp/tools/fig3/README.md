@@ -110,6 +110,47 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## Resume after Phone Termux worker was accidentally closed
+
+A completed PC --profile-only run already saved its PC trace and 16+90+16
+clock observations. If Phone was then stopped, DO NOT run the original
+Phone helper in normal/start mode: it refuses a nonempty phone.csv.
+Do NOT delete phone.csv and do NOT use a different run-id.
+
+After updating the branch, recover Phone with the same run-id:
+
+    cd ~/prima-qwen3
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git merge --ff-only FETCH_HEAD
+    cd baselines/prima.cpp
+    bash -n tools/fig3/phone_worker_fig3.sh
+    PRIMA_FIG3_PHONE_RESUME=1 bash tools/fig3/phone_worker_fig3.sh \
+      "$HOME/models/Qwen3-14B-Q4_K_M.gguf" \
+      10.238.229.214 prima-fig3-14b-fasttrace-v1
+
+The helper checks that phone.csv is nonempty and belongs to this exact
+run; it skips tracing, skips re-running the clock server, and continues
+at the next unused rank1-NN.log session. The phone CSV remains byte-for-
+byte unchanged. Keep the helper alive while PC finishes Normal cases.
+
+PC WSL (no change to model binaries needed):
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-fasttrace-v1 \
+      --out /mnt/d/fig3-prima14b-fasttrace-v1 \
+      --model /mnt/e/llama/models/Qwen3-14B-Q4_K_M.gguf \
+      --prompt /mnt/e/llama/datasets/sharegpt/sharegpt50_short/prompt_1024_01.txt \
+      --master 10.238.229.214 --next 10.238.229.239 \
+      --context 2048 --batch 512 --ubatch 512 --threads 8 \
+      --fixed-layers 39,1 --pc-ngl 21 --model-layers 40 \
+      --warmups 1 --repeats 3 --between 30 --resume
+
+The resume command does not re-run the Profile or re-collect clocks
+because those are already saved. If the original Rank1 process is
+still running independently (terminal disappeared but process survived),
+do not launch a duplicate; first inspect `ps -ef | grep llama-cli`.
+
 ## PC trace write amplification and quick A/B (2026-11-18)
 
 Full original PC logs confirm the same manual PC39/Phone1, PC GPU21,
