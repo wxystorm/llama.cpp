@@ -423,6 +423,9 @@ def inspect(args):
     print("[PRIMA_FIG3] phone-meta-poll raw %.3f ms, overlap PC-GRAPH_SUBMIT %.3f ms"
           % (polling_diagnostics["phone_metadata_poll_raw_ms"],
              polling_diagnostics["phone_poll_overlaps_pc_graph_submit_ms"]))
+    print("[PRIMA_FIG3] WAITING/OTHER diagnostic: PC GRAPH_SUBMIT wall"
+          " overlapping residual = %.3f ms (NOT proven idle)"
+          % polling_diagnostics["pc_graph_submit_in_waiting_other_ms"])
     print("[PRIMA_FIG3] source events", len(source_rows),
           "100%-coverage", summary["full_coverage"],
           "GPU timestamp fidelity", fidelity)
