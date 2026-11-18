@@ -129,6 +129,17 @@ def read_case(args: argparse.Namespace, chunk: int, repeat: int) -> list[dict]:
         with path.open(encoding="utf-8-sig", newline="") as stream:
             entries = {r.get("prompt", ""): r for r in csv.DictReader(stream)}
     config_path = folder / "server-run-config.json"
+    # An untouched (Chunk, repeat) is scheduled work, not a failed run.
+    if not config_path.exists() and not path.exists() and not folder.exists():
+        return [
+            {"input_group": group, "prompt": prompt_name(group, args.prompt_index),
+             "chunk": chunk, "repeat": repeat, "status": "PENDING",
+             "audit_error": "", **{key: "" for key in RAW_FIELDS
+                                   if key not in ("input_group", "prompt",
+                                                  "chunk", "repeat", "status",
+                                                  "audit_error")}}
+            for group in args.groups
+        ]
     config_errors = []
     if not config_path.is_file():
         config_errors.append("missing server-run-config.json")
@@ -219,7 +230,14 @@ def read_case(args: argparse.Namespace, chunk: int, repeat: int) -> list[dict]:
             # Native server probe already validates the actual physical
             # tail-coalesced widths against the log, not against the requested
             # fixed width, since the two may differ.
-            for key in ("runtime_xc", "runtime_xg", "runtime_xp"):
+            # The locked Full Cycle layout has G/P regions only (no CPU
+            # compute stages). REGION_RING_SUM may legitimately report XC=0
+            # for a non-existent C stage. XG and XP must remain positive.
+            has_cpu_stage = any(part.startswith("C") for part in args.layout.split(","))
+            xc_actual = int(row["runtime_xc"])
+            if xc_actual < 0 or (has_cpu_stage and xc_actual == 0):
+                errors.append("invalid runtime_xc for layer placement")
+            for key in ("runtime_xg", "runtime_xp"):
                 if int(row[key]) <= 0:
                     errors.append("missing runtime width " + key)
         except (ValueError, TypeError):
@@ -247,7 +265,9 @@ def aggregate(args: argparse.Namespace) -> tuple[int, int, bool]:
     raw = [row for chunk in args.chunks for rep in range(1, args.repeats + 1)
            for row in read_case(args, chunk, rep)]
     write_csv(args.out / "fig4b_raw.csv", RAW_FIELDS, raw)
-    errors = [r for r in raw if r["status"] != "PASS"]
+    # Reports may be emitted after only the first case. Unrun slots are
+    # pending, not measurement failures; never flood diagnostics with them.
+    errors = [r for r in raw if r["status"] not in ("PASS", "PENDING")]
     for row in errors[:12]:
         print(f"[FIG4B_INVALID] group={row['input_group']} chunk={row['chunk']} "
               f"repeat={row['repeat']} {row['audit_error']}", file=sys.stderr)
