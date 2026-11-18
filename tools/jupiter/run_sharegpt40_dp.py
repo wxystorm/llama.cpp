@@ -58,6 +58,20 @@ def discover(folder: Path, groups: list[int]) -> list[tuple[int, Path]]:
     return [(group, path) for group, _, path in found]
 
 
+def select_last_per_group(
+    prompts: list[tuple[int, Path]], count: int,
+) -> list[tuple[int, Path]]:
+    """Keep the last N numbered prompts in each group, without reordering."""
+    if count < 1:
+        raise ValueError("--last-per-group must be positive")
+    by_group: dict[int, list[Path]] = {}
+    for group, prompt in prompts:
+        by_group.setdefault(group, []).append(prompt)
+    selected = {prompt for group_prompts in by_group.values()
+                for prompt in group_prompts[-count:]}
+    return [(group, prompt) for group, prompt in prompts if prompt in selected]
+
+
 def feasible_min_chunk(total: int, preferred: int, maximum: int) -> int:
     """Keep b as close to the calibrated 96-token choice as feasibility allows."""
     if total <= 0 or preferred <= 0 or maximum <= 0:
@@ -113,6 +127,22 @@ def existing_rows(path: Path) -> dict[str, dict[str, str]]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         return {row["prompt"]: row for row in csv.DictReader(handle)
                 if row.get("prompt")}
+
+
+def merge_rows(previous: dict[str, dict], current: list[dict]) -> list[dict]:
+    """Preserve results outside a selected subset when resuming a sweep."""
+    merged = dict(previous)
+    for row in current:
+        merged[str(row["prompt"])] = row
+
+    def sort_key(row: dict) -> tuple[int, int, str]:
+        prompt = str(row.get("prompt", ""))
+        match = NAME_RE.fullmatch(prompt)
+        if match:
+            return int(match.group(1)), int(match.group(2)), prompt.lower()
+        return sys.maxsize, sys.maxsize, prompt.lower()
+
+    return sorted(merged.values(), key=sort_key)
 
 
 def save_results(out: Path, rows: list[dict], args: argparse.Namespace) -> None:
@@ -402,7 +432,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, default=None,
-                   help="only the first N prompts (smoke test)")
+                   help="only the first N selected prompts (smoke test)")
+    p.add_argument("--last-per-group", type=int, default=None,
+                   help="select the last N numbered prompts per group (e.g. 4 -> 07-10)")
     p.add_argument("--fail-fast", action="store_true")
     return p
 
@@ -417,8 +449,9 @@ def main() -> int:
             or args.min_context < args.ubatch or args.context_padding < 0
             or args.q_repeats < 1
             or args.refine_repeats < 1 or args.bench_repeats < 1
-            or args.max_rounds < 1 or args.window < 1):
-        raise ValueError("invalid devices/chunk/batch/repeats configuration")
+            or args.max_rounds < 1 or args.window < 1
+            or (args.last_per_group is not None and args.last_per_group < 1)):
+        raise ValueError("invalid devices/chunk/batch/repeats/last-per-group configuration")
     try:
         groups = [int(x.strip()) for x in args.groups.split(",")]
     except ValueError as exc:
@@ -429,6 +462,8 @@ def main() -> int:
         for group in groups:
             context_for_group(group)  # fail early if an unsupported group is requested
     prompts = discover(Path(args.prompts_dir), groups)
+    if args.last_per_group is not None:
+        prompts = select_last_per_group(prompts, args.last_per_group)
     if args.limit is not None:
         if args.limit < 1:
             raise ValueError("--limit must be positive")
@@ -498,10 +533,10 @@ def main() -> int:
               f"group={group} prompt={prompt.name}", flush=True)
         row = run_case(group, prompt, out, case_args)
         rows.append(row)
-        save_results(out, rows, args)
+        save_results(out, merge_rows(old_rows, rows), args)
         if row["status"] != "PASS" and args.fail_fast:
             break
-    save_results(out, rows, args)
+    save_results(out, merge_rows(old_rows, rows), args)
     passed = sum(row["status"] == "PASS" for row in rows)
     failed = len(rows) - passed
     print(f"[JUPITER_SHAREGPT40_DP_DONE] passed={passed} failed={failed} "
