@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from analyze_fig3 import inspect, projection, calibrate, clock_mapping
+from analyze_fig3 import (inspect, projection, calibrate, clock_mapping,
+                          normalized_category, PHONE_META_WAIT)
 
 
 def row(run, rank, start, end, category, kind, tokens=0):
@@ -44,6 +45,25 @@ class Fig3Test(unittest.TestCase):
         self.assertEqual(overlap, 10)
         self.assertEqual(timeline[0]["a"], 0)
         self.assertEqual(timeline[-1]["b"], 100)
+
+    def test_phone_blocking_meta_is_not_network(self):
+        self.assertEqual(normalized_category("phone", "ZMQ_RECV_META",
+                                             "Coordination"), PHONE_META_WAIT)
+        self.assertEqual(normalized_category("pc", "ZMQ_RECV_TENSORS",
+                                             "Coordination"),
+                         "RPC / Coordination")
+        self.assertEqual(normalized_category("phone", "CPU_GRAPH",
+                                             "Phone Compute"), "Phone Compute")
+        source = [
+            dict(a=0, b=100, category=PHONE_META_WAIT),
+            dict(a=10, b=40, category="GPU Compute"),
+            dict(a=55, b=75, category="Phone Compute"),
+        ]
+        _, counts, _ = projection(source, 0, 100)
+        self.assertEqual(counts["RPC / Coordination"], 0)
+        self.assertEqual(counts["GPU Compute"], 30)
+        self.assertEqual(counts["Phone Compute"], 20)
+        self.assertEqual(counts["Waiting / Other"], 50)
 
     def test_clock_drift(self):
         self.assertEqual(calibrate(samples())[0], 5000000)
