@@ -26,8 +26,9 @@ class Fig4bTests(unittest.TestCase):
             args = self.args(Path(d))
             self.assertEqual(args.layout, server.DEFAULT_CANONICAL_LAYOUT)
             self.assertEqual(args.layout, "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7")
-            cmd = fig.runner_command(args, 32, 1)
-            self.assertEqual(cmd[cmd.index("--fixed-chunk") + 1], "32")
+            self.assertEqual(tuple(args.chunks), (64, 128, 256))
+            cmd = fig.runner_command(args, 64, 1)
+            self.assertEqual(cmd[cmd.index("--fixed-chunk") + 1], "64")
             self.assertIn("--no-mmap", cmd)
             self.assertIn("--all50", cmd)
             self.assertIn("--per-request-chunks", cmd)
@@ -46,9 +47,9 @@ class Fig4bTests(unittest.TestCase):
 
     def populate(self, args, bad=False):
         synthetic = {
-            128: {32: 100, 64: 105, 128: 120},
-            512: {32: 210, 64: 190, 128: 205},
-            1024: {32: 390, 64: 360, 128: 310},
+            128: {64: 100, 128: 105, 256: 120},
+            512: {64: 210, 128: 190, 256: 205},
+            1024: {64: 390, 128: 360, 256: 310},
         }
         for chunk in args.chunks:
             for repeat in range(1, args.repeats + 1):
@@ -80,6 +81,7 @@ class Fig4bTests(unittest.TestCase):
                 (folder / "requests.jsonl").write_text("{}\n", encoding="utf-8")
                 records = []
                 for group in args.groups:
+                    actual_width = min(chunk, group + 15)
                     records.append({
                         "prompt": fig.prompt_name(group, args.prompt_index),
                         "group": group, "status": "PASS", "cache_n": 0,
@@ -87,15 +89,16 @@ class Fig4bTests(unittest.TestCase):
                         "prefill_tps": 100.0,
                         "runtime_layout": args.layout,
                         "planner_mode": f"FIXED_{chunk}_NO_REQUEST_SEARCH",
-                        "plan_xc": chunk, "plan_xg": chunk, "plan_xp": chunk,
+                        "plan_xc": actual_width, "plan_xg": actual_width,
+                        "plan_xp": actual_width,
                         # A GPU/Phone-only runtime can report XC=0 because
                         # no CPU compute stage exists in the layer placement.
                         "runtime_xc": 0,
-                        "runtime_xg": (32 if bad and chunk == 64 and group == 512
-                                       else chunk),
-                        "runtime_xp": chunk, "planner_ms": 0.1,
+                        "runtime_xg": (0 if bad and chunk == 128 and group == 512
+                                       else actual_width),
+                        "runtime_xp": actual_width, "planner_ms": 0.1,
                         "scheduler_mode": "DRAIN_FIRST",
-                        "prefetch_mode": ("SYNC_DEMAND" if bad and chunk == 64
+                        "prefetch_mode": ("SYNC_DEMAND" if bad and chunk == 128
                                           and group == 512 else "ASYNC_DOUBLE_BANK"),
                     })
                 with (folder / "requests.csv").open(
@@ -117,12 +120,32 @@ class Fig4bTests(unittest.TestCase):
             winners = {int(row["input_group"]):
                        min(args.chunks, key=lambda c: float(row[f"chunk_{c}"]))
                        for row in rows}
-            self.assertEqual(winners, {128: 32, 512: 64, 1024: 128})
+            self.assertEqual(winners, {128: 64, 512: 128, 1024: 256})
+
+    def test_256_is_one_full_prompt_chunk_for_short_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self.args(Path(d))
+            self.populate(args)
+            records = fig.read_case(args, 256, 1)
+            short = next(r for r in records if r["input_group"] == 128)
+            # The synthetic 128-group prompt is 143 tokens, so target 256
+            # correctly becomes one 143-token chunk, not an invalid >N width.
+            self.assertEqual(int(short["prefill_tokens"]), 143)
+            self.assertEqual(int(short["plan_xg"]), 143)
+            self.assertEqual(int(short["runtime_xg"]), 143)
+            self.assertEqual(short["status"], "PASS")
+
+    def test_old_output_dir_with_chunk32_requires_new_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "results" / "chunk_032").mkdir(parents=True)
+            with self.assertRaises(SystemExit):
+                self.args(root)
 
     def test_unstarted_cases_are_pending_not_false_failures(self):
         with tempfile.TemporaryDirectory() as d:
             args = self.args(Path(d), repeats=3)
-            rows = fig.read_case(args, 128, 3)
+            rows = fig.read_case(args, 256, 3)
             self.assertEqual(len(rows), 3)
             self.assertTrue(all(r["status"] == "PENDING" for r in rows))
             self.assertTrue(all(not r["audit_error"] for r in rows))
@@ -131,7 +154,7 @@ class Fig4bTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             args = self.args(Path(d))
             self.populate(args)
-            target = fig.case_dir(args.out, 32, 1) / "requests.csv"
+            target = fig.case_dir(args.out, 64, 1) / "requests.csv"
             with target.open(encoding="utf-8-sig", newline="") as stream:
                 records = list(csv.DictReader(stream))
             records[0]["runtime_xg"] = "0"
@@ -139,7 +162,7 @@ class Fig4bTests(unittest.TestCase):
                 writer = csv.DictWriter(stream, fieldnames=records[0].keys())
                 writer.writeheader()
                 writer.writerows(records)
-            result = fig.read_case(args, 32, 1)
+            result = fig.read_case(args, 64, 1)
             self.assertEqual(result[0]["status"], "AUDIT_FAIL")
             self.assertIn("runtime_xg", result[0]["audit_error"])
             self.assertEqual(result[1]["status"], "PASS")
