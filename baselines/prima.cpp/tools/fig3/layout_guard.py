@@ -26,14 +26,35 @@ FIELDS = ("rank", "world", "lw0", "lw1", "ngl", "prefetch")
 
 
 def parse_fixed(value: str, n_model_layers=0):
+    """Parse per-cycle rank windows, NOT the total allocated model layers.
+
+    In Prima Piped-ring a rank's --layer-window repeats over the full model;
+    for 32B, k>1 can mean PC/Phone windows sum to LESS than 64.
+    """
     if not re.fullmatch(r"[1-9]\d*,[1-9]\d*", value):
         raise ValueError("--fixed-layers must be TWO positive integers, e.g. 39,1")
     pc, phone = (int(x) for x in value.split(","))
-    if n_model_layers and pc + phone != n_model_layers:
+    if n_model_layers and (n_model_layers < 1 or pc + phone > n_model_layers):
         raise ValueError(
-            f"--fixed-layers {value} total {pc+phone} != model layers {n_model_layers}"
+            f"--fixed-layers {value} window total {pc+phone} exceeds "
+            f"model layers {n_model_layers}"
         )
     return pc, phone
+
+
+def local_layer_counts(pc_window: int, phone_window: int, model_layers: int):
+    """Layer assignment count from repeated [Phone, PC] Prima windows.
+
+    See src/llama.cpp:this_layer_is_mine: it starts at rank 1 (Phone),
+    then rank 0 (PC), and may stop mid-window on the final cycle.
+    """
+    if min(pc_window, phone_window, model_layers) <= 0:
+        raise ValueError("positive windows/model_layers required")
+    total_window = pc_window + phone_window
+    whole, tail = divmod(model_layers, total_window)
+    phone_count = whole * phone_window + min(tail, phone_window)
+    pc_count = model_layers - phone_count
+    return pc_count, phone_count
 
 
 def summarize_log(path):
