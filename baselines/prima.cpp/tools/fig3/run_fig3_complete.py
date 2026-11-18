@@ -142,7 +142,7 @@ def args_parser():
     p.add_argument("--next", default="10.238.229.239")
     p.add_argument("--clock-host", default="10.238.229.239")
     p.add_argument("--clock-port", type=int, default=19139)
-    p.add_argument("--clock-interval", type=float, default=2.0,
+    p.add_argument("--clock-interval", type=float, default=0.5,
                    help="during-Profile clock sampling interval in seconds")
     p.add_argument("--clock-mode", choices=["strict", "affine-diagnostic"],
                    default="strict",
