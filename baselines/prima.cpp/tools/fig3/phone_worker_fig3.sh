@@ -13,29 +13,62 @@ LOG_ROOT="$HOME/prima-fig3-phone/$RUN_ID"
 if [ "$#" -gt 3 ]; then LOG_ROOT="$4"; fi
 RESTART_DELAY="$(printenv PRIMA_FIG3_PHONE_DELAY 2>/dev/null || echo 20)"
 CLOCK_PORT="$(printenv PRIMA_FIG3_CLOCK_PORT 2>/dev/null || echo 19139)"
+RESUME="${PRIMA_FIG3_PHONE_RESUME:-0}"
+case "$RESUME" in 0|1) ;; *) echo "PRIMA_FIG3_PHONE_RESUME must be 0 or 1" >&2; exit 2;; esac
 case "$RUN_ID" in *[!a-zA-Z0-9._-]*|"") echo "unsafe RUN_ID" >&2; exit 2;; esac
 if [ ! -x "$ROOT/llama-cli" ] || [ ! -f "$MODEL" ]; then
     echo "Missing llama-cli or model" >&2; exit 2
 fi
 mkdir -p "$LOG_ROOT/logs" || exit 2
 TRACE="$LOG_ROOT/phone.csv"
-if [ -e "$TRACE" ] && [ -s "$TRACE" ]; then
-    echo "Existing Phone profile: $TRACE (choose new RUN_ID)" >&2; exit 2
+attempt=0
+clock_pid=""
+if [ "$RESUME" = "1" ]; then
+    # Only recover an already COMPLETE first, traced session. Reusing
+    # the run ID must never truncate phone.csv or create a new profile.
+    if [ ! -s "$TRACE" ]; then
+        echo "Cannot resume: original Phone profile missing/empty: $TRACE" >&2
+        exit 2
+    fi
+    IFS=, read -r saved_run_id _ < "$TRACE"
+    if [ "$saved_run_id" != "$RUN_ID" ]; then
+        echo "Cannot resume: Phone trace run-id $saved_run_id != $RUN_ID" >&2
+        exit 2
+    fi
+    for prior in "$LOG_ROOT"/logs/rank1-*.log; do
+        [ -f "$prior" ] || continue
+        n="${prior##*/rank1-}"
+        n="${n%.log}"
+        case "$n" in *[!0-9]*|"") continue;; esac
+        n=$((10#$n))
+        if [ "$n" -gt "$attempt" ]; then attempt="$n"; fi
+    done
+    if [ "$attempt" -lt 1 ]; then
+        echo "Cannot resume: no Rank1 session log; original Profile not verified" >&2
+        exit 2
+    fi
+    # The PC --resume path reuses the previous before/during/after
+    # calibrations. No clock responder is necessary for Normal runs.
+    echo "[PRIMA_FIG3_PHONE] RESUME saved_phone_csv=$TRACE next_session=$((attempt+1))"
+else
+    if [ -e "$TRACE" ] && [ -s "$TRACE" ]; then
+        echo "Existing Phone profile: $TRACE (use PRIMA_FIG3_PHONE_RESUME=1 or new RUN_ID)" >&2
+        exit 2
+    fi
+    : > "$TRACE"
+    python3 -u "$ROOT/tools/fig3/phone_clock_server.py" \
+        --port "$CLOCK_PORT" > "$LOG_ROOT/clock.log" 2>&1 &
+    clock_pid=$!
 fi
-: > "$TRACE"
-python3 -u "$ROOT/tools/fig3/phone_clock_server.py" \
-    --port "$CLOCK_PORT" > "$LOG_ROOT/clock.log" 2>&1 &
-clock_pid=$!
 child=""
 stop() {
     if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null || true; fi
-    kill -TERM "$clock_pid" 2>/dev/null || true
+    if [ -n "$clock_pid" ]; then kill -TERM "$clock_pid" 2>/dev/null || true; fi
 }
 trap 'stop; exit 130' INT TERM
 trap 'stop' EXIT
 cd "$ROOT" || exit 2
-attempt=0
-echo "[PRIMA_FIG3_PHONE] run=$RUN_ID trace=$TRACE clock=$CLOCK_PORT"
+echo "[PRIMA_FIG3_PHONE] run=$RUN_ID trace=$TRACE clock=$CLOCK_PORT resume=$RESUME"
 while true; do
     attempt=$((attempt + 1))
     logfile="$LOG_ROOT/logs/rank1-$(printf '%02d' "$attempt").log"
