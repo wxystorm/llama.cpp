@@ -446,6 +446,76 @@ raw source presence, before/after four-timestamp clock offset/drift,
 A valid CSV output is NOT itself evidence of exact CUDA absolute placement.
 Do not turn approximate device/host alignment into verified percentages.
 
+## Prima 32B Fig.3: first discover, then replay only if needed
+
+Qwen3-32B-Q4_K_M has 64 transformer layers. Unlike the 14B 40-layer
+replay, do **not** reuse `-lw 39,1 -ngl 21` for 32B: its PC/Phone
+memory budgets and best ring windows differ. In Prima a manual `-lw`
+describes the *per-cycle rank windows*, which can repeat across
+multiple cycles. Hence for a 64-layer model, `-lw 12,10` is a valid
+22-layer ring window; it is NOT a claim of only 22 model layers.
+The updated fixed-layout validator accepts such windows and estimates
+actual local layer counts for `--pc-ngl` bounds (accounting for a
+partial last cycle).
+
+Preflight on both devices: ensure the 32B GGUF exists, inspect
+available memory with `free -h`; check PC CUDA memory with
+`nvidia-smi`. Do not blindly use a 14B layout on 32B.
+
+First attempt should preserve Prima's *automatic* HiGHS placement,
+so launch the Phone Fig.3 worker with a FRESH run-id:
+
+    cd ~/prima-qwen3/baselines/prima.cpp
+    bash tools/fig3/phone_worker_fig3.sh \
+      "$HOME/models/Qwen3-32B-Q4_K_M.gguf" \
+      10.238.229.214 prima-fig3-32b-auto-v1
+
+On PC WSL, profile **one 1024-group prompt** only. The collector
+already stages all PC raw trace writes to native /tmp:
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-32b-auto-v1 \
+      --binary ./llama-cli \
+      --model /mnt/e/llama/models/Qwen3-32B-Q4_K_M.gguf \
+      --prompt /mnt/e/llama/datasets/sharegpt/sharegpt50_short/prompt_1024_01.txt \
+      --out /mnt/d/fig3-prima32b-auto-v1 \
+      --master 10.238.229.214 --next 10.238.229.239 \
+      --context 2048 --batch 512 --ubatch 512 --threads 8 \
+      --model-layers 64 --profile-only
+
+Notice there is NO `--fixed-layers` nor `--pc-ngl` in this
+initial attempt. After it succeeds, check the post-init layout:
+
+    grep -E 'k =|W =|Device Index|Assignment Set|N Layer Window|N GPU Layers|PRIMA_FIG3_LAYOUT' \
+      /mnt/d/fig3-prima32b-auto-v1/profile_run.log
+
+If the plan is feasible and you want to retain the original auto-plan
+mode, rerun the same PC command with `--resume` INSTEAD OF
+`--profile-only`; this fills 1 warmup + 3 Normal sessions. The
+collector compares effective placement and rejects re-plans rather
+than silently combining inconsistent data.
+
+If HiGHS changes its layout between independent runs, stop the phone
+worker, start a *new* run-id, and repeat a full collection with the
+measured `--fixed-layers PC_WINDOW,PHONE_WINDOW` plus
+`--pc-ngl OBSERVED_PC_GPU_LAYERS --model-layers 64`. Those
+numbers MUST come from the successful 32B probe, not be invented.
+This replay is explicitly named `FIXED_LAYOUT_REPLAY`, not automatic
+placement performance. The 14B diagnostic was also a fixed replay.
+
+32B may consume more RAM/VRAM or choose to remove Phone compute.
+If the phone is selected out (world=1, Phone=0), do not invent a
+Phone Compute fraction. Keep the raw trace and report that the
+automatic plan used only the PC. Check for OOM separately.
+
+The strict PC/Phone clock guard remains enabled by default. If it
+rejects the reconstruction, the Profile and Normal raw traces stay
+saved. For an explicitly non-paper diagnostic plot only, use
+`--clock-mode piecewise-diagnostic --analyze-only`. CUDA event
+absolute placement and clock anomaly audits still govern whether
+an exclusive six-way breakdown can support the final paper figure.
+
 ## 4. 24B/32B and fairness
 
 Reuse the tooling after the 14B instrumented run passes. Use unique run IDs,
