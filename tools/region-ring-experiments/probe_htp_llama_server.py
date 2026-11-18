@@ -114,7 +114,7 @@ def parse_args(argv=None):
                    help="preserve native GPU/CPU/Phone/HTP feasibility on locked layout")
     p.add_argument("--skip-plan-memory-checks", action="store_true",
                    help="no-DAG locked-layout only: explicitly skip planner ESTIMATED memory checks; CUDA/HTP runtime allocations remain active")
-    p.add_argument("--fixed-chunk", type=int, choices=(32, 64, 128), default=None,
+    p.add_argument("--fixed-chunk", type=int, choices=(32, 64, 128, 256), default=None,
                    help="Planner ablation: fixed XC=XG=XP to 64 or 128; requests shorter than the target run whole as one Chunk, retaining async double-bank streaming")
     p.add_argument("--fig4b-prompts", nargs=3, default=None,
                    metavar=("PROMPT_1024", "PROMPT_128", "PROMPT_512"),
