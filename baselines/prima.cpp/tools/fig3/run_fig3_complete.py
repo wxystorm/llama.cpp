@@ -145,9 +145,12 @@ def args_parser():
     p.add_argument("--clock-port", type=int, default=19139)
     p.add_argument("--clock-interval", type=float, default=0.5,
                    help="during-Profile clock sampling interval in seconds")
-    p.add_argument("--clock-mode", choices=["strict", "affine-diagnostic"],
+    p.add_argument("--clock-mode",
+                   choices=["strict", "affine-diagnostic", "piecewise-diagnostic"],
                    default="strict",
-                   help="affine-diagnostic is NOT paper-ready; use only to inspect legacy traces")
+                   help="diagnostic modes are NEVER paper-ready; "
+                        "piecewise-diagnostic preserves dense anchor evidence "
+                        "but flags all clock steps")
     p.add_argument("--context", type=int, default=2048)
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--ubatch", type=int, default=512)
@@ -250,8 +253,9 @@ def finalize(args, root, manifest):
                             out=str(root/"profile"), clock_mode=args.clock_mode)
     try:
         summary = inspect(ns)
-    except Exception:
+    except Exception as error:
         manifest["status"] = "ANALYSIS_FAILED"
+        manifest["analysis_error"] = str(error)
         atomic_json(root/"manifest.json", manifest)
         raise
     manifest["status"] = summary["paper_fidelity"]
