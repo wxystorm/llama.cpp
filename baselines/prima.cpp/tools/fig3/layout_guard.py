@@ -66,6 +66,23 @@ def validate_layout(layout, expected=None):
     effective = layout["effective"]
     if effective["rank"] != 0:
         raise ValueError(f"expected PC rank 0, got {effective}")
+    if expected is None:
+        # In AUTO mode it is unsafe to combine timing from different
+        # planning stages unless the source proves which stage performed
+        # Prefill. Reject any observed reassignment (including PC-only).
+        stages = layout["planner_stages"]
+        signatures = []
+        for stage in stages:
+            signatures.append(tuple(sorted(
+                (row["rank"], row["layers"], row["gpu_layers"])
+                for row in stage
+            )))
+        if len(set(signatures)) > 1:
+            raise ValueError(
+                "Prima auto-plan REPLANNED within this session: "
+                f"{signatures}. Use fixed replay or inspect the exact "
+                "Prefill-stage allocation before reporting Fig.3."
+            )
     if expected is not None:
         pc, phone, ngl = expected
         required = dict(rank=0, world=2, lw0=pc, lw1=phone,
