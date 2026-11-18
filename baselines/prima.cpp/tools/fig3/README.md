@@ -110,6 +110,46 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## FastTrace v1 complete: strict clock failure + diagnostic-only recovery
+
+The completed `prima-fig3-14b-fasttrace-v1` archive contains
+PC 1,573 raw events, Phone 72 raw events, Profile 11933.83ms, and
+3 normal Prefill runs 8228.27/7694.00/7785.37ms (median 7785.37ms)
+on the SAME fixed PC39/Phone1 (PC GPU21) layout.
+The Profile/Normal ratio has improved from 2.87x to 1.53x after staging
+the trace in native Linux /tmp. PC GRAPH_SUBMIT inside Prefill fell from
+~15.99s in the original run to ~3.50s. The 8.82s PC Graph call
+before the formal Prefill window is outside the plotted envelope.
+
+The archived manifest status is `ANALYSIS_FAILED`, so the `profile/`
+folder is empty. This is due to the STRICT clock discontinuity guard:
+90 in-run samples, 88 with <=20ms uncertainty, plus before/after
+calibrations. The best four before/after offset changed by 122.465ms
+in ~49.675s, but DURING the Prefill a pair of neighboring anchors,
+1.586s apart, differs by **111.026ms** in relative offset. The code's
+100ms local guard fails and correctly refuses paper proportions.
+
+The analyser still defaults to `--clock-mode strict`. DO NOT disable or
+raise this guard for the paper. Instead, an **explicit diagnostic-only**
+mode can save a dense-anchor extrapolation for debugging the event
+accounting, while recording the rejected clock segment:
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    python3 tools/fig3/test_fig3.py
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-fasttrace-v1 \
+      --out /mnt/d/fig3-prima14b-fasttrace-v1 \
+      --clock-mode piecewise-diagnostic --analyze-only
+
+The resulting `paper_fidelity` label is
+`DIAGNOSTIC_ONLY_DENSE_CLOCK_ANOMALY_AND_GPU_EPOCH`.
+This is **NOT PAPER DATA**: inside the Prefill the sampled offset is
+strongly nonstationary and CUDA absolute event time placement remains
+unverified. Avoid the two-endpoint affine correction here, since it
+would ignore the >350ms mid-run offset excursion. No rerun is required
+for diagnostic extraction; correct device-clock and GPU epoch placement
+before submitting final six-class Figure 3 data.
+
 ## Resume after Phone Termux worker was accidentally closed
 
 A completed PC --profile-only run already saved its PC trace and 16+90+16
