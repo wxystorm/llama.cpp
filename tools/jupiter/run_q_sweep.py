@@ -169,6 +169,21 @@ def should_echo_runtime_line(line: str) -> bool:
     )
 
 
+def echo_runtime_line(line: str) -> None:
+    """Echo diagnostics without crashing on non-GBK Unicode in Windows terminals.
+
+    llama-completion echoes the raw prompt without a newline, so a following
+    JUPITER/timing diagnostic can share the same logical output line. The full
+    original line is preserved in the UTF-8 log, but console output must be
+    representable in the active stdout encoding.
+    """
+    encoding = sys.stdout.encoding or "utf-8"
+    safe = line.encode(encoding, errors="backslashreplace").decode(
+        encoding, errors="replace"
+    )
+    print(safe, flush=True)
+
+
 def stream_process(
     cmd: Sequence[str],
     env: dict[str, str],
@@ -205,13 +220,13 @@ def stream_process(
                 raw, pending = pending.split(b"\n", 1)
                 line = raw.decode("utf-8", errors="replace").rstrip("\r")
                 if should_echo_runtime_line(line):
-                    print(line, flush=True)
+                    echo_runtime_line(line)
                 log.write(line + "\n")
 
         if pending:
             line = pending.decode("utf-8", errors="replace").rstrip("\r")
             if should_echo_runtime_line(line):
-                print(line, flush=True)
+                echo_runtime_line(line)
             log.write(line + "\n")
 
         return proc.wait()
