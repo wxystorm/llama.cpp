@@ -75,6 +75,8 @@ class LayoutGuardTest(unittest.TestCase):
             ))
             with self.assertRaisesRegex(ValueError, "removed Phone"):
                 validate_layout(summarize_log(path), (39, 1, 21))
+            with self.assertRaisesRegex(ValueError, "REPLANNED"):
+                validate_layout(summarize_log(path))
 
     def test_old_binary_without_marker_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
