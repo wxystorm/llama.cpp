@@ -14,6 +14,7 @@ import json
 import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
+from layout_guard import compare_runs
 
 FIELDS = ("run_id", "rank", "pid", "start_ns", "end_ns", "category",
           "kind", "bytes", "detail")
@@ -224,6 +225,18 @@ def inspect(args):
 
     samples = manifest.get("clock_samples", [])
     clock_mode = getattr(args, "clock_mode", "strict")
+    all_runs = [manifest.get("profile") or {}] + list(manifest.get("warmup", [])) + list(manifest.get("normal", []))
+    if all("layout" in r for r in all_runs):
+        observed_layout = compare_runs(all_runs[0], all_runs[1:])
+        layout_fidelity = "VERIFIED_SAME_POST_INIT_LAYOUT"
+    elif clock_mode == "affine-diagnostic":
+        observed_layout = None
+        layout_fidelity = "UNVERIFIED_LEGACY_LAYOUT"
+    else:
+        raise ValueError(
+            "No post-init Prima layout audit in manifest; strict Fig.3 "
+            "cannot combine independently selected Profile and Normal layouts."
+        )
     phone_to_pc, clock_quality = clock_mapping(samples, clock_mode, t0, t1)
     uncertainty = clock_quality["best_uncertainty_ns"]
     spread = clock_quality["spread_ns"]
@@ -327,6 +340,9 @@ def inspect(args):
         "waiting_diagnostics_nonexclusive_ms": diagnostics,
         "gpu_time_placement": "CUDA device durations, host upper-bound sync-anchor, NOT exact device absolute timestamps",
         "paper_fidelity": fidelity,
+        "placement_mode": manifest.get("placement_mode", "UNKNOWN_LEGACY_AUTO"),
+        "layout_fidelity": layout_fidelity,
+        "effective_layout": observed_layout,
         "categories": rows,
         "accounting": "priority-exclusive projection, not causal critical path",
     }
@@ -344,6 +360,8 @@ def inspect(args):
         "rpc_coordination_pct": selected["RPC / Coordination"],
         "waiting_other_pct": selected["Waiting / Other"],
         "paper_fidelity": fidelity,
+        "placement_mode": summary["placement_mode"],
+        "layout_fidelity": summary["layout_fidelity"],
     }
     write_csv(root/"fig3_prima_paper_row.csv", [paper], tuple(paper))
     print("[PRIMA_FIG3] clock mapping", clock_quality["mode"],
