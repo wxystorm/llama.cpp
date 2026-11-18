@@ -24,7 +24,7 @@ ROOT = HERE.parents[1]
 RUNNER = HERE / "probe_htp_llama_server.py"
 LAYOUT = "G7,P4,G7,P4,G8,P5,G7,P4,G7,P4,G7"
 GROUPS = (128, 512, 1024)
-CHUNKS = (32, 64, 128)
+CHUNKS = (64, 128, 256)
 ENV_POLICY = {
     "LLAMA_REGION_RING_GPU_BANK_COUNT": "2",
     "LLAMA_REGION_RING_GPU_BANK_PREFETCH": "1",
@@ -83,6 +83,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ap.error("main50 parity requires layout " + LAYOUT)
     for key in ("server_exe", "model", "prompt_dir", "profile_source", "out"):
         setattr(args, key, getattr(args, key).expanduser().resolve())
+    if (args.out / "chunk_032").exists():
+        ap.error("old Chunk=32 results found in --out; use a fresh output "
+                 "directory for the new 64/128/256 sweep")
     return args
 
 
