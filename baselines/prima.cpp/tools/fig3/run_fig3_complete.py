@@ -17,6 +17,7 @@ import shutil
 import socket
 import statistics
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from analyze_fig3 import inspect
@@ -76,6 +77,27 @@ def clock_batch(host, port, phase):
     return result
 
 
+def clock_during_profile(args, stop, result, failures):
+    """Keep sparse four-stamp observations DURING GPU/Phone activity."""
+    while not stop.is_set():
+        try:
+            result.append(clock_sample(args.clock_host, args.clock_port, "during"))
+        except Exception as error:
+            failures.append(str(error)[:180])
+        stop.wait(args.clock_interval)
+
+
+def start_clock_sampling(args):
+    stop = threading.Event()
+    result = []
+    failures = []
+    thread = threading.Thread(
+        target=clock_during_profile, args=(args, stop, result, failures),
+        daemon=True, name="prima_fig3_clock")
+    thread.start()
+    return stop, thread, result, failures
+
+
 def build_cmd(args):
     return [
         str(args.binary.resolve()), "-m", str(args.model.resolve()),
@@ -113,6 +135,11 @@ def args_parser():
     p.add_argument("--next", default="10.238.229.239")
     p.add_argument("--clock-host", default="10.238.229.239")
     p.add_argument("--clock-port", type=int, default=19139)
+    p.add_argument("--clock-interval", type=float, default=2.0,
+                   help="during-Profile clock sampling interval in seconds")
+    p.add_argument("--clock-mode", choices=["strict", "affine-diagnostic"],
+                   default="strict",
+                   help="affine-diagnostic is NOT paper-ready; use only to inspect legacy traces")
     p.add_argument("--context", type=int, default=2048)
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--ubatch", type=int, default=512)
@@ -137,6 +164,8 @@ def args_parser():
     args.extra = extra
     if not (0 < args.ubatch <= args.batch <= args.context):
         p.error("need 0 < ubatch <= batch <= context")
+    if args.clock_interval < 0.5 or args.clock_interval > 5.0:
+        p.error("clock-interval must be between 0.5 and 5 seconds")
     if args.warmups < 0 or args.repeats < 3 or args.between < 0:
         p.error("need >=3 normal repetitions, >=0 warmups")
     if not re.fullmatch(r"[a-zA-Z0-9._-]+", args.run_id):
@@ -173,7 +202,7 @@ def finalize(args, root, manifest):
         raise RuntimeError("Missing PC raw trace; do not produce invented Fig.3 proportions")
     ns = argparse.Namespace(manifest=str(root/"manifest.json"),
                             pc=str(root/"pc_events.csv"), phone=str(phone),
-                            out=str(root/"profile"))
+                            out=str(root/"profile"), clock_mode=args.clock_mode)
     try:
         summary = inspect(ns)
     except Exception:
@@ -182,7 +211,7 @@ def finalize(args, root, manifest):
         raise
     manifest["status"] = summary["paper_fidelity"]
     atomic_json(root/"manifest.json", manifest)
-    print("[PRIMA_FIG3] DONE (with GPU epoch caveat).", root/"profile", flush=True)
+    print("[PRIMA_FIG3] ANALYSIS:", summary["paper_fidelity"], root/"profile", flush=True)
 
 
 def main():
@@ -245,8 +274,19 @@ def main():
             raise RuntimeError("PC trace already exists but Profile manifest missing; inspect before overwrite")
         profile_env = dict(env, PRIMA_FIG3_FILE=str(trace), PRIMA_FIG3_RANK="0",
                            PRIMA_FIG3_RUN_ID=args.run_id)
-        manifest["profile"] = launch(args, cmd, root/"profile_run.log", profile_env)
+        stop, thread, during_samples, clock_errors = start_clock_sampling(args)
+        try:
+            result = launch(args, cmd, root/"profile_run.log", profile_env)
+        finally:
+            stop.set()
+            thread.join(timeout=12)
+            manifest["clock_samples"].extend(during_samples)
+            manifest["clock_poll_failures"] = clock_errors[:20]
+            atomic_json(path, manifest)
+        manifest["profile"] = result
         atomic_json(path, manifest)
+        print("[PRIMA_FIG3] during-Profile clock samples:",
+              len(during_samples), "errors:", len(clock_errors), flush=True)
         if not trace.exists() or trace.stat().st_size < 100:
             raise RuntimeError("PC instrumentation absent: no profile source events")
         samples = clock_batch(args.clock_host, args.clock_port, "after")
