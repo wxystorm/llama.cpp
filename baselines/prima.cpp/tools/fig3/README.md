@@ -110,6 +110,50 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## Verified 14B fixed-layout diagnostics (profile(3).zip)
+
+A real fixed-layout Qwen3-14B run yielded post-init PC39 (GPU21), Phone1,
+1033 tokens, normal Prefill median 7773.30 ms, Profile Prefill
+22302.92 ms, 154 clock samples (123 selected anchors) and an
+**unresolved 1298.36 ms relative clock offset change**. Its
+paper_fidelity=PROVISIONAL_CLOCK_RATE_AND_GPU_EPOCH: not final
+publication-quality absolute overlap evidence.
+
+The first generated six-class percentage had RPC / Coordination=70.25%
+because its inclusion of Phone ZMQ_RECV_META classified 18.01s of
+blocking *metadata polling* as communications. In the original trace
+15.55s of those poll intervals overlapped PC GRAPH_SUBMIT. This is
+not 15.55s of network traffic and not proof of CPU idle on the PC.
+
+The offline analyzer now preserves Phone ZMQ_RECV_META in source events
+as `Phone Metadata Poll Wait` but excludes it from the RPC /
+Coordination numerator. Under the same priority-exclusive projection,
+the saved trace's diagnostic proportions become approximately:
+Phone Compute 13.17%, PCIe Copy 4.67%, GPU Compute 7.41%,
+CPU Compute 4.42%, RPC / Coordination 10.79%, Waiting / Other 59.54%.
+The last category is residual/unattributed host work plus device waits;
+it MUST NOT be labeled "PC idle" or "Wi-Fi delay".
+
+To reprocess the original fixed39/1 run with no model execution:
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-fixed39-1 \
+      --out /mnt/d/fig3-prima14b-fixed39-1 \
+      --analyze-only
+
+This rebuilds only the derived `profile/` outputs. Keep a copy of
+the earlier profile archive for reproducibility; neither PC nor
+Phone raw CSV requires modification. The new audit includes
+`polling_and_host_submit_diagnostics`.
+
+The Profile takes 2.87x the uninstrumented median even with the
+same post-init placement. The PC GRAPH_SUBMIT API wall time alone is
+15.99s. The cause is NOT proven: investigate weight/page-cache
+effects, backend launch/memory handling, profiling overhead, and CPU
+native events. Avoid claiming the ratio is a calibrated profiler
+overhead before an A/B comparison on warm/cold matched placement.
+
 ## Controlled replay: Qwen3-14B consistent layer placement
 
 The previous 14B Figure 3 is **not** a valid Profile/Normal comparison:
