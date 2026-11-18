@@ -110,6 +110,37 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## Clock discontinuity recovery and follow-up
+
+A large discrepancy between *before* and *after* four-timestamp clock
+calibrations is a scientific validity issue, not Prima's network transfer
+latency. Example: PC time elapsed 164.733 s, Phone time elapsed 166.247 s;
+offset changed by 1514.126 ms with individual clock-probe uncertainty
+approximately 1.2 ms. Do **not** raise a 20 ms tolerance to 2000 ms.
+
+Existing files can still be inspected WITHOUT inference or file overwrite:
+
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-20261118 \
+      --out /mnt/d/fig3-prima14b-complete \
+      --clock-mode affine-diagnostic --analyze-only
+
+Only use this mode to investigate graph composition and event accounting.
+It **assumes** a linear clock-rate mismatch between the two endpoints.
+A clock jump in the middle cannot be ruled out from two snapshots.
+All generated outputs are explicitly labeled
+paper_fidelity=DIAGNOSTIC_ONLY_UNVERIFIED_TWO_POINT_CLOCK, **NOT paper data**.
+The original PC/Phone CSV and manifest clock samples are retained.
+
+For newly collected experiments, the PC script records four-timestamp
+clock observations **during** Profile, every 2s by default, in addition
+to before/after samples. Default strict mode can piecewise-align densely
+sampled observations only if it sees no large step and every adjacent
+calibration is within 8s; gaps and jumps fail closed.
+Even the piecewise path remains PROVISIONAL because CUDA device-event
+absolute placement is still estimated. Check WSL timing behavior before
+using absolute cross-device attribution in the paper.
+
 ## 2. Recovery without rerunning completed inference
 
 If the phone CSV SCP failed, copy it manually to PC and run:
