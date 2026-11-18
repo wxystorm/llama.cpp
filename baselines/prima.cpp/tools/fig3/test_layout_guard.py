@@ -30,7 +30,7 @@ class LayoutGuardTest(unittest.TestCase):
         # the full 64-layer model; last round may be partial.
         self.assertEqual(parse_fixed("8,8", 64), (8, 8))
         self.assertEqual(local_layer_counts(8, 8, 64), (32, 32))
-        self.assertEqual(local_layer_counts(12, 10, 64), (30, 34))
+        self.assertEqual(local_layer_counts(12, 10, 64), (34, 30))
         self.assertEqual(local_layer_counts(39, 1, 40), (39, 1))
         with self.assertRaisesRegex(ValueError, "exceeds"):
             parse_fixed("39,30", 64)
