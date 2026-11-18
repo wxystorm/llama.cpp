@@ -24,6 +24,24 @@ MAPPING = {"Phone Compute": "Phone Compute", "PCIe Copy": "PCIe Copy",
            "GPU Compute": "GPU Compute", "CPU Compute": "CPU Compute",
            "Coordination": "RPC / Coordination"}
 DIAGNOSTICS = ("Host Prepare", "Prefetch", "Host Transfer")
+PHONE_META_WAIT = "Phone Metadata Poll Wait"
+
+
+def normalized_category(origin, kind, raw_category):
+    """Receiving metadata can block for an entire PC compute stage.
+
+    Phone ZMQ_RECV_META is kept as a *raw* wait event but MUST NOT be
+    charged as a network transfer / coordination-exclusive time.
+    It contributes to Waiting / Other only where no higher-priority
+    compute, copy, or communication interval is present.
+    """
+    if origin == "phone" and kind == "ZMQ_RECV_META":
+        return PHONE_META_WAIT
+    return MAPPING.get(raw_category, raw_category)
+
+
+def intersection_ns(a, b):
+    return max(0, min(a["b"], b["b"]) - max(a["a"], b["a"]))
 
 
 def events(path, run_id):
@@ -253,7 +271,7 @@ def inspect(args):
                 continue
             r = dict(r)
             r.update(a=a, b=b, origin=origin)
-            r["category"] = MAPPING.get(r["category"], r["category"])
+            r["category"] = normalized_category(origin, r["kind"], r["category"])
             if r["category"] in CATEGORIES and r["category"] != "Waiting / Other":
                 counts[(origin, r["category"])] += 1
             raw.append(r)
@@ -310,6 +328,34 @@ def inspect(args):
             for a in waiting_intervals for d in raw if d["category"] == cat)/1e6, 4)
     # Raw Host Prepare, Host Transfer and Prefetch may themselves overlap;
     # diagnostics are non-exclusive and must not be summed.
+    phone_poll = [x for x in raw if x["category"] == PHONE_META_WAIT]
+    pc_submit = [x for x in raw if x["origin"] == "pc"
+                 and x["kind"] == "GRAPH_SUBMIT"]
+    phone_poll_ns = sum(x["b"] - x["a"] for x in phone_poll)
+    pc_submit_ns = sum(x["b"] - x["a"] for x in pc_submit)
+    phone_poll_pc_submit_ns = sum(
+        intersection_ns(x, y) for x in phone_poll for y in pc_submit)
+    phone_poll_in_waiting_ns = sum(
+        intersection_ns(x, y) for x in phone_poll for y in waiting_intervals)
+    pc_submit_in_waiting_ns = sum(
+        intersection_ns(x, y) for x in pc_submit for y in waiting_intervals)
+    # These diagnostics answer WHY a polling wait does not measure Wi-Fi
+    # traffic. They may overlap other raw events; they are not components
+    # of an exclusive breakdown.
+    polling_diagnostics = {
+        "phone_metadata_poll_raw_ms": round(phone_poll_ns / 1e6, 4),
+        "phone_metadata_poll_in_waiting_other_ms":
+            round(phone_poll_in_waiting_ns / 1e6, 4),
+        "pc_graph_submit_raw_ms": round(pc_submit_ns / 1e6, 4),
+        "pc_graph_submit_in_waiting_other_ms":
+            round(pc_submit_in_waiting_ns / 1e6, 4),
+        "phone_poll_overlaps_pc_graph_submit_ms":
+            round(phone_poll_pc_submit_ns / 1e6, 4),
+        "interpretation":
+            "Blocked Phone ZMQ_RECV_META is a polling/wait interval, not "
+            "pure network transfer. PC GRAPH_SUBMIT is host-side wall time, "
+            "NOT CUDA device execution time or CPU-only compute.",
+    }
     cuda_approx = [x for x in raw if x["category"] in ("GPU Compute", "PCIe Copy") and
                    x["detail"] == "DEVICE_DURATION_SYNC_UPPER_BOUND"]
     fidelity = ("PROVISIONAL_GPU_EPOCH" if cuda_approx else "REQUIRES_GPU_QUALITY_REVIEW")
@@ -338,6 +384,7 @@ def inspect(args):
         "exclusive_segments": len(exclusive),
         "event_counts": {f"{k[0]}:{k[1]}": v for k, v in counts.items()},
         "waiting_diagnostics_nonexclusive_ms": diagnostics,
+        "polling_and_host_submit_diagnostics": polling_diagnostics,
         "gpu_time_placement": "CUDA device durations, host upper-bound sync-anchor, NOT exact device absolute timestamps",
         "paper_fidelity": fidelity,
         "placement_mode": manifest.get("placement_mode", "UNKNOWN_LEGACY_AUTO"),
@@ -345,6 +392,10 @@ def inspect(args):
         "effective_layout": observed_layout,
         "categories": rows,
         "accounting": "priority-exclusive projection, not causal critical path",
+        "categorization_note": "Phone ZMQ_RECV_META wait excluded from RPC / "
+          "Coordination; counted in Waiting / Other only where no actual "
+          "compute/copy/other coordination interval overlaps. RPC still "
+          "includes blocked tensor receives and is NOT pure Wi-Fi time.",
     }
     (root/"fig3_prima_audit.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False)+"\n", encoding="utf-8")
@@ -369,6 +420,9 @@ def inspect(args):
     if clock_mode == "affine-diagnostic":
         print("[PRIMA_FIG3] WARNING: DIAGNOSTIC ONLY. Endpoint clock drift may "
               "have been a step rather than smooth drift. NOT PAPER DATA.")
+    print("[PRIMA_FIG3] phone-meta-poll raw %.3f ms, overlap PC-GRAPH_SUBMIT %.3f ms"
+          % (polling_diagnostics["phone_metadata_poll_raw_ms"],
+             polling_diagnostics["phone_poll_overlaps_pc_graph_submit_ms"]))
     print("[PRIMA_FIG3] source events", len(source_rows),
           "100%-coverage", summary["full_coverage"],
           "GPU timestamp fidelity", fidelity)
