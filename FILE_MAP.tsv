@@ -1,0 +1,51 @@
+category	path	bytes	git_blob_sha
+01 Runtime and integration	src/llama-region-ring.h	75053	af292477ccc54048b1037938e30ce780750f9eb2
+01 Runtime and integration	src/llama-region-ring-planner.h	251566	24eb03b5e8c8f8d1ab4845d990fd4e018ae1cd37
+01 Runtime and integration	src/llama-region-ring-real-profile.h	17035	bf8da437752ea59178d47eab046ba009ae034b41
+01 Runtime and integration	src/llama-region-ring-htp-memory.h	7975	46b58f086f23cbe2e29c55ec869f991a35c4e394
+01 Runtime and integration	src/llama-context.cpp	745773	5b4fdaa06b6f259adbb6801f8d471f13357c21fe
+01 Runtime and integration	src/llama-context.h	30045	47980e3b385033b01e3ca72019faa6462269cf99
+01 Runtime and integration	src/llama-hybrid.cpp	601098	df8f78840eaa55639efb0e5101cef08a1c219334
+01 Runtime and integration	src/llama-hybrid.h	24557	5bda13d48df8a3782622330f14ed2db40fbdd465
+01 Runtime and integration	src/llama-hybrid-arch.h	1328	aa22864d62b5d537537564ab2eba636f46a95d08
+01 Runtime and integration	src/llama-hybrid-profile-cpu-threadpool.h	2981	6c1a2878b1c2d7ab3a85c8197a0e83101bf40929
+01 Runtime and integration	src/llama-memory-hybrid.cpp	9539	42c7381a9e6fa507c925ba66a35a7e433c4447b8
+01 Runtime and integration	src/llama-memory-hybrid.h	4382	484eafb749910567b8c50ec36d46bdb678c75426
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/ggml-rpc.cpp	705502	2a907219065da2715cc7afefba72b53b8ffa4854
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/p2c-arena-queue.h	7644	347c68bee0019630598c82a1adb03e48194432bc
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/p2c-stream-receiver.h	8160	78721bc1ff9acfeeb46e768ce94f487ba6e9cd60
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-autonomous-policy.h	2441	950468c9c16b5ec779c78568ec85ff13f029191b
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-npu-serial-executor.h	123953	eaa9b35da97188b956b647fbe4111acf7025ccf9
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-npu-serial-policy.h	2211	6d40b933779d639e2605a40d685550aad7c65acb
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-owned-execution-plan.h	11773	e3ff38c0ccce65b705904277eeb7836d5e791c4a
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-qwen3-local-builder.h	14581	d3f1996327906f48e4877e4ddf1588bc3396ab55
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-qwen3-local-parity.h	6675	3a5292b1e702f53eaa61bc02cf7807a6b705b238
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-stage-binding-map.h	7712	7115199c9b38961267b7ceafe62fadef132f480e
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/phone-stage-binding-pool.h	11975	fc8b16e9ed80fc34b4046dcff03ba1c6226342b6
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/transport.cpp	22106	b8fbefb04172f85f1244dd347ecd116d4bcbe63a
+02 GPU, RPC, Phone execution	ggml/src/ggml-rpc/transport.h	903	cd8bd62a9b7cfea221f8060f95b1547e56def97a
+02 GPU, RPC, Phone execution	ggml/src/ggml-hexagon/ggml-hexagon.cpp	237194	4b5071e1d49169b336f9542212bfb4004a222f36
+02 GPU, RPC, Phone execution	ggml/src/ggml-hexagon/htp-drv.cpp	17311	4c376b5fc9187b2263be4977028f3776f0c6ac14
+02 GPU, RPC, Phone execution	ggml/src/ggml-hexagon/htp-drv.h	3039	6eba7ba17d8df7e7ff7db4482baf93f81e2d6999
+02 GPU, RPC, Phone execution	ggml/src/ggml-cuda/ggml-cuda.cu	212165	ac11800b6d37e18fcf238aa7913de05511a42fc7
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/chunk_dag.py	18344	66033496f3731ea2ffb54db0241216f0b7225faf
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/build_real_stage_profile.py	9529	133fd247444471a6fc33c07479435826297f9021
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/rolling_real_stage_profile.py	6606	dc85c536b91bd9666975a174c3468cae933b79f2
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/audit_plan_calibration.py	7372	eda38e16b0d21f3cf0916a42e0e10217588a6c77
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/probe_htp_llama_server.py	68923	7a617cb5ac04be0ef1544bcfd634f398853a735d
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/run_32b_all40.py	107891	e7247c6b8eed0b3b6250b2158fe761196c658b7d
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/run_32b_ablation.py	25985	6c6e19e138bc90055e1ececd8e0990b93206202a
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/run_32b_fig4b_fixed_chunks.py	18412	c49421d508033ba0a9d4fe7749557b1f761df854
+03 Profiling, DAG and experiment entrypoints	tools/region-ring-experiments/ablations/run_32b_memory_proportional.py	5901	620f69b41fa9d22d8fe1b1435c1850a5a289f57b
+04 Tests and invariants	tests/test-region-ring.cpp	87235	e47370f9af4d246d86be9f9ef2c16c11a307a3f4
+04 Tests and invariants	tests/test-region-ring-planner.cpp	126970	cf61c62dd3475d56f510ea4d223be3d66b2b0d34
+04 Tests and invariants	tests/test-phone-owned-execution-plan.cpp	9582	e0efb27d352462806dc8b1fbb98c7920b4918b0b
+04 Tests and invariants	tools/region-ring-experiments/test_first_plan_lock.py	3380	9c0fb03e61a00e0354f79d13cb4d2feb8aaf1d73
+04 Tests and invariants	tools/region-ring-experiments/test_chunk_dag.py	5334	517efa3899fe1fb049471efafe41c538762976b2
+04 Tests and invariants	tools/region-ring-experiments/test_cpu_optional_planner.cpp	13981	8a12a15ca9d0af7d9a8e352e581577bd3288d82e
+05 Existing project documentation	tools/region-ring-experiments/README_SHAREGPT50_SHORT_FIRST_LONG.md	18139	fd798186f67a534dac0f9d2e83870ef738c43019
+05 Existing project documentation	tools/region-ring-experiments/README_32B_ALL40.md	22658	dfb62e8bd8d81d152618b5756079755745ebdc52
+05 Existing project documentation	tools/region-ring-experiments/README_32B_FIG4B_FIXED_CHUNKS.md	8403	275c62b822e0dadfe609e7bc6a0212e2977b388f
+05 Existing project documentation	tools/region-ring-experiments/PHONE_OWNED_PLAN.md	35582	9723402748908620931dc7e9fa17d165817595cf
+05 Existing project documentation	tools/region-ring-experiments/PHONE_HTP_ONLY.md	11847	0f825fec41969ad67aae04c5a005cbb854825d27
+05 Existing project documentation	tools/region-ring-experiments/README_32B_HTP_ONLY_PROFILE5_PLAN.md	29852	510e8ffd18a65b1a8c973b1d77279ff94e8469b7
