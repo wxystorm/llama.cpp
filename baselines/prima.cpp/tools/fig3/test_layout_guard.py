@@ -3,7 +3,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from layout_guard import parse_fixed, summarize_log, validate_layout, compare_runs
+from layout_guard import (parse_fixed, local_layer_counts, summarize_log,
+                          validate_layout, compare_runs)
 
 
 def dump(path, rank0=39, rank1=1, ngl=21, world=2, extra_stage=""):
@@ -25,8 +26,14 @@ def dump(path, rank0=39, rank1=1, ngl=21, world=2, extra_stage=""):
 class LayoutGuardTest(unittest.TestCase):
     def test_parse(self):
         self.assertEqual(parse_fixed("39,1", 40), (39, 1))
-        with self.assertRaisesRegex(ValueError, "model layers"):
-            parse_fixed("39,1", 64)
+        # Multi-cycle windows are valid: two windows add up to less than
+        # the full 64-layer model; last round may be partial.
+        self.assertEqual(parse_fixed("8,8", 64), (8, 8))
+        self.assertEqual(local_layer_counts(8, 8, 64), (32, 32))
+        self.assertEqual(local_layer_counts(12, 10, 64), (30, 34))
+        self.assertEqual(local_layer_counts(39, 1, 40), (39, 1))
+        with self.assertRaisesRegex(ValueError, "exceeds"):
+            parse_fixed("39,30", 64)
         with self.assertRaises(ValueError):
             parse_fixed("39,0")
         with self.assertRaises(ValueError):
