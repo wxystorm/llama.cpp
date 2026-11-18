@@ -17,6 +17,7 @@ import shutil
 import socket
 import statistics
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -159,6 +160,12 @@ def args_parser():
                    help="optional exact model layer count for fixed layout validation")
     p.add_argument("--warmups", type=int, default=1)
     p.add_argument("--repeats", type=int, default=3)
+    p.add_argument("--profile-only", action="store_true",
+                   help="run one instrumented Profile only, retaining raw evidence; "
+                        "resume later for normal timing")
+    p.add_argument("--trace-tmp-dir", type=Path, default=Path("/tmp"),
+                   help="Linux native filesystem for temporary Rank0 CSV; "
+                        "do NOT use /mnt/c or /mnt/d on WSL")
     p.add_argument("--between", type=float, default=30.0)
     p.add_argument("--timeout", type=int, default=3600)
     p.add_argument("--phone-user", default="u0_a283")
@@ -192,6 +199,10 @@ def args_parser():
         p.error("clock-interval must be between 0.5 and 5 seconds")
     if args.warmups < 0 or args.repeats < 3 or args.between < 0:
         p.error("need >=3 normal repetitions, >=0 warmups")
+    if not args.trace_tmp_dir.is_dir():
+        p.error("--trace-tmp-dir must be an existing directory")
+    if str(args.trace_tmp_dir.resolve()).startswith(("/mnt/c/", "/mnt/d/", "/mnt/e/")):
+        p.error("--trace-tmp-dir must be on a native Linux filesystem, not Windows DrvFs")
     if not re.fullmatch(r"[a-zA-Z0-9._-]+", args.run_id):
         p.error("unsafe run-id")
     return args
@@ -333,17 +344,29 @@ def main():
         trace = root/"pc_events.csv"
         if trace.exists():
             raise RuntimeError("PC trace already exists but Profile manifest missing; inspect before overwrite")
-        profile_env = dict(env, PRIMA_FIG3_FILE=str(trace), PRIMA_FIG3_RANK="0",
-                           PRIMA_FIG3_RUN_ID=args.run_id)
-        stop, thread, during_samples, clock_errors = start_clock_sampling(args)
-        try:
-            result = launch(args, cmd, root/"profile_run.log", profile_env)
-        finally:
-            stop.set()
-            thread.join(timeout=12)
-            manifest["clock_samples"].extend(during_samples)
-            manifest["clock_poll_failures"] = clock_errors[:20]
-            atomic_json(path, manifest)
+        # /mnt/d on WSL is DrvFs. The trace emitter historically performs
+        # open/write/close for EVERY event (~1200/Prefill). Directly writing
+        # to NTFS can dominate the measured compute time. Stage the *raw*
+        # trace on a native Linux filesystem, then copy once after exit.
+        with tempfile.TemporaryDirectory(prefix="prima_fig3_", dir=args.trace_tmp_dir) as td:
+            local_trace = Path(td)/"pc_events.csv"
+            profile_env = dict(env, PRIMA_FIG3_FILE=str(local_trace), PRIMA_FIG3_RANK="0",
+                               PRIMA_FIG3_RUN_ID=args.run_id)
+            print("[PRIMA_FIG3] TRACE FAST PATH:", str(local_trace),
+                  "(one final copy to", str(trace)+")", flush=True)
+            stop, thread, during_samples, clock_errors = start_clock_sampling(args)
+            try:
+                result = launch(args, cmd, root/"profile_run.log", profile_env)
+            finally:
+                stop.set()
+                thread.join(timeout=12)
+                manifest["clock_samples"].extend(during_samples)
+                manifest["clock_poll_failures"] = clock_errors[:20]
+                if local_trace.exists():
+                    shutil.copyfile(local_trace, trace)
+                    manifest["trace_staging"] = "NATIVE_LINUX_TEMP_COPY_ONCE"
+                    manifest["trace_bytes"] = trace.stat().st_size
+                atomic_json(path, manifest)
         manifest["profile"] = result
         atomic_json(path, manifest)
         print("[PRIMA_FIG3] during-Profile clock samples:",
@@ -353,6 +376,12 @@ def main():
         samples = clock_batch(args.clock_host, args.clock_port, "after")
         manifest["clock_samples"].extend(samples)
         atomic_json(path, manifest)
+    if args.profile_only:
+        print("[PRIMA_FIG3] PROFILE_ONLY complete, Prefill=%.3f ms; "
+              "existing trace and clock samples saved; later use --resume "
+              "without --profile-only for normal runs."
+              % manifest["profile"]["prefill_ms"], flush=True)
+        return
     for i in range(len(manifest["warmup"]), args.warmups):
         if args.between:
             time.sleep(args.between)
