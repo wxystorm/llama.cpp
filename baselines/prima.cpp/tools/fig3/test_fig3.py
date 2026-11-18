@@ -89,12 +89,18 @@ class Fig3Test(unittest.TestCase):
                 with target.open("w", newline="") as handle:
                     csv.writer(handle).writerows(rows)
             manifest = base/"manifest.json"
+            layout = {"effective": {
+                "rank": 0, "world": 2, "lw0": 39, "lw1": 1,
+                "ngl": 21, "prefetch": 1}, "planner_stages": []}
             manifest.write_text(json.dumps({
                 "run_id": run, "model": "Qwen3-14B",
+                "placement_mode": "FIXED_LAYOUT_REPLAY",
                 "clock_samples": samples(),
-                "normal": [{"prefill_ms": 870, "tokens": 1041},
-                           {"prefill_ms": 890, "tokens": 1041},
-                           {"prefill_ms": 900, "tokens": 1041}]
+                "profile": {"layout": layout},
+                "warmup": [{"layout": layout}],
+                "normal": [{"prefill_ms": 870, "tokens": 1041, "layout": layout},
+                           {"prefill_ms": 890, "tokens": 1041, "layout": layout},
+                           {"prefill_ms": 900, "tokens": 1041, "layout": layout}]
             }))
             args = SimpleNamespace(manifest=str(manifest), pc=str(pcfile),
                                    phone=str(phonefile), out=str(base/"out"))
