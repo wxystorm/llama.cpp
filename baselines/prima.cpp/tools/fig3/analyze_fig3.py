@@ -8,6 +8,7 @@ an absolute GPU timestamp trace has been supplied and integrated.
 """
 from __future__ import annotations
 import argparse
+import bisect
 import csv
 import json
 import statistics
@@ -80,6 +81,89 @@ def calibrate(samples):
     return offset, min(s["uncertainty_ns"] for s in selected), max(drift, temporal_drift)
 
 
+def _clock_anchor(group, label):
+    """Median of the four smallest-RTT four-stamp observations."""
+    good = [x for x in group if 0 <= x.get("uncertainty_ns", 1e30) <= 20000000
+            and all(key in x for key in ("pc_t0", "pc_t3", "phone_t1", "phone_t2"))]
+    if len(good) < 4:
+        raise ValueError(f"not enough high-quality {label} clock samples")
+    best = sorted(good, key=lambda x: x["uncertainty_ns"])[:4]
+    pc = int(statistics.median((x["pc_t0"] + x["pc_t3"]) // 2 for x in best))
+    phone = int(statistics.median((x["phone_t1"] + x["phone_t2"]) // 2 for x in best))
+    uncertainty = max(x["uncertainty_ns"] for x in best)
+    return dict(pc=pc, phone=phone, uncertainty=uncertainty, phase=label)
+
+
+def clock_mapping(samples, mode="strict", profile_start=None, profile_end=None):
+    """Map PHONE CLOCK_MONOTONIC timestamps to PC CLOCK_MONOTONIC.
+
+    Strict mode stays constant-offset when only before+after stamps exist.
+    If in-run clock samples are available, strict mode uses piecewise mapping
+    only when anchors densely cover the Profile and no large clock step is
+    observed. Two-point affine mode is an EXPLICIT DIAGNOSTIC ONLY.
+    """
+    if mode not in ("strict", "affine-diagnostic"):
+        raise ValueError("clock mode must be strict or affine-diagnostic")
+    before = _clock_anchor([x for x in samples if x.get("phase") == "before"], "before")
+    after  = _clock_anchor([x for x in samples if x.get("phase") == "after"], "after")
+    if not (before["pc"] < after["pc"] and before["phone"] < after["phone"]):
+        raise ValueError("clock anchor endpoints not strictly increasing")
+    offset_change = (after["phone"] - after["pc"]) - (before["phone"] - before["pc"])
+    best_uncertainty = min(x.get("uncertainty_ns", 1e30) for x in samples)
+    during = [
+        dict(pc=(s["pc_t0"] + s["pc_t3"]) // 2,
+             phone=(s["phone_t1"] + s["phone_t2"]) // 2,
+             uncertainty=s["uncertainty_ns"], phase="during")
+        for s in samples if s.get("phase") == "during"
+        and 0 <= s.get("uncertainty_ns", 1e30) <= 20000000
+        and all(k in s for k in ("pc_t0", "pc_t3", "phone_t1", "phone_t2"))
+    ]
+    during.sort(key=lambda a: a["pc"])
+    if mode == "strict" and len(during) < 8:
+        offset, uncertainty, drift = calibrate(samples)
+        return (lambda phone_ns: phone_ns - offset), dict(
+            mode="constant-offset-strict", anchor_count=2, max_anchor_gap_ms=None,
+            best_uncertainty_ns=uncertainty, offset_change_ns=offset_change,
+            spread_ns=drift, rate_ratio=1.0)
+    if mode == "affine-diagnostic":
+        anchors = [before, after]
+        mapping = "TWO_POINT_AFFINE_ASSUMED_NOT_VERIFIED"
+    else:
+        anchors = [before] + during + [after]
+        mapping = "PIECEWISE_DURING_PROFILE_UNDER_REVIEW"
+    if profile_start is not None and not (
+            anchors[0]["pc"] <= profile_start <= profile_end <= anchors[-1]["pc"]):
+        raise ValueError("clock samples do not bracket whole PC Prefill window")
+    max_gap_ns = 0
+    max_local_delta_ns = 0
+    for a, b in zip(anchors, anchors[1:]):
+        pc_gap, phone_gap = b["pc"] - a["pc"], b["phone"] - a["phone"]
+        if pc_gap <= 0 or phone_gap <= 0:
+            raise ValueError("non-monotonic clock alignment anchors")
+        max_gap_ns = max(max_gap_ns, pc_gap)
+        local_delta_ns = abs(phone_gap - pc_gap)
+        max_local_delta_ns = max(max_local_delta_ns, local_delta_ns)
+        if mode == "strict":
+            if pc_gap > 8000000000:
+                raise ValueError(f"clock calibration gap {pc_gap/1e9:.2f}s > 8s during Profile")
+            # A sudden 100ms discrepancy between adjacent 2s anchors indicates
+            # a clock step or badly asymmetric network. Do not interpolate it.
+            if local_delta_ns > max(100000000, int(pc_gap * 0.03)):
+                raise ValueError(
+                    f"clock discontinuity between samples: {local_delta_ns/1e6:.1f}ms")
+    phone_points = [x["phone"] for x in anchors]
+    def map_phone(t):
+        i = max(0, min(len(anchors)-2, bisect.bisect_right(phone_points, t)-1))
+        a, b = anchors[i], anchors[i+1]
+        return a["pc"] + (t - a["phone"]) * (b["pc"]-a["pc"]) // (b["phone"]-a["phone"])
+    rate = (after["pc"]-before["pc"])/(after["phone"]-before["phone"])
+    return map_phone, dict(
+        mode=mapping, anchor_count=len(anchors),
+        max_anchor_gap_ms=round(max_gap_ns/1e6, 3),
+        max_local_clock_delta_ms=round(max_local_delta_ns/1e6, 3),
+        best_uncertainty_ns=best_uncertainty, offset_change_ns=offset_change,
+        spread_ns=abs(offset_change), rate_ratio=rate)
+
 def projection(source, start, end):
     """O(N log N) event sweep with mutually-exclusive priority projection."""
     edges = []
@@ -139,13 +223,16 @@ def inspect(args):
         raise ValueError("Prefill token count not recorded")
 
     samples = manifest.get("clock_samples", [])
-    offset, uncertainty, spread = calibrate(samples)
+    clock_mode = getattr(args, "clock_mode", "strict")
+    phone_to_pc, clock_quality = clock_mapping(samples, clock_mode, t0, t1)
+    uncertainty = clock_quality["best_uncertainty_ns"]
+    spread = clock_quality["spread_ns"]
     raw = []
     counts = Counter()
     for origin, rows in (("pc", pc), ("phone", phone)):
         for r in rows:
-            a = r["start_ns"] - (offset if origin == "phone" else 0)
-            b = r["end_ns"] - (offset if origin == "phone" else 0)
+            a = phone_to_pc(r["start_ns"]) if origin == "phone" else r["start_ns"]
+            b = phone_to_pc(r["end_ns"]) if origin == "phone" else r["end_ns"]
             if b <= t0 or a >= t1 or a == b:
                 continue
             a, b = max(t0, a), min(t1, b)
@@ -213,6 +300,10 @@ def inspect(args):
     cuda_approx = [x for x in raw if x["category"] in ("GPU Compute", "PCIe Copy") and
                    x["detail"] == "DEVICE_DURATION_SYNC_UPPER_BOUND"]
     fidelity = ("PROVISIONAL_GPU_EPOCH" if cuda_approx else "REQUIRES_GPU_QUALITY_REVIEW")
+    if clock_mode == "affine-diagnostic":
+        fidelity = "DIAGNOSTIC_ONLY_UNVERIFIED_TWO_POINT_CLOCK"
+    elif clock_quality["mode"].startswith("PIECEWISE"):
+        fidelity = "PROVISIONAL_CLOCK_RATE_AND_GPU_EPOCH"
     summary = {
         "baseline": "Prima", "run_id": run_id, "model": manifest["model"],
         "normal_prefill_ms": round(normal_ms, 3),
@@ -221,6 +312,13 @@ def inspect(args):
         "tokens": prefill[0]["bytes"], "clock_samples": len(samples),
         "clock_best_uncertainty_ms": round(uncertainty/1e6, 4),
         "clock_offset_spread_ms": round(spread/1e6, 4),
+        "clock_alignment": clock_quality,
+        "clock_warning": ("The two-point affine assumption cannot detect a "
+                          "mid-run clock jump; values are for debugging only."
+                          if clock_mode == "affine-diagnostic" else
+                          "Piecewise clock mapping is provisional: verify against "
+                          "a GPU absolute-timestamp trace and investigate WSL clock."),
+
         "full_coverage": sum(totals.values()) == envelope,
         "overlap_ms": round(overlap/1e6, 3),
         "source_event_count": len(source_rows),
@@ -248,6 +346,11 @@ def inspect(args):
         "paper_fidelity": fidelity,
     }
     write_csv(root/"fig3_prima_paper_row.csv", [paper], tuple(paper))
+    print("[PRIMA_FIG3] clock mapping", clock_quality["mode"],
+          "offset-change-ms", round(clock_quality["offset_change_ns"]/1e6, 3))
+    if clock_mode == "affine-diagnostic":
+        print("[PRIMA_FIG3] WARNING: DIAGNOSTIC ONLY. Endpoint clock drift may "
+              "have been a step rather than smooth drift. NOT PAPER DATA.")
     print("[PRIMA_FIG3] source events", len(source_rows),
           "100%-coverage", summary["full_coverage"],
           "GPU timestamp fidelity", fidelity)
@@ -263,6 +366,8 @@ def main():
     ap.add_argument("--pc", required=True)
     ap.add_argument("--phone", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--clock-mode", default="strict",
+                    choices=["strict", "affine-diagnostic"])
     inspect(ap.parse_args())
 
 
