@@ -88,6 +88,35 @@ class Fig3Test(unittest.TestCase):
         self.assertEqual(detail["anchor_count"], 2)
         self.assertIn("ASSUMED", detail["mode"])
 
+    def test_dense_clock_diagnostic_flags_real_anomaly(self):
+        readings = samples(200_000_000)
+        # before PC=9s, after PC=21s: 12s span with dense 1s anchors.
+        # Phone clock offset has a 200ms discontinuity at PC=16s.
+        for row in readings:
+            if row["phase"] == "after":
+                row["pc_t0"] = 21_000_000_000 - 100_000
+                row["pc_t3"] = 21_000_000_000 + 100_000
+                row["phone_t1"] = 21_000_000_000 + 205_000_000 - 100_000
+                row["phone_t2"] = 21_000_000_000 + 205_000_000 + 100_000
+        for second in range(10, 21):
+            center = second * 1_000_000_000
+            offset = 205_000_000 if second >= 16 else 5_000_000
+            readings.append({
+                "phase": "during", "uncertainty_ns": 100_000,
+                "pc_t0": center - 100_000,
+                "pc_t3": center + 100_000,
+                "phone_t1": center + offset - 100_000,
+                "phone_t2": center + offset + 100_000,
+            })
+        with self.assertRaisesRegex(ValueError, "clock discontinuity"):
+            clock_mapping(readings, "strict", 10_000_000_000, 20_000_000_000)
+        mapper, quality = clock_mapping(
+            readings, "piecewise-diagnostic", 10_000_000_000, 20_000_000_000)
+        self.assertEqual(quality["clock_anomaly_count"], 1)
+        self.assertIn("NOT_VERIFIED", quality["mode"])
+        self.assertEqual(mapper(10_005_000_000), 10_000_000_000)
+        self.assertEqual(mapper(17_205_000_000), 17_000_000_000)
+
     def test_synthetic_full(self):
         run = "synthetic-prima"
         with tempfile.TemporaryDirectory() as tmp:
