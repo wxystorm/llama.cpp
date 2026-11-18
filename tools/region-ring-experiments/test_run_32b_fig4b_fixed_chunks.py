@@ -88,7 +88,9 @@ class Fig4bTests(unittest.TestCase):
                         "runtime_layout": args.layout,
                         "planner_mode": f"FIXED_{chunk}_NO_REQUEST_SEARCH",
                         "plan_xc": chunk, "plan_xg": chunk, "plan_xp": chunk,
-                        "runtime_xc": chunk,
+                        # A GPU/Phone-only runtime can report XC=0 because
+                        # no CPU compute stage exists in the layer placement.
+                        "runtime_xc": 0,
                         "runtime_xg": (32 if bad and chunk == 64 and group == 512
                                        else chunk),
                         "runtime_xp": chunk, "planner_ms": 0.1,
@@ -116,6 +118,31 @@ class Fig4bTests(unittest.TestCase):
                        min(args.chunks, key=lambda c: float(row[f"chunk_{c}"]))
                        for row in rows}
             self.assertEqual(winners, {128: 32, 512: 64, 1024: 128})
+
+    def test_unstarted_cases_are_pending_not_false_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self.args(Path(d), repeats=3)
+            rows = fig.read_case(args, 128, 3)
+            self.assertEqual(len(rows), 3)
+            self.assertTrue(all(r["status"] == "PENDING" for r in rows))
+            self.assertTrue(all(not r["audit_error"] for r in rows))
+
+    def test_missing_gpu_width_still_rejects_real_measurements(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self.args(Path(d))
+            self.populate(args)
+            target = fig.case_dir(args.out, 32, 1) / "requests.csv"
+            with target.open(encoding="utf-8-sig", newline="") as stream:
+                records = list(csv.DictReader(stream))
+            records[0]["runtime_xg"] = "0"
+            with target.open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=records[0].keys())
+                writer.writeheader()
+                writer.writerows(records)
+            result = fig.read_case(args, 32, 1)
+            self.assertEqual(result[0]["status"], "AUDIT_FAIL")
+            self.assertIn("runtime_xg", result[0]["audit_error"])
+            self.assertEqual(result[1]["status"], "PASS")
 
     def test_wrong_server_prefetch_policy_rejects_samples(self):
         with tempfile.TemporaryDirectory() as d:
