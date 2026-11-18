@@ -45,16 +45,16 @@ caveat or silently label the projection fully hardware-verified.
 PC WSL:
 
     cd /mnt/d/prima-qwen3
-    git fetch origin
-    git switch -c exp/prima-fig3-full-trace-20261118 origin/exp/prima-fig3-full-trace-20261118
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git switch -c exp/prima-fig3-full-trace-20261118 FETCH_HEAD
     cd baselines/prima.cpp
     make USE_HIGHS=1 GGML_CUDA=1 CUDA_DOCKER_ARCH=compute_86 CC=gcc-10 CXX=g++-10 NVCCFLAGS="-ccbin=/usr/bin/g++-10" -j4 llama-cli
 
 Phone Termux:
 
     cd ~/prima-qwen3
-    git fetch origin
-    git switch -c exp/prima-fig3-full-trace-20261118 origin/exp/prima-fig3-full-trace-20261118
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git switch -c exp/prima-fig3-full-trace-20261118 FETCH_HEAD
     cd baselines/prima.cpp
     make CC=clang CXX=clang++ -j4 llama-cli
 
@@ -110,6 +110,80 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## Controlled replay: Qwen3-14B consistent layer placement
+
+The previous 14B Figure 3 is **not** a valid Profile/Normal comparison:
+the Profile assigned PC6 GPU layers and Phone34 CPU layers (109006.70ms /
+1033 tokens); three Normal runs first planned PC39/Phone1 (PC GPU21) and
+subsequently logged PC40-only, with a normal median of 5144.86ms.
+The 21x discrepancy is a placement mismatch, **not proof of a profiling
+slowdown**. That run also had 1514.126ms PC/Phone clock-offset change.
+Keep its CSVs as diagnostic evidence only.
+
+Prima supports a documented manual layout option on Rank 0:
+-lw "39,1" -ngl 21. This bypasses HiGHS auto placement. The run
+is therefore called **FIXED_LAYOUT_REPLAY**; never label its performance
+as Prima's automatic placement baseline. The collector now records the
+post-init effective layout of *every* run, including Normal, and fails
+closed if the profile/normal layouts disagree or the phone was removed.
+
+Use a fresh run-id and output directory. First STOP the old phone worker.
+
+Phone Termux:
+
+    cd ~/prima-qwen3
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git switch exp/prima-fig3-full-trace-20261118
+    git merge --ff-only FETCH_HEAD
+    cd baselines/prima.cpp
+    make CC=clang CXX=clang++ -j4 llama-cli
+    bash tools/fig3/phone_worker_fig3.sh \
+      "$HOME/models/Qwen3-14B-Q4_K_M.gguf" \
+      10.238.229.214 prima-fig3-14b-fixed39-1
+
+PC WSL (different terminal, after Phone Worker starts):
+
+    cd /mnt/d/prima-qwen3
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git switch exp/prima-fig3-full-trace-20261118
+    git merge --ff-only FETCH_HEAD
+    cd baselines/prima.cpp
+    make USE_HIGHS=1 GGML_CUDA=1 \
+      CUDA_DOCKER_ARCH=compute_86 CC=gcc-10 CXX=g++-10 \
+      NVCCFLAGS="-ccbin=/usr/bin/g++-10" -j4 llama-cli
+    python3 -m py_compile tools/fig3/*.py
+    python3 tools/fig3/test_fig3.py
+    python3 tools/fig3/test_layout_guard.py
+
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-fixed39-1 \
+      --binary ./llama-cli \
+      --model /mnt/e/llama/models/Qwen3-14B-Q4_K_M.gguf \
+      --prompt /mnt/e/llama/datasets/sharegpt/sharegpt50_short/prompt_1024_01.txt \
+      --out /mnt/d/fig3-prima14b-fixed39-1 \
+      --master 10.238.229.214 --next 10.238.229.239 \
+      --context 2048 --batch 512 --ubatch 512 --threads 8 \
+      --fixed-layers 39,1 --pc-ngl 21 --model-layers 40 \
+      --clock-interval 0.5 --warmups 1 --repeats 3 --between 30
+
+Rank 1 needs no -lw/-ngl option; Rank 0 supplies the split through the
+existing ring. Both nodes use the same GGUF and fresh run-id.
+The expected PC log line starts with:
+
+    [PRIMA_FIG3_LAYOUT] stage=post_init rank=0 world=2 lw0=39 lw1=1 ngl=21
+
+The runner verifies this after every session, including all 3 Normal
+measurements. Using a pinned replay is more reproducible, but does NOT
+substitute for rerunning a stable real auto-plan baseline. The original
+normal median 5144.86ms must not be reused; the fixed replay remeasures it.
+
+If phone.csv is not copied automatically, fetch:
+    ~/prima-fig3-phone/prima-fig3-14b-fixed39-1/phone.csv
+to D:\fig3-prima14b-fixed39-1\phone_events.csv, then use --analyze-only.
+
+Even a matched replay remains provisional for cross-device overlap until
+the CUDA device-epoch alignment and clock discontinuity checks pass.
+
 ## Clock discontinuity recovery and follow-up
 
 A large discrepancy between *before* and *after* four-timestamp clock
@@ -133,7 +207,7 @@ paper_fidelity=DIAGNOSTIC_ONLY_UNVERIFIED_TWO_POINT_CLOCK, **NOT paper data**.
 The original PC/Phone CSV and manifest clock samples are retained.
 
 For newly collected experiments, the PC script records four-timestamp
-clock observations **during** Profile, every 2s by default, in addition
+clock observations **during** Profile, every 0.5s by default, in addition
 to before/after samples. Default strict mode can piecewise-align densely
 sampled observations only if it sees no large step and every adjacent
 calibration is within 8s; gaps and jumps fail closed.
