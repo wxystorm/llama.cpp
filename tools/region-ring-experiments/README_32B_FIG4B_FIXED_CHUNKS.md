@@ -109,6 +109,35 @@ python .\tools\region-ring-experiments\probe_htp_llama_server.py @baseline
 
 Do not compare the previous mmap-on server Prefill figures directly with no-mmap results and describe them as all-other-settings-equal.
 
+## Resume after the 2026-11-18 XC=0 audit bug
+
+In the fixed `G7/P4/.../G7` placement there are **no CPU compute
+regions**. Thus the native `REGION_RING_SUM` line can report
+`runtime_xc=0` while `plan_xc=32`, `runtime_xg=32`,
+`runtime_xp=32`. This is expected and **does not invalidate inference**.
+The first Fig.4(b) wrapper mistakenly required every runtime width to be
+positive, stopping after `chunk_032/repeat_01` even though the server
+had completed 3/3 prompts. The corrected audit permits `runtime_xc=0`
+only when no C stage exists; XG/XP remain strictly positive and native
+request-plan/runtime checks remain enabled. Unrun cases are reported
+as `PENDING`, not as inference failures.
+
+Do not delete or rename `fig4b-32b-main50-nommap`. Update the
+existing Fig.4(b) branch, then rerun the exact same `$opts`
+with `--repeats 3`:
+
+```powershell
+git pull --ff-only
+python -m unittest discover -s .\tools\region-ring-experiments -p test_run_32b_fig4b_fixed_chunks.py -v
+python .\tools\region-ring-experiments\run_32b_fig4b_fixed_chunks.py @opts --repeats 3
+```
+
+The wrapper automatically adds `--resume` to a case with an existing
+`server-run-config.json`. Previously measured PASS requests are
+fingerprint-checked and reused. Only unfinished Chunk/repetition cases
+are executed. This fix changes Python validation/reporting only; no
+additional C++ rebuild is required for the same executable.
+
 ## Offline tests
 
 ```powershell
