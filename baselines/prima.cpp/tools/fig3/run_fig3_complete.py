@@ -254,10 +254,25 @@ def main():
     cmd = build_cmd(args)
     print("[PRIMA_FIG3] runner:", " ".join(cmd), flush=True)
     print("[PRIMA_FIG3] Phone run id:", args.run_id, flush=True)
-    print("[PRIMA_FIG3] PLACEMENT MODE:",
-          ("FIXED_LAYOUT_REPLAY " + args.fixed_layers + " GPU=" + str(args.pc_ngl))
-          if args.fixed_layers else "AUTO_PLAN_STRICT_COMPARISON",
-          flush=True)
+    # In --analyze-only mode no inference is launched. The CLI defaults
+    # are irrelevant: the placement provenance belongs to the saved run.
+    if args.analyze_only:
+        saved = root/"manifest.json"
+        if saved.exists():
+            saved_manifest = json.loads(saved.read_text(encoding="utf-8"))
+            print("[PRIMA_FIG3] ANALYZE_ONLY (no inference); ORIGINAL PLACEMENT:",
+                  saved_manifest.get("placement_mode", "UNRECORDED"),
+                  "layout=", saved_manifest.get("requested_layout"),
+                  "pc_ngl=", saved_manifest.get("requested_pc_gpu_layers"),
+                  flush=True)
+        else:
+            print("[PRIMA_FIG3] ANALYZE_ONLY: manifest missing", flush=True)
+    else:
+        print("[PRIMA_FIG3] PLACEMENT MODE:",
+              ("FIXED_LAYOUT_REPLAY " + args.fixed_layers +
+               " GPU=" + str(args.pc_ngl))
+              if args.fixed_layers else "AUTO_PLAN_STRICT_COMPARISON",
+              flush=True)
     if args.dry_run:
         print("[PRIMA_FIG3] DRY_RUN_PASS (no inference, no file writes)")
         return
