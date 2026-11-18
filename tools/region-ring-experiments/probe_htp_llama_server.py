@@ -837,7 +837,9 @@ def write_reports(out, records, expected_counts=None):
             stream, fieldnames=detail_fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)
-    rows = report_rows(records, runner.MAIN50_SHORT_GROUPS, expected_counts)
+    report_groups = ((128, 512, 1024) if expected_counts is not None
+                     else runner.MAIN50_SHORT_GROUPS)
+    rows = report_rows(records, report_groups, expected_counts)
     with (out / "summary.csv").open(
             "w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
@@ -1140,15 +1142,16 @@ def main(argv=None):
         config = sweep_config(args, command, env, prompts, anchor_tokens)
         completed = prepare_sweep_output(args, config, prompts)
         selected_count = args.limit or len(prompts)
-        print(f"[SERVER_SWEEP] experiment=ALL50_UNIQUE"
-              f" long_anchor=FIRST selected={selected_count}/50"
+        sweep_kind = "FIG4B_FIXED_CHUNK" if args.fig4b_prompts else "ALL50_UNIQUE"
+        print(f"[SERVER_SWEEP] experiment={sweep_kind}"
+              f" long_anchor=FIRST selected={selected_count}/{len(prompts)}"
               f" existing_pass={len(completed)}"
               f" resume={int(args.resume)}"
               f" delay_seconds={args.inter_prompt_delay_seconds:.1f}"
               f" fingerprint={config['fingerprint'][:12]}", flush=True)
         if len(completed) >= selected_count:
             print(f"[SERVER_SWEEP] status="
-                  f"{'PASS' if len(completed) == 50 else 'PARTIAL'}"
+                  f"{'PASS' if len(completed) == len(prompts) else 'PARTIAL'}"
                   f" completed={len(completed)}/{len(prompts)}"
                   f" no_new_requests=1 results={metrics_path}", flush=True)
             return 0
