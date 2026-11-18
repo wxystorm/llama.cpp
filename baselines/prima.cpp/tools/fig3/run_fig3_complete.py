@@ -21,6 +21,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from analyze_fig3 import inspect
+from layout_guard import parse_fixed, summarize_log, validate_layout, compare_runs
 
 PERF = re.compile(r"prompt eval time\s*=\s*([\d,.]+)\s*ms\s*/\s*(\d+)\s*(?:tokens?|runs?)",
                   flags=re.I)
@@ -106,7 +107,8 @@ def build_cmd(args):
         "--master", args.master, "--next", args.next,
         "--prefetch", "-b", str(args.batch), "-ub", str(args.ubatch),
         "-t", str(args.threads),
-    ] + args.extra
+    ] + (["-lw", args.fixed_layers, "-ngl", str(args.pc_ngl)]
+         if args.fixed_layers else []) + args.extra
 
 
 def launch(args, cmd, log, env):
@@ -119,6 +121,11 @@ def launch(args, cmd, log, env):
         tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
         raise RuntimeError(f"llama-cli status={proc.returncode}: {log}\n{tail}")
     value = timing(log)
+    value["layout"] = summarize_log(log)
+    expected = (parse_fixed(args.fixed_layers) + (args.pc_ngl,)
+                if args.fixed_layers else None)
+    validate_layout(value["layout"], expected)
+    print("[PRIMA_FIG3] EFFECTIVE PLACEMENT:", value["layout"]["effective"], flush=True)
     print("[PRIMA_FIG3] PASS %s %d tokens %.3f ms" %
           (log.name, value["tokens"], value["prefill_ms"]), flush=True)
     return value
@@ -144,6 +151,12 @@ def args_parser():
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--ubatch", type=int, default=512)
     p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--fixed-layers", default="",
+                   help="manual deterministic replay, e.g. 39,1; keeps Phone active")
+    p.add_argument("--pc-ngl", type=int, default=None,
+                   help="PC CUDA layers for --fixed-layers, e.g. 21")
+    p.add_argument("--model-layers", type=int, default=0,
+                   help="optional exact model layer count for fixed layout validation")
     p.add_argument("--warmups", type=int, default=1)
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--between", type=float, default=30.0)
@@ -159,9 +172,20 @@ def args_parser():
     if extra and extra[0] == "--":
         extra = extra[1:]
     if any(x in extra for x in ("-m", "--model", "-f", "--file", "--world",
-                                "--rank", "--master", "--next", "-n", "--predict")):
+                                "--rank", "--master", "--next", "-n", "--predict",
+                                "-lw", "--layer-window", "--n-layer-window",
+                                "-ngl", "--n-gpu-layers")):
         p.error("Do not override the comparison model, prompt, topology, or predict count")
     args.extra = extra
+    if bool(args.fixed_layers) != (args.pc_ngl is not None):
+        p.error("--fixed-layers and --pc-ngl must be supplied together")
+    if args.fixed_layers:
+        try:
+            pc, phone = parse_fixed(args.fixed_layers, args.model_layers)
+        except ValueError as err:
+            p.error(str(err))
+        if not 0 <= args.pc_ngl <= pc:
+            p.error("--pc-ngl must be between 0 and the number of PC layers")
     if not (0 < args.ubatch <= args.batch <= args.context):
         p.error("need 0 < ubatch <= batch <= context")
     if args.clock_interval < 0.5 or args.clock_interval > 5.0:
@@ -200,6 +224,16 @@ def finalize(args, root, manifest):
         return
     if not (root/"pc_events.csv").exists():
         raise RuntimeError("Missing PC raw trace; do not produce invented Fig.3 proportions")
+    if all("layout" in r for r in [manifest.get("profile") or {}] +
+           list(manifest.get("warmup", [])) + list(manifest.get("normal", []))):
+        compare_runs(manifest["profile"], manifest.get("warmup", []) +
+                     manifest.get("normal", []))
+    elif args.clock_mode != "affine-diagnostic":
+        raise ValueError("No audited layout in legacy manifest; cannot claim "
+                         "same Prima placement. Use a NEW run-id and fixed replay.")
+    else:
+        print("[PRIMA_FIG3] LEGACY LAYOUT UNVERIFIED - DIAGNOSTIC ONLY",
+              flush=True)
     ns = argparse.Namespace(manifest=str(root/"manifest.json"),
                             pc=str(root/"pc_events.csv"), phone=str(phone),
                             out=str(root/"profile"), clock_mode=args.clock_mode)
@@ -220,6 +254,10 @@ def main():
     cmd = build_cmd(args)
     print("[PRIMA_FIG3] runner:", " ".join(cmd), flush=True)
     print("[PRIMA_FIG3] Phone run id:", args.run_id, flush=True)
+    print("[PRIMA_FIG3] PLACEMENT MODE:",
+          ("FIXED_LAYOUT_REPLAY " + args.fixed_layers + " GPU=" + str(args.pc_ngl))
+          if args.fixed_layers else "AUTO_PLAN_STRICT_COMPARISON",
+          flush=True)
     if args.dry_run:
         print("[PRIMA_FIG3] DRY_RUN_PASS (no inference, no file writes)")
         return
@@ -244,7 +282,8 @@ def main():
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if (manifest["run_id"] != args.run_id or
             manifest["model"] != str(args.model.resolve()) or
-            manifest["prompt"] != str(args.prompt.resolve())):
+            manifest["prompt"] != str(args.prompt.resolve()) or
+            manifest.get("full_command") != cmd):
             raise RuntimeError("Resume model/prompt/run-id conflict")
     else:
         manifest = dict(
@@ -256,6 +295,11 @@ def main():
             world=2, rank0="WSL CPU+CUDA", rank1="Termux native CPU",
             master=args.master, next=args.next, context=args.context,
             batch=args.batch, ubatch=args.ubatch,
+            full_command=cmd,
+            placement_mode=("FIXED_LAYOUT_REPLAY" if args.fixed_layers else
+                            "AUTO_PLAN_STRICT_COMPARISON"),
+            requested_layout=args.fixed_layers or None,
+            requested_pc_gpu_layers=args.pc_ngl,
             normal=[], warmup=[], profile=None, clock_samples=[],
             status="RUNNING", created_at=datetime.now(timezone.utc).isoformat(),
             note="Prima native Piped-ring/HiGHS unchanged; Profile and normal measured separately")
@@ -263,6 +307,8 @@ def main():
     env = os.environ.copy()
     for key in ("PRIMA_FIG3_FILE", "PRIMA_FIG3_RANK", "PRIMA_FIG3_RUN_ID"):
         env.pop(key, None)
+    # A single post-model-load log line is outside measured Prefill.
+    env["PRIMA_FIG3_LAYOUT_AUDIT"] = "1"
 
     if not manifest["profile"]:
         # Validate the actual Phone clock service before heavy model loads.
@@ -298,12 +344,14 @@ def main():
         value = launch(args, cmd, root/f"warmup_{i+1}.log", env)
         manifest["warmup"].append(value)
         atomic_json(path, manifest)
+        compare_runs(manifest["profile"], manifest["warmup"])
     for i in range(len(manifest["normal"]), args.repeats):
         if args.between:
             time.sleep(args.between)
         value = launch(args, cmd, root/f"normal_{i+1}.log", env)
         manifest["normal"].append(value)
         atomic_json(path, manifest)
+        compare_runs(manifest["profile"], manifest["warmup"] + manifest["normal"])
     if any(abs(r["tokens"]-manifest["profile"]["tokens"])>2
            for r in manifest["normal"]):
         raise RuntimeError("Normal vs Profile token count mismatch")
