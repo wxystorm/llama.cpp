@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <fstream>
@@ -208,6 +209,21 @@ int main(int argc, char ** argv) {
 
     model = llama_init.model;
     ctx = llama_init.context;
+
+    // Record the EFFECTIVE rank/topology after Prima's automatic device
+    // selection. This is printed even on unprofiled runs when requested.
+    // Distinguish an auto-selected 40+0 PC-only run from a 39+1 replay.
+    if (std::getenv("PRIMA_FIG3_LAYOUT_AUDIT")) {
+        std::fprintf(stderr,
+            "[PRIMA_FIG3_LAYOUT] stage=post_init rank=%u world=%u lw0=%u lw1=%u ngl=%d prefetch=%d\n",
+            static_cast<unsigned>(params.rank),
+            static_cast<unsigned>(params.n_world),
+            static_cast<unsigned>(params.n_layer_window[0]),
+            static_cast<unsigned>(params.n_layer_window[1]),
+            static_cast<int>(params.n_gpu_layers),
+            params.prefetch ? 1 : 0);
+        std::fflush(stderr);
+    }
     int64_t prima_fig3_prefill_begin_ns = 0;
     bool prima_fig3_prefill_closed = false;
 
