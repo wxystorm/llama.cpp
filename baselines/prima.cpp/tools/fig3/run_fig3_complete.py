@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from analyze_fig3 import inspect
 from layout_guard import (parse_fixed, local_layer_counts, summarize_log,
                           validate_layout, compare_runs)
+from profile_lock import locked_normal_command, quarantine_mismatched_runs
 
 PERF = re.compile(r"prompt eval time\s*=\s*([\d,.]+)\s*ms\s*/\s*(\d+)\s*(?:tokens?|runs?)",
                   flags=re.I)
@@ -113,7 +114,7 @@ def build_cmd(args):
          if args.fixed_layers else []) + args.extra
 
 
-def launch(args, cmd, log, env):
+def launch(args, cmd, log, env, expected_layout=None):
     print("[PRIMA_FIG3] START", log.name, flush=True)
     with log.open("wb") as handle:
         proc = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL,
@@ -124,8 +125,9 @@ def launch(args, cmd, log, env):
         raise RuntimeError(f"llama-cli status={proc.returncode}: {log}\n{tail}")
     value = timing(log)
     value["layout"] = summarize_log(log)
-    expected = (parse_fixed(args.fixed_layers) + (args.pc_ngl,)
-                if args.fixed_layers else None)
+    expected = expected_layout if expected_layout is not None else (
+        parse_fixed(args.fixed_layers) + (args.pc_ngl,)
+        if args.fixed_layers else None)
     validate_layout(value["layout"], expected)
     print("[PRIMA_FIG3] EFFECTIVE PLACEMENT:", value["layout"]["effective"], flush=True)
     print("[PRIMA_FIG3] PASS %s %d tokens %.3f ms" %
@@ -179,6 +181,10 @@ def args_parser():
     p.add_argument("--skip-scp", action="store_true")
     p.add_argument("--analyze-only", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--lock-normal-to-profile", action="store_true",
+                   help="on --resume, keep the saved auto Profile untouched, "
+                        "but use its exact -lw/-ngl for Warmup and Normal; "
+                        "archive old mismatched Warmup evidence")
     p.add_argument("--dry-run", action="store_true")
     args, extra = p.parse_known_args()
     if extra and extra[0] == "--":
@@ -189,6 +195,11 @@ def args_parser():
                                 "-ngl", "--n-gpu-layers")):
         p.error("Do not override the comparison model, prompt, topology, or predict count")
     args.extra = extra
+    if args.lock_normal_to_profile and (not args.resume or args.profile_only
+                                        or args.analyze_only or args.fixed_layers
+                                        or args.pc_ngl is not None):
+        p.error("--lock-normal-to-profile requires --resume with a saved "
+                "auto Profile, and no --profile-only/-lw/-ngl/--analyze-only")
     if bool(args.fixed_layers) != (args.pc_ngl is not None):
         p.error("--fixed-layers and --pc-ngl must be supplied together")
     if args.fixed_layers:
@@ -291,9 +302,11 @@ def main():
             print("[PRIMA_FIG3] ANALYZE_ONLY: manifest missing", flush=True)
     else:
         print("[PRIMA_FIG3] PLACEMENT MODE:",
-              ("FIXED_LAYOUT_REPLAY " + args.fixed_layers +
-               " GPU=" + str(args.pc_ngl))
-              if args.fixed_layers else "AUTO_PLAN_STRICT_COMPARISON",
+              ("AUTO_PROFILE_LOCKED_NORMAL_RESUME"
+               if args.lock_normal_to_profile else
+               "FIXED_LAYOUT_REPLAY " + args.fixed_layers +
+               " GPU=" + str(args.pc_ngl)
+               if args.fixed_layers else "AUTO_PLAN_STRICT_COMPARISON"),
               flush=True)
     if args.dry_run:
         print("[PRIMA_FIG3] DRY_RUN_PASS (no inference, no file writes)")
@@ -341,6 +354,51 @@ def main():
             status="RUNNING", created_at=datetime.now(timezone.utc).isoformat(),
             note="Prima native Piped-ring/HiGHS unchanged; Profile and normal measured separately")
         atomic_json(path, manifest)
+    normal_cmd = cmd
+    normal_expected = None
+    if args.lock_normal_to_profile:
+        original_mode = manifest.get("profile_placement_mode",
+                                     manifest.get("placement_mode"))
+        if original_mode != "AUTO_PLAN_STRICT_COMPARISON":
+            raise RuntimeError(
+                f"--lock-normal-to-profile requires an original auto Profile; "
+                f"stored mode={original_mode}")
+        normal_cmd, normal_expected = locked_normal_command(
+            manifest, cmd, args.model_layers)
+        if (manifest.get("locked_normal_command") is not None
+                and manifest["locked_normal_command"] != normal_cmd):
+            raise RuntimeError("Resume lock command differs from original locked Normal")
+        # Keep the previous manifest and every rejected run's original log.
+        backup_path = root/"manifest_before_normal_lock.json"
+        if not backup_path.exists():
+            shutil.copyfile(path, backup_path)
+        rejected = quarantine_mismatched_runs(
+            manifest, root, manifest["profile"]["layout"]["effective"])
+        manifest["profile_placement_mode"] = original_mode
+        manifest["placement_mode"] = "AUTO_PROFILE_LOCKED_NORMAL"
+        manifest["normal_mode"] = "PROFILE_LOCKED_REPLAY"
+        manifest["locked_normal_command"] = normal_cmd
+        manifest["requested_layout"] = (
+            f"{normal_expected[0]},{normal_expected[1]}")
+        manifest["requested_pc_gpu_layers"] = normal_expected[2]
+        manifest["status"] = "RESUME_LOCKED_TO_PROFILE"
+        atomic_json(path, manifest)
+        print("[PRIMA_FIG3] KEEP original AUTO Profile. NORMAL COMMAND:",
+              " ".join(normal_cmd), flush=True)
+        print("[PRIMA_FIG3] quarantined mismatched sessions:",
+              len(rejected), flush=True)
+        for entry in rejected:
+            print("[PRIMA_FIG3] REJECTED", entry["group"],
+                  entry["index"], "log=", entry["log"],
+                  "reason=", entry["reason"], flush=True)
+    elif manifest.get("normal_mode") == "PROFILE_LOCKED_REPLAY":
+        raise RuntimeError(
+            "Existing Normal sessions are locked to the Profile; "
+            "add --lock-normal-to-profile on every --resume.")
+    if manifest.get("profile") is not None:
+        compare_runs(manifest["profile"],
+                     list(manifest.get("warmup", [])) +
+                     list(manifest.get("normal", [])))
     env = os.environ.copy()
     for key in ("PRIMA_FIG3_FILE", "PRIMA_FIG3_RANK", "PRIMA_FIG3_RUN_ID"):
         env.pop(key, None)
@@ -396,17 +454,20 @@ def main():
     for i in range(len(manifest["warmup"]), args.warmups):
         if args.between:
             time.sleep(args.between)
-        value = launch(args, cmd, root/f"warmup_{i+1}.log", env)
+        value = launch(args, normal_cmd, root/f"warmup_{i+1}.log", env,
+                       expected_layout=normal_expected)
+        compare_runs(manifest["profile"], manifest["warmup"] + [value])
         manifest["warmup"].append(value)
         atomic_json(path, manifest)
-        compare_runs(manifest["profile"], manifest["warmup"])
     for i in range(len(manifest["normal"]), args.repeats):
         if args.between:
             time.sleep(args.between)
-        value = launch(args, cmd, root/f"normal_{i+1}.log", env)
+        value = launch(args, normal_cmd, root/f"normal_{i+1}.log", env,
+                       expected_layout=normal_expected)
+        compare_runs(manifest["profile"],
+                     manifest["warmup"] + manifest["normal"] + [value])
         manifest["normal"].append(value)
         atomic_json(path, manifest)
-        compare_runs(manifest["profile"], manifest["warmup"] + manifest["normal"])
     if any(abs(r["tokens"]-manifest["profile"]["tokens"])>2
            for r in manifest["normal"]):
         raise RuntimeError("Normal vs Profile token count mismatch")
