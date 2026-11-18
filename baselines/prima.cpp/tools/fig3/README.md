@@ -446,6 +446,58 @@ raw source presence, before/after four-timestamp clock offset/drift,
 A valid CSV output is NOT itself evidence of exact CUDA absolute placement.
 Do not turn approximate device/host alignment into verified percentages.
 
+## 32B PC52 / Phone12 controlled comparison (GPU14)
+
+For a new experiment changing **only** the layer split from the original
+32B PC40/Phone24/GPU14, use the committed preset
+`tools/fig3/run_32b_pc52_phone12.sh`. It fixes:
+`-lw 52,12 -ngl 14` for BOTH Profile and Warmup/Normal; model is
+Qwen3-32B-Q4_K_M, 64 layers, context 2048, batch/ubatch 512,
+threads 8, predict 1, Prefetch enabled. This is **FIXED_LAYOUT_REPLAY**,
+not HiGHS automatic placement. It does not touch old auto-v1 results.
+
+The new experiment has run-id
+`prima-fig3-32b-pc52-phone12-gpu14-v1`, output folder
+`/mnt/d/fig3-prima32b-pc52-phone12-gpu14-v1`.
+Because the PC now holds 52 instead of 40 layers, with the same 14 GPU
+layers, it holds **38 vs 26 CPU layers**: check WSL RAM/swap before
+starting, even if 40/24 succeeded. Do not assume a 7.7GiB WSL memory
+cap will work. GPU count is deliberately kept at 14 for isolation.
+
+Stop the old phone worker to free network/clock ports. On Termux:
+
+    cd ~/prima-qwen3/baselines/prima.cpp
+    PRIMA_FIG3_PHONE_RESUME=0 bash tools/fig3/phone_worker_fig3.sh \
+      "$HOME/models/Qwen3-32B-Q4_K_M.gguf" \
+      10.238.229.214 prima-fig3-32b-pc52-phone12-gpu14-v1
+
+On PC WSL (after updating the experiment branch):
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    free -h
+    nvidia-smi
+    bash tools/fig3/run_32b_pc52_phone12.sh profile
+
+When Profile prints PC52/Phone12/GPU14 and PASS, run
+
+    bash tools/fig3/run_32b_pc52_phone12.sh finish
+
+The latter uses --resume, **not** --lock-normal-to-profile, because
+both Profile and Normal are already fixed. It reuses the original
+PC/Phone trace and clock calibration and runs 1 Warmup + 3 Normal.
+
+If a terminal is interrupted, use the same `finish` command to resume
+only saved successful cases. If analysis fails on strict clock checks,
+keep the raw CSV and run
+
+    bash tools/fig3/run_32b_pc52_phone12.sh diagnostic
+
+This is an explicitly **non-paper** diagnostic, not an approved six-class
+critical-path breakdown. A failure due to missing phone.csv can be
+recovered via a manual SCP followed by `analyze` or `diagnostic`.
+Do not reuse the old 40/24 graphic or pretend the prior 32B percentages
+apply to this new configuration.
+
 ## 32B AUTO mismatch recovery: PC40/Phone24 vs PC37/Phone27
 
 Observed Qwen3-32B (64 layers) from one real run:
