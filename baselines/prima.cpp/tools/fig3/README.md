@@ -446,6 +446,78 @@ raw source presence, before/after four-timestamp clock offset/drift,
 A valid CSV output is NOT itself evidence of exact CUDA absolute placement.
 Do not turn approximate device/host alignment into verified percentages.
 
+## 32B AUTO mismatch recovery: PC40/Phone24 vs PC37/Phone27
+
+Observed Qwen3-32B (64 layers) from one real run:
+- first Profile chose per-cycle windows PC40 / Phone24;
+- next independent Warmup chose PC37 / Phone27, GPU14;
+- Warmup completed in 157086.34ms but failed the strict layout check;
+- older collector committed that incompatible Warmup to manifest before
+  comparing it to the original Profile.
+
+**Do not combine these runs** in a six-category or Normal/Profiler
+overhead comparison. The existing Profile raw PC/Phone events, clock
+samples, and model timings can be preserved for a separate diagnostic
+experiment, as long as its saved layout was consistent within Profile.
+The alternative fully controlled paper experiment is a NEW fixed-layout
+run with the same -lw/-ngl flags for both Profile and Normal.
+
+NEW recovery command: `--resume --lock-normal-to-profile`. It extracts
+the original Profile's actual PC GPU count automatically; no guessing
+about -ngl. It adds **only to Normal sessions** the exact native flags
+`-lw 40,24 -ngl PROFILE_GPU_COUNT`, retaining the original auto
+Profile trace as-is. This is labeled `AUTO_PROFILE_LOCKED_NORMAL`
+because Profile used automatic HiGHS but later runs use a forced replay.
+It does NOT establish independent automatic HiGHS throughput. If the
+forced replay changes any relevant post-init state or fails, the
+comparison is rejected.
+
+The recovery first copies `manifest.json` to
+`manifest_before_normal_lock.json`, archives the incompatible
+`warmup_1.log` in `rejected_runs/warmup_1.log`, and retains its old
+manifest record in `rejected_sessions`. No original event CSV, Profile
+log or clock samples are overwritten. The new `warmup_1.log` will
+be measured under the saved Profile layout.
+
+Phone: if the original `prima-fig3-32b-auto-v1` worker is still
+running, **do not start a second one**. It is already restarting the
+Rank1 process after the previous Warmup. If the worker was stopped,
+use `PRIMA_FIG3_PHONE_RESUME=1` with the ORIGINAL run-id as documented
+above; never delete `phone.csv`.
+
+PC WSL, first update this branch and run the no-device tests:
+
+    cd /mnt/d/prima-qwen3
+    git fetch origin refs/heads/exp/prima-fig3-full-trace-20261118
+    git merge --ff-only FETCH_HEAD
+    cd baselines/prima.cpp
+    python3 -m py_compile tools/fig3/*.py
+    python3 tools/fig3/test_profile_lock.py
+    python3 tools/fig3/test_layout_guard.py
+
+Continue ONLY the missing/mismatched Normal-side runs:
+
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-32b-auto-v1 \
+      --model /mnt/e/llama/models/Qwen3-32B-Q4_K_M.gguf \
+      --prompt /mnt/e/llama/datasets/sharegpt/sharegpt50_short/prompt_1024_01.txt \
+      --out /mnt/d/fig3-prima32b-auto-v1 \
+      --master 10.238.229.214 --next 10.238.229.239 \
+      --context 2048 --batch 512 --ubatch 512 --threads 8 \
+      --model-layers 64 --warmups 1 --repeats 3 --between 30 \
+      --resume --lock-normal-to-profile
+
+The runner should report
+`KEEP original AUTO Profile. NORMAL COMMAND: ... -lw 40,24 -ngl N`
+and `quarantined mismatched sessions: 1`; it will re-run Warmup,
+then three Normal measurements. Do not manually delete warmup records
+from JSON or overwrite previous raw Profile events.
+
+If clock validation still rejects the final breakdown, keep the raw
+evidence and use `--clock-mode piecewise-diagnostic --analyze-only`
+strictly for a clearly labeled *diagnostic* plot. The CUDA absolute
+event placement remains provisional.
+
 ## Prima 32B Fig.3: first discover, then replay only if needed
 
 Qwen3-32B-Q4_K_M has 64 transformer layers. Unlike the 14B 40-layer
