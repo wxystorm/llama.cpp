@@ -121,8 +121,9 @@ def clock_mapping(samples, mode="strict", profile_start=None, profile_end=None):
     only when anchors densely cover the Profile and no large clock step is
     observed. Two-point affine mode is an EXPLICIT DIAGNOSTIC ONLY.
     """
-    if mode not in ("strict", "affine-diagnostic"):
-        raise ValueError("clock mode must be strict or affine-diagnostic")
+    if mode not in ("strict", "affine-diagnostic", "piecewise-diagnostic"):
+        raise ValueError("clock mode must be strict, affine-diagnostic, "
+                         "or piecewise-diagnostic")
     before = _clock_anchor([x for x in samples if x.get("phase") == "before"], "before")
     after  = _clock_anchor([x for x in samples if x.get("phase") == "after"], "after")
     if not (before["pc"] < after["pc"] and before["phone"] < after["phone"]):
@@ -148,28 +149,40 @@ def clock_mapping(samples, mode="strict", profile_start=None, profile_end=None):
         anchors = [before, after]
         mapping = "TWO_POINT_AFFINE_ASSUMED_NOT_VERIFIED"
     else:
+        if mode == "piecewise-diagnostic" and len(during) < 8:
+            raise ValueError("dense diagnostic requires >=8 in-Profile anchors")
         anchors = [before] + during + [after]
-        mapping = "PIECEWISE_DURING_PROFILE_UNDER_REVIEW"
+        mapping = ("DENSE_PIECEWISE_CLOCK_WITH_ANOMALIES_NOT_VERIFIED"
+                   if mode == "piecewise-diagnostic"
+                   else "PIECEWISE_DURING_PROFILE_UNDER_REVIEW")
     if profile_start is not None and not (
             anchors[0]["pc"] <= profile_start <= profile_end <= anchors[-1]["pc"]):
         raise ValueError("clock samples do not bracket whole PC Prefill window")
     max_gap_ns = 0
     max_local_delta_ns = 0
-    for a, b in zip(anchors, anchors[1:]):
+    anomalies = []
+    for i, (a, b) in enumerate(zip(anchors, anchors[1:])):
         pc_gap, phone_gap = b["pc"] - a["pc"], b["phone"] - a["phone"]
         if pc_gap <= 0 or phone_gap <= 0:
             raise ValueError("non-monotonic clock alignment anchors")
         max_gap_ns = max(max_gap_ns, pc_gap)
         local_delta_ns = abs(phone_gap - pc_gap)
         max_local_delta_ns = max(max_local_delta_ns, local_delta_ns)
-        if mode == "strict":
+        if mode in ("strict", "piecewise-diagnostic"):
             if pc_gap > 8000000000:
                 raise ValueError(f"clock calibration gap {pc_gap/1e9:.2f}s > 8s during Profile")
-            # A sudden 100ms discrepancy between adjacent 2s anchors indicates
-            # a clock step or badly asymmetric network. Do not interpolate it.
+            # A sudden >100ms discrepancy may signal VM clock instability
+            # or asymmetric transport. Strict mode MUST reject it. Opt-in
+            # diagnostic mode retains all dense anchors, explicitly labels
+            # this evidence as unusable for a paper-ready timeline.
             if local_delta_ns > max(100000000, int(pc_gap * 0.03)):
-                raise ValueError(
-                    f"clock discontinuity between samples: {local_delta_ns/1e6:.1f}ms")
+                anomalies.append(dict(anchor_index=i,
+                                     pc_gap_ms=round(pc_gap/1e6, 4),
+                                     relative_offset_change_ms=round(
+                                         (phone_gap-pc_gap)/1e6, 4)))
+                if mode == "strict":
+                    raise ValueError(
+                        f"clock discontinuity between samples: {local_delta_ns/1e6:.1f}ms")
     phone_points = [x["phone"] for x in anchors]
     def map_phone(t):
         i = max(0, min(len(anchors)-2, bisect.bisect_right(phone_points, t)-1))
@@ -181,7 +194,8 @@ def clock_mapping(samples, mode="strict", profile_start=None, profile_end=None):
         max_anchor_gap_ms=round(max_gap_ns/1e6, 3),
         max_local_clock_delta_ms=round(max_local_delta_ns/1e6, 3),
         best_uncertainty_ns=best_uncertainty, offset_change_ns=offset_change,
-        spread_ns=abs(offset_change), rate_ratio=rate)
+        spread_ns=abs(offset_change), rate_ratio=rate,
+        clock_anomalies=anomalies, clock_anomaly_count=len(anomalies))
 
 def projection(source, start, end):
     """O(N log N) event sweep with mutually-exclusive priority projection."""
@@ -361,6 +375,8 @@ def inspect(args):
     fidelity = ("PROVISIONAL_GPU_EPOCH" if cuda_approx else "REQUIRES_GPU_QUALITY_REVIEW")
     if clock_mode == "affine-diagnostic":
         fidelity = "DIAGNOSTIC_ONLY_UNVERIFIED_TWO_POINT_CLOCK"
+    elif clock_mode == "piecewise-diagnostic":
+        fidelity = "DIAGNOSTIC_ONLY_DENSE_CLOCK_ANOMALY_AND_GPU_EPOCH"
     elif clock_quality["mode"].startswith("PIECEWISE"):
         fidelity = "PROVISIONAL_CLOCK_RATE_AND_GPU_EPOCH"
     summary = {
@@ -372,11 +388,15 @@ def inspect(args):
         "clock_best_uncertainty_ms": round(uncertainty/1e6, 4),
         "clock_offset_spread_ms": round(spread/1e6, 4),
         "clock_alignment": clock_quality,
-        "clock_warning": ("The two-point affine assumption cannot detect a "
-                          "mid-run clock jump; values are for debugging only."
-                          if clock_mode == "affine-diagnostic" else
-                          "Piecewise clock mapping is provisional: verify against "
-                          "a GPU absolute-timestamp trace and investigate WSL clock."),
+        "clock_warning": (
+            "DIAGNOSTIC ONLY: dense clock anchors fail strict rate checks; "
+            "do NOT use exclusive PC/Phone overlap for a paper figure."
+            if clock_mode == "piecewise-diagnostic" else
+            "The two-point affine assumption cannot detect a mid-run clock jump."
+            if clock_mode == "affine-diagnostic" else
+            "Clock mapping is provisional: verify GPU absolute timestamps "
+            "and independently investigate WSL/Phone clock rates."
+        ),
 
         "full_coverage": sum(totals.values()) == envelope,
         "overlap_ms": round(overlap/1e6, 3),
@@ -417,9 +437,11 @@ def inspect(args):
     write_csv(root/"fig3_prima_paper_row.csv", [paper], tuple(paper))
     print("[PRIMA_FIG3] clock mapping", clock_quality["mode"],
           "offset-change-ms", round(clock_quality["offset_change_ns"]/1e6, 3))
-    if clock_mode == "affine-diagnostic":
-        print("[PRIMA_FIG3] WARNING: DIAGNOSTIC ONLY. Endpoint clock drift may "
-              "have been a step rather than smooth drift. NOT PAPER DATA.")
+    if clock_mode in ("affine-diagnostic", "piecewise-diagnostic"):
+        print("[PRIMA_FIG3] WARNING: DIAGNOSTIC ONLY. Clock alignment "
+              "fails strict scientific validity checks. NOT PAPER DATA.")
+        print("[PRIMA_FIG3] clock anomalies",
+              clock_quality.get("clock_anomaly_count", 0))
     print("[PRIMA_FIG3] phone-meta-poll raw %.3f ms, overlap PC-GRAPH_SUBMIT %.3f ms"
           % (polling_diagnostics["phone_metadata_poll_raw_ms"],
              polling_diagnostics["phone_poll_overlaps_pc_graph_submit_ms"]))
@@ -442,7 +464,8 @@ def main():
     ap.add_argument("--phone", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--clock-mode", default="strict",
-                    choices=["strict", "affine-diagnostic"])
+                    choices=["strict", "affine-diagnostic",
+                             "piecewise-diagnostic"])
     inspect(ap.parse_args())
 
 
