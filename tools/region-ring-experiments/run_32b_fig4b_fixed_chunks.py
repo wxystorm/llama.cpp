@@ -76,7 +76,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     args.chunks = sorted(set(args.chunks))
     if args.groups != list(GROUPS):
         ap.error("Fig. 4(b) requires exactly groups 128 512 1024")
-    parts = re.findall(r"([GCP])(\\d+)", args.layout)
+    parts = re.findall(r"([GCP])(\d+)", args.layout)
     if (not parts or ",".join(f"{k}{n}" for k, n in parts) != args.layout
             or sum(int(n) for _, n in parts) != 64
             or args.layout != LAYOUT):
