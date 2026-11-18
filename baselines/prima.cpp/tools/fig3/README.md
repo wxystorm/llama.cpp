@@ -110,6 +110,69 @@ port access permission (Termux allows nonprivileged port 19139).
 Do not use old automatic ShareGPT sweep logs to infer six-way proportions.
 They are separate, normal throughput measurements only.
 
+## PC trace write amplification and quick A/B (2026-11-18)
+
+Full original PC logs confirm the same manual PC39/Phone1, PC GPU21,
+ubatch512, ctx2048 on Profile, Warmup and Normal1-3. Exact PC Prefill
+(ms): 22299.08; 8295.31; 7773.30; 7894.46; 7701.38.
+The normal median is 7773.30ms (132.89 tokens/s), versus the Profile
+22.30s. PC model-load times vary but are NOT included in prompt eval.
+
+The raw source_events.csv contains 9 PC GRAPH_SUBMIT calls totaling
+15985.74ms. Two especially long calls: 5550.14ms and 7878.45ms.
+EACH contained 238 H2D_BUFFER events, 216 CUDA_GRAPH events,
+54 D2H_BUFFER events, and 36 CPU_GRAPH events. The implementation
+in prima-fig3-trace.h historically performs open+write+close for every
+event. The original PC event file lived on WSL DrvFs /mnt/d; slow
+per-event metadata operations could have artificially inflated these
+host-side timings. This is a hypothesis, not a measured cause.
+
+NEW: run_fig3_complete.py stages the PC raw events into a native Linux
+/tmp temporary directory and copies the CSV **once** into the output
+directory when the first Profile process exits. This changes only the
+trace destination, not the inference or placement. Source timestamps
+and source event schema are unchanged. It also supports --profile-only
+to stop after Profile, without the normal repetitions. The original
+file and run-id are never overwritten.
+
+Check file I/O overhead without executing model or phone:
+
+    cd /mnt/d/prima-qwen3/baselines/prima.cpp
+    python3 tools/fig3/trace_io_probe.py \
+      --linux-dir /tmp \
+      --windows-dir /mnt/d/fig3-prima14b-fixed39-1 --iterations 400
+
+Start a NEW phone worker, after stopping the previous one:
+
+    bash tools/fig3/phone_worker_fig3.sh \
+      "$HOME/models/Qwen3-14B-Q4_K_M.gguf" \
+      10.238.229.214 prima-fig3-14b-fasttrace-v1
+
+On PC WSL, a ONE-PROFILE A/B for the 39/1 layout:
+
+    python3 tools/fig3/run_fig3_complete.py \
+      --run-id prima-fig3-14b-fasttrace-v1 \
+      --out /mnt/d/fig3-prima14b-fasttrace-v1 \
+      --model /mnt/e/llama/models/Qwen3-14B-Q4_K_M.gguf \
+      --prompt /mnt/e/llama/datasets/sharegpt/sharegpt50_short/prompt_1024_01.txt \
+      --master 10.238.229.214 --next 10.238.229.239 \
+      --context 2048 --batch 512 --ubatch 512 --threads 8 \
+      --fixed-layers 39,1 --pc-ngl 21 --model-layers 40 \
+      --profile-only
+
+The output ends with PROFILE_ONLY complete, Prefill=...ms. Compare
+against the old 22299.08ms under equivalent conditions. If no longer
+grossly inflated, the DrvFs trace write amplification is implicated.
+If it stays slow, isolate CUDA per-op event timing and WSL clock behavior
+next. The test cannot by itself validate absolute GPU epoch alignment.
+Do not mislabel the 39/1 replay as Prima automatic placement.
+
+Clock samples in the old run had 122 DURING observations: offset
+increased broadly throughout the Profile, by around 1.30s over
+64.7s of PC clock elapsed (~2% relative rate difference), not just
+a single observed endpoint anomaly. This is too large to accept as
+normal clock skew; verify WSL/Android clocks independently.
+
 ## Verified 14B fixed-layout diagnostics (profile(3).zip)
 
 A real fixed-layout Qwen3-14B run yielded post-init PC39 (GPU21), Phone1,
