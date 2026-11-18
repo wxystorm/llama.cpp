@@ -10990,7 +10990,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             const char * force_small_batch_raw =
                 std::getenv("LLAMA_REGION_RING_GPU_BANK_FORCE_SMALL_BATCH");
             if (replay_requested || end == fixed_chunk_raw ||
-                    *end != '\0' || (target != 32 && target != 64 && target != 128) ||
+                    *end != '\0' || (target != 32 && target != 64 && target != 128 && target != 256) ||
                     force_small_batch_raw == nullptr ||
                     std::strcmp(force_small_batch_raw, "1") != 0) {
                 LLAMA_LOG_ERROR(
@@ -11017,7 +11017,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 (int) n_tokens_all < target ?
                     "WHOLE_PROMPT_SINGLE_CHUNK" :
                     (target == 32 ? "FIXED_32" :
-                     target == 64 ? "FIXED_64" : "FIXED_128"));
+                     target == 64 ? "FIXED_64" :
+                     target == 128 ? "FIXED_128" : "FIXED_256"));
         } else if (replay_requested) {
             std::ifstream replay(replay_path);
             uint32_t replay_tokens = 0;
