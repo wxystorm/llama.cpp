@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from analyze_fig3 import inspect, projection, calibrate
+from analyze_fig3 import inspect, projection, calibrate, clock_mapping
 
 
 def row(run, rank, start, end, category, kind, tokens=0):
@@ -16,10 +16,15 @@ def row(run, rank, start, end, category, kind, tokens=0):
 def samples(drift=0):
     data = []
     for phase, add in (("before", 0), ("after", drift)):
+        center = 9000000000 if phase == "before" else 12000000000
         for i in range(16):
             data.append({
                 "phase": phase, "offset_phone_minus_pc_ns": 5000000 + add,
                 "uncertainty_ns": 100000 + i * 100,
+                "pc_t0": center - 100000,
+                "pc_t3": center + 100000,
+                "phone_t1": center + 5000000 + add - 100000,
+                "phone_t2": center + 5000000 + add + 100000,
             })
     return data
 
@@ -44,6 +49,24 @@ class Fig3Test(unittest.TestCase):
         self.assertEqual(calibrate(samples())[0], 5000000)
         with self.assertRaisesRegex(ValueError, "drift"):
             calibrate(samples(30000000))
+
+    def test_two_point_diagnostic_recovery(self):
+        readings = samples(1514126000)
+        # Keep the real PC elapsed / phone elapsed monotonic for this fixture.
+        for v in readings:
+            if v["phase"] == "after":
+                v["pc_t0"] = 173733000000 - 100000
+                v["pc_t3"] = 173733000000 + 100000
+                v["phone_t1"] = 173733000000 + 5000000 + 1514126000 - 100000
+                v["phone_t2"] = 173733000000 + 5000000 + 1514126000 + 100000
+        with self.assertRaisesRegex(ValueError, "drift"):
+            clock_mapping(readings, "strict", 10000000000, 150000000000)
+        mapper, detail = clock_mapping(
+            readings, "affine-diagnostic", 10000000000, 150000000000)
+        self.assertEqual(mapper(9005000000), 9000000000)
+        self.assertEqual(mapper(175252126000), 173733000000)
+        self.assertEqual(detail["anchor_count"], 2)
+        self.assertIn("ASSUMED", detail["mode"])
 
     def test_synthetic_full(self):
         run = "synthetic-prima"
