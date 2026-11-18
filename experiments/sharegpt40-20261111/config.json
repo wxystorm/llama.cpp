@@ -13,7 +13,7 @@
     ],
     "prompts_per_group": 10,
     "prompt_ids": "prompt_{group}_{01..10}.txt",
-    "note": "Ours 14B/24B/32B, Galaxy 14B, and Prima.cpp 24B/32B cover groups 0/128/256/512/1024. Prima.cpp 14B has a 0-group summary (10 prompts) and 40 existing prompt-level records. Jupiter 24B group 1024 has six PASS observations."
+    "note": "Ours 14B/24B/32B, Galaxy 14B, and Prima.cpp 24B/32B cover groups 0/128/256/512/1024. Prima.cpp 14B has a group-0 summary (10 prompts) and 40 existing prompt-level records. Jupiter 24B has user-reported remeasured group means for all 5 groups, 10 prompts each (50 total); new per-prompt data was not provided. Old 36 Jupiter 24B prompt-level records are superseded due to a prefix issue."
   },
   "models": {
     "14b": "Qwen3-14B-Q4_K_M.gguf",
@@ -215,19 +215,21 @@
       "framework": "jupiter",
       "model": "24b",
       "method": "Sequence DP",
-      "run_config": "runs/jupiter-24b/run-config.json",
-      "context": 2048,
-      "batch": 2048,
-      "ubatch": 128,
-      "pc_layers": 32,
-      "cpu_layers": 24,
-      "graph_prebuild": false,
-      "min_chunk": 96,
-      "max_chunk": 128,
-      "bench_repeats": 1,
-      "expected_prompts": 40,
-      "observed_passes": 36,
-      "complete": false
+      "aggregation": "group_mean_only",
+      "source": "user-reported remeasurement, 2026-11-18",
+      "remeasurement_reason": "24B prefix issue",
+      "group_counts": {
+        "0": 10,
+        "128": 10,
+        "256": 10,
+        "512": 10,
+        "1024": 10
+      },
+      "reported_prompts": 50,
+      "group_means_complete": true,
+      "new_per_prompt_data_available": false,
+      "legacy_run_config": "runs/jupiter-24b/run-config.json",
+      "legacy_per_prompt_details": "runs/jupiter-24b/per-prompt-details.csv"
     }
   ],
   "measurements": {

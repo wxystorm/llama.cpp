@@ -21,7 +21,7 @@
   "refine_repeats": 1,
   "benchmark_repeats": 1,
   "graph_prebuild": false,
-  "status": "PARTIAL",
+  "status": "SUPERSEDED_PREFIX_ISSUE",
   "expected_prompts": 40,
   "observed_successful_prompts": 36,
   "successful_groups": {
@@ -30,5 +30,5 @@
     "512": 10,
     "1024": 6
   },
-  "note": "36 PASS rows in dp-summary.json; 4 missing group-1024 prompts are not treated as PASS or FAIL. Paths and RPC target are placeholders."
+  "note": "Historical 36-prompt run (group 1024 contains 6 PASS prompts) superseded due to a 24B prefix issue. Re-measured 2026-11-18 replacement results are available only as five user-reported group-average throughput values in ../../group-summary.csv (10 prompts per group; no new per-prompt rows). This run configuration and per-prompt-details.csv describe the old run only. Paths and RPC target are placeholders."
 }

@@ -1,6 +1,6 @@
 # ShareGPT benchmark snapshot
 
-Ten experimental runs; **456 successful per-prompt results** in `results.csv` and **62 group summary rows** in `group-summary.csv`. Prompt groups are sampling labels, not exact model token counts.
+Ten experimental runs; **420 successful per-prompt results** in `results.csv` and **63 group summary rows** in `group-summary.csv`. Prompt groups are sampling labels, not exact model token counts.
 
 ## Run inventory
 
@@ -10,7 +10,7 @@ Ten experimental runs; **456 successful per-prompt results** in `results.csv` an
 | Prima.cpp | Mistral Small 3.2-24B Q6_K | `prima-24b` | 50 |
 | Prima.cpp | Qwen3-32B | `prima-32b` | 50 |
 | Jupiter | Qwen3-14B | `jupiter-14b` | 40 |
-| Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 36 |
+| Jupiter | Mistral Small 3.2-24B Q6_K | `jupiter-24b` | 50 (aggregate-only, 10/group) |
 | Jupiter | Qwen3-32B | `jupiter-32b` | 40 |
 | Galaxy | Qwen3-14B | `galaxy-14b` | 50 |
 | Ours | Qwen3-14B | `ours-14b-server-plan` | 50 |
@@ -23,9 +23,9 @@ Each new run's `runs/ours-*-server-plan/per-prompt-details.csv` keeps input toke
 
 Ours 14B has been fully replaced by the new 50-prompt Server Plan measurements for groups 0/128/256/512/1024, with the user-confirmed placement `G11,P5,G11,P5,G8` (40 layers). Its earlier 2048 group and old mixed per-prompt maxima are no longer part of the current summary. They remain available in Git history.
 
-Galaxy 14B covers groups 0/128/256/512/1024 with 10 prompts per group (group 0 mean: 5.202 tok/s). Prima.cpp 24B and 32B each contain 50 observations (context 2048). Jupiter 24B has 36 observations (group 1024: six).
+Galaxy 14B covers groups 0/128/256/512/1024 with 10 prompts per group (group 0 mean: 5.202 tok/s). Prima.cpp 24B and 32B each contain 50 observations (context 2048). Jupiter 24B was **remeasured due to a 24B prefix issue**. The user-reported replacement group-average Prefill throughput (tok/s), each based on 10 prompts, is: **0: 22.551; 128: 23.138; 256: 25.252; 512: 28.374; 1024: 30.521**. The new 50 per-prompt measurements were not provided, so this replacement is **aggregate-only**. The former 36 Jupiter 24B per-prompt rows are excluded from active `results.csv`; the old `runs/jupiter-24b/per-prompt-details.csv` and run configuration remain as **superseded historical evidence**, not valid inputs for the new means.
 
-`group-summary.csv` computes ordinary arithmetic mean/median of recorded per-prompt Prefill TPS and latency; a group mean is not pooled token throughput. Planner time is retained in per-prompt details, not added to prefill time.
+`group-summary.csv` reports the arithmetic mean of per-prompt Prefill TPS; a group mean is not pooled token throughput. **Exception:** Jupiter 24B replacement means and sample counts were supplied directly by the user, not recalculated from current per-prompt rows. Its median TPS and latency fields remain blank because those metrics were not supplied. Planner time is retained in per-prompt details, not added to prefill time.
 
 
 ## llama.cpp single-PC ShareGPT50 baseline
